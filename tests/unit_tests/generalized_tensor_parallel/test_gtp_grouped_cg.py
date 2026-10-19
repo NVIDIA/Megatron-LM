@@ -19,6 +19,21 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_grouped_graph_streams():
+    """Do not join streams belonging to a previous test's destroyed process groups."""
+    # Production keeps stream caches for a model's lifetime. These tests construct
+    # and destroy independent models/groups; a full graph's final fence must not
+    # join uncaptured streams left behind by an earlier eager or local-graph test.
+    torch.cuda.synchronize()
+    gtp._AG_STREAMS.clear()
+    gtp._RS_STREAMS.clear()
+    yield
+    torch.cuda.synchronize()
+    gtp._AG_STREAMS.clear()
+    gtp._RS_STREAMS.clear()
+
+
 class _Block(torch.nn.Module):
     def __init__(self, group):
         super().__init__()
