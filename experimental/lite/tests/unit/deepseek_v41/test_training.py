@@ -227,9 +227,9 @@ def _run(root, shape, sft=False):
 )
 def test_small_model_parallel_contract_and_grad_mode(tmp_path, monkeypatch, shape):
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    reference = _run(tmp_path / "reference", (1, 1, 1, None))
+    reference = _run(tmp_path / "reference", (1, shape[1] if shape[2] > 1 else 1, 1, None))
     actual = _run(tmp_path / "parallel", shape)
-    if shape[1] == 1:
+    if shape[1] == 1 or shape[2] > 1:
         error = (reference - actual).abs()
         assert error.max() <= 0.125 and torch.quantile(error, 0.99) <= 0.03
         torch.testing.assert_close(reference.mean(), actual.mean(), atol=0.02, rtol=0.005)
