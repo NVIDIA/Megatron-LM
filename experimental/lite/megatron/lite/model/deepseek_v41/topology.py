@@ -21,6 +21,15 @@ def layer_sources(config: DeepseekV41Config) -> tuple[LayerSources, ...]:
     for ids in sources:
         if any(type(i) is not int or i < 0 for i in ids) or list(ids) != sorted(set(ids)):
             raise ValueError("DS4.1 owner layer ids must be sorted unique nonnegative integers")
+    candidate = config.candidate_source_layer_id
+    if 0 <= candidate and (
+        candidate not in config.index_source_layer_ids
+        or candidate >= len(ratios)
+        or ratios[candidate] != 1
+    ):
+        # Release (layer 20): the publisher is a ratio-one index owner. A publisher
+        # reusing another layer's selection would never publish its pool.
+        raise ValueError("DS4.1 candidate publisher must be a ratio-one index source layer")
     result = []
     for i, ratio in enumerate(ratios[:n]):
         if type(ratio) is not int or ratio not in (0, 1, 2):
@@ -28,7 +37,6 @@ def layer_sources(config: DeepseekV41Config) -> tuple[LayerSources, ...]:
         owners = tuple(max((s for s in ids if s <= i), default=None) for ids in sources)
         if ratio and any(s is None or ratios[s] != ratio for s in owners):
             raise ValueError(f"DS4.1 layer {i} has no compatible KV/index owner")
-        candidate = config.candidate_source_layer_id
         uses_candidate = candidate >= 0 and i >= candidate
         if ratio == 1 and not uses_candidate:
             raise ValueError("DS4.1 ratio-1 layers require a candidate publisher")

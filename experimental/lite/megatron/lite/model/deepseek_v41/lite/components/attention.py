@@ -2,6 +2,7 @@
 """DS4.1 projections over Core's native attention/THD/CP execution."""
 import torch
 
+from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridSelfAttention,
@@ -18,6 +19,38 @@ class DS41SelfAttention(DSv4HybridSelfAttention):
     This standard training interface uses packed THD, TP1, unfused RoPE;
     it does not implement an inference cache or change CP communication.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self._dsv4_compress_ratio == 1:
+            self._use_compressed_rope()
+
+    def _use_compressed_rope(self):
+        """Ratio one rotates like every compressing layer: compress theta with YaRN.
+
+        The release (and its reference) select compress_rope_theta and YaRN for any
+        nonzero ratio. Core dev 7b150acf selects them only for ratio > 1, so it gives
+        ratio one the base theta without YaRN. Build Core's ratio > 1 rotary and
+        replace every reference this layer holds to the one Core built.
+        """
+        config, old = self.config, self.rotary_pos_emb
+        new = YarnRotaryEmbedding(
+            config.qk_pos_emb_head_dim,
+            rotary_base=config.csa_compress_rotary_base,
+            scaling_factor=config.rotary_scaling_factor,
+            original_max_position_embeddings=config.original_max_position_embeddings,
+            beta_fast=config.beta_fast,
+            beta_slow=config.beta_slow,
+            mscale=config.mscale,
+            mscale_all_dim=config.mscale_all_dim,
+            cp_group=self.pg_collection.cp,
+        )
+        for module in list(self.modules()):
+            for table in (module._modules, module.__dict__):
+                for name in [name for name, value in table.items() if value is old]:
+                    table[name] = new
+        self._dsv4_rope_base = config.csa_compress_rotary_base
+        self._dsv4_uses_yarn_rope = True
 
     def get_query_key_value_tensors(
         self,
