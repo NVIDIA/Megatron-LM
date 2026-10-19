@@ -364,6 +364,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         use_layer_wise_param_layout: bool = True,
         device: torch.device | str | None = None,
         checkpoint=None,
+        distillation=None,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -378,6 +379,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             data_parallel_random_init: Whether to use data parallel random initialization
             device: Explicit final device, including for meta materialization; None keeps the default.
             checkpoint: Run-owned checkpoint config used for pre-wrap transformation restoration.
+            distillation: Run-owned ModelOpt ``DistillationConfig``; converts the student for KD.
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -388,7 +390,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
-        composed_pre_wrap_hook = self.pre_wrap_hook(checkpoint)
+        composed_pre_wrap_hook = self.pre_wrap_hook(checkpoint, distillation)
         model_list = unimodal_build_distributed_models(
             self.build_model,
             transformer_config,

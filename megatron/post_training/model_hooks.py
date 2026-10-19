@@ -196,9 +196,9 @@ def te_load_state_dict_hook() -> PreWrapHook:
     return hook
 
 
-def _build_teacher(student_model_config, model):
+def _build_teacher(student_model_config, distillation, model):
     """Build the resolved teacher architecture on the same pipeline stage as the student."""
-    teacher_model_config = student_model_config.distillation.teacher_model
+    teacher_model_config = distillation.teacher_model
     if teacher_model_config is None:
         raise ValueError("Distillation requires a resolved teacher_model configuration.")
     # Tokenizer initialization may resolve the student's vocabulary after CLI translation.
@@ -208,7 +208,6 @@ def _build_teacher(student_model_config, model):
         vocab_size=student_model_config.vocab_size,
         should_pad_vocab=student_model_config.should_pad_vocab,
         transformations=None,
-        distillation=None,
         pre_wrap_hooks=[],
         post_wrap_hooks=[],
     )
@@ -224,7 +223,7 @@ def _build_teacher(student_model_config, model):
     )
 
 
-def kd_convert_hook(student_model_config, te_mcore_model: bool) -> PreWrapHook:
+def kd_convert_hook(student_model_config, distillation, te_mcore_model: bool) -> PreWrapHook:
     """Convert each model stage into a ModelOpt ``DistillationModel`` with its teacher stage.
 
     The teacher is built by the same ``ModelBuilder`` class as the student, from the student's
@@ -236,12 +235,10 @@ def kd_convert_hook(student_model_config, te_mcore_model: bool) -> PreWrapHook:
     them before wrapping would lose the wrapper's dtype handling (e.g. fp32 MoE router params).
 
     Args:
-        student_model_config: The student ``ModelConfig``; its ``distillation`` must be set.
+        student_model_config: The student ``ModelConfig``.
+        distillation: The run's ``DistillationConfig`` (teacher and distillation loss).
         te_mcore_model: Whether to register the TE state_dict key-remapping hook on the teacher.
     """
-    distillation = student_model_config.distillation
-    assert distillation is not None, "kd_convert_hook requires model_config.distillation"
-
     def hook(models: list[MegatronModule]) -> list[MegatronModule]:
         print_rank_0("Distillation: Enabled.")
         if len(models) != 1:
@@ -252,9 +249,11 @@ def kd_convert_hook(student_model_config, te_mcore_model: bool) -> PreWrapHook:
         converted = []
         for model in models:
             distill_cfg = mtd_mcore.setup_distillation_config(
-                distillation.kd_cfg, student_cfg=model.config, teacher_cfg=teacher_transformer
+                mtd_mcore.DistillationConfig(**distillation.loss_kwargs()),
+                student_cfg=model.config,
+                teacher_cfg=teacher_transformer,
             )
-            teacher = _build_teacher(student_model_config, model)
+            teacher = _build_teacher(student_model_config, distillation, model)
             if te_mcore_model:
                 teacher._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
 
@@ -274,7 +273,7 @@ def kd_convert_hook(student_model_config, te_mcore_model: bool) -> PreWrapHook:
     return hook
 
 
-def modelopt_pre_wrap_hook(model_config, checkpoint=None) -> PreWrapHook:
+def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> PreWrapHook:
     """Rebuild setup hooks from configuration, keeping all student freezes before KD.
 
     Called by the stock builders on every build, including after deserialization.
@@ -297,6 +296,7 @@ def modelopt_pre_wrap_hook(model_config, checkpoint=None) -> PreWrapHook:
             register(te_load_state_dict_hook())
 
     hooks.extend(model_config.pre_wrap_hooks)
-    if model_config.distillation is not None:
-        register(kd_convert_hook(model_config, options.te_mcore_model if options else False))
+    if distillation is not None:
+        te_mcore_model = options.te_mcore_model if options else False
+        register(kd_convert_hook(model_config, distillation, te_mcore_model))
     return compose_hooks(hooks)

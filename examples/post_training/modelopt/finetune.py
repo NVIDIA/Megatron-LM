@@ -12,21 +12,23 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import datasets
 import torch
 import transformers
+from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import get_context_parallel_group
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
-from megatron.post_training.model_config import modelopt_model_config_from_args
+from megatron.post_training.model_config import (
+    distillation_config_from_args,
+    modelopt_model_config_from_args,
+)
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
-from megatron.training.utils import print_rank_0
 from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
-from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
-from megatron.core.parallel_state import get_context_parallel_group
-
+from megatron.training.utils import print_rank_0
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -576,9 +578,9 @@ if __name__ == "__main__":
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
     )
-    full_config = pretrain_cfg_container_from_args(
-        args, modelopt_model_config_from_args(args, vocab_size_from_tokenizer=True)
-    )
+    model_cfg = modelopt_model_config_from_args(args, vocab_size_from_tokenizer=True)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    full_config.distillation = distillation_config_from_args(args, model_cfg)
     set_run_config(full_config)
     initialize_runtime_services(args, training=True)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)

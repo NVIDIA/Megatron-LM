@@ -14,7 +14,6 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-from megatron.training.models.distillation import DistillationConfig
 from megatron.training.models.transforms import ModelTransformConfig
 
 # Hooks and callbacks that each run attaches to the live config. Not to be serialized.
@@ -115,9 +114,6 @@ class ModelConfig:
     transformations: ModelTransformConfig | None = None
     """Declarative ModelOpt setup, reconstructed as hooks by GPT/Hybrid builders."""
 
-    distillation: DistillationConfig | None = None
-    """ModelOpt teacher, converted after setup and user pre-wrap hooks by GPT/Hybrid builders."""
-
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
     may be useful when extending Megatron-Core models, e.g. converting to/from HuggingFace.
@@ -140,8 +136,6 @@ class ModelConfig:
             target = self.transformations.qad_train_target
             if target not in (None, "mtp", "base", "both"):
                 raise ValueError(f"Unsupported qad_train_target: {target}")
-        if self.distillation is not None:
-            self.distillation.validate(self)
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.
@@ -264,16 +258,22 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
     def __init__(self, model_config: ModelConfig):
         self._model_config = model_config
 
-    def pre_wrap_hook(self, checkpoint=None) -> Callable:
-        """Resolve declarative setup for each build, without mutating runtime hook lists."""
+    def pre_wrap_hook(self, checkpoint=None, distillation=None) -> Callable:
+        """Resolve declarative setup for each build, without mutating runtime hook lists.
+
+        ``checkpoint`` and ``distillation`` are the run container's settings, if any.
+        """
         config = self._model_config
-        if config.transformations is not None or config.distillation is not None:
+        if config.transformations is not None or distillation is not None:
             from megatron.post_training.model_hooks import modelopt_pre_wrap_hook
 
             # Also covers callers that build without a run container.
             config.validate()
+            if distillation is not None:
+                distillation.validate()
+                distillation.validate_student(config)
 
-            return modelopt_pre_wrap_hook(config, checkpoint)
+            return modelopt_pre_wrap_hook(config, checkpoint, distillation)
         return compose_hooks(config.pre_wrap_hooks)
 
     @abc.abstractmethod

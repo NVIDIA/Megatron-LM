@@ -36,6 +36,7 @@ from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
 from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 from megatron.training.models.build import ModelBuildConfig
+from megatron.training.models.distillation import DistillationConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -69,9 +70,11 @@ class ConfigContainerBase:
             if key in kwargs and kwargs[key] != value:
                 raise ValueError(f"Build argument {key} conflicts with model_build configuration.")
             kwargs[key] = value
-        if "checkpoint" in kwargs:
-            raise ValueError("Set container.checkpoint instead of passing a checkpoint override.")
+        for key in ("checkpoint", "distillation"):
+            if key in kwargs:
+                raise ValueError(f"Set container.{key} instead of passing a {key} override.")
         kwargs["checkpoint"] = self.checkpoint
+        kwargs["distillation"] = getattr(self, "distillation", None)
         kwargs.setdefault("use_megatron_fsdp", self.dist.use_megatron_fsdp)
         kwargs.setdefault("use_torch_fsdp2", self.dist.use_torch_fsdp2)
         builder = self.model.get_builder_cls()(self.model)
@@ -84,10 +87,13 @@ class ConfigContainerBase:
         if model_build is not None and model_build.device is not None and dist is not None:
             if dist.use_torch_fsdp2 or dist.use_megatron_fsdp:
                 raise ValueError("Explicit device placement conflicts with FSDP-managed placement.")
-        model = getattr(self, "model", None)
-        train = getattr(self, "train", None)
-        if getattr(model, "distillation", None) is not None and train is not None:
-            if train.manual_gc:
+        distillation = getattr(self, "distillation", None)
+        if distillation is not None:
+            model = getattr(self, "model", None)
+            if model is not None:
+                distillation.validate_student(model)
+            train = getattr(self, "train", None)
+            if train is not None and train.manual_gc:
                 raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
         rng = getattr(self, "rng", None)
         if rng is not None:
@@ -311,6 +317,8 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""

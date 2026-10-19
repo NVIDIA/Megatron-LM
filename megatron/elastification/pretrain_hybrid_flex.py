@@ -66,7 +66,10 @@ from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_l
 try:
     from megatron.elastification.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.arguments import add_modelopt_args
-    from megatron.post_training.model_config import modelopt_model_config_from_args
+    from megatron.post_training.model_config import (
+        distillation_config_from_args,
+        modelopt_model_config_from_args,
+    )
     has_nvidia_modelopt = True
 except ImportError:
     print_rank_0("ModelOpt is not installed. Please install it using `pip install nvidia-modelopt`")
@@ -95,7 +98,8 @@ def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collecti
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     builder = model_config.get_builder_cls()(model_config)
     models = [builder.build_model(pg_collection, pre_process, post_process, vp_stage)]
-    models = builder.pre_wrap_hook(get_run_config().checkpoint)(models)
+    run_config = get_run_config()
+    models = builder.pre_wrap_hook(run_config.checkpoint, run_config.distillation)(models)
     return models[0]
 
 
@@ -587,6 +591,10 @@ if __name__ == "__main__":
     )
 
     full_config = pretrain_cfg_container_from_args(args)
+    if has_nvidia_modelopt and getattr(args, "export_kd_teacher_load", None):
+        full_config.distillation = distillation_config_from_args(
+            args, modelopt_model_config_from_args(args, model_type="hybrid")
+        )
     set_run_config(full_config)
     initialize_runtime_services(args, training=True)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)

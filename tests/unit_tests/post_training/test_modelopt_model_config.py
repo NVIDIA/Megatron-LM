@@ -43,21 +43,101 @@ def _make_args(extra_argv=(), **overrides):
 
 class TestDistillationConfigFromArgs:
     def test_none_without_teacher(self):
-        assert mc.distillation_config_from_args(_make_args()) is None
+        args = _make_args()
+        student = mc.modelopt_model_config_from_args(args)
+        assert mc.distillation_config_from_args(args, student) is None
 
-    def test_maps_kd_arguments(self):
+    def test_maps_kd_arguments_and_reads_loss_yaml(self, tmp_path):
+        teacher_yaml = tmp_path / "teacher.yaml"
+        teacher_yaml.write_text(yaml.safe_dump({"num_layers": 4}))
+        kd_yaml = tmp_path / "kd.yaml"
+        kd_yaml.write_text(
+            yaml.safe_dump(
+                {"logit_kl_temperature": 2.0, "intermediate_layer_pairs": [["a", "b", "mse"]]}
+            )
+        )
         args = _make_args(
-            export_kd_teacher_load="/ckpt/teacher",
-            export_kd_teacher_model_config="/cfg/teacher.yaml",
+            export_kd_teacher_load=str(tmp_path),
+            export_kd_teacher_model_config=str(teacher_yaml),
             export_kd_teacher_ckpt_format="torch_dist",
-            export_kd_cfg="/cfg/kd.yaml",
+            export_kd_cfg=str(kd_yaml),
         )
-        assert mc.distillation_config_from_args(args) == DistillationConfig(
-            teacher_load="/ckpt/teacher",
-            teacher_model_config="/cfg/teacher.yaml",
-            teacher_ckpt_format="torch_dist",
-            kd_cfg="/cfg/kd.yaml",
+        student = mc.modelopt_model_config_from_args(args)
+
+        distillation = mc.distillation_config_from_args(args, student)
+
+        assert distillation.teacher_load == str(tmp_path)
+        assert distillation.teacher_model_config == str(teacher_yaml)
+        assert distillation.teacher_ckpt_format == "torch_dist"
+        assert distillation.kd_cfg is None
+        assert distillation.logit_kl_temperature == 2.0
+        assert distillation.intermediate_layer_pairs == [("a", "b", "mse")]
+        assert distillation.teacher_model.transformer.num_layers == 4
+        assert distillation.teacher_model.transformations is None
+        assert student.transformer.num_layers == 2  # the student config is untouched
+
+    def test_rejects_unknown_loss_yaml_keys(self, tmp_path):
+        kd_yaml = tmp_path / "kd.yaml"
+        kd_yaml.write_text(yaml.safe_dump({"criterion": "x"}))
+        args = _make_args(export_kd_teacher_load=str(tmp_path), export_kd_cfg=str(kd_yaml))
+        with pytest.raises(ValueError, match="Unknown distillation settings"):
+            mc.distillation_config_from_args(args, mc.modelopt_model_config_from_args(args))
+
+
+class TestDistillationConfig:
+    def test_deprecated_kd_cfg_is_read_into_loss_fields(self, tmp_path):
+        kd_yaml = tmp_path / "kd.yaml"
+        kd_yaml.write_text(yaml.safe_dump({"skip_lm_loss": False, "kd_loss_scale": 0.5}))
+        with pytest.warns(DeprecationWarning, match="kd_cfg is deprecated"):
+            config = DistillationConfig(teacher_load="/t", kd_cfg=str(kd_yaml))
+        assert config.kd_cfg is None
+        assert (config.skip_lm_loss, config.kd_loss_scale) == (False, 0.5)
+
+    def test_deprecated_kd_cfg_conflicting_with_field_raises(self, tmp_path):
+        kd_yaml = tmp_path / "kd.yaml"
+        kd_yaml.write_text(yaml.safe_dump({"kd_loss_scale": 0.5}))
+        with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="kd_loss_scale"):
+            DistillationConfig(teacher_load="/t", kd_cfg=str(kd_yaml), kd_loss_scale=2.0)
+
+    def test_loss_kwargs_only_contains_non_defaults(self):
+        assert DistillationConfig(teacher_load="/t").loss_kwargs() == {}
+        config = DistillationConfig(
+            teacher_load="/t", logit_kl_topk=64, logit_layers=["out", "out"]
         )
+        assert config.logit_layers == ("out", "out")
+        assert config.loss_kwargs() == {"logit_kl_topk": 64, "logit_layers": ("out", "out")}
+
+    def test_loss_kwargs_are_accepted_by_modelopt(self):
+        import modelopt.torch.distill.plugins.megatron as mtd_mcore
+
+        config = DistillationConfig(
+            teacher_load="/t",
+            intermediate_layer_pairs=[("decoder.layers.0", "decoder.layers.0", "cosine")],
+            logit_kl_temperature=2.0,
+            logit_kl_topk=8,
+            skip_lm_loss=False,
+            kd_loss_scale=0.5,
+        )
+        modelopt_config = mtd_mcore.DistillationConfig(**config.loss_kwargs())
+        assert modelopt_config.logit_kl_topk == 8
+        assert modelopt_config.kd_loss_scale == 0.5
+
+    @pytest.mark.parametrize(
+        "overrides,match",
+        [
+            ({"logit_layers": ("a",)}, "logit_layers"),
+            ({"intermediate_layer_pairs": [("a",)]}, "intermediate_layer_pairs"),
+            ({"kd_loss_scale": 0.0}, "positive"),
+        ],
+    )
+    def test_validate_rejects_invalid_loss(self, overrides, match):
+        config = DistillationConfig(teacher_load="/t", teacher_model=Mock(), **overrides)
+        with pytest.raises(ValueError, match=match):
+            config.validate()
+
+    def test_validate_requires_resolved_teacher(self):
+        with pytest.raises(ValueError, match="resolved teacher_model"):
+            DistillationConfig(teacher_load="/t").validate()
 
 
 class TestModelOptModelConfigFromArgs:
@@ -165,11 +245,10 @@ class TestModelOptModelConfigFromArgs:
         # Use a serializable spec without requiring the optional hybrid spec backends.
         with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None):
             original = mc.modelopt_model_config_from_args(args)
+            distillation = mc.distillation_config_from_args(args, original)
         config = ModelConfig.from_dict(original.as_dict())
         assert config.pre_wrap_hooks == []
         assert config.transformations == original.transformations
-        assert config.distillation.teacher_model.transformer.num_layers == 2
-        assert config.distillation.teacher_model.transformations is None
         assert config.restore_modelopt_state is False
 
         def freeze(models):
@@ -179,9 +258,9 @@ class TestModelOptModelConfigFromArgs:
         config.pre_wrap_hooks.append(freeze)
         builder = builder_cls(config)
         for _ in range(2):
-            builder.pre_wrap_hook(Namespace(load="/ckpt/student", ckpt_format="torch_dist"))(
-                [Mock()]
-            )
+            builder.pre_wrap_hook(
+                Namespace(load="/ckpt/student", ckpt_format="torch_dist"), distillation
+            )([Mock()])
         expected = [
             "restore_modelopt_state_hook",
             "qad_freeze_hook",
@@ -197,7 +276,6 @@ class TestModelOptModelConfigFromArgs:
         config = mc.modelopt_model_config_from_args(_make_args())
         assert config.pre_wrap_hooks == []
         assert config.transformations.qad_train_target is None
-        assert config.distillation is None
         assert config.restore_modelopt_state is False
 
     def test_teacher_yaml_resolved_before_serialization(self, tmp_path):
@@ -207,11 +285,11 @@ class TestModelOptModelConfigFromArgs:
             export_kd_teacher_load=str(tmp_path), export_kd_teacher_model_config=str(teacher_yaml)
         )
         config = mc.modelopt_model_config_from_args(args)
+        distillation = mc.distillation_config_from_args(args, config)
         teacher_yaml.unlink()
-        restored = ModelConfig.from_dict(config.as_dict())
-        assert restored.distillation.teacher_model.transformer.num_layers == 4
+        assert distillation.teacher_model.transformer.num_layers == 4
         with patch.object(GPTModelBuilder, "build_model", return_value=Mock()) as build:
-            model_hooks._build_teacher(restored, Mock())
+            model_hooks._build_teacher(config, distillation, Mock())
         build.assert_called_once()
 
     @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -311,19 +389,23 @@ class TestBuildTeacher:
             transformer=TransformerConfig(num_layers=4, hidden_size=128, num_attention_heads=1),
             vocab_size=32000,
             transformer_layer_spec=student_spec,
-            distillation=DistillationConfig(teacher_load="/ckpt/teacher"),
             pre_wrap_hooks=[Mock()],
         )
         teacher_transformer = TransformerConfig(
             num_layers=2, hidden_size=128, num_attention_heads=1
         )
-        student.distillation.teacher_model = GPTModelConfig(
-            transformer=teacher_transformer, vocab_size=None, transformer_layer_spec=student_spec
+        distillation = DistillationConfig(
+            teacher_load="/ckpt/teacher",
+            teacher_model=GPTModelConfig(
+                transformer=teacher_transformer,
+                vocab_size=None,
+                transformer_layer_spec=student_spec,
+            ),
         )
         student_stage = Mock(pre_process=True, post_process=False, vp_stage=None)
 
         with patch.object(GPTModelBuilder, "build_model", autospec=True) as build_model:
-            teacher = model_hooks._build_teacher(student, student_stage)
+            teacher = model_hooks._build_teacher(student, distillation, student_stage)
 
         builder = build_model.call_args.args[0]
         assert teacher is build_model.return_value
@@ -331,7 +413,7 @@ class TestBuildTeacher:
         assert teacher_config.transformer is teacher_transformer
         assert teacher_config.transformer_layer_spec is student_spec
         assert teacher_config.vocab_size == 32000
-        assert teacher_config.distillation is None
+        assert teacher_config.transformations is None
         assert teacher_config.pre_wrap_hooks == []
         assert build_model.call_args.args[1] is student_stage.pg_collection
         assert build_model.call_args.kwargs == {
@@ -341,7 +423,7 @@ class TestBuildTeacher:
         }
         # The student config itself is untouched.
         assert student.transformer.num_layers == 4
-        assert student.distillation is not None
+        assert len(student.pre_wrap_hooks) == 1
 
 
 class TestOnModelInitDevice:
@@ -377,17 +459,18 @@ class TestKdConvertHook:
         )
         for name, value in transformer_overrides.items():
             setattr(transformer, name, value)
-        return GPTModelConfig(
-            transformer=transformer,
-            vocab_size=32000,
-            distillation=DistillationConfig(teacher_load="/ckpt/teacher"),
+        return GPTModelConfig(transformer=transformer, vocab_size=32000)
+
+    @staticmethod
+    def _distillation(teacher_transformer):
+        return DistillationConfig(
+            teacher_load="/ckpt/teacher",
+            teacher_model=GPTModelConfig(transformer=teacher_transformer, vocab_size=32000),
         )
 
     def _run(self, student_config, teacher_transformer, models):
-        student_config.distillation.teacher_model = GPTModelConfig(
-            transformer=teacher_transformer, vocab_size=32000
-        )
-        hook = model_hooks.kd_convert_hook(student_config, te_mcore_model=False)
+        distillation = self._distillation(teacher_transformer)
+        hook = model_hooks.kd_convert_hook(student_config, distillation, te_mcore_model=False)
         return hook(models)
 
     @pytest.mark.parametrize(
@@ -403,9 +486,8 @@ class TestKdConvertHook:
         )
         setattr(teacher, attr, 2)
         student = self._student_config()
-        student.distillation.teacher_model = GPTModelConfig(transformer=teacher, vocab_size=32000)
         with pytest.raises(ValueError, match=f"same {attr}"):
-            student.distillation.validate(student)
+            self._distillation(teacher).validate_student(student)
 
     def test_rejects_multiple_model_chunks(self):
         with pytest.raises(ValueError, match="virtual pipeline"):
@@ -443,13 +525,12 @@ class TestKdConvertHookDoesNotLoadTeacherWeights:
                 expert_model_parallel_size=1,
                 pipeline_dtype=None,
             ),
-            distillation=DistillationConfig(teacher_load="/ckpt/teacher"),
         )
-        teacher_transformer = student_config.transformer
-        student_config.distillation.teacher_model = GPTModelConfig(
-            transformer=teacher_transformer, vocab_size=32000
+        distillation = DistillationConfig(
+            teacher_load="/ckpt/teacher",
+            teacher_model=GPTModelConfig(transformer=student_config.transformer, vocab_size=32000),
         )
-        hook = model_hooks.kd_convert_hook(student_config, te_mcore_model=False)
+        hook = model_hooks.kd_convert_hook(student_config, distillation, te_mcore_model=False)
         student_stage = Mock()
 
         with (

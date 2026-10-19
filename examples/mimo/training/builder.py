@@ -140,10 +140,13 @@ class MimoModelBuilder(ModelBuilder[MimoModel, MimoBuildConfig]):
         use_layer_wise_param_layout: bool = True,
         device: torch.device | str | None = None,
         checkpoint: Any | None = None,
+        distillation: Any | None = None,
     ) -> list[MimoModel]:
         """Seed, build, prepare, and configure the active rank-local MIMO model."""
         if device is not None:
             raise NotImplementedError("Explicit device placement is not supported for MIMO.")
+        if distillation is not None:
+            raise NotImplementedError("ModelOpt distillation is not supported for MIMO.")
         del checkpoint
         if use_megatron_fsdp or use_torch_fsdp2:
             raise NotImplementedError("MIMO training with FSDP/FSDP2 has not been tested yet.")

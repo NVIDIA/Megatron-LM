@@ -3143,10 +3143,9 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
 
-        model_config = getattr(cfg_container, "model", None)
         load_kd_teacher_checkpoint(
             model,
-            getattr(model_config, "distillation", None),
+            getattr(cfg_container, "distillation", None),
             student_checkpoint=getattr(cfg_container, "checkpoint", None),
         )
 

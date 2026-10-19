@@ -149,7 +149,7 @@ def get_model_for_inference() -> MegatronModule:
     args = get_args()
     cfg = get_run_config()
     if cfg.model is not None and (
-        cfg.model.transformations is not None or cfg.model.distillation is not None
+        cfg.model.transformations is not None
     ):
         model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
     elif HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args):

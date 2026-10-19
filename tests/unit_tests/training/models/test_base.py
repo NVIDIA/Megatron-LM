@@ -9,7 +9,6 @@ import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
-from megatron.training.models.distillation import DistillationConfig
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +91,6 @@ class TestModelConfigDefaults:
     def test_base_field_defaults(self):
         cfg = DummyModelConfig()
         assert cfg.restore_modelopt_state is False
-        assert cfg.distillation is None
         assert cfg.extra_checkpoint_metadata is None
         assert cfg.pre_wrap_hooks == []
         assert cfg.post_wrap_hooks == []
@@ -277,34 +275,6 @@ class TestModelConfigFromDict:
         assert cfg.sub.y == "nested"
         # Encoded callable fields resolve back to the original function.
         assert cfg.fn_field is _dummy_callable
-
-
-# =============================================================================
-# Section 5 — TestModelConfigDistillation
-# =============================================================================
-
-
-class TestModelConfigDistillation:
-    """The declarative DistillationConfig is serialized with the model config."""
-
-    def test_distillation_round_trips(self):
-        distillation = DistillationConfig(
-            teacher_load="/ckpt/teacher",
-            teacher_model_config="/cfg/teacher.yaml",
-            teacher_ckpt_format="torch_dist",
-            kd_cfg="/cfg/kd.yaml",
-        )
-        original = DummyModelConfig(distillation=distillation)
-
-        result = original.as_dict()
-        assert result["distillation"]["teacher_load"] == "/ckpt/teacher"
-
-        restored = ModelConfig.from_dict(result)
-        assert restored.distillation == distillation
-
-    def test_distillation_none_round_trips(self):
-        restored = ModelConfig.from_dict(DummyModelConfig().as_dict())
-        assert restored.distillation is None
 
 
 # =============================================================================

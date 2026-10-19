@@ -26,7 +26,7 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.training import print_rank_0
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.models.distillation import DistillationConfig
+from megatron.training.models.distillation import DistillationConfig, load_distillation_loss_yaml
 from megatron.training.models.gpt import GPTModelConfig
 from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.models.transforms import ModelTransformConfig
@@ -35,20 +35,42 @@ from megatron.training.utils import is_hybrid_model
 logger = logging.getLogger(__name__)
 
 
-def distillation_config_from_args(args: Namespace) -> DistillationConfig | None:
-    """Build the ``DistillationConfig`` from ``--export-kd-*``, or ``None`` if KD is not enabled.
+def distillation_config_from_args(
+    args: Namespace, student_model_config: GPTModelConfig | HybridModelConfig
+) -> DistillationConfig | None:
+    """Build the run's ``DistillationConfig`` from ``--export-kd-*``, or ``None`` without KD.
 
-    Incompatible settings are rejected by ``DistillationConfig.validate`` and the run container.
+    The teacher architecture is resolved here from the student's model config and the teacher
+    YAML, and the ``--export-kd-cfg`` YAML is read into the loss fields, so the result is
+    self-contained. Incompatible settings are rejected by the run container's validation.
+
+    Args:
+        args: The parsed arguments, including those from ``add_modelopt_args``.
+        student_model_config: The student config, from ``modelopt_model_config_from_args``.
     """
     if not getattr(args, "export_kd_teacher_load", None):
         return None
 
-    return DistillationConfig(
+    loss = load_distillation_loss_yaml(args.export_kd_cfg) if args.export_kd_cfg else {}
+    distillation = DistillationConfig(
         teacher_load=args.export_kd_teacher_load,
         teacher_model_config=args.export_kd_teacher_model_config,
         teacher_ckpt_format=args.export_kd_teacher_ckpt_format,
-        kd_cfg=args.export_kd_cfg,
+        **loss,
     )
+    teacher_args = _load_teacher_model_config(distillation, args)
+    overrides = {}
+    if isinstance(student_model_config, HybridModelConfig):
+        overrides["hybrid_layer_pattern"] = teacher_args.hybrid_layer_pattern
+    distillation.teacher_model = dataclasses.replace(
+        student_model_config,
+        transformer=core_transformer_config_from_args(teacher_args),
+        transformations=None,
+        pre_wrap_hooks=[],
+        post_wrap_hooks=[],
+        **overrides,
+    )
+    return distillation
 
 
 def _load_teacher_model_config(distillation: DistillationConfig, args: Namespace) -> Namespace:
@@ -281,8 +303,6 @@ def modelopt_model_config_from_args(
             moe_grouped_gemm=not disable_moe_grouped_gemm,
         )
 
-    model_config.distillation = distillation_config_from_args(args)
-
     qad_train_target = getattr(args, 'qad_train_target', None)
     if args.freeze_base_for_mtp:
         if qad_train_target not in (None, 'mtp'):
@@ -296,21 +316,6 @@ def modelopt_model_config_from_args(
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
         te_mcore_model=args.export_te_mcore_model,
     )
-    if model_config.distillation is not None:
-        teacher_args = _load_teacher_model_config(model_config.distillation, args)
-        overrides = {}
-        if isinstance(model_config, HybridModelConfig):
-            overrides["hybrid_layer_pattern"] = teacher_args.hybrid_layer_pattern
-        model_config.distillation.teacher_model = dataclasses.replace(
-            model_config,
-            transformer=core_transformer_config_from_args(teacher_args),
-            transformations=None,
-            distillation=None,
-            pre_wrap_hooks=[],
-            post_wrap_hooks=[],
-            **overrides,
-        )
-
     return model_config
 
 

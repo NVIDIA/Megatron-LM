@@ -70,6 +70,7 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     model = mc.modelopt_model_config_from_args(args)
     if training:
         cfg = pretrain_cfg_container_from_args(args, model)
+        cfg.distillation = mc.distillation_config_from_args(args, model)
     else:
         cfg = mc.modelopt_inference_config_from_args(args, device="cpu")
     path = tmp_path / "run.yaml"
@@ -85,11 +86,17 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     else:
         assert restored.model_build == cfg.model_build
     assert not hasattr(restored.model.transformations, "load")
-    if kd:
+    if training and kd:
+        assert restored.distillation.teacher_load == str(tmp_path)
         assert (
-            restored.model.distillation.teacher_model.get_builder_cls()
+            restored.distillation.teacher_model.get_builder_cls()
             is restored.model.get_builder_cls()
         )
+        assert restored.distillation.loss_kwargs() == cfg.distillation.loss_kwargs()
+    elif training:
+        assert restored.distillation is None
+    else:
+        assert "distillation" not in cfg.to_dict()  # inference never distills
     # Changing the only student checkpoint reference must affect transformation restoration.
     restored.checkpoint.load = "/replacement"
     with patch.object(
@@ -130,7 +137,10 @@ def test_rejects_placement_conflict_before_build(field):
     "field,value", [("tp_comm_overlap", True), ("cross_entropy_fusion_impl", "te")]
 )
 def test_direct_config_validates_kd_incompatibilities(tmp_path, field, value):
-    cfg = mc.modelopt_inference_config_from_args(_make_args(export_kd_teacher_load=str(tmp_path)))
+    args = _make_args(export_kd_teacher_load=str(tmp_path))
+    model = mc.modelopt_model_config_from_args(args)
+    cfg = pretrain_cfg_container_from_args(args, model)
+    cfg.distillation = mc.distillation_config_from_args(args, model)
     setattr(cfg.model.transformer, field, value)
     with pytest.raises(ValueError, match="incompatible"):
         cfg.validate()
@@ -138,10 +148,24 @@ def test_direct_config_validates_kd_incompatibilities(tmp_path, field, value):
 
 def test_direct_training_config_rejects_manual_gc(tmp_path):
     args = _make_args(export_kd_teacher_load=str(tmp_path))
-    cfg = pretrain_cfg_container_from_args(args, mc.modelopt_model_config_from_args(args))
+    model = mc.modelopt_model_config_from_args(args)
+    cfg = pretrain_cfg_container_from_args(args, model)
+    cfg.distillation = mc.distillation_config_from_args(args, model)
     cfg.train.manual_gc = True
     with pytest.raises(ValueError, match="manual_gc"):
         cfg.validate()
+
+
+def test_build_models_passes_run_distillation_to_builder(tmp_path):
+    args = _make_args(export_kd_teacher_load=str(tmp_path))
+    model = mc.modelopt_model_config_from_args(args)
+    cfg = pretrain_cfg_container_from_args(args, model)
+    cfg.distillation = mc.distillation_config_from_args(args, model)
+    with patch.object(GPTModelBuilder, "build_distributed_models") as build:
+        cfg.build_models(Mock())
+    assert build.call_args.kwargs["distillation"] is cfg.distillation
+    with pytest.raises(ValueError, match="container.distillation"):
+        cfg.build_models(Mock(), distillation=None)
 
 
 def test_build_policy_conflict_is_rejected():

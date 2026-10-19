@@ -74,7 +74,10 @@ from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_l
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
-    from megatron.post_training.model_config import modelopt_model_config_from_args
+    from megatron.post_training.model_config import (
+        distillation_config_from_args,
+        modelopt_model_config_from_args,
+    )
     from megatron.post_training.utils import is_distillation_model, should_use_modelopt_config
 
     has_nvidia_modelopt = True
@@ -570,6 +573,8 @@ if __name__ == "__main__":
     else:
         model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    if use_modelopt_config:
+        full_config.distillation = distillation_config_from_args(args, model_cfg)
     set_run_config(full_config)
     initialize_runtime_services(args, training=True)
     resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)

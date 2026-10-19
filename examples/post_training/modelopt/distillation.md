@@ -31,7 +31,7 @@ are converted in `megatron/post_training/model_config.py`.
 
 ### Distillation config format
 
-Configuring the distillation run is done via a separate YAML file with the following fields:
+Configuring the distillation loss is done via a separate YAML file, passed with `--export-kd-cfg`, with the following fields:
 
 ```yaml
 logit_layers: ["output_layer", "output_layer"]
@@ -50,6 +50,10 @@ logit_kl_temperature: 1.0
 * `logit_kl_temperature` is the temperature smoothing factor to multiply the logits by prior to softmax and loss.
 
 Without this configuration file, the default logits-only distillation with scale and temperatures of 1.0 will be performed.
+
+The YAML is read once, when the CLI is translated, into the fields of the same names on the run's
+`DistillationConfig` (`PretrainConfigContainer.distillation`). A run config built directly can set those
+fields itself; `DistillationConfig.kd_cfg` (a path to this YAML) is deprecated.
 
 ### Training
 
@@ -97,24 +101,28 @@ without a teacher model. This means the total time per iteration may be up to 40
 
 ### Configuration-based construction
 
-`modelopt_model_config_from_args` resolves the teacher architecture into
-`DistillationConfig.teacher_model` at CLI translation time. The resolved teacher,
-checkpoint path/format, ModelOpt setup options, and independent MTP specification
-are serialized with the stock GPT/Hybrid model config. Rebuilding a deserialized
-config reconstructs setup hooks automatically; it does not need to reread the
-teacher architecture YAML or retain the original argparse namespace.
+Distillation is a run-level setting: `PretrainConfigContainer.distillation`, next to the
+student's `checkpoint`, rather than part of the student's model config.
+`distillation_config_from_args(args, model_config)` resolves the teacher architecture into
+`DistillationConfig.teacher_model` and reads the loss settings, at CLI translation time.
+The teacher, its checkpoint path/format, and the loss are serialized with the run config;
+the ModelOpt setup options and independent MTP specification are serialized with the stock
+GPT/Hybrid model config. Rebuilding a deserialized config reconstructs setup hooks
+automatically; it does not need to reread the teacher architecture YAML or retain the
+original argparse namespace.
 
 Setup runs in this order: restore ModelOpt state, apply QAD freezing and LSQ
 setup, register checkpoint key remapping, run user pre-wrap hooks (including
-training freezes), then convert for KD. Teacher weights are loaded after wrapping
-by `load_kd_teacher_checkpoint(models, model_config.distillation)`. A runner using
-the builders directly must invoke that checkpoint-loading step as well.
+training freezes), then convert for KD. `cfg.build_models()` passes the run's
+`distillation` to the builder; a runner using the builders directly passes it to
+`build_distributed_models(..., distillation=...)`. Teacher weights are loaded after wrapping
+by `load_kd_teacher_checkpoint(models, cfg.distillation)`, which such a runner must also call.
 
 The run container owns the stock model config, student checkpoint, and
 `ModelBuildConfig` execution policy. `model.transformations` contains only
 `ModelTransformConfig` options (QAD, LSQ, TE key mapping); it does not duplicate
-checkpoint locations. The teacher's own checkpoint reference stays in
-`DistillationConfig`.
+checkpoint locations. The teacher's own checkpoint reference is in
+`DistillationConfig`. Inference containers have no distillation section.
 
 Post-training CLI entry points use `modelopt_inference_config_from_args(args)`
 once, before runtime initialization. After tokenizer setup,
