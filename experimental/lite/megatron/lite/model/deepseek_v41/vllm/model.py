@@ -48,11 +48,18 @@ class Block(DS41Block):
 class DeepseekV41Model(NativeModel):
     deployment_providers = {
         'attention': 'native BI SWA + ratio2 compressor/indexer + sparse FlashMLA; ratio2 parity pending',
-        'engram': 'Lite frozen-host native FP8 owner; Core projections provisional',
+        'engram': 'Lite frozen-host owner; native BI MXFP8 WKV and Triton post-WKV; parity pending',
         'moe': 'R1 nonfused MegaMoE + Core native groups/owners/collectives',
         'mhc': 'native BI caller-stream pre + materialized post; parity unverified',
         'head': 'native BI BF16 GEMM + Core cross entropy; parity unverified',
     }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .engram import forward
+
+        for module in self.engrams.values():
+            module.forward = forward.__get__(module, type(module))
 
     def _build_attention(self, config, index):
         return build_attention(config, index, self.context)
