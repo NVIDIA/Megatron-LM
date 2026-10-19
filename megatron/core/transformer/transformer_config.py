@@ -4030,7 +4030,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"FlashAttention kernel (got {self.flash_attention_version})."
             )
             if self.is_hybrid_model:
-                from megatron.core.ssm.ops.common.determinism import use_deterministic_mode
+                from megatron.core.ops.ssm.common.determinism import use_deterministic_mode
 
                 # Checked rather than set: the autotune config lists are fixed at
                 # import, so setting the flag here would change nothing.

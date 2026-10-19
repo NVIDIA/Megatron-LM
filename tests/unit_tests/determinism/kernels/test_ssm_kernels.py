@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Bit-exact replay of the in-repo SSM Triton kernels (``megatron/core/ssm/ops/``) and the
+"""Bit-exact replay of the in-repo SSM Triton kernels (``megatron/core/ops/ssm/``) and the
 gated-delta-net code paths.
 
 The Mamba training mixer is covered by ``correctness/test_ssm_conv1d.py``; this module drives
@@ -21,8 +21,8 @@ Each kernel is replayed in that mode, including with Triton's autotune cache ena
 import pytest
 import torch
 
-from megatron.core.ssm import mamba_mixer as mamba_mixer_module
-from megatron.core.ssm.ops.common import determinism as ssm_determinism
+from megatron.core.ops.ssm.common import determinism as ssm_determinism
+from megatron.core.ops.ssm.mamba2 import mixer as mamba_mixer_module
 from megatron.core.tuning import autotune_configs, choice_log
 from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
@@ -89,7 +89,7 @@ def _assert_pinned(*tuners):
 
 
 def test_mamba_chunk_scan_combined_varlen_replays():
-    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ops.ssm.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     seeded()
     seqlen, nheads, headdim, ngroups, dstate, chunk = 4096, 32, 64, 1, 128, 256
@@ -139,7 +139,7 @@ def test_mamba_chunk_scan_combined_varlen_replays():
 
 
 def test_selective_state_update_replays():
-    from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+    from megatron.core.ops.ssm.mamba2.mamba_ssm import selective_state_update
 
     seeded()
     batch, nheads, headdim, dstate, ngroups = 256, 32, 64, 128, 1
@@ -178,7 +178,7 @@ def test_selective_state_update_replays():
 
 
 def test_causal_conv1d_update_replays():
-    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+    from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
 
     seeded()
     batch, dim, width = 256, 4096, 4
@@ -205,7 +205,7 @@ def test_causal_conv1d_update_spec_decode_replays():
     writes the snapshot from the shifted registers rather than re-reading HBM --
     the single-token test above covers the ``state_len > width`` branch.
     """
-    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+    from megatron.core.ops.ssm.common.causal_conv1d_triton import causal_conv1d_update
 
     seeded()
     batch, seq_len, dim, width = 256, 4, 4096, 4
@@ -244,7 +244,7 @@ def test_causal_conv1d_update_spec_decode_replays():
 
 @pytest.mark.parametrize("cache_autotuning", [False, True], ids=["no_cache", "autotune_cache"])
 def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
-    from megatron.core.ssm.ops.common import causal_conv1d_varlen
+    from megatron.core.ops.ssm.common import causal_conv1d_varlen
 
     monkeypatch.setenv("TRITON_CACHE_AUTOTUNING", "1" if cache_autotuning else "0")
     assert ssm_determinism.autotune_configs is autotune_configs
@@ -288,7 +288,7 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
 
 
 def _gdp_case():
-    from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
+    from megatron.core.ops.ssm.gdp.chunk import chunk_gated_delta_product_varlen
 
     seeded()
     T, H, K, V, M = 4096, 16, 128, 128, 2
@@ -320,7 +320,7 @@ def _gdp_case():
 
 def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
     """Runtime pinning covers the GDP autotuners, which training imports before determinism."""
-    from megatron.core.ssm.ops.gdp import chunk_h, chunk_o
+    from megatron.core.ops.ssm.gdp import chunk_h, chunk_o
 
     tuners = (
         _autotuner(chunk_h.chunk_gated_delta_product_fwd_kernel_h_blockdim64),
@@ -350,7 +350,7 @@ def test_chunk_gated_delta_product_varlen_replays():
 
 @pytest.mark.parametrize("gate_in_kernel", [False, True])
 def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
-    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+    from megatron.core.ops.ssm.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
     B, H, K, V = 128, 16, 128, 128
@@ -401,7 +401,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
     roll the recurrence back to an accepted prefix. The snapshot buffer is an
     output here, so its contents are compared across replays like any other.
     """
-    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+    from megatron.core.ops.ssm.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
     B, S, M, H, K, V = 64, 4, 2, 8, 128, 128
@@ -450,7 +450,7 @@ def test_fused_recurrent_gated_delta_rule_update_padding_replays():
     The kernel zeroes padding rows in its output store, so they must come out as ``+0.0``
     bytes on every replay while real rows and the slot-indexed state cache replay exactly.
     """
-    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+    from megatron.core.ops.ssm.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
     B, H, K, V = 128, 16, 128, 128
@@ -495,7 +495,7 @@ def test_fused_recurrent_gated_delta_rule_update_padding_replays():
 @pytest.mark.parametrize("S", [1, 4])
 def test_gdp_decode_prepare_replays(S):
     """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
-    from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
+    from megatron.core.ops.ssm.gdp.decode_prepare import gdp_decode_prepare
 
     seeded()
     n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
@@ -515,8 +515,8 @@ def test_gdp_decode_prepare_replays(S):
 
 
 def test_gdp_l2norm_and_cumsum_replay():
-    from megatron.core.ssm.ops.gdp.common import l2norm_fwd
-    from megatron.core.ssm.ops.gdp.cumsum import chunk_local_cumsum
+    from megatron.core.ops.ssm.gdp.common import l2norm_fwd
+    from megatron.core.ops.ssm.gdp.cumsum import chunk_local_cumsum
 
     seeded()
     x = torch.randn(65536, 128, device="cuda", dtype=torch.bfloat16)
@@ -541,7 +541,7 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
     """Preserve FLA's output/gradient contract while removing autotune-dependent rounding."""
     from fla.modules.l2norm import l2norm
 
-    from megatron.core.ssm.gated_delta_net.common import torch_l2norm
+    from megatron.core.ops.ssm.gated_delta.common import torch_l2norm
 
     seeded()
     x = torch.randn(2, 256, head_dim, device="cuda", dtype=dtype)
@@ -571,7 +571,7 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
 
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
     """The path ``--deterministic-mode`` selects for GDN (FLA is not deterministic)."""
-    from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
+    from megatron.core.ops.ssm.gated_delta.gdn import torch_chunk_gated_delta_rule
 
     seeded()
     B, T, H, K = 2, 2048, 16, 128
