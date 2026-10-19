@@ -387,7 +387,8 @@ state-dict differences:
   HybridModel pattern.
 
 Custom layer classes placed in a `HybridStack` must accept
-`layer(hidden_states, LayerInputs)` and return the updated hidden-state tensor.
+`layer(hidden_states, LayerInputs)` and return `(hidden_states, bias)`. Complete
+residual layers return their updated hidden states with `bias=None`.
 A `MegatronModule` can keep an ordinary explicit-argument `forward` and opt into
 shared input binding:
 
@@ -399,7 +400,8 @@ class CustomLayer(MegatronModule):
     @layer_inputs_forward
     def forward(self, hidden_states, attention_mask=None, inference_context=None):
         # Implement the layer using the named arguments as usual.
-        return hidden_states + self.compute(hidden_states, attention_mask, inference_context)
+        update = self.compute(hidden_states, attention_mask, inference_context)
+        return hidden_states + update, None
 ```
 
 The decorator prepares the field mapping once, using the forward signature.
@@ -418,14 +420,22 @@ Subclasses inherit the binding when they inherit `forward`; an overridden
 `forward` should declare its own binding. Native `forward(x, inputs)` methods
 continue to work without a decorator.
 
-Compute cores return `Addends`, while complete residual layers return a tensor.
-A legacy core returning `(output, bias)` declares
-`@layer_inputs_forward(output=as_addends)`. A legacy skeleton returning
-`(hidden_states, context)` declares `output=lambda result: result[0]`. The shared
-utility does not infer the meaning of a tuple or perform residual arithmetic.
-`MoESubmodules.pre_norm` is available for core input normalization and defaults to
-`IdentityOp`; the MoE binding applies it only for shared calls and requests
-separate routed and shared addends.
+All shared calls use `LayerOutput = tuple[Tensor, Tensor | None]`. The second
+value is exclusively deferred output-projection bias, which callers can fuse
+with dropout and the residual addition. Compute cores already returning
+`(output, bias)` need no output conversion. MoE combines routed and shared expert
+contributions internally and returns `(output, None)`; auxiliary losses,
+attention context, and recurrent state never occupy the bias slot.
+
+Legacy complete layers returning `(hidden_states, context)` declare
+`output=lambda result: (result[0], None)`, while tensor-returning layers declare
+`output=lambda result: (result, None)`. The HybridStack adapter also handles its
+legacy mHC multistream result; the model's legacy decoder call retains that
+extra stream for MTP. The shared utility does not infer tuple semantics or
+perform residual arithmetic.
+
+`MoESubmodules.pre_norm` is available for core input normalization and defaults
+to `IdentityOp`; the MoE binding applies it only for shared calls.
 
 `MegatronModule` binds shared inputs before module hooks and CUDA-graph selection.
 Hooks see the ordinary forward arguments and legacy result; output conversion

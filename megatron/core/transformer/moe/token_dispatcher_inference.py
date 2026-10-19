@@ -682,7 +682,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         )
         return output.to(torch.bfloat16)
 
-    def combine_postprocess(self, hidden_states, *, return_shared_expert_output=False):
+    def combine_postprocess(self, hidden_states):
         """Restore original input shape (e.g. [S/TP, B, H] from [S*B/TP, H]).
 
         If shared_expert_overlap is enabled AND _external_shared_expert_launch
@@ -694,10 +694,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         so we only restore the shape here.
         """
         output = hidden_states.view(self.hidden_shape)
-        shared_expert_output = self._shared_expert_output
-        if shared_expert_output is not None:
+        if self._shared_expert_output is not None:
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
-            if not return_shared_expert_output:
-                output = output + shared_expert_output
+            output = output + self._shared_expert_output
             self._shared_expert_output = None
-        return (output, shared_expert_output) if return_shared_expert_output else output
+        return output

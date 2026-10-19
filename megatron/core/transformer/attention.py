@@ -34,11 +34,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import (
-    LayerInterface,
-    as_addends,
-    layer_inputs_forward,
-)
+from megatron.core.transformer.layer_interface import LayerInterface, layer_inputs_forward
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
@@ -1709,7 +1705,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, LayerInterface, ABC):
 
         return output, bias
 
-    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"}, output=as_addends)
+    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"})
     @copy_signature(forward_pre_attn_and_core_attn)
     def forward(self, *args, **kwargs):
         """Run core attention followed by the output projection."""

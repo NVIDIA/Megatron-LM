@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Common compute inputs and additive outputs for hybrid layer cores.
+"""Common invocation inputs and output/bias pairs for hybrid layers.
 
 Legacy forwards remain supported during migration. The private adapter dispatches
 only on the input container, never on the kind of layer or core.
@@ -52,29 +52,26 @@ class LayerInputs:
     mhc_recompute_manager: Any = None
 
 
-Addends = tuple[Tensor, ...]
-
-
-@experimental_api
-def as_addends(output: tuple[Tensor, Tensor | None]) -> Addends:
-    """Preserve output/bias order without performing any arithmetic."""
-    value, bias = output
-    return (value,) if bias is None else (value, bias)
+LayerOutput = tuple[Tensor, Tensor | None]
 
 
 @experimental_api
 @runtime_checkable
 class LayerInterface(Protocol):
-    """A core consumes hidden-width input and returns additive tensor updates.
+    """A layer returns hidden states and an optional deferred output-projection bias.
 
-    Cores can implement ``forward(x, inputs) -> Addends`` directly, or decorate
-    an explicit-argument ``forward`` with ``layer_inputs_forward``. The shared
-    module entry point binds the fields before execution. Cores own their norms
-    and compute; residual updates and output dropout belong to the caller.
+    Compute cores leave output bias separate for dropout/residual fusion. Complete
+    residual layers return their updated hidden states with ``bias=None``. Shared
+    expert contributions are combined inside MoE; auxiliary losses, attention
+    context, and recurrent state are never carried in the bias slot.
+
+    Implement ``forward(x, inputs) -> LayerOutput`` directly, or decorate an
+    explicit-argument forward with ``layer_inputs_forward``. Legacy output
+    formats are adapted only for shared calls.
     """
 
-    def forward(self, x: Tensor, inputs: LayerInputs) -> Addends:
-        """Run compute without the residual connection or output dropout."""
+    def forward(self, x: Tensor, inputs: LayerInputs) -> LayerOutput:
+        """Return exactly ``(hidden_states, bias)`` without applying deferred bias."""
         ...
 
 
@@ -94,7 +91,6 @@ def layer_inputs_forward(
     omit_none=(),
     exclude=(),
     include_if=None,
-    extra_kwargs=None,
     input_transform=None,
     reject=None,
 ):
@@ -107,8 +103,8 @@ def layer_inputs_forward(
     ``aliases`` maps forward parameter names to input field names, including
     explicitly forwarded kwargs. ``exclude`` skips unused parameters, while
     ``omit_none`` preserves legacy graph argument sets. ``include_if`` maps
-    parameter names to predicates on the module. ``extra_kwargs`` and
-    ``input_transform(module, hidden_states)`` express shared-call-only behavior.
+    parameter names to predicates on the module.
+    ``input_transform(module, hidden_states)`` expresses shared-call-only normalization.
     ``reject`` is an exception for all shared calls, or a field-to-exception map
     rejecting non-None values. ``output`` converts legacy results explicitly.
 
@@ -125,7 +121,6 @@ def layer_inputs_forward(
             omit_none=omit_none,
             exclude=exclude,
             include_if=include_if,
-            extra_kwargs=extra_kwargs,
             input_transform=input_transform,
             reject=reject,
         )
@@ -140,7 +135,6 @@ def layer_inputs_forward(
     field_names = {field.name for field in fields(LayerInputs)}
     aliases = dict(aliases or {})
     include_if = dict(include_if or {})
-    extra_kwargs = dict(extra_kwargs or {})
     omit_none, exclude = frozenset(omit_none), frozenset(exclude)
     named = {
         parameter.name: parameter
@@ -166,14 +160,10 @@ def layer_inputs_forward(
         raise ValueError("LayerInputs policies must name bound forward parameters")
     if not exclude <= named.keys():
         raise ValueError("LayerInputs exclusions must name forward parameters")
-    if set(extra_kwargs) & (mapping.keys() | {hidden_parameter.name, "inputs"}):
-        raise ValueError("Extra kwargs cannot overwrite LayerInputs arguments")
-    if not has_kwargs and not extra_kwargs.keys() <= named.keys():
-        raise ValueError("Extra kwargs must name forward parameters")
     for name, parameter in named.items():
         if name in mapping and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
             raise TypeError("LayerInputs fields must be keyword-capable parameters")
-        if parameter.default is inspect.Parameter.empty and name not in mapping | extra_kwargs:
+        if parameter.default is inspect.Parameter.empty and name not in mapping:
             raise ValueError(f"Required parameter {name} has no LayerInputs binding")
     if isinstance(reject, dict):
         if not reject.keys() <= field_names:
@@ -206,7 +196,7 @@ def layer_inputs_forward(
         for source, error in reject or ():
             if getattr(inputs, source) is not None:
                 raise type(error)(*error.args)
-        bound = dict(extra_kwargs)
+        bound = {}
         for name, source, skip_none, predicate in binding:
             value = getattr(inputs, source)
             if (skip_none and value is None) or (predicate is not None and not predicate(module)):

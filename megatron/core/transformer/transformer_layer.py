@@ -658,14 +658,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         output_with_bias, offload_manager, forced_released_tensors: Optional[list[Tensor]] = None
     ):
         """Commit a fine-grained offload group for a raw branch output tuple."""
-        if isinstance(output_with_bias, tuple):
-            output = offload_manager.group_offload(
-                output_with_bias[0], forced_released_tensors=forced_released_tensors
-            )
-            return (output, *output_with_bias[1:])
-        return offload_manager.group_offload(
-            output_with_bias, forced_released_tensors=forced_released_tensors
+        output, bias = output_with_bias
+        output = offload_manager.group_offload(
+            output, forced_released_tensors=forced_released_tensors
         )
+        return output, bias
 
     def _forward_self_attention_output_with_bias(
         self,
@@ -1119,7 +1116,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return hidden_states, context
 
     @layer_inputs_forward(
-        output=lambda result: result[0],
+        output=lambda result: (result[0], None),
         exclude=("rotary_pos_cos_sin",),
         omit_none=(
             "context",

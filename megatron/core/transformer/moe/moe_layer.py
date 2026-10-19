@@ -664,13 +664,7 @@ class MoELayer(BaseMoELayer, LayerInterface):
         output = self.token_dispatcher.token_combine(output)
         return output
 
-    def postprocess(
-        self,
-        output: torch.Tensor,
-        shared_expert_output: Optional[torch.Tensor],
-        *,
-        _return_addends: bool = False,
-    ):
+    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed.
 
@@ -678,29 +672,12 @@ class MoELayer(BaseMoELayer, LayerInterface):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        if _return_addends:
-            output, overlapped_shared = self.token_dispatcher.combine_postprocess(
-                output, return_shared_expert_output=True
-            )
-            if overlapped_shared is not None:
-                shared_expert_output = overlapped_shared
-        else:
-            output = self.token_dispatcher.combine_postprocess(output)
+        output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
 
-        if _return_addends:
-            if (
-                shared_expert_output is None
-                and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
-                and self._latent_shared_expert_output is not None
-            ):
-                torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
-                shared_expert_output = self._latent_shared_expert_output
-                self._latent_shared_expert_output = None
-            return (output,) if shared_expert_output is None else (output, shared_expert_output)
         if shared_expert_output is not None:
             output = output + shared_expert_output
         elif (
@@ -721,9 +698,7 @@ class MoELayer(BaseMoELayer, LayerInterface):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    @layer_inputs_forward(
-        input_transform=lambda module, x: module.pre_norm(x), extra_kwargs={"_return_addends": True}
-    )
+    @layer_inputs_forward(input_transform=lambda module, x: module.pre_norm(x))
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -731,8 +706,6 @@ class MoELayer(BaseMoELayer, LayerInterface):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        *,
-        _return_addends: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -752,11 +725,6 @@ class MoELayer(BaseMoELayer, LayerInterface):
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
-        if _return_addends and intermediate_tensors is not None:
-            raise ValueError(
-                "intermediate_tensors cannot be combined with _return_addends; "
-                "use a complete MoE forward"
-            )
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
@@ -805,8 +773,6 @@ class MoELayer(BaseMoELayer, LayerInterface):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                if _return_addends:
-                    return self.postprocess(output, shared_expert_output, _return_addends=True)
                 output = self.postprocess(output, shared_expert_output)
 
                 if intermediate_tensors is not None:

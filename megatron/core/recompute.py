@@ -118,7 +118,7 @@ def checkpointed_forward(
                             and layer.config.linear_cp_mode == "chunkwise"
                             else None
                         )
-                        hidden_states = layer(
+                        hidden_states, bias = layer(
                             hidden_states,
                             LayerInputs(
                                 attention_mask=attention_mask,
@@ -129,6 +129,7 @@ def checkpointed_forward(
                                 cp_metadata=layer_cp_metadata,
                             ),
                         )
+                        assert bias is None, "Recompute requires complete residual layers"
                     else:
                         # GPT cross-attention may update context; keep its existing API.
                         hidden_states, context = layer(

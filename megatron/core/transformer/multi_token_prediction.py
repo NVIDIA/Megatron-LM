@@ -1775,7 +1775,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
             with transformer_layer_quantization_context:
-                hidden_states = self.mtp_model_layer(
+                hidden_states, bias = self.mtp_model_layer(
                     hidden_states,
                     LayerInputs(
                         attention_mask=attention_mask,
@@ -1793,6 +1793,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                         cp_layout_plan=cp_layout_plan,
                     ),
                 )
+
+                assert bias is None, "MTP requires complete residual layers"
 
         if not self.mhc_enabled:
             hidden_states = self._postprocess(hidden_states)

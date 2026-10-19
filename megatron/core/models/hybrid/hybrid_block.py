@@ -535,7 +535,10 @@ class HybridStack(MegatronModule):
         if manager is not None and is_block_end:
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
-    @layer_inputs_forward
+    # The legacy decoder can additionally return the mHC stream for MTP.
+    @layer_inputs_forward(
+        output=lambda result: (result[0] if isinstance(result, tuple) else result, None)
+    )
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -765,7 +768,8 @@ class HybridStack(MegatronModule):
                                 residual_stream_recompute_context=residual_stream_recompute_context,
                                 mhc_recompute_manager=mhc_manager,
                             )
-                            hidden_states = layer(hidden_states, layer_inputs)
+                            hidden_states, bias = layer(hidden_states, layer_inputs)
+                            assert bias is None, "HybridStack requires complete residual layers"
 
                         observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if cp_layout_state is not None:

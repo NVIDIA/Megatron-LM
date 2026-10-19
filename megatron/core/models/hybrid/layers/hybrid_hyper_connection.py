@@ -123,7 +123,7 @@ class HyperConnectionHybridLayer(MegatronModule):
 
     @layer_inputs_forward(
         aliases={"packed_sequence_cp_metadata": "cp_metadata"},
-        output=lambda result: result[0],
+        output=lambda result: (result[0], None),
         reject={
             "residual_stream_recompute_context": TypeError(
                 "HyperConnectionHybridLayer does not support residual_stream recomputation; "
@@ -162,7 +162,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         )
 
         if fast_path_result is None:
-            layer_output = self.inner_layer(
+            layer_output, bias = self.inner_layer(
                 aggregated,
                 LayerInputs(
                     attention_mask=attention_mask,
@@ -175,6 +175,7 @@ class HyperConnectionHybridLayer(MegatronModule):
                     input_ids=input_ids,
                 ),
             )
+            assert bias is None, "mHC requires a complete residual layer"
             context = None
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)

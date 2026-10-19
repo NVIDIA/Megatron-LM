@@ -1688,7 +1688,8 @@ class _CudaGraphRunner(torch.nn.Module):
         # Run the forward pass as normal in eager mode.
         out = self.func(*args, **kwargs)
 
-        if type(out) != tuple:
+        output_is_tuple = type(out) == tuple
+        if not output_is_tuple:
             out = (out,)
 
         # Register a noop autograd node that toggles `self.graph_status` in the bwd pass, which
@@ -1735,9 +1736,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
             self.fwd_graph_recorded = True
 
-        if len(out) == 1:
-            return out[0]
-        return tuple(out)
+        return out if output_is_tuple else out[0]
 
     def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
@@ -1764,8 +1763,12 @@ class _CudaGraphRunner(torch.nn.Module):
         out = self._make_pipeline_output_viewless(out)
 
         out_iter = iter(self.to_list(out))
-        fwd_outputs = self.to_list(self.fwd_graph_outputs)
-        return tuple(next(out_iter) if torch.is_tensor(o) else o for o in fwd_outputs)
+        # Restore the captured return structure before the layer-output adapter runs.
+        # In particular, a tensor-returning legacy layer must not become a singleton tuple.
+        return tree_map(
+            lambda value: next(out_iter) if torch.is_tensor(value) else value,
+            self.fwd_graph_outputs,
+        )
 
     def get_mismatch_errors(self, args, kwargs):
         """Return list of detailed errors for mismatched cudagraph args."""

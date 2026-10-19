@@ -1,10 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Bitwise forward/backward checks of real core and skeleton entry points.
-
-MoE compares sum(addends) with the legacy core output, preserving routed + shared
-addition order. Residual association, (x + routed) + shared versus x + (routed +
-shared), is deliberately outside this core-level comparison and can differ in bf16.
-"""
+"""Bitwise forward/backward checks of legacy and canonical output/bias entry points."""
 
 import copy
 from dataclasses import replace
@@ -88,11 +83,12 @@ def make_stack(symbol, *, stack_spec=hybrid_stack_spec, **config_kwargs):
     )
 
 
-def sum_addends(addends):
-    result = addends[0]
-    for addend in addends[1:]:
-        result = result + addend
-    return result
+def apply_output_bias(output):
+    assert isinstance(output, tuple) and len(output) == 2
+    hidden_states, bias = output
+    assert isinstance(hidden_states, torch.Tensor)
+    assert bias is None or isinstance(bias, torch.Tensor)
+    return hidden_states if bias is None else hidden_states + bias
 
 
 def assert_forward_backward(module, x, legacy_call, inputs_call):
@@ -163,7 +159,7 @@ class TestLayerInputsEquivalence:
         ],
     )
     @pytest.mark.parametrize("pre_norm", [False, True])
-    def test_moe_addends_and_pre_norm(self, dispatcher, overlap, pre_norm):
+    def test_moe_output_pair_and_pre_norm(self, dispatcher, overlap, pre_norm):
         if dispatcher == "flex":
             if not HAVE_DEEP_EP:
                 pytest.skip("DeepEP not installed")
@@ -191,9 +187,9 @@ class TestLayerInputsEquivalence:
         x = torch.randn(64, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
         def adapted(value):
-            addends = core(value, LayerInputs())
-            assert len(addends) == 2  # routed and shared stay separate
-            return sum_addends(addends)
+            output, bias = core(value, LayerInputs())
+            assert bias is None
+            return output
 
         assert_forward_backward(core, x, lambda value: core(core.pre_norm(value))[0], adapted)
 
@@ -212,7 +208,8 @@ class TestLayerInputsEquivalence:
         def run(value, shared):
             context = ResidualStreamRecomputeContext(CheckpointWithoutOutputManager(), True)
             if shared:
-                output = layer(value, LayerInputs(residual_stream_recompute_context=context))
+                output, bias = layer(value, LayerInputs(residual_stream_recompute_context=context))
+                assert bias is None
             else:
                 output = layer(
                     value, attention_mask=None, residual_stream_recompute_context=context
@@ -243,7 +240,8 @@ class TestLayerInputsEquivalence:
             manager = CheckpointWithoutOutputManager()
             manager.is_last_layer_in_recompute_block = True
             if shared:
-                output = layer(value, LayerInputs(mhc_recompute_manager=manager))
+                output, bias = layer(value, LayerInputs(mhc_recompute_manager=manager))
+                assert bias is None
             else:
                 output = layer(value, attention_mask=None, mhc_recompute_manager=manager)[0]
             manager.discard_all_outputs_and_register_unified_recompute(output)
@@ -267,12 +265,13 @@ class TestLayerInputsEquivalence:
                         context.enable_decode_mode()
                     sequence_offset = torch.full((2,), offset, device="cuda", dtype=torch.int32)
                     if shared:
-                        output = layer(
+                        output, bias = layer(
                             x,
                             LayerInputs(
                                 inference_context=context, sequence_len_offset=sequence_offset
                             ),
                         )
+                        assert bias is None
                     else:
                         kwargs = {"sequence_len_offset": sequence_offset} if symbol == "*" else {}
                         output = layer(x, attention_mask=None, inference_context=context, **kwargs)
@@ -319,7 +318,9 @@ def check_equivalence(symbol, test_core, *, stack_spec=hybrid_stack_spec, **conf
 
     def adapted(value):
         output = module(value, LayerInputs(attention_mask=mask))
-        return sum_addends(output) if test_core else output
+        if not test_core:
+            assert output[1] is None
+        return apply_output_bias(output)
 
     assert_forward_backward(module, x, legacy, adapted)
 
@@ -355,18 +356,23 @@ class TestLayerInputsCudaGraphs:
             param.main_grad = torch.zeros_like(param)
         x = torch.randn(32, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         expected = eager(x, attention_mask=None)
+        expected_value = expected.detach().clone()
         expected.float().sum().backward()
         expected_grad = x.grad.detach().clone()
-        expected = expected.detach().clone()
         x.grad = None
         recorded = graphed(x, attention_mask=None)
+        assert_bit_exact(expected_value, {}, recorded, {})
         recorded.float().sum().backward()
         create_cudagraphs()
         for _ in range(2):
             x.grad = None
             replayed = graphed(x, attention_mask=None)
+            # Backward replay can reuse forward graph buffers; snapshot the value first.
+            replayed_value = replayed.detach().clone()
             replayed.float().sum().backward()
-            assert_bit_exact(expected, {"input": expected_grad}, replayed, {"input": x.grad})
+            assert_bit_exact(
+                expected_value, {"input": expected_grad}, replayed_value, {"input": x.grad}
+            )
         assert all(layer.cudagraph_manager.cudagraph_runners for layer in graphed.layers)
 
 
@@ -426,8 +432,8 @@ class TestLayerInputsNVLS:
                 legacy, bias = core(x)
                 assert bias is None
                 legacy = legacy.detach().clone()
-                addends = core(x, LayerInputs(inference_context=context))
-                assert len(addends) == 2
-                assert_bit_exact(legacy, {}, sum_addends(addends), {})
+                output, bias = core(x, LayerInputs(inference_context=context))
+                assert bias is None
+                assert_bit_exact(legacy, {}, output, {})
                 assert core.token_dispatcher is core._inference_token_dispatcher
                 assert core.token_dispatcher._shared_expert_output is None

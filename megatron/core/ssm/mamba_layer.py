@@ -248,6 +248,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         return None
 
     @layer_inputs_forward(
+        output=lambda result: (result, None),
         aliases={"packed_sequence_cp_metadata": "cp_metadata"},
         exclude=("rotary_pos_emb",),  # Unused by this skeleton, including its CUDA graphs.
         omit_none=("packed_sequence_cp_metadata", "residual_stream_recompute_context"),

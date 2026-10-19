@@ -25,6 +25,11 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.cuda_graphs import (
+    _CudagraphReplayNode,
+    _CudaGraphRunner,
+    _GraphStatus,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -35,7 +40,6 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
     LayerInputs,
     LayerInterface,
-    as_addends,
     layer_inputs_forward,
 )
 from megatron.core.transformer.mlp import MLP
@@ -61,21 +65,18 @@ def bare(cls):
     return module
 
 
-def add_updates(updates):
-    result = updates[0]
-    for update in updates[1:]:
-        result = result + update
-    return result
+def apply_output_bias(output):
+    assert isinstance(output, tuple) and len(output) == 2
+    hidden_states, bias = output
+    assert isinstance(hidden_states, torch.Tensor)
+    assert bias is None or isinstance(bias, torch.Tensor)
+    return hidden_states if bias is None else hidden_states + bias
 
 
-def test_frozen_inputs_and_bias_identity():
+def test_frozen_inputs_and_interface():
     inputs = LayerInputs()
     with pytest.raises(FrozenInstanceError):
         inputs.input_ids = torch.ones(1)
-    x, bias = (torch.randn(2, 4), torch.randn(4))
-    assert len(as_addends((x, None))) == 1
-    assert as_addends((x, bias))[0] is x
-    assert as_addends((x, bias))[1] is bias
     assert not isinstance(object(), LayerInterface)
     for cls in (
         SelfAttention,
@@ -95,7 +96,7 @@ def assert_equivalent(module, legacy, inputs=LayerInputs()):
     x = torch.randn(3, 2, 4, requires_grad=True)
     y = x.detach().clone().requires_grad_(True)
     old = legacy(module, x)
-    new = add_updates(other(y, inputs))
+    new = apply_output_bias(other(y, inputs))
     assert_bit_exact(new, {}, old, {})
     old.square().sum().backward()
     new.square().sum().backward()
@@ -117,7 +118,7 @@ def test_mlp_forward_backward_with_and_without_bias():
         module.activation_func = nn.functional.gelu
         module.linear_fc1 = DeferredBiasLinear(4, 8, bias=bias)
         module.linear_fc2 = DeferredBiasLinear(8, 4, bias=bias)
-        assert_equivalent(module, lambda m, x: add_updates(as_addends(m(x))))
+        assert_equivalent(module, lambda m, x: apply_output_bias(m(x)))
 
 
 def test_attention_adapter_threads_every_execution_input():
@@ -193,14 +194,14 @@ def test_new_core_implements_interface_without_legacy_adapter_or_layer_wrapper()
             self.proj = nn.Linear(4, 4)
 
         def forward(self, x, inputs: LayerInputs):
-            return (self.proj(x),)
+            return self.proj(x), None
 
     core = Core()
     assert isinstance(core, LayerInterface)
     assert not hasattr(core, 'forward_layer')
     x = torch.randn(3, 2, 4, requires_grad=True)
     inputs = LayerInputs(input_ids=torch.ones(2, 3, dtype=torch.long))
-    result = add_updates(core(x, inputs))
+    result = apply_output_bias(core(x, inputs))
     assert_bit_exact(core(x=x, inputs=inputs)[0], {}, result, {})
     expected = nn.functional.linear(x, core.proj.weight, core.proj.bias)
     assert_bit_exact(result, {}, expected, {})
@@ -219,8 +220,8 @@ def test_gdp_training_forward_backward_and_packed_metadata():
         inputs = LayerInputs(packed_seq_params=packed, cp_metadata=metadata)
         assert_equivalent(
             core,
-            lambda m, x: add_updates(
-                as_addends(m(x, packed_seq_params=packed, packed_sequence_cp_metadata=metadata))
+            lambda m, x: apply_output_bias(
+                m(x, packed_seq_params=packed, packed_sequence_cp_metadata=metadata)
             ),
             inputs,
         )
@@ -230,9 +231,8 @@ def test_gdp_training_forward_backward_and_packed_metadata():
         kwargs = core._gdp_chunk_forward.call_args.kwargs
         assert kwargs['packed_seq_params'] is packed
         assert kwargs['packed_sequence_cp_metadata'] is metadata
-        assert len(updates) == (2 if bias else 1)
-        if bias:
-            assert updates[1] is core.out_proj.bias
+        assert len(updates) == 2
+        assert updates[1] is (core.out_proj.bias if bias else None)
 
 
 def test_gdp_preserves_static_and_dynamic_inference_dispatch():
@@ -263,9 +263,8 @@ def test_gdp_preserves_static_and_dynamic_inference_dispatch():
                 legacy = core(x, inference_context=context)
                 updates = core(x, LayerInputs(inference_context=context))
             assert updates[0] is legacy[0]
-            assert len(updates) == (1 if bias is None else 2)
-            if bias is not None:
-                assert updates[1] is bias
+            assert len(updates) == 2
+            assert updates[1] is bias
             if dynamic:
                 core.ssm_dynamic_inference.assert_called_with(x, context)
                 core._static_decode.assert_not_called()
@@ -296,7 +295,7 @@ def test_skeleton_adapters_preserve_recompute_and_mhc_state():
         module._call_with_bound_args = Mock(
             return_value=(x, None) if cls is TransformerLayer else x
         )
-        assert module(x, inputs) is x
+        assert module(x, inputs) == (x, None)
         kwargs = module._call_with_bound_args.call_args.kwargs
         assert kwargs['residual_stream_recompute_context'] is replay
         if cls is MambaLayer:
@@ -306,7 +305,7 @@ def test_skeleton_adapters_preserve_recompute_and_mhc_state():
     wrapper = bare(HyperConnectionHybridLayer)
     wrapper.inner_layer = SimpleNamespace()
     wrapper._call_with_bound_args = Mock(return_value=(x, None))
-    assert wrapper(x, LayerInputs(mhc_recompute_manager=manager)) is x
+    assert wrapper(x, LayerInputs(mhc_recompute_manager=manager)) == (x, None)
     assert wrapper._call_with_bound_args.call_args.kwargs['mhc_recompute_manager'] is manager
     with pytest.raises(TypeError, match='mhc'):
         wrapper(x, inputs)
@@ -317,7 +316,7 @@ def test_graph_adapter_passes_tensors_to_legacy_graph_manager():
     module.config = SimpleNamespace(cuda_graph_impl='local')
     x = torch.randn(2, 4)
     module.cudagraph_manager = Mock(return_value=(x, None))
-    assert module(x, LayerInputs()) is x
+    assert module(x, LayerInputs()) == (x, None)
     args = module.cudagraph_manager.call_args.args
     assert args[1] == ()
     assert args[2]['hidden_states'] is x
@@ -326,7 +325,7 @@ def test_graph_adapter_passes_tensors_to_legacy_graph_manager():
 
 def test_shortcut_atomic_call_accepts_any_layer_with_shared_inputs():
     x = torch.randn(2, 4)
-    layer = Mock(return_value=x)
+    layer = Mock(return_value=(x, None))
     unit = SimpleNamespace(compute_layer=layer)
     assert (
         ShortcutMoEBlock._forward_compute_atomic(
@@ -364,7 +363,7 @@ def test_recompute_calls_shared_inputs_and_replays_gradients(config_cls, method)
 
         def forward(self, x, inputs):
             self.inputs.append(inputs)
-            return x.sin()
+            return x.sin(), None
 
     layer = Layer()
     stack = SimpleNamespace(
@@ -417,7 +416,7 @@ def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
 
         def forward(self, hidden_states, inputs):
             self.assert_inputs = isinstance(inputs, LayerInputs)
-            return hidden_states.sin()
+            return hidden_states.sin(), None
 
     for method in (None, 'uniform', 'block'):
         config = TransformerConfig(
@@ -462,7 +461,7 @@ def test_mtp_depth_invokes_the_shared_call_shape():
 
     def depth(hidden_states, inputs):
         seen.append(inputs)
-        return hidden_states.sin()
+        return hidden_states.sin(), None
 
     layer = SimpleNamespace(
         config=SimpleNamespace(sequence_parallel=False, fp8=False, fp4=False),
@@ -486,7 +485,7 @@ def test_mtp_stack_adapter_preserves_layout_inputs():
     x = torch.randn(2, 4)
     stack._call_with_bound_args = Mock(return_value=x)
     inputs = LayerInputs(packed_seq_params_by_layout=object(), cp_layout_plan=object())
-    assert stack(x, inputs) is x
+    assert stack(x, inputs) == (x, None)
     assert stack._call_with_bound_args.call_args.kwargs['cp_layout_plan'] is inputs.cp_layout_plan
     assert (
         stack._call_with_bound_args.call_args.kwargs['packed_seq_params_by_layout']
@@ -494,7 +493,7 @@ def test_mtp_stack_adapter_preserves_layout_inputs():
     )
 
 
-def test_moe_forward_backward_shared_addends_and_pre_norm():
+def test_moe_forward_backward_combined_output_and_pre_norm():
     for shared in (False, True):
         for recompute in (False, True):
             for latent in (False, True):
@@ -517,11 +516,7 @@ def test_moe_forward_backward_shared_addends_and_pre_norm():
                 module.dispatch = lambda x, probs: (x, probs)
                 module.routed_experts_compute = lambda x, probs: (x.sin(), None)
                 module.combine = lambda x: x
-                module.token_dispatcher = SimpleNamespace(
-                    combine_postprocess=lambda x, return_shared_expert_output=False: (
-                        (x, None) if return_shared_expert_output else x
-                    )
-                )
+                module.token_dispatcher = SimpleNamespace(combine_postprocess=lambda x: x)
                 if latent:
                     module.fc2_latent_proj = DeferredBiasLinear(4, 4, bias=False)
                 with patch(
@@ -535,30 +530,24 @@ def test_moe_forward_backward_shared_addends_and_pre_norm():
                 module.pre_norm = nn.LayerNorm(4)
                 x = torch.randn(3, 2, 4)
                 expected = module(module.pre_norm(x))[0]
-                assert_bit_exact(add_updates(module(x, LayerInputs())), {}, expected, {})
+                assert_bit_exact(apply_output_bias(module(x, LayerInputs())), {}, expected, {})
 
 
-def test_flex_dispatcher_defers_overlap_add_without_changing_execution():
-    for deferred in (False, True):
-        x = torch.randn(3, 4, requires_grad=True)
-        shared = torch.randn(3, 4, requires_grad=True)
-        expert = SimpleNamespace(
-            linear_fc2_forward=Mock(),
-            post_forward_comm=Mock(),
-            get_output=Mock(return_value=shared),
-        )
-        dispatcher = SimpleNamespace(shared_experts=expert, hidden_shape=(3, 1, 4))
-        result = MoEFlexTokenDispatcher.combine_postprocess(
-            dispatcher, x.clone(), return_shared_expert_output=deferred
-        )
-        result = add_updates(result) if deferred else result
-        assert_bit_exact(result, {}, (x + shared).view(3, 1, 4), {})
-        result.sum().backward()
-        assert_bit_exact(x.grad, {}, torch.ones_like(x), {})
-        assert_bit_exact(shared.grad, {}, torch.ones_like(shared), {})
-        expert.linear_fc2_forward.assert_called_once()
-        expert.post_forward_comm.assert_called_once()
-        expert.get_output.assert_called_once()
+def test_flex_dispatcher_combines_shared_output_and_preserves_gradients():
+    x = torch.randn(3, 4, requires_grad=True)
+    shared = torch.randn(3, 4, requires_grad=True)
+    expert = SimpleNamespace(
+        linear_fc2_forward=Mock(), post_forward_comm=Mock(), get_output=Mock(return_value=shared)
+    )
+    dispatcher = SimpleNamespace(shared_experts=expert, hidden_shape=(3, 1, 4))
+    result = MoEFlexTokenDispatcher.combine_postprocess(dispatcher, x.clone())
+    assert_bit_exact(result, {}, (x + shared).view(3, 1, 4), {})
+    result.sum().backward()
+    assert_bit_exact(x.grad, {}, torch.ones_like(x), {})
+    assert_bit_exact(shared.grad, {}, torch.ones_like(shared), {})
+    expert.linear_fc2_forward.assert_called_once()
+    expert.post_forward_comm.assert_called_once()
+    expert.get_output.assert_called_once()
 
 
 @pytest.mark.parametrize("hash_routing", [False, True])
@@ -573,7 +562,7 @@ def test_input_ids_only_reach_hash_layers(hash_routing, wrapper):
     if wrapper:
         module._call_inner_transformer_layer_without_local_bda = Mock(return_value=None)
     ids = torch.ones(1, 2, dtype=torch.long)
-    assert_bit_exact(module(x, LayerInputs(input_ids=ids)), {}, x, {})
+    assert_bit_exact(apply_output_bias(module(x, LayerInputs(input_ids=ids))), {}, x, {})
     assert inner._call_with_bound_args.call_args.kwargs.get("input_ids") is (
         ids if hash_routing else None
     )
@@ -595,7 +584,7 @@ def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(shared
     class NativeLayer(nn.Module):
         def forward(self, x, inputs):
             self.inputs = inputs
-            return x + x.sin()
+            return x + x.sin(), None
 
     inner = NativeLayer()
     x = torch.randn(3, 2, 4, requires_grad=True)
@@ -611,7 +600,8 @@ def test_mhc_fallback_accepts_native_layer_inputs_and_preserves_gradients(shared
         input_ids=object(),
     )
     if shared_call:
-        output = wrapper(x, inputs)
+        output, bias = wrapper(x, inputs)
+        assert bias is None
     else:
         output, context = wrapper(
             x,
@@ -665,16 +655,10 @@ def test_mamba_mixer_rejects_chunkwise_metadata():
         bare(MambaMixer)(torch.randn(2, 4), LayerInputs(cp_metadata=object()))
 
 
-def test_moe_rejects_intermediate_tensors_with_addends_before_dispatch():
-    module = bare(MoELayer)
-    with pytest.raises(ValueError, match="intermediate_tensors"):
-        module.forward(torch.randn(2, 4), intermediate_tensors=(), _return_addends=True)
-
-
 class ExplicitSignatureLayer(MegatronModule):
     """Exercise binding without implementing any LayerInputs-specific method."""
 
-    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"}, output=as_addends)
+    @layer_inputs_forward(aliases={"packed_sequence_cp_metadata": "cp_metadata"})
     def forward(
         self, hidden_states, attention_mask=None, *, packed_sequence_cp_metadata=None, **kwargs
     ):
@@ -715,7 +699,7 @@ def test_signature_binding_preserves_hooks_gradients_and_legacy_calls(call_style
             result = module.forward(x, inputs)
         else:
             result = module(**{call_style: x, "inputs": inputs})
-    assert len(result) == 1
+    assert len(result) == 2 and result[1] is None
     assert module.seen == (mask, metadata, {})
     expected = x.sin() if call_style == "forward" else (x * 2).sin() * 3
     assert_bit_exact(result[0], {}, expected, {})
@@ -765,14 +749,14 @@ def test_adapter_validates_declarations_and_requires_a_forwarding_schema():
         layer_inputs_forward(lambda self, x, required: x)
     with pytest.raises(ValueError, match="policies"):
         layer_inputs_forward(lambda self, x: x, omit_none=("attention_mask",))
-    with pytest.raises(ValueError, match="overwrite"):
-        layer_inputs_forward(lambda self, x: x, extra_kwargs={"x": None})
+    with pytest.raises(ValueError, match="alias"):
+        layer_inputs_forward(lambda self, x, **kwargs: x, aliases={"x": "attention_mask"})
 
 
 @pytest.mark.parametrize("mode", ["eager", "local", "te_capture", "te_replay"])
 def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode):
     class Layer(GraphableMegatronModule):
-        @layer_inputs_forward(output=as_addends)
+        @layer_inputs_forward
         def forward(self, hidden_states, attention_mask=None):
             return hidden_states.sin(), None
 
@@ -799,7 +783,9 @@ def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode):
     module.register_forward_hook(lambda mod, args, result: seen.append(result))
     for _ in range(2):
         result = module(x, LayerInputs(attention_mask=mask))
-        assert len(result) == 1  # Conversion wraps both eager execution and graph output.
+        assert (
+            len(result) == 2 and result[1] is None
+        )  # Both eager and graph output obey the pair contract.
         assert_bit_exact(result[0], {}, x.sin(), {})
         assert seen[-1][1] is None
     assert len(seen) == 2
@@ -834,12 +820,12 @@ def test_inherited_adapter_and_override_keep_distinct_signatures():
         @layer_inputs_forward
         def forward(self, hidden_states, input_ids=None):
             self.ids = input_ids
-            return hidden_states
+            return hidden_states, None
 
     x, ids = torch.ones(2, 4), object()
-    assert len(bare(Inherited)(x, LayerInputs(input_ids=ids))) == 1
+    assert len(bare(Inherited)(x, LayerInputs(input_ids=ids))) == 2
     module = bare(Override)
-    assert module(x, LayerInputs(input_ids=ids)) is x
+    assert module(x, LayerInputs(input_ids=ids)) == (x, None)
     assert module.ids is ids
 
 
@@ -901,13 +887,13 @@ def test_mhc_per_call_setup_runs_before_graph_dispatch():
 
     module.cudagraph_manager = Mock(side_effect=graph)
     assert module(hidden_states=x, mhc_recompute_manager=manager) == (x, None)
-    assert module(x, LayerInputs()) is x
+    assert module(x, LayerInputs()) == (x, None)
     assert seen == [manager, None]
 
 
 def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
     class Layer(GraphableMegatronModule):
-        @layer_inputs_forward(output=as_addends)
+        @layer_inputs_forward
         def forward(self, hidden_states, attention_mask=None):
             self.forward_count += 1
             return hidden_states.sin(), None
@@ -930,7 +916,7 @@ def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
     for microbatch in (0, 1):
         module.current_microbatch = microbatch
         result = module(x, inputs)
-        assert len(result) == 1
+        assert len(result) == 2 and result[1] is None
         assert_bit_exact(result[0], {}, x.sin(), {})
         assert graph.call_args.args == (x,)
         assert graph.call_args.kwargs == {
@@ -939,3 +925,103 @@ def test_te_capture_and_replay_use_legacy_tensors_and_manual_hooks():
         }
     assert module.forward_count == 1
     assert hook.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "cls", [TransformerLayer, MambaLayer, HybridStack, HyperConnectionHybridLayer]
+)
+def test_complete_layer_output_never_exposes_context_as_bias(cls):
+    module = bare(cls)
+    x, context = torch.randn(2, 4), object()
+    legacy_output = x if cls in (MambaLayer, HybridStack) else (x, context)
+    module._call_with_bound_args = Mock(return_value=legacy_output)
+    result = module(x, LayerInputs())
+    assert isinstance(result, tuple) and len(result) == 2
+    assert result[0] is x and result[1] is None
+    assert module(x) is legacy_output
+
+
+@pytest.mark.parametrize(
+    "cls",
+    [
+        MLP,
+        MoELayer,
+        SelfAttention,
+        MLASelfAttention,
+        AbsorbedMLASelfAttention,
+        DSv4HybridSelfAttention,
+        MambaMixer,
+        GatedDeltaNet,
+        GatedDeltaNet2,
+        GatedDeltaProductMixer,
+    ],
+)
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_core_output_preserves_pair_and_bias_identity(cls, with_bias):
+    module = bare(cls)
+    if cls is MoELayer:
+        module.pre_norm = IdentityOp()
+    x = torch.randn(2, 4)
+    bias = torch.randn(4) if with_bias else None
+    legacy_output = (x, bias)
+    module._call_with_bound_args = Mock(return_value=legacy_output)
+    assert module(x, LayerInputs()) is legacy_output
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_offload_preserves_deferred_bias(with_bias):
+    x = torch.randn(2, 4, requires_grad=True)
+    bias = torch.randn(4, requires_grad=True) if with_bias else None
+    manager = SimpleNamespace(group_offload=Mock(side_effect=lambda value, **kw: value.clone()))
+    output = TransformerLayer._group_offload_output_with_bias((x, bias), manager, [x])
+    assert output[1] is bias
+    manager.group_offload.assert_called_once_with(x, forced_released_tensors=[x])
+    apply_output_bias(output).sum().backward()
+    assert torch.equal(x.grad, torch.ones_like(x))
+    if with_bias:
+        assert torch.equal(bias.grad, torch.full_like(bias, 2))
+
+
+def test_stack_mhc_stream_is_not_a_shared_output_bias():
+    module = bare(HybridStack)
+    x, stream = torch.randn(2, 4), torch.randn(2, 16)
+    legacy_output = (x, stream)
+    module._call_with_bound_args = Mock(return_value=legacy_output)
+    result = module(x, LayerInputs())
+    assert result[0] is x and result[1] is None
+    assert module(x) is legacy_output
+
+
+@pytest.mark.parametrize("output_kind", ["tensor", "singleton", "bias", "none"])
+def test_local_graph_record_and_replay_preserve_return_structure(output_kind):
+    x = torch.randn(2, 4)
+    bias = torch.randn(4)
+    legacy_output = {"tensor": x, "singleton": (x,), "bias": (x, bias), "none": (x, None)}[
+        output_kind
+    ]
+    runner = object.__new__(_CudaGraphRunner)
+    runner.func = lambda: legacy_output
+    runner.status = _GraphStatus.FWD_READY
+    runner.fwd_graph_recorded = True
+    runner._make_pipeline_output_viewless = lambda output: output
+    recorded = runner.record_graph_capture((), {})
+
+    runner.fwd_graph_outputs = legacy_output
+    runner._gtp_fwd_params_to_ensure_ready = ()
+    runner.grad_enabled = False
+    runner.get_mismatch_errors = lambda args, kwargs: []
+    runner.get_tensors = lambda *args, **kwargs: ()
+    tensors = (x, bias) if output_kind == "bias" else (x,)
+    with patch.object(_CudagraphReplayNode, "apply", return_value=tensors):
+        replayed = runner.replay_graph_capture(False, (), {})
+
+    assert type(recorded) is type(replayed) is type(legacy_output)
+    if output_kind == "tensor":
+        assert_bit_exact(recorded, {}, replayed, {})
+    else:
+        assert len(recorded) == len(replayed) == len(legacy_output)
+        for actual, expected in zip(recorded, replayed):
+            if expected is None:
+                assert actual is None
+            else:
+                assert_bit_exact(actual, {}, expected, {})
