@@ -66,10 +66,10 @@ class ImplConfig:
     router_aux_loss_coef: float | None = None
     deterministic: bool = False  # also selects the ordered (bitwise-reproducible) msa_v1 backward
     optimizer_config: OptimizerConfig | None = None
-    # Magi CP dispatch chunk (tokens; batch padded to chunk*cp), FP32 dK group-reduce, and the kernel
-    # backend of the dense layers' native calc_attn. ``fa4`` is the production path; ``sdpa_ol`` is
-    # retained for tests only and materialises [H, S, S] logits in backward; ``fa4_varlen`` (cp=1) calls
-    # flash_attn.cute varlen directly.
+    # Magi CP dispatch chunk (tokens; cp>1 pads the batch to chunk*cp, cp=1 never pads), FP32 dK
+    # group-reduce, and the kernel backend of the dense layers' native calc_attn. ``fa4`` is the
+    # production path; ``sdpa_ol`` is retained for tests only and materialises [H, S, S] logits in
+    # backward; ``fa4_varlen`` (cp=1) calls flash_attn.cute varlen directly.
     magi_chunk_size: int = 2048
     magi_high_precision_reduce: bool = False
     magi_dense_kernel_backend: str = "fa4"

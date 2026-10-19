@@ -81,7 +81,7 @@ def _ensure_magi() -> SimpleNamespace:
 class MagiMsaSettings:
     """Runtime knobs of the ``magi`` backend (see ``ImplConfig.magi_*``)."""
 
-    chunk_size: int = 2048  # CP dispatch granularity (tokens); total tokens are padded to chunk_size * cp
+    chunk_size: int = 2048  # CP dispatch granularity (tokens); cp>1 pads total tokens to chunk_size * cp
     high_precision_reduce: bool = False  # FP32 required-dK group-reduce in backward
     dense_kernel_backend: str = "fa4"  # dense layers: fa4 | sdpa_ol (Magi calc_attn) | fa4_varlen (cp=1)
     deterministic: bool = False  # ordered msa_v1 backward (bitwise-reproducible, slower)
@@ -241,9 +241,10 @@ class MagiMsaContext:
         )
 
 
-def dispatch_config(settings: MagiMsaSettings) -> Any:
+def dispatch_config(settings: MagiMsaSettings, chunk_size: int | None = None) -> Any:
     m = _ensure_magi()
-    return m.DispatchConfig(chunk_size=settings.chunk_size, uneven_shard=False, alg=m.MinHeapDispatchAlg())
+    chunk_size = settings.chunk_size if chunk_size is None else chunk_size
+    return m.DispatchConfig(chunk_size=chunk_size, uneven_shard=False, alg=m.MinHeapDispatchAlg())
 
 
 def plan_magi_batch(
@@ -259,16 +260,17 @@ def plan_magi_batch(
 ) -> MagiMsaContext:
     """Build (cached) Magi runtimes for one packed batch.
 
-    Total tokens are padded to a multiple of ``chunk_size * cp`` by appending the padding as an
-    extra trailing document, so real documents keep their ranges and pad queries only see pad keys.
+    With cp>1, total tokens are padded to a multiple of ``chunk_size * cp`` by appending the padding as
+    an extra trailing document, so real documents keep their ranges and pad queries only see pad keys.
+    With cp=1 the batch is one chunk and is not padded (pad tokens would change the MoE GEMM shapes).
     """
     m = _ensure_magi()
     seq_lens = [int(s) for s in seq_lens_host]
     if not seq_lens or min(seq_lens) <= 0:
         raise ValueError("plan_magi_batch needs at least one non-empty sequence")
     total = sum(seq_lens)
-    align = settings.chunk_size * ps.cp_size
-    pad = (-total) % align
+    chunk_size = total if ps.cp_size == 1 else settings.chunk_size
+    pad = (-total) % (chunk_size * ps.cp_size)
     if pad:
         seq_lens.append(pad)
     cu = [0]
@@ -276,7 +278,7 @@ def plan_magi_batch(
         cu.append(cu[-1] + s)
     cu_seqlens = tuple(cu)
     group = msa_cp_group(ps)
-    dcfg = dispatch_config(settings)
+    dcfg = dispatch_config(settings, chunk_size)
     key = m.msa.make_magi_msa_key(list(cu_seqlens), group, config=msa_config, dispatch_config=dcfg)
     position_ids = m.msa.get_position_ids(key).to(torch.int64)
     dense_key = None
@@ -306,7 +308,7 @@ def plan_magi_batch(
         key=key,
         dense_key=dense_key,
         cp_size=ps.cp_size,
-        chunk_size=settings.chunk_size,
+        chunk_size=chunk_size,
         cu_seqlens_host=cu_seqlens,
         num_real_docs=len(seq_lens_host),
         pad=pad,

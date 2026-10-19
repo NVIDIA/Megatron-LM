@@ -150,18 +150,17 @@ def test_magi_packed_two_docs_matches_per_doc_torch(pair):
     assert c >= 0.999 and r <= 5e-3
 
 
-def test_magi_padding_doc_does_not_change_real_tokens(pair):
+def test_magi_cp1_odd_length_is_not_padded(pair):
     ps, ref_m, magi = pair
     S = 3000
     torch.manual_seed(3)
     x = torch.randn(S, 1, HIDDEN, device=DEV, dtype=torch.bfloat16)
     ctx = _ctx(ps, [S])
-    assert ctx.pad == (-S) % CHUNK and ctx.cu_seqlens_host[-1] == S + ctx.pad
-    x_pad = torch.cat([x, torch.zeros(ctx.pad, 1, HIDDEN, device=DEV, dtype=torch.bfloat16)], 0)
-    out = magi(x_pad, magi_ctx=ctx)[:S]
+    assert ctx.pad == 0 and ctx.cu_seqlens_host[-1] == S
+    out = magi(x, magi_ctx=ctx)
     ref = _torch_ref(ref_m, [x])
     c, r = _cos(out, ref), _rel(out, ref)
-    print(f"[magi vs torch] padded cos={c:.6f} rel={r:.3e}")
+    print(f"[magi vs torch] cp1 unpadded cos={c:.6f} rel={r:.3e}")
     assert c >= 0.999 and r <= 5e-3
 
 
