@@ -1324,6 +1324,10 @@ class _HybridEPManager(_DispatchManager):
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
         self.handle = None
+        self.routing_map = None
+        self.topk_idx = None
+        self.token_probs = None
+        self.dispatched_probs = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
         self._original_num_tokens = None
