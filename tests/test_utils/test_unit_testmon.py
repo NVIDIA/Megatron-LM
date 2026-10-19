@@ -130,6 +130,14 @@ def test_successful_baseline_records_each_phase(project, cache):
     for phase in ("prod", "experimental"):
         assert (cache / phase / ".testmondata").is_file()
         assert (cache / phase / "metadata.json").is_file()
+        collection = json.loads((cache / phase / "collection/rank-0.json").read_text())
+        assert collection["rank"] == 0
+        assert collection["world_size"] == 4
+        assert collection["rootpath"] == str(project)
+        assert collection["nodeids"] == [
+            "tests/test_app.py::test_active",
+            "tests/test_other.py::test_other",
+        ]
 
 
 def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
@@ -137,6 +145,7 @@ def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
     result = _invoke(project, cache, "baseline")
     assert result.returncode == 1
     assert not (cache / "prod/metadata.json").exists()
+    assert not (cache / "prod/collection/rank-0.json").exists()
 
 
 def test_empty_baseline_phase_is_recorded(project, tmp_path):
@@ -151,11 +160,47 @@ def test_empty_baseline_phase_is_recorded(project, tmp_path):
     assert (cache / ".testmon-work/prod/rank-0/selected-tests").read_text() == ""
 
 
-def test_nonzero_baseline_rank_runs_without_recording(project, tmp_path):
+def test_nonzero_baseline_rank_records_collection_without_database(project, tmp_path):
     cache = tmp_path / "rank-three-cache"
     result = _invoke(project, cache, "baseline", rank=3)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert not cache.exists()
+    assert not (cache / "prod/.testmondata").exists()
+    assert not (cache / "prod/metadata.json").exists()
+    collection = json.loads((cache / "prod/collection/rank-3.json").read_text())
+    assert collection["rank"] == 3
+    assert collection["world_size"] == 4
+    assert collection["nodeids"] == [
+        "tests/test_app.py::test_active",
+        "tests/test_other.py::test_other",
+    ]
+
+
+def test_baseline_collection_includes_test_helpers(project, tmp_path):
+    helper = project / "tests/unit_tests/shared_helper.py"
+    helper.parent.mkdir()
+    helper.write_text("def shared_helper(): return 1\n")
+    cache = tmp_path / "inventory-cache"
+    result = _invoke(project, cache, "baseline", rank=1)
+    assert result.returncode == 0, result.stdout + result.stderr
+    collection = json.loads((cache / "prod/collection/rank-1.json").read_text())
+    expected = sys.modules["testmon_cache"].collection_inventory(project)
+    assert collection["files"] == expected
+    assert "tests/unit_tests/shared_helper.py" in collection["files"]
+
+
+def test_baseline_records_tests_collected_only_on_nonzero_ranks(project, tmp_path):
+    (project / "tests/test_rank.py").write_text(
+        "import os\n\nif os.environ['RANK'] == '3':\n"
+        "    def test_nonzero_rank_only():\n        assert True\n"
+    )
+    cache = tmp_path / "rank-specific-cache"
+    for rank in (0, 3):
+        result = _invoke(project, cache, "baseline", rank=rank)
+        assert result.returncode == 0, result.stdout + result.stderr
+        collection = json.loads((cache / f"prod/collection/rank-{rank}.json").read_text())
+        assert ("tests/test_rank.py::test_nonzero_rank_only" in collection["nodeids"]) is (
+            rank == 3
+        )
 
 
 @pytest.mark.parametrize("rank", (0, 3))
@@ -409,7 +454,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
     ("overrides", "expected"),
     [
         ({}, "true"),
-        ({"HAS_UNIT_TESTMON": "false"}, "false"),
+        ({"UNIT_TESTMON_REQUESTED": "false"}, "false"),
         ({"EVENT_NAME": "merge_group"}, "false"),
         ({"REF": "refs/heads/main"}, "false"),
         ({"LABELS_VALID": "false"}, "false"),
@@ -427,7 +472,9 @@ def test_pr_label_gate(overrides, expected):
     environment = {
         **os.environ,
         "LABELS_VALID": "true",
-        "HAS_UNIT_TESTMON": "true",
+        "UNIT_TESTMON_REQUESTED": "true",
+        "IS_CI_WORKLOAD": "false",
+        "IS_MERGE_GROUP": "false",
         "EVENT_NAME": "push",
         "REF": "refs/heads/pull-request/123",
         "HAS_RUN_TESTS": "false",
@@ -453,5 +500,5 @@ def test_mode_is_passed_as_container_environment():
     gb200_recipe = _source("tests/test_utils/recipes/gb200/unit-tests.yaml")
 
     assert '"UNIT_TESTMON_MODE": unit_testmon_mode' in launcher
-    assert '["full", "enforce", "baseline"]' in launcher
+    assert '["full", "enforce", "preselected", "baseline"]' in launcher
     assert "{unit_testmon_mode}" not in h100_recipe + gb200_recipe

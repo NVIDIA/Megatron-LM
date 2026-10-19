@@ -1,0 +1,186 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Unit-test bucket
+
+on:
+  workflow_call:
+    inputs:
+      bucket:
+        type: string
+        required: true
+      platform:
+        type: string
+        default: dgx_h100
+      runner:
+        description: JSON-encoded runner label or object with group and labels
+        type: string
+        required: true
+      container-image:
+        type: string
+        required: true
+      cloud:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      timeout:
+        type: number
+        default: 30
+      unit_testmon_mode:
+        type: string
+        default: full
+      unit_testmon_target_branch:
+        type: string
+        default: ""
+      unit_test_pr_files_artifact_id:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  select:
+    name: Select tests on CPU
+    if: inputs.unit_testmon_mode == 'enforce'
+    runs-on: ubuntu-latest
+    # Selection is optional: any failure leaves the full GPU bucket enabled.
+    continue-on-error: true
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.result.outputs.mode }}
+      has_tests: ${{ steps.result.outputs.has_tests }}
+      plan_artifact: ${{ steps.result.outputs.plan_artifact }}
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha }}
+
+      - name: Setup Python
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install selection dependencies
+        id: dependencies
+        run: python -m pip install 'pytest-testmon==2.2.0' PyYAML
+
+      - name: Compute unit Testmon cache identity
+        id: identity
+        shell: bash -e -u -o pipefail {0}
+        env:
+          BUCKET: ${{ inputs.bucket }}
+          RECIPE_PLATFORM: ${{ inputs.platform }}
+          TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
+          PR_FILES_ARTIFACT: ${{ inputs.unit_test_pr_files_artifact_id }}
+        run: |
+          [[ "$TARGET_BRANCH" == "main" && -n "$PR_FILES_ARTIFACT" ]]
+          python tests/unit_tests/testmon_cache.py identity \
+            --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+            --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
+          BUCKET_HASH=$(printf '%s' "$BUCKET" | sha256sum | cut -c 1-16)
+          echo "artifact=unit-test-plan-${RECIPE_PLATFORM}-${BUCKET_HASH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore unit Testmon baseline
+        id: baseline
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: assets_dir/testmon
+          key: ${{ steps.identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.identity.outputs.cache_prefix }}
+
+      - name: Download built image identity
+        id: image
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unit-test-image-${{ inputs.sha }}-${{ inputs.cloud }}
+          path: assets_dir/testmon-image
+
+      - name: Download PR files for mandatory unit tests
+        id: pr-files
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ inputs.unit_test_pr_files_artifact_id }}
+          path: ${{ runner.temp }}/unit-test-pr-files
+          merge-multiple: true
+
+      - name: Select affected tests without importing the GPU suite
+        id: plan
+        shell: bash -e -u -o pipefail {0}
+        env:
+          BUCKET: ${{ inputs.bucket }}
+          RECIPE_PLATFORM: ${{ inputs.platform }}
+          SOURCE_SHA: ${{ inputs.sha }}
+          MATCHED_KEY: ${{ steps.baseline.outputs.cache-matched-key }}
+          PR_FILES_DIR: ${{ runner.temp }}/unit-test-pr-files
+        run: |
+          mkdir -p assets_dir/testmon-plan
+          IMAGE_ID=$(cat assets_dir/testmon-image/image-id.txt)
+          python tests/unit_tests/testmon_plan.py select \
+            --cache-dir assets_dir/testmon --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+            --image-id "$IMAGE_ID" --source-sha "$SOURCE_SHA" --matched-key "$MATCHED_KEY" \
+            --pr-files-dir "$PR_FILES_DIR" \
+            --output assets_dir/testmon-plan/plan.json | tee -a "$GITHUB_OUTPUT"
+
+      # Keep empty plans as evidence for the no-tests result and coverage gate.
+      - name: Upload unit Testmon plan
+        id: upload
+        if: steps.plan.outputs.mode == 'selected'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.identity.outputs.artifact }}
+          path: assets_dir/testmon-plan/plan.json
+          if-no-files-found: error
+
+      # Publish outputs only after the artifact is available to the GPU job.
+      - name: Publish selection
+        id: result
+        if: steps.upload.outcome == 'success'
+        env:
+          HAS_TESTS: ${{ steps.plan.outputs.has_tests }}
+          PLAN_ARTIFACT: ${{ steps.identity.outputs.artifact }}
+        run: |
+          echo "mode=selected" >> "$GITHUB_OUTPUT"
+          echo "has_tests=$HAS_TESTS" >> "$GITHUB_OUTPUT"
+          echo "plan_artifact=$PLAN_ARTIFACT" >> "$GITHUB_OUTPUT"
+
+  run:
+    name: Run tests on GPU
+    needs: select
+    # A successful CPU job keeps the reusable bucket check successful even
+    # when its GPU child is skipped. Missing outputs always schedule the GPU.
+    if: ${{ !cancelled() && (needs.select.result != 'success' || needs.select.outputs.mode != 'selected' || needs.select.outputs.has_tests != 'false') }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 60
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.sha }}
+      - name: Run unit-test bucket
+        uses: ./.github/actions
+        with:
+          script: ""
+          test_case: ${{ inputs.bucket }}
+          tag: latest
+          timeout: ${{ inputs.timeout }}
+          is_unit_test: "true"
+          container-image: ${{ inputs.container-image }}
+          platform: ${{ inputs.platform }}
+          sha: ${{ inputs.sha }}
+          unit_testmon_mode: ${{ needs.select.outputs.mode == 'selected' && 'preselected' || 'full' }}
+          unit_testmon_target_branch: ${{ inputs.unit_testmon_target_branch }}
+          unit_testmon_plan_artifact: ${{ needs.select.outputs.plan_artifact }}
+          unit_test_pr_files_artifact_id: ${{ inputs.unit_test_pr_files_artifact_id }}
