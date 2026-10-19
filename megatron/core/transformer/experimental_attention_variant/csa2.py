@@ -7,6 +7,7 @@ tensors belong to one stack forward and are passed explicitly; modules retain no
 state or inference caches.
 """
 
+from collections.abc import Iterator
 from copy import copy
 from dataclasses import dataclass
 
@@ -54,6 +55,14 @@ from .csa_utils.csa2_context_parallel import (
     CSA2CPCompressionLayout,
     build_csa2_cp_compression_layout,
 )
+
+# Rows per per-row operation chunk (causal mask build, argsort, masked_fill) as a
+# score-matrix element budget: the [batch, seq, M] fp32 scores and a full [seq, M]
+# bool causal mask plus a functional masked_fill copy double the footprint at long
+# contexts (~16 GiB scores + 4 GiB causal + 16 GiB copy at 128K). Rows are
+# independent, so chunking the leading dimension bounds peak memory with identical
+# semantics. The same budget is used by select_indices.
+_SELECT_ROW_CHUNK_ELEMENTS = 1 << 24
 
 
 def _chunked_csa2_indexer_scores(
@@ -395,6 +404,92 @@ class CSA2Indexer(MegatronModule):
         may pass a pre-RoPE latent as before; Reindex layers pass ``latent=None`` and the Full
         owner's ``indexer_k``. Supplying shared keys preserves their graph for auxiliary losses.
         """
+        q, weights, indexer_k = self._prepare_indexer_inputs(
+            x,
+            qr,
+            latent,
+            rotary_pos_emb,
+            indexer_k=indexer_k,
+            thd_layout=thd_layout,
+            compressed_layout=compressed_layout,
+        )
+        if torch.is_grad_enabled():
+            scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
+            scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+        else:
+            scores = _chunked_csa2_indexer_scores(q, indexer_k, weights)
+        if thd_layout is None:
+            visible = torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
+            # Build causal and apply in-place over row chunks: a full [seq, M] bool
+            # mask plus a functional masked_fill copy would double the [batch, seq, M]
+            # fp32 scores footprint (~16 GiB at 128K contexts), OOMing the forward peak.
+            # Rows mask independently, so chunk the leading dimension with identical
+            # semantics. Mirrors _chunked_topk_argsort's row budget.
+            seq = x.shape[0]
+            _chunk = max(
+                1,
+                _SELECT_ROW_CHUNK_ELEMENTS
+                // (max(scores.shape[0], 1) * max(indexer_k.shape[0], 1)),
+            )
+            key_range = torch.arange(indexer_k.shape[0], device=x.device)
+            for start in range(0, seq, _chunk):
+                end = min(start + _chunk, seq)
+                causal_chunk = key_range[None, :] < visible[start:end, None]
+                scores[:, start:end].masked_fill_(~causal_chunk, -torch.inf)
+            del key_range, visible
+        else:
+            # Row-chunked causal build for the thd-layout path: the four-way boolean
+            # broadcast chain materializes a full [seq, M] bool mask (and temporaries)
+            # alongside the scores. Chunk the leading dimension to bound peak memory
+            # with identical semantics (per-row independent mask).
+            seq = x.shape[0]
+            _chunk = max(
+                1,
+                _SELECT_ROW_CHUNK_ELEMENTS
+                // (max(scores.shape[0], 1) * max(indexer_k.shape[0], 1)),
+            )
+            vt = thd_layout.valid_tokens
+            vg = compressed_layout.valid_groups
+            sids = thd_layout.sequence_ids
+            cids = compressed_layout.sequence_ids
+            cpos = compressed_layout.position_ids
+            tpos = thd_layout.position_ids
+            for start in range(0, seq, _chunk):
+                end = min(start + _chunk, seq)
+                causal_chunk = (
+                    vt[start:end, None]
+                    & vg[None, :]
+                    & (sids[start:end, None] == cids[None, :])
+                    & (cpos[None, :] + self.compress_ratio <= tpos[start:end, None] + 1)
+                )
+                scores[:, start:end].masked_fill_(~causal_chunk, -torch.inf)
+            del vt, vg, sids, cids, cpos, tpos
+        if isinstance(candidates, CSA2CandidateBlocks):
+            candidates = (
+                candidates.to_mask(scores.shape[-1])
+                if thd_layout is None
+                else candidates.to_mask_thd(
+                    thd_layout.sequence_ids,
+                    compressed_layout.sequence_ids,
+                    compressed_layout.position_ids // self.compress_ratio,
+                )
+            )
+        if candidates is not None:
+            scores.masked_fill_(~candidates, -torch.inf)
+        return scores
+
+    def _prepare_indexer_inputs(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        latent: torch.Tensor | None,
+        rotary_pos_emb: nn.Module,
+        *,
+        indexer_k: torch.Tensor | None,
+        thd_layout: CSA2THDLayout | None,
+        compressed_layout: CSA2THDCompressionLayout | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project the query, indexer keys and per-head score weights once."""
         if indexer_k is None:
             if latent is None:
                 raise ValueError("CSA2 indexer scores require latent or shared indexer_k.")
@@ -418,45 +513,107 @@ class CSA2Indexer(MegatronModule):
         )
         weights, _ = self.linear_weights_proj(x)
         weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
-        if torch.is_grad_enabled():
-            scores = torch.einsum("sbhd,tbd->bsht", q.float(), indexer_k.float()).relu()
-            scores = (scores * weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
-        else:
-            scores = _chunked_csa2_indexer_scores(q, indexer_k, weights)
+        return q, weights, indexer_k
+
+    @torch.no_grad()
+    def iter_forward_before_topk(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        latent: torch.Tensor | None,
+        rotary_pos_emb: nn.Module,
+        *,
+        indexer_k: torch.Tensor | None = None,
+        candidates: CSA2CandidateBlocks | torch.Tensor | None = None,
+        thd_layout: CSA2THDLayout | None = None,
+        compressed_layout: CSA2THDCompressionLayout | None = None,
+    ) -> Iterator[tuple[int, int, torch.Tensor]]:
+        """Yield causal score rows without materializing the full score matrix."""
+        q, weights, indexer_k = self._prepare_indexer_inputs(
+            x,
+            qr,
+            latent,
+            rotary_pos_emb,
+            indexer_k=indexer_k,
+            thd_layout=thd_layout,
+            compressed_layout=compressed_layout,
+        )
+        head_weights = weights.permute(1, 0, 2).unsqueeze(-1)
+        rows_per_chunk = max(
+            1, _SELECT_ROW_CHUNK_ELEMENTS // (max(q.shape[1], 1) * max(indexer_k.shape[0], 1))
+        )
+        key_range = torch.arange(indexer_k.shape[0], device=x.device)
         if thd_layout is None:
             visible = torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
-            causal = torch.arange(indexer_k.shape[0], device=x.device)[None, :] < visible[:, None]
         else:
-            causal = (
-                thd_layout.valid_tokens[:, None]
-                & compressed_layout.valid_groups[None, :]
-                & (thd_layout.sequence_ids[:, None] == compressed_layout.sequence_ids[None, :])
-                & (
-                    compressed_layout.position_ids[None, :] + self.compress_ratio
-                    <= thd_layout.position_ids[:, None] + 1
-                )
+            vt = thd_layout.valid_tokens
+            vg = compressed_layout.valid_groups
+            sids = thd_layout.sequence_ids
+            cids = compressed_layout.sequence_ids
+            cpos = compressed_layout.position_ids
+            tpos = thd_layout.position_ids
+        candidate_spec = candidates
+        for start in range(0, x.shape[0], rows_per_chunk):
+            end = min(start + rows_per_chunk, x.shape[0])
+            q_chunk = q[start:end].float()
+            scores = torch.empty(
+                (q.shape[1], end - start, indexer_k.shape[0]), device=x.device, dtype=torch.float32
             )
-        scores = scores.masked_fill(~causal, -torch.inf)
-        if isinstance(candidates, CSA2CandidateBlocks):
-            candidates = (
-                candidates.to_mask(scores.shape[-1])
-                if thd_layout is None
-                else candidates.to_mask_thd(
-                    thd_layout.sequence_ids,
-                    compressed_layout.sequence_ids,
-                    compressed_layout.position_ids // self.compress_ratio,
+            for key_start in range(0, indexer_k.shape[0], 64):
+                key_end = min(key_start + 64, indexer_k.shape[0])
+                score_chunk = torch.einsum(
+                    "sbhd,tbd->bsht", q_chunk, indexer_k[key_start:key_end].float()
+                ).relu()
+                scores[..., key_start:key_end] = (score_chunk * head_weights[:, start:end]).sum(
+                    dim=2
                 )
-            )
-        if candidates is not None:
-            scores = scores.masked_fill(~candidates, -torch.inf)
-        return scores
+            if thd_layout is None:
+                causal = key_range[None, :] < visible[start:end, None]
+            else:
+                causal = (
+                    vt[start:end, None]
+                    & vg[None, :]
+                    & (sids[start:end, None] == cids[None, :])
+                    & (cpos[None, :] + self.compress_ratio <= tpos[start:end, None] + 1)
+                )
+            scores.masked_fill_(~causal, -torch.inf)
+            if isinstance(candidate_spec, CSA2CandidateBlocks):
+                candidate_rows = CSA2CandidateBlocks(
+                    candidate_spec.indices[:, start:end], candidate_spec.block_size
+                )
+                candidate_mask = (
+                    candidate_rows.to_mask(scores.shape[-1])
+                    if thd_layout is None
+                    else candidate_rows.to_mask_thd(
+                        thd_layout.sequence_ids[start:end],
+                        compressed_layout.sequence_ids,
+                        compressed_layout.position_ids // self.compress_ratio,
+                    )
+                )
+            elif candidate_spec is not None:
+                candidate_mask = candidate_spec[:, start:end]
+            else:
+                candidate_mask = None
+            if candidate_mask is not None:
+                scores.masked_fill_(~candidate_mask, -torch.inf)
+            yield start, end, scores
 
     def select_indices(self, scores: torch.Tensor) -> torch.Tensor:
         """Return sorted logical positions, with -1 for masked or unavailable entries."""
         # ReLU scores can tie at zero; masked future capacity must not change the winners.
-        indices = scores.argsort(dim=-1, descending=True, stable=True)[
-            ..., : min(self.topk, scores.shape[-1])
-        ]
+        # Sort rows independently so a long-context score matrix does not allocate one
+        # full CUDA sort workspace. Chunking preserves the stable row semantics.
+        topk = min(self.topk, scores.shape[-1])
+        if topk == 0 or scores.numel() == 0:
+            indices = torch.empty(*scores.shape[:-1], topk, dtype=torch.int64, device=scores.device)
+        else:
+            flat_scores = scores.reshape(-1, scores.shape[-1])
+            rows_per_chunk = max(1, _SELECT_ROW_CHUNK_ELEMENTS // flat_scores.shape[-1])
+            chunks = [
+                block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
+                for block in flat_scores.split(rows_per_chunk, dim=0)
+            ]
+            indices = torch.cat(chunks, dim=0).reshape(*scores.shape[:-1], topk)
         indices = indices.sort(dim=-1).values
         return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
 
@@ -656,8 +813,9 @@ class CompressedSparseAttention2(MegatronModule):
                         f"{self.config.csa2_candidate_source_layer} in the same CSA2State."
                     )
                 candidates = state.candidates
-            with torch.set_grad_enabled(use_indexer_loss):
-                scores = self.indexer.forward_before_topk(
+            stream_scores = not use_indexer_loss
+            if stream_scores:
+                score_chunks = self.indexer.iter_forward_before_topk(
                     x.detach(),
                     qr.detach(),
                     None,
@@ -667,40 +825,105 @@ class CompressedSparseAttention2(MegatronModule):
                     thd_layout=thd_layout,
                     compressed_layout=state.compressed_layout,
                 )
+            else:
+                with torch.set_grad_enabled(use_indexer_loss):
+                    scores = self.indexer.forward_before_topk(
+                        x.detach(),
+                        qr.detach(),
+                        None,
+                        self.rotary_pos_emb,
+                        indexer_k=state.indexer_k,
+                        candidates=candidates,
+                        thd_layout=thd_layout,
+                        compressed_layout=state.compressed_layout,
+                    )
+                score_chunks = ((0, x.shape[0], scores),)
             with torch.no_grad():
                 if self.is_candidate_source:
-                    if thd_layout is None:
-                        visible = (
-                            torch.arange(1, x.shape[0] + 1, device=x.device) // self.compress_ratio
-                        ).unsqueeze(-1)
-                    else:
-                        sequence_ids = thd_layout.sequence_ids.clamp_min(0)
-                        compressed = state.compressed_layout
-                        local_keys = torch.arange(compressed.max_seqlen, device=x.device)
-                        physical = compressed.cu_seqlens_padded[sequence_ids, None] + local_keys
-                        if scores.shape[-1]:
-                            local_scores = scores.squeeze(0).gather(
-                                1, physical.clamp_max(scores.shape[-1] - 1).long()
-                            )
-                            local_scores = local_scores.masked_fill(
-                                physical >= compressed.cu_seqlens_padded[sequence_ids + 1, None],
-                                -torch.inf,
+                    global_indices = []
+                    candidate_indices = []
+                    for start, end, score_chunk in score_chunks:
+                        global_indices.append(self.indexer.select_indices(score_chunk))
+                        if thd_layout is None:
+                            visible = (
+                                torch.arange(start + 1, end + 1, device=x.device)
+                                // self.compress_ratio
+                            ).unsqueeze(-1)
+                            candidate_chunk = candidate_blocks_from_scores(
+                                score_chunk,
+                                visible,
+                                self.config.csa2_candidate_topk_blocks,
+                                self.config.csa2_candidate_block_size,
                             )
                         else:
-                            local_scores = scores.new_full(physical.shape, -torch.inf)
-                        visible = (thd_layout.position_ids + 1) // self.compress_ratio
-                        local_scores = local_scores.unsqueeze(0)
-                        visible = visible.unsqueeze(0).unsqueeze(-1)
-                    state.candidates = candidate_blocks_from_scores(
-                        scores if thd_layout is None else local_scores,
-                        visible,
-                        self.config.csa2_candidate_topk_blocks,
-                        self.config.csa2_candidate_block_size,
-                    )
+                            sequence_ids = thd_layout.sequence_ids[start:end].clamp_min(0)
+                            compressed = state.compressed_layout
+                            local_keys = torch.arange(compressed.max_seqlen, device=x.device)
+                            physical = compressed.cu_seqlens_padded[sequence_ids, None] + local_keys
+                            if score_chunk.shape[-1]:
+                                local_scores = score_chunk.squeeze(0).gather(
+                                    1, physical.clamp_max(score_chunk.shape[-1] - 1).long()
+                                )
+                                local_scores.masked_fill_(
+                                    physical
+                                    >= compressed.cu_seqlens_padded[sequence_ids + 1, None],
+                                    -torch.inf,
+                                )
+                            else:
+                                local_scores = score_chunk.new_full(physical.shape, -torch.inf)
+                            visible = (
+                                thd_layout.position_ids[start:end] + 1
+                            ) // self.compress_ratio
+                            candidate_chunk = candidate_blocks_from_scores(
+                                local_scores.unsqueeze(0),
+                                visible.unsqueeze(0).unsqueeze(-1),
+                                self.config.csa2_candidate_topk_blocks,
+                                self.config.csa2_candidate_block_size,
+                            )
+                        candidate_indices.append(candidate_chunk.indices)
+                    if global_indices:
+                        state.global_indices = torch.cat(global_indices, dim=1)
+                        state.candidates = CSA2CandidateBlocks(
+                            torch.cat(candidate_indices, dim=1),
+                            self.config.csa2_candidate_block_size,
+                        )
+                    else:
+                        empty_scores = torch.empty(
+                            x.shape[1],
+                            0,
+                            state.indexer_k.shape[0],
+                            device=x.device,
+                            dtype=torch.float32,
+                        )
+                        state.global_indices = self.indexer.select_indices(empty_scores)
+                        state.candidates = candidate_blocks_from_scores(
+                            empty_scores,
+                            torch.empty(0, 1, device=x.device, dtype=torch.long),
+                            self.config.csa2_candidate_topk_blocks,
+                            self.config.csa2_candidate_block_size,
+                        )
                     state.candidate_source_layer = self.layer_idx
-                # The candidate source itself selects over all causal positions. Only later
-                # Reindex layers apply its candidate mask, matching the reference ordering.
-                state.global_indices = self.indexer.select_indices(scores)
+                elif stream_scores:
+                    global_indices = [
+                        self.indexer.select_indices(score_chunk)
+                        for _, _, score_chunk in score_chunks
+                    ]
+                    if global_indices:
+                        state.global_indices = torch.cat(global_indices, dim=1)
+                    else:
+                        state.global_indices = self.indexer.select_indices(
+                            torch.empty(
+                                x.shape[1],
+                                0,
+                                state.indexer_k.shape[0],
+                                device=x.device,
+                                dtype=torch.float32,
+                            )
+                        )
+                else:
+                    # The dense indexer-loss path keeps the full score tensor for the auxiliary
+                    # objective; only the no-loss path can discard each score chunk after top-k.
+                    state.global_indices = self.indexer.select_indices(scores)
             state.index_source_layer = self.layer_idx
         elif state.index_source_layer != self.index_source_layer or state.global_indices is None:
             raise ValueError(

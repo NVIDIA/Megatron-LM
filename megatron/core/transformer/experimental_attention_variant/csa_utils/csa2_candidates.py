@@ -68,9 +68,20 @@ def candidate_blocks_from_scores(
     block_scores = block_scores.masked_fill(
         torch.arange(num_blocks, device=scores.device) == newest, torch.inf
     )
-    ids = block_scores.argsort(dim=-1, descending=True, stable=True)[
-        ..., : min(topk_blocks, num_blocks)
-    ]
+    topk = min(topk_blocks, num_blocks)
+    if topk == 0 or block_scores.numel() == 0:
+        ids = torch.empty(
+            *block_scores.shape[:-1], topk, dtype=torch.int64, device=block_scores.device
+        )
+    else:
+        flat_scores = block_scores.reshape(-1, block_scores.shape[-1])
+        max_sort_elements = 1 << 24
+        rows_per_chunk = max(1, max_sort_elements // flat_scores.shape[-1])
+        chunks = [
+            block.argsort(dim=-1, descending=True, stable=True)[..., :topk]
+            for block in flat_scores.split(rows_per_chunk, dim=0)
+        ]
+        ids = torch.cat(chunks, dim=0).reshape(*block_scores.shape[:-1], topk)
     valid = block_scores.gather(-1, ids) > -torch.inf
     sentinel = torch.iinfo(torch.int32).max
     ids = ids.masked_fill(~valid, sentinel).sort(-1).values

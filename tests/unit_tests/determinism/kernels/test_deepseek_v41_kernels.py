@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant import (
     deepseek_v4_hybrid_attention as dsv4_attention,
 )
+from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2Indexer
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_attention_spec,
 )
@@ -129,6 +132,20 @@ def test_csa2_candidate_replay(groups):
         second = candidate_blocks_from_scores(scores, visible, 4, 2)
         for a, b in zip((first.indices, first.to_mask(257)), (second.indices, second.to_mask(257))):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_csa2_indexer_selection_replay():
+    """Stable indexer selection is bit-exact across replayed CUDA sorts."""
+    seeded()
+    scores = torch.randn(2, 9, 257, device="cuda")
+    scores[..., :4] = 0
+    scores[..., -3:] = -torch.inf
+
+    def select(x):
+        return CSA2Indexer.select_indices(SimpleNamespace(topk=4), x)
+
+    with deterministic_algorithms(True):
+        assert_replays_bit_exact(select, (scores,), backward=False, what="CSA2 indexer selection")
 
 
 def test_csa2_thd_candidate_mask_replay():

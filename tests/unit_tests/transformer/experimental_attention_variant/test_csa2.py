@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import megatron.core.transformer.experimental_attention_variant.csa2 as csa2_impl
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -679,6 +680,67 @@ def test_candidate_source_can_run_standalone(pg_collection):
     assert torch.isfinite(output).all() and torch.isfinite(x.grad).all()
 
 
+def test_thd_candidate_chunking_matches_dense_gather(pg_collection, monkeypatch):
+    """Streaming THD candidate selection preserves dense indices and candidates."""
+    layer = build_module(
+        csa2_attention_spec, config=_make_config(), layer_number=4, pg_collection=pg_collection
+    ).cuda()
+    core = layer.core_attention
+    x = torch.randn(12, 1, layer.config.hidden_size, device="cuda")
+    qr = torch.randn(12, 1, layer.config.q_lora_rank, device="cuda")
+    logical = torch.tensor([0, 3, 7], device="cuda", dtype=torch.int32)
+    physical = torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=7,
+        max_seqlen_kv=7,
+    )
+    dense_state = CSA2State()
+    dense_state.thd_layout = build_csa2_thd_layout(packed, x.shape[0], cp_group=core.cp_group)
+    with torch.enable_grad():
+        core._shared_global_attention(x, qr, dense_state, use_indexer_loss=True)
+    dense_indices = dense_state.candidates.indices.clone()
+    dense_global_indices = dense_state.global_indices.clone()
+
+    monkeypatch.setattr(csa2_impl, "_SELECT_ROW_CHUNK_ELEMENTS", 2)
+    chunked_state = CSA2State()
+    chunked_state.thd_layout = build_csa2_thd_layout(packed, x.shape[0], cp_group=core.cp_group)
+    with torch.no_grad():
+        core._shared_global_attention(x, qr, chunked_state, use_indexer_loss=False)
+    torch.testing.assert_close(chunked_state.candidates.indices, dense_indices)
+    torch.testing.assert_close(chunked_state.global_indices, dense_global_indices)
+
+
+def test_reindex_streaming_matches_dense_candidate_mask(pg_collection, monkeypatch):
+    """Streaming Reindex selection applies the same candidate mask as dense scoring."""
+    layers = _layers(pg_collection, candidates=True)
+    x = torch.randn(9, 2, layers[0].config.hidden_size, device="cuda")
+    qr = torch.randn(9, 2, layers[0].config.q_lora_rank, device="cuda")
+
+    dense_state = CSA2State()
+    with torch.enable_grad():
+        layers[3].core_attention._shared_global_attention(x, qr, dense_state, use_indexer_loss=True)
+        layers[4].core_attention._shared_global_attention(x, qr, dense_state, use_indexer_loss=True)
+    dense_candidates = dense_state.candidates.indices.clone()
+    dense_indices = dense_state.global_indices.clone()
+
+    monkeypatch.setattr(csa2_impl, "_SELECT_ROW_CHUNK_ELEMENTS", 2)
+    streamed_state = CSA2State()
+    with torch.no_grad():
+        layers[3].core_attention._shared_global_attention(
+            x, qr, streamed_state, use_indexer_loss=False
+        )
+        layers[4].core_attention._shared_global_attention(
+            x, qr, streamed_state, use_indexer_loss=False
+        )
+    torch.testing.assert_close(streamed_state.candidates.indices, dense_candidates)
+    torch.testing.assert_close(streamed_state.global_indices, dense_indices)
+
+
 def test_causal_mask_and_unsupported_packing(pg_collection):
     layer = _layer(pg_collection, 2)
     x = torch.randn(5, 2, layer.config.hidden_size, device="cuda")
@@ -1102,6 +1164,23 @@ def test_tied_selection_is_independent_of_masked_future_capacity():
         # Repeated invalid slots must not overwrite the valid first block in other rows.
         assert not compact.to_mask(width)[0].any()
         assert compact.to_mask(width)[1, :3].all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CSA2 selection uses CUDA")
+def test_chunked_selection_handles_row_chunk_boundary():
+    """Stable selection remains correct when the score rows span two sort chunks."""
+    rows, width = 1025, 16384
+    scores = torch.full((1, rows, width), -torch.inf, device="cuda")
+    scores[..., 0] = 3
+    scores[..., 1] = 2
+    scores[..., 2:6] = 1
+
+    selected = CSA2Indexer.select_indices(SimpleNamespace(topk=4), scores)
+    expected = torch.tensor([0, 1, 2, 3], device="cuda", dtype=torch.int32).expand(1, rows, -1)
+    torch.testing.assert_close(selected, expected)
+
+    compact = candidate_blocks_from_scores(scores, 1, 4, 1)
+    torch.testing.assert_close(compact.indices, expected)
 
 
 def test_tied_shared_indexers_preserve_prefix_when_sequence_grows(pg_collection):
