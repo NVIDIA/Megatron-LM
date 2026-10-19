@@ -213,6 +213,8 @@ link-mode = "copy"
 # For instance, when installing into a PyTorch base image, we don't want to install torch,
 # torchvision, and triton.
 override-dependencies = [
+    # LeptonAI caps AnyIO at 4.9.0; override it for the CVE-2026-63374 fix.
+    "anyio>=4.14.2",
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
