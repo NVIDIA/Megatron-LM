@@ -1720,6 +1720,24 @@ def _warn_dsa_checkpoint_topk_reuse_fallback(layer_number: int, reason: str) -> 
     )
 
 
+def _reject_mxfp8_indexer_reference_fallback(
+    config: TransformerConfig, what: str, reason: str, path: str = "the BF16 reference path"
+) -> None:
+    """Raise instead of scoring the indexer without MXFP8 when MXFP8 was requested.
+
+    Only the cuDNN fused indexer hooks honour ``dsa_indexer_precision='mxfp8'``. The
+    PyTorch reference scorer is BF16 and KPool selection has its own scorer, so taking
+    either would report other numerics and speed for a run configured as MXFP8.
+    """
+    if getattr(config, "dsa_indexer_precision", "bf16") != "mxfp8":
+        return
+    raise RuntimeError(
+        "dsa_indexer_precision='mxfp8' requires the cuDNN fused DSA indexer, but "
+        f"{what} would be computed by {path}: {reason}. "
+        "Use dsa_indexer_precision='bf16' for this layout."
+    )
+
+
 def _dsa_weights_proj_forward_gemm(
     x: torch.Tensor, weight: torch.Tensor, te_gemm_supported: Optional[bool]
 ) -> Tuple[torch.Tensor, Optional[bool]]:
@@ -2323,6 +2341,11 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads * index_head_dim]
         # [seqlen, batch, index_head_dim]
         # [seqlen, batch, index_n_heads]
+        _reject_mxfp8_indexer_reference_fallback(
+            self.config,
+            "the DSAIndexer scores and top-k",
+            "DSAIndexer.forward_with_scores always scores in BF16",
+        )
         q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
 
         if self.index_kpool > 1 and self._kpool_gate_score is not None:
@@ -2539,11 +2562,14 @@ class _DSAIndexSharingPayload:
     ``topk_by_layer`` and ``topk_key_len_by_layer`` the key length they were selected
     from. Both are written only by the no-grad first call of a checkpointed computing
     layer under ``dsa_indexer_reuse_checkpoint_topk``, together with the indices, so the
-    replay can compute the sparse indexer loss without rerunning the dense indexer. Any
-    other publication of a layer's indices drops its score entries. Without the indexer
-    loss (a frozen indexer) that replay stores and needs no scores: it reuses the layer's
-    own ``topk_by_layer``, ``topk_length_by_layer`` and ``topk_rows_nonempty_by_layer``
-    entries, which the checkpoint snapshot taken after the first call already holds.
+    replay can compute the sparse indexer loss without rerunning the dense indexer. With
+    ``dsa_indexer_precision='mxfp8'`` the scores are the selected keys' log-probabilities
+    over the selection, recomputed in FP32 from the BF16 indexer inputs, which the loss's
+    per-row softmax consumes exactly like logits. Any other publication of a layer's
+    indices drops its score entries. Without the indexer loss (a frozen indexer) that replay
+    stores and needs no scores: it reuses the layer's own ``topk_by_layer``,
+    ``topk_length_by_layer`` and ``topk_rows_nonempty_by_layer`` entries, which the
+    checkpoint snapshot taken after the first call already holds.
 
     ``topk_rows_nonempty_by_layer`` holds the publishing call's host-side certificate that
     every row of its top-k selects at least one key (``can_prove_all_topk_rows_nonempty``).
@@ -3645,6 +3671,20 @@ class DSAttention(MegatronModule):
 
         indexer_loss = None
 
+        def reject_mxfp8_reference_fallback(what: str) -> None:
+            if not use_fused_kernels:
+                reason = "the fused DSA kernels are disabled"
+            elif fused_bounds is None:
+                reason = "no fused indexer bounds exist for this attention mask layout"
+            else:
+                reason = (
+                    "the cuDNN indexer hook declined this layout (DEBUG logging of "
+                    "dsa_kernels names the hook)"
+                )
+            _reject_mxfp8_indexer_reference_fallback(
+                self.config, f"the {what} of DSA layer {self.layer_number}", reason
+            )
+
         def slice_topk_to_local_sequence_parallel_rows():
             nonlocal topk_indices, topk_length
             if topk_indices is None or not sequence_parallel_query_is_local:
@@ -3745,6 +3785,7 @@ class DSAttention(MegatronModule):
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
 
             if topk_indices is None or indexer_loss is None:
+                reject_mxfp8_reference_fallback("indexer top-k and loss")
                 topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
             # No TP-local top-k slicing here: the guard above forbids the indexer loss
             # under sequence-local TP query shards, so the top-k rows are already global.
@@ -3767,6 +3808,12 @@ class DSAttention(MegatronModule):
             # Get top-k indices
             # ===================================
             if _is_kpool:
+                _reject_mxfp8_indexer_reference_fallback(
+                    self.config,
+                    f"the KPool indexer top-k of DSA layer {self.layer_number}",
+                    "KPool selection does not use the cuDNN dense scorer",
+                    path="the KPool selector",
+                )
                 # KPool selection is discrete and does not need an autograd graph.
                 with torch.no_grad():
                     _index_scores, topk_indices = fused_qk_topk_kpool(
@@ -3828,6 +3875,7 @@ class DSAttention(MegatronModule):
                         topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
+                reject_mxfp8_reference_fallback("indexer top-k")
                 with torch.no_grad():
                     index_scores, topk_indices = fused_qk_topk_naive(
                         q,

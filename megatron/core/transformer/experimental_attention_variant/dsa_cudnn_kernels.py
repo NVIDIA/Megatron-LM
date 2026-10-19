@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.quantization import indexer_quantization
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
     dsa_indexer_loss,
@@ -147,6 +148,22 @@ class CudnnDsaInterface(Protocol):
     ) -> dict:
         """Recompute the head-summed sparse attention target over the top-k keys."""
 
+    def sparse_indexer_score_recompute_wrapper(
+        self,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        topk_indices: Tensor,
+        qhead_per_kv_head: Optional[int] = None,
+        topk_length: Optional[Tensor] = None,
+        topk_indices_global: bool = False,
+    ) -> dict:
+        """FP32 softmax over the selected keys of ``sum_h relu(q_h . k) * w_h`` (``"predict"``).
+
+        Without ``topk_length`` slots with a negative index are masked; the top-k must be a
+        multiple of 128.
+        """
+
 
 _cudnn_dsa: Optional[CudnnDsaInterface] = None
 # Every cudnn-frontend DSA entry point MCore calls; _ensure_dsa_namespace resolves them all.
@@ -159,6 +176,7 @@ _CUDNN_DSA_ENTRY_POINTS = (
     "sparse_attn_score_recompute_wrapper",
     "dense_attn_score_recompute_wrapper",
     "dense_indexer_backward_wrapper",
+    "sparse_indexer_score_recompute_wrapper",
 )
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
@@ -201,6 +219,20 @@ _TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION = (1, 29)
 _TOPK_OOB_LANE_GUARD_FE_VERSION = (1, 29)
 _NAMED_PARAMETER_CACHE: dict[int, tuple[object, frozenset]] = {}
 _CLEAN_LOGITS_UNAVAILABLE_LOGGED = False
+_MXFP8_SCORER_HEAD_COUNTS = frozenset((32, 64))
+_MXFP8_SCORER_HEAD_DIM = 128
+_MXFP8_SCORER_MIN_SM_MAJOR = 10
+_MXFP8_SCORER_WRAPPER_PARAMETERS = (
+    "precision",
+    "q_scale",
+    "k_scale",
+    "cu_seqlens_q_scale_padded",
+    "cu_seqlens_k_scale_padded",
+    "sf_vec_size",
+)
+_MXFP8_SF_VEC_SIZE = 32
+# cuDNN's sparse indexer score recompute tiles the top-k by 128 keys.
+_SPARSE_INDEXER_RECOMPUTE_TOPK_ALIGNMENT = 128
 
 
 @dataclass(frozen=True)
@@ -212,15 +244,25 @@ class IndexerScorerOptions:
             ``clean_logits=False`` so cuDNN skips the ``-inf`` prefill of the dense score
             buffer, when the installed frontend supports it. Columns at or past each row's
             causal limit are then unspecified; every reader is clamped to that limit.
+        precision: Compute precision of the selection scorer, ``"bf16"`` or ``"mxfp8"``.
+            With ``"mxfp8"`` the general packed THD scorer quantizes the indexer Q and K to
+            E4M3 with E8M0 1x32 scales and runs the cuDNN MXFP8 dense scorer, which then
+            decides only the top-k selection: the selected scores returned for the indexer
+            loss are recomputed in FP32 from the BF16 Q/K/weights over the selected keys
+            (:func:`_selected_scores_for_indexer_loss`). Weights stay BF16, and the indexer
+            loss and backward keep using the BF16 Q/K. ``"bf16"`` returns the scorer's own
+            FP32 values. Every other scorer path rejects ``"mxfp8"``.
     """
 
     skip_masked_score_fill: bool = False
+    precision: str = "bf16"
 
 
 def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> IndexerScorerOptions:
     """Read the indexer scorer options from ``config`` (defaults when absent)."""
     return IndexerScorerOptions(
-        skip_masked_score_fill=bool(getattr(config, "dsa_indexer_skip_masked_score_fill", False))
+        skip_masked_score_fill=bool(getattr(config, "dsa_indexer_skip_masked_score_fill", False)),
+        precision=str(getattr(config, "dsa_indexer_precision", "bf16")),
     )
 
 
@@ -1155,6 +1197,12 @@ def _indexer_topk_packed_thd(
     scorer is asked not to prefill the dense score buffer with ``-inf``. Every reader
     below is then clamped to the kernel's per-row column limit derived from the same
     segment layout that the kernel consumes.
+
+    The selected scores returned for the indexer loss (``return_topk_scores``) follow the
+    scorer's compute precision on every path, the every-column one included
+    (:func:`_selected_scores_for_indexer_loss`): the BF16 scorer's own values, or, for
+    ``scorer_options.precision == 'mxfp8'``, the selected keys' scores recomputed in FP32
+    from the BF16 inputs.
     """
     if scorer_options is None:
         scorer_options = IndexerScorerOptions()
@@ -1175,7 +1223,63 @@ def _indexer_topk_packed_thd(
         local_packed_cp_query_len=local_packed_cp_query_len,
     ):
         raise RuntimeError("general packed THD scorer received incompatible layout metadata")
+    topk_indices, selection_scores = _indexer_topk_packed_thd_cudnn(
+        q_bshd=q_bshd,
+        k_bshd=k_bshd,
+        w_bsh=w_bsh,
+        topk_k=topk_k,
+        return_topk_scores=return_topk_scores,
+        starts=starts,
+        ends=ends,
+        packed_cu_seqlens_q=packed_cu_seqlens_q,
+        packed_cu_seqlens_k=packed_cu_seqlens_k,
+        packed_max_seqlen_q=packed_max_seqlen_q,
+        packed_max_seqlen_k=packed_max_seqlen_k,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        deterministic=deterministic,
+        scorer_options=scorer_options,
+    )
+    topk_indices, topk_scores = _selected_scores_for_indexer_loss(
+        topk_indices,
+        selection_scores,
+        return_topk_scores=return_topk_scores,
+        q_bshd=q_bshd,
+        k_bshd=k_bshd,
+        w_bsh=w_bsh,
+        starts=starts,
+        ends=ends,
+        topk_k=topk_k,
+        precision=scorer_options.precision,
+    )
+    return _pad_topk_result(topk_indices, topk_scores, topk_k)
 
+
+def _indexer_topk_packed_thd_cudnn(
+    *,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    w_bsh: Tensor,
+    topk_k: int,
+    return_topk_scores: bool,
+    starts: Tensor,
+    ends: Tensor,
+    packed_cu_seqlens_q: Tensor,
+    packed_cu_seqlens_k: Tensor,
+    packed_max_seqlen_q: int,
+    packed_max_seqlen_k: int,
+    cp_size: int,
+    cp_rank: int,
+    deterministic: bool,
+    scorer_options: IndexerScorerOptions,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """cuDNN dense scorer + top-k of :func:`_indexer_topk_packed_thd`.
+
+    Returns global top-k indices ``(1, sq, min(topk_k, max_score_k))`` and, when asked, the
+    scorer's own values in the same slots (both unpadded).
+    """
+    _b, sq, _idx_nh, _idx_hd = q_bshd.shape
+    sk = k_bshd.size(1)
     device = q_bshd.device
     score_q_causal_offsets: Optional[Tensor] = None
     if cp_size == 1:
@@ -1211,6 +1315,13 @@ def _indexer_topk_packed_thd(
     skip_fill = scorer_options.skip_masked_score_fill and _supports_indexer_clean_logits()
     if scorer_options.skip_masked_score_fill and not skip_fill:
         _log_clean_logits_unavailable_once()
+    precision_kwargs = {}
+    if scorer_options.precision == "mxfp8":
+        # Only the scorer consumes the quantized tensors; the loss and indexer backward
+        # keep the caller's BF16 Q/K.
+        score_q, score_k, precision_kwargs = _quantize_packed_thd_scorer_inputs_mxfp8(
+            score_q, score_k, score_w, score_cu_q, score_cu_k
+        )
     scores = _indexer_forward_wrapper_with_warning(
         score_q,
         score_k,
@@ -1227,6 +1338,7 @@ def _indexer_topk_packed_thd(
             else {}
         ),
         **({"clean_logits": False} if skip_fill else {}),
+        **precision_kwargs,
     )["scores"]
 
     # Without the prefill only [0, column_limit) of each row is defined. Rows outside
@@ -1253,7 +1365,7 @@ def _indexer_topk_packed_thd(
                 torch.full_like(topk_indices, -1),
             )
         topk_scores = scores.view(1, sq, score_topk) if return_topk_scores else None
-        return _pad_topk_result(topk_indices, topk_scores, topk_k)
+        return topk_indices, topk_scores
 
     local_seq_lens = ends - starts
     if column_limits is not None:
@@ -1284,7 +1396,243 @@ def _indexer_topk_packed_thd(
     topk_indices = torch.where(
         valid, topk_indices + starts.view(1, sq, 1).to(dtype=topk_indices.dtype), topk_indices
     )
-    return _pad_topk_result(topk_indices, topk_scores, topk_k)
+    return topk_indices, topk_scores
+
+
+def _recomputes_indexer_loss_scores(precision: str) -> bool:
+    """Whether the selected scores for the indexer loss are recomputed from the BF16 inputs.
+
+    True exactly when the selection scorer computes in MXFP8 (``dsa_indexer_precision=
+    'mxfp8'``), whichever kernel scores and whatever dtype its scores come in: MXFP8 then
+    decides only which keys are selected. A scorer that computes in BF16 keeps its own
+    values, which already are the BF16 path's: the dense BF16 scorer's FP32 scores today,
+    and a future BF16-compute scorer that writes BF16 scores would keep its values as well.
+    """
+    return precision == "mxfp8"
+
+
+def _selected_scores_for_indexer_loss(
+    topk_indices: Tensor,
+    selection_scores: Optional[Tensor],
+    *,
+    return_topk_scores: bool,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    w_bsh: Tensor,
+    starts: Tensor,
+    ends: Tensor,
+    topk_k: int,
+    precision: str,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """The selected scores the indexer loss consumes for one packed THD selection.
+
+    ``topk_indices`` ``(1, sq, n)`` holds global key ids (``-1`` unselected) and
+    ``selection_scores`` the selection scorer's values in the same slots. The loss is on
+    exactly when the caller asked for scores (``return_topk_scores``), whatever the kernel
+    returned: a call without them (a frozen indexer or a selection-only call) keeps its
+    indices, returns no scores and never recomputes, and a loss-on call without values
+    raises. A BF16-compute scorer's values are returned unchanged
+    (:func:`_recomputes_indexer_loss_scores`). For an MXFP8-compute scorer they only mark the
+    selections the caller would drop: a slot whose value is not finite (a ``-inf`` prefill
+    column, a NaN score), outside its row's ``[starts, ends)`` or past the keys becomes
+    ``-1``, so such a slot or row still ends with no key, and the remaining keys are scored
+    again by :func:`_recompute_selected_indexer_log_probs`. Given the selection, the KL
+    predict and its gradient are then the BF16 path's.
+    """
+    if not return_topk_scores:
+        return topk_indices, None
+    if selection_scores is None:
+        raise RuntimeError(
+            "the DSA indexer selection scorer returned no selected scores for a call with the "
+            "indexer loss on (return_topk_scores=True)."
+        )
+    if not _recomputes_indexer_loss_scores(precision):
+        return topk_indices, selection_scores
+    sq, sk = q_bshd.size(1), k_bshd.size(1)
+    valid = (
+        (topk_indices >= 0)
+        & (topk_indices >= starts.view(1, sq, 1))
+        & (topk_indices < ends.view(1, sq, 1))
+        & (topk_indices < sk)
+        & torch.isfinite(selection_scores)
+    )
+    topk_indices = torch.where(valid, topk_indices, torch.full_like(topk_indices, -1))
+    return topk_indices, _recompute_selected_indexer_log_probs(
+        q_bshd, k_bshd, w_bsh, topk_indices, topk_k=topk_k
+    )
+
+
+def _recompute_selected_indexer_log_probs(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, topk_indices: Tensor, *, topk_k: int
+) -> Tensor:
+    """FP32 indexer log-probabilities over each row's selected keys (``-inf`` at ``-1``).
+
+    cuDNN's sparse indexer score recompute evaluates ``softmax_S(sum_h relu(q_h . k_j) w_h)``
+    in FP32 from the BF16 ``q_bshd`` ``(1, sq, H, D)``, ``k_bshd`` ``(1, sk, 1, D)`` and
+    ``w_bsh`` over the selected set ``S`` (``topk_indices`` ``(1, sq, n)``, global packed
+    key ids, ``-1`` unselected; masked by the kernel, so the valid slots need not be a
+    prefix). The same math as the dense BF16 scorer, on the selected keys only. The result is
+    ``log(max(p, FLT_MIN))``: the selected logits minus the row's log-sum-exp over ``S``.
+    Every consumer of the selected scores takes a per-row softmax over a subset of ``S``
+    (``masked_log_softmax``), which is shift invariant, so this equals passing the logits
+    themselves; only slots with ``p < FLT_MIN`` read -87.3 instead of their exact
+    log-probability. Those are the logits more than 87.3 below the row's log-sum-exp over
+    ``S``, which exceeds the row's maximum by up to ``ln |S|``: every logit more than 87.3
+    below the maximum, and at ``|S| = 2048`` possibly one only about 79.7 below it. The backward
+    clamps ``p`` to ``FLT_MIN`` as well, so the gradient is unchanged; the reported KL value
+    is not: where the attention target puts mass on such a slot, its term is capped near
+    87.3 nats while the BF16 path's keeps growing with the gap, so the KL reads lower than
+    the BF16 path's. The indices are padded with ``-1`` to ``topk_k`` rounded up to 128 (the
+    kernel's tile), one shape per configured top-k, so a narrow call never compiles a new
+    kernel variant.
+    """
+    recompute = getattr(_cudnn_dsa, "sparse_indexer_score_recompute_wrapper", None)
+    if recompute is None:
+        raise RuntimeError(
+            f"cuDNN frontend {_cudnn_frontend_version()} lacks "
+            "sparse_indexer_score_recompute_wrapper, needed for the indexer loss of "
+            "dsa_indexer_precision='mxfp8' (it recomputes the selected scores in FP32 from "
+            "the BF16 indexer inputs)."
+        )
+    n_selected = topk_indices.size(-1)
+    padded_topk = round_up_to_nearest_multiple(
+        max(topk_k, n_selected), _SPARSE_INDEXER_RECOMPUTE_TOPK_ALIGNMENT
+    )
+    indices = torch.nn.functional.pad(
+        topk_indices.to(torch.int32), (0, padded_topk - n_selected), value=-1
+    ).contiguous()
+    predict = recompute(
+        q_bshd.contiguous(),
+        k_bshd.squeeze(2).contiguous(),
+        w_bsh.contiguous(),
+        indices,
+        qhead_per_kv_head=q_bshd.size(2),
+        topk_indices_global=False,
+    )["predict"][..., :n_selected]
+    log_probs = torch.log(predict.float().clamp_min(_CLIP_PROB_MIN))
+    return torch.where(topk_indices >= 0, log_probs, torch.full_like(log_probs, float("-inf")))
+
+
+def _mxfp8_scorer_device_problem(device: torch.device) -> Optional[str]:
+    """Why ``device`` cannot run the cuDNN MXFP8 dense indexer scorer, or None."""
+    if device.type != "cuda":
+        return f"the MXFP8 scorer needs CUDA tensors, got device {device}"
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] < _MXFP8_SCORER_MIN_SM_MAJOR:
+        return f"SM{_MXFP8_SCORER_MIN_SM_MAJOR}0+ is required, got SM{capability[0]}{capability[1]}"
+    return None
+
+
+def _check_mxfp8_scorer_supported(q_thd: Tensor, k_thd: Tensor, w_th: Tensor) -> None:
+    """Raise unless this process can run the cuDNN MXFP8 dense indexer scorer."""
+    problems = []
+    if q_thd.ndim != 3 or q_thd.size(1) not in _MXFP8_SCORER_HEAD_COUNTS:
+        problems.append(f"indexer heads must be 32 or 64, got q shape {tuple(q_thd.shape)}")
+    if q_thd.size(-1) != _MXFP8_SCORER_HEAD_DIM or k_thd.size(-1) != _MXFP8_SCORER_HEAD_DIM:
+        problems.append(f"indexer head_dim must be {_MXFP8_SCORER_HEAD_DIM}")
+    if q_thd.dtype != torch.bfloat16 or k_thd.dtype != torch.bfloat16:
+        problems.append(f"indexer q/k must be BF16, got {q_thd.dtype}/{k_thd.dtype}")
+    if w_th.dtype != torch.bfloat16:
+        problems.append(
+            f"indexer weights must be BF16 (dsa_indexer_weights_proj_output_dtype='bf16'), "
+            f"got {w_th.dtype}"
+        )
+    device_problem = _mxfp8_scorer_device_problem(q_thd.device)
+    if device_problem is not None:
+        problems.append(device_problem)
+    missing = [
+        name
+        for name in _MXFP8_SCORER_WRAPPER_PARAMETERS
+        if not _accepts_named_parameter(_cudnn_dsa.indexer_forward_wrapper, name)
+    ]
+    if missing:
+        problems.append(
+            "the installed cuDNN frontend indexer_forward_wrapper lacks "
+            f"{', '.join(missing)} (cuDNN frontend >= 1.29 provides the MXFP8 dense scorer)"
+        )
+    if not indexer_quantization.HAVE_TE_MXFP8:
+        problems.append("Transformer Engine MXFP8 quantization is unavailable")
+    if not indexer_quantization.HAVE_TRITON:
+        problems.append("Triton (MXFP8 scale packing) is unavailable")
+    if problems:
+        raise RuntimeError(
+            "dsa_indexer_precision='mxfp8' cannot run the cuDNN dense indexer scorer: "
+            + "; ".join(problems)
+        )
+
+
+def _quantize_packed_thd_scorer_inputs_mxfp8(
+    q_thd: Tensor, k_thd: Tensor, w_th: Tensor, cu_seqlens_q: Tensor, cu_seqlens_k: Tensor
+) -> Tuple[Tensor, Tensor, dict]:
+    """Quantize the packed THD scorer Q ``(T_q, H, D)`` and K ``(T_k, 1, D)`` to MXFP8.
+
+    Returns the E4M3 Q/K and the ``indexer_forward_wrapper`` kwargs carrying the packed
+    E8M0 1x32 scales and their per-segment padded prefixes.
+
+    CUDA graph safety: no tensor is read on the host. The padded scale prefixes are
+    computed on the device, and the scale storage is sized from tensor shapes alone:
+    ``indexer_mxfp8_thd_scale_capacity`` bounds the padded scale rows of any boundaries
+    with these token and segment counts, which covers every dynamic-CP layout that maps
+    onto the same static shapes. All storage is dispatch-local, so a capture pool can
+    reuse it and replay never depends on an earlier call's pointers.
+    """
+    _check_mxfp8_scorer_supported(q_thd, k_thd, w_th)
+    total_q, num_heads, head_dim = q_thd.shape
+    total_k = k_thd.size(0)
+    num_segments = cu_seqlens_q.numel() - 1
+    device = q_thd.device
+    cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int32).contiguous()
+    cu_seqlens_k = cu_seqlens_k.to(dtype=torch.int32).contiguous()
+    q_scale_cu = indexer_quantization.make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_q, num_heads)
+    k_scale_cu = indexer_quantization.make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_k, 1)
+    q_scale = torch.empty(
+        _packed_thd_mxfp8_scale_shape(total_q, num_segments, num_heads, head_dim),
+        dtype=torch.float8_e8m0fnu,
+        device=device,
+    )
+    k_scale = torch.empty(
+        _packed_thd_mxfp8_scale_shape(total_k, num_segments, 1, head_dim),
+        dtype=torch.float8_e8m0fnu,
+        device=device,
+    )
+    q_fp8, q_scale = indexer_quantization.quantize_indexer_mxfp8(
+        q_thd.contiguous(),
+        cu_seqlens=cu_seqlens_q,
+        cu_seqlens_scale_padded=q_scale_cu,
+        out_scale=q_scale,
+        sf_vec_size=_MXFP8_SF_VEC_SIZE,
+    )
+    k_fp8, k_scale = indexer_quantization.quantize_indexer_mxfp8(
+        k_thd.reshape(total_k, head_dim).contiguous(),
+        cu_seqlens=cu_seqlens_k,
+        cu_seqlens_scale_padded=k_scale_cu,
+        out_scale=k_scale,
+        sf_vec_size=_MXFP8_SF_VEC_SIZE,
+    )
+    return (
+        q_fp8,
+        k_fp8.view(total_k, 1, head_dim),
+        {
+            "precision": "mxfp8",
+            "q_scale": q_scale,
+            "k_scale": k_scale,
+            "cu_seqlens_q_scale_padded": q_scale_cu,
+            "cu_seqlens_k_scale_padded": k_scale_cu,
+            "sf_vec_size": _MXFP8_SF_VEC_SIZE,
+        },
+    )
+
+
+def _packed_thd_mxfp8_scale_shape(
+    total_tokens: int, num_segments: int, num_heads: int, head_dim: int
+) -> Tuple[int, int, int]:
+    """Static packed E8M0 scale shape covering any segment boundaries of this geometry."""
+    capacity = indexer_quantization.indexer_mxfp8_thd_scale_capacity(
+        max(1, total_tokens), max(1, num_segments), num_heads
+    )
+    return indexer_quantization.indexer_mxfp8_thd_scale_shape(
+        capacity, num_heads, head_dim, _MXFP8_SF_VEC_SIZE
+    )
 
 
 def _log_clean_logits_unavailable_once() -> None:
@@ -2013,6 +2361,18 @@ def _indexer_topk_bshd(
         packed_metadata_available=packed_metadata_available,
     )
     if (
+        scorer_options is not None
+        and scorer_options.precision == "mxfp8"
+        and scoring_plan.plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS
+        and packed_metadata_available
+    ):
+        # Only the general THD scorer runs in MXFP8. A one-sequence pack is an ordinary
+        # general-THD layout, so score it there instead of rejecting the request.
+        scoring_plan = IndexerScoringDecision(
+            IndexerScoringPlan.PACKED_THD_GENERAL,
+            "single-sequence pack scored by the general packed THD scorer for MXFP8",
+        )
+    if (
         scoring_plan.plan is IndexerScoringPlan.PACKED_THD_GENERAL
         and packed_cp_size > 1
         and not _supports_indexer_q_causal_offsets()
@@ -2025,6 +2385,10 @@ def _indexer_topk_bshd(
     report_unfused_scoring_once(scoring_plan, "indexer scoring")
     if plan is IndexerScoringPlan.DECLINE:
         raise RuntimeError(f"invalid DSA scoring dispatch: {scoring_plan.reason}")
+    if scorer_options is not None:
+        _check_scorer_precision_supported(
+            scorer_options, plan=plan, reason=scoring_plan.reason, return_scores=return_scores
+        )
 
     # PLAIN_CAUSAL means the bounds, if any, are the trivial whole-sequence causal ones
     # that ``_causal_seq_lens`` rebuilds exactly, so the single-kernel scorer applies.
@@ -2197,6 +2561,29 @@ def _indexer_topk_bshd(
     topk_indices, topk_length = _compact_valid_topk_indices(topk_indices)
     topk_indices = _sort_valid_topk_indices_by_index(topk_indices, topk_length, sk)
     return topk_indices.int().contiguous(), topk_length, None
+
+
+def _check_scorer_precision_supported(
+    scorer_options: IndexerScorerOptions,
+    *,
+    plan: IndexerScoringPlan,
+    reason: str,
+    return_scores: bool,
+) -> None:
+    """Reject a requested scorer precision that this call's scoring path cannot honour."""
+    precision = scorer_options.precision
+    if precision == "bf16":
+        return
+    if precision != "mxfp8":
+        raise ValueError(f"dsa_indexer_precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    if plan is IndexerScoringPlan.PACKED_THD_GENERAL and not return_scores:
+        return
+    path = "the dense indexer loss (full scores)" if return_scores else f"the {plan.value} plan"
+    raise RuntimeError(
+        "dsa_indexer_precision='mxfp8' is implemented only by the general packed THD cuDNN "
+        f"scorer with the sparse indexer loss, but this call takes {path} ({reason}). "
+        "Use dsa_indexer_precision='bf16' for this layout."
+    )
 
 
 def _sbhd_to_bshd_indexer_inputs(
@@ -2439,7 +2826,12 @@ def run_fused_qk_topk_with_scores(
     ``run_fused_qk_topk``. The fp32 scores are the selected indexer logits in the same
     slots, which ``run_sparse_indexer_loss_from_topk`` consumes in a checkpoint replay.
     Declines when that replay could not consume the attention ``query``/``key`` layout,
-    so no scores are kept for nothing.
+    so no scores are kept for nothing. The kept scores are exactly what the non-reusing
+    path feeds the loss: with ``dsa_indexer_precision='mxfp8'`` the fp32 payload is the
+    selected keys' scores recomputed in FP32 from the BF16 indexer inputs, as
+    log-probabilities over the selection floored at ``log(FLT_MIN)``
+    (:func:`_recompute_selected_indexer_log_probs`); every consumer applies a per-row
+    softmax, which is shift invariant.
     """
     if not _sparse_indexer_loss_layout_supported(q, query, key, config):
         return None
@@ -2516,7 +2908,9 @@ def run_sparse_indexer_loss_from_topk(
     """Run the cuDNN sparse indexer loss for top-k selected by an earlier call.
 
     ``topk_indices``/``topk_length``/``topk_scores`` must come from
-    ``run_fused_qk_topk_with_scores`` on the same layer inputs.
+    ``run_fused_qk_topk_with_scores`` on the same layer inputs. The scores enter the loss
+    only through a per-row softmax over the valid slots, so the log-probability payload of
+    ``dsa_indexer_precision='mxfp8'`` is consumed exactly like logits.
     """
     tp_group = getattr(pg_collection, "tp", None)
     if loss_coeff <= 0:

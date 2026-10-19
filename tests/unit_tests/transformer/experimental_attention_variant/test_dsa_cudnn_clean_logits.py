@@ -33,36 +33,6 @@ def frontend(monkeypatch):
     return install
 
 
-def _packed_layout(seq_lens, cp_size, cp_rank, max_num_seqs=None):
-    """Local rows, bounds and padded cu_seqlens of a zigzag-CP packed THD batch."""
-    divisor = 2 * cp_size if cp_size > 1 else 1
-    assert all(length % divisor == 0 for length in seq_lens)
-    cu = [0]
-    for length in seq_lens:
-        cu.append(cu[-1] + length)
-    if max_num_seqs is not None:
-        cu += [cu[-1]] * (max_num_seqs + 1 - len(cu))
-    starts, ends = [], []
-    for seq, length in enumerate(seq_lens):
-        if cp_size == 1:
-            positions = range(length)
-        else:
-            half = length // divisor
-            front = range(cp_rank * half, (cp_rank + 1) * half)
-            back = range((divisor - 1 - cp_rank) * half, (divisor - cp_rank) * half)
-            positions = list(front) + list(back)
-        for position in positions:
-            starts.append(cu[seq])
-            ends.append(cu[seq] + position + 1)
-    cu_tensor = torch.tensor(cu, dtype=torch.int32)
-    return (
-        torch.tensor(starts, dtype=torch.int64),
-        torch.tensor(ends, dtype=torch.int64),
-        cu_tensor,
-        max(seq_lens),
-    )
-
-
 def _inputs(sq, sk, heads=4, dim=8, seed=0):
     generator = torch.Generator().manual_seed(seed)
     q = torch.randn((1, sq, heads, dim), generator=generator).to(torch.bfloat16)
@@ -138,7 +108,9 @@ def test_scorer_options_follow_the_config():
 def test_skipping_the_prefill_selects_identical_topk(
     frontend, poison, return_topk_scores, topk, seq_lens, cp_size, cp_rank, max_num_seqs
 ):
-    starts, ends, cu, max_seqlen = _packed_layout(seq_lens, cp_size, cp_rank, max_num_seqs)
+    starts, ends, cu, max_seqlen = fakes.packed_zigzag_layout(
+        seq_lens, cp_size, cp_rank, max_num_seqs
+    )
     sq = starts.numel()
     q, k, w = _inputs(sq, sq * cp_size, seed=sum(seq_lens) + cp_rank)
     args = (q, k, w, starts, ends, cu, max_seqlen, cp_size, cp_rank, topk, return_topk_scores)
@@ -158,7 +130,7 @@ def test_skipping_the_prefill_selects_identical_topk(
 
 
 def test_skip_is_ignored_without_frontend_support(frontend):
-    starts, ends, cu, max_seqlen = _packed_layout((8, 8), 1, 0)
+    starts, ends, cu, max_seqlen = fakes.packed_zigzag_layout((8, 8), 1, 0)
     q, k, w = _inputs(16, 16)
     dsa = frontend(fakes.Fe131DSA)
     _score(q, k, w, starts, ends, cu, max_seqlen, 1, 0, 3, False, SKIP)
@@ -166,7 +138,7 @@ def test_skip_is_ignored_without_frontend_support(frontend):
 
 
 def test_keep_option_never_requests_clean_logits(frontend):
-    starts, ends, cu, max_seqlen = _packed_layout((8, 8), 1, 0)
+    starts, ends, cu, max_seqlen = fakes.packed_zigzag_layout((8, 8), 1, 0)
     q, k, w = _inputs(16, 16)
     dsa = frontend(fakes.Fe131CleanLogitsDSA)
     _score(q, k, w, starts, ends, cu, max_seqlen, 1, 0, 3, False, KEEP)
@@ -176,7 +148,7 @@ def test_keep_option_never_requests_clean_logits(frontend):
 @pytest.mark.parametrize("topk", [3, 64], ids=["ranked", "full_cover"])
 def test_rows_past_the_last_cu_seqlens_entry_select_nothing(frontend, topk):
     """A pack whose cu_seqlens do not cover every row fails closed instead of reading poison."""
-    starts, ends, cu, max_seqlen = _packed_layout((8, 4), 1, 0)
+    starts, ends, cu, max_seqlen = fakes.packed_zigzag_layout((8, 4), 1, 0)
     # Four trailing rows that the bounds treat as part of the last sequence, but that no
     # cu_seqlens segment covers, so the kernel never writes them.
     starts = torch.cat((starts, torch.full((4,), 8)))
@@ -204,7 +176,7 @@ def test_column_limits_match_the_kernel_contract():
 
 
 def test_skip_path_does_not_synchronize_with_the_host(frontend, monkeypatch):
-    starts, ends, cu, max_seqlen = _packed_layout((8, 16), 2, 1, 4)
+    starts, ends, cu, max_seqlen = fakes.packed_zigzag_layout((8, 16), 2, 1, 4)
     sq = starts.numel()
     q, k, w = _inputs(sq, sq * 2)
     frontend(fakes.Fe131CleanLogitsDSA)
