@@ -992,7 +992,14 @@ class TestFlexDispatcher:
             hidden_size=1024,
             test_dtype=torch.bfloat16,
         )
-        container.dispatcher_dropless_test()
+        manager = container.moe_layer.token_dispatcher._comm_manager
+        assert isinstance(manager, _HybridEPManager)
+        for _ in range(2):
+            container.dispatcher_dropless_test()
+            assert manager.routing_map is None
+            assert manager.topk_idx is None
+            assert manager.token_probs is None
+            assert manager.dispatched_probs is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
