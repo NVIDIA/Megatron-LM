@@ -1,0 +1,52 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""DS4.1 source ownership; Core owns layout, communication and scheduling."""
+from dataclasses import dataclass
+
+from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+
+
+@dataclass(frozen=True)
+class LayerSources:
+    kv: int | None
+    index: int | None
+    candidate: bool
+
+
+def layer_sources(config: DeepseekV41Config) -> tuple[LayerSources, ...]:
+    n = config.num_hidden_layers
+    ratios = config.compress_ratios or ([0, 0] + [2] * 18 + [1] * 20 + [0] * 3)
+    if type(n) is not int or n <= 0 or len(ratios) < n:
+        raise ValueError("DS4.1 needs positive layer count and a ratio for every layer")
+    sources = (config.kv_source_layer_ids, config.index_source_layer_ids)
+    for ids in sources:
+        if any(type(i) is not int or i < 0 for i in ids) or list(ids) != sorted(set(ids)):
+            raise ValueError("DS4.1 owner layer ids must be sorted unique nonnegative integers")
+    result = []
+    for i, ratio in enumerate(ratios[:n]):
+        if type(ratio) is not int or ratio not in (0, 1, 2):
+            raise ValueError("DS4.1 compression ratios are literal 0, 1 or 2")
+        owners = tuple(max((s for s in ids if s <= i), default=None) for ids in sources)
+        if ratio and any(s is None or ratios[s] != ratio for s in owners):
+            raise ValueError(f"DS4.1 layer {i} has no compatible KV/index owner")
+        candidate = config.candidate_source_layer_id
+        uses_candidate = candidate >= 0 and i >= candidate
+        if ratio == 1 and not uses_candidate:
+            raise ValueError("DS4.1 ratio-1 layers require a candidate publisher")
+        result.append(LayerSources(*(owners if ratio else (None, None)), uses_candidate))
+    return tuple(result)
+
+
+def validate_build(
+    config: DeepseekV41Config, *, context_parallel_size: int
+) -> tuple[LayerSources, ...]:
+    """Call before process-group initialization or allocating model parameters."""
+    if type(context_parallel_size) is not int or context_parallel_size < 1:
+        raise ValueError("Context parallel size must be a positive integer")
+    policies = layer_sources(config)
+    if context_parallel_size > 1 and any(p.candidate for p in policies):
+        raise NotImplementedError(
+            "DS4.1 CP support is incomplete: candidate layers CP>1 await an upstream "
+            "candidate-column injection point in Core CompressedSparseAttention._forward_thd_cp "
+            "(dev 7b150acf). Use CP1 or a candidate-free layer prefix; see the DS4.1 README."
+        )
+    return policies
