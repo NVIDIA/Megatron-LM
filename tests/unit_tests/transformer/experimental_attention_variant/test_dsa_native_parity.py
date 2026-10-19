@@ -24,6 +24,34 @@ from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_pari
     run_absorbed_mla_dsa_parity,
 )
 
+# Frontend version reported while a test-local fake replaces the cuDNN DSA namespace.
+_FAKE_NAMESPACE_FRONTEND_VERSION = (1, 21)
+
+
+@pytest.fixture(autouse=True)
+def _fake_dsa_namespaces_report_a_legacy_frontend(monkeypatch):
+    """Report a legacy cuDNN frontend version whenever a fake DSA namespace is installed.
+
+    The fakes in this file model the frontend <= 1.28 wrappers: no ``q_causal_offsets`` and
+    the bottom-right causal default. ``_cudnn_frontend_version`` reads the installed
+    ``cudnn`` package, so on a host with frontend >= 1.29 the version gates would otherwise
+    describe a different frontend than the namespace the code under test calls. The real
+    namespace keeps reporting the installed version.
+    """
+    installed_version = dsa_cudnn_kernels._cudnn_frontend_version
+    try:
+        from cudnn import DSA as real_namespace
+    except ImportError:
+        real_namespace = None
+
+    def frontend_version():
+        namespace = dsa_cudnn_kernels._cudnn_dsa
+        if namespace is not None and namespace is not real_namespace:
+            return _FAKE_NAMESPACE_FRONTEND_VERSION
+        return installed_version()
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_frontend_version", frontend_version)
+
 
 # Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
 # case fails with a CUDA error in CI (deterministic, not truly flaky). Re-enable once the

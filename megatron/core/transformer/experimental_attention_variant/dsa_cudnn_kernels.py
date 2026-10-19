@@ -7,6 +7,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import re
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -162,6 +163,9 @@ _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS = 32768
 _DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES = 256 * 1024 * 1024
 _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS = frozenset((16, 32, 64, 96, 128))
 _DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict[tuple[torch.device, int], Tensor] = {}
+# First cuDNN frontend release whose dense DSA kernels default to a zero (top-left)
+# q_causal_offset instead of the legacy bottom-right alignment.
+_TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION = (1, 29)
 
 
 def _indexer_forward_wrapper_with_warning(
@@ -179,6 +183,27 @@ def _indexer_forward_wrapper_with_warning(
     if total_q > FUSED_INDEXER_MAX_SAFE_ROWS:
         warn_fused_indexer_row_limit_once(total_q, logger=logging.getLogger(__name__))
     return _cudnn_dsa.indexer_forward_wrapper(index_q, index_k, weights, **kwargs)
+
+
+def _indexer_forward_bshd_bottom_right(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, *, ratio: int
+) -> Tensor:
+    """Dense BSHD indexer scores with the bottom-right causal alignment on any frontend."""
+    return _indexer_forward_wrapper_with_warning(
+        q_bshd,
+        k_bshd,
+        w_bsh,
+        ratio=ratio,
+        sm_scale=_INDEXER_SOFTMAX_SCALE,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.indexer_forward_wrapper,
+            batch=q_bshd.size(0),
+            seqlen_q=q_bshd.size(1),
+            seqlen_k=k_bshd.size(1),
+            ratio=ratio,
+            device=q_bshd.device,
+        ),
+    )["scores"]
 
 
 def _assert_supported_indexer_scoring(use_relu: bool) -> None:
@@ -832,13 +857,13 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
-            scores_chunk = _indexer_forward_wrapper_with_warning(
-                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )["scores"]
+            scores_chunk = _indexer_forward_bshd_bottom_right(
+                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio
+            )
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
-            scores_chunk = _indexer_forward_wrapper_with_warning(
-                q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )["scores"]
+            scores_chunk = _indexer_forward_bshd_bottom_right(
+                q_chunk, k_bshd, w_chunk, ratio=indexer_ratio
+            )
         else:
             if global_rows_k_bdk is None:
                 global_rows_k_bdk = (
@@ -1303,6 +1328,55 @@ def _supports_indexer_q_causal_offsets() -> bool:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _cudnn_frontend_version() -> Optional[Tuple[int, int]]:
+    """Return the installed cuDNN frontend ``(major, minor)``, or None if unknown."""
+    try:
+        import cudnn
+    except ImportError:
+        return None
+    match = re.match(r"(\d+)\.(\d+)", str(getattr(cudnn, "__version__", "")))
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _cudnn_frontend_at_least(version: Tuple[int, int]) -> bool:
+    """Whether the installed cuDNN frontend is known to be at least ``version``."""
+    installed = _cudnn_frontend_version()
+    return installed is not None and installed >= version
+
+
+def _bottom_right_q_offset_kwargs(
+    wrapper, *, batch: int, seqlen_q: int, seqlen_k: int, ratio: int, device: torch.device
+) -> dict:
+    """Pin the bottom-right causal alignment of a cuDNN BSHD dense DSA call.
+
+    Without ``q_causal_offsets`` the dense indexer forward, dense attention score
+    recompute and dense indexer backward kernels of cuDNN frontend <= 1.28 (including the
+    1.21.1 q-offset overlay) align the causal mask bottom-right, i.e. local query row ``i``
+    sees keys ``[0, (seqlen_k * ratio - seqlen_q + i + 1) // ratio)``. Frontend 1.29
+    (NVIDIA/cudnn-frontend#370) changed that default to a zero offset (top-left). Every
+    MCore BSHD call site was written against the bottom-right contract -- the score-chunk
+    path crops the key prefix precisely so that bottom-right masking reproduces each row's
+    absolute length -- so pass the legacy offset explicitly whenever the default differs.
+
+    Returns no kwargs when the offset is zero (both conventions agree) or when the
+    installed frontend still has the legacy default, which keeps those calls, and their
+    kernel compile keys, exactly as before.
+    """
+    offset = seqlen_k * ratio - seqlen_q
+    if offset == 0 or not _cudnn_frontend_at_least(_TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION):
+        return {}
+    if not filter_kwargs_for_callable(wrapper, {"q_causal_offsets": None}):
+        raise RuntimeError(
+            f"cuDNN frontend {_cudnn_frontend_version()} aligns causal masks top-left by "
+            f"default, but {getattr(wrapper, '__name__', wrapper)!r} does not accept "
+            "q_causal_offsets to restore the bottom-right alignment MCore requires."
+        )
+    return {"q_causal_offsets": torch.full((batch,), offset, dtype=torch.int32, device=device)}
+
+
 def _supports_deterministic_sparse_attention_backward(query: Tensor) -> bool:
     """Return whether the installed cuDNN DSA backend can run deterministic backward."""
     if not query.is_cuda or query.size(2) not in _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS:
@@ -1720,11 +1794,8 @@ def _indexer_topk_bshd(
                 deterministic=deterministic,
             )
         else:
-            scores = _indexer_forward_wrapper_with_warning(
-                q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )[
-                "scores"
-            ]  # (b, sq, sk) fp32, -inf on masked positions
+            # (b, sq, sk) fp32, -inf on masked positions
+            scores = _indexer_forward_bshd_bottom_right(q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO)
     else:
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
         if not return_scores and plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS:
@@ -2527,6 +2598,14 @@ def _compute_dense_attn_score(
         softmax_scale,
         qhead_per_kv_head=qhead_per_kv_head,
         ratio=_INDEXER_RATIO,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.dense_attn_score_recompute_wrapper,
+            batch=q_attn_bshd.size(0),
+            seqlen_q=q_attn_bshd.size(1),
+            seqlen_k=k_attn_bshd.size(1),
+            ratio=_INDEXER_RATIO,
+            device=q_attn_bshd.device,
+        ),
     )
     return result["out"], result["denom"]
 
@@ -2757,6 +2836,14 @@ def _compute_dense_indexer_loss_and_grads(
         grad_loss=unit_grad_loss,
         ratio=_INDEXER_RATIO,
         block_I=128,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.dense_indexer_backward_wrapper,
+            batch=q_idx_bshd_for_bwd.size(0),
+            seqlen_q=q_idx_bshd_for_bwd.size(1),
+            seqlen_k=k_idx_bsd.size(1),
+            ratio=_INDEXER_RATIO,
+            device=q_idx_bshd_for_bwd.device,
+        ),
     )
     # BSHD -> SBHD (match input layout).
     grad_q_bshd, grad_w_bsh = _slice_indexer_backward_head_grads(
