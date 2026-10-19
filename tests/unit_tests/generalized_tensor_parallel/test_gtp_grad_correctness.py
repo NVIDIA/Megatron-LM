@@ -425,7 +425,7 @@ def _worker_wide_residual(
             sharded_names.append(name)
         else:
             param.data.copy_(full)
-        if 'residual_connection_' in name:
+        if 'residual_read_' in name or 'residual_write_' in name:
             controller_names.append(name.removeprefix('0.'))
             assert not isinstance(param, GTPShardedParam), f"controller was GTP-sharded: {name}"
 
