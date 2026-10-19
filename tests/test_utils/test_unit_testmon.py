@@ -36,11 +36,30 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0):
+def _invoke(project, cache, mode, phase="prod", rank=0, check_no_inventory=False):
+    launcher = [str(WRAPPER_PATH)]
+    if check_no_inventory:
+        launcher = [
+            "-c",
+            textwrap.dedent(f"""\
+                import runpy
+                import sys
+
+                sys.path.insert(0, {str(WRAPPER_PATH.parent)!r})
+                import testmon_cache
+
+                def unexpected_inventory(root):
+                    raise AssertionError('nonzero ranks must not fingerprint test sources')
+
+                testmon_cache.collection_inventory = unexpected_inventory
+                sys.argv[0] = {str(WRAPPER_PATH)!r}
+                runpy.run_path(sys.argv[0], run_name='__main__')
+                """),
+        ]
     return subprocess.run(
         [
             sys.executable,
-            str(WRAPPER_PATH),
+            *launcher,
             "--mode",
             mode,
             "--cache-dir",
@@ -129,15 +148,14 @@ def test_successful_baseline_records_each_phase(project, cache):
     assert result.returncode == 0, result.stdout + result.stderr
     for phase in ("prod", "experimental"):
         assert (cache / phase / ".testmondata").is_file()
-        assert (cache / phase / "metadata.json").is_file()
-        collection = json.loads((cache / phase / "collection/rank-0.json").read_text())
-        assert collection["rank"] == 0
+        collection = json.loads((cache / phase / "metadata.json").read_text())["collection"]
         assert collection["world_size"] == 4
         assert collection["rootpath"] == str(project)
         assert collection["nodeids"] == [
             "tests/test_app.py::test_active",
             "tests/test_other.py::test_other",
         ]
+        assert not (cache / phase / "collection").exists()
 
 
 def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
@@ -145,7 +163,6 @@ def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
     result = _invoke(project, cache, "baseline")
     assert result.returncode == 1
     assert not (cache / "prod/metadata.json").exists()
-    assert not (cache / "prod/collection/rank-0.json").exists()
 
 
 def test_empty_baseline_phase_is_recorded(project, tmp_path):
@@ -160,19 +177,12 @@ def test_empty_baseline_phase_is_recorded(project, tmp_path):
     assert (cache / ".testmon-work/prod/rank-0/selected-tests").read_text() == ""
 
 
-def test_nonzero_baseline_rank_records_collection_without_database(project, tmp_path):
+def test_nonzero_baseline_rank_runs_tests_without_writing_cache(project, tmp_path):
     cache = tmp_path / "rank-three-cache"
     result = _invoke(project, cache, "baseline", rank=3)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert not (cache / "prod/.testmondata").exists()
-    assert not (cache / "prod/metadata.json").exists()
-    collection = json.loads((cache / "prod/collection/rank-3.json").read_text())
-    assert collection["rank"] == 3
-    assert collection["world_size"] == 4
-    assert collection["nodeids"] == [
-        "tests/test_app.py::test_active",
-        "tests/test_other.py::test_other",
-    ]
+    assert "2 passed" in result.stdout
+    assert not cache.exists()
 
 
 def test_baseline_collection_includes_test_helpers(project, tmp_path):
@@ -180,27 +190,21 @@ def test_baseline_collection_includes_test_helpers(project, tmp_path):
     helper.parent.mkdir()
     helper.write_text("def shared_helper(): return 1\n")
     cache = tmp_path / "inventory-cache"
-    result = _invoke(project, cache, "baseline", rank=1)
+    result = _invoke(project, cache, "baseline")
     assert result.returncode == 0, result.stdout + result.stderr
-    collection = json.loads((cache / "prod/collection/rank-1.json").read_text())
+    collection = json.loads((cache / "prod/metadata.json").read_text())["collection"]
     expected = sys.modules["testmon_cache"].collection_inventory(project)
     assert collection["files"] == expected
     assert "tests/unit_tests/shared_helper.py" in collection["files"]
 
 
-def test_baseline_records_tests_collected_only_on_nonzero_ranks(project, tmp_path):
-    (project / "tests/test_rank.py").write_text(
-        "import os\n\nif os.environ['RANK'] == '3':\n"
-        "    def test_nonzero_rank_only():\n        assert True\n"
-    )
-    cache = tmp_path / "rank-specific-cache"
-    for rank in (0, 3):
-        result = _invoke(project, cache, "baseline", rank=rank)
-        assert result.returncode == 0, result.stdout + result.stderr
-        collection = json.loads((cache / f"prod/collection/rank-{rank}.json").read_text())
-        assert ("tests/test_rank.py::test_nonzero_rank_only" in collection["nodeids"]) is (
-            rank == 3
-        )
+def test_nonzero_baseline_rank_preserves_rank_zero_metadata_without_fingerprinting(project, cache):
+    before = _snapshot(cache / "prod")
+    result = _invoke(project, cache, "baseline", rank=3, check_no_inventory=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+    assert _snapshot(cache / "prod") == before
+    assert not (cache / "prod/collection").exists()
 
 
 @pytest.mark.parametrize("rank", (0, 3))

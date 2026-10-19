@@ -33,7 +33,7 @@ def source_tree(tmp_path):
     root = tmp_path / "source"
     (root / "tests/unit_tests").mkdir(parents=True)
     (root / "tests/unit_tests/test_example.py").write_text(
-        "def test_rank_0(): pass\ndef test_rank_1(): pass\n"
+        "def test_one(): pass\ndef test_two(): pass\n"
     )
     for name in (*cache.COMPATIBILITY_FILES, "docker/.ngc_version.dev", "docker/Dockerfile.ci.dev"):
         path = root / name
@@ -55,19 +55,19 @@ def generation(tmp_path, source_tree):
         path.parent.mkdir(parents=True)
         database = DB(str(path))
         database.con.close()
-        cache.record_phase(directory, phase)
-        for rank in range(2):
-            cache.record_collection(
-                directory,
-                phase,
-                rank,
-                2,
-                {
-                    "rootpath": str(source_tree),
-                    "nodeids": [f"tests/unit_tests/test_example.py::test_rank_{rank}"],
-                    "files": cache.collection_inventory(source_tree),
-                },
-            )
+        cache.record_phase(
+            directory,
+            phase,
+            {
+                "world_size": 2,
+                "rootpath": str(source_tree),
+                "nodeids": [
+                    "tests/unit_tests/test_example.py::test_one",
+                    "tests/unit_tests/test_example.py::test_two",
+                ],
+                "files": cache.collection_inventory(source_tree),
+            },
+        )
     cache.finalize(directory, identity, "b" * 40, "123-1")
     return directory, identity
 
@@ -297,41 +297,48 @@ def test_manifest_requires_timezone_for_age_reporting(generation):
         cache.validate_cache(directory, identity, identity["cache_prefix"] + "123-1")
 
 
-def test_finalized_collection_unions_all_ranks(generation, source_tree):
-    directory, _ = generation
+def test_finalization_uses_rank_zero_metadata_without_per_rank_files(generation, source_tree):
+    directory, identity = generation
+    metadata_before = {
+        phase: (directory / phase / "metadata.json").read_bytes() for phase in cache.PHASES
+    }
+    cache.finalize(directory, identity, "b" * 40, "123-2")
     for phase in cache.PHASES:
+        assert not (directory / phase / "collection").exists()
+        assert (directory / phase / "metadata.json").read_bytes() == metadata_before[phase]
         metadata = json.loads((directory / phase / "metadata.json").read_text())
         assert metadata["collection"] == {
             "rootpath": str(source_tree),
             "world_size": 2,
             "nodeids": [
-                "tests/unit_tests/test_example.py::test_rank_0",
-                "tests/unit_tests/test_example.py::test_rank_1",
+                "tests/unit_tests/test_example.py::test_one",
+                "tests/unit_tests/test_example.py::test_two",
             ],
             "files": cache.collection_inventory(source_tree),
         }
 
 
-@pytest.mark.parametrize("mutation", ["missing-rank", "extra-rank", "files", "world-size", "rank"])
-def test_finalize_rejects_incomplete_or_inconsistent_rank_collections(generation, mutation):
+@pytest.mark.parametrize("mutation", ["missing", "nodeids", "files", "world-size", "rootpath"])
+def test_finalize_rejects_invalid_rank_zero_collection(generation, mutation):
     directory, identity = generation
     (directory / "manifest.json").unlink()
-    rank_path = directory / "experimental/collection/rank-1.json"
-    if mutation == "missing-rank":
-        rank_path.unlink()
-    elif mutation == "extra-rank":
-        rank_path.with_name("rank-2.json").write_text(rank_path.read_text())
+    metadata_path = directory / "experimental/metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    if mutation == "missing":
+        del metadata["collection"]
     else:
-        collection = json.loads(rank_path.read_text())
+        collection = metadata["collection"]
         if mutation == "files":
-            collection["files"] = {}
+            collection["files"] = {"tests/unit_tests/test_example.py": "invalid-hash"}
         elif mutation == "world-size":
-            collection["world_size"] = 3
+            collection["world_size"] = 0
+        elif mutation == "nodeids":
+            collection["nodeids"] = [None]
         else:
-            collection["rank"] = 0
-        rank_path.write_text(json.dumps(collection))
+            collection["rootpath"] = ""
+    metadata_path.write_text(json.dumps(metadata))
     before = _snapshot(directory)
-    with pytest.raises(ValueError, match="Testmon rank collections"):
+    with pytest.raises(ValueError, match="collection inventory"):
         cache.finalize(directory, identity, "b" * 40, "123-2")
     assert _snapshot(directory) == before
     assert not (directory / "manifest.json").exists()

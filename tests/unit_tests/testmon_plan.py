@@ -47,7 +47,7 @@ def _nodeid(root: Path, value: str) -> str:
 def _collection(root: Path, metadata: dict, files: dict[str, str]) -> dict:
     collection = metadata.get("collection")
     if not isinstance(collection, dict):
-        raise ValueError("missing complete rank collection inventory")
+        raise ValueError("missing rank-zero collection inventory")
     world_size = collection.get("world_size")
     if type(world_size) is not int or world_size < 1:
         raise ValueError("invalid rank collection world size")
@@ -57,7 +57,7 @@ def _collection(root: Path, metadata: dict, files: dict[str, str]) -> dict:
     for nodeid in nodeids:
         _nodeid(root, nodeid)
     if collection.get("files") != files:
-        # Collection can execute arbitrary Python, generate parameters, and vary by rank.
+        # Collection can execute arbitrary Python and generate parameters.
         # Any new or changed test/helper needs collection in its original GPU environment.
         raise ValueError("unit-test sources changed; GPU collection is required")
     return collection
@@ -149,7 +149,7 @@ def _select_phase(root: Path, database: Path, collected: list[str]) -> list[str]
     inventory = set(collected)
     # Testmon records placeholders before pytest applies marker deselection.
     known = {_nodeid(root, nodeid) for nodeid, _ in recorded} & inventory
-    # Tests collected only on other ranks have no rank-zero dependency evidence.
+    # Keep any collected tests that have no recorded dependency evidence.
     selected = inventory - known
     selected.update(nodeid for nodeid, failed in recorded if nodeid in inventory and failed != 0)
     sources = {}

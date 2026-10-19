@@ -121,19 +121,6 @@ def collection_inventory(root: Path) -> dict[str, str]:
     }
 
 
-def record_collection(
-    cache_dir: Path, phase: str, rank: int, world_size: int, collection: dict
-) -> None:
-    """Record a successful rank's collection for the baseline finalizer."""
-    collection = {**collection, "rank": rank, "world_size": world_size}
-    _validate_collection(collection)
-    if not 0 <= rank < world_size:
-        raise ValueError("invalid Testmon collection rank")
-    directory = _database(cache_dir, phase).parent / "collection"
-    directory.mkdir(parents=True, exist_ok=True)
-    _write_json(directory / f"rank-{rank}.json", collection)
-
-
 def _validate_collection(collection: object) -> None:
     if not isinstance(collection, dict):
         raise ValueError("missing Testmon collection inventory")
@@ -159,31 +146,6 @@ def _validate_collection(collection: object) -> None:
         )
     ):
         raise ValueError("invalid Testmon collection inventory")
-
-
-def _merge_collections(cache_dir: Path, phase: str) -> dict:
-    directory = _database(cache_dir, phase).parent / "collection"
-    first = _read_json(directory / "rank-0.json")
-    _validate_collection(first)
-    world_size = first["world_size"]
-    expected = {f"rank-{rank}.json" for rank in range(world_size)}
-    if {path.name for path in directory.glob("rank-*.json")} != expected:
-        raise ValueError(f"incomplete Testmon rank collections: {phase}")
-    nodeids = set()
-    for rank in range(world_size):
-        collection = _read_json(directory / f"rank-{rank}.json")
-        _validate_collection(collection)
-        if collection.get("rank") != rank or any(
-            collection[field] != first[field] for field in ("world_size", "rootpath", "files")
-        ):
-            raise ValueError(f"inconsistent Testmon rank collections: {phase}")
-        nodeids.update(collection["nodeids"])
-    return {
-        "world_size": world_size,
-        "rootpath": first["rootpath"],
-        "nodeids": sorted(nodeids),
-        "files": first["files"],
-    }
 
 
 def cache_identity(
@@ -246,8 +208,9 @@ def _validate_database(database: Path) -> None:
         raise ValueError(f"invalid Testmon database {database}: {error}") from error
 
 
-def record_phase(cache_dir: Path, phase: str) -> None:
-    """Checkpoint and mark a successfully completed rank-zero baseline phase."""
+def record_phase(cache_dir: Path, phase: str, collection: dict) -> None:
+    """Save rank zero's dependency database and collection after a successful phase."""
+    _validate_collection(collection)
     database = _database(cache_dir, phase)
     if not database.is_file():
         raise ValueError(f"missing Testmon database: {database}")
@@ -269,6 +232,7 @@ def record_phase(cache_dir: Path, phase: str) -> None:
             "complete": True,
             "runtime": identity,
             "database_sha256": _digest(database),
+            "collection": collection,
         },
     )
 
@@ -283,6 +247,7 @@ def validate_phase(cache_dir: Path, phase: str, *, check_runtime: bool = True) -
         or metadata.get("complete") is not True
     ):
         raise ValueError(f"incomplete Testmon phase: {phase}")
+    _validate_collection(metadata.get("collection"))
     runtime = metadata.get("runtime")
     if not isinstance(runtime, dict) or runtime.get("testmon") != TESTMON_VERSION:
         raise ValueError(f"invalid Testmon runtime metadata: {phase}")
@@ -299,14 +264,8 @@ def finalize(cache_dir: Path, identity: dict, source_sha: str, generation: str) 
         r"[0-9]+-[0-9]+", generation
     ):
         raise ValueError("invalid baseline source or generation")
-    metadata_by_phase = {}
     for phase in PHASES:
         validate_phase(cache_dir, phase, check_runtime=False)
-        metadata = _read_json(_database(cache_dir, phase).parent / "metadata.json")
-        metadata["collection"] = _merge_collections(cache_dir, phase)
-        metadata_by_phase[phase] = metadata
-    for phase, metadata in metadata_by_phase.items():
-        _write_json(_database(cache_dir, phase).parent / "metadata.json", metadata)
     manifest = {
         "schema": SCHEMA,
         "source_ref": "refs/heads/main",
@@ -341,8 +300,6 @@ def validate_cache(cache_dir: Path, identity: dict, matched_key: str) -> dict:
         raise ValueError("Testmon baseline creation time must include a timezone")
     for phase in PHASES:
         validate_phase(cache_dir, phase, check_runtime=False)
-        metadata = _read_json(_database(cache_dir, phase).parent / "metadata.json")
-        _validate_collection(metadata.get("collection"))
     return manifest
 
 

@@ -24,13 +24,17 @@ class _SelectionOutput:
 
 
 class _BaselineCollection:
-    def __init__(self, inventory) -> None:
+    """Record rank zero's inventory, assuming all ranks collect the same test IDs."""
+
+    def __init__(self, inventory, world_size: int) -> None:
         self.inventory = inventory
+        self.world_size = world_size
         self.collection: dict | None = None
 
     def pytest_collection_finish(self, session) -> None:
         root = session.config.rootpath.resolve()
         self.collection = {
+            "world_size": self.world_size,
             "rootpath": str(root),
             "nodeids": sorted({item.nodeid for item in session.items}),
             "files": self.inventory(root),
@@ -73,7 +77,7 @@ def _testmon_dependency_override() -> str:
 
 def _run(args: argparse.Namespace) -> int:
     # Spawned workers reload this script after its directory leaves sys.path.
-    from testmon_cache import collection_inventory, record_collection, record_phase, validate_phase
+    from testmon_cache import collection_inventory, record_phase, validate_phase
 
     try:
         rank = int(os.environ["RANK"])
@@ -89,13 +93,10 @@ def _run(args: argparse.Namespace) -> int:
     if not pytest_args:
         raise RuntimeError("pytest arguments are required after --")
 
-    plugin: _BaselineCollection | _SelectionOutput
+    plugin: _BaselineCollection | _SelectionOutput | None = None
     if args.mode == "baseline":
-        plugin = _BaselineCollection(collection_inventory)
-        (_database(args.cache_dir, args.phase).parent / "collection" / f"rank-{rank}.json").unlink(
-            missing_ok=True
-        )
         if rank == 0:
+            plugin = _BaselineCollection(collection_inventory, world_size)
             database = _database(args.cache_dir, args.phase)
             _clear_database_files(database)
             (database.parent / "metadata.json").unlink(missing_ok=True)
@@ -131,13 +132,11 @@ def _run(args: argparse.Namespace) -> int:
 
     import pytest
 
-    result = int(pytest.main(pytest_args, plugins=[plugin]))
+    result = int(pytest.main(pytest_args, plugins=[plugin] if plugin is not None else []))
     if isinstance(plugin, _BaselineCollection) and result in (0, 5):
         if plugin.collection is None:
             raise RuntimeError("missing baseline pytest collection")
-        record_collection(args.cache_dir, args.phase, rank, world_size, plugin.collection)
-        if rank == 0:
-            record_phase(args.cache_dir, args.phase)
+        record_phase(args.cache_dir, args.phase, plugin.collection)
     return 0 if result == 5 else result
 
 

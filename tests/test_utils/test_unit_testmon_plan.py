@@ -214,10 +214,8 @@ def test_collection_changes_fall_back_to_full_bucket(project, generation, change
     assert "sources changed" in plan["reason"]
 
 
-def test_tests_collected_only_on_other_ranks_are_always_selected(project, generation):
-    extra = OTHER_TEST + "::test_rank_one"
-    for phase in cache.PHASES:
-        _metadata(generation, phase, lambda value: value["collection"].update(world_size=2))
+def test_collected_tests_without_dependency_evidence_are_always_selected(project, generation):
+    extra = OTHER_TEST + "::test_unrecorded"
     _metadata(generation, "prod", lambda value: value["collection"]["nodeids"].append(extra))
     plan = _select(project, generation)
     assert plan["mode"] == "selected", plan["reason"]
