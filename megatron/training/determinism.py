@@ -2,7 +2,7 @@
 
 """Reusable helpers for enabling bit-exact-reproducible execution.
 
-Two entry points:
+Three entry points:
 
 * :func:`apply_determinism_env` — validate env-var settings and setdefault
   the canonical values. Must run BEFORE the first cuBLAS / Transformer
@@ -10,10 +10,13 @@ Two entry points:
 * :func:`apply_determinism_to_args` — validate a parsed ``args`` Namespace,
   call :func:`apply_determinism_env` on ``os.environ``, and flip
   ``torch.use_deterministic_algorithms(True)``.
+* :func:`assert_nccl_algo_still_empty` — after the first NCCL process group,
+  check that PyTorch left an empty ``NCCL_ALGO`` alone.
 """
 
 from __future__ import annotations
 
+import ctypes
 import os
 from typing import MutableMapping
 
@@ -65,7 +68,15 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
 # ``Tree`` is intentionally NOT accepted: its intra-node chain reduction
 # order is not user-controllable and its multi-node inter-tree topology can
 # vary across runs without a pinned topology file, so we cannot vouch for it.
-ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset({"Ring", "CollnetDirect", "CollnetChain", "^NVLS"})
+#
+# An empty ``NCCL_ALGO`` is accepted as well and lets NCCL choose; see
+# :func:`apply_determinism_env`.
+#
+# ``NVLS`` is accepted only together with ``Ring`` and never on Hopper; see
+# :func:`apply_determinism_env` and :func:`apply_determinism_to_args`.
+ACCEPTED_NCCL_ALGO_TOKENS: frozenset[str] = frozenset(
+    {"Ring", "CollnetDirect", "CollnetChain", "^NVLS", "NVLS"}
+)
 
 # Env vars whose valid deterministic values are a small fixed exact-match set
 # (unlike NCCL_ALGO which accepts comma-separated subsets of tokens). An unset
@@ -97,7 +108,10 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     Semantics per key:
 
     * ``NCCL_ALGO`` — if set, each comma-separated token must be in
-      :data:`ACCEPTED_NCCL_ALGO_TOKENS`.
+      :data:`ACCEPTED_NCCL_ALGO_TOKENS`, and ``NVLS`` needs ``Ring`` in the same
+      list. The empty string is accepted and kept: NCCL (and a tuner plugin, if
+      one is loaded) then chooses the algorithms. A value of only whitespace is
+      rejected.
     * ``NCCL_EP_HT_EM_AG_SCAN_MODE`` / ``NVTE_ALLOW_NONDETERMINISTIC_ALGO`` /
       ``CUBLAS_WORKSPACE_CONFIG`` —
       if set, must be in :data:`ACCEPTED_ENV_VAR_VALUES`.
@@ -119,10 +133,22 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     (NCCL at communicator init, cuBLAS at handle creation, TE at first
     attention forward), so the call must happen BEFORE any of those events.
     """
-    # NCCL_ALGO subset check.
+    # NCCL_ALGO subset check. The empty string is an explicit request to let NCCL choose:
+    # PyTorch counts it as set and so does not write NCCL_ALGO=^NVLS under
+    # torch.use_deterministic_algorithms(True), and NCCL 2.24 and later exclude no algorithm
+    # for the empty string.
     nccl_algo = env.get("NCCL_ALGO")
-    if nccl_algo is not None:
+    if nccl_algo not in (None, ""):
+        assert nccl_algo.strip(), (
+            f"NCCL_ALGO={nccl_algo!r} contains only whitespace, which NCCL 2.24 and later fail "
+            "to parse. Set NCCL_ALGO to the empty string to let NCCL choose the algorithms, or "
+            f"to a subset of {sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
+        )
         tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
+        assert "NVLS" not in tokens or "Ring" in tokens, (
+            f"NCCL_ALGO={nccl_algo!r}: NVLS needs Ring in the list, because broadcast and "
+            "reduce run only with Ring. Use 'Ring,NVLS'."
+        )
         assert tokens and all(t in ACCEPTED_NCCL_ALGO_TOKENS for t in tokens), (
             f"NCCL_ALGO={nccl_algo!r}: each token must be in "
             f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
@@ -184,7 +210,9 @@ def apply_determinism_to_args(args) -> None:
        ``CUBLAS_WORKSPACE_CONFIG``,
        ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``,
        ``TRITON_CACHE_AUTOTUNING`` and its required ``TRITON_CACHE_DIR``) and
-       setdefaults the canonical values.
+       setdefaults the canonical values. If ``NCCL_ALGO`` is empty or has
+       ``NVLS`` among its tokens, the run is rejected on Hopper; elsewhere, for
+       an empty value, rank 0 warns that NCCL chooses the algorithms.
     3. Calls ``torch.use_deterministic_algorithms(True)``, then clears
        ``torch.utils.deterministic.fill_uninitialized_memory``, which that call
        turns on and which reproducibility does not need.
@@ -219,6 +247,27 @@ def apply_determinism_to_args(args) -> None:
 
     # Delegate env-var validation + setdefault to the single-source helper.
     apply_determinism_env(os.environ)
+    nccl_algo = os.environ.get("NCCL_ALGO")
+    if nccl_algo == "" or "NVLS" in [t.strip() for t in (nccl_algo or "").split(",")]:
+        from megatron.training.utils import get_device_arch_version
+
+        assert get_device_arch_version() != 9, (
+            f"NCCL_ALGO={nccl_algo!r} under --deterministic-mode can let NCCL use NVLS, which "
+            "may not be reproducible on Hopper unless the kernel driver and Fabric Manager are "
+            "550.144.03 or later in the 550 branch, or 570 or later (the 560 branch has no fix); "
+            "their versions are not checked here (NVIDIA/nccl#2360). Unset NCCL_ALGO to use the "
+            "Ring default."
+        )
+    if nccl_algo == "":
+        from megatron.training.utils import warn_rank_0
+
+        warn_rank_0(
+            "Deterministic mode: NCCL_ALGO is empty, so NCCL chooses the algorithm for each "
+            "collective. With NCCL >= 2.24 the candidates include NVLS, where available, and "
+            "Tree, which is not an accepted NCCL_ALGO token. Bit-exact reproducibility "
+            'then rests on what NCCL selects; see "Letting NCCL choose the algorithm" in '
+            "docs/user-guide/deterministic-training.md."
+        )
 
     # Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)
@@ -236,3 +285,21 @@ def apply_determinism_to_args(args) -> None:
     # — roughly 15% TFLOP/s on large configs. Set back to True only to debug a
     # suspected uninitialized-memory read.
     torch.utils.deterministic.fill_uninitialized_memory = False
+
+
+def assert_nccl_algo_still_empty() -> None:
+    """No-op unless NCCL_ALGO was set empty. Call after the first NCCL process group.
+
+    PyTorch writes NCCL_ALGO from C++, which ``os.environ`` does not see, so the value is
+    read back through libc.
+    """
+    if os.environ.get("NCCL_ALGO") != "":
+        return
+    libc = ctypes.CDLL(None)
+    libc.getenv.restype = ctypes.c_char_p
+    libc.getenv.argtypes = [ctypes.c_char_p]
+    actual = libc.getenv(b"NCCL_ALGO")
+    assert actual == b"", (
+        f'NCCL_ALGO was "" but is {actual!r} after process-group creation, so '
+        "PyTorch's NVLS exclusion applied anyway. Unset NCCL_ALGO to use the Ring default."
+    )
