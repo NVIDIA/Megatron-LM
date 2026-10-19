@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from _ds41_fixture import tiny_config
-from test_training import _initialize
+from test_training import _build, _initialize
 from torch.utils._pytree import tree_leaves
 
 BOUNDS = (0, 8, 10, 96)  # documents of 8, 2, 86 rows; CP2 splits the last at row 48
@@ -25,30 +25,11 @@ BOUNDS = (0, 8, 10, 96)  # documents of 8, 2, 86 rows; CP2 splits the last at ro
 
 def _worker(rank, root, cp):
     from megatron.core.packed_seq_params import PackedSeqParams
-    from megatron.lite.runtime import create_runtime
-    from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-    from megatron.lite.runtime.contracts import ParallelConfig
-    from megatron.lite.runtime.contracts.config import RuntimeConfig
 
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", f"file://{root}/store-{cp}", rank=rank, world_size=cp)
     torch.use_deterministic_algorithms(True, warn_only=True)
-    options = dict(token_map=list(range(128)), deterministic_mode=True, optimizer=None)
-    options.update(attention_backend_override="cudnn")
-    cfg = MegatronLiteConfig(
-        model_name="deepseek_v41",
-        impl="lite",
-        hf_path=root,
-        parallel=ParallelConfig(cp=cp),
-        load_hf_weights=False,
-        attention_backend_override=None,
-        impl_cfg=options,
-    )
-    rt = create_runtime(RuntimeConfig(backend="mlite", hf_path=root, backend_cfg=cfg))
-    handle = rt.build_model()
-    model, ps = handle._model, handle._parallel_state
-    while hasattr(model, "module"):
-        model = model.module
+    _, _, model, ps = _build(root, cp=cp)
     _initialize(model, ps)
     bounds = torch.tensor(BOUNDS, dtype=torch.int32, device="cuda")
     params = PackedSeqParams(

@@ -41,16 +41,13 @@ def _initialize(model, ps):
                 module.weight.copy_(full[a:b])
 
 
-def _worker(rank, root, world, ep, cp, pp, recompute, sft):
+def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
     from megatron.lite.runtime import create_runtime
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-    from megatron.lite.runtime.contracts import LossContext, PackedBatch, ParallelConfig
+    from megatron.lite.runtime.contracts import ParallelConfig
     from megatron.lite.runtime.contracts.config import RuntimeConfig
 
-    torch.cuda.set_device(rank)
     torch.manual_seed(42)
-    dist.init_process_group("nccl", f"file://{root}/store", rank=rank, world_size=world)
-    torch.use_deterministic_algorithms(not sft, warn_only=True)
     options = dict(
         token_map=list(range(128)),
         deterministic_mode=not sft,
@@ -75,6 +72,16 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft):
     model, ps = handle._model, handle._parallel_state
     while hasattr(model, "module"):
         model = model.module
+    return rt, handle, model, ps
+
+
+def _worker(rank, root, world, ep, cp, pp, recompute, sft):
+    from megatron.lite.runtime.contracts import LossContext, PackedBatch
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", f"file://{root}/store", rank=rank, world_size=world)
+    torch.use_deterministic_algorithms(not sft, warn_only=True)
+    rt, handle, model, ps = _build(root, ep, cp, pp, recompute, sft)
     if not sft:
         _initialize(model, ps)
         assert all(m.config.deterministic_mode for m in model.modules() if hasattr(m, "config"))
