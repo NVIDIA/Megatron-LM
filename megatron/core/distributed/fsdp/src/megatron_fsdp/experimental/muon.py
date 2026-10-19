@@ -110,7 +110,6 @@ class FsdpMuon(Muon):
                 if fsdp_group not in fsdp_groups:
                     fsdp_groups.append(fsdp_group)
                 param_to_optimizer_group_index[param] = group_index
-        self._validate_param_groups(fsdp_groups)
         self._fsdp_group_assignments = []
         for fsdp_group, tensor_to_owner_rank in zip(
             fsdp_groups, assign_owner_work(group.main_weight for group in fsdp_groups), strict=True
@@ -126,13 +125,15 @@ class FsdpMuon(Muon):
                     tensor_to_owner_rank=tensor_to_owner_rank,
                 )
             )
+        self._validate_parameter_groups()
 
-    def _validate_param_groups(self, fsdp_groups: list[FsdpParameterGroup]) -> None:
+    def _validate_parameter_groups(self) -> None:
         """Validate optimizer parameters and the FSDP buffers that contain them."""
         for group in self.param_groups:
             if group["weight_decay"] != 0:
                 raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
-        for fsdp_group in fsdp_groups:
+        for assignment in self._fsdp_group_assignments:
+            fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             if fsdp_group.mesh.ndim != 1:
                 raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
             for buffer in (fsdp_group.main_weight, fsdp_group.main_grad, fsdp_group.model_weight):
