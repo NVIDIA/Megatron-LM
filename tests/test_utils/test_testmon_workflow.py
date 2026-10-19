@@ -762,6 +762,34 @@ def test_full_test_guards_override_selective_requests(
 
 @pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
 def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
+    # Hosted runners provide zstd, but the existing GPU baselines use gzip.
+    zstd = tmp_path / "zstd"
+    zstd.write_text("#!/bin/sh\nprintf '1.5.7\\n'\n")
+    zstd.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+    result, compression = _run(
+        _step("_unit-tests.yml", "select", "cache-compression")["run"],
+        tmp_path,
+        {**environment, "RUNNER_TEMP": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    restore = _step("_unit-tests.yml", "select", "baseline")
+    assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
+    assert restore["if"] == "steps.cache-compression.outcome == 'success'"
+    probe = subprocess.run(
+        ["zstd", "--quiet", "--version"],
+        env={**environment, "PATH": compression["path"]},
+        text=True,
+        capture_output=True,
+    )
+    # The pinned cache action uses gzip when the version probe emits no output.
+    assert probe.stdout == probe.stderr == ""
+    assert probe.returncode != 0
+    assert (
+        subprocess.check_output(["zstd", "--quiet", "--version"], env=environment, text=True)
+        == "1.5.7\n"
+    )
+
     bucket = "tests/unit_tests/test_example.py"
     result, outputs = _run(
         _step("_unit-tests.yml", "select", "result")["run"],

@@ -92,11 +92,27 @@ jobs:
           BUCKET_HASH=$(printf '%s' "$BUCKET" | sha256sum | cut -c 1-16)
           echo "artifact=unit-test-plan-${RECIPE_PLATFORM}-${BUCKET_HASH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
+      - name: Match the baseline cache compression
+        id: cache-compression
+        if: steps.identity.outcome == 'success'
+        continue-on-error: true
+        shell: bash -e -u -o pipefail {0}
+        run: |
+          # GPU runners publish gzip caches. actions/cache includes compression
+          # in its version and otherwise chooses ubuntu-latest's installed zstd.
+          # Make its zstd probe unavailable only for this restore step.
+          TESTMON_CACHE_BIN=$(mktemp -d "$RUNNER_TEMP/unit-testmon-gzip.XXXXXX")
+          printf '#!/bin/sh\nexit 1\n' > "$TESTMON_CACHE_BIN/zstd"
+          chmod +x "$TESTMON_CACHE_BIN/zstd"
+          printf 'path=%s:%s\n' "$TESTMON_CACHE_BIN" "$PATH" >> "$GITHUB_OUTPUT"
+
       - name: Restore unit Testmon baseline
         id: baseline
-        if: steps.identity.outcome == 'success'
+        if: steps.cache-compression.outcome == 'success'
         uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         continue-on-error: true
+        env:
+          PATH: ${{ steps.cache-compression.outputs.path }}
         with:
           path: assets_dir/testmon
           key: ${{ steps.identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
