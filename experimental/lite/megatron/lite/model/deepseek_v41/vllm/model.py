@@ -18,7 +18,9 @@ from .norm import ModelNorm
 
 class Head(ColumnParallelLinear):
     def forward(self, x, weight=None, **kwargs):
-        return head_logits(x, self.weight if weight is None else weight), None
+        # Core cross entropy owns and mutates its logits buffer in place.
+        # A custom Function's view output must not be that mutable buffer.
+        return head_logits(x, self.weight if weight is None else weight).clone(), None
 
 
 class Block(DS41Block):
