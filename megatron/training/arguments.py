@@ -1170,13 +1170,6 @@ def validate_args(args, defaults={}):
     # data
     assert args.num_dataset_builder_threads > 0
 
-    # Consumed tokens.
-    args.consumed_train_samples = 0
-    args.skipped_train_samples = 0
-    args.consumed_valid_samples = 0
-    if args.rl_use_sequence_packing:
-        args.consumed_train_bins = 0
-
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
     if args.train_iters and not args.skip_train:
@@ -3071,6 +3064,9 @@ def _add_distributed_args(parser):
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
+    group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
+                       help="Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2.")
+
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '
@@ -3230,10 +3226,6 @@ def _add_distributed_args(parser):
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
     group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
-    group.add_argument('--fake-process-group', action='store_true', default=False,
-                       help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
-                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
-                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
     return parser
 
 
