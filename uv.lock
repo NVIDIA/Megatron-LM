@@ -25,6 +25,10 @@ overrides = [
 ]
 
 [[manifest.dependency-metadata]]
+name = "deep-select"
+version = "1.0.0"
+
+[[manifest.dependency-metadata]]
 name = "fast-hadamard-transform"
 version = "1.0.4.post1"
 requires-dist = ["torch", "packaging", "ninja"]
@@ -1276,6 +1280,11 @@ wheels = [
 name = "deep-gemm"
 version = "2.8.0+local"
 source = { git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=ea2b7805b97956268bed1adf94591f428ded6cc1#ea2b7805b97956268bed1adf94591f428ded6cc1" }
+
+[[package]]
+name = "deep-select"
+version = "1.0.0"
+source = { git = "https://github.com/deepseek-ai/DeepSelect.git?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18#bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" }
 
 [[package]]
 name = "defusedxml"
@@ -2634,6 +2643,7 @@ dev = [
     { name = "zstandard" },
 ]
 inference = [
+    { name = "deep-select", marker = "sys_platform == 'linux'" },
     { name = "torch-memory-saver" },
 ]
 mlm = [
@@ -2734,6 +2744,7 @@ requires-dist = [
     { name = "av", marker = "extra == 'dev'" },
     { name = "causal-conv1d", marker = "extra == 'ssm'", specifier = "~=1.5" },
     { name = "datasets", marker = "extra == 'dev'" },
+    { name = "deep-select", marker = "sys_platform == 'linux' and extra == 'inference'", git = "https://github.com/deepseek-ai/DeepSelect.git?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },

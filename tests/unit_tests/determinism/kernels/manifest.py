@@ -601,7 +601,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="cutedsl",
         training_path=False,
         notes="Paged BF16 indexer and sparse attention: byte-exact CUDA Graph replay with "
-        "updated inputs and launch-time streams; stable routing gated by batch_invariant_mode.",
+        "updated inputs and launch-time streams; DeepSelect FP32/BF16 routing with per-request lengths, "
+        "and a PyTorch fallback with stable sorting gated by batch_invariant_mode.",
     ),
     KernelEntry(
         name="inference_kv_cache_tensor_ops",
