@@ -6,32 +6,62 @@ import pytest
 import torch
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import MXFP8BlockScaling
 from transformer_engine.pytorch import fp8_autocast
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp
-from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
+from megatron.core import parallel_state as ps
+from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TERowParallelGroupedLinear,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.gtp_api import (
+    gtp_native_fp8_load_context,
+    wrap_module_params_gtp,
+)
+from megatron.core.tensor_parallel.random import (
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    create_cudagraphs,
+    delete_cuda_graphs,
+)
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
     _requires_mxfp8,
-    _run_distributed,
     _torchrun_dist_init,
     reset_fp8_state,
     reset_gtp_globals,
 )
 
 
-@pytest.fixture(autouse=True)
-def isolate_grouped_graph_streams():
-    """Do not join streams belonging to a previous test's destroyed process groups."""
-    # Production keeps stream caches for a model's lifetime. These tests construct
-    # and destroy independent models/groups; a full graph's final fence must not
-    # join uncaptured streams left behind by an earlier eager or local-graph test.
+@pytest.fixture
+def expert_group():
+    """Isolate each model's process groups and communication streams."""
+    if torch.distributed.get_world_size() != 4:
+        pytest.skip("requires torchrun --nproc-per-node=4")
     torch.cuda.synchronize()
+    # Full graphs must not join uncaptured streams from earlier test models.
     gtp._AG_STREAMS.clear()
     gtp._RS_STREAMS.clear()
-    yield
-    torch.cuda.synchronize()
-    gtp._AG_STREAMS.clear()
-    gtp._RS_STREAMS.clear()
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(gtp_remat_size=4, expert_gtp_remat_size=4)
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        yield ps.get_expert_gtp_weight_remat_group()
+    finally:
+        torch.cuda.synchronize()
+        gtp._AG_STREAMS.clear()
+        gtp._RS_STREAMS.clear()
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
 
 
 class _Block(torch.nn.Module):
@@ -55,136 +85,204 @@ class _Block(torch.nn.Module):
         return x + self.mlp.experts.linear_fc2(F.silu(gate) * value, self.splits)
 
 
-def _worker_full_iteration(rank, world_size, port):
-    del port
-    group = torch.distributed.new_group(list(range(world_size)))
-    torch.manual_seed(123)
-    model = torch.nn.Sequential(*[_Block(group) for _ in range(4)]).cuda()
+def _initialize_grads(model):
+    params = list(model.parameters())
+    for p in params:
+        p.main_grad = torch.zeros(p.shape, device=p.device, dtype=torch.bfloat16)
+        # Retain AccumulateGrad and mirror DDP readiness hooks for local graph replay.
+        p.register_grad_accum_hook(p.expand_as(p).grad_fn.next_functions[0][0], lambda: None)
+    return params
+
+
+def _allow_retained_grad_nodes():
+    if hasattr(torch.autograd.graph, "set_override_stale_capture_stream"):
+        torch.autograd.graph.set_override_stale_capture_stream(True)
+
+
+@torch.no_grad()
+def _copy_weights(params, values):
+    for p, value in zip(params, values):
+        p.copy_(value)
+
+
+def _step(model, x, recipe=None):
+    x.grad = None
+    for p in model.parameters():
+        p.main_grad.zero_()
+        p.grad = None
+        p.grad_added_to_main_grad = False
+    with fp8_autocast(enabled=recipe is not None, fp8_recipe=recipe):
+        y = model(x)
+    # Local backward graphs can reuse forward output storage.
+    saved_y = y.detach().clone()
+    (y.float().square().mean() * (100 if recipe else 1)).backward()
+    gtp.wait_for_gtp_grad_reduction_on_current_stream()
+    return saved_y
+
+
+def _snapshot(y, x, params):
+    torch.cuda.synchronize()
+    return y.clone(), x.grad.clone(), [p.main_grad.clone() for p in params]
+
+
+def _assert_snapshot(actual, expected):
+    y, dx, grads = actual
+    ref_y, ref_dx, ref_grads = expected
+    torch.testing.assert_close(y, ref_y, rtol=0.01, atol=0.01)
+    for grad, ref in zip([dx, *grads], [ref_dx, *ref_grads]):
+        torch.testing.assert_close(grad, ref, rtol=0.02, atol=2e-5)
+
+
+def _native_model(group, recipe):
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=256,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        add_bias_linear=False,
+        bias_dropout_fusion=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        # Upstream prohibits interleaved GLU with GTP. Use the supported,
+        # noninterleaved op-fuser path; this does not require a fused MLP kernel.
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        use_transformer_engine_op_fuser=True,
+        moe_router_padding_for_quantization=True,
+        moe_token_dispatcher_type="alltoall",
+        fp8='e4m3',
+        fp8_recipe=Fp8Recipe.mxfp8,
+        fp8_param=True,
+        gtp_weight_remat_size=group.size(),
+        expert_gtp_weight_remat_size=group.size(),
+        gradient_accumulation_fusion=True,
+    )
+
+    class FusedBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = torch.nn.Module()
+            self.mlp.experts = TEGroupedMLP(
+                2,
+                config,
+                GroupedMLPSubmodules(TEColumnParallelGroupedLinear, TERowParallelGroupedLinear),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+            self.splits = torch.tensor([256, 256], device='cuda', dtype=torch.int64)
+            self.probs = torch.ones(512, device='cuda', dtype=torch.float32)
+
+        def forward(self, x):
+            output, _ = self.mlp.experts(x, self.splits, self.probs)
+            return x + output
+
+    with te.quantized_model_init(enabled=True, recipe=recipe):
+        model = torch.nn.Sequential(*[FusedBlock() for _ in range(4)]).cuda()
+    return model
+
+
+@pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "native-mxfp8"])
+def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8):
+    if mxfp8:
+        _requires_mxfp8()
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
+    recipe = MXFP8BlockScaling() if mxfp8 else None
+    model = (
+        _native_model(expert_group, recipe)
+        if mxfp8
+        else torch.nn.Sequential(*[_Block(expert_group) for _ in range(4)]).cuda()
+    )
     gtp.set_cuda_graph_modules([], cuda_graph_impl="full_iteration")
     gtp.classify_gtp_chains(model)
-    for param in model.parameters():
-        param.main_grad = torch.zeros_like(param)
-        # Mirror DDP's retained AccumulateGrad node across warmup and capture.
-        param.register_grad_accum_hook(param.expand_as(param).grad_fn.next_functions[0][0], None)
-        param.grad_added_to_main_grad = False
-    static_x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    # Keep AccumulateGrad alive across capture; this strong reference is intentional.
-    input_grad_node = static_x.expand_as(static_x).grad_fn.next_functions[0][0]
+    params = _initialize_grads(model)
+    assert len(params) == 16
+    if mxfp8:
+        assert all(getattr(p, "_gtp_native_fp8", False) for p in params)
+    masters = [
+        torch.nn.Parameter(
+            (gtp.dequantize_gtp_native_fp8(p) if mxfp8 else p.detach()).float().clone()
+        )
+        for p in params
+    ]
+    initial = [m.detach().clone() for m in masters]
+    shape = (512, 256) if mxfp8 else (64, 128)
+    x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    # Keep AccumulateGrad alive across capture; this reference is load-bearing.
+    input_grad_node = x.expand_as(x).grad_fn.next_functions[0][0]
+    inputs = [torch.randn_like(x) for _ in range(6)]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
 
-    def step():
-        static_x.grad = None
-        for param in model.parameters():
-            param.main_grad.zero_()
-            param.grad = None
-        with fp8_autocast(enabled=False):
-            out = model(static_x)
-        loss = out.float().square().mean()
-        loss.backward()
-        gtp.wait_for_gtp_grad_reduction_on_current_stream()
-        return out, loss
+    def sync_params():
+        with gtp_native_fp8_load_context(model):
+            _copy_weights(params, [m.to(torch.bfloat16) for m in masters])
+
+    def trajectory(run, expected=None):
+        optimizer = torch.optim.Adam(masters, lr=1e-3)
+        snapshots = []
+        for i, value in enumerate(inputs):
+            _copy_weights([x], [value])
+            actual = _snapshot(run(), x, params)
+            if expected is not None:
+                _assert_snapshot(actual, expected[i])
+            snapshots.append(actual)
+            for p, m in zip(params, masters):
+                m.grad = p.main_grad.float() / expert_group.size()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            sync_params()
+        return snapshots
 
     with torch.cuda.stream(stream):
-        with torch.cuda.stream(stream):
-            for _ in range(3):
-                step()
-        torch.cuda.current_stream().wait_stream(stream)
-        torch.cuda.synchronize()
-
-        # Four blocks exercise alternating AG-buffer reuse in both directions.
-        for role in ("linear_fc1", "linear_fc2"):
-            leaders = [getattr(block.mlp.experts, role).weight0 for block in model]
+        sync_params()
+        for _ in range(3):
+            _step(model, x, recipe)
+        # Four blocks exercise alternating buffers and same-role links in both directions.
+        roles = [
+            [getattr(b.mlp.experts, role).weight0 for b in model]
+            for role in ("linear_fc1", "linear_fc2")
+        ]
+        assert roles[0][0].chain_id != roles[1][0].chain_id
+        for leaders in roles:
             assert all("grouped" in p.chain_id and p.chain_id.endswith("_graphed") for p in leaders)
             for previous, current in zip(leaders, leaders[1:]):
-                assert previous.next_w is current
-                assert current.prev_w is previous
-            assert leaders[0].chain_id != (
-                model[0].mlp.experts.linear_fc2.weight0.chain_id
-                if role == "linear_fc1"
-                else model[0].mlp.experts.linear_fc1.weight0.chain_id
+                assert previous.next_w is current and current.prev_w is previous
+        if mxfp8:
+            assert all(
+                b.mlp.experts._with_fused_impl and b.mlp.experts._fused_ops is not None
+                for b in model
             )
-
-        # Save an eager trajectory with changing inputs AND weights; constant-weight replay
-        # alone would miss stale prefetch buffers and graph-owned gradients.
-        initial = [param.detach().clone() for param in model.parameters()]
-        inputs = [torch.randn_like(static_x) for _ in range(6)]
-        expected = []
-        with torch.no_grad():
-            for param, value in zip(model.parameters(), initial):
-                param.copy_(value)
-        for x in inputs:
-            with torch.no_grad():
-                static_x.copy_(x)
-            out, loss = step()
-            torch.cuda.synchronize()
-            expected.append(
-                (
-                    out.detach().clone(),
-                    static_x.grad.clone(),
-                    [param.main_grad.clone() for param in model.parameters()],
-                )
-            )
-            with torch.no_grad():
-                for param in model.parameters():
-                    param.sub_(0.01 / world_size * param.main_grad)
-
-        with torch.no_grad():
-            for param, value in zip(model.parameters(), initial):
-                param.copy_(value)
-        torch.cuda.synchronize()
-        if hasattr(torch.autograd.graph, "set_override_stale_capture_stream"):
-            torch.autograd.graph.set_override_stale_capture_stream(True)
+        expected = trajectory(lambda: _step(model, x, recipe))
+        assert any(not torch.equal(m, value) for m, value in zip(masters, initial))
+        _copy_weights(masters, initial)
+        sync_params()
+        _allow_retained_grad_nodes()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            captured_out, captured_loss = step()
-        for x, (ref_out, ref_dx, ref_grads) in zip(inputs, expected):
-            with torch.no_grad():
-                static_x.copy_(x)
-            graph.replay()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                captured_y = _step(model, x, recipe)
+
+            def replay():
+                graph.replay()
+                return captured_y
+
+            trajectory(replay, expected)
+        finally:
+            graph.reset()
             torch.cuda.synchronize()
-            torch.testing.assert_close(captured_out, ref_out, rtol=0.01, atol=0.01)
-            torch.testing.assert_close(static_x.grad, ref_dx, rtol=0.02, atol=2e-5)
-            for param, ref_grad in zip(model.parameters(), ref_grads):
-                torch.testing.assert_close(param.main_grad, ref_grad, rtol=0.02, atol=2e-5)
-            with torch.no_grad():
-                for param in model.parameters():
-                    param.sub_(0.01 / world_size * param.main_grad)
-        graph.reset()
-        torch.cuda.synchronize()
-    torch.distributed.destroy_process_group(group)
 
 
-def test_grouped_full_iteration_replay():
-    _run_distributed(_worker_full_iteration, 4)
-
-
-def _worker_local_grouped(rank, world_size, port):
-    del port
-    from megatron.core import parallel_state as ps
-    from megatron.core.tensor_parallel.random import (
-        initialize_rng_tracker,
-        model_parallel_cuda_manual_seed,
-    )
-    from megatron.core.transformer.cuda_graphs import (
-        CudaGraphManager,
-        create_cudagraphs,
-        delete_cuda_graphs,
-    )
-    from megatron.core.transformer.module import MegatronModule
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(gtp_remat_size=world_size, expert_gtp_remat_size=world_size)
-    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-    model_parallel_cuda_manual_seed(123)
-    group = ps.get_expert_gtp_weight_remat_group()
+def test_grouped_local_graph_replay(expert_group):
+    group = expert_group
     config = TransformerConfig(
         num_layers=4,
         hidden_size=128,
         num_attention_heads=4,
         params_dtype=torch.bfloat16,
-        gtp_weight_remat_size=world_size,
+        gtp_weight_remat_size=group.size(),
         num_moe_experts=2,
         moe_expert_capacity_factor=1.0,
         moe_pad_expert_input_to_capacity=True,
@@ -210,92 +308,53 @@ def _worker_local_grouped(rank, world_size, port):
     model = torch.nn.Sequential(*[LocalBlock(i) for i in range(4)]).cuda()
     gtp.set_cuda_graph_modules(["moe"], cuda_graph_impl="local")
     gtp.classify_gtp_chains(model)
-    for param in model.parameters():
-        param.main_grad = torch.zeros_like(param)
-        param.grad_added_to_main_grad = False
-        # Upstream records finalization only when a DDP readiness hook is registered.
-        param.register_grad_accum_hook(
-            param.expand_as(param).grad_fn.next_functions[0][0], lambda: None
-        )
+    params = _initialize_grads(model)
     inputs = [torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
-    initial = [p.detach().clone() for p in model.parameters()]
+    initial = [p.detach().clone() for p in params]
 
     def step(x):
-        for p in model.parameters():
-            p.main_grad.zero_()
-            p.grad = None
-            p.grad_added_to_main_grad = False
         x = x.detach().clone().requires_grad_()
-        with fp8_autocast(enabled=False):
-            out = model(x)
-        # Local graphs share a memory pool across forward/backward. Preserve the
-        # output before backward can reuse its storage; reading it afterward is invalid.
-        saved_out = out.detach().clone()
-        out.float().square().mean().backward()
-        gtp.wait_for_gtp_grad_reduction_on_current_stream()
-        torch.cuda.synchronize()
-        return (saved_out, x.grad.clone(), [p.main_grad.clone() for p in model.parameters()])
+        return _snapshot(_step(model, x), x, params)
 
     def update():
         with torch.no_grad():
-            for p in model.parameters():
-                p.sub_(0.01 / world_size * p.main_grad)
+            for p in params:
+                p.sub_(0.01 / group.size() * p.main_grad)
 
     reference = []
     for x in inputs:
         reference.append(step(x))
         update()
-    with torch.no_grad():
-        for p, value in zip(model.parameters(), initial):
-            p.copy_(value)
+    _copy_weights(params, initial)
     for block in model:
         block.manager = CudaGraphManager(config, base_module=block, function_name="compute")
-    step(inputs[0])  # Record the cross-block graph call order without an optimizer update.
-    # Match the full-iteration runner's compatibility setting for retained
-    # AccumulateGrad nodes on this PyTorch build.
-    if hasattr(torch.autograd.graph, "set_override_stale_capture_stream"):
-        torch.autograd.graph.set_override_stale_capture_stream(True)
+    step(inputs[0])  # Record the cross-block call order without updating weights.
+    _allow_retained_grad_nodes()
     create_cudagraphs()
     try:
-        for x, (ref_y, ref_dx, ref_grads) in zip(inputs, reference):
-            y, dx, grads = step(x)
-            torch.testing.assert_close(y, ref_y, rtol=0.01, atol=0.01)
-            torch.testing.assert_close(dx, ref_dx, rtol=0.02, atol=2e-5)
-            for grad, ref_grad in zip(grads, ref_grads):
-                torch.testing.assert_close(grad, ref_grad, rtol=0.02, atol=2e-5)
+        for x, expected in zip(inputs, reference):
+            _assert_snapshot(step(x), expected)
             update()
         runners = [block.manager.cudagraph_runners[0] for block in model]
         assert any(runner._gtp_wgrad_ring_slots for runner in runners)
-        # Cross-graph RS finalizes the next block's gradients in the current
-        # block's backward graph. The last forward block can have no hooks;
-        # require exact coverage across the whole stack, not a nonempty plan per block.
-        finalized_ids = [
-            id(param)
-            for runner in runners
-            for _, params in runner._gtp_finalize_hook_plan
-            for param in params
+        # Cross-graph RS can finalize a block in its predecessor's backward graph.
+        finalized = [
+            id(p) for r in runners for _, weights in r._gtp_finalize_hook_plan for p in weights
         ]
-        assert sorted(finalized_ids) == sorted(id(param) for param in model.parameters())
+        assert sorted(finalized) == sorted(map(id, params))
     finally:
         torch.cuda.synchronize()
         for block in model:
             for runner in block.manager.cudagraph_runners:
-                if runner.fwd_graph is not None:
-                    runner.fwd_graph.reset()
-                if runner.bwd_graph is not None:
-                    runner.bwd_graph.reset()
+                for graph in (runner.fwd_graph, runner.bwd_graph):
+                    if graph is not None:
+                        graph.reset()
         delete_cuda_graphs()
-        ps.destroy_model_parallel()
-        ps.initialize_model_parallel()
 
 
-def test_grouped_local_graph_replay():
-    _run_distributed(_worker_local_grouped, 4)
-
-
-def _worker_grouped_completion(rank, world_size, port, captured):
-    del rank, port
-    group = torch.distributed.new_group(list(range(world_size)))
+@pytest.mark.parametrize("captured", [False, True])
+def test_grouped_consumer_does_not_wait_for_later_gather(expert_group, captured):
+    group = expert_group
     model = _Block(group)
     gtp.set_cuda_graph_modules([], cuda_graph_impl="full_iteration" if captured else "none")
     gtp.classify_gtp_chains(torch.nn.Sequential(model))
@@ -335,17 +394,11 @@ def _worker_grouped_completion(rank, world_size, port, captured):
     assert ready.elapsed_time(tail) > 1.0, "consumer incorrectly depends on later AG-stream work"
     if captured:
         graph.reset()
-    torch.distributed.destroy_process_group(group)
 
 
-@pytest.mark.parametrize("captured", [False, True])
-def test_grouped_consumer_does_not_wait_for_later_gather(captured):
-    _run_distributed(_worker_grouped_completion, 4, captured)
-
-
-def _worker_grouped_sync_fallback(rank, world_size, port, monkeypatch, recompute):
-    del rank, port
-    group = torch.distributed.new_group(list(range(world_size)))
+@pytest.mark.parametrize("recompute", [False, True])
+def test_grouped_sync_fallback_records_completion(expert_group, monkeypatch, recompute):
+    group = expert_group
     op = te.ops.GroupedLinear(1, 128, 128, bias=False, device="cuda", dtype=torch.bfloat16)
     op.gtp_remat_size = group.size()
     wrap_module_params_gtp(op, ["weight0"], group, is_grouped=True)
@@ -363,197 +416,18 @@ def _worker_grouped_sync_fallback(rank, world_size, port, monkeypatch, recompute
         return result, None
 
     monkeypatch.setattr(gtp, "gather_along_first_dim", synchronous_fallback)
-    try:
-        result, handle = param._all_gather_weight(async_op=True, fwd=True, recompute=recompute)
-        assert calls == [True]  # One local expert takes the non-coalesced gather path.
-        assert handle.completion_recorded
-        if recompute:
-            param._recompute_prefetch_handle = handle
-            param._wait_recompute_param_gather()
-            event = param._recompute_ag_event
-        else:
-            param._prefetch_handle = handle
-            param._wait_param_gather()
-            event = param.ag_event
-        event.wait()
-        torch.cuda.synchronize()
-        assert event.query()
-        assert result[0].shape == (128, 128)
-    finally:
-        torch.distributed.destroy_process_group(group)
-
-
-@pytest.mark.parametrize("recompute", [False, True])
-def test_grouped_sync_fallback_records_completion(monkeypatch, recompute):
-    _run_distributed(_worker_grouped_sync_fallback, 4, monkeypatch, recompute)
-
-
-def _worker_mxfp8_op_fuser(rank, world_size, port):
-    """Exercise op-fuser SwiGLU experts with native MXFP8 shards across Adam updates."""
-    del rank, port
-    from transformer_engine.common.recipe import MXFP8BlockScaling
-
-    from megatron.core import parallel_state as ps
-    from megatron.core.enums import Fp8Recipe
-    from megatron.core.extensions.transformer_engine import (
-        TEColumnParallelGroupedLinear,
-        TERowParallelGroupedLinear,
-    )
-    from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
-    from megatron.core.tensor_parallel.random import (
-        initialize_rng_tracker,
-        model_parallel_cuda_manual_seed,
-    )
-    from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, TEGroupedMLP
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(gtp_remat_size=world_size, expert_gtp_remat_size=world_size)
-    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-    model_parallel_cuda_manual_seed(123)
-    pg = ProcessGroupCollection.use_mpu_process_groups()
-    recipe = MXFP8BlockScaling()
-    config = TransformerConfig(
-        num_layers=4,
-        hidden_size=256,
-        num_attention_heads=4,
-        num_moe_experts=2,
-        moe_ffn_hidden_size=256,
-        moe_grouped_gemm=True,
-        params_dtype=torch.bfloat16,
-        bf16=True,
-        add_bias_linear=False,
-        bias_dropout_fusion=False,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        # Upstream prohibits interleaved GLU with GTP. Use the supported,
-        # noninterleaved op-fuser path; this does not require a fused MLP kernel.
-        gated_linear_unit=True,
-        activation_func=F.silu,
-        use_transformer_engine_op_fuser=True,
-        moe_router_padding_for_quantization=True,
-        moe_token_dispatcher_type="alltoall",
-        fp8='e4m3',
-        fp8_recipe=Fp8Recipe.mxfp8,
-        fp8_param=True,
-        gtp_weight_remat_size=world_size,
-        expert_gtp_weight_remat_size=world_size,
-        gradient_accumulation_fusion=True,
-    )
-
-    class FusedBlock(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.mlp = torch.nn.Module()
-            self.mlp.experts = TEGroupedMLP(
-                2,
-                config,
-                GroupedMLPSubmodules(TEColumnParallelGroupedLinear, TERowParallelGroupedLinear),
-                pg_collection=pg,
-            )
-            self.splits = torch.tensor([256, 256], device='cuda', dtype=torch.int64)
-            self.probs = torch.ones(512, device='cuda', dtype=torch.float32)
-
-        def forward(self, x):
-            output, _ = self.mlp.experts(x, self.splits, self.probs)
-            return x + output
-
-    with te.quantized_model_init(enabled=True, recipe=recipe):
-        model = torch.nn.Sequential(*[FusedBlock() for _ in range(4)]).cuda()
-    gtp.set_cuda_graph_modules([], cuda_graph_impl='full_iteration')
-    gtp.classify_gtp_chains(model)
-    params = list(model.parameters())
-    assert len(params) == 16
-    assert all(getattr(p, '_gtp_native_fp8', False) for p in params)
-    masters = [torch.nn.Parameter(gtp.dequantize_gtp_native_fp8(p).float().clone()) for p in params]
-    initial = [m.detach().clone() for m in masters]
-    for p in params:
-        p.main_grad = torch.zeros(p.shape, device='cuda', dtype=torch.bfloat16)
-        p.grad_added_to_main_grad = False
-        p.register_grad_accum_hook(p.expand_as(p).grad_fn.next_functions[0][0], None)
-    static_x = torch.randn(512, 256, device='cuda', dtype=torch.bfloat16, requires_grad=True)
-    # Keep AccumulateGrad alive across capture; this strong reference is intentional.
-    input_grad_node = static_x.expand_as(static_x).grad_fn.next_functions[0][0]
-    inputs = [torch.randn_like(static_x) for _ in range(6)]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-
-    def sync_params():
-        with torch.no_grad(), gtp_native_fp8_load_context(model):
-            for p, m in zip(params, masters):
-                p.copy_(m.to(torch.bfloat16))
-
-    def step():
-        static_x.grad = None
-        for p in params:
-            p.main_grad.zero_()
-            p.grad = None
-            p.grad_added_to_main_grad = False
-        with fp8_autocast(enabled=True, fp8_recipe=recipe):
-            output = model(static_x)
-        loss = output.float().square().mean() * 100
-        loss.backward()
-        gtp.wait_for_gtp_grad_reduction_on_current_stream()
-        return output
-
-    def update(optimizer):
-        for p, m in zip(params, masters):
-            m.grad = p.main_grad.float() / world_size
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        sync_params()
-
-    with torch.cuda.stream(stream):
-        sync_params()
-        for _ in range(3):
-            step()
-        torch.cuda.synchronize()
-        assert all(block.mlp.experts._with_fused_impl for block in model)
-        assert all(block.mlp.experts._fused_ops is not None for block in model)
-        optimizer = torch.optim.Adam(masters, lr=1e-3)
-        expected = []
-        for x in inputs:
-            with torch.no_grad():
-                static_x.copy_(x)
-            output = step()
-            torch.cuda.synchronize()
-            expected.append(
-                (
-                    output.detach().clone(),
-                    static_x.grad.clone(),
-                    [p.main_grad.clone() for p in params],
-                )
-            )
-            update(optimizer)
-        assert any(not torch.equal(m, value) for m, value in zip(masters, initial))
-        with torch.no_grad():
-            for m, value in zip(masters, initial):
-                m.copy_(value)
-        sync_params()
-        optimizer = torch.optim.Adam(masters, lr=1e-3)
-        if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
-            torch.autograd.graph.set_override_stale_capture_stream(True)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            captured_output = step()
-        for x, (ref_output, ref_dx, ref_grads) in zip(inputs, expected):
-            with torch.no_grad():
-                static_x.copy_(x)
-            graph.replay()
-            torch.cuda.synchronize()
-            torch.testing.assert_close(captured_output, ref_output, rtol=0.01, atol=0.01)
-            torch.testing.assert_close(static_x.grad, ref_dx, rtol=0.02, atol=2e-5)
-            for p, ref_grad in zip(params, ref_grads):
-                torch.testing.assert_close(p.main_grad, ref_grad, rtol=0.02, atol=2e-5)
-            update(optimizer)
-        graph.reset()
-        torch.cuda.synchronize()
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel()
-
-
-def test_mxfp8_op_fuser_full_iteration_replay(monkeypatch):
-    _requires_mxfp8()
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
-    _run_distributed(_worker_mxfp8_op_fuser, 4)
+    result, handle = param._all_gather_weight(async_op=True, fwd=True, recompute=recompute)
+    assert calls == [True]  # One local expert takes the non-coalesced gather path.
+    assert handle.completion_recorded
+    if recompute:
+        param._recompute_prefetch_handle = handle
+        param._wait_recompute_param_gather()
+        event = param._recompute_ag_event
+    else:
+        param._prefetch_handle = handle
+        param._wait_param_gather()
+        event = param.ag_event
+    event.wait()
+    torch.cuda.synchronize()
+    assert event.query()
+    assert result[0].shape == (128, 128)
