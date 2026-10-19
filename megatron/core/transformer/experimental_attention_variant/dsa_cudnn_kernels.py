@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 import inspect
 import logging
 import re
@@ -146,6 +147,17 @@ class CudnnDsaInterface(Protocol):
 
 
 _cudnn_dsa: Optional[CudnnDsaInterface] = None
+# Every cudnn-frontend DSA entry point MCore calls; _ensure_dsa_namespace resolves them all.
+_CUDNN_DSA_ENTRY_POINTS = (
+    "indexer_forward_wrapper",
+    "indexer_top_k_wrapper",
+    "indexer_backward_wrapper",
+    "sparse_attention_backward_wrapper",
+    "SparseAttentionBackward",
+    "sparse_attn_score_recompute_wrapper",
+    "dense_attn_score_recompute_wrapper",
+    "dense_indexer_backward_wrapper",
+)
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
@@ -1305,7 +1317,21 @@ def _dsa_fwd_flash_mla(
 
 
 def _ensure_dsa_namespace() -> None:
-    """Lazily import the cudnn-frontend DSA namespace."""
+    """Import the cudnn-frontend DSA namespace and every entry point MCore calls.
+
+    ``cudnn.DSA`` imports the kernel modules behind an entry point on its first attribute
+    access. Under CUTLASS DSL 4.6 each ``@cute.kernel`` decoration in those modules leaves
+    a frame that references itself (``CuTeDSL.kernel`` keeps ``inspect.currentframe()`` in
+    a local), and that frame's ``f_back`` chain runs through the import into the frame that
+    touched the entry point. A first access from inside a training step therefore pins
+    every tensor on the Python stack at that moment (the activations and gradients of the
+    first recompute/backward on the rank) until the cyclic collector runs, which
+    ``--manual-gc`` defers to the GC interval or to the collection before full-iteration
+    CUDA graph capture: 1.3-3.6 GB per rank through the eager warmup steps of the 16K
+    GLM-5.2 proxy. Resolve all entry points in this one-time call and collect the import's
+    reference cycles before returning, so later calls import nothing and no caller frame
+    is kept alive.
+    """
     global _cudnn_dsa
     if _cudnn_dsa is not None:
         return
@@ -1316,6 +1342,14 @@ def _ensure_dsa_namespace() -> None:
             "cudnn-frontend DSA namespace not available. Install with "
             "`pip install nvidia-cudnn-frontend[cutedsl]`."
         ) from e
+    for name in _CUDNN_DSA_ENTRY_POINTS:
+        try:
+            getattr(_ns, name)
+        except AttributeError:
+            # Not provided by this frontend; its call sites probe for it.
+            pass
+    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+        gc.collect()
     _cudnn_dsa = _ns
 
 
