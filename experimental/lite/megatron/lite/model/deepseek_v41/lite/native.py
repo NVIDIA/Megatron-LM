@@ -21,6 +21,7 @@ def core_config(release, parallel, *, initialize=True):
         ffn_hidden_size=release.moe_intermediate_size,
         tensor_model_parallel_size=1,
         context_parallel_size=parallel.cp,
+        cp_partition_mode="contiguous",
         pipeline_model_parallel_size=parallel.pp,
         expert_model_parallel_size=parallel.ep,
         expert_tensor_parallel_size=1,

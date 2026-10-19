@@ -29,7 +29,7 @@ class IndexProjection(nn.Module):
         self.state, self.layer, self.owner, self.channel = state, layer, owner, channel
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        geometry = (self.channel, tuple(x.shape), x.dtype, x.device, torch.is_grad_enabled())
+        geometry = (self.channel, tuple(x.shape), x.dtype, x.device, self.state.grad_mode)
         return self.state.resolve(
             self.layer, self.owner, geometry, lambda: self.linear(x, *args, **kwargs)
         )

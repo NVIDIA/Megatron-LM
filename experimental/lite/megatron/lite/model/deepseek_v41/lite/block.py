@@ -21,8 +21,12 @@ class DS41Block(nn.Module):
         self.attn_mixes = HyperConnectionModule(config, layer_number)
         self.ffn_mixes = HyperConnectionModule(config, layer_number)
         self.attn_mixes.norm_eps = self.ffn_mixes.norm_eps = config.layernorm_epsilon
-        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
-        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.attn_norm = nn.RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon, dtype=config.params_dtype
+        )
+        self.ffn_norm = nn.RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon, dtype=config.params_dtype
+        )
         self.copies, self.width = config.num_residual_streams, config.hidden_size
 
     def forward(self, hidden, pre_mix, *, packed_seq_params, input_ids=None):

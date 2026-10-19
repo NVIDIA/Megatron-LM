@@ -4,17 +4,29 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
 
+import torch
+from torch.utils._pytree import tree_flatten, tree_unflatten
+
 
 class KVSourceState:
     """Keep local owner outputs attached to their original autograd graph.
 
-    The caller must keep the scope open through backward/recomputation. A new
-    microbatch cannot reuse an old graph, and nested scopes are rejected.
+    Direct calls share state only within the forward microbatch scope. Native
+    checkpoint segments carry their source tensors explicitly through backward;
+    a later microbatch cannot reuse an old graph. Nested scopes are rejected.
     """
 
     def __init__(self) -> None:
         self.active = False
         self.values = {}
+        self._logical_grad_mode = None
+
+    @property
+    def grad_mode(self) -> bool:
+        """Logical segment mode stays fixed through a checkpoint replay."""
+        return (
+            torch.is_grad_enabled() if self._logical_grad_mode is None else self._logical_grad_mode
+        )
 
     @contextmanager
     def microbatch(self) -> Iterator["KVSourceState"]:
@@ -36,3 +48,78 @@ class KVSourceState:
         elif key not in self.values:
             raise RuntimeError("KV owner has not produced this layout and grad mode")
         return self.values[key]
+
+    def checkpoint(self, function: Callable, *args: torch.Tensor, checkpoint_fn=None) -> Any:
+        """Pass shared source tensors across native Core checkpoint boundaries.
+
+        An owner segment publishes its source tensors as checkpoint outputs.
+        A reader segment receives them as explicit tensor inputs. Core then
+        propagates reader gradients to the original owner checkpoint exactly
+        once; a reader replay never requests an owner recomputation out of order.
+        The cached graph is neither a hidden backward closure nor detached data.
+        """
+        if not self.active:
+            raise RuntimeError("Checkpointed KV reuse requires an active microbatch")
+        if not all(isinstance(arg, torch.Tensor) for arg in args):
+            raise TypeError("DS4.1 checkpoint arguments must be tensors")
+        if checkpoint_fn is None:
+            from megatron.core.tensor_parallel.random import checkpoint
+
+            checkpoint_fn = checkpoint
+        leaves, input_spec = tree_flatten(self.values)
+        slots = [i for i, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
+        saved_sources = tuple(leaves[i] for i in slots)
+        for slot in slots:
+            leaves[slot] = None
+        argument_count = len(args)
+        logical_mode = self.grad_mode
+        metadata = []
+
+        def segment(*saved):
+            local_leaves = list(leaves)
+            for slot, tensor in zip(slots, saved[argument_count:]):
+                local_leaves[slot] = tensor
+            inputs = tree_unflatten(local_leaves, input_spec)
+            old_values, old_active, old_mode = self.values, self.active, self._logical_grad_mode
+            self.values, self.active, self._logical_grad_mode = dict(inputs), True, logical_mode
+            try:
+                result = function(*saved[:argument_count])
+                published = {
+                    key: value
+                    for key, value in self.values.items()
+                    if key not in inputs or value is not inputs[key]
+                }
+                values, spec = tree_flatten((result, published))
+                tensor_slots = [
+                    i for i, value in enumerate(values) if isinstance(value, torch.Tensor)
+                ]
+                if metadata:
+                    if metadata[0][1:] != (spec, tensor_slots):
+                        raise RuntimeError(
+                            "DS4.1 checkpoint changed its source publication structure"
+                        )
+                else:
+                    metadata.append(
+                        (
+                            [
+                                None if isinstance(value, torch.Tensor) else value
+                                for value in values
+                            ],
+                            spec,
+                            tensor_slots,
+                        )
+                    )
+                return tuple(values[i] for i in tensor_slots)
+            finally:
+                self.values, self.active, self._logical_grad_mode = old_values, old_active, old_mode
+
+        output = checkpoint_fn(segment, False, *args, *saved_sources)
+        if isinstance(output, torch.Tensor):
+            output = (output,)
+        values, spec, tensor_slots = metadata[0]
+        values = list(values)
+        for slot, tensor in zip(tensor_slots, output):
+            values[slot] = tensor
+        result, published = tree_unflatten(values, spec)
+        self.values.update(published)
+        return result

@@ -35,7 +35,7 @@ class DS41Compressor(Compressor):
             prefix.data_ptr() if prefix is not None else None,
             max_length,
             global_start,
-            torch.is_grad_enabled(),
+            self.source_state.grad_mode,
             id(self.pg_collection.cp),
         )
         return self.source_state.resolve(self.source_layer, self.source_owner, geometry, produce)

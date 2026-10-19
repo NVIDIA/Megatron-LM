@@ -346,3 +346,154 @@ def test_ds41_query_projection_contract():
     assert original is x and torch.equal(k, v)
     (q.square().mean() + k.square().mean()).backward()
     assert torch.isfinite(x.grad).all()
+
+
+@pytest.fixture
+def cpu_core_checkpoint(monkeypatch):
+    """CPU-only CUDA RNG snapshot adapter; restore it before leaving the fixture."""
+    from megatron.core.tensor_parallel import random as core_random
+
+    original = (
+        core_random.CheckpointFunction,
+        core_random.CheckpointFunction.forward,
+        core_random.CheckpointFunction.backward,
+        torch.autograd.backward,
+    )
+    get_rng, set_rng = core_random._get_all_rng_states, core_random._set_all_rng_states
+    with monkeypatch.context() as fixture:
+        fixture.setattr(core_random, "_get_all_rng_states", lambda: (torch.get_rng_state(),))
+        fixture.setattr(
+            core_random, "_set_all_rng_states", lambda state: torch.set_rng_state(state)
+        )
+        assert original == (
+            core_random.CheckpointFunction,
+            core_random.CheckpointFunction.forward,
+            core_random.CheckpointFunction.backward,
+            torch.autograd.backward,
+        )
+        yield core_random.checkpoint
+    assert core_random._get_all_rng_states is get_rng and core_random._set_all_rng_states is set_rng
+    assert original == (
+        core_random.CheckpointFunction,
+        core_random.CheckpointFunction.forward,
+        core_random.CheckpointFunction.backward,
+        torch.autograd.backward,
+    )
+
+
+@pytest.mark.parametrize("segments", [1, 2, 3])
+def test_cross_segment_sources_native_core_checkpoint(segments, cpu_core_checkpoint):
+    """CPU adapts only RNG snapshots; native Core checkpoint/autograd execute."""
+    from megatron.lite.model.deepseek_v41.lite.index import IndexProjection
+
+    class Projection(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x), None
+
+    torch.manual_seed(7)
+    state = KVSourceState()
+    owner = IndexProjection(Projection(4, 4, bias=False), state, 0, 0, "index_q")
+    readers = [IndexProjection(None, state, i + 1, 0, "index_q") for i in range(segments)]
+    x = torch.randn(3, 1, 4, requires_grad=True)
+    initial_weight = owner.linear.weight.detach().clone()
+    calls = []
+
+    def owner_segment(value):
+        calls.append(("owner", torch.is_grad_enabled()))
+        return owner(value)[0].sin()
+
+    def reader_segment(reader, value):
+        calls.append(("reader", torch.is_grad_enabled()))
+        return value.cos() + reader(value)[0].square()
+
+    with state.microbatch():
+        actual = state.checkpoint(owner_segment, x, checkpoint_fn=cpu_core_checkpoint)
+        for reader in readers:
+            actual = state.checkpoint(
+                lambda value, reader=reader: reader_segment(reader, value),
+                actual,
+                checkpoint_fn=cpu_core_checkpoint,
+            )
+    # Forward may finish before pipeline backward. Explicit checkpoint inputs
+    # must keep the graph alive after the temporary source cache has cleared.
+    assert not state.active and not state.values
+    actual.sum().backward()
+    reference_x = x.detach().clone().requires_grad_()
+    reference_weight = initial_weight.requires_grad_()
+    shared = torch.nn.functional.linear(reference_x, reference_weight)
+    reference = shared.sin()
+    for _ in readers:
+        reference = reference.cos() + shared.square()
+    reference.sum().backward()
+    assert torch.equal(actual, reference)
+    assert torch.equal(x.grad, reference_x.grad)
+    assert torch.equal(owner.linear.weight.grad, reference_weight.grad)
+    assert torch.isfinite(x.grad).all() and torch.isfinite(owner.linear.weight.grad).all()
+    # Reverse graph traversal really recomputes readers before their owner.
+    reverse = [name for name, grad in calls if grad]
+    assert reverse == ["reader"] * segments + ["owner"]
+    assert not state.active and not state.values
+
+
+@pytest.mark.parametrize("halo", [False, True])
+def test_query_projection_parent_without_per_head_rms_is_bitwise(halo):
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as native,
+    )
+    from megatron.lite.model.deepseek_v41.lite.attention import DS41SelfAttention
+
+    class Projection(torch.nn.Linear):
+        def forward(self, x):
+            return super().forward(x), None
+
+    class Frequencies:
+        def get_rotary_seq_len(self, *args):
+            return 4
+
+        def __call__(self, length, packed_seq):
+            return (torch.arange(length).float() / 7).view(-1, 1, 1, 1).expand(-1, 1, 1, 2)
+
+    module = DS41SelfAttention.__new__(DS41SelfAttention)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        apply_rope_fusion=False,
+        qk_pos_emb_head_dim=2,
+        qk_head_dim=2,
+        q_lora_rank=4,
+        layernorm_epsilon=1e-6,
+        rotary_interleaved=False,
+        multi_latent_attention=True,
+        mrope_section=None,
+    )
+    module.recompute_up_proj = module._dsv4_uses_yarn_rope = False
+    module.pg_collection = SimpleNamespace(
+        cp=SimpleNamespace(rank=lambda: int(halo), size=lambda: 2 if halo else 1)
+    )
+    module.num_attention_heads_per_partition, module.q_head_dim = 1, 4
+    module.linear_q_down_proj = Projection(4, 4, bias=False)
+    module.linear_q_up_proj = Projection(4, 4, bias=False)
+    module.linear_kv_proj = Projection(4, 4, bias=False)
+    module.q_layernorm = torch.nn.RMSNorm(4, eps=1e-6)
+    module.kv_layernorm = torch.nn.RMSNorm(4, eps=1e-6)
+    module.rotary_pos_emb = Frequencies()
+    rows = 4 if halo else 8
+    x = torch.arange(rows * 4).float().reshape(rows, 1, 4).div(11).requires_grad_()
+    boundary = torch.arange(8).float().reshape(2, 1, 4).div(13).requires_grad_() if halo else None
+    prefix = torch.tensor([0, 4, 8], dtype=torch.int32)
+    params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q_padded=prefix,
+        cu_seqlens_kv_padded=prefix,
+        max_seqlen_q=4,
+        max_seqlen_kv=4,
+    )
+    actual = module.get_query_key_value_tensors(
+        x, packed_seq_params=params, boundary_hidden=boundary
+    )
+    with patch.object(native, "_q_rms_norm", lambda query, eps: query):
+        reference = native.DSv4HybridSelfAttention.get_query_key_value_tensors(
+            module, x, packed_seq_params=params, boundary_hidden=boundary
+        )
+    assert len(actual) == len(reference) == (6 if halo else 5)
+    for ours, core in zip(actual, reference):
+        assert torch.equal(ours, core)
