@@ -32,7 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .indexed_order import IndexedOrder
+from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -320,21 +320,25 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder[nn.Module], prefetch_size: int | None
+        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        next_module = order.next_item(cast(nn.Module, self))
+        module = cast(nn.Module, self)
+        order.advance(module)
+        next_module = order.next_item()
         if prefetch_size is None:
             if next_module is not None:
                 cast(FsdpModule, next_module)._unshard_parameter_groups()
             return
 
         prefetched_size = 0
+        offset = 1
         while next_module is not None and prefetched_size < prefetch_size:
             fsdp_module = cast(FsdpModule, next_module)
             fsdp_module._unshard_parameter_groups()
             prefetched_size += fsdp_module.num_parameter_elements
-            next_module = order.next_item(next_module)
+            offset += 1
+            next_module = order.next_item(offset)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
