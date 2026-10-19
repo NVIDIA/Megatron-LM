@@ -274,8 +274,9 @@ class FsdpModule:
 
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
-            # Shared contexts concatenate independent roots. Only the first
-            # root starts a new static traversal; later roots continue its cursor.
+            # Independent roots can share a context even without VPP, e.g.
+            # separately sharded siblings whose parent is not sharded. Reset only
+            # at the first root so later roots continue the shared static cursor.
             if (
                 not context.iteration_order.active
                 and not is_recomputing
