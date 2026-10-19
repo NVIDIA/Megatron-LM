@@ -87,6 +87,10 @@ class MoETokenDispatcher:
         self.shared_experts: Optional[SharedExpertMLP] = None
         # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
         self.use_nccl_stream = False  # Will be set to True when shared_experts is set.
+        # Set by the MoE layer while its checkpointed forward is re-run for the backward pass:
+        # nothing reads the combined values then, so the combine may return zeros without
+        # communicating (its backward still communicates). Dispatchers may ignore it.
+        self.skip_combine_forward_comm = False
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -378,7 +382,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
+                hidden_states.to(self.local_probs.dtype),
+                group=self.tp_ep_group,
+                skip_forward=self.skip_combine_forward_comm,
             ).to(hidden_states.dtype)
         return hidden_states
 
@@ -845,6 +851,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 hidden_states.to(self.probs.dtype),
                 group=self.tp_group,
                 input_split_sizes=input_split_sizes,
+                skip_forward=self.skip_combine_forward_comm,
             ).to(hidden_states.dtype)
 
         return hidden_states
@@ -882,6 +889,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
             self.output_splits,
             use_nccl_stream=self.use_nccl_stream,
+            skip_forward=self.skip_combine_forward_comm,
         )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)

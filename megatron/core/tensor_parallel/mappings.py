@@ -385,6 +385,30 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         )
 
 
+class _ReduceScatterToSequenceParallelRegionSkipForward(_ReduceScatterToSequenceParallelRegion):
+    """Reduce-scatter whose forward returns zeros without communicating; the backward all-gathers.
+
+    For a forward whose output values are never read, such as the re-run of a checkpointed region
+    that only rebuilds the autograd graph. All ranks of the group must skip alike.
+    """
+
+    @staticmethod
+    def forward(ctx, input_, group, input_split_sizes=None, use_global_buffer=False):
+        """Forward function."""
+        ctx.group = group
+        ctx.input_split_sizes = input_split_sizes
+        ctx.use_global_buffer = use_global_buffer
+        world_size = group.size()
+        if world_size == 1:
+            return input_
+        dim_size = list(input_.size())
+        if input_split_sizes is None:
+            dim_size[0] = dim_size[0] // world_size
+        else:
+            dim_size[0] = input_split_sizes[group.rank()]
+        return torch.zeros(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
+
+
 class _AllGatherFromTensorParallelRegion(torch.autograd.Function):
     """Gather the input from model parallel region and concatenate."""
 
@@ -488,6 +512,31 @@ class _AllToAll(torch.autograd.Function):
         )
 
 
+class _AllToAllSkipForward(_AllToAll):
+    """All-to-all whose forward returns zeros without communicating; the backward is the usual
+    all-to-all of the gradient.
+
+    For a forward whose output values are never read, such as the re-run of a checkpointed region
+    that only rebuilds the autograd graph. All ranks of the group must skip alike.
+    """
+
+    @staticmethod
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, use_nccl_stream=False):
+        """Forward function."""
+        ctx.group = group
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        ctx.use_nccl_stream = use_nccl_stream
+        if group.size() == 1:
+            return input
+        num_rows = input.size(0) if output_split_sizes is None else sum(output_split_sizes)
+        return torch.zeros(
+            [num_rows] + list(input.size()[1:]),
+            dtype=input.dtype,
+            device=torch.cuda.current_device(),
+        )
+
+
 # -----------------
 # Helper functions.
 # -----------------
@@ -540,10 +589,18 @@ def gather_from_sequence_parallel_region(
 
 
 def reduce_scatter_to_sequence_parallel_region(
-    input_, group=None, input_split_sizes=None, use_global_buffer=False
+    input_, group=None, input_split_sizes=None, use_global_buffer=False, skip_forward=False
 ):
-    """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>"""
+    """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>
+
+    With ``skip_forward``, the forward returns zeros of the output shape without communicating
+    (for outputs whose values are never read); the backward still all-gathers.
+    """
     group = get_tensor_model_parallel_group_if_none(group)
+    if skip_forward:
+        return _ReduceScatterToSequenceParallelRegionSkipForward.apply(
+            input_, group, input_split_sizes, use_global_buffer
+        )
     return _ReduceScatterToSequenceParallelRegion.apply(
         input_, group, input_split_sizes, use_global_buffer
     )
@@ -562,11 +619,21 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_, group=None):
 
 
 def all_to_all(
-    group, input_, output_split_sizes_=None, input_split_sizes=None, use_nccl_stream=False
+    group,
+    input_,
+    output_split_sizes_=None,
+    input_split_sizes=None,
+    use_nccl_stream=False,
+    skip_forward=False,
 ):
-    """Wrapper for autograd function"""
+    """Wrapper for autograd function
+
+    With ``skip_forward``, the forward returns zeros of the output shape without communicating
+    (for outputs whose values are never read); the backward still communicates.
+    """
     assert group is not None, "group should not be None"
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
+    function = _AllToAllSkipForward if skip_forward else _AllToAll
+    return function.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
 
 
 def all_to_all_sp2hp(input_, group=None):

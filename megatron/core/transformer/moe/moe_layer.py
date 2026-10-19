@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 import torch
 
@@ -786,7 +786,7 @@ class MoELayer(BaseMoELayer):
 
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(
-                custom_forward,
+                self._skip_combine_comm_on_recompute(custom_forward),
                 self.config,
                 self.tp_group,
                 hidden_states,
@@ -797,6 +797,38 @@ class MoELayer(BaseMoELayer):
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
+
+    def _skip_combine_comm_on_recompute(self, forward_fn: Callable) -> Callable:
+        """Wrap the checkpointed MoE forward so that its re-run skips the combine communication.
+
+        The checkpoint calls ``forward_fn`` once in the forward pass and once more in the backward
+        pass to rebuild the autograd graph. Nothing in the re-run reads the combined values: they
+        only flow through the unpermutation, the shared-expert add and the layer output, whose
+        backward passes do not use them, and the checkpoint starts the backward from the incoming
+        output gradient. The re-run's combine therefore returns zeros without communicating, while
+        its backward communicates as usual, so the gradients are unchanged. Every rank re-runs the
+        layer, so all ranks of the combine group skip alike.
+
+        With latent MoE, ``fc2_latent_proj`` saves the combined values for its weight gradient, so
+        the combine is kept.
+        """
+        if self.config.moe_latent_size:
+            return forward_fn
+
+        num_calls = 0
+
+        def wrapped_forward(*args, **kwargs):
+            nonlocal num_calls
+            num_calls += 1
+            if num_calls == 1:
+                return forward_fn(*args, **kwargs)
+            self.token_dispatcher.skip_combine_forward_comm = True
+            try:
+                return forward_fn(*args, **kwargs)
+            finally:
+                self.token_dispatcher.skip_combine_forward_comm = False
+
+        return wrapped_forward
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
