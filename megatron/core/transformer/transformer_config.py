@@ -509,7 +509,38 @@ class TransformerConfig(ModelParallelConfig):
     frontends without the switch, keep the prefill. Disable for A/B comparisons."""
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
-    """Precision used only by the fused compact DSA indexer forward and Top-K."""
+    """Precision of the DSA indexer scorer that produces the scores for Top-K selection.
+
+    ``dsv4_hybrid`` uses it for the fused compact CSA indexer forward and Top-K. For
+    ``dsa`` with ``dsa_kernel_backend='cudnn'``, ``'mxfp8'`` quantizes the indexer Q and K
+    (E4M3 with E8M0 1x32 scales) for the cuDNN dense scorer on the general packed THD path;
+    it needs SM100+, cuDNN frontend >= 1.29, ``dsa_indexer_head_dim=128``, 32 or 64 indexer
+    heads, BF16 indexer weights, the sparse indexer loss and the fused DSA kernels
+    (``attention_backend`` other than unfused). Other DSA scorer paths, and any layer that
+    would fall back to the BF16 PyTorch reference indexer, raise. Weights and the indexer
+    loss/backward stay BF16, and MXFP8 decides only which keys are selected: with the
+    indexer loss on, the selected keys' scores that feed the sparse KL (and that
+    ``dsa_indexer_reuse_checkpoint_topk`` keeps for the checkpoint replay) are recomputed
+    in FP32 from the BF16 indexer Q/K/weights (cuDNN
+    ``sparse_indexer_score_recompute_wrapper``), so given the selection the KL gradient is
+    the BF16 path's. That is one sparse recompute per loss-on scorer call, estimated (not
+    measured) at about 1.5-3 ms per GLM-5.2 1M CP64 rank-0 call and 0.1-0.5 ms at 128K
+    CP32; frozen-indexer and selection-only calls keep only indices and never recompute.
+    The KL value equals the BF16 path's too, except that a selected key whose indexer
+    probability underflows FLT_MIN (a logit more than 87.3 below the row's log-sum-exp over
+    the selection, which exceeds the row's maximum by up to ln(top-k): from about 79.7 below
+    the maximum at top-k 2048) contributes at most about 87.3 nats where the BF16 path's term
+    keeps growing.
+    The recompute follows this compute precision only, not the scorer kernel or the dtype
+    of its scores; ``'bf16'`` keeps the BF16 scorer's own FP32 scores (a scorer computing in
+    BF16 with BF16 scores would keep its values too), and ``dsv4_hybrid`` keeps its own
+    indexer-loss semantics. ``'mxfp8'`` cannot be combined with KPool selection
+    (``dsa_indexer_kpool > 1``), which bypasses the dense scorer; use
+    ``dsa_indexer_kpool_use_quantization`` for quantized KPool scoring instead.
+    ``dsa_indexer_qk_proj_use_quantization`` only picks the precision context of the indexer
+    Q/K projection GEMMs, whose BF16 outputs the MXFP8 scorer then quantizes itself, so the
+    two are independent. The DSA MXFP8 scale storage is allocated per scorer call, so
+    ``dsa_compact_indexer_workspace_sharing`` (CSA only) does not apply to it."""
 
     dsa_compact_indexer_workspace_sharing: bool = True
     """Under CUDA graphs the fused compact DSA indexer keeps a persistent workspace per static
@@ -2738,6 +2769,53 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
                 )
+            if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+                raise ValueError(
+                    "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                    f"got {self.dsa_indexer_precision!r}."
+                )
+            if self.dsa_indexer_precision == "mxfp8":
+                # Static requirements of the cuDNN MXFP8 dense indexer scorer. The SM100+
+                # device and the installed frontend's MXFP8 API are checked at the first
+                # scorer call, since config validation can run without a GPU.
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires "
+                        f"dsa_kernel_backend='cudnn', got {self.dsa_kernel_backend!r}."
+                    )
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires the fused DSA kernels "
+                        "(attention_backend != unfused); the unfused path scores the indexer "
+                        "in BF16 only."
+                    )
+                if self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads not in (32, 64):
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires dsa_indexer_head_dim=128 "
+                        "and dsa_indexer_n_heads of 32 or 64, got "
+                        f"head_dim={self.dsa_indexer_head_dim}, "
+                        f"n_heads={self.dsa_indexer_n_heads}."
+                    )
+                if not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA supports only the sparse "
+                        "indexer loss; set dsa_indexer_use_sparse_loss=True."
+                    )
+                if self.dsa_indexer_weights_proj_output_dtype != "bf16":
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires BF16 indexer weights; "
+                        "set dsa_indexer_weights_proj_output_dtype='bf16'."
+                    )
+                if self.dsa_indexer_kpool > 1:
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA is the per-token cuDNN dense "
+                        "scorer; KPool selection (dsa_indexer_kpool > 1) bypasses it. Use "
+                        "dsa_indexer_kpool_use_quantization for quantized KPool scoring."
+                    )
             if self.dsa_indexer_skip_topk_offset < 0:
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
