@@ -1817,70 +1817,9 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_processed_log_probs_keep_partial_chunk_row_raw(self):
-        """A partial prefill chunk's final row scores a prompt token, so it stays raw."""
-        dynamic_context = self._get_dynamic_context(
-            params_dtype=torch.float32,
-            num_layers=4,
-            kv_channels=8,
-            num_attention_heads=2,
-            max_sequence_length=512,
-            buffer_size_gb=0.03,
-            block_size_tokens=128,
-            max_tokens=None,
-        )
-        dynamic_context.config.logprobs_mode = "processed_logprobs"
-
-        request_sampling = {
-            2001: (dict(temperature=0.5, top_k=8, top_p=0.0), 6),
-            2002: (dict(temperature=0.5, top_k=8, top_p=0.0), 9),
-        }
-        for request_id, (sampling_kwargs, prompt_len) in request_sampling.items():
-            dynamic_context.add_request(
-                DynamicInferenceRequest(
-                    request_id=request_id,
-                    prompt_tokens=torch.randint(0, 100, (prompt_len,), device='cpu'),
-                    sampling_params=SamplingParams(
-                        num_tokens_to_generate=4, return_log_probs=True, **sampling_kwargs
-                    ),
-                )
-            )
-        # Treat the last active request as a partial chunk.
-        dynamic_context.chunked_prefill_request_id = 2002
-
-        dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
-
-        vocab_size = 1000
-        sampling = TorchSampling(rng=torch.Generator(), vocab_size=vocab_size)
-        logits = torch.randn(
-            1, dynamic_context.active_token_count, vocab_size, device='cuda', dtype=torch.float32
-        )
-        new_tokens = torch.randint(0, 100, (2,), device='cuda').long()
-        _, log_probs_full = dynamic_context.calculate_log_probs(
-            logits, new_tokens, sampling=sampling
-        )
-
-        logits_2d = logits.squeeze(0)
-        expected = torch.nn.functional.log_softmax(logits_2d, dim=-1)
-        expected_context, sampled_rows = _processed_rows_context(
-            list(request_sampling.values()), num_sampled=1
-        )
-        expected[sampled_rows] = sampling.log_probs_kernel(
-            logits_2d[sampled_rows], expected_context, token_to_request_index=torch.arange(1)
-        )
-        assert torch.allclose(log_probs_full, expected, atol=1e-6)
-        # Only the sampled row is filtered. Every prompt row, including the partial
-        # chunk's final row, keeps the full raw support.
-        prompt_rows = torch.ones(log_probs_full.shape[0], dtype=torch.bool)
-        prompt_rows[sampled_rows] = False
-        assert torch.isinf(log_probs_full[sampled_rows[0]]).any()
-        assert torch.isfinite(log_probs_full[prompt_rows]).all()
-
-    @pytest.mark.internal
-    @rounder_override(64)
     @pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "processed_logprobs"])
-    def test_calculate_and_store_log_probs(self, logprobs_mode):
+    @pytest.mark.parametrize("partial_chunk", [False, True])
+    def test_calculate_and_store_log_probs(self, logprobs_mode, partial_chunk):
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1939,7 +1878,7 @@ class TestDynamicContext:
         # Supplies log_probs_kernel for processed mode (unused by raw mode).
         sampling = TorchSampling(rng=torch.Generator(), vocab_size=vocab_size)
 
-        def expected_log_probs(logits, active_id_and_counts):
+        def expected_log_probs(logits, active_id_and_counts, num_sampled=None):
             """Mode-aware expected log-probs over every active-token row.
 
             Prompt rows are always raw. In processed mode, each request's final
@@ -1948,6 +1887,8 @@ class TestDynamicContext:
             Args:
                 logits (Tensor): Raw logits for the active token rows.
                 active_id_and_counts: Request IDs paired with their row counts.
+                num_sampled: Number of leading requests whose final row is
+                    engine-sampled. Defaults to every request.
 
             Returns:
                 Tensor: Expected log probabilities.
@@ -1960,7 +1901,8 @@ class TestDynamicContext:
                 [
                     (request_data[active_id]["sampling"], count)
                     for active_id, count in active_id_and_counts
-                ]
+                ],
+                num_sampled=num_sampled,
             )
             expected[sampled_rows] = sampling.log_probs_kernel(
                 logits_2d[sampled_rows],
@@ -1979,6 +1921,11 @@ class TestDynamicContext:
             scaled = logits.squeeze(0)[row].float() / max(req_sampling["temperature"], 1e-6)
             tempered = (scaled[token] - scaled.logsumexp(0)).item()
             assert actual == pytest.approx(tempered, rel=1e-5, abs=1e-6)
+
+        if partial_chunk:
+            # Treat the last active request as a partial chunk. Its final row scores
+            # its next prompt token, so it stays raw even in processed mode.
+            dynamic_context.chunked_prefill_request_id = 1003
 
         # Populate gpu_view for calculate_log_probs (which reads from gpu_view).
         dynamic_context.initialize_attention_state()
@@ -2002,8 +1949,15 @@ class TestDynamicContext:
 
         # Calculate expected prefill log probs for the selected tokens
         prefill_active = [(req_id, request_data[req_id]["prefill_len"]) for req_id in request_data]
-        expected_prefill_full = expected_log_probs(prefill_logits, prefill_active)
+        expected_prefill_full = expected_log_probs(
+            prefill_logits,
+            prefill_active,
+            num_sampled=len(prefill_active) - 1 if partial_chunk else None,
+        )
         assert torch.allclose(prefill_log_probs_full, expected_prefill_full, atol=1e-6)
+        if partial_chunk:
+            # The partial chunk's final row keeps the full raw support despite top-k.
+            assert torch.isfinite(prefill_log_probs_full[total_active_tokens - 1]).all()
         expected_prefill_log_probs = expected_prefill_full.to(torch.float32).cpu()
 
         for i, (req_id, data) in enumerate(request_data.items()):
@@ -2032,6 +1986,10 @@ class TestDynamicContext:
                         prefill_log_probs[i][j]
                         == expected_prefill_log_probs[initial_token_offset + j, token].item()
                     )
+
+        if partial_chunk:
+            # Complete the chunk so the remaining steps run as ordinary decode.
+            dynamic_context.chunked_prefill_request_id = -1
 
         # Simulate decode step
         # All requests are active, so the mask will be all ones for the current active requests

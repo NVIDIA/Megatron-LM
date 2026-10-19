@@ -448,8 +448,10 @@ sp = SamplingParams(
 `InferenceConfig.logprobs_mode` controls *which* log-probs you get:
 `'raw_logprobs'` (default) returns the unmodified model log-probs, while
 `'processed_logprobs'` returns log-probs of sampled tokens after temperature,
-top-k, and top-p have been applied. Prompt log-probs are always raw in both
-modes, because prompt tokens were not sampled from the processed distribution.
+top-k, and top-p have been applied. The mode applies to both the selected-token
+log-probs and the top-N log-probs (`top_n_logprobs`). Prompt log-probs, including
+prompt top-N log-probs, are always raw in both modes, because prompt tokens were
+not sampled from the processed distribution.
 `'processed_logprobs'` is not yet supported with speculative decoding.
 
 ### Engine Configuration
