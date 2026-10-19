@@ -48,7 +48,7 @@ from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.validation import StrictHandling, parse_strict_flag
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model, get_pg_rank, get_pg_size
 
 
 def _strip_wrapper_prefixes(path):
@@ -71,18 +71,47 @@ def _shift_slice(s, offset):
     return slice(s.start + offset, s.stop + offset)
 
 
-def get_ep_layer_offset(num_experts: int | None = None) -> int:
+def get_ep_rank_and_size(pg_collection) -> tuple[int | None, int | None]:
+    """Return the expert-parallel rank and size of ``pg_collection`` for the helpers below.
+
+    Returns ``(None, None)``, which makes the helpers read the global grid, when there is no
+    collection or it does not set ``ep``. An ``ep`` set to None means expert parallelism is off.
+
+    Args:
+        pg_collection: The process-group collection of the model that owns the experts.
+    """
+    if pg_collection is None or 'ep' not in vars(pg_collection):
+        return None, None
+    return get_pg_rank(pg_collection.ep), get_pg_size(pg_collection.ep)
+
+
+def get_ep_layer_offset(
+    num_experts: int | None = None, *, ep_rank: int | None = None, ep_size: int | None = None
+) -> int:
     """
     Get the expert layer offset for the current model.
 
     Args:
         num_experts: Total number of experts in the model. If None, returns 0.
+        ep_rank: This rank's expert-parallel rank in the model that owns the experts.
+        ep_size: Expert-parallel size of that model. Pass ``ep_rank`` and ``ep_size``
+            together; integers keep offline tools that have no process groups working. When
+            both are omitted, they are read from the global parallel grid.
 
     Returns:
         The expert layer offset for the current EP rank.
+
+    Raises:
+        ValueError: If only one of ``ep_rank`` and ``ep_size`` is given.
     """
-    ep_size = parallel_state.get_expert_model_parallel_world_size()
-    ep_rank = parallel_state.get_expert_model_parallel_rank()
+    if ep_rank is None and ep_size is None:
+        # Migration fallback for callers that do not pass the model's expert-parallel layout.
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+    elif ep_rank is None or ep_size is None:
+        raise ValueError(
+            f"Pass ep_rank and ep_size together, got ep_rank={ep_rank} and ep_size={ep_size}"
+        )
     num_local_experts = num_experts // ep_size if num_experts else 0
     local_expert_offset = ep_rank * num_local_experts
 
@@ -126,18 +155,27 @@ def get_expert_index_from_key(key):
     return None
 
 
-def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
+def handle_experts_in_state_dict(
+    state_dict,
+    num_experts: int | None = None,
+    *,
+    ep_rank: int | None = None,
+    ep_size: int | None = None,
+):
     """
     Rewrite expert keys in state dict.
 
     Args:
         state_dict: The state dictionary to process.
         num_experts: Total number of experts in the model. If None, no expert processing occurs.
+        ep_rank: Expert-parallel rank of the model that owns the experts; see
+            ``get_ep_layer_offset``.
+        ep_size: Expert-parallel size of that model; see ``get_ep_layer_offset``.
 
     Returns:
         The processed state dictionary with rewritten expert keys.
     """
-    local_expert_start = get_ep_layer_offset(num_experts)
+    local_expert_start = get_ep_layer_offset(num_experts, ep_rank=ep_rank, ep_size=ep_size)
     local_expert_end = get_total_num_experts(num_experts)
 
     def should_keep_expert_key(expert_index):
@@ -184,17 +222,26 @@ def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
     return state_dict
 
 
-def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
+def expert_param_local_key(
+    key: str,
+    num_experts: int | None = None,
+    *,
+    ep_rank: int | None = None,
+    ep_size: int | None = None,
+) -> str:
     """Get the module parameter corresponding to the key.
 
     Args:
         key: The parameter key to process.
         num_experts: Total number of experts in the model. If None, no expert processing occurs.
+        ep_rank: Expert-parallel rank of the model that owns the experts; see
+            ``get_ep_layer_offset``.
+        ep_size: Expert-parallel size of that model; see ``get_ep_layer_offset``.
 
     Returns:
         The local parameter key with adjusted expert indices.
     """
-    local_expert_offset = get_ep_layer_offset(num_experts)
+    local_expert_offset = get_ep_layer_offset(num_experts, ep_rank=ep_rank, ep_size=ep_size)
     expert_index = get_expert_index_from_key(key)
     if expert_index is not None:
         new_expert_index = expert_index - local_expert_offset
@@ -230,6 +277,10 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     num_experts = (
         getattr(model_config, 'num_moe_experts', None) if model_config is not None else None
     )
+    # The model's own expert-parallel layout maps its local experts to global indices.
+    ep_rank = ep_size = None
+    if num_experts:
+        ep_rank, ep_size = get_ep_rank_and_size(get_attr_wrapped_model(model, "pg_collection"))
 
     # ------------------------------------------------------------------
     # Build per-TransformerLayer gated_linear_unit map.
@@ -379,7 +430,9 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
                 for subkey in ["exp_avg", "exp_avg_sq"]:
                     dist_param = model.get_parameter(
-                        expert_param_local_key(key[len("module.") :], num_experts)
+                        expert_param_local_key(
+                            key[len("module.") :], num_experts, ep_rank=ep_rank, ep_size=ep_size
+                        )
                     )
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
@@ -1058,13 +1111,17 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
             ), f"key: {key}; {value} {load_item_dict[key]}"
 
 
-def get_global_unique_param_name(model_chunks, param):
+def get_global_unique_param_name(
+    model_chunks, param, *, ep_rank: int | None = None, ep_size: int | None = None
+):
     """
     Get the global unique parameter name for a given model and parameter.
 
     Args:
         model_chunks: List of model chunks to search for the parameter.
         param: The parameter to find the name for.
+        ep_rank: Expert-parallel rank of the model; see ``get_ep_layer_offset``.
+        ep_size: Expert-parallel size of the model; see ``get_ep_layer_offset``.
 
     Returns:
         The global unique parameter name.
@@ -1093,6 +1150,12 @@ def get_global_unique_param_name(model_chunks, param):
 
     # Get EP unique parameter name
     num_experts = model_chunks[0].config.num_moe_experts if model_chunks else None
-    param_name = next(iter(handle_experts_in_state_dict({param_name: None}, num_experts).keys()))
+    param_name = next(
+        iter(
+            handle_experts_in_state_dict(
+                {param_name: None}, num_experts, ep_rank=ep_rank, ep_size=ep_size
+            ).keys()
+        )
+    )
 
     return param_name
