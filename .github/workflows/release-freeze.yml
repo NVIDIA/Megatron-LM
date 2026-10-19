@@ -32,10 +32,15 @@ on:
         description: Dry-run of code-freeze
         required: false
         default: true
+permissions:
+  contents: read
+
 jobs:
   code-freeze:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@bfdb5e35067fd8cd91ce21fca4eb1072ffd7ab8c # v1.4.2
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_code_freeze.yml@61445a177938967f70c94094b98402e979452151 # github app authentication
     with:
+      app-id: ${{ vars.BOT_ID }}
+      environment-name: main
       library-name: Megatron-Core
       python-package: megatron.core
       release-type: ${{ inputs.release-type }}
@@ -44,8 +49,7 @@ jobs:
       next-pre-release: ""
       next-dev: ""
       release-branch-prefix: core_
-      use-pat: true
     secrets:
       SLACK_WEBHOOK: ${{ inputs.dry-run && secrets.SLACK_CI_CHANNEL_WEBHOOK ||secrets.SLACK_MAIN_CHANNEL_WEBHOOK }}
       SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_TEAM_GROUP_ID }}
-      PAT: ${{ secrets.PAT }}
+      BOT_KEY: ${{ secrets.BOT_KEY }}

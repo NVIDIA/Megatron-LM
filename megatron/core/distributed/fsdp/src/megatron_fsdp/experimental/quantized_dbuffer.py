@@ -25,10 +25,13 @@ try:
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 except ImportError as exc:
+    # Keep "UnavailableError": .gitlab/scripts/check_imports.py imports this module
+    # directly and uses that string to classify missing optional dependencies as graceful.
     raise ImportError(
         "UnavailableError: QuantizedDBuffer requires Transformer Engine MXFP8 support"
     ) from exc
 
+from . import layout_builder
 from .dbuffer import DBuffer
 from .layout import GlobalLayout, Shape
 from .placement import BlockAtomic, RowAtomic
@@ -48,30 +51,24 @@ def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
 def _rowwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     """Derive rowwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
-        tensor_shapes=tuple(
-            torch.Size((shape[0], shape[1] // _MXFP8_BLOCK_SIZE))
-            for shape in data_layout.tensor_shapes
+        tensor_shapes=(
+            (shape[0], shape[1] // _MXFP8_BLOCK_SIZE) for shape in data_layout.tensor_shapes
         ),
-        tensor_to_offset=tuple(
-            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
-        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 
 def _columnwise_scale_layout(data_layout: GlobalLayout) -> GlobalLayout:
     """Derive columnwise scales from the layout shared by rowwise_data and columnwise_data."""
     return GlobalLayout(
-        tensor_shapes=tuple(
-            torch.Size((shape[0] // _MXFP8_BLOCK_SIZE, shape[1]))
-            for shape in data_layout.tensor_shapes
+        tensor_shapes=(
+            (shape[0] // _MXFP8_BLOCK_SIZE, shape[1]) for shape in data_layout.tensor_shapes
         ),
-        tensor_to_offset=tuple(
-            offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset
-        ),
+        tensor_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.tensor_to_offset),
         size=data_layout.size // _MXFP8_BLOCK_SIZE,
-        rank_to_offset=tuple(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
+        rank_to_offset=(offset // _MXFP8_BLOCK_SIZE for offset in data_layout.rank_to_offset),
     )
 
 
@@ -162,7 +159,7 @@ class QuantizedDBuffer:
         device: torch.device | str,
     ) -> "QuantizedDBuffer":
         """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
-        layout = GlobalLayout.build_for_row_atomic(
+        layout = layout_builder.build_for_row_atomic(
             tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
         )
         return cls(mesh, placements, layout, device)
@@ -233,7 +230,28 @@ class QuantizedDBuffer:
             if actual != expected:
                 raise ValueError(f"Expected main_weight {attribute} {expected!r}, got {actual!r}.")
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
+            # TE's MXFP8 quantize kernel writes scale_inv in its padded physical
+            # layout (see _pad_rowwise_scale and _pad_columnwise_scale) and stores
+            # scales for every row of its 64-row chunk, including rows beyond the
+            # tensor (https://github.com/NVIDIA/TransformerEngine/issues/3689). The
+            # compact plane views are smaller than that whenever this rank's shard
+            # is not a multiple of 64 rows, so quantizing into them is an
+            # out-of-bounds write: into the next rank's chunk of a replicated plane,
+            # or beyond the end of the local buffer. This is the producer-side
+            # counterpart of the GEMM padding in get_tensor() (TE issue 3518):
+            # quantize into the padded scales that get_tensor() builds and copy the
+            # compact region back. Once TE quantizes into compact scales in bounds,
+            # this loop body reduces to:
+            #   self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
+            tensor = self.get_tensor(index)
+            tensor.quantize_(main_weight.get_tensor_view(index))
+            for plane, padded in (
+                (self.rowwise_scale, tensor._rowwise_scale_inv),
+                (self.columnwise_scale, tensor._columnwise_scale_inv),
+            ):
+                compact = plane.get_tensor_view(index)
+                if padded.shape != compact.shape:
+                    compact.copy_(padded[: compact.shape[0], : compact.shape[1]])
 
     @property
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:
@@ -291,9 +309,12 @@ class QuantizedDBuffer:
         return out
 
     def allgather(
-        self, mesh_axis: int, *, out: "QuantizedDBuffer | None" = None
+        self, mesh_axis: int | Iterable[int], *, out: "QuantizedDBuffer | None" = None
     ) -> "QuantizedDBuffer":
-        """All-gather every plane, returning ``out`` when supplied or a new wrapper."""
+        """Gather one or more axes in every plane, reusing ``out`` when supplied."""
+        # Materialize generators once so every plane gathers the same axes.
+        if not isinstance(mesh_axis, int):
+            mesh_axis = tuple(mesh_axis)
         if out is None:
             return self._from_planes(*(plane.allgather(mesh_axis) for plane in self.planes))
         for plane, out_plane in zip(self.planes, out.planes):

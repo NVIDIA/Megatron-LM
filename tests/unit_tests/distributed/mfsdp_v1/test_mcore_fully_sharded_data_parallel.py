@@ -1077,15 +1077,9 @@ class TestMegatronFSDPE2E:
         from megatron.training.argument_utils import (
             gpt_config_from_args,
             pretrain_cfg_container_from_args,
-            resolve_tokenizer_vocab_size,
         )
         from megatron.training.arguments import add_megatron_arguments, validate_args
-        from megatron.training.global_vars import (
-            initialize_runtime_services,
-            set_args,
-            set_run_config,
-            unset_global_variables,
-        )
+        from megatron.training.global_vars import set_args, set_run_config, unset_global_variables
 
         # Because we are using pretrain() to test, destroy the entire global state
         # before calling pretrain() for the next test case.
@@ -1190,8 +1184,6 @@ class TestMegatronFSDPE2E:
             model_cfg = gpt_config_from_args(args)
             cfg = pretrain_cfg_container_from_args(args, model_cfg)
             set_run_config(cfg)
-            initialize_runtime_services(args)
-            resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
 
             from gpt_builders import gpt_builder
             from model_provider import model_provider
