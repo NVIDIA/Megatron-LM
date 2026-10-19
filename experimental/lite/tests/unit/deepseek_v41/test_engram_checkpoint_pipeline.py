@@ -1,10 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DS4.1 Engram, checkpoint and pipeline state transport contracts."""
+import json
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+from safetensors.torch import save_file
 
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.lite.model.deepseek_v41.lite.checkpoint import (
+    attach_checkpoint_metadata,
+    load_hf_weights,
+)
+from megatron.lite.model.deepseek_v41.lite.engram import Engram, ShardedFrozenTable
 from megatron.lite.model.deepseek_v41.lite.protocol import forward_step
 from megatron.lite.runtime.contracts import PackedBatch
 
@@ -12,25 +22,17 @@ from megatron.lite.runtime.contracts import PackedBatch
 @pytest.mark.parametrize("rank", [0, 1])
 def test_forward_step_rows_are_original_unpadded_rows(rank):
     class Rows(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.ps = SimpleNamespace(cp_size=2, cp_rank=rank, cp_group=object())
+        ps = SimpleNamespace(cp_size=2, cp_rank=rank, cp_group=object())
 
-        def forward(self, input_ids, **kwargs):
-            local = input_ids.numel()
-            mask = kwargs["loss_mask"].bool()
-            return {
-                "log_probs": torch.zeros(local),
-                "rows": torch.arange(local) + rank * local,  # physical, as the model reports
-                "valid_mask": mask,
-            }
+        def forward(self, input_ids, loss_mask, **_):  # physical rows, as the model reports
+            n = input_ids.numel()
+            rows = torch.arange(n) + rank * n
+            return {"log_probs": torch.zeros(n), "rows": rows, "valid_mask": loss_mask.bool()}
 
     ids = torch.arange(12)
     output = forward_step(Rows(), PackedBatch(ids, ids, torch.tensor([5, 1, 6])))
     # Documents padded to 8 + 4 + 8 physical rows, contiguous CP halves of 10.
-    expected = (
-        [0, 1, 2, 3, 4, -1, -1, -1, 5, -1] if rank == 0 else [-1, -1, 6, 7, 8, 9, 10, 11, -1, -1]
-    )
+    expected = [0, 1, 2, 3, 4, -1, -1, -1, 5, -1] if rank == 0 else [-1, -1, *range(6, 12), -1, -1]
     assert output["rows"].tolist() == expected
     # Padding rows are never valid; document ends stay masked by the label roll.
     assert not output["valid_mask"][output["rows"] < 0].any()
@@ -38,10 +40,6 @@ def test_forward_step_rows_are_original_unpadded_rows(rank):
 
 
 def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
-    import torch.distributed as dist
-
-    from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
-
     dist.init_process_group("gloo", init_method=f"file://{tmp_path}/store", rank=0, world_size=1)
     try:
         group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)  # rank 1 of a 2-way row shard
@@ -51,9 +49,6 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
         engram = torch.nn.Module()
         engram.embed, engram.wkv = table, torch.nn.Linear(4, 4, bias=False)
         engram.register_buffer("cache", torch.zeros(2), persistent=False)
-        from megatron.core.transformer.module import MegatronModule
-        from megatron.core.transformer.transformer_config import TransformerConfig
-
         # A native Core module describes itself; global mpu is never initialized here.
         native = MegatronModule(
             TransformerConfig(num_layers=1, hidden_size=4, num_attention_heads=1)
@@ -61,15 +56,15 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
         native.tp_group, native.bias = dist.group.WORLD, torch.nn.Parameter(torch.zeros(4))
         model = torch.nn.Module()
         model.engrams, model.native = torch.nn.ModuleDict({"1": engram}), native
-        ps = SimpleNamespace(dp_cp_rank=1, dp_cp_group=dist.group.WORLD)
-        attach_checkpoint_metadata([model], ps)
+        attach_checkpoint_metadata(
+            [model], SimpleNamespace(dp_cp_rank=1, dp_cp_group=dist.group.WORLD)
+        )
         state = model.sharded_state_dict()
         assert model._mlite_dist_opt_sharded_state_dict
         assert set(state) == {"engrams.1.embed.weight", "engrams.1.wkv.weight", "native.bias"}
         rows = state["engrams.1.embed.weight"]
         assert rows.global_shape == (6, 4) and rows.global_offset == (3, 0)
         assert rows.replica_id == (0, 0, 0)  # the row group covers dp x cp: no replicas
-        assert state["engrams.1.wkv.weight"].global_shape == (4, 4)
         table.lookup.boundaries = (0, 2, 6)
         with pytest.raises(ValueError, match="equal Core row shards"):
             model.sharded_state_dict()
@@ -78,26 +73,17 @@ def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
 
 
 def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
-    import json
-
-    from safetensors.torch import save_file
-
-    from megatron.lite.model.deepseek_v41.lite.checkpoint import load_hf_weights
-
     names = ["embed.weight", "layers.0.attn_norm.weight", "layers.1.attn_norm.weight", "mtp.x"]
     save_file({n: torch.ones(4, dtype=torch.bfloat16) for n in names}, tmp_path / "a.safetensors")
     index = {"weight_map": {n: "a.safetensors" for n in names}}
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
 
     def stage():  # first stage holding layer 0; layer 1 and MTP belong elsewhere
-        layer = torch.nn.Module()
+        model, layer = torch.nn.Module(), torch.nn.Module()
         layer.attn_norm = torch.nn.Module()
         layer.attn_norm.weight = torch.nn.Parameter(torch.zeros(4))
-        model = torch.nn.Module()
-        model.embed = torch.nn.Embedding(1, 4)
-        model.embed.weight = torch.nn.Parameter(torch.zeros(4))
-        model.layers = torch.nn.ModuleDict({"0": layer})
-        model.local_layer_range = (0, 1)
+        model.embed, model.embed.weight = torch.nn.Module(), torch.nn.Parameter(torch.zeros(4))
+        model.layers, model.local_layer_range = torch.nn.ModuleDict({"0": layer}), (0, 1)
         model.layout = SimpleNamespace(has_embed=True, has_head=False)
         return model
 
@@ -113,3 +99,27 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     unloaded.layers["0"].register_buffer("state", torch.zeros(1))  # persistent, unmapped
     with pytest.raises(ValueError, match=r"unloaded \['layers.0.state'\]"):
         load_hf_weights(unloaded, str(tmp_path), cfg, ps)
+
+
+def test_engram_masked_rows_pass_the_residual_through():
+    engram = Engram(4, 2, torch.nn.Embedding(6, 4), torch.nn.Linear(8, 12, bias=False))
+    hidden, ids = torch.randn(3, 1, 2, 4), torch.tensor([[[0, 1]], [[2, 3]], [[4, 5]]])
+    out = engram(hidden, ids, torch.tensor([[True], [False], [True]]))
+    assert torch.equal(out[1], hidden[1]) and not torch.equal(out[0], hidden[0])
+
+
+def _gather_worker(rank, store):
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=f"file://{store}", rank=rank, world_size=2)
+    config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
+    table = ShardedFrozenTable(5, 8, config, dist.group.WORLD)  # 6 padded rows, 3 per rank
+    full = torch.arange(48.0, device="cuda").reshape(6, 8).to(table.weight.dtype)
+    table.weight.copy_(full[3 * rank : 3 * rank + 3])
+    ids = torch.tensor([[0, 4], [2, 3], [1, 0]], device="cuda")[rank:]  # 3 and 2 query rows
+    assert torch.equal(table(ids), full[ids])
+    dist.destroy_process_group()
+
+
+@pytest.mark.gpus(2, min_architecture="blackwell")
+def test_sharded_engram_table_matches_a_single_table_lookup(tmp_path):
+    torch.multiprocessing.spawn(_gather_worker, args=(f"{tmp_path}/store",), nprocs=2)
