@@ -131,14 +131,25 @@ def build_coactivation(
 # ---------------------------------------------------------------------------
 
 
-def kl_partition(coact: np.ndarray, ep_size: int, max_iter: Optional[int] = None) -> np.ndarray:
+def kl_partition(
+    coact: np.ndarray, ep_size: int, max_iter: Optional[int] = None, max_load_ratio: float = 0.0
+) -> np.ndarray:
     """Kernighan-Lin balanced partition of the co-activation graph.
 
     Faithful port of the notebook's ``kl_partition`` (the ``coplace`` builder):
     start from the contiguous round-robin placement, then repeatedly apply the
     single best expert-swap between two ranks that most increases intra-rank
     co-activation weight, for ``max_iter`` (default ``3*E``) steps.  Swaps
-    preserve group sizes, so the result stays perfectly balanced.
+    preserve group sizes, so the result stays perfectly balanced in expert COUNT.
+
+    ``max_load_ratio > 0`` additionally balances token LOAD. The diagonal of
+    ``coact`` is the number of tokens that selected each expert, so a rank's
+    load is the sum of its members' diagonals. A swap is accepted only if both
+    ranks end up at or below ``max_load_ratio * mean_rank_load``, or if it does
+    not raise the larger of the two ranks' loads (so an initially over-full
+    rank can still be repaired). Without this, grouping co-activated (= popular)
+    experts piles load onto a few ranks; the all-to-all and the expert GEMMs are
+    then bounded by the hottest rank, which cancels the wire-row savings.
 
     Returns ``rank[e]`` = the EP rank expert ``e`` is assigned to (NOT a
     permutation -- see :func:`rank_assignment_to_order`).
@@ -150,11 +161,14 @@ def kl_partition(coact: np.ndarray, ep_size: int, max_iter: Optional[int] = None
         max_iter = 3 * E
 
     W = coact.astype(np.float64).copy()
+    load = np.diag(W).copy()  # tokens that selected each expert
     np.fill_diagonal(W, 0.0)  # self-count must not drive grouping
     rank = (np.arange(E) // cap).copy()
     mem = {r: list(np.where(rank == r)[0]) for r in range(ep_size)}
     # WR[e, r] = total co-activation weight from expert e to experts on rank r.
     WR = np.stack([W[:, mem[r]].sum(1) for r in range(ep_size)], axis=1)
+    rank_load = np.array([load[mem[r]].sum() for r in range(ep_size)])
+    load_cap = max_load_ratio * rank_load.mean() if max_load_ratio > 0 else None
 
     for _ in range(max_iter):
         best_gain, best = 1e-9, None
@@ -168,6 +182,14 @@ def kl_partition(coact: np.ndarray, ep_size: int, max_iter: Optional[int] = None
                     + (WR[np.ix_(B, [ra])] - WR[np.ix_(B, [rb])]).T
                     - 2 * W[np.ix_(A, B)]
                 )
+                if load_cap is not None:
+                    la = load[A][:, None]
+                    lb = load[B][None, :]
+                    new_a = rank_load[ra] - la + lb
+                    new_b = rank_load[rb] + la - lb
+                    within_cap = (new_a <= load_cap) & (new_b <= load_cap)
+                    not_worse = np.maximum(new_a, new_b) <= max(rank_load[ra], rank_load[rb])
+                    G = np.where(within_cap | not_worse, G, -np.inf)
                 i, j = np.unravel_index(np.argmax(G), G.shape)
                 if G[i, j] > best_gain:
                     best_gain, best = G[i, j], (A[i], B[j], ra, rb)
@@ -181,8 +203,21 @@ def kl_partition(coact: np.ndarray, ep_size: int, max_iter: Optional[int] = None
         mem[rb].append(a)
         WR[:, ra] += W[:, b] - W[:, a]
         WR[:, rb] += W[:, a] - W[:, b]
+        rank_load[ra] += load[b] - load[a]
+        rank_load[rb] += load[a] - load[b]
 
     return rank
+
+
+def load_imbalance(coact: np.ndarray, order: List[int], ep_size: int) -> float:
+    """max / mean per-rank token load of a rank-major ``order`` (1.0 = perfectly even).
+
+    Per-expert load is the diagonal of ``coact`` (tokens that selected the expert)."""
+    E = coact.shape[0]
+    cap = E // ep_size
+    load = np.diag(coact).astype(np.float64)
+    per_rank = np.array([load[order[r * cap : (r + 1) * cap]].sum() for r in range(ep_size)])
+    return float(per_rank.max() / per_rank.mean()) if per_rank.mean() > 0 else 1.0
 
 
 def rank_assignment_to_order(rank: np.ndarray, ep_size: int) -> List[int]:
@@ -196,7 +231,9 @@ def rank_assignment_to_order(rank: np.ndarray, ep_size: int) -> List[int]:
     return order
 
 
-def coactivation_placement(coact: np.ndarray, ep_size: int, nodes: int = 1) -> List[int]:
+def coactivation_placement(
+    coact: np.ndarray, ep_size: int, nodes: int = 1, max_load_ratio: float = 0.0
+) -> List[int]:
     """Co-activation placement as a rank-major permutation (KL partition).
 
     ``nodes > 1`` makes the partition hierarchical (node-aware): experts are first
@@ -205,17 +242,21 @@ def coactivation_placement(coact: np.ndarray, ep_size: int, nodes: int = 1) -> L
     assumed node-major (rank r lives on node r // (ep_size // nodes)), which is how
     torchrun lays out a multi-node job.  Cross-node wire rows are the volume-priced
     ones on the NIC fabric, so the node level is optimised first.
+
+    ``max_load_ratio`` is forwarded to :func:`kl_partition` (token-load cap per rank).
     """
     if nodes <= 1:
-        return rank_assignment_to_order(kl_partition(coact, ep_size), ep_size)
+        return rank_assignment_to_order(
+            kl_partition(coact, ep_size, max_load_ratio=max_load_ratio), ep_size
+        )
     assert ep_size % nodes == 0, f"ep_size {ep_size} not divisible by nodes {nodes}"
     per_node = ep_size // nodes
-    node_of = kl_partition(coact, nodes)
+    node_of = kl_partition(coact, nodes, max_load_ratio=max_load_ratio)
     rank = np.empty(coact.shape[0], dtype=np.int64)
     for n in range(nodes):
         members = np.where(node_of == n)[0]
         sub = coact[np.ix_(members, members)]
-        local_rank = kl_partition(sub, per_node)
+        local_rank = kl_partition(sub, per_node, max_load_ratio=max_load_ratio)
         rank[members] = n * per_node + local_rank
     return rank_assignment_to_order(rank, ep_size)
 
@@ -257,6 +298,7 @@ def build_placement_json(
     ep_size: int,
     emit_default: bool = True,
     nodes: int = 1,
+    max_load_ratio: float = 0.0,
 ) -> Dict:
     counts, moe_layer_indices = build_coactivation(capture_dir, iters, num_experts)
     n_moe = counts.shape[0]
@@ -264,13 +306,16 @@ def build_placement_json(
     out: Dict[str, object] = {"num_experts": num_experts, "layers": {}}
     if nodes > 1:
         out["nodes"] = nodes
+    if max_load_ratio > 0:
+        out["max_load_ratio"] = max_load_ratio
+    contiguous = list(range(num_experts))
     print(
         f"\nper-layer placement (quality = intra-rank co-activation kept"
         + (f"; node = intra-node kept, {nodes} nodes" if nodes > 1 else "")
-        + "):"
+        + "; load = max/mean per-rank token load, contiguous placement in parentheses):"
     )
     for m in range(n_moe):
-        order = coactivation_placement(counts[m], ep_size, nodes)
+        order = coactivation_placement(counts[m], ep_size, nodes, max_load_ratio)
         q = placement_quality(counts[m], order, ep_size)
         layer_number = int(moe_layer_indices[m])
         out["layers"][str(layer_number)] = order
@@ -279,15 +324,21 @@ def build_placement_json(
             if nodes > 1
             else ""
         )
-        print(f"  layer {layer_number:>3} (moe pos {m:>2}): quality {q*100:5.1f}%{extra}")
+        print(
+            f"  layer {layer_number:>3} (moe pos {m:>2}): quality {q*100:5.1f}%{extra}"
+            f"  load {load_imbalance(counts[m], order, ep_size):.3f}"
+            f" ({load_imbalance(counts[m], contiguous, ep_size):.3f})"
+        )
 
     if emit_default:
         agg = counts.sum(axis=0)
-        default = coactivation_placement(agg, ep_size, nodes)
+        default = coactivation_placement(agg, ep_size, nodes, max_load_ratio)
         out["default"] = default
         print(
             f"  default (all layers summed): quality "
             f"{placement_quality(agg, default, ep_size)*100:5.1f}%"
+            f"  load {load_imbalance(agg, default, ep_size):.3f}"
+            f" ({load_imbalance(agg, contiguous, ep_size):.3f})"
         )
     return out
 
@@ -318,6 +369,14 @@ def _cli(argv: Optional[Sequence[str]] = None) -> None:
         help="node-aware two-level partition: optimise intra-node co-activation first "
         "(EP ranks node-major, ep_size/nodes ranks per node)",
     )
+    ap.add_argument(
+        "--max-load-ratio",
+        type=float,
+        default=1.1,
+        help="cap each rank's token load (sum of its experts' selection counts) at this "
+        "multiple of the mean while partitioning; 0 disables load balancing (pure "
+        "co-activation partition, which tends to pile popular experts onto a few ranks)",
+    )
     args = ap.parse_args(argv)
 
     obj = build_placement_json(
@@ -327,6 +386,7 @@ def _cli(argv: Optional[Sequence[str]] = None) -> None:
         args.ep_size,
         emit_default=not args.no_default,
         nodes=args.nodes,
+        max_load_ratio=args.max_load_ratio,
     )
     with open(args.out, "w") as f:
         json.dump(obj, f, indent=2)
