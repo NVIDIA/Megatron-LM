@@ -162,7 +162,7 @@ def _host_copy(tensor):
     """Exact-size host copy, page-locked in place when CUDA is available.
 
     pin_memory=True goes through the caching host allocator, which rounds each block
-    up to a power of two; register a plain allocation instead (as vLLM does).
+    up to a power of two; register a plain allocation instead.
     """
     nbytes = tensor.numel() * tensor.element_size()
     owner = np.empty(max(nbytes, 1), dtype=np.uint8)

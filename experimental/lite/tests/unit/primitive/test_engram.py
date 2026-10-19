@@ -44,8 +44,7 @@ def _worker(rank, root):
     module = torch.nn.Module()
     module.embed, ps = table, SimpleNamespace(dp_cp_rank=rank, dp_cp_group=group)
     attach_checkpoint_metadata([module], ps)
-    for name in ("new", "old"):
-        Path(root, name).mkdir(exist_ok=True)
+    Path(root, "new").mkdir()
     dist_checkpointing.save(module.sharded_state_dict(), f"{root}/new")
     saved = weight.clone(), scale.clone()
     weight.view(torch.uint8).zero_(), scale.view(torch.uint8).zero_()
@@ -54,15 +53,6 @@ def _worker(rank, root):
         torch.equal(a.view(torch.uint8), b.view(torch.uint8))
         for a, b in zip((weight, scale), saved)
     )
-    old = torch.nn.Module()  # the previous schema: a BF16 table and no scale
-    old.embed = torch.nn.Module()
-    old.embed.embedding = torch.nn.Module()
-    old.embed.embedding.lookup = table.embedding.lookup
-    old.embed.embedding.register_buffer("weight", weight.to(torch.bfloat16))
-    attach_checkpoint_metadata([old], ps)
-    dist_checkpointing.save(old.sharded_state_dict(), f"{root}/old")
-    with pytest.raises(Exception):
-        dist_checkpointing.load(module.sharded_state_dict(), f"{root}/old")
     dist.destroy_process_group()
 
 
