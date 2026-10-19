@@ -1,0 +1,105 @@
+# Regression for #7400: cuBLAS grouped BF16 GEMM overlapping MFSDP collectives.
+# Preserve the reproducer's GEMM shapes and two accumulation microbatches on
+# 2 nodes x 4 GPUs. The smaller graph-enabled proxy exercises a different path.
+ENV_VARS:
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NVTE_CUTEDSL_FUSED_GROUPED_MLP: 1
+  # Keep the regression on cuBLAS even if TE changes its default backend.
+  NVTE_USE_CUTLASS_GROUPED_GEMM: 0
+  NCCL_LAUNCH_ORDER_IMPLICIT: 1
+  NCCL_DEBUG: VERSION
+MODEL_ARGS:
+  --bf16: true
+  --use-mcore-models: true
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 1
+  --expert-model-parallel-size: 2
+  --expert-tensor-parallel-size: 1
+  --use-megatron-fsdp: true
+  --megatron-fsdp-version: 2
+  --data-parallel-sharding-strategy: optim_grads_params
+  --num-distributed-optimizer-instances: 4
+  --outer-dp-sharding-strategy: optim
+  --expert-outer-dp-sharding-strategy: optim
+  --megatron-fsdp-main-params-dtype: fp32
+  --megatron-fsdp-main-grads-dtype: fp32
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --no-gradient-accumulation-fusion: true
+  --use-precision-aware-optimizer: true
+  --ckpt-format: fsdp_dtensor
+  # Eager execution, including the optimizer.
+  --cuda-graph-impl: none
+  --micro-batch-size: 1
+  --global-batch-size: 16
+  --train-iters: 100
+  --exit-interval: 100
+  --seed: 1234
+  --mock-data: true
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 32000
+  --make-vocab-size-divisible-by: 128
+  --seq-length: 2048
+  --max-position-embeddings: 2048
+  --num-layers: 5
+  --hidden-size: 4096
+  --ffn-hidden-size: 11008
+  --num-attention-heads: 32
+  --position-embedding-type: rope
+  --rotary-base: 10000
+  --no-rope-fusion: true
+  --normalization: RMSNorm
+  --norm-epsilon: 1e-5
+  --swiglu: true
+  --disable-bias-linear: true
+  --untie-embeddings-and-output-weights: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --init-method-std: 0.02
+  --multi-latent-attention: true
+  --qk-layernorm: true
+  --q-lora-rank: 512
+  --kv-lora-rank: 512
+  --qk-head-dim: 128
+  --qk-pos-emb-head-dim: 64
+  --v-head-dim: 128
+  --num-experts: 16
+  --moe-layer-freq: ([0]+[1]*4)
+  --moe-ffn-hidden-size: 2048
+  --moe-shared-expert-intermediate-size: 2048
+  --moe-router-topk: 8
+  --moe-token-dispatcher-type: flex
+  --moe-flex-dispatcher-backend: hybridep
+  --moe-expert-rank-capacity-factor: 4.0
+  --use-transformer-engine-op-fuser: true
+  --moe-grouped-gemm: true
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1e-4
+  --moe-router-score-function: sigmoid
+  --moe-router-pre-softmax: true
+  --moe-router-enable-expert-bias: true
+  --moe-router-dtype: fp32
+  --moe-permute-fusion: true
+  --optimizer: adam
+  --lr: 1e-4
+  --min-lr: 1e-5
+  --lr-warmup-iters: 2
+  --lr-decay-iters: 50
+  --lr-decay-style: cosine
+  --weight-decay: 0.01
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --adam-eps: 1e-8
+  # Effectively disable clipping while retaining gradient-norm logs for diagnostics.
+  --clip-grad: 1.0e9
+  --eval-iters: 0
+  --eval-interval: 101
+  --log-interval: 1
+  --tensorboard-log-interval: 1
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+TEST_TYPE: regular
+METRICS:
+  - "lm loss"
+LAUNCHER: torchrun
