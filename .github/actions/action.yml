@@ -242,7 +242,7 @@ runs:
             ;;
           preselected)
             if [[ "$IDENTITY_OUTCOME" == "success" && "$PLAN_OUTCOME" == "success" ]] \
-              && python tests/unit_tests/testmon_plan.py prepare \
+              && python tests/unit_tests/testmon_selector.py prepare \
                 --plan assets_dir/testmon/plan.json --cache-dir assets_dir/testmon \
                 --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
                 --source-sha "$(git rev-parse HEAD)" \

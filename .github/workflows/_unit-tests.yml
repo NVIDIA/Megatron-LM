@@ -144,7 +144,7 @@ jobs:
         run: |
           mkdir -p assets_dir/testmon-plan
           IMAGE_ID=$(cat assets_dir/testmon-image/image-id.txt)
-          python tests/unit_tests/testmon_plan.py select \
+          python tests/unit_tests/testmon_selector.py select \
             --cache-dir assets_dir/testmon --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
             --image-id "$IMAGE_ID" --source-sha "$SOURCE_SHA" --matched-key "$MATCHED_KEY" \
             --pr-files-dir "$PR_FILES_DIR" \

@@ -4,13 +4,11 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import platform
 import re
 import sqlite3
 import subprocess
-import sys
 from contextlib import closing
 from pathlib import Path
 
@@ -229,57 +227,3 @@ def prepare(
         output.with_name("mandatory-tests").write_text(
             "".join(f"{filename}\n" for filename in plan["mandatory_files"])
         )
-
-
-def main(argv: list[str] | None = None) -> int:
-    """Write a selection artifact and Actions outputs; uncertainty always schedules GPUs."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-    select_parser = commands.add_parser("select")
-    select_parser.add_argument("--matched-key", required=True)
-    select_parser.add_argument("--pr-files-dir", type=Path, required=True)
-    select_parser.add_argument("--output", type=Path, required=True)
-    prepare_parser = commands.add_parser("prepare")
-    prepare_parser.add_argument("--plan", type=Path, required=True)
-    for child in (select_parser, prepare_parser):
-        child.add_argument("--cache-dir", type=Path, required=True)
-        child.add_argument("--bucket", required=True)
-        child.add_argument("--platform", required=True)
-        child.add_argument("--image-id", required=child is select_parser)
-        child.add_argument("--source-sha", required=True)
-    args = parser.parse_args(argv)
-    if args.command == "prepare":
-        try:
-            prepare(
-                json.loads(args.plan.read_text()),
-                args.cache_dir,
-                args.bucket,
-                args.platform,
-                args.source_sha,
-                image_id=args.image_id,
-            )
-        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
-            print(f"Unit Testmon plan unavailable: {error}", file=sys.stderr)
-            return 2
-        return 0
-    plan = select(
-        Path.cwd(),
-        args.cache_dir,
-        args.bucket,
-        args.platform,
-        args.image_id,
-        args.source_sha,
-        args.matched_key,
-        args.pr_files_dir,
-    )
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(plan, sort_keys=True, indent=2) + "\n")
-    has_tests = plan["mode"] == "full" or any(plan["phases"].values())
-    print(f"mode={plan['mode']}")
-    print(f"has_tests={str(has_tests).lower()}")
-    print(f"Unit Testmon CPU selection: {plan['reason']}", file=sys.stderr)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
