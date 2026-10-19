@@ -543,8 +543,11 @@ def assert_close(name, a, b, bitwise):
 
 
 @pytest.mark.parametrize("tc", TEST_CASES, ids=lambda tc: tc.name)
-def test_thd_format(tc: TestCase):
+def test_thd_format(tc: TestCase, monkeypatch):
     """Compare THD vs SBHD format outputs and gradients."""
+    # CP rings use multiple P2P communicators. Queue all their finalizers before
+    # waiting, so blocking ncclCommFinalize calls cannot form a peer cycle at exit.
+    monkeypatch.setenv("TORCH_NCCL_USE_COMM_NONBLOCKING", "1")
     H, seqlens = tc.hidden_size, tc.seqlens
     tp_size, cp_size, sp = tc.tp_size, tc.cp_size, tc.sp_enabled
     B = len(seqlens)
