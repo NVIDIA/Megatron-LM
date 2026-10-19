@@ -28,6 +28,24 @@ from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import RowAtomic
 
 
+# Design choice: integrating Emerging Optimizers (EO) into FsdpMuon.
+#
+# 1. Inherit from EO's Muon (chosen).
+#    Reuse its constructor, configuration, orthogonalize(), and update hooks.
+#    Keep state, parameter groups, and checkpointing on one optimizer instance.
+# 2. Contain an EO Muon instance (composition).
+#    The main problem is state ownership across two optimizer instances. One must
+#    own the sharded momentum and parameter groups; updates and checkpoint
+#    save/load must all use that same state, even when loading replaces it.
+# 3. Call EO kernels from a standalone torch.optim.Optimizer.
+#    Use Newton-Schulz and scaling functions directly, but maintain Muon's
+#    configuration, defaults, and validation in FsdpMuon.
+#
+# We use inheritance for now. Composition (2) makes optimizer state ownership
+# unclear, while direct kernel calls (3) duplicate EO optimizer code.
+# Revisit this decision as the inheritance tax grows, such as when EO changes
+# require more overrides or workarounds in FsdpMuon.
+# See https://media.pragprog.com/titles/tpp20/inheritance-tax.pdf.
 class FsdpMuon(Muon):
     """Muon for 2-D parameters on a one-dimensional, all-RowAtomic DP mesh.
 
