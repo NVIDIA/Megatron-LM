@@ -125,7 +125,7 @@ def _optimizer(chunks, cfg, impl, ps):
     return optimizer, lambda: finalize_dist_opt_grads(chunks, optimizer)
 
 
-def build_model(model_cfg, *, impl_cfg):
+def build_model(model_cfg, *, impl_cfg, _model_class=None):
     _validate(model_cfg, impl_cfg)
     from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
 
@@ -149,6 +149,7 @@ def build_model(model_cfg, *, impl_cfg):
         path = Path(impl_cfg.hf_path) / "token_map.pt"
         if path.is_file():
             token_map = torch.load(path, map_location="cpu", weights_only=True)
+    constructor = DeepseekV41Model if _model_class is None else _model_class
     reader = None
     if impl_cfg.prefetch_weights and not impl_cfg.initialize_weights and impl_cfg.hf_path:
         from megatron.lite.primitive.ckpt.row_reader import RowSliceReader
@@ -156,7 +157,7 @@ def build_model(model_cfg, *, impl_cfg):
         reader = RowSliceReader(impl_cfg.hf_path, device=impl_cfg.device)
     try:
         chunks = [
-            DeepseekV41Model(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)
+            constructor(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)
         ]
     except BaseException:
         if reader is not None:
