@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
 
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.lite.model.deepseek_v41.lite.checkpoint import (
@@ -117,6 +118,8 @@ def test_engram_masked_rows_pass_the_residual_through():
 def _gather_worker(rank, store):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", init_method=f"file://{store}", rank=rank, world_size=2)
+    ranks = dict(tp_rank=0, ep_rank=0, etp_rank=0, gtp_remat_rank=0, egtp_remat_rank=0)
+    model_parallel_cuda_manual_seed(915, **ranks, gtp_remat_world_size=1, egtp_remat_world_size=1)
     config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
     table = ShardedFrozenTable(5, 8, config, dist.group.WORLD)  # 6 padded rows, 3 per rank
     full = torch.arange(48.0, device="cuda").reshape(6, 8).to(table.weight.dtype)
