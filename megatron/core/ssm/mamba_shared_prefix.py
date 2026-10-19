@@ -77,7 +77,17 @@ def _validate_mamba_fork(mixer: MambaMixer) -> None:
         raise NotImplementedError("shared-prefix Mamba state forking requires gated RMSNorm")
     if causal_conv1d_fn is None or mamba_chunk_scan_combined is None:
         raise RuntimeError("shared-prefix Mamba state forking requires causal-conv1d and mamba-ssm")
-    if _shared_prefix_mamba_impl().startswith("ragged_state_fork"):
+    implementation = _shared_prefix_mamba_impl()
+    # Dense fused training and batch-invariant prefill and decode gate inside the scan, before
+    # its output is rounded to the activation dtype. The differentiable shared-prefix backends
+    # scan without the gate and apply it in mixer.norm afterwards, so they cannot keep the
+    # bitwise training/inference agreement that batch-invariant mode promises.
+    if getattr(getattr(mixer, "config", None), "batch_invariant_mode", False):
+        raise NotImplementedError(
+            "shared-prefix Mamba state forking does not support batch-invariant mode: it "
+            "applies the gate to the rounded scan output instead of inside the scan"
+        )
+    if implementation.startswith("ragged_state_fork"):
         try:
             # Ragged imports private mamba_ssm SSD kernels; fail before any layer runs.
             from megatron.core.ssm import (  # pylint: disable=unused-import
