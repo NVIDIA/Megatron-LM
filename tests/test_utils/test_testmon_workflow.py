@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -598,32 +597,6 @@ def test_h100_runner_traffic_routing(
     assert outputs["h100_registry"] == registry
     assert outputs["h100_use_gcp"] == use_gcp
 
-    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
-    caller = workflow["jobs"]["cicd-unit-tests-latest"]["with"]
-    inputs = {}
-    for name in ("runner", "cloud"):
-        reference = re.fullmatch(r"\$\{\{ needs\.configure\.outputs\.(\w+) \}\}", caller[name])
-        assert reference is not None, caller[name]
-        inputs[name] = outputs[reference.group(1)]
-
-    # Resolve only this format expression so registry, SHA, and cloud must all
-    # survive the handoff to the reusable workflow for every routing outcome.
-    source_sha = "a" * 40
-    image = re.fullmatch(
-        r"\$\{\{ format\('([^']+)', needs\.configure\.outputs\.(\w+), "
-        r"needs\.configure\.outputs\.sha, needs\.configure\.outputs\.(\w+)\) \}\}",
-        caller["container-image"],
-    )
-    assert image is not None, caller["container-image"]
-    inputs["container-image"] = image.group(1).format(
-        outputs[image.group(2)], source_sha, outputs[image.group(3)]
-    )
-    reusable = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    assert reusable["jobs"]["run"]["runs-on"] == "${{ fromJSON(inputs.runner) }}"
-    assert json.loads(inputs["runner"]) == gpu_runner
-    assert inputs["cloud"] == cloud
-    assert inputs["container-image"] == f"{registry}/megatron-lm:{source_sha}-{cloud}"
-
 
 def test_nemo_cicd_validator_declares_every_needs_reference_directly() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
@@ -786,113 +759,72 @@ def test_full_test_guards_override_selective_requests(
     assert "| `unit_testmon_eligible` | `false` |" in summary
 
 
-@pytest.mark.parametrize(
-    "mode,has_tests,upload_outcome,expected",
-    [
-        (
-            "selected",
-            "false",
-            "success",
-            {"mode": "selected", "has_tests": "false", "plan_artifact": "plan"},
-        ),
-        (
-            "selected",
-            "true",
-            "success",
-            {"mode": "selected", "has_tests": "true", "plan_artifact": "plan"},
-        ),
-        ("full", "true", "skipped", {}),
-        ("selected", "false", "failure", {}),
-        ("selected", "false", "skipped", {}),
-    ],
-)
-def test_cpu_selection_requires_a_complete_artifact_handoff(
-    tmp_path, mode, has_tests, upload_outcome, expected
-):
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    job = workflow["jobs"]["select"]
-    assert job["continue-on-error"] is True
-    # Stop at the first failed prerequisite; never publish a partial selection.
-    assert all(not step.get("continue-on-error") for step in job["steps"])
-    upload = _step("_unit-tests.yml", "select", "upload")
-    assert upload["if"] == "steps.plan.outputs.mode == 'selected'"
-    publish = _step("_unit-tests.yml", "select", "result")
-    condition = publish["if"].replace("steps.upload.outcome", repr(upload_outcome))
-    outputs = {}
-    if eval(condition, {"__builtins__": {}}):
-        result, outputs = _run(
-            publish["run"], tmp_path, {"HAS_TESTS": has_tests, "PLAN_ARTIFACT": "plan"}
+@pytest.mark.parametrize("include_gb200", ["true", "false"])
+def test_cpu_selection_matrix(tmp_path, shell_environment, include_gb200):
+    # Execute the real parser shell; provide the yq extraction using PyYAML.
+    (tmp_path / "bin/yq").write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, yaml\n"
+        "with open(sys.argv[4]) if len(sys.argv) > 4 else sys.stdin as stream:\n"
+        "    recipe = yaml.safe_load(stream)\n"
+        "entries = [{'bucket': case} for product in recipe['products'] for case in product['test_case']]\n"
+        "if 'platform' in sys.argv[3]:\n"
+        "    entries = [dict(entry, platform='dgx_gb200') for entry in entries]\n"
+        "print(json.dumps(entries))\n"
+    )
+    result, outputs = _run(
+        _step("cicd-main.yml", "cicd-parse-unit-tests", "parse-unit-tests")["run"],
+        tmp_path,
+        {**shell_environment, "INCLUDE_GB200": include_gb200},
+    )
+    assert result.returncode == 0, result.stderr
+    matrix = json.loads(outputs["selection-matrix"])
+    expected = [dict(entry, platform="dgx_h100") for entry in json.loads(outputs["unit-tests"])]
+    if include_gb200 == "true":
+        recipe = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes/gb200/unit-tests.yaml").read_text()
         )
-        assert result.returncode == 0, result.stderr
-    assert outputs == expected
-
-
-@pytest.mark.parametrize(
-    "result,mode,has_tests,cancelled,expected",
-    [
-        ("success", "selected", "false", False, False),
-        ("success", "selected", "true", False, True),
-        ("success", "full", "true", False, True),
-        ("skipped", "", "", False, True),
-        ("failure", "selected", "false", False, True),
-        ("success", "", "false", False, True),
-        ("success", "selected", "", False, True),
-        ("success", "selected", "true", True, False),
-    ],
-)
-def test_gpu_job_runs_unless_cpu_selection_proves_the_bucket_empty(
-    result, mode, has_tests, cancelled, expected
-):
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
-    assert workflow["jobs"]["run"]["needs"] == "select"
-    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
-    expression = (
-        expression.replace("!cancelled()", "not cancelled").replace("&&", "and").replace("||", "or")
-    )
-    needs = SimpleNamespace(
-        select=SimpleNamespace(
-            result=result, outputs=SimpleNamespace(mode=mode, has_tests=has_tests)
+        expected.extend(
+            {"bucket": case, "platform": "dgx_gb200"}
+            for product in recipe["products"]
+            for case in product["test_case"]
         )
-    )
-    assert (
-        eval(expression, {"__builtins__": {}}, {"needs": needs, "cancelled": cancelled}) == expected
-    )
+    assert matrix == expected
 
 
 @pytest.mark.parametrize("platform", ["h100", "gb200"])
-def test_unit_buckets_use_cpu_selection_before_the_gpu_runner(platform):
+@pytest.mark.parametrize("selection_result", ["success", "failure", "skipped"])
+def test_gpu_execution_does_not_depend_on_selection_success(platform, selection_result):
     workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
     suffix = "" if platform == "h100" else "-gb200"
     job = workflow["jobs"][f"cicd-unit-tests-latest{suffix}"]
-    assert job["uses"] == "./.github/workflows/_unit-tests.yml"
-    assert "steps" not in job and "runs-on" not in job
-    if platform == "h100":
-        assert job["with"]["cloud"] == "${{ needs.configure.outputs.h100_cloud }}"
-        assert job["with"]["runner"] == "${{ needs.configure.outputs.h100_gpu_runs_on }}"
-    else:
-        assert job["with"]["cloud"] == "gb-gpu"
-        assert job["with"]["runner"] == (
-            "${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}"
-        )
-    reusable = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    assert reusable["jobs"]["run"]["runs-on"] == "${{ fromJSON(inputs.runner) }}"
-    assert "unit_testmon_eligible" in job["with"]["unit_testmon_mode"]
-    assert job["with"]["unit_test_pr_files_artifact_id"] == (
-        "${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}"
+    assert "cicd-select-unit-tests" in job["needs"]
+    expression = job["if"].replace("!cancelled()", "True")
+    expression = re.sub(
+        r"needs\.([\w-]+)\.result",
+        lambda match: repr(selection_result if match[1] == "cicd-select-unit-tests" else "success"),
+        expression,
     )
+    expression = re.sub(r"needs\.pre-flight\.outputs\.[\w_]+", "'false'", expression)
+    expression = re.sub(r"needs\.[\w-]+\.outputs\.[\w_]+|vars\.[\w_]+", "'true'", expression)
+    assert eval(
+        " ".join(expression.split()).replace("&&", "and").replace("||", "or"), {"__builtins__": {}}
+    )
+    execution = next(step for step in job["steps"] if step.get("uses") == "./.github/actions")
+    assert "'preselected'" in execution["with"]["unit_testmon_mode"]
 
 
-def test_cpu_plan_requires_the_configured_pr_files_download():
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
-    steps = workflow["jobs"]["select"]["steps"]
-    download = _step("_unit-tests.yml", "select", "pr-files")
-    assert download["with"]["artifact-ids"] == "${{ inputs.unit_test_pr_files_artifact_id }}"
-    assert download["with"]["merge-multiple"] is True
-    plan = _step("_unit-tests.yml", "select", "plan")
-    assert steps.index(download) < steps.index(plan)
-    assert "if" not in plan  # Default success() requires all preceding steps to pass.
-    assert "continue-on-error" not in download
+def test_cpu_and_gpu_use_the_same_plan_artifact_name():
+    upload = _step("cicd-main.yml", "cicd-select-unit-tests", "upload")
+    action = yaml.safe_load((ROOT / ".github/actions/action.yml").read_text())
+    download = next(
+        step for step in action["runs"]["steps"] if step.get("id") == "download-unit-testmon-plan"
+    )
+    assert (
+        upload["with"]["name"].replace("steps.identity", "steps.unit-testmon-identity")
+        == download["with"]["name"]
+    )
+    assert download["continue-on-error"] is True
 
 
 def test_cpu_plan_passes_the_downloaded_pr_files_to_the_selector(tmp_path):
@@ -903,7 +835,7 @@ def test_cpu_plan_passes_the_downloaded_pr_files_to_the_selector(tmp_path):
     script = (
         'python() { printf "%s\\n" "$@" > arguments; '
         'printf "mode=selected\\nhas_tests=true\\n"; }\n'
-        + _step("_unit-tests.yml", "select", "plan")["run"]
+        + _step("cicd-main.yml", "cicd-select-unit-tests", "plan")["run"]
     )
     result, outputs = _run(
         script,
@@ -920,82 +852,3 @@ def test_cpu_plan_passes_the_downloaded_pr_files_to_the_selector(tmp_path):
     arguments = (tmp_path / "arguments").read_text().splitlines()
     assert arguments[arguments.index("--pr-files-dir") + 1] == str(pr_files)
     assert outputs == {"mode": "selected", "has_tests": "true"}
-
-
-@pytest.mark.parametrize(
-    "evidence,allowed",
-    [
-        ("complete", True),
-        ("repeated-empty", True),
-        ("missing", False),
-        ("nonempty-prod", False),
-        ("nonempty-experimental", False),
-        ("full", False),
-        ("wrong-sha", False),
-        ("wrong-schema", False),
-        ("unexpected-bucket", False),
-        ("no-expected-buckets", False),
-        ("not-selective", False),
-    ],
-)
-def test_no_coverage_requires_empty_plans_for_every_expected_bucket(tmp_path, evidence, allowed):
-    bucket = "tests/unit_tests/test_example.py"
-    plans = []
-    for platform in ("dgx_h100", "dgx_gb200"):
-        plans.append(
-            {
-                "schema": 1,
-                "source_sha": "a" * 40,
-                "bucket": bucket,
-                "platform": platform,
-                "mode": "selected",
-                "phases": {"prod": [], "experimental": []},
-            }
-        )
-    if evidence == "missing":
-        plans.pop()
-    elif evidence == "repeated-empty":
-        plans.append(plans[0])
-    elif evidence.startswith("nonempty-"):
-        plans[0]["phases"][evidence.removeprefix("nonempty-")] = [bucket + "::test_example"]
-    elif evidence == "full":
-        plans[0]["mode"] = "full"
-    elif evidence == "wrong-sha":
-        plans[0]["source_sha"] = "b" * 40
-    elif evidence == "wrong-schema":
-        plans[0]["schema"] = 2
-    elif evidence == "unexpected-bucket":
-        plans[0]["bucket"] = "tests/unit_tests/test_unexpected.py"
-    for index, plan in enumerate(plans):
-        directory = tmp_path / f"unit-test-plan-{index}"
-        directory.mkdir()
-        (directory / "plan.json").write_text(json.dumps(plan))
-    result, outputs = _run(
-        _step("cicd-main.yml", "Coverage", "coverage")["run"],
-        tmp_path,
-        {
-            "SELECTIVE": "false" if evidence == "not-selective" else "true",
-            "H100_BUCKETS": json.dumps(
-                [] if evidence == "no-expected-buckets" else [{"bucket": bucket}]
-            ),
-            "GB200_BUCKETS": json.dumps(
-                [] if evidence == "no-expected-buckets" else [{"bucket": bucket}]
-            ),
-            "SOURCE_SHA": "a" * 40,
-        },
-    )
-    assert (result.returncode == 0) == allowed, result.stdout + result.stderr
-    assert outputs == ({"has_coverage": "false"} if allowed else {})
-
-
-def test_actual_coverage_does_not_require_selective_plans(tmp_path):
-    directory = tmp_path / "coverage-unit-test-example"
-    directory.mkdir()
-    (directory / ".coverage").touch()
-    result, outputs = _run(
-        _step("cicd-main.yml", "Coverage", "coverage")["run"],
-        tmp_path,
-        {"SELECTIVE": "false", "H100_BUCKETS": "[]", "GB200_BUCKETS": "[]", "SOURCE_SHA": "a" * 40},
-    )
-    assert result.returncode == 0, result.stderr
-    assert outputs == {"has_coverage": "true"}

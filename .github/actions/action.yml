@@ -78,10 +78,6 @@ inputs:
     description: "Artifact containing the validated PR file list from the configure job."
     required: false
     default: ""
-  unit_testmon_plan_artifact:
-    description: "Artifact containing the CPU-selected plan.json for this bucket."
-    required: false
-    default: ""
 runs:
   using: "composite"
   steps:
@@ -207,11 +203,11 @@ runs:
 
     - name: Download CPU unit Testmon plan
       id: download-unit-testmon-plan
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'preselected' && inputs.unit_testmon_plan_artifact != '' && steps.unit-testmon-identity.outcome == 'success'
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'preselected' && steps.unit-testmon-identity.outcome == 'success'
       uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
       continue-on-error: true
       with:
-        name: ${{ inputs.unit_testmon_plan_artifact }}
+        name: unit-test-plan-${{ steps.unit-testmon-identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
         path: assets_dir/testmon
 
     - name: Resolve unit Testmon mode

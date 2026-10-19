@@ -941,7 +941,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
+      selection-matrix: ${{ steps.parse-unit-tests.outputs.selection-matrix }}
     needs:
+      - is-not-external-contributor
       - pre-flight
       - configure
       - cicd-wait-in-queue
@@ -965,9 +967,111 @@ jobs:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
         id: parse-unit-tests
+        env:
+          INCLUDE_GB200: ${{ needs.is-not-external-contributor.outputs.is_maintainer == 'true' && vars.ENABLE_GB200_TESTING == 'true' }}
         run: |
           cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+          jq 'map(. + {platform: "dgx_h100"})' unit-tests.json > selection-matrix.json
+          if [[ "$INCLUDE_GB200" == "true" ]]; then
+            yq -o json '[.products[].test_case[] | {"bucket": ., "platform": "dgx_gb200"}]' tests/test_utils/recipes/gb200/unit-tests.yaml > gb200-selection.json
+            jq -s 'add' selection-matrix.json gb200-selection.json > combined-selection.json
+            mv combined-selection.json selection-matrix.json
+          fi
+          echo "selection-matrix=$(jq -c . selection-matrix.json)" >> "$GITHUB_OUTPUT"
+
+  cicd-select-unit-tests:
+    name: "Select ${{ matrix.platform }} / ${{ matrix.bucket }} on CPU"
+    needs: [configure, cicd-parse-unit-tests]
+    if: needs.configure.outputs.unit_testmon_eligible == 'true'
+    runs-on: ubuntu-latest
+    # A missing plan makes the existing GPU job run the full bucket.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.cicd-parse-unit-tests.outputs.selection-matrix) }}
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+
+      - name: Setup Python
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install selection dependencies
+        id: dependencies
+        run: python -m pip install 'pytest-testmon==2.2.0' PyYAML
+
+      - name: Compute unit Testmon cache identity
+        id: identity
+        shell: bash -e -u -o pipefail {0}
+        env:
+          BUCKET: ${{ matrix.bucket }}
+          RECIPE_PLATFORM: ${{ matrix.platform }}
+          TARGET_BRANCH: ${{ needs.configure.outputs.target_branch }}
+          PR_FILES_ARTIFACT: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+        run: |
+          [[ "$TARGET_BRANCH" == "main" && -n "$PR_FILES_ARTIFACT" ]]
+          python tests/unit_tests/testmon_cache.py identity \
+            --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+            --output "$RUNNER_TEMP/unit-testmon-identity.json" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Restore unit Testmon baseline
+        id: baseline
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: assets_dir/testmon
+          key: ${{ steps.identity.outputs.cache_prefix }}lookup-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.identity.outputs.cache_prefix }}
+
+      - name: Download built image identity
+        id: image
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unit-test-image-${{ needs.configure.outputs.sha }}-${{ matrix.platform == 'dgx_gb200' && 'gb-gpu' || needs.configure.outputs.h100_cloud }}
+          path: assets_dir/testmon-image
+
+      - name: Download PR files for mandatory unit tests
+        id: pr-files
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+          path: ${{ runner.temp }}/unit-test-pr-files
+          merge-multiple: true
+
+      - name: Select affected tests without importing the GPU suite
+        id: plan
+        shell: bash -e -u -o pipefail {0}
+        env:
+          BUCKET: ${{ matrix.bucket }}
+          RECIPE_PLATFORM: ${{ matrix.platform }}
+          SOURCE_SHA: ${{ needs.configure.outputs.sha }}
+          MATCHED_KEY: ${{ steps.baseline.outputs.cache-matched-key }}
+          PR_FILES_DIR: ${{ runner.temp }}/unit-test-pr-files
+        run: |
+          mkdir -p assets_dir/testmon-plan
+          IMAGE_ID=$(cat assets_dir/testmon-image/image-id.txt)
+          python tests/unit_tests/testmon_plan.py select \
+            --cache-dir assets_dir/testmon --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
+            --image-id "$IMAGE_ID" --source-sha "$SOURCE_SHA" --matched-key "$MATCHED_KEY" \
+            --pr-files-dir "$PR_FILES_DIR" \
+            --output assets_dir/testmon-plan/plan.json | tee -a "$GITHUB_OUTPUT"
+
+      - name: Upload unit Testmon plan
+        id: upload
+        if: steps.plan.outputs.mode == 'selected'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unit-test-plan-${{ steps.identity.outputs.cache_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          path: assets_dir/testmon-plan/plan.json
+          if-no-files-found: error
+
 
   cicd-unit-tests-latest:
     strategy:
@@ -975,12 +1079,15 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.cicd-parse-unit-tests.outputs.unit-tests) }}
     needs:
+      - cicd-select-unit-tests
       - is-not-external-contributor
       - pre-flight
       - configure
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests
+    runs-on: ${{ fromJSON(needs.configure.outputs.h100_gpu_runs_on) }}
+    timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
@@ -990,29 +1097,40 @@ jobs:
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-parse-unit-tests.result != 'cancelled'
       && (
-        success()
+        needs.cicd-parse-unit-tests.result == 'success'
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
-    uses: ./.github/workflows/_unit-tests.yml
-    with:
-      bucket: ${{ matrix.bucket }}
-      timeout: ${{ matrix.timeout || 30 }}
-      runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
-      container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
-      cloud: ${{ needs.configure.outputs.h100_cloud }}
-      sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-      unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: main
+        uses: ./.github/actions
+        with:
+          test_case: ${{ matrix.bucket }}
+          tag: latest
+          timeout: ${{ matrix.timeout || 30 }}
+          is_unit_test: "true"
+          container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
+          sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'preselected' || 'full' }}
+          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
     outputs:
       unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
-      container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
     needs:
       - is-not-external-contributor
       - pre-flight
@@ -1050,12 +1168,15 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200) }}
     needs:
+      - cicd-select-unit-tests
       - is-not-external-contributor
       - pre-flight
       - configure
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-parse-unit-tests-gb200
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+    timeout-minutes: 60
     name: "${{ matrix.bucket }} - gb200 latest"
     if: |
       needs.is-not-external-contributor.result != 'cancelled'
@@ -1067,24 +1188,36 @@ jobs:
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
       && (
-        success()
+        needs.cicd-parse-unit-tests-gb200.result == 'success'
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
-    uses: ./.github/workflows/_unit-tests.yml
-    with:
-      bucket: ${{ matrix.bucket }}
-      timeout: ${{ matrix.timeout || 30 }}
-      runner: ${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}
-      container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
-      cloud: gb-gpu
-      platform: dgx_gb200
-      sha: ${{ needs.configure.outputs.sha }}
-      unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
-      unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-      unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: main
+        uses: ./.github/actions
+        with:
+          test_case: ${{ matrix.bucket }}
+          tag: latest
+          timeout: ${{ matrix.timeout || 30 }}
+          is_unit_test: "true"
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
+          platform: dgx_gb200
+          sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'preselected' || 'full' }}
+          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
+          unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
@@ -1521,12 +1654,14 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
+    needs: [Nemo_CICD_Test]
     if: |
-      !cancelled()
-      && needs.Nemo_CICD_Test.result == 'success'
-      && needs.pre-flight.outputs.docs_only != 'true'
-      && needs.pre-flight.outputs.is_deployment_workflow != 'true'
+      (
+        (needs.pre-flight.outputs.is_ci_workload == 'true' && !failure())
+        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
+        || success()
+      )
+      && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
@@ -1545,63 +1680,12 @@ jobs:
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
-      - name: Download CPU selection evidence
-        if: needs.configure.outputs.unit_testmon_eligible == 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          pattern: unit-test-plan-*
-
-      - name: Require coverage or verified empty selections
-        id: coverage
-        env:
-          SELECTIVE: ${{ needs.configure.outputs.unit_testmon_eligible }}
-          H100_BUCKETS: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests || '[]' }}
-          GB200_BUCKETS: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 || '[]' }}
-          SOURCE_SHA: ${{ needs.configure.outputs.sha }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          has_coverage = any(Path.cwd().glob("coverage-unit-test-*/.coverage"))
-          if not has_coverage:
-              if os.environ["SELECTIVE"] != "true":
-                  raise SystemExit("Missing unit-test coverage artifacts")
-              expected = {
-                  (platform, entry["bucket"])
-                  for platform, variable in (
-                      ("dgx_h100", "H100_BUCKETS"), ("dgx_gb200", "GB200_BUCKETS")
-                  )
-                  for entry in json.loads(os.environ[variable])
-              }
-              observed = set()
-              for path in Path.cwd().glob("unit-test-plan-*/plan.json"):
-                  plan = json.loads(path.read_text())
-                  identity = (plan["platform"], plan["bucket"])
-                  if (
-                      identity not in expected
-                      or plan.get("schema") != 1
-                      or plan.get("source_sha") != os.environ["SOURCE_SHA"]
-                      or plan.get("mode") != "selected"
-                      or plan.get("phases") != {"prod": [], "experimental": []}
-                  ):
-                      raise SystemExit(f"Invalid empty-selection evidence: {path}")
-                  observed.add(identity)
-              if not expected or observed != expected:
-                  raise SystemExit("Missing CPU selection evidence for unit-test buckets")
-              print("Every unit-test bucket has a verified empty selection; no coverage expected.")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"has_coverage={str(has_coverage).lower()}\n")
-          PY
-
       - name: List coverage files
-        if: steps.coverage.outputs.has_coverage == 'true'
         run: find . -type f -name "*.xml" -o -name "*.lcov"
 
       - name: Get total coverage of current branch
         shell: bash -x -e -u -o pipefail {0}
-        if: steps.coverage.outputs.has_coverage == 'true'
+        if: always()
         run: |
           pip install coverage
 
@@ -1613,7 +1697,6 @@ jobs:
           ls -al
 
       - name: Upload coverage reports to Codecov
-        if: steps.coverage.outputs.has_coverage == 'true'
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -1622,37 +1705,12 @@ jobs:
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
-        if: steps.coverage.outputs.has_coverage == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
             .coverage
           include-hidden-files: true
-
-      - name: Generate token for the no-tests coverage status
-        id: app-token
-        if: steps.coverage.outputs.has_coverage == 'false'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.COMMUNITY_BOT_ID }}
-          private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
-          permission-statuses: write
-
-      - name: Report verified empty unit-test selection
-        if: steps.coverage.outputs.has_coverage == 'false'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        with:
-          github-token: ${{ steps.app-token.outputs.token }}
-          script: |
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.sha,
-              state: 'success',
-              description: 'No affected unit tests - coverage check skipped',
-              context: 'codecov/patch'
-            });
 
   merge-queue-notification:
     runs-on: ubuntu-latest
