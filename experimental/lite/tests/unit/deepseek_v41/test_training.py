@@ -116,6 +116,16 @@ def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
 
 
 def _worker(rank, root, world, ep, cp, pp, recompute, sft):
+    import importlib.abc
+    import sys
+
+    class Guard(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "vllm" or fullname.startswith("vllm."):
+                raise AssertionError("Lite execution requested vllm: " + fullname)
+
+    assert not any(n == "vllm" or n.startswith("vllm.") for n in sys.modules)
+    sys.meta_path.insert(0, Guard())
     from megatron.lite.runtime.contracts import LossContext, PackedBatch
 
     torch.cuda.set_device(rank)
