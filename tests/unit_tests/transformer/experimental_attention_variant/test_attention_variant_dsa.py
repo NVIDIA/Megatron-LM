@@ -479,7 +479,8 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
             run_fused_dsa_attention=lambda **_kwargs: None,
         ),
     )
-    caplog.set_level(logging.DEBUG, logger=dsa_kernels.__name__)
+    monkeypatch.setattr(dsa_kernels, "_DECLINED_HOOKS_WARNED", set())
+    caplog.set_level(logging.WARNING, logger=dsa_kernels.__name__)
 
     assert dsa_kernels.run_fused_qk_topk(Config, q, q, q[..., 0], 1, starts, ends, 128) is None
     assert (
@@ -527,6 +528,10 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
     ):
         assert f"DSA fused backend tilelang {hook_name} declined" in caplog.text
     assert "backend returned None" in caplog.text
+
+    warnings_before = len(caplog.records)
+    assert dsa_kernels.run_fused_qk_topk(Config, q, q, q[..., 0], 1, starts, ends, 128) is None
+    assert len(caplog.records) == warnings_before
 
 
 def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
