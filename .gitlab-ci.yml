@@ -8,7 +8,6 @@
   FUNCTIONAL_TEST_SCOPE: mr-slim
   FUNCTIONAL_TEST_REPEAT: 1
   FUNCTIONAL_TEST_TIME_LIMIT: 2700
-  CLUSTER_A100: ""
   CLUSTER_H100: ""
   PUBLISH: "no"
 
@@ -48,7 +47,6 @@ workflow:
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
         FUNCTIONAL_TEST_TIME_LIMIT: 3600
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
       auto_cancel:
@@ -62,7 +60,6 @@ workflow:
         UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -82,7 +79,6 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr-slim
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -98,7 +94,6 @@ workflow:
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -114,7 +109,6 @@ workflow:
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
         FUNCTIONAL_TEST_TIME_LIMIT: 9000
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -129,7 +123,6 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -231,12 +224,6 @@ variables:
     options:
       - "yes"
       - "no"
-  CLUSTER_A100:
-    value: "dgxa100_dracooci"
-    options:
-      - "dgxa100_dracooci"
-      - "dgxa100_dracooci-ord"
-    description: "Cluster for A100 workloads"
   CLUSTER_H100:
     value: "dgxh100_coreweave"
     options:
