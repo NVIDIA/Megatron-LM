@@ -259,10 +259,8 @@ def build_attention(config, index, context):
         DSv4HybridSelfAttentionSubmodules,
     )
     from megatron.core.transformer.spec_utils import ModuleSpec
-    from megatron.lite.model.deepseek_v41.lite.components.assembly import (
-        DS41AttentionSources,
-        ModelNorm,
-    )
+    from megatron.lite.model.deepseek_v41.lite.components.assembly import ModelNorm
+    from megatron.lite.model.deepseek_v41.lite.model import CoreAttentionSources
 
     attention = SWAAttention(
         config,
@@ -272,7 +270,7 @@ def build_attention(config, index, context):
             linear_q_down_proj=TELinear,
             linear_q_up_proj=TEColumnParallelLinear,
             linear_kv_proj=TEColumnParallelLinear,
-            core_attention=ModuleSpec(DS41AttentionSources, params={'context': context}),
+            core_attention=ModuleSpec(CoreAttentionSources, params={'context': context}),
             linear_proj=TERowParallelLinear,
         ),
         index + 1,
