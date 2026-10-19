@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Native ratio-two compression/indexing; owned pooling and codec VJPs."""
+"""Native compression/indexing; owned pooling and codec VJPs."""
 from types import SimpleNamespace
 
 import torch
@@ -8,8 +8,8 @@ from .linear import linear
 
 
 def metadata(rows, ratio, device):
-    if ratio != 2:
-        raise NotImplementedError('Deployment compressed provider currently validates ratio two')
+    if ratio not in (1, 2):
+        raise NotImplementedError('Deployment compression requires literal ratio one or two')
     p = torch.arange(rows, device=device, dtype=torch.int64)
     return SimpleNamespace(
         positions=p,
@@ -28,8 +28,11 @@ def pool_vjp(raw, weight, ratio, grad, eps):
     with torch.enable_grad():
         z = raw[:count].detach().float().requires_grad_()
         w = weight.detach().float().requires_grad_()
-        values, scores = z.reshape(-1, ratio, 1024).split(512, -1)
-        pooled = (values * scores.softmax(1)).sum(1)
+        if ratio == 1:
+            pooled = z
+        else:
+            values, scores = z.reshape(-1, ratio, 1024).split(512, -1)
+            pooled = (values * scores.softmax(1)).sum(1)
         normed = pooled * torch.rsqrt(pooled.square().mean(-1, keepdim=True) + eps) * w
         dz, dw = torch.autograd.grad(normed, (z, w), grad[ratio - 1 : count : ratio].float())
     result = torch.zeros_like(raw)
@@ -45,10 +48,19 @@ class _Pool(torch.autograd.Function):
         )
 
         m = metadata(raw.shape[0], ratio, raw.device)
-        ring = raw.new_zeros((1, ratio, 1024))
+        ring = raw.new_zeros((1, ratio, 1024)) if ratio == 2 else None
         latent = torch.zeros((raw.shape[0], 512), dtype=torch.bfloat16, device=raw.device)
         fused_save_compress_norm(
-            raw, m.positions, ring, m.ring_slots, m.cu, m.requests, weight, eps, ratio, latent
+            raw,
+            m.positions,
+            ring,
+            m.ring_slots if ratio == 2 else m.slots,
+            m.cu,
+            m.requests,
+            weight,
+            eps,
+            ratio,
+            latent,
         )
         ctx.save_for_backward(raw, weight)
         ctx.ratio, ctx.eps = ratio, eps
@@ -101,7 +113,7 @@ def index_keys(latent, wk, norm, rope, ratio, eps):
     return values, scales
 
 
-def index_topk(x, qr, qa, weights, keys, rope, ratio, emit):
+def index_topk(x, qr, qa, weights, keys, rope, ratio, emit, candidates=None):
     from vllm.model_executor.kernels.batch_invariant import top_k_per_row_prefill_index_order
     from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
     from vllm.models.deepseek_v41.common.ops import fused_indexer_q_rope_quant
@@ -139,6 +151,8 @@ def index_topk(x, qr, qa, weights, keys, rope, ratio, emit):
         'indexer_logits_valid',
         logits[torch.arange(logits.shape[1], device=x.device)[None] < ends[:, None]],
     )
+    if candidates is not None:
+        candidates(logits, starts, ends)
     topk = torch.full((x.shape[0], 512), -1, device=x.device, dtype=torch.int32)
     top_k_per_row_prefill_index_order(
         logits, starts, ends, topk, x.shape[0], logits.stride(0), logits.stride(1), 512
@@ -153,32 +167,70 @@ def source(attention, x, qr, qa, rope, document, emit):
     state, layer = context.state, core.layer
     native = core.native
     ratio, eps = core.ratio, attention.config.layernorm_epsilon
-    if ratio != 2 or 0 <= context.release.candidate_source_layer_id <= layer:
-        raise NotImplementedError('Candidate and ratio-one deployment need separate module gates')
+    if ratio not in (1, 2):
+        raise NotImplementedError('Deployment compression requires literal ratio one or two')
     geometry = (document, tuple(x.shape), x.device, x.dtype, state.grad_mode)
 
     def produce():
-        compressor = native.compressor
-        weight = torch.cat((compressor.linear_wkv.weight, compressor.linear_wgate.weight))
+        if ratio == 1:
+            weight, norm = core.main_projection.weight, core.main_norm.weight
+            wk, knorm = core.index_key[0].weight, core.index_key[1].weight
+        else:
+            compressor = native.compressor
+            weight = torch.cat((compressor.linear_wkv.weight, compressor.linear_wgate.weight))
+            norm = compressor.norm.weight
+            key = native.indexer.compressor
+            wk, knorm = key.wk.weight, key.norm.weight
         raw = linear(x, weight, fp8=False)
         emit('compressor_projection', raw)
-        latent = _Pool.apply(raw, compressor.norm.weight, ratio, eps)
+        latent = _Pool.apply(raw, norm, ratio, eps)
         emit('compressor_latent', latent[ratio - 1 :: ratio])
         decoded = _Record.apply(latent, rope, ratio)
-        key = native.indexer.compressor
         with torch.no_grad():
-            keys = index_keys(latent, key.wk.weight, key.norm.weight, rope, ratio, eps)
+            keys = index_keys(latent, wk, knorm, rope, ratio, eps)
         emit('indexer_k_values', keys[0])
         emit('indexer_k_scales', keys[1])
         return decoded, keys
 
     decoded, keys = state.resolve(layer, policy.kv, ('vllm_kv', geometry), produce)
 
+    def candidates(logits, starts, ends):
+        release = context.release
+        owner = release.candidate_source_layer_id
+        if owner < 0 or layer < owner:
+            return
+        from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+            apply_candidate_mask,
+            select_candidate_blocks,
+        )
+
+        def publish():
+            out = torch.full(
+                (x.shape[0], release.candidate_topk_blocks), -1, dtype=torch.int32, device=x.device
+            )
+            select_candidate_blocks(
+                logits,
+                starts,
+                ends,
+                release.candidate_topk_blocks,
+                release.candidate_block_size,
+                out,
+            )
+            return out
+
+        blocks = state.resolve(layer, owner, ('vllm_candidate', geometry), publish)
+        if layer != owner:
+            apply_candidate_mask(logits, starts, ends, blocks, release.candidate_block_size)
+        emit('candidate_blocks', blocks)
+
     def select():
-        indexer = native.indexer
-        weights = (indexer.linear_wq_b.linear.weight, indexer.linear_weights_proj.linear.weight)
+        if ratio == 1:
+            weights = (core.index_q.linear.weight, core.index_weights.linear.weight)
+        else:
+            indexer = native.indexer
+            weights = (indexer.linear_wq_b.linear.weight, indexer.linear_weights_proj.linear.weight)
         with torch.no_grad():
-            return index_topk(x, qr, qa, weights, keys, rope, ratio, emit)
+            return index_topk(x, qr, qa, weights, keys, rope, ratio, emit, candidates)
 
     topk = state.resolve(layer, policy.index, ('vllm_index', geometry), select)
     emit('compressed_kv_decoded', decoded)
