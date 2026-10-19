@@ -282,6 +282,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     ):
         super().__init__(config=config)
 
+        if (
+            config.experimental_attention_variant == "dsv4_hybrid"
+            and config.dsv4_version == "v4.1"
+            and config.recompute_granularity == "full"
+        ):
+            raise NotImplementedError(
+                "CSA2 full recompute requires the stateful HybridStack execution path"
+            )
+
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection

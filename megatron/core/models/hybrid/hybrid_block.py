@@ -629,9 +629,19 @@ class HybridStack(MegatronModule):
             and "mhc" in self.config.recompute_modules
         )
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
+        use_stateful_full_recompute = (
+            self.training
+            and self.config.recompute_granularity == 'full'
+            and self.forward_adapter is not None
+            and hasattr(self.forward_adapter, 'checkpoint_layer')
+        )
 
         with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and not use_stateful_full_recompute
+            ):
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -717,7 +727,12 @@ class HybridStack(MegatronModule):
                                     )
                                 if forward_context.mhc_state is not None:
                                     layer_kwargs["mhc_state"] = forward_context.mhc_state
-                                hidden_states, _ = layer(**layer_kwargs)
+                                if use_stateful_full_recompute:
+                                    hidden_states, _ = self.forward_adapter.checkpoint_layer(
+                                        layer, layer_kwargs, forward_context
+                                    )
+                                else:
+                                    hidden_states, _ = layer(**layer_kwargs)
                             elif layer_cp_metadata is not None:
                                 hidden_states = layer(
                                     hidden_states=hidden_states,
