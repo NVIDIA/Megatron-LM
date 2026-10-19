@@ -6,15 +6,17 @@ import ast
 import importlib
 import importlib.util
 import pickle
+import re
 import sys
 import warnings
 from pathlib import Path
 from types import ModuleType
+from unittest import mock
 
 import pytest
 
 from megatron.core.ops import _compat
-from tests.unit_tests.ops.deprecated_paths import FORWARDED
+from tests.unit_tests.ops.deprecated_paths import EXPORTS, FORWARDED
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -36,11 +38,17 @@ def synthetic_forwarder(request, tmp_path, monkeypatch):
         f'__getattr__, __dir__ = deprecated_module(__name__, *{targets!r}, '
         'removal_version="99.0")\n'
     )
+    exporting = (
+        'from megatron.core.ops._compat import deprecated_module\n'
+        f'__getattr__, __dir__ = deprecated_module(__name__, {targets[0]!r}, '
+        f'exports={{"other": "{package}.second"}}, removal_version="99.0")\n'
+    )
     sources = {
         '__init__.py': '',
         'first.py': '__all__ = ["public"]\npublic = object()\n_private = object()\nshared = object()\n',
         'second.py': 'other = object()\n_other_private = object()\nshared = object()\n',
         'legacy.py': forwarder,
+        'exporting.py': exporting,
         'legacy_package/__init__.py': forwarder,
         'legacy_package/child.py': 'value = object()\n',
     }
@@ -124,6 +132,107 @@ def test_synthetic_forwarder_package_child_is_lazy(synthetic_forwarder):
     assert namespace['child'] is importlib.import_module(f'{old}.child')
     assert parent.child is namespace['child']
     assert all(target not in sys.modules for target in targets)
+    # The import system binds the child on the forwarder itself, not on its targets.
+    assert vars(parent)['child'] is namespace['child']
+    assert not hasattr(importlib.import_module(targets[0]), 'child')
+
+
+def test_synthetic_forwarder_writes_reach_the_implementation(synthetic_forwarder, monkeypatch):
+    """Patching through the old path changes the module the name is read from."""
+    package, targets = synthetic_forwarder
+    old = f'{package}.legacy'
+    with pytest.warns(DeprecationWarning):
+        module = importlib.import_module(old)
+    first = importlib.import_module(targets[0])
+    original, replacement = first.public, object()
+    if len(targets) == 2:
+        # With several homes there is no single module to write to, so the write fails loudly.
+        with pytest.raises(AttributeError, match='several modules'):
+            module.public = replacement
+        assert first.public is original and 'public' not in vars(module)
+        return
+    with mock.patch(f'{old}.public', replacement):
+        assert first.public is replacement and module.public is replacement
+    assert first.public is original and 'public' not in vars(module)
+    monkeypatch.setattr(module, 'public', replacement)
+    assert first.public is replacement
+    monkeypatch.undo()
+    assert first.public is original and module.public is original
+    # Deleting a patched name restores what the patch replaced: mock.patch, and monkeypatch.undo
+    # on pytest 9.2+, undo a patch this way. Nested patches unwind in order.
+    inner = object()
+    with mock.patch(f'{old}.public', replacement):
+        with mock.patch(f'{old}.public', inner):
+            assert first.public is inner
+        assert first.public is replacement
+    assert first.public is original
+    module.public = replacement
+    del module.public
+    assert first.public is original
+    # Writing the replaced value back also undoes the write.
+    module.public = replacement
+    module.public = original
+    assert first.public is original and not vars(module)['__forwarder_replaced__']['public']
+
+
+def test_specs_load_through_forwarders(tmp_path, monkeypatch):
+    """``--spec`` and ``(module, name)`` specs resolve names a forwarder serves lazily.
+
+    Checkpoints record their ``--spec``, so an old path must keep loading the training spec and
+    finding its inference counterpart after the spec module moves.
+    """
+    from megatron.core.transformer.spec_utils import import_module as import_spec
+    from megatron.training.argument_utils import _hybrid_inference_stack_spec
+
+    package = '_ops_spec_fixture'
+    root = tmp_path / package
+    root.mkdir()
+    (root / '__init__.py').write_text('')
+    (root / 'specs.py').write_text(
+        'from megatron.core.transformer.spec_utils import ModuleSpec\n'
+        'foo_stack_spec = ModuleSpec(module=object)\n'
+        'foo_inference_stack_spec = ModuleSpec(module=object)\n'
+    )
+    (root / 'old_specs.py').write_text(
+        'from megatron.core.ops._compat import deprecated_module\n'
+        f'__getattr__, __dir__ = deprecated_module(__name__, "{package}.specs")\n'
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', DeprecationWarning)
+            old = f'{package}.old_specs'
+            specs = importlib.import_module(f'{package}.specs')
+            assert import_spec((old, 'foo_stack_spec')) is specs.foo_stack_spec
+            with pytest.raises(ImportError, match='missing_stack_spec'):
+                import_spec((old, 'missing_stack_spec'))
+            inference = _hybrid_inference_stack_spec([old, 'foo_stack_spec'], wide_residual=False)
+            assert inference is specs.foo_inference_stack_spec
+    finally:
+        for name in list(sys.modules):
+            if name == package or name.startswith(package + '.'):
+                del sys.modules[name]
+
+
+def test_synthetic_forwarder_exports(synthetic_forwarder):
+    """Re-exported names resolve from their defining module and form the forwarder's __all__."""
+    package, targets = synthetic_forwarder
+    old = f'{package}.exporting'
+    with pytest.warns(DeprecationWarning):
+        module = importlib.import_module(old)
+    assert module.__all__ == ['other']
+    assert f'{package}.second' not in sys.modules
+    second = importlib.import_module(f'{package}.second')
+    assert module.other is second.other
+    assert module.public is importlib.import_module(targets[0]).public
+    assert 'other' in dir(module)
+    namespace = {}
+    exec(f'from {old} import *', namespace)
+    assert set(namespace) - {'__builtins__'} == {'other'}
+    original, replacement = second.other, object()
+    with mock.patch(f'{old}.other', replacement):
+        assert second.other is replacement
+    assert second.other is original
 
 
 @pytest.mark.parametrize('old,targets', FORWARDED.items())
@@ -167,12 +276,54 @@ def test_forwarder_preserves_exports(old, targets, monkeypatch):
     assert module.public is implementation.public
     assert module._private is implementation._private
     assert 'public' in dir(module)
-    namespace = {}
-    exec(f'from {old} import *', namespace)
-    assert namespace['public'] is implementation.public
-    assert '_private' not in namespace
+    if old in EXPORTS:
+        # A historical package's wildcard surface is its own re-export list.
+        assert module.__all__ == list(EXPORTS[old])
+    else:
+        namespace = {}
+        exec(f'from {old} import *', namespace)
+        assert namespace['public'] is implementation.public
+        assert '_private' not in namespace
     with pytest.raises(AttributeError):
         getattr(module, 'missing_export')
+
+
+@pytest.mark.parametrize('old,exports', EXPORTS.items())
+def test_historical_package_exports_resolve_canonically(old, exports):
+    """Each re-exported name is the object defined at its canonical home."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        module = importlib.import_module(old)
+    assert module.__all__ == list(exports)
+    for name, home in exports.items():
+        # A home that is not a module in this tree is a stale entry, not a missing kernel.
+        assert _module_file(home).is_file(), f'{old}.{name}: {home} does not exist'
+        try:
+            canonical = getattr(importlib.import_module(home), name)
+        except ImportError as exc:
+            if (exc.name or '').startswith('megatron'):
+                raise
+            continue  # an optional third-party kernel library is absent in this environment
+        assert getattr(module, name) is canonical, name
+
+
+def test_canonical_packages_do_not_reexport():
+    """An operation package ``__init__`` is its contract: docstring, typing and protocols only."""
+    allowed_imports = ('__future__', 'typing')
+    violations = []
+    for path in sorted((REPO_ROOT / 'megatron/core/ops').rglob('__init__.py')):
+        relative = path.relative_to(REPO_ROOT)
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                continue
+            if isinstance(node, ast.ImportFrom) and node.module in allowed_imports:
+                continue
+            if isinstance(node, ast.If) and ast.unparse(node.test) == 'TYPE_CHECKING':
+                continue
+            if isinstance(node, ast.ClassDef):
+                continue
+            violations.append(f'{relative}:{node.lineno}: {ast.unparse(node).splitlines()[0]}')
+    assert not violations, '\n'.join(violations)
 
 
 @pytest.mark.skipif(
@@ -199,18 +350,23 @@ def test_package_child_import_stays_lazy(monkeypatch):
 )
 def test_old_ssm_entry_points_preserve_missing_dependency_behavior(monkeypatch):
     """The historical optional entry points still return None when kernels are absent."""
-    from megatron.core.ops import ssm
+    kernels = set(EXPORTS['megatron.core.ssm.ops'].values())
+    real_import = _compat.import_module
 
-    def unavailable(*args):
-        raise ImportError('optional kernel unavailable')
+    def unavailable(name):
+        if name in kernels:
+            raise ImportError('optional kernel unavailable')
+        return real_import(name)
 
-    monkeypatch.setattr(ssm, 'import_module', unavailable)
+    monkeypatch.setattr(_compat, 'import_module', unavailable)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', DeprecationWarning)
         old = importlib.import_module('megatron.core.ssm.ops')
     assert old.__all__ == ['mamba_chunk_scan_combined_varlen', 'causal_conv1d_varlen_fn']
     assert old.mamba_chunk_scan_combined_varlen is None
     assert old.causal_conv1d_varlen_fn is None
+    # The fallback belongs to the deprecated path only; the canonical package exports nothing.
+    assert not hasattr(importlib.import_module('megatron.core.ops.ssm'), '__all__')
 
 
 @pytest.mark.skipif(
@@ -225,12 +381,16 @@ def test_gdn_package_exports_canonical_classes():
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', DeprecationWarning)
         old = importlib.import_module('megatron.core.ssm.gated_delta_net')
+    from megatron.core.extensions.transformer_engine import HAVE_TE_GDN
+
     assert old.GatedDeltaNet is GatedDeltaNet
     assert old.GatedDeltaNet2 is GatedDeltaNet2
     assert old.GatedDeltaNetSubmodules is GatedDeltaNetSubmodules
+    assert old.HAVE_TE_GDN is HAVE_TE_GDN
     namespace = {}
     exec('from megatron.core.ssm.gated_delta_net import *', namespace)
     assert namespace['GatedDeltaNet'] is GatedDeltaNet
+    assert set(namespace) - {'__builtins__'} == set(EXPORTS['megatron.core.ssm.gated_delta_net'])
 
 
 @pytest.mark.parametrize(
@@ -247,7 +407,9 @@ def test_gdn_package_exports_canonical_classes():
     ],
 )
 def test_canonical_identity_and_legacy_pickle(old, symbol):
-    """Old pickle GLOBAL records load the class defined at the new canonical path."""
+    """Old pickle GLOBAL records and (module, name) specs load the class at its canonical path."""
+    from megatron.core.transformer.spec_utils import import_module as import_spec
+
     canonical = importlib.import_module(FORWARDED[old][0])
     expected = getattr(canonical, symbol)
     with warnings.catch_warnings():
@@ -255,6 +417,7 @@ def test_canonical_identity_and_legacy_pickle(old, symbol):
         alias = importlib.import_module(old)
         assert getattr(alias, symbol) is expected
         restored = pickle.loads(f'c{old}\n{symbol}\n.'.encode())
+        assert import_spec((old, symbol)) is expected
     assert restored is expected
     assert expected.__module__ == canonical.__name__
     assert pickle.loads(pickle.dumps(expected)) is expected
@@ -278,9 +441,20 @@ def test_internal_imports_resolve_after_move():
 
 
 def test_in_tree_code_uses_canonical_imports():
-    """Production code and tests must exercise implementations instead of the aliases."""
+    """Production code and tests must exercise implementations instead of the aliases.
+
+    String constants count too: a ``mock.patch`` target or a module name passed to a helper
+    that still spells an old path would patch or inspect the forwarder, not the implementation.
+    """
     # The stack moves one family at a time; unmoved modules retain their original paths.
     obsolete = tuple(name + '.' for name in FORWARDED)
+    old_names = sorted(FORWARDED, key=len, reverse=True)
+    stale_text = re.compile(
+        '|'.join(
+            [rf'(?<![\w.]){re.escape(name)}(?!\w)' for name in old_names]
+            + [rf'(?<![\w/]){re.escape(name.replace(".", "/"))}(?:\.py|/)' for name in old_names]
+        )
+    )
     violations = []
     for folder in ('megatron', 'tests', 'examples', 'tools'):
         for path in (REPO_ROOT / folder).rglob('*.py'):
@@ -289,6 +463,10 @@ def test_in_tree_code_uses_canonical_imports():
                 continue
             package = '.'.join(relative.parent.parts)
             for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    if old_names and stale_text.search(node.value):
+                        violations.append(f'{relative}:{node.lineno}')
+                    continue
                 names = []
                 if isinstance(node, ast.Import):
                     names = [alias.name for alias in node.names]
@@ -319,6 +497,12 @@ def test_in_tree_code_uses_canonical_imports():
         ('from .mamba_mixer import MambaMixer', True, True),
         ('from . import mamba_mixer', True, True),
         ('from megatron.core.ssm.ops.mamba2 import ssd_combined', True, True),
+        ('target = "megatron.core.ssm.mamba_layer.MambaLayer"', True, False),
+        ('target = "megatron.core.ssm.mamba_mixer.MambaMixer"', False, False),
+        ('target = "megatron.core.ssm.mamba_mixer.MambaMixer"', True, True),
+        ('target = "megatron.core.ssm.mamba_mixer_extra"', True, False),
+        ('target = "megatron/core/ssm/mamba_mixer.py"', True, True),
+        ('target = "megatron/core/ssm/ops/"', True, True),
     ],
 )
 def test_canonical_import_check_tracks_partial_moves(
