@@ -248,6 +248,7 @@ def test_inference_uses_config_without_cli_enable_flag():
     with (
         patch.object(utils, "get_args", return_value=args),
         patch("megatron.training.global_vars.get_run_config", return_value=cfg),
+        patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
         patch.object(utils.ProcessGroupCollection, "use_mpu_process_groups"),
         patch.object(utils, "get_model_builder") as legacy_builder,
         patch.object(

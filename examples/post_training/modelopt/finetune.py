@@ -26,8 +26,7 @@ from megatron.post_training.model_config import (
 )
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 
 REMOVE_THINK_CHAT_TEMPLATE = (
@@ -582,8 +581,6 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     full_config.distillation = distillation_config_from_args(args, model_cfg)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_sft_datasets_provider,

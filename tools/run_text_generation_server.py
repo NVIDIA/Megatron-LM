@@ -30,7 +30,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import print_rank_0
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import set_run_config
 
 try:
     from megatron.post_training.model_config import modelopt_inference_config_from_args
@@ -46,10 +46,7 @@ sys.path.append(
 
 from megatron.core import mpu
 from megatron.training import get_args, get_tokenizer
-from megatron.training.argument_utils import (
-    inference_cfg_container_from_args,
-    resolve_tokenizer_vocab_size,
-)
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
@@ -140,9 +137,6 @@ def main(model_type: str = "gpt"):
         else inference_cfg_container_from_args(args, build_model_config=False)
     )
     set_run_config(cfg)
-    initialize_runtime_services(args)
-    if use_modelopt:
-        resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:

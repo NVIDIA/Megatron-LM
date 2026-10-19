@@ -27,6 +27,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
     get_checkpoint_version,
@@ -39,10 +40,38 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
+from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.usefixtures("run_config")
+
+
+@pytest.mark.parametrize("ckpt_args", [None, SimpleNamespace()])
+def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
+    """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
+
+    args = SimpleNamespace(hybrid_layer_pattern="M*E")
+    assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
+
+
+@pytest.mark.parametrize("auto_detect", [False, True])
+def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkeypatch, auto_detect):
+    from megatron.training import checkpointing
+
+    args = create_ckpt_load_args
+    args.load = "unused"
+    args.ckpt_format = "torch_dist" if auto_detect else "torch"
+    args.auto_detect_ckpt_format = auto_detect
+    args.inference_shards = "tp=1,role=prefill+tp=1,role=decode"
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        mock.Mock(return_value=({}, "unused", False, CheckpointType.LEGACY)),
+    )
+    with pytest.raises(ValueError, match="incompatible with legacy torch checkpoints"):
+        load_checkpoint([], None, None)
 
 
 class MockModel(MegatronModule):
@@ -557,9 +586,6 @@ def create_ckpt_load_args(create_args):
     """Setup dummy args allowing checkpoint load."""
     args = create_args
     args.auto_detect_ckpt_format = False
-    args.consumed_train_samples = 0
-    args.skipped_train_samples = 0
-    args.consumed_valid_samples = 0
     args.num_layers = 1
     args.hidden_size = 2
     args.num_attention_heads = 1
@@ -820,6 +846,22 @@ def test_load_checkpoint(
             assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
 
 
+def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_args):
+    """The streaming dequantize load is weights-only (inference): the loaded state dict holds
+    the re-quantized params, so `load_checkpoint` must refuse any optimizer up front, before
+    anything is read."""
+    args = create_ckpt_load_args
+    args.load = "/nonexistent"
+    args.no_load_optim = True
+    args.stream_ckpt_dequant = True
+    set_args(args)
+
+    with pytest.raises(ValueError, match="inference-only"):
+        load_checkpoint(
+            [MockModel(TransformerConfig(num_layers=1, kv_channels=1))], MockState({}), None
+        )
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
     init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
@@ -834,11 +876,16 @@ def test_load_checkpoint_override_opt_param_scheduler(
     args.min_lr = 0.1
     args.decoupled_lr = 0.5
     args.decoupled_min_lr = 0.05
-    args.consumed_train_samples = 42
+    train_state = TrainState(consumed_train_samples=42)
 
-    with TempNamedDir(
-        tmp_path_dist_ckpt / "test_load_checkpoint_override_opt_param_scheduler", sync=True
-    ) as ckpt_dir:
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_train_state", return_value=train_state
+        ) as get_train_state,
+        TempNamedDir(
+            tmp_path_dist_ckpt / "test_load_checkpoint_override_opt_param_scheduler", sync=True
+        ) as ckpt_dir,
+    ):
         args.load = ckpt_dir
         args.save = ckpt_dir
         args.save_tokenizer_assets = False
@@ -875,6 +922,8 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
 
         # Load checkpoint and verify runtime overrides are restored.
+        train_state = TrainState()
+        get_train_state.return_value = train_state
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model],
             new_optimizer,
@@ -888,7 +937,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_optimizer.param_groups[0]["min_lr"] == args.min_lr
         assert new_optimizer.param_groups[1]["max_lr"] == args.decoupled_lr
         assert new_optimizer.param_groups[1]["min_lr"] == args.decoupled_min_lr
-        assert new_opt_param_scheduler.num_steps == args.consumed_train_samples
+        assert new_opt_param_scheduler.num_steps == train_state.consumed_train_samples == 42
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
@@ -1006,8 +1055,13 @@ def test_checkpoint_load_without_microbatch_calculator(
     args.bf16 = False
     args.hidden_size = 32
     args.num_attention_heads = 4
-    args.consumed_train_samples = 123 * args.global_batch_size
-    with TempNamedDir(tmp_path_dist_ckpt / "inference_checkpoint", sync=True) as ckpt_dir:
+    train_state = TrainState(consumed_train_samples=123 * args.global_batch_size)
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_train_state", return_value=train_state
+        ) as get_train_state,
+        TempNamedDir(tmp_path_dist_ckpt / "inference_checkpoint", sync=True) as ckpt_dir,
+    ):
         args.load = ckpt_dir
         args.save = ckpt_dir
         args.save_tokenizer_assets = False
@@ -1017,6 +1071,8 @@ def test_checkpoint_load_without_microbatch_calculator(
         )
 
         def build_model():
+            # CPU-initialized DP replicas must match the weights saved by rank 0.
+            torch.manual_seed(123)
             return (
                 GPTModel(
                     config=config,
@@ -1028,6 +1084,7 @@ def test_checkpoint_load_without_microbatch_calculator(
                 .eval()
             )
 
+        torch.manual_seed(123)
         model = build_model()
         save_checkpoint(123, [model], None, None, 456)
         saved_rng = torch.get_rng_state().clone()
@@ -1046,15 +1103,10 @@ def test_checkpoint_load_without_microbatch_calculator(
         is_inference = load_mode in ("default", "inference")
         args.phase_transition_iterations = [100] if is_inference else None
         args.no_load_optim = True
-        args.consumed_train_samples = 0
+        train_state = None if is_inference else TrainState()
+        get_train_state.return_value = train_state
         if is_inference:
-            for name in (
-                "global_batch_size",
-                "micro_batch_size",
-                "consumed_train_samples",
-                "skipped_train_samples",
-                "consumed_valid_samples",
-            ):
+            for name in ("global_batch_size", "micro_batch_size"):
                 delattr(args, name)
         unset_num_microbatches_calculator()
         if is_inference:
@@ -1070,7 +1122,8 @@ def test_checkpoint_load_without_microbatch_calculator(
         else:
             metadata = load_checkpoint([restored], None, None, restore_training_state=True)
             expected_iteration = 7 if load_mode == "override" else 123
-            assert args.consumed_train_samples == expected_iteration * args.global_batch_size
+            assert train_state.iteration == expected_iteration
+            assert train_state.consumed_train_samples == expected_iteration * args.global_batch_size
         assert metadata == (7 if load_mode == "override" else 123, 456)
         for expected, actual in zip(model.parameters(), restored.parameters()):
             assert torch.equal(expected, actual)

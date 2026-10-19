@@ -48,7 +48,7 @@ class FsdpContext:
     forward_order: IndexedOrder[nn.Module]
     backward_order: IndexedOrder[nn.Module]
     # Topology metadata must not keep modules alive after construction.
-    _roots: IndexedOrder[nn.Module]
+    _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
     _module_names: WeakKeyDictionary[nn.Module, str]
     # The optimizer runs on the current stream and must wait for reductions on
@@ -100,7 +100,7 @@ class FsdpContext:
         self._post_backward_hook_registered = False
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
-        self._roots = IndexedOrder()
+        self._roots = WeakKeyDictionary()
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
@@ -153,14 +153,14 @@ class FsdpContext:
         for root in self._registered_modules:
             if root in children:
                 continue
-            self._roots.append(root)
+            self._roots[root] = None
             for name, module in root.named_modules():
                 if module not in registered_modules:
                     continue
                 self._module_names[module] = name
                 self.forward_order.append(module)
 
-        for root in reversed(self._roots):
+        for root in reversed(list(self._roots)):
             _collect_backward_order(root, registered_modules, self.backward_order)
 
         self._registered_modules.clear()

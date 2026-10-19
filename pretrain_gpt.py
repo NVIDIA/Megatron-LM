@@ -57,20 +57,12 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (
-    gpt_config_from_args,
-    pretrain_cfg_container_from_args,
-    resolve_tokenizer_vocab_size,
-)
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    initialize_runtime_services,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
@@ -590,8 +582,6 @@ if __name__ == "__main__":
     if use_modelopt_config:
         full_config.distillation = distillation_config_from_args(args, model_cfg)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
