@@ -72,8 +72,7 @@ def unpermute(
     if ep_invariant:
         from megatron.core.transformer.moe import ep_invariant_combine as eic
 
-        slots = eic.dense_slots(inverse_map[0], inverse_map[1], num_experts)
-        out = eic.tree_combine(permuted_tokens, slots, eic.num_leaf_blocks(num_experts), probs)
+        out = eic.tree_combine(permuted_tokens, inverse_map[0], inverse_map[1], num_experts, probs)
         return out.view(restore_shape).to(input_dtype)
     # Mirror the inference engine's summation tree exactly:
     # - When probs is None the activations were probability-weighted upstream

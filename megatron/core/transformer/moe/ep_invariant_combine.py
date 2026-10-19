@@ -214,43 +214,6 @@ def tree_combine_forward(
     return out
 
 
-class _TreeCombine(torch.autograd.Function):
-    """``tree_combine_forward`` with the gradient of the plain sum of the weighted rows."""
-
-    @staticmethod
-    def forward(ctx, rows, slots, num_leaves, probs):
-        # pylint: disable=missing-function-docstring
-        out = tree_combine_forward(rows.contiguous(), slots, num_leaves, probs)
-        ctx.save_for_backward(rows, slots, probs)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad):  # pylint: disable=missing-function-docstring
-        rows, slots, probs = ctx.saved_tensors
-        grad = grad.to(torch.float32)
-        hit = slots >= 0
-        safe = slots.clamp_min(0).long()
-        d_rows = torch.zeros(rows.shape, dtype=torch.float32, device=rows.device)
-        d_probs = None if probs is None else torch.zeros_like(probs, dtype=torch.float32)
-        for j in range(slots.shape[1]):
-            g = grad.masked_fill(~hit[:, j : j + 1], 0.0)
-            if probs is not None:
-                d_probs[:, j] = (g * rows.index_select(0, safe[:, j]).float()).sum(-1)
-                g = g * probs[:, j : j + 1].float()
-            # Each row belongs to at most one (token, column).
-            d_rows.index_add_(0, safe[hit[:, j], j], g[hit[:, j]])
-        if d_probs is not None:
-            d_probs = d_probs.to(probs.dtype)
-        return d_rows.to(rows.dtype), None, None, d_probs
-
-
-def tree_combine(
-    rows: torch.Tensor, slots: torch.Tensor, num_leaves: int, probs: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """Autograd-aware ``tree_combine_forward`` (see there for the arguments)."""
-    return _TreeCombine.apply(rows, slots, num_leaves, probs)
-
-
 def dense_slots(row_of_slot: torch.Tensor, expert_of_slot: torch.Tensor, num_experts: int):
     """[T, K] (row, expert) top-k slots -> [T, num_experts] row per expert (-1 = none)."""
     num_tokens = row_of_slot.shape[0]
@@ -262,3 +225,67 @@ def dense_slots(row_of_slot: torch.Tensor, expert_of_slot: torch.Tensor, num_exp
     )
     dense.scatter_(1, cols, torch.where(valid, row_of_slot, -1).to(torch.int32))
     return dense[:, :num_experts].contiguous()
+
+
+def _per_row(values: torch.Tensor, slot_row: torch.Tensor, num_rows: int, fill) -> torch.Tensor:
+    """[T, K] per-slot values -> [num_rows] per permuted row (``fill`` for rows of no slot).
+
+    Each permuted row belongs to at most one valid slot; invalid slots (row -1) land in a
+    spare last entry, which is dropped.
+    """
+    out = torch.full((num_rows + 1,), fill, dtype=values.dtype, device=values.device)
+    out.scatter_(0, torch.where(slot_row >= 0, slot_row, num_rows).flatten(), values.flatten())
+    return out[:num_rows]
+
+
+class _TreeCombine(torch.autograd.Function):
+    """``tree_combine_forward`` over all experts, with the gradient of the plain sum."""
+
+    @staticmethod
+    def forward(ctx, rows, row_of_slot, expert_of_slot, num_experts, probs):
+        # pylint: disable=missing-function-docstring
+        slots = dense_slots(row_of_slot, expert_of_slot, num_experts)
+        out = tree_combine_forward(rows.contiguous(), slots, num_leaf_blocks(num_experts), probs)
+        valid = (row_of_slot >= 0) & (expert_of_slot >= 0) & (expert_of_slot < num_experts)
+        slot_row = torch.where(valid, row_of_slot, -1)
+        ctx.save_for_backward(rows, slot_row, expert_of_slot.clamp(0, num_experts - 1), probs)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):  # pylint: disable=missing-function-docstring
+        rows, slot_row, expert, probs = ctx.saved_tensors
+        num_tokens, topk = slot_row.shape
+        grad = grad.to(torch.float32)
+        # d out[t] / d row = prob of the row's (token, expert) slot: one gather per row.
+        token = torch.arange(num_tokens, device=grad.device)[:, None].expand(-1, topk)
+        token_of_row = _per_row(token, slot_row, rows.shape[0], num_tokens)
+        grad_ext = torch.cat([grad, grad.new_zeros(1, grad.shape[1])])
+        d_rows = grad_ext.index_select(0, token_of_row)
+        d_probs = None
+        if probs is not None:
+            slot_prob = probs.gather(1, expert).float()
+            d_rows *= _per_row(slot_prob, slot_row, rows.shape[0], 0.0)[:, None]
+            # d out[t] / d probs[t, e] = the (token, e) row; spare column for invalid slots.
+            d_probs = grad.new_zeros(num_tokens, probs.shape[1] + 1)
+            safe = slot_row.clamp_min(0)
+            for k in range(topk):
+                dot = (grad * rows.index_select(0, safe[:, k]).float()).sum(-1)
+                col = torch.where(slot_row[:, k] >= 0, expert[:, k], probs.shape[1])
+                d_probs.scatter_(1, col[:, None], dot[:, None])
+            d_probs = d_probs[:, :-1].to(probs.dtype)
+        return d_rows.to(rows.dtype), None, None, None, d_probs
+
+
+def tree_combine(
+    rows: torch.Tensor,
+    row_of_slot: torch.Tensor,
+    expert_of_slot: torch.Tensor,
+    num_experts: int,
+    probs: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Autograd-aware combine of each token's top-k slots over the whole tree -> fp32 [T, H].
+
+    ``row_of_slot`` / ``expert_of_slot`` [T, K]: permuted row and global expert of each
+    slot (-1 = none). ``probs`` [T, num_experts] multiplies each row in fp32 first.
+    """
+    return _TreeCombine.apply(rows, row_of_slot, expert_of_slot, num_experts, probs)
