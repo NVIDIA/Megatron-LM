@@ -8,6 +8,7 @@ import functools
 import gc
 import inspect
 import logging
+import math
 import re
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
@@ -162,9 +163,26 @@ _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
-_TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
+# cuDNN radix top-k allocates an int32 scratch of ``rows x 2 x num_cols`` per launch. 8 GiB is
+# 1024 rows per launch at 1M keys (4.3 waves of CTAs on GB300 instead of 256 rows), which
+# measured 20.85 -> 14.24 ms per 1M CP64 rank-0 call; at 128K it fits all 4096 rows in one launch.
+# The scratch is transient but needs this much spare memory, eagerly and inside a CUDA graph
+# pool, for every call whose FP32 scores exceed 1 GiB (rows x cols > 2**28): it is
+# min(8 GiB, twice the score buffer the caller already holds), so e.g. a 32K CP1 call (4 GiB of
+# scores) also takes 8 GiB where it took 2 GiB. Headroom was checked for GLM-5.2 1M CP64 and
+# 128K CP32 only; the toolkit's GLM-5.3-flash recipes (4K, CP1) stay far below 1 GiB of scores.
+_TOPK_WRAPPER_MAX_SCRATCH_BYTES = 8 * 1024 * 1024 * 1024
 _TOPK_WRAPPER_SCRATCH_INT32_FACTOR = 2
-_TOPK_WRAPPER_ROW_ALIGNMENT = 512
+# The frontend indexes that scratch with int32: one launch may hold at most 2**31 elements, so
+# the highest scratch index is 2**31 - 1 (FE 1.21.1 has no internal split). The limit is on
+# elements, not rows, so short rows still get large launches. At 1M keys the 8 GiB budget hits
+# exactly 2**31 elements (1024 rows). That deliberately takes FE >= 1.31's own split branch
+# (it splits only above 2**31 - 1 elements, into ``(2**31 - 1) // (2 * cols) + 1`` = 1024 rows,
+# i.e. the same single 2**31-element buffer); both FE 1.21.1 and FE 1.31 were validated exact
+# there (jobs 4629521, 4629523). 2**31 - 1 would cost a 17th launch per 1M rank-0 call.
+_TOPK_WRAPPER_MAX_SCRATCH_INT32_ELEMENTS = 2**31
+# The compiled kernel assumes a 32-byte aligned score base pointer; chunk starts keep it.
+_TOPK_WRAPPER_INPUT_ALIGNMENT_BYTES = 32
 _DETERMINISTIC_TOPK_REPAIR_MAX_BYTES = 512 * 1024 * 1024
 _INDEXER_SCORE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _INDEXER_SCORE_CHUNK_ROW_ALIGNMENT = 512
@@ -533,6 +551,33 @@ def _bytes_to_chunk_rows(n_rows: int, bytes_per_row: int, max_bytes: int, alignm
     return min(n_rows, chunk_rows)
 
 
+def _topk_wrapper_row_alignment(num_cols: int, element_size: int) -> int:
+    """Smallest row multiple that keeps every top-k chunk start 32-byte aligned.
+
+    Rows whose byte width is already a multiple of 32 need no alignment (1); otherwise chunk
+    starts are multiples of ``32 / gcd(32, row_bytes)`` rows (at most 8 for FP32 scores).
+    """
+    row_bytes = max(1, num_cols) * element_size
+    return _TOPK_WRAPPER_INPUT_ALIGNMENT_BYTES // math.gcd(
+        _TOPK_WRAPPER_INPUT_ALIGNMENT_BYTES, row_bytes
+    )
+
+
+def _topk_wrapper_chunk_rows(n_rows: int, num_cols: int, element_size: int) -> int:
+    """Rows per cuDNN top-k launch under the scratch budget and the frontend's int32 limit."""
+    scratch_elements_per_row = max(1, num_cols) * _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
+    int32_bytes = torch.iinfo(torch.int32).bits // 8
+    max_scratch_bytes = min(
+        _TOPK_WRAPPER_MAX_SCRATCH_BYTES, _TOPK_WRAPPER_MAX_SCRATCH_INT32_ELEMENTS * int32_bytes
+    )
+    return _bytes_to_chunk_rows(
+        n_rows,
+        scratch_elements_per_row * int32_bytes,
+        max_scratch_bytes,
+        _topk_wrapper_row_alignment(num_cols, element_size),
+    )
+
+
 def _causal_seq_lens(q_positions: Tensor, ratio: int, sk: int) -> Tensor:
     """Per-query causal key length under the indexer ``ratio``, clamped to ``sk``."""
     return ((q_positions + 1) // ratio).clamp(max=sk)
@@ -700,13 +745,15 @@ def _indexer_top_k_wrapper_chunked(
     return_topk_scores: bool,
     deterministic: bool = False,
 ) -> dict:
-    """Run cuDNN top-k in row chunks to bound wrapper scratch allocation."""
+    """Run cuDNN top-k in row chunks to bound wrapper scratch allocation.
+
+    Every cuDNN top-k call in this module goes through here. The CSA paths
+    (``csa_utils/fused_sparse_attention.py``) call the frontend directly with their own sizing
+    and deterministic selection (the dense fallback row-chunks under its own 1 GiB score
+    budget when only top-k is needed), so this scratch budget does not apply to them.
+    """
     n_rows, sk = scores_flat.shape
-    scratch_bytes_per_row = max(1, sk) * torch.iinfo(torch.int32).bits // 8
-    scratch_bytes_per_row *= _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
-    chunk_rows = _bytes_to_chunk_rows(
-        n_rows, scratch_bytes_per_row, _TOPK_WRAPPER_MAX_SCRATCH_BYTES, _TOPK_WRAPPER_ROW_ALIGNMENT
-    )
+    chunk_rows = _topk_wrapper_chunk_rows(n_rows, sk, scores_flat.element_size())
     deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
     if deterministic:
         # Bound the masks, prefix ranks, and K-wide gather buffers used by the
@@ -736,24 +783,41 @@ def _indexer_top_k_wrapper_chunked(
     if chunk_rows >= n_rows:
         return run_chunk(scores_flat, seq_lens)
 
-    indices_chunks = []
-    values_chunks = [] if return_topk_scores else None
+    # Each chunk's result is copied into outputs allocated before the first launch and dropped
+    # before the next one. The frontend allocates a launch's outputs before its scratch, so a
+    # chunk result still alive at the next launch (as in the former collect-then-torch.cat) is
+    # carved out of the scratch block just freed, and every later launch needs a second
+    # scratch-sized segment: two 8 GiB blocks in a CUDA graph's private pool at 1M (16.02 GiB
+    # reserved against an 8.25 GiB allocated peak, job 4629523), likewise cached eagerly.
+    indices = torch.empty((n_rows, topk_k), dtype=torch.int32, device=scores_flat.device)
+    values = (
+        torch.empty((n_rows, topk_k), dtype=scores_flat.dtype, device=scores_flat.device)
+        if return_topk_scores
+        else None
+    )
     for row_start in range(0, n_rows, chunk_rows):
         row_end = min(row_start + chunk_rows, n_rows)
         tk_result = run_chunk(
             scores_flat[row_start:row_end].contiguous(), seq_lens[row_start:row_end].contiguous()
         )
-        indices_chunks.append(tk_result["indices"])
+        _copy_topk_chunk(indices[row_start:row_end], tk_result["indices"], "indices")
         if return_topk_scores:
-            values = tk_result["values"]
-            if values is None:
+            if tk_result["values"] is None:
                 raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
-            values_chunks.append(values)
+            _copy_topk_chunk(values[row_start:row_end], tk_result["values"], "values")
+        del tk_result
 
-    return {
-        "indices": torch.cat(indices_chunks, dim=0),
-        "values": torch.cat(values_chunks, dim=0) if return_topk_scores else None,
-    }
+    return {"indices": indices, "values": values}
+
+
+def _copy_topk_chunk(destination: Tensor, chunk: Tensor, name: str) -> None:
+    """Copy one top-k chunk result into its output rows without a silent dtype or shape cast."""
+    if chunk.dtype != destination.dtype or chunk.numel() != destination.numel():
+        raise RuntimeError(
+            f"cuDNN top-k chunk {name} have dtype {chunk.dtype} and {chunk.numel()} elements; "
+            f"expected {destination.dtype} and {destination.numel()} ({tuple(destination.shape)})."
+        )
+    destination.copy_(chunk.reshape(destination.shape))
 
 
 def _indexer_score_chunk_rows(b: int, sq: int, sk: int) -> int:
