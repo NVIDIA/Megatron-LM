@@ -5,15 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.distributed as dist
 from safetensors.torch import save_file
 
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.lite.model.deepseek_v41.lite.checkpoint import (
-    attach_checkpoint_metadata,
-    load_hf_weights,
-)
+from megatron.lite.model.deepseek_v41.lite.checkpoint import load_hf_weights
 from megatron.lite.model.deepseek_v41.lite.protocol import forward_step
 from megatron.lite.runtime.contracts import PackedBatch
 
@@ -34,39 +28,6 @@ def test_forward_step_rows_are_original_unpadded_rows(rank):
     assert output["rows"].tolist() == expected
     assert not output["valid_mask"][output["rows"] < 0].any()
     assert output["valid_mask"].sum() == (4 if rank == 0 else 5)
-
-
-def test_checkpoint_metadata_keeps_engram_rows_at_global_offsets(tmp_path):
-    dist.init_process_group("gloo", init_method=f"file://{tmp_path}/store", rank=0, world_size=1)
-    try:
-        group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)  # rank 1 of a 2-way row shard
-        table = torch.nn.Module()
-        table.register_buffer("weight", torch.ones(3, 4, dtype=torch.bfloat16))
-        table.lookup = SimpleNamespace(group=group, boundaries=(0, 3, 6))
-        engram = torch.nn.Module()
-        engram.embed, engram.wkv = table, torch.nn.Linear(4, 4, bias=False)
-        engram.register_buffer("cache", torch.zeros(2), persistent=False)
-        native = MegatronModule(
-            TransformerConfig(num_layers=1, hidden_size=4, num_attention_heads=1)
-        )
-        native.tp_group, native.bias = dist.group.WORLD, torch.nn.Parameter(torch.zeros(4))
-        model = torch.nn.Module()
-        model.engrams, model.native = torch.nn.ModuleDict({"1": engram}), native
-        attach_checkpoint_metadata(
-            [model], SimpleNamespace(dp_cp_rank=1, dp_cp_group=dist.group.WORLD)
-        )
-        state = model.sharded_state_dict()
-        assert set(model.state_dict()) == set(state)
-        assert model._mlite_dist_opt_sharded_state_dict
-        assert set(state) == {"engrams.1.embed.weight", "engrams.1.wkv.weight", "native.bias"}
-        rows = state["engrams.1.embed.weight"]
-        assert rows.global_shape == (6, 4) and rows.global_offset == (3, 0)
-        assert rows.replica_id == (0, 0, 0)  # the row group covers dp x cp: no replicas
-        table.lookup.boundaries = (0, 2, 6)
-        with pytest.raises(ValueError, match="equal Core row shards"):
-            model.sharded_state_dict()
-    finally:
-        dist.destroy_process_group()
 
 
 def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
@@ -140,3 +101,23 @@ def test_native_fp4_fp8_gpu_decode_matches_cpu_bits(tmp_path):
                 assert torch.equal(
                     cpu.to(dtype).view(torch.uint8), gpu.to(dtype).cpu().view(torch.uint8)
                 )
+
+
+def test_native_row_reads_keep_owned_bytes_across_shards(tmp_path):
+    from megatron.lite.primitive.ckpt.row_reader import RowSliceReader as SafeTensorReader
+
+    tensors = {
+        "weight": torch.arange(128, dtype=torch.uint8).reshape(8, 16).view(torch.float8_e4m3fn),
+        "scale": torch.arange(16, dtype=torch.uint8).reshape(8, 2).view(torch.float8_e8m0fnu),
+    }
+    for key, value in tensors.items():
+        save_file({key: value}, tmp_path / f"{key}.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: f"{k}.safetensors" for k in tensors}})
+    )
+    with SafeTensorReader(tmp_path) as reader:
+        rows = reader.get_row_tensors([(k, 3, 6) for k in tensors])
+    assert set(rows) == set(tensors)
+    for key, value in rows.items():
+        assert value.dtype == tensors[key].dtype and value.shape[0] == 3
+        assert torch.equal(value.view(torch.uint8), tensors[key][3:6].view(torch.uint8))

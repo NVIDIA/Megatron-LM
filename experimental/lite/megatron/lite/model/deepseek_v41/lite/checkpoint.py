@@ -4,7 +4,7 @@ import re
 
 import torch
 
-from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
+from megatron.lite.primitive.ckpt.row_reader import RowSliceReader as SafeTensorReader
 
 _ATTENTION = {
     "linear_q_down_proj.weight": "wq_a.weight",
@@ -122,12 +122,19 @@ def _engram(reader, name, tensor, model):
         start = table.embedding.lookup.boundaries[table.group.rank()]
         stop = min(start + tensor.shape[0], table.rows)
         kind = suffix.rsplit(".", 1)[1]
-        raw = reader._get_raw_tensor(prefix + "embed." + kind, torch.device("cpu"))
+        if not hasattr(reader, "_engram_rows"):
+            reader._engram_rows = {}
+        if layer not in reader._engram_rows:
+            requests = [(prefix + "embed." + k, start, stop) for k in ("weight", "scale")]
+            reader._engram_rows[layer] = reader.get_row_tensors(requests)
+        raw = reader._engram_rows[layer].pop(prefix + "embed." + kind)
+        if not reader._engram_rows[layer]:
+            del reader._engram_rows[layer]
         expected = torch.float8_e4m3fn if kind == "weight" else torch.float8_e8m0fnu
         if raw.dtype != expected or tensor.dtype != expected or raw.shape[1] != tensor.shape[1]:
             raise ValueError("Engram release storage must retain FP8 weight and E8M0/32 scales")
         tensor.zero_()
-        tensor[: stop - start].copy_(raw[start:stop])
+        tensor[: stop - start].copy_(raw)
         return tensor
     key = {"wkv.weight": "wkv.weight", "q_weight": "q_weight", "k_weight": "k_weight"}.get(suffix)
     if key is None:
@@ -144,7 +151,14 @@ def _record_reads(reader):
         keys.add(name)
         return read(name, device)
 
-    reader._get_raw_tensor = recording
+    row_read = reader.get_row_tensors
+
+    def row_recording(requests):
+        values = row_read(requests)
+        keys.update(values)
+        return values
+
+    reader._get_raw_tensor, reader.get_row_tensors = recording, row_recording
     return keys
 
 

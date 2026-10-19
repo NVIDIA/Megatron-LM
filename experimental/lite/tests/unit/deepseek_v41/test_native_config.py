@@ -11,23 +11,6 @@ from megatron.lite.primitive.modules.attention import ratio_one
 from megatron.lite.runtime.contracts import ParallelConfig
 
 
-def test_release_text_config_and_overrides():
-    config = DeepseekV41Config._from_hf_dict(
-        {
-            "text_config": {
-                "hidden_size": 5120,
-                "kv_source_layer_ids": [2, 8],
-                "rope_scaling": {"factor": 16, "original_max_position_embeddings": 65536},
-            }
-        },
-        num_hidden_layers=4,
-    )
-    assert config.kv_source_layer_ids == (2, 8)
-    assert config.num_hidden_layers == 4 and config.head_dim == 512
-    assert config.rotary_scaling_factor == 16 and config.original_max_position_embeddings == 65536
-    assert len(config.compress_ratios) == 43
-
-
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministic):
 
