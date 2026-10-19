@@ -54,11 +54,15 @@ def test_registry_reuses_native_lifecycle_and_dist_opt():
     assert inspect.signature(native.build_model).parameters['_model_class'].default is None
 
 
-def test_attention_provider_keeps_compressed_gap_explicit_and_native_lifecycle():
+def test_deployment_keeps_native_pipeline_and_explicit_output_boundary():
     from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
     from megatron.lite.model.deepseek_v41.vllm.attention import SWAAttention
 
     assert issubclass(SWAAttention, DS41SelfAttention)
     assert 'ratio2 parity pending' in DeepseekV41Model.deployment_providers['attention']
     assert DeepseekV41Model.set_input_tensor is NativeModel.set_input_tensor
-    assert DeepseekV41Model.forward is NativeModel.forward
+    assert DeepseekV41Model.forward is not NativeModel.forward
+    assert (
+        inspect.signature(DeepseekV41Model.forward).parameters['labels'].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
