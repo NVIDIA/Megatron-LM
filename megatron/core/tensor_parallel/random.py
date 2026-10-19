@@ -861,7 +861,8 @@ class _InputStash(torch.autograd.Function):
 class _RegionFunction(torch.autograd.Function):
     """Autograd node that stands in for the checkpointed function.
 
-    The node owns its region through ``ctx.region``; the region never refers back to the node.
+    It keeps its region in ``ctx.region`` so that backward can route the output gradients through
+    the recomputed graph.
     """
 
     @staticmethod
@@ -894,8 +895,6 @@ class _RecomputeRegion:
         self, function: Callable, args: tuple, use_te_context: bool, retain_input_tensors: bool
     ):
         self.state: Optional[_RegionState] = None
-        # Whether autograd recorded a node for this region (some input requires grad).
-        self.has_node = False
         self._function = function
         self._layout = _ArgLayout(args)
         # Taken before the function draws any random number.
@@ -916,8 +915,6 @@ class _RecomputeRegion:
         tensors = self._layout.tensors_of(args)
         result = _RegionFunction.apply(self, *tensors)
         self._stash = _InputStash.apply(*tensors)
-        # Both Functions receive the same tensors, so the stash has a node iff the region has one.
-        self.has_node = self._stash.grad_fn is not None
         self.state = _RegionState.RECORDED
         return result
 
@@ -969,14 +966,9 @@ class _RecomputeRegion:
 
     def _unstash_inputs(self) -> tuple:
         """Read the stashed inputs back (unpack hooks run here, once) as new graph leaves."""
+        # checkpoint() only records a region when some input requires grad, so the stash node
+        # exists and holds every tensor input.
         stash, self._stash = self._stash, None
-        if not self._layout.tensor_positions:
-            return ()
-        if stash is None or stash.grad_fn is None:
-            raise RuntimeError(
-                "CheckpointWithoutOutput cannot recompute: none of its inputs requires grad, so "
-                "they were not saved."
-            )
         leaves = []
         for saved in stash.grad_fn.saved_tensors:
             leaf = saved.detach()
@@ -1134,13 +1126,22 @@ class CheckpointWithoutOutput:
 
         If ckpt_manager was provided during initialization, this checkpoint
         will be automatically registered to the manager after execution.
+
+        When grad is disabled, or no tensor argument requires grad, backward cannot need the
+        outputs, so the function runs as a plain call and later discard calls do nothing.
         """
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
         # may be called in a separate graph warmup.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
-        if is_graph_warmup():
+        # A plain call also keeps parameters used inside the function on the normal autograd
+        # path, and enters no Transformer Engine recompute context, whose first-pass state is
+        # only consumed by a recomputation.
+        records_graph = torch.is_grad_enabled() and any(
+            isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args
+        )
+        if is_graph_warmup() or not records_graph:
             self.outputs = None
             self._region = self._released_region = None
             return run_function(*args)
@@ -1159,9 +1160,9 @@ class CheckpointWithoutOutput:
     def _release_outputs(self) -> Optional[_RecomputeRegion]:
         """Release the outputs of the latest checkpoint() call and return its region.
 
-        From then on a region with an autograd node is owned by that node and by its recompute
-        hooks; the facade only keeps a weak reference (for further hooks), so a region whose
-        backward never runs does not keep its recomputed graph alive through the facade.
+        From then on the region is owned by its autograd node and by its recompute hooks; the
+        facade only keeps a weak reference (for further hooks), so a region whose backward never
+        runs does not keep its recomputed graph alive through the facade.
         """
         region = self._region
         if region is None:
@@ -1169,8 +1170,7 @@ class CheckpointWithoutOutput:
         if self.outputs is not None:
             region.release(self.outputs)
         self.outputs = None
-        if region.has_node:
-            self._region, self._released_region = None, weakref.ref(region)
+        self._region, self._released_region = None, weakref.ref(region)
         return region
 
     def discard_output_and_register_recompute(self, hook_tensor):
