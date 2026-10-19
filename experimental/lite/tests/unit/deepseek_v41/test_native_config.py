@@ -30,6 +30,8 @@ def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministi
     assert config.moe_token_dispatcher_type == "alltoall"
     runtime = MegatronLiteConfig(hf_path="release", load_hf_weights=deterministic)
     assert _build_impl_cfg(protocol, runtime).initialize_weights is not deterministic
+    with pytest.raises(ValueError, match="at most 40 text layers"):
+        protocol._validate(DeepseekV41Config(num_hidden_layers=43), protocol.ImplConfig())
 
 
 @pytest.mark.parametrize(

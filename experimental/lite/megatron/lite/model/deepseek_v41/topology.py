@@ -17,6 +17,8 @@ def layer_sources(config: DeepseekV41Config) -> tuple[LayerSources, ...]:
     ratios = config.compress_ratios or ([0, 0] + [2] * 18 + [1] * 20 + [0] * 3)
     if type(n) is not int or n <= 0 or len(ratios) < n:
         raise ValueError("DS4.1 needs positive layer count and a ratio for every layer")
+    if not config.compress_ratios and n > 40:
+        raise ValueError("DS4.1 default ratios support at most 40 text layers; MTP is unsupported")
     sources = (config.kv_source_layer_ids, config.index_source_layer_ids)
     for ids in sources:
         if any(type(i) is not int or i < 0 for i in ids) or list(ids) != sorted(set(ids)):
