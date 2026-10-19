@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DS4.1 routing selection over the native Core router."""
 from collections.abc import Callable
-from typing import Any
 
 import torch
 
@@ -41,11 +40,3 @@ def bind_sorted_selection(router: TopKRouter) -> None:
     if router.router_replay is not None:
         raise ValueError("DS4.1 sorted selection cannot replace an active replay policy")
     router.router_replay = SortedTopKPolicy()
-
-
-class DS41TopKRouter(TopKRouter):
-    """Native Core routing with an instance-local sorted selection policy."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        bind_sorted_selection(self)

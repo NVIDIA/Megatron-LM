@@ -26,7 +26,7 @@ def tiny_config():
         engram_max_ngram_size=2,
         engram_vocab_size=31,
         engram_n_heads=2,
-        engram_head_dim=8,
+        engram_head_dim=32,
         engram_pad_token_id=0,
         engram_compressed_vocab_size=128,
         rms_norm_eps=1e-6,

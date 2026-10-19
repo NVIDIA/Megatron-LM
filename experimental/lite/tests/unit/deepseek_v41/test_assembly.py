@@ -143,3 +143,8 @@ def test_runtime_rejects_unknown_model_options_before_build():
 def test_non_adam_optimizer_is_rejected_before_model_allocation(option):
     with pytest.raises(ValueError, match="optimizer"):
         _validate(DeepseekV41Config(num_hidden_layers=4), ImplConfig(**option))
+
+
+def test_trainable_engram_rejected_before_model_allocation():
+    with pytest.raises(ValueError, match="Trainable Engram"):
+        _validate(DeepseekV41Config(), ImplConfig(trainable_engram=True))

@@ -63,6 +63,8 @@ def _validate(model_cfg, impl):
         or impl.dtype not in (torch.bfloat16, "bfloat16", "bf16")
     ):
         raise ValueError("DS4.1 standard training supports BF16 execution only")
+    if impl.trainable_engram:
+        raise ValueError("Trainable Engram is not supported; tables must be frozen")
     if impl.optimizer not in (None, "adam", "dist_opt"):
         raise ValueError(f"Unsupported DS4.1 optimizer: {impl.optimizer}")
     options = impl.optimizer_config

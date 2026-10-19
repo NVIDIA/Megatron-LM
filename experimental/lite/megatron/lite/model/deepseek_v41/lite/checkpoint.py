@@ -117,25 +117,17 @@ def _engram(reader, name, tensor, model):
         return None
     layer, suffix = match.groups()
     prefix = f"layers.{layer}.engram."
-    if suffix == "embed.embedding.weight":
+    if suffix in {"embed.embedding.weight", "embed.embedding.scale"}:
         table = model.engrams[layer].embed
         start = table.embedding.lookup.boundaries[table.group.rank()]
         stop = min(start + tensor.shape[0], table.rows)
-        raw = reader._get_raw_tensor(prefix + "embed.weight", torch.device("cpu"))
-        scales = (
-            reader._get_raw_tensor(prefix + "embed.scale", torch.device("cpu"))
-            if reader.has_tensor(prefix + "embed.scale")
-            else None
-        )
+        kind = suffix.rsplit(".", 1)[1]
+        raw = reader._get_raw_tensor(prefix + "embed." + kind, torch.device("cpu"))
+        expected = torch.float8_e4m3fn if kind == "weight" else torch.float8_e8m0fnu
+        if raw.dtype != expected or tensor.dtype != expected or raw.shape[1] != tensor.shape[1]:
+            raise ValueError("Engram release storage must retain FP8 weight and E8M0/32 scales")
         tensor.zero_()
-        for begin in range(start, stop, 4096):
-            end = min(begin + 4096, stop)
-            value = raw[begin:end].float()
-            if scales is not None:
-                value = (
-                    value.unflatten(-1, (-1, 32)) * scales[begin:end].float().unsqueeze(-1)
-                ).flatten(-2)
-            tensor[begin - start : end - start].copy_(value.to(torch.bfloat16))
+        tensor[: stop - start].copy_(raw[start:stop])
         return tensor
     key = {"wkv.weight": "wkv.weight", "q_weight": "q_weight", "k_weight": "k_weight"}.get(suffix)
     if key is None:
@@ -185,7 +177,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
         (n, v)
         for n, v in model.named_buffers()
         if n.endswith("expert_bias")
-        or n.endswith("embed.embedding.weight")
+        or n.endswith(("embed.embedding.weight", "embed.embedding.scale"))
         or n.endswith("tid2eid")
     ]
     loaded = []

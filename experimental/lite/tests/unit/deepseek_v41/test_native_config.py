@@ -77,10 +77,13 @@ def test_native_core_configuration_is_bf16_and_keeps_literal_ratios(deterministi
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"recompute_granularity": "full"},
-        {"recompute_granularity": "selective"},
-        {"recompute_method": "uniform"},
-        {"recompute_method": "block"},
+        dict([pair])
+        for pair in [
+            ("recompute_granularity", "full"),
+            ("recompute_granularity", "selective"),
+            ("recompute_method", "uniform"),
+            ("recompute_method", "block"),
+        ]
     ],
 )
 def test_native_recompute_rejected_before_core_build(overrides):

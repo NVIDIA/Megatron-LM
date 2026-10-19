@@ -27,15 +27,13 @@ def official_selection():
         == "4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65"
     )
     tree = ast.parse(raw)
-    pool = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "select_candidate_blocks"
-    )
-    indexer = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Indexer")
-    forward = next(
-        n for n in indexer.body if isinstance(n, ast.FunctionDef) and n.name == "forward"
-    )
+
+    def named(nodes, cls, name):
+        return next(n for n in nodes if isinstance(n, cls) and n.name == name)
+
+    pool = named(tree.body, ast.FunctionDef, "select_candidate_blocks")
+    indexer = named(tree.body, ast.ClassDef, "Indexer")
+    forward = named(indexer.body, ast.FunctionDef, "forward")
     begin = next(
         i
         for i, n in enumerate(forward.body)
