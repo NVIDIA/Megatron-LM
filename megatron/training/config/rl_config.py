@@ -2,7 +2,10 @@
 
 import argparse
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from megatron.core.distributed import DistributedDataParallelConfig
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
@@ -247,6 +250,37 @@ class RLConfig:
                     "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                 )
 
+    @property
+    def requires_grad_buffer_offload(self) -> bool:
+        """Whether RL releases gradient storage between training and inference."""
+        return (
+            self.perform_rl_step
+            and self.rl_offload_optimizer_during_inference
+            and not self.rl_training_cuda_graphs
+        )
+
+    def validate_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
+        """Check the requested and RL-required layouts without changing either config."""
+        if (
+            ddp_config.grad_buffer_offload or self.requires_grad_buffer_offload
+        ) and ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "--reuse-grad-buf-for-mxfp8-param-ag: "
+                "parameters share the gradient-buffer storage that offload releases."
+            )
+
+    def finalize_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
+        """Apply the RL layout during container finalization, before DDP allocates buffers.
+
+        Unlike validation, this updates the run's owned config so checkpoint metadata
+        and model construction see the same effective layout. Do not change the RL
+        offload policy after model setup; the buffer layout is fixed at construction.
+        """
+        self.validate_ddp_config(ddp_config)
+        if self.requires_grad_buffer_offload:
+            ddp_config.grad_buffer_offload = True
+
     def validate_run(
         self,
         *,
@@ -272,28 +306,29 @@ class RLConfig:
                 "micro batch increase the sequence length."
             )
 
-        if global_batch_size is None:
-            raise ValueError("global_batch_size must be resolved before validating the RL run.")
-        # Ensure that the number of samples we collect is a multiple of the global batch size.
-        samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
-        if samples_per_inference_iteration % global_batch_size != 0:
-            raise ValueError(
-                "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
-                "global_batch_size"
-            )
-        # For now only exit/checkpoint on iterations where we generate data. We don't currently
-        # have a way to checkpoint the generated data.
-        iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
-        if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
-            raise ValueError(
-                "exit_interval should be divisible by number of global batches per inference "
-                "iteration."
-            )
-        if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
-            raise ValueError(
-                "save_interval should be divisible by number of global batches per inference "
-                "iteration."
-            )
+        # A native config can leave this default unresolved during user validation.
+        # Framework finalization repeats these checks with the resolved batch size.
+        if global_batch_size is not None:
+            # Ensure that collected samples are a multiple of the global batch size.
+            samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
+            if samples_per_inference_iteration % global_batch_size != 0:
+                raise ValueError(
+                    "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
+                    "global_batch_size"
+                )
+            # Only exit/checkpoint on iterations where we generate data: generated
+            # data cannot currently be checkpointed.
+            iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
+            if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "exit_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+            if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "save_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
 
         # In inference-only mode the optimizer is created only when it is loaded.
         if skip_train and not load_optim and self.rl_offload_optimizer_during_inference:

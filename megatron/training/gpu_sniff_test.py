@@ -382,6 +382,7 @@ def _get_ffn_gemm_shapes():
     """Derive FFN GEMM shapes from the model and current training batch shape."""
     from megatron.training.global_vars import get_args, get_run_config
 
+    cfg = get_run_config()
     args = get_args()
     cfg = get_run_config()
     h = cfg.model.transformer.hidden_size
@@ -392,7 +393,7 @@ def _get_ffn_gemm_shapes():
     tp = cfg.model.transformer.tensor_model_parallel_size
     gated = cfg.model.transformer.gated_linear_unit
 
-    tokens = args.micro_batch_size * args.seq_length
+    tokens = cfg.train.micro_batch_size * args.seq_length
     glu_mult = 2 if gated else 1
 
     # fc1 / up-proj: (tokens, ffn_hidden_size * glu_mult / TP) with K = hidden_size

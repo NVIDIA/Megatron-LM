@@ -7,9 +7,11 @@ import logging
 import sys
 
 import torch
+import torch.nn.functional as F
 
-from megatron.core.activations import squared_relu
-from megatron.core.transformer import TransformerConfig
+from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -17,16 +19,13 @@ logger = logging.getLogger(__name__)
 def _warmup_cross_entropy(
     config: TransformerConfig,
     tp_group: torch.distributed.ProcessGroup,
-    *,
-    sequence_length: int,
+    sequence: int,
     micro_batch_size: int,
-    vocab_size: int,
+    vocab: int,
     logit_dtype: torch.dtype | None,
 ) -> None:
     from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
-    sequence = sequence_length // config.context_parallel_size
-    vocab = vocab_size
     if vocab <= 0:
         raise ValueError("CE vocabulary must be positive")
     if vocab % tp_group.size():
@@ -57,35 +56,60 @@ def _warmup_activation(
     config: TransformerConfig,
     tp_size: int,
     width: int,
-    *,
-    sequence_length: int,
+    sequence: int,
     micro_batch_size: int,
+    *,
+    kernel: str,
     flatten: bool = False,
 ) -> None:
+    """Warm one MLP activation path at the model's FC1 output shape.
+
+    ``kernel`` is what MLP.forward will run, selected by the caller from activation_func together
+    with its gating and fusion settings; nothing here re-derives it from a single config field.
+    "squared_relu", "swiglu", "geglu" and "gelu" are the fused kernels. "unfused" is the eager
+    expression, whose jit-fused pieces (situ_glu, tanh_soft_clamp and activations such as
+    squared_relu or quick_gelu) also compile on first use.
+    """
+    from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
     from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
     from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
     from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 
-    sequence = sequence_length // config.context_parallel_size
     leading_shape = (sequence, micro_batch_size)
     if flatten:
         leading_shape = (sequence * micro_batch_size,)
-    swiglu = config.gated_linear_unit and config.activation_func is torch.nn.functional.silu
+    # Gated activations consume FC1's [gate, linear] output, twice the width.
+    gated = kernel in ("swiglu", "geglu") or (kernel == "unfused" and config.gated_linear_unit)
+    clamp = config.activation_func_tanh_clamp_scale
     for _ in range(2):
         x = torch.zeros(
-            (*leading_shape, width // tp_size * (2 if swiglu else 1)),
+            (*leading_shape, width // tp_size * (2 if gated else 1)),
             device="cuda",
             dtype=config.params_dtype,
             requires_grad=True,
         )
+        # The unfused path adds its bias eagerly before the activation; nothing to warm there.
         bias = (
             torch.zeros(x.shape[-1], device="cuda", dtype=x.dtype, requires_grad=True)
-            if config.add_bias_linear and config.activation_func is not squared_relu
+            if config.add_bias_linear and kernel not in ("squared_relu", "unfused")
             else None
         )
-        if config.activation_func is squared_relu:
-            output = weighted_squared_relu_impl(x, None, config.activation_func_tanh_clamp_scale)
-        elif swiglu:
+        if kernel == "squared_relu":
+            output = weighted_squared_relu_impl(x, None, clamp)
+        elif kernel == "unfused":
+            if gated and clamp is not None:
+                linear_clamp = config.activation_func_tanh_clamp_scale_linear
+                output = situ_glu(x, clamp, linear_clamp, config.glu_linear_offset)
+            elif gated:
+                x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                if (val := config.activation_func_clamp_value) is not None:
+                    x_glu = x_glu.clamp(min=None, max=val)
+                    x_linear = x_linear.clamp(min=-val, max=val)
+                output = config.activation_func(x_glu) * (x_linear + config.glu_linear_offset)
+            else:
+                y = tanh_soft_clamp(x, clamp) if clamp is not None else x
+                output = config.activation_func(y)
+        elif kernel == "swiglu":
             output = bias_swiglu_impl(
                 x,
                 bias,
@@ -94,6 +118,8 @@ def _warmup_activation(
                 gate_clamp_scale=config.activation_func_tanh_clamp_scale,
                 linear_clamp_scale=config.activation_func_tanh_clamp_scale_linear,
             )
+        elif kernel == "geglu":
+            output = bias_geglu_impl(x, bias)
         else:
             output = bias_gelu_impl(x, bias)
         inputs = (x, bias) if bias is not None else (x,)
@@ -102,11 +128,10 @@ def _warmup_activation(
 
 
 def _warmup_residual(
-    config: TransformerConfig, tp_size: int, *, sequence_length: int, micro_batch_size: int
+    config: TransformerConfig, tp_size: int, sequence: int, micro_batch_size: int
 ) -> None:
     from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 
-    sequence = sequence_length // config.context_parallel_size
     if config.sequence_parallel:
         sequence //= tp_size
     for grad_enabled in (False, True):
@@ -149,12 +174,79 @@ def _shutdown_compile_workers() -> None:
 
 
 def warmup_training_kernels(
+    model_config,
+    tp_group: torch.distributed.ProcessGroup,
+    *,
+    seq_length: int,
+    micro_batch_size: int,
+) -> None:
+    """Warm up training kernels for a GPT or Hybrid model config at the training batch shape.
+
+    Entry points that still pass a provider function instead of a model config leave
+    ``model_config`` unset; there is no TransformerConfig to select kernels from, so nothing
+    is warmed.
+    """
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+    from megatron.training.vocab_utils import calculate_padded_vocab_size
+
+    if not isinstance(model_config, (GPTModelConfig, HybridModelConfig)):
+        log_single_rank(
+            logger, logging.INFO, "Skipping training-kernel warmup: no GPT/Hybrid model config"
+        )
+        return
+    config = model_config.transformer
+    vocab_size = model_config.vocab_size
+    if vocab_size is not None and model_config.should_pad_vocab:
+        vocab_size = calculate_padded_vocab_size(
+            vocab_size,
+            model_config.make_vocab_size_divisible_by,
+            config.tensor_model_parallel_size,
+            logging_enabled=False,
+        )
+    _warmup_training_kernels(
+        config,
+        tp_group,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        padded_vocab_size=vocab_size,
+        logit_dtype=model_config.logit_dtype,
+    )
+
+
+def _select_activation_kernel(config: TransformerConfig) -> str | None:
+    """Return the activation path MLP.forward runs for fixed-shape (dense and shared) MLPs.
+
+    None means nothing to warm: TE activations, or fused combinations MLP.forward rejects.
+    Quick-GeLU and the per-token-weighted kernels are fused only for routed experts, whose
+    token counts are data-dependent, so they are left to runtime compilation.
+    """
+    if config.use_te_activation_func:
+        return None
+    if (
+        config.activation_func == squared_relu
+        and not config.gated_linear_unit
+        and config.use_fused_weighted_squared_relu
+        and config.activation_func_tanh_clamp_scale is not None
+    ):
+        return "squared_relu"
+    if not config.bias_activation_fusion:
+        return "unfused"
+    if config.activation_func == F.silu and config.gated_linear_unit:
+        return "swiglu"
+    if config.activation_func == F.gelu:
+        if config.gated_linear_unit:
+            return "geglu"
+        return "gelu" if config.add_bias_linear else None
+    return None
+
+
+def _warmup_training_kernels(
     config: TransformerConfig,
     tp_group: torch.distributed.ProcessGroup,
     *,
-    sequence_length: int,
+    seq_length: int,
     micro_batch_size: int,
-    vocab_size: int,
+    padded_vocab_size: int | None,
     logit_dtype: torch.dtype | None = None,
 ) -> None:
     """Compile/autotune supported kernels, then release temporary startup resources.
@@ -165,66 +257,52 @@ def warmup_training_kernels(
     shapes; no training data or parameters are needed. RNG state and compiler
     parallelism are preserved. Dynamic expert shapes and library-specific kernels
     can still compile later; shutting down workers does not disable compilation.
+
+    Args:
+        config: The TransformerConfig used to build the model.
+        tp_group: The model's tensor-parallel process group.
+        seq_length: Actual training sequence length before context parallel partitioning.
+        micro_batch_size: Microbatch size used by the training schedule and dataloader.
+        padded_vocab_size: Global padded vocabulary size before tensor parallel partitioning.
+            May be None when native fused cross-entropy is disabled.
+        logit_dtype: Model output-projection dtype; None uses config.params_dtype for warmup.
     """
-    if sequence_length // config.context_parallel_size <= 0 or micro_batch_size <= 0:
+    sequence = seq_length // config.context_parallel_size
+    if sequence <= 0 or micro_batch_size is None or micro_batch_size <= 0:
         raise ValueError("Kernel warmup dimensions must be positive")
     tp_size = tp_group.size()
     # New warmups (notably dropout) must not advance training RNG state. The
     # existing JIT warmup runs separately and retains its original RNG behavior.
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]), torch.enable_grad():
         if config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "native":
+            if padded_vocab_size is None:
+                raise ValueError("Model vocabulary must be resolved before kernel warmup")
             _warmup_cross_entropy(
-                config,
-                tp_group,
-                sequence_length=sequence_length,
-                micro_batch_size=micro_batch_size,
-                vocab_size=vocab_size,
-                logit_dtype=logit_dtype,
+                config, tp_group, sequence, micro_batch_size, padded_vocab_size, logit_dtype
             )
 
-        warmup_squared_relu = (
-            config.activation_func is squared_relu
-            and config.use_fused_weighted_squared_relu
-            and config.activation_func_tanh_clamp_scale is not None
-        )
-        swiglu = (
-            config.gated_linear_unit
-            and config.activation_func is torch.nn.functional.silu
-            and config.bias_activation_fusion
-        )
-        gelu = (
-            config.activation_func is torch.nn.functional.gelu
-            and config.bias_activation_fusion
-            and config.add_bias_linear
-        )
-        if not config.use_te_activation_func and (warmup_squared_relu or swiglu or gelu):
+        kernel = _select_activation_kernel(config)
+        if kernel is not None:
             # Shared and dense MLPs have fixed shapes. Routed-expert token counts
             # are data-dependent and are intentionally left to runtime compilation.
             widths = {config.ffn_hidden_size}
             if config.moe_shared_expert_intermediate_size:
                 widths.add(config.moe_shared_expert_intermediate_size)
             for width in sorted(widths):
-                _warmup_activation(
-                    config,
-                    tp_size,
-                    width,
-                    sequence_length=sequence_length,
-                    micro_batch_size=micro_batch_size,
-                )
                 # MLP paths also use flattened [tokens, width] activations;
                 # Dynamo specializes on tensor rank even with identical numel.
-                _warmup_activation(
-                    config,
-                    tp_size,
-                    width,
-                    sequence_length=sequence_length,
-                    micro_batch_size=micro_batch_size,
-                    flatten=True,
-                )
+                for flatten in (False, True):
+                    _warmup_activation(
+                        config,
+                        tp_size,
+                        width,
+                        sequence,
+                        micro_batch_size,
+                        kernel=kernel,
+                        flatten=flatten,
+                    )
         if config.bias_dropout_fusion:
-            _warmup_residual(
-                config, tp_size, sequence_length=sequence_length, micro_batch_size=micro_batch_size
-            )
+            _warmup_residual(config, tp_size, sequence, micro_batch_size)
 
     # Each helper has returned after invoking its kernels and waiting for their
     # compilation. Finish GPU work before releasing unused pinned blocks.

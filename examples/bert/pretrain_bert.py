@@ -17,11 +17,9 @@ from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
-    initialize_runtime_services,
     set_run_config,
 )
 from megatron.core.transformer.spec_utils import import_module
@@ -194,8 +192,6 @@ if __name__ == "__main__":
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     full_config = pretrain_cfg_container_from_args(args)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(full_config, train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,
              forward_step, model_provider)

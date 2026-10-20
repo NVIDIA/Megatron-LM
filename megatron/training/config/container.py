@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import copy
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from dataclasses import is_dataclass
+from dataclasses import is_dataclass, replace
 from typing import Any, Type, TypeVar
 
 try:
@@ -44,19 +44,39 @@ class ConfigContainerBase:
     """
     Configuration container base class for Megatron configurations.
 
-    Provides sub-config validation and YAML/Dict serialization and deserialization.
+    Provides validation, runtime finalization, and YAML/Dict serialization.
     """
 
+    _finalized: bool = field(default=False, init=False, repr=False, compare=False)
+
     def validate(self) -> None:
-        """Run each sub-config's explicit validation before runtime initialization."""
-        rng = getattr(self, "rng", None)
-        if rng is not None:
-            rng.finalize_model_config(getattr(self, "model", None))
+        """Check sub-configs without mutation; callers may validate repeatedly."""
         for config_field in dataclass_fields(self):
             config = getattr(self, config_field.name)
             validate = getattr(config, "validate", None)
             if callable(validate):
                 validate()
+
+    def finalize(self) -> None:
+        """Validate and apply runtime derivations once, before runtime initialization.
+
+        Called by ``initialize_megatron``, not by configuration-editing code.
+        Re-entering initialization (e.g. an in-process restart) does not apply the
+        derivations again. After finalization, treat layout and RNG policy as fixed;
+        create a new container for a differently configured run. The lifecycle flag
+        is private and is not saved in YAML/checkpoint configuration metadata.
+        """
+        if self._finalized:
+            return
+        self.validate()
+        self._finalize()
+        self._finalized = True
+
+    def _finalize(self) -> None:
+        """Apply shared runtime derivations after all validation has succeeded."""
+        rng = getattr(self, "rng", None)
+        if rng is not None:
+            rng.finalize_model_config(getattr(self, "model", None))
     
     @classmethod
     def from_dict(
@@ -272,10 +292,6 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
 
-    def finalize(self) -> None:
-        """Resolve model-owned precision inputs before runtime initialization."""
-        self.optimizer = self.finalize_optimizer_config(self.optimizer)
-
     def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
         """Derive shared precision for the configured or legacy-built optimizer."""
         # Reconstruct so optimizer-local derived precision settings are recomputed too.
@@ -287,14 +303,70 @@ class PretrainConfigContainer(ConfigContainerBase):
             fp8_recipe=self.model.transformer.fp8_recipe,
         )
 
+    def _resolve_batch_sizes(
+        self, batch_parallel_size: int | None = None
+    ) -> tuple[int | None, int | None, int | None]:
+        """Check effective train/eval batch sizes without mutating configuration."""
+        micro_batch_size = self.train.micro_batch_size
+        if batch_parallel_size is not None:
+            assert batch_parallel_size > 0
+            assert micro_batch_size is not None, "Training requires a micro batch size"
+        if micro_batch_size is not None:
+            assert micro_batch_size > 0, "Training micro batch size must be positive"
+        global_batch_size = self.train.global_batch_size
+        if global_batch_size is None and batch_parallel_size is not None:
+            global_batch_size = micro_batch_size * batch_parallel_size
+        if global_batch_size is not None:
+            assert global_batch_size > 0, "Training global batch size must be positive"
+        batch_multiple = micro_batch_size
+        if batch_multiple is not None and batch_parallel_size is not None:
+            batch_multiple *= batch_parallel_size
+        # Reduction mode and schedules validate the effective/current batch in the
+        # calculator; a schedule may resume after entries for a different topology.
+        if (
+            not self.train.decrease_batch_size_if_needed
+            and self.train.step_batch_size_schedule is None
+            and global_batch_size is not None
+            and batch_multiple is not None
+        ):
+            assert global_batch_size % batch_multiple == 0, (
+                "Training global batch size must be divisible by its microbatch size "
+                "times batch parallel size"
+            )
+        eval_global_batch_size = self.validation.eval_global_batch_size
+        if eval_global_batch_size is None:
+            eval_global_batch_size = global_batch_size
+        eval_micro_batch_size = self.validation.eval_micro_batch_size
+        if eval_micro_batch_size is None:
+            eval_micro_batch_size = micro_batch_size
+        if eval_micro_batch_size is not None:
+            assert eval_micro_batch_size > 0, "Evaluation micro batch size must be positive"
+        if eval_global_batch_size is not None:
+            assert eval_global_batch_size > 0, "Evaluation global batch size must be positive"
+        eval_batch_multiple = eval_micro_batch_size
+        if eval_batch_multiple is not None and batch_parallel_size is not None:
+            eval_batch_multiple *= batch_parallel_size
+        if eval_global_batch_size is not None and eval_batch_multiple is not None:
+            assert eval_global_batch_size % eval_batch_multiple == 0, (
+                "Evaluation global batch size must be divisible by its microbatch size "
+                "times batch parallel size"
+            )
+        return global_batch_size, eval_global_batch_size, eval_micro_batch_size
+
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
+        self.rl.validate_ddp_config(self.ddp)
         super().validate()
+        global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._validate_rl_config(global_batch_size)
+
+    def _validate_rl_config(self, global_batch_size: int | None) -> None:
+        """Check RL policy against the supplied or resolved training batch size."""
         transformer = getattr(self.model, "transformer", None)
         if transformer is not None and transformer.gtp_remat_num_sequence_shards > 1:
             if self.checkpoint.ckpt_format != "torch_dist":
                 raise ValueError("GTP sequence sharding requires torch_dist checkpoints")
-            if self.dist.use_torch_fsdp2 or self.dist.use_megatron_fsdp:
+            if self.dist.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
@@ -302,12 +374,47 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.rl.validate_run(
             cuda_graph_impl=cuda_graph_impl,
             micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=self.train.global_batch_size,
+            global_batch_size=global_batch_size,
             skip_train=self.validation.skip_train,
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+
+    def _finalize(self) -> None:
+        from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
+        from megatron.training import get_args
+
+        # Launch size remains a runtime input until the remaining args migration.
+        # Model topology comes only from its config, including the MIMO language grid.
+        args = get_args()
+        transformer = self.model.transformer
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if transformer.context_parallel_size % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        layout = GTPParallelLayout(
+            world_size=getattr(args, "mimo_llm_world_size", args.world_size),
+            tp=transformer.tensor_model_parallel_size,
+            pp=transformer.pipeline_model_parallel_size,
+            cp=transformer.context_parallel_size // sequence_shards,
+            weight_size=transformer.gtp_weight_remat_size,
+            num_sequence_shards=sequence_shards,
+        )
+        batch_sizes = self._resolve_batch_sizes(layout.batch_parallel_size)
+        self._validate_rl_config(batch_sizes[0])
+        optimizer = self.finalize_optimizer_config(self.optimizer)
+        (
+            self.train.global_batch_size,
+            self.validation.eval_global_batch_size,
+            self.validation.eval_micro_batch_size,
+        ) = batch_sizes
+        self.optimizer = optimizer
+        # Runtime consumers still read these derived facts from args during migration.
+        args.data_parallel_size = layout.dp
+        args.batch_parallel_size = layout.batch_parallel_size
+        super()._finalize()
+        if self.rl.perform_rl_step:
+            self.rl.finalize_ddp_config(self.ddp)
 
 
 @dataclass(kw_only=True)

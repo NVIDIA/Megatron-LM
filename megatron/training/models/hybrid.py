@@ -71,7 +71,7 @@ class HybridModelConfig(ModelConfig):
     should_pad_vocab: bool = False
 
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
-    """Transformer Engine user-buffer overrides, as a YAML path or a dictionary."""
+    """User-buffer settings, or their YAML path, when TP communication overlap is enabled."""
 
     @property
     def mamba_stack_spec(self):

@@ -18,7 +18,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
-from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
+from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
@@ -165,31 +165,39 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct training runtime services."""
+    """Register caller-provided args/config and construct their runtime services."""
+
+    from megatron.training.config import PretrainConfigContainer
 
     assert args is not None
     assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    training = isinstance(cfg_container, PretrainConfigContainer)
+    cfg_container.validate()
     set_run_config(cfg_container)
     set_args(args)
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
+    if training:
+        cfg_container.finalize()
+    initialize_runtime_services(
+        args,
+        build_tokenizer=build_tokenizer,
+        training=training,
+    )
+    if not training:
+        # Legacy checkpoint converters preserve progress without training services.
+        _set_train_state()
 
 
 def initialize_runtime_services(
-    args: Namespace, *, build_tokenizer: bool = True, training: bool = False,
-    training_world_size: int | None = None,
+    args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
-    """Initialize shared services, plus training-only services when requested.
+    """Build services from finalized config; normally called by initialize_megatron."""
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 
-    ``training_world_size`` is the language-model world for heterogeneous jobs;
-    ordinary training uses the launch world size.
-    """
-    if training:
-        _set_training_parallel_sizes(args, world_size=training_world_size)
+    cfg = get_run_config()
     if build_tokenizer:
         if training:
-            cfg = get_run_config()
             _build_tokenizer(
                 args,
                 tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
@@ -197,59 +205,37 @@ def initialize_runtime_services(
             )
         else:
             _build_tokenizer(args)
-            from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-
-            resolve_tokenizer_vocab_size(get_run_config(), getattr(args, 'padded_vocab_size', None))
+    resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
     if args.enable_experimental:
         set_experimental_flag(True)
 
-    if args.disable_jit_fuser:
+    if cfg.dist.disable_jit_fuser:
         disable_jit_fuser()
 
     if training:
         initialize_training_runtime_services(args)
 
 
-def _set_training_parallel_sizes(args: Namespace, *, world_size: int | None) -> None:
-    """Resolve runtime batch topology before telemetry and microbatch initialization."""
-    cfg = get_run_config()
-    model_config = cfg.model.transformer
-    sequence_shards = model_config.gtp_remat_num_sequence_shards
-    if model_config.context_parallel_size % sequence_shards:
-        raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
-    layout = GTPParallelLayout(
-        world_size=args.world_size if world_size is None else world_size,
-        tp=model_config.tensor_model_parallel_size,
-        pp=model_config.pipeline_model_parallel_size,
-        cp=model_config.context_parallel_size // sequence_shards,
-        weight_size=model_config.gtp_weight_remat_size,
-        num_sequence_shards=sequence_shards,
-    )
-    # These are derived runtime facts, not model configuration. Their consumers
-    # remain on args until runtime-state migration; derive them from the config owner.
-    args.data_parallel_size = layout.dp
-    args.batch_parallel_size = layout.batch_parallel_size
-
-
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
-    if args.step_batch_size_schedule is not None:
+    cfg = get_run_config()
+    if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
         from megatron.training.utils import print_rank_0
-        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+        print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
         rank=args.rank,
-        global_batch_size=args.global_batch_size,
-        micro_batch_size=args.micro_batch_size,
+        global_batch_size=cfg.train.global_batch_size,
+        micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
-        data_parallel_size=args.batch_parallel_size,
-        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-        step_batch_size_schedule=args.step_batch_size_schedule,
+        data_parallel_size=get_batch_parallel_size(args),
+        decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+        step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
     _set_tensorboard_writer(args)
@@ -259,10 +245,10 @@ def initialize_training_runtime_services(args: Namespace) -> None:
     _set_energy_monitor(args)
     _set_train_state()
 
-    if args.exit_signal_handler:
-        _set_signal_handler(args.exit_signal)
+    if cfg.train.exit_signal_handler:
+        _set_signal_handler(cfg.train.exit_signal)
 
-    if args.exit_signal_handler_for_training:
+    if cfg.train.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
 
@@ -386,7 +372,9 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
-        wandb_config = vars(args)
+        # Private attributes are runtime state rather than configuration and can be large; keep
+        # them out of the wandb config. Copy so the kitchen contents added below stay off args.
+        wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
         if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.
@@ -475,7 +463,7 @@ def _detect_gpu_identity(local_rank):
 
     Uses ``local_rank`` directly (not ``torch.cuda.current_device()``) because
     this runs from ``set_global_variables`` during arg parsing, before
-    ``torch.cuda.set_device(args.local_rank)`` happens in
+    ``torch.cuda.set_device(cfg.dist.local_rank)`` happens in
     ``_initialize_distributed`` -- ``current_device()`` would still read back
     the default (always 0) at this point. ``local_rank`` is resolved against
     ``CUDA_VISIBLE_DEVICES`` the same way ``set_device`` will later resolve it,
@@ -533,9 +521,9 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     """
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
-    resource_attrs = {}
+    cfg = get_run_config()
+    resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.local_rank', 'local_rank'),
         ('dl.data_parallel.size', 'data_parallel_size'),
         ('dl.sequence_length', 'seq_length'),
         ('megatron.ckpt_format', 'ckpt_format'),
@@ -553,7 +541,6 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
 
     # Preserve inference's CLI boundary; training's existing model tags use its config owner.
     if include_training:
-        cfg = get_run_config()
         model_config = cfg.model.transformer
     else:
         model_config = args
@@ -576,7 +563,7 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     else:
         resource_attrs['megatron.precision'] = 'fp32'
 
-    resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
+    resource_attrs.update(_detect_gpu_identity(cfg.dist.local_rank))
 
     # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
     # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's

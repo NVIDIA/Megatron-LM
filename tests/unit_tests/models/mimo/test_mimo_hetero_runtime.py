@@ -217,10 +217,7 @@ def _eight_gpu_topology():
 
 def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     """The non-colocated builder seeds the one active role and sets the model contract."""
-    from examples.mimo.training.builder import (
-        _LANGUAGE_SEED_OFFSET,
-        MimoModelBuilder,
-    )
+    from examples.mimo.training.builder import _LANGUAGE_SEED_OFFSET, MimoModelBuilder
 
     args = _args(init_model_with_meta_device=True)
     groups = mocker.Mock()
@@ -270,10 +267,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
 
 def test_builder_encoder_role_sets_encoder_contract(mocker):
     """On an encoder-only rank the builder seeds/labels with the encoder role."""
-    from examples.mimo.training.builder import (
-        _ENCODER_SEED_OFFSET,
-        MimoModelBuilder,
-    )
+    from examples.mimo.training.builder import _ENCODER_SEED_OFFSET, MimoModelBuilder
 
     args = _args(init_model_with_meta_device=False)
     encoder_pg = mocker.Mock()

@@ -48,6 +48,9 @@ class TestDataLoaderResume:
             transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
             seq_length=16,
         )
+
+        run_config.train.micro_batch_size = 1
+        run_config.train.global_batch_size = Utils.world_size
         monkeypatch.setattr(
             data_samplers,
             'get_args',
@@ -98,6 +101,8 @@ class TestDataLoaderResume:
         self, monkeypatch, run_config, hybrid_cp, scheduler
     ):
         Utils.initialize_model_parallel(1, 1)
+        run_config.train.micro_batch_size = 1
+        run_config.train.global_batch_size = 2 * Utils.world_size
         run_config.model = ModelProviderConfig(
             transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
             seq_length=16,

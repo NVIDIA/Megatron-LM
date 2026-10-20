@@ -46,7 +46,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     calls = {}
     for name in (
         "set_run_config",
-        "initialize_runtime_services",
         "initialize_megatron",
         "load_checkpoint",
         "generate_and_write_samples_conditional",
@@ -59,7 +58,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     script.main()
 
     calls["set_run_config"].assert_called_once_with(cfg)
-    calls["initialize_runtime_services"].assert_called_once_with(args)
     calls["initialize_megatron"].assert_called_once_with()
     if load_checkpoint:
         calls["load_checkpoint"].assert_called_once_with([model], None, None)
@@ -76,22 +74,26 @@ def test_resume_updates_microbatches_before_setup_validation(
     monkeypatch, restored_samples, run_config
 ):
     from megatron.training import training
+    from megatron.training.state import TrainState
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.skip_train = True  # Evaluation-only setup must also restore the calculator.
+    run_config.validation.skip_train = True
+    run_config.train.micro_batch_size = 1
     args.load = "checkpoint"
     args.data_parallel_size = 1
     args.micro_batch_size = 1
-    args.consumed_train_samples = 0
     run_config.model = ModelProviderConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
         seq_length=16,
         vocab_size=128,
     )
+    train_state = TrainState()
     model = [SimpleNamespace()]
     monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_train_state", lambda: train_state)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
     monkeypatch.setattr(training, "has_nvidia_modelopt", False)
@@ -102,7 +104,7 @@ def test_resume_updates_microbatches_before_setup_validation(
 
     def restore(*unused_args, **unused_kwargs):
         assert unused_kwargs["restore_training_state"] is True
-        args.consumed_train_samples = restored_samples
+        train_state.consumed_train_samples = restored_samples
         events.append("load")
         return 7, 0
 
@@ -136,9 +138,8 @@ def test_runtime_services_initialize_training_only_when_requested(
         seq_length=16,
         vocab_size=128,
     )
-    args = Namespace(
-        enable_experimental=enable_runtime_flags, disable_jit_fuser=enable_runtime_flags
-    )
+    args = Namespace(enable_experimental=enable_runtime_flags)
+    run_config.dist.disable_jit_fuser = enable_runtime_flags
     experimental = Mock()
     jit = Mock()
     monkeypatch.setattr(global_vars, "set_experimental_flag", experimental)
@@ -149,8 +150,6 @@ def test_runtime_services_initialize_training_only_when_requested(
         monkeypatch.setattr(global_vars, name, services[name])
     training_services = Mock()
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)
-    parallel_sizes = Mock()
-    monkeypatch.setattr(global_vars, "_set_training_parallel_sizes", parallel_sizes)
     for name in (
         "init_num_microbatches_calculator",
         "_set_tensorboard_writer",
@@ -174,23 +173,18 @@ def test_runtime_services_initialize_training_only_when_requested(
     )
     if training_kwargs.get("training", False):
         training_services.assert_called_once_with(args)
-        parallel_sizes.assert_called_once_with(args, world_size=None)
     else:
         training_services.assert_not_called()
-        parallel_sizes.assert_not_called()
     if enable_runtime_flags:
         experimental.assert_called_once_with(True)
         jit.assert_called_once_with()
     else:
         experimental.assert_not_called()
         jit.assert_not_called()
-    assert vars(args) == {
-        "enable_experimental": enable_runtime_flags,
-        "disable_jit_fuser": enable_runtime_flags,
-    }
+    assert vars(args) == {"enable_experimental": enable_runtime_flags}
 
 
-def test_inference_telemetry_does_not_read_training_fields(monkeypatch):
+def test_inference_telemetry_does_not_read_training_fields(monkeypatch, run_config):
     class InferenceArgs(Namespace):
         def __getattribute__(self, name):
             if name in {"micro_batch_size", "global_batch_size", "train_iters"}:
@@ -227,7 +221,10 @@ def test_inference_distributed_initialization_without_training_fields(
         "result_rejected_tracker_filename",
     ):
         delattr(args, name)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "initialize_runtime_services", Mock())
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
@@ -254,7 +251,7 @@ def test_inference_distributed_initialization_without_training_fields(
 def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch, run_config):
     args = Namespace(tp_comm_overlap=True)
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)
@@ -263,32 +260,56 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
     distributed.assert_not_called()
 
 
-def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_config):
+@pytest.mark.parametrize("native_model", [False, True])
+@pytest.mark.parametrize("decoder_overlap", [False, True])
+def test_distributed_training_services_require_explicit_opt_in(
+    monkeypatch, run_config, native_model, decoder_overlap
+):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.rank = 0
     args.async_save = True
+    args.world_size = 1
     args.use_persistent_ckpt_worker = True
-    args.tp_comm_overlap = True
-    run_config.model = ModelProviderConfig(
-        transformer=TransformerConfig(
-            num_layers=2,
-            hidden_size=32,
-            num_attention_heads=4,
-            tp_comm_overlap=True,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-        ),
-        seq_length=16,
-        vocab_size=128,
-    )
+    args.tp_comm_overlap = not native_model
+    args.num_layers, args.hidden_size, args.num_attention_heads = 4, 128, 8
+    args.params_dtype = torch.float32
+    args.seq_length, args.decoder_seq_length = 64, 96
+    args.decoder_tp_comm_overlap = decoder_overlap
+    args.micro_batch_size = 7  # Deliberately stale; cfg.train owns the input.
+    args.batch_parallel_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    run_config.train.micro_batch_size = 3
+    if native_model:
+        run_config.model = GPTModelConfig(
+            transformer=TransformerConfig(
+                num_layers=4, hidden_size=128, num_attention_heads=8, tp_comm_overlap=True
+            ),
+            seq_length=1024,  # Position capacity must not be used for buffer sizing.
+            tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
+        )
+    else:
+        from megatron.training.argument_utils import model_provider_config_from_args
+
+        run_config.model = model_provider_config_from_args(args)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
     events = []
+    finalize = run_config.finalize
+
+    def finalize_config():
+        finalize()
+        events.append("finalize_config")
+
+    monkeypatch.setattr(run_config, "finalize", finalize_config)
     for name in (
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
@@ -306,6 +327,8 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_
     initialize.initialize_megatron(allow_no_cuda=True, training=True)
 
     assert events == [
+        "finalize_config",
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
@@ -314,6 +337,15 @@ def test_distributed_training_services_require_explicit_opt_in(monkeypatch, run_
         "_compile_dependencies",
         "_initialize_tp_communicators",
     ]
+    tp_call = initialize._initialize_tp_communicators.call_args
+    assert isinstance(tp_call.args[0], TransformerConfig)
+    assert tp_call.kwargs["sequence_length"] == (96 if decoder_overlap else 64)
+    assert tp_call.kwargs["micro_batch_size"] == 3
+    if native_model:
+        assert tp_call.args[0] is run_config.model.transformer
+        assert tp_call.kwargs["tp_comm_overlap_cfg"] == run_config.model.tp_comm_overlap_cfg
+    else:
+        assert tp_call.kwargs["tp_comm_overlap_cfg"] == args.tp_comm_overlap_cfg
 
 
 @pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])

@@ -16,6 +16,7 @@ bias_swiglu/bias_gelu/bias_geglu kernel calls may be skipped.
 
 from unittest import mock
 
+import pytest
 import torch
 
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -160,11 +161,12 @@ def test_dropout_warmup_and_geglu_cat(mock_get_args, mock_dropout, mock_rand, _c
     the fused dropout warmup runs even when bias_dropout_fusion is False so
     RNG consumption stays identical to the historical behavior."""
     config = _config(gated_linear_unit=True, bias_activation_fusion=True, bias_dropout_fusion=False)
-    _warmup_jit_function(config, sequence_length=8, micro_batch_size=1)
+    _warmup_jit_function(config, sequence_length=8, micro_batch_size=2)
     assert mock_geglu.call_count == 10
     # bias_geglu receives 2x-ffn tensors built via torch.cat
     bias_arg, input_arg = mock_geglu.call_args[0]
     assert bias_arg.shape[-1] == 128  # 2 * (ffn_hidden_size // tp) = 2 * 64
     assert input_arg.shape[-1] == 128
+    assert input_arg.shape[1] == 2  # The caller supplies cfg.train's resolved batch size.
     assert mock_dropout.call_count == 10  # unconditional for RNG parity
     assert mock_rand.call_count == 5

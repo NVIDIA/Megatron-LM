@@ -787,13 +787,19 @@ def test_get_batch_on_this_cp_rank_contiguous_keeps_attention_mask_zigzag(cp_siz
 def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with_contiguous_layout):
     tokens = torch.arange(1, 17).view(1, 16)
     loss_mask = torch.tensor([[1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]])
+    decoder_input = torch.stack((tokens, tokens + 20), dim=-1)
+    mtp_input_mask = tokens.remainder(2).to(dtype=torch.bool)
+    cu_seqlens = torch.tensor([[0, 3, 13]], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([[0, 4, 16]], dtype=torch.int32)
     batch = {
         "tokens": tokens,
         "labels": tokens + 100,
         "loss_mask": loss_mask,
         "position_ids": tokens - 1,
-        "cu_seqlens": torch.tensor([[0, 3, 13]], dtype=torch.int32),
-        "cu_seqlens_padded": torch.tensor([[0, 4, 16]], dtype=torch.int32),
+        "decoder_input": decoder_input,
+        "mtp_input_mask": mtp_input_mask,
+        "cu_seqlens": cu_seqlens,
+        "cu_seqlens_padded": cu_seqlens_padded,
         "max_seqlen": torch.tensor([12], dtype=torch.int32),
     }
     parallel_context = SimpleNamespace(
@@ -840,8 +846,16 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     expected_loss_mask = loss_mask.index_select(1, gathered_indices).masked_fill(
         padding.view(1, -1), 0
     )
+    expected_decoder_input = decoder_input.index_select(1, gathered_indices).masked_fill(
+        padding.view(1, -1, 1), 0
+    )
+    expected_mtp_input_mask = mtp_input_mask.index_select(1, gathered_indices).masked_fill(
+        padding.view(1, -1), 0
+    )
     torch.testing.assert_close(result["tokens"], expected_tokens)
     torch.testing.assert_close(result["loss_mask"], expected_loss_mask)
+    torch.testing.assert_close(result["decoder_input"], expected_decoder_input)
+    torch.testing.assert_close(result["mtp_input_mask"], expected_mtp_input_mask)
     torch.testing.assert_close(
         result["cu_seqlens_padded"], torch.tensor([[0, 8, 32]], dtype=torch.int32)
     )
@@ -855,9 +869,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     torch.testing.assert_close(
         zigzag_packed_seq_params.cu_seqlens_q_padded, result["cu_seqlens_padded"].squeeze(0)
     )
-    torch.testing.assert_close(
-        zigzag_packed_seq_params.cu_seqlens_q, batch["cu_seqlens"].squeeze(0)
-    )
+    torch.testing.assert_close(zigzag_packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
     assert zigzag_packed_seq_params.max_seqlen_q == 24
     assert zigzag_packed_seq_params.pad_between_seqs
     assert zigzag_packed_seq_params.total_tokens == 32
@@ -887,6 +899,27 @@ def test_metadata_only_cp_batch_skips_sharding():
     shard_batch.assert_not_called()
     assert cp_batch.get_batch()["tokens"] is None
     assert cp_batch.get_packed_seq_params("zigzag") is not None
+
+
+def test_size_one_cp_batch_without_group_skips_sharding():
+    tokens = torch.arange(8).view(1, 8)
+    batch = {
+        "tokens": tokens,
+        "cu_seqlens": torch.tensor([[0, 3, 8]], dtype=torch.int32),
+        "cu_seqlens_padded": None,
+        "max_seqlen": torch.tensor([5], dtype=torch.int32),
+    }
+
+    with patch("megatron.core.utils.get_batch_on_this_cp_rank") as shard_batch:
+        cp_batch = get_batches_on_this_cp_rank(
+            batch, boundary_layout="zigzag", is_hybrid_cp=False, cp_group=None, tokens_per_sample=8
+        )
+
+    shard_batch.assert_not_called()
+    assert cp_batch.get_batch()["tokens"] is tokens
+    packed_seq_params = cp_batch.get_packed_seq_params()
+    assert packed_seq_params is not None
+    torch.testing.assert_close(packed_seq_params.cu_seqlens_q, batch["cu_seqlens"].squeeze(0))
 
 
 def test_get_batch_builds_required_cp_layouts():
