@@ -341,6 +341,40 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         return global_batch_size, eval_global_batch_size, eval_micro_batch_size
 
+    def _resolve_scheduler_step_fields(self):
+        """Calculate user-unspecified scheduler configuration arguments from configurable fields."""
+
+        assert (self.train.train_iters is not None or self.train.train_samples is not None), 'either train-iters or train-samples should be provided.'
+        # Iteration-based training.
+        if self.train.train_iters:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+        # Sample-based training.
+        elif self.train.train_samples:
+            # We need to set training iters for later use. Technically
+            # we need to adjust the training samples too (due to last
+            # batch being incomplete) but we leave it as is for now.
+            update_train_iters(self.train)
+            if self.scheduler.lr_decay_samples is None:
+                self.scheduler.lr_decay_samples = self.train.train_samples
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
+            self.scheduler.wd_incr_steps = self.train.train_samples
+            self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
+
+
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
         self.rl.validate_ddp_config(self.ddp)
@@ -383,8 +417,33 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         super()._finalize()
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
+        self._resolve_scheduler_step_fields()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+
+def update_train_iters(train: TrainingConfig) -> None:
+    """Resolve the sample-based training horizon on the supplied training config."""
+    # For iteration-based training, we don't need to do anything
+    if train.train_iters:
+        return
+
+    if train.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
+        iterations = 0
+        consumed_samples = 0
+        while consumed_samples < train.train_samples:
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
+            iterations += 1
+        # Reset
+        update_num_microbatches(0, consistency_check=False)
+        train.train_iters = iterations
+    else:
+        # Constant batch size with sample-based training.
+        train.train_iters = train.train_samples // train.global_batch_size
+
+    print_rank_0(f'setting training iterations to {train.train_iters}')
 
 
 @dataclass(kw_only=True)
