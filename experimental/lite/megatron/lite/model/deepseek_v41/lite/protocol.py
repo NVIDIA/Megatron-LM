@@ -189,9 +189,7 @@ def build_model(model_cfg, *, impl_cfg, _model_class=None):
 
         reader = RowSliceReader(impl_cfg.hf_path, device=impl_cfg.device)
     try:
-        chunks = [
-            constructor(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)
-        ]
+        chunks = [constructor(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)]
     except BaseException:
         if reader is not None:
             reader.close()

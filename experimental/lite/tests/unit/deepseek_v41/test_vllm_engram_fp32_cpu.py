@@ -29,9 +29,7 @@ def test_post_backward_promotes_query_key_before_making_leaves(rows, master_dtyp
     for got in actual[2:4]:
         assert got.dtype == torch.float32
         if rows:
-            assert not torch.equal(
-                got, got.bfloat16().float()
-            ), 'BF16-leaf negative control'
+            assert not torch.equal(got, got.bfloat16().float()), 'BF16-leaf negative control'
 
 
 def test_fp4_negative_zero_survives_decode_and_requantization():
@@ -60,9 +58,7 @@ def test_modular_forward_consults_readiness_between_updates(monkeypatch, publish
         model.child.weight.data.copy_(master.detach())
 
     setattr(model.child.weight, PARAM_READY_CALLBACK_ATTR, ready)
-    monkeypatch.setattr(
-        module.NativeModel, 'forward', lambda self, x, **kw: x @ self.child.weight
-    )
+    monkeypatch.setattr(module.NativeModel, 'forward', lambda self, x, **kw: x @ self.child.weight)
     if not publish:
         monkeypatch.setattr(module, 'ensure_params_ready', lambda params: None)
     for _ in range(2):
