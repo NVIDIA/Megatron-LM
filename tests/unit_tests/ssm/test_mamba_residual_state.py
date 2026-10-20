@@ -173,9 +173,11 @@ def test_prepared_result_is_immutable_and_does_not_impose_state_layout():
             result.write_state = None
 
 
-def test_shared_schedule_keeps_state_opaque_and_call_local(monkeypatch):
+@pytest.mark.parametrize("two_stage", [False, True], ids=["normal", "two_stage"])
+def test_shared_schedule_keeps_state_opaque_and_call_local(monkeypatch, two_stage):
     layer = _layer(False, False)
     contexts = []
+    updates = []
 
     def prepare(value, residual_stream_recompute_context=None):
         # Neither a tensor nor a residual-first tuple: only the matching update knows it.
@@ -186,13 +188,28 @@ def test_shared_schedule_keeps_state_opaque_and_call_local(monkeypatch):
     def update(output, write_state, recompute_context=None):
         assert recompute_context is None
         assert any(write_state is context for context in contexts)
+        updates.append(write_state)
         return output[0] + write_state.residual
 
     monkeypatch.setattr(layer, "_prepare_mixer_state", prepare)
     monkeypatch.setattr(layer, "_apply_mixer_update", update)
     first, second = (torch.randn(2, 1, 8, dtype=torch.bfloat16) for _ in range(2))
-    layer.forward(first, residual_stream_recompute_context=object())
-    layer.forward(second, residual_stream_recompute_context=object())
+    if two_stage:
+        first_stage = layer.forward_pre_attn_and_core_attn(
+            first, residual_stream_recompute_context=object()
+        )
+        second_stage = layer.forward_pre_attn_and_core_attn(
+            second, residual_stream_recompute_context=object()
+        )
+        # Finish in reverse order so one invocation cannot overwrite the other's state.
+        layer.forward_post_core_attn(*second_stage)
+        layer.forward_post_core_attn(*first_stage)
+    else:
+        layer.forward(first, residual_stream_recompute_context=object())
+        layer.forward(second, residual_stream_recompute_context=object())
+    expected_updates = contexts[::-1] if two_stage else contexts
+    assert len(updates) == len(expected_updates) == 2
+    assert all(actual is expected for actual, expected in zip(updates, expected_updates))
     assert contexts[0] is not contexts[1]
     assert contexts[0].residual is first
     assert contexts[1].residual is second

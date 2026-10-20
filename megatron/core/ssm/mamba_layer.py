@@ -241,11 +241,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         inference_context: Optional[BaseInferenceContext] = None,
         padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Apply Mamba's output projection and ordinary bias-dropout-add update."""
+        """Apply Mamba's output projection and the layer's residual-update hook."""
 
         del inference_context, padding_mask
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
-        return self._apply_mixer_bda(mixer_out_with_bias, residual)
+        return self._apply_mixer_update(mixer_out_with_bias, residual)
 
     def _get_residual_connection(self):
         """Return an optional architecture-owned connection around the Mamba mixer."""
