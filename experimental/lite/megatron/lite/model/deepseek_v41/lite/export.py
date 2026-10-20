@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """HF/BF16 and native release export, shared by training and deployment protocols.
 
-Native targets use block-FP8 32x32 UE8M0 and MXFP4 experts. Frozen tables
+Native targets use block-FP8 32x32 UE8M0 and MXFP4 experts. The paired vLLM
+target keeps official BF16 wo_a unquantized, matching the training forward. Frozen tables
 always retain original row-sharded FP8/E8M0 bytes. With include_frozen=True,
 export streams TensorRowChunk objects for these tables; save_hf_weights drains
 them directly to safetensors. Online sync can set include_frozen=False.
@@ -172,7 +173,7 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
                     ).contiguous(),
                 )
             ]
-            if target in ("hf", "bf16")
+            if target in ("hf", "bf16") or (target == "vllm" and key.endswith(".attn.wo_a.weight"))
             else to_release(key, tensor)
         )
     if scales:

@@ -42,7 +42,7 @@ from .config import MegatronLiteEngineConfig
 
 _patch_bucketed_weight_sender()
 
-BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
+(BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches) = (
     load_verl_engine_api()
 )
 
@@ -401,7 +401,7 @@ class MegatronLiteEngine(BaseEngine):
             # Offline HF save defaults to BF16 + complete frozen row shards.
             # Live vLLM reload instead consumes native release codes/scales;
             # frozen Engram is already loaded from that release on receivers.
-            target = export_kwargs.setdefault("target", "release")
+            target = export_kwargs.setdefault("target", "vllm")
             if target not in ("release", "vllm"):
                 raise ValueError("DS4.1 rollout resync requires native release weights")
             export_kwargs["include_frozen"] = False
@@ -842,7 +842,7 @@ class MegatronLiteEngine(BaseEngine):
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
-            loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
+            loss_mask=(None if loss_mask is None else loss_mask.values().contiguous().float()),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
             routed_experts=routed_experts,
             r3_replay_mask=(

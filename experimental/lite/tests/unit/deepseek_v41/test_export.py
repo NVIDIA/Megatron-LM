@@ -67,7 +67,7 @@ def _model(ps):
             _put(
                 model,
                 prefix + 'attn_mixes.' + name,
-                (3,) if name == 'bias' else ((24, 64) if name.endswith('weight') else (1,)),
+                ((3,) if name == 'bias' else ((24, 64) if name.endswith('weight') else (1,))),
                 torch.float32,
             )
         group = ps.dp_cp_group or SimpleNamespace(size=lambda: 1, rank=lambda: 0)
@@ -178,3 +178,27 @@ def test_row_fragments_are_bounded_and_preserve_order():
     parts = [p for _, p in iter_row_shards([("rows", value, 0, 5)], max_bytes=64)]
     assert [p.start for p in parts] == [0, 2, 4] and all(p.tensor.numel() <= 64 for p in parts)
     assert torch.equal(torch.cat([p.tensor for p in parts]), value)
+
+
+def test_live_bf16_wo_a_keeps_updates_which_release_fp8_would_round(monkeypatch):
+    from megatron.lite.model.deepseek_v41.lite.export import export_hf_weights
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    key = 'layers.0.attn.wo_a.weight'
+    weight = torch.ones(32, 32, dtype=torch.bfloat16)
+    weight[0, 0] += 1 / 128  # One actual BF16 update, below an FP8 rounding step.
+
+    def native(*args, **kwargs):
+        yield key, weight
+
+    monkeypatch.setattr(hf_weights, 'export_hf_weights', native)
+    online = dict(export_hf_weights([], None, None, target='vllm', include_frozen=False))
+    assert set(online) == {key}
+    assert online[key].dtype == torch.bfloat16
+    assert torch.equal(_bits(online[key]), _bits(weight))
+    offline = dict(export_hf_weights([], None, None, target='release', include_frozen=False))
+    assert set(offline) == {key, 'layers.0.attn.wo_a.scale'}
+    decoded = _dequantize_block_scaled_tensor(
+        offline[key], offline['layers.0.attn.wo_a.scale'], weight.shape
+    ).bfloat16()
+    assert not torch.equal(_bits(decoded), _bits(weight)), 'FP8 roundtrip negative control'
