@@ -1364,7 +1364,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
             set_model_config_attribute(model, "flash_decode", False)
-            fp32_output = not (cfg.optimizer.fp16 or cfg.optimizer.bf16)
+            fp32_output = not (args.fp16 or args.bf16)
 
             # Keep the logits TP-shared and compute logprobs without gathering the full vocab.
             use_vp_logprobs = not is_batch_invariant_mode_enabled()
@@ -2551,7 +2551,7 @@ def prepare_data_for_update(
         toggle_cuda_graphs(lang_module, "none")
 
     model = model[0]
-    dtype = torch.bfloat16 if cfg.optimizer.bf16 else (torch.float16 if cfg.optimizer.fp16 else torch.float32)
+    dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):
@@ -2695,7 +2695,7 @@ def prepare_data_for_update(
                 dtype = torch.float32
             else:
                 dtype = (
-                    torch.bfloat16 if cfg.optimizer.bf16 else (torch.float16 if cfg.optimizer.fp16 else torch.float32)
+                    torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
                 )
 
             pg_collection = get_attr_wrapped_model(model, "pg_collection")

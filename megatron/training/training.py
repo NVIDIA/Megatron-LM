@@ -2626,7 +2626,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model_module.cuda(torch.cuda.current_device())
 
     # Fp16 conversion.
-    if cfg.optimizer.fp16 or cfg.optimizer.bf16:
+    if args.fp16 or args.bf16:
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
 
@@ -3059,7 +3059,7 @@ def setup_model_and_optimizer(
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
-        if (cfg.optimizer.fp16 or cfg.optimizer.bf16) and optimizer is not None:
+        if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {args.save}')
 
@@ -3151,7 +3151,7 @@ def setup_model_and_optimizer(
     ):
         print_rank_0("Initializing ICT from pretrained BERT model")
         unwrapped_model[0].init_state_dict_from_bert()
-        if cfg.optimizer.fp16:
+        if args.fp16:
             optimizer.reload_model_params()
 
     # Convert checkpoint format.

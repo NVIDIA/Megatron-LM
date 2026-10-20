@@ -65,7 +65,7 @@ from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import get_run_config set_run_config
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -498,7 +498,6 @@ if __name__ == "__main__":
 
     check_arguments()
 
-    cfg = get_run_config()
     args = get_args()
 
     tokenizer = get_hf_tokenizer()
@@ -516,7 +515,7 @@ if __name__ == "__main__":
     if args.pretrained_model_path is not None:
         from modelopt.torch.export import import_mcore_gpt_from_hf
 
-        import_dtype = torch.float16 if cfg.optimizer.fp16 else torch.bfloat16
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
 

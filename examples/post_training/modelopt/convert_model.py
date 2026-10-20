@@ -25,7 +25,7 @@ from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
@@ -116,7 +116,6 @@ if __name__ == "__main__":
     initialize_megatron(training=False)
     check_arguments()
 
-    cfg = get_run_config()
     args = get_args()
 
     # Meta device initialization for ParallelLinear only works if using cpu initialization.
@@ -149,7 +148,7 @@ if __name__ == "__main__":
             FutureWarning,
             stacklevel=2,
         )
-        import_dtype = torch.float16 if cfg.optimizer.fp16 else torch.bfloat16
+        import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
         print_rank_0(
