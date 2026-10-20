@@ -1,13 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
 import torch
 
-from ..utils import is_te_min_version, warn_rank_0
+from ..utils import is_te_min_version
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -551,7 +554,7 @@ class OptimizerConfig:
 
         if self.optimizer not in ('sgd', 'adam'):
             if self.optimizer == 'dist_muon':
-                warn_rank_0(
+                logger.warning(
                     "optimizer='dist_muon' is deprecated. "
                     "Use --optimizer muon --use-distributed-optimizer instead."
                 )
