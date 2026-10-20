@@ -455,18 +455,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     rotary_seq_len, packed_seq=packed_seq, cp_group=cp_group
                 )
-                if (
-                    in_inference_mode
-                    and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
-                    and torch.cuda.is_current_stream_capturing()
-                ):
-                    # Block graphs read RoPE as an internal constant, not a graph
-                    # input. Retain it when the shared LRU cache is cleared or
-                    # evicted, including across colocated RL sleep/wake cycles.
-                    # Only captured shapes are retained; eager prefill lengths
-                    # must not make this model-owned cache grow without bound.
-                    cache_key = ('rope', rotary_seq_len, packed_seq, cp_group)
-                    rotary_pos_emb = self.rotary_pos_emb_cache.setdefault(cache_key, rotary_pos_emb)
         elif self.position_embedding_type == 'yarn':
             if not InferenceMode.is_active() or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -496,6 +484,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
                     "MultimodalRotaryEmbedding yet."
                 )
+
+        if (
+            rotary_pos_emb is not None
+            and self.position_embedding_type in ("rope", "yarn")
+            and in_inference_mode
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # Explicitly cache the RoPE embeddings by model to avoid LRU cache eviction.
+            # Keep the original constant alive when another graph captures the same shape.
+            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            cp_group = packed_seq_params.cp_group if packed_seq_params is not None else None
+            cache_key = (self.position_embedding_type, rotary_seq_len, packed_seq, cp_group)
+            rotary_pos_emb = self.rotary_pos_emb_cache.setdefault(cache_key, rotary_pos_emb)
 
         if (
             in_inference_mode

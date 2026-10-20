@@ -388,6 +388,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
+        # Keep captured RoPE/YaRN constants alive independently of their shared LRU caches.
+        self.rotary_pos_emb_cache = {}
+
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -671,6 +674,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )
+
+        if (
+            rotary_pos_emb is not None
+            and in_inference_mode
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # Block graphs read this tensor as an internal constant, not a graph input.
+            # Retain captured shapes only, and never replace a constant an older graph reads.
+            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            cache_key = (
+                self.position_embedding_type,
+                rotary_seq_len,
+                packed_seq,
+                self.rotary_pos_emb.cp_group,
+            )
+            rotary_pos_emb = self.rotary_pos_emb_cache.setdefault(cache_key, rotary_pos_emb)
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection
