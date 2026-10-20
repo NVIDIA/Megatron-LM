@@ -382,8 +382,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/fused_a2a.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="external-lib",
-        notes="DeepEP flex dispatcher cell (skipped without deep_ep / >=2 GPUs). HybridEP and NCCL-EP backends are not yet "
-        "replayed bit-exactly here.",
+        notes="DeepEP and NCCL-EP flex dispatcher cells (skipped without compatible dependencies / "
+        ">=2 GPUs). HybridEP is not yet replayed bit-exactly here.",
     ),
     KernelEntry(
         name="moe_shared_experts",
