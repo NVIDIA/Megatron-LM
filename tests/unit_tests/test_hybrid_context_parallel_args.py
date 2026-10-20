@@ -79,3 +79,13 @@ def test_hybrid_builder_rejects_dynamic_context_parallel(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     with pytest.raises(NotImplementedError, match="not yet supported for HybridModel"):
         hybrid_builder(args, pre_process=True, post_process=True)
+
+
+def test_deprecated_hybrid_context_parallel_flag_warns_and_maps(monkeypatch):
+    args = _hybrid_cp_args(
+        monkeypatch, rank=0, dynamic_context_parallel=False, hybrid_context_parallel=True
+    )
+    with pytest.warns(UserWarning, match="--hybrid-context-parallel is deprecated"):
+        validate_args(args)
+    assert args.dynamic_context_parallel
+    assert not args.hybrid_context_parallel

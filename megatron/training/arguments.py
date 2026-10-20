@@ -8,7 +8,6 @@ import json
 import os
 import re
 import types
-import warnings
 from pathlib import Path
 
 import torch
@@ -1292,9 +1291,9 @@ def validate_args(args, defaults={}):
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.hybrid_context_parallel:
-        warnings.warn(
-            "--hybrid-context-parallel is deprecated; use --dynamic-context-parallel.",
-            DeprecationWarning,
+        warn_rank_0(
+            "--hybrid-context-parallel is deprecated. Use --dynamic-context-parallel instead.",
+            args.rank,
         )
         if args.dynamic_context_parallel:
             raise ValueError(
