@@ -21,25 +21,6 @@ from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_mode
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
 
 
-def model_forward_kwargs(model: torch.nn.Module) -> Dict[str, Any]:
-    """Keyword arguments every inference call of `model` must carry.
-
-    Specifically, this is currently only used to deal with `Float16Module`.
-    Right now, `Float16Module` by default upcasts the outputs to fp32, for ZERO precision gain.
-    This upcast is solely to make the training code cleaner. There is no benefit.
-    So we make sure it is disabled in inference.
-    """
-    # Deferred to avoid a circular import.
-    from megatron.core.transformer.module import Float16Module
-
-    module = model
-    while module is not None:
-        if isinstance(module, Float16Module):
-            return {"fp32_output": False}
-        module = getattr(module, "module", None)
-    return {}
-
-
 class AbstractModelInferenceWrapper(abc.ABC):
     """Abstract inference wrapper
 
@@ -107,8 +88,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             self.model = prepare_model_for_fp8_inference(self.model)
 
         # TODO(ksanthanam): Add support for fp4
-
-        self._model_forward_kwargs = model_forward_kwargs(self.model)
 
     def prep_model_for_inference(self):
         """A utility function for preparing model for inference
@@ -256,7 +235,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             attention_mask,
             inference_context=self.inference_context,
             runtime_gather_output=True,  # Inference should always gather the logits
-            **self._model_forward_kwargs,
         )
 
     def _get_batch_size_and_seq_len(

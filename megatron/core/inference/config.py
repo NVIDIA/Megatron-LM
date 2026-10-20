@@ -659,6 +659,16 @@ class InferenceConfig:
     if returning log probs.
     """
 
+    logits_dtype: Optional[torch.dtype] = torch.float32
+    """
+    Dtype the LM head emits its logits in under an inference context (GPT and hybrid heads).
+    Sampling and log-probs compute in fp32, so fp32 (the default) spares the logits a round trip
+    through the compute dtype. A dtype other than the compute dtype needs Transformer Engine
+    general_gemm and is beyond the MXFP8 output projection; the head then keeps the compute dtype
+    and the controller warns. None keeps the head's own output dtype (`logit_dtype`, else
+    `params_dtype`).
+    """
+
     # =================================
     # Engine config
     # =================================

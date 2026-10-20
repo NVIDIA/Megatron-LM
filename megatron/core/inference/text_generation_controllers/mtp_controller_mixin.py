@@ -621,6 +621,7 @@ class MTPControllerMixin:
                         if context.using_cuda_graph_this_step()
                         else None
                     ),
+                    logits_dtype=self._logits_dtype,
                     **mtp_context_kwarg,
                 )
                 if mtp_kv_cache_on:
@@ -765,6 +766,7 @@ class MTPControllerMixin:
                             if not mtp_forward_eager
                             else None
                         ),
+                        logits_dtype=self._logits_dtype,
                         **mtp_context_kwarg,
                     )
                     if mtp_context_kwarg:
@@ -775,7 +777,7 @@ class MTPControllerMixin:
                 if self.model_is_pipeline_parallel:
                     broadcast_from_last_pipeline_stage(
                         [padded_count, self.vocab_size],
-                        dtype=dtype,
+                        dtype=self._logits_dtype,
                         tensor=mtp_logits_2d,
                         pp_group=self.pp_group,
                     )

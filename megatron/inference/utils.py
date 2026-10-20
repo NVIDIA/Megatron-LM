@@ -14,8 +14,6 @@ from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.extensions.transformer_engine import te_general_gemm
-from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.quantization.utils import (
@@ -111,27 +109,7 @@ def get_model_builder(
             raise ValueError('Model vocabulary must be resolved before model construction')
         model_config.vocab_size = tokenizer_config.padded_vocab_size
         model_config.should_pad_vocab = False
-    model_config.logit_dtype = default_inference_logit_dtype(model_config)
     return builder_cls(model_config)
-
-
-def default_inference_logit_dtype(model_config) -> Optional[torch.dtype]:
-    """The LM head's output dtype for a model built for inference."""
-    transformer_config = model_config.transformer
-    if model_config.logit_dtype is not None:
-        return model_config.logit_dtype
-    if is_mxfp8_output_proj_active(transformer_config):
-        return None
-    if transformer_config.params_dtype != torch.float32 and te_general_gemm is None:
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "Inference keeps the logits in the model's compute dtype: "
-            "an fp32 result from a half-precision LM head needs Transformer Engine general_gemm, "
-            "which is unavailable. Pass --output-logit-dtype to choose explicitly.",
-        )
-        return None
-    return torch.float32
 
 
 def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):

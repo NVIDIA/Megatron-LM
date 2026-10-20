@@ -128,7 +128,6 @@ def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = model
     wrapper.inference_context = None
-    wrapper._model_forward_kwargs = {}
 
     output = wrapper._forward_vision_encoder(
         torch.ones(1, 3, 2, 2, dtype=torch.float32),
@@ -352,7 +351,6 @@ def test_omni_raw_image_forward_calls_full_model():
     wrapper = object.__new__(NemotronOmniInferenceWrapper)
     wrapper.model = mock.Mock(return_value=(output, None))
     wrapper.inference_context = mock.sentinel.inference_context
-    wrapper._model_forward_kwargs = {}
 
     result = wrapper._forward(
         {
