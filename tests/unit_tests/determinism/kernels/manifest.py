@@ -164,7 +164,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/fusions/fused_cross_entropy.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
-        notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
+        notes="Rejected by --deterministic-mode (op catalog); TP1/TP2, bf16/fp32, strict "
+        "deterministic algorithms on/off and side-stream contention are recorded as "
+        "xfail(strict=False).",
     ),
     KernelEntry(
         name="te_fused_cross_entropy",
