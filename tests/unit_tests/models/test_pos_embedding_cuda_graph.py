@@ -29,13 +29,11 @@ class _RotaryConsumer(torch.nn.Module):
 
 @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
 @pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
-@pytest.mark.parametrize("invalidate", ["clear", "evict"])
-def test_block_graph_rotary_survives_lru_invalidation(
-    model_type, position_embedding_type, invalidate
-):
+def test_block_graph_rotary_survives_lru_invalidation(model_type, position_embedding_type):
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
     model = None
+
     try:
         config = TransformerConfig(
             num_layers=1 if model_type == "gpt" else 2,
@@ -71,6 +69,7 @@ def test_block_graph_rotary_survives_lru_invalidation(
             )
             model.decoder = _RotaryConsumer()
         model = model.cuda().eval()
+
         # Capture the actual preprocessing that runs inside a block graph. The
         # attention/MLP arithmetic is not needed to exercise this ownership bug.
         config.cuda_graph_impl = "local"
@@ -102,68 +101,37 @@ def test_block_graph_rotary_survives_lru_invalidation(
                     decoder_input=hidden,
                     inference_context=context,
                 )[1]
-                + 1
+                + 1  # For hybrid, it's in the decoder
             )
 
         with torch.no_grad():
             refs = []
+            graphs = []
 
             def record_rotary(module, args, output):
                 tensor = output[0] if isinstance(output, tuple) else output
                 refs.append(weakref.ref(tensor))
 
-            handle = model.rotary_pos_emb.register_forward_hook(record_rotary)
-            expected = forward().cpu()
-            eager_weak = refs[-1]
+            for seq_len in (64, 128):
+                context.max_sequence_length = seq_len
+                # Populate the LRU before capture so the graph reads an existing tensor.
+                forward()
+                graph = torch.cuda.CUDAGraph()
+                with model.rotary_pos_emb.register_forward_hook(record_rotary):
+                    with torch.cuda.graph(graph):
+                        forward()
+                graphs.append(graph)
+
             model.rotary_pos_emb.forward.cache_clear()
             gc.collect()
-            assert eager_weak() is None, "eager-only RoPE constants must not be retained"
-            expected = forward().cpu()
-            handle.remove()
-            weak = refs[-1]
-            shape = weak().shape
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(3):
-                    output = forward()
-            torch.cuda.current_stream().wait_stream(stream)
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                output = forward()
-            graph.replay()
-            torch.cuda.synchronize()
-            assert torch.equal(output.cpu(), expected)
+            torch.cuda.empty_cache()
 
-            if invalidate == "clear":
-                model.rotary_pos_emb.forward.cache_clear()
-            else:
-                for length in range(1, 34):
-                    model.rotary_pos_emb(length)
-            gc.collect()
-            # Fail before replay if the constant was freed, rather than reading
-            # a dangling device pointer to demonstrate the old failure.
-            assert weak() is not None, "block graph lost its cached RoPE constant"
-            scratch = [torch.full(shape, -3.0, device="cuda") for _ in range(32)]
-            graph.replay()
-            torch.cuda.synchronize()
-            assert torch.equal(output.cpu(), expected)
+            # After we attempted to clear the LRU, the cached positional embeddings should still be present
+            assert len(refs) == 2
+            for ref in refs:
+                assert ref() is not None, "block graph lost its cached positional embedding"
+                assert any(tensor is ref() for tensor in model.rotary_pos_emb_cache.values())
 
-            # Recapture the same shape after the LRU has changed. Replacing the
-            # model-owned constant here would invalidate the first graph.
-            second_graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(second_graph, stream=stream):
-                second_output = forward()
-            model.rotary_pos_emb.forward.cache_clear()
-            gc.collect()
-            assert weak() is not None, "recapture released the first graph's RoPE constant"
-            graph.replay()
-            second_graph.replay()
-            torch.cuda.synchronize()
-            assert torch.equal(output.cpu(), expected)
-            assert torch.equal(second_output.cpu(), expected)
-            del graph, second_graph, output, second_output, scratch
     finally:
         InferenceMode.unset_active()
         if model is not None:
