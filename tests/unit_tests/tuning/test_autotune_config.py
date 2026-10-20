@@ -13,6 +13,7 @@ import pytest
 from megatron.core import tuning
 from megatron.core.transformer import TransformerConfig
 from megatron.core.tuning import AutotunePolicy
+from megatron.training import global_vars
 from megatron.training import initialize as initialization
 from megatron.training.argument_utils import _triton_autotune_config_from_args
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
@@ -130,11 +131,17 @@ def test_training_installs_the_policy_before_distributed_init(
 ):
     # Parsed but not validated, as in callers that build their own arguments.
     args = parser.parse_args(['--deterministic-mode', '--triton-autotune-modules', 'my_kernels'])
-    monkeypatch.setattr(initialization, 'get_args', lambda: args)
+    # Training finalization resolves batch defaults using the registered topology.
+    args.batch_parallel_size = 1
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', args)
+    monkeypatch.setattr(initialization, 'initialize_runtime_services', Mock())
     monkeypatch.setattr(initialization, 'setup_logging', lambda: None)
     monkeypatch.setattr(initialization, 'initialize_rerun_state_machine', Mock())
 
-    initialization.initialize_megatron(allow_no_cuda=True, skip_mpu_initialization=True)
+    initialization.initialize_megatron(
+        allow_no_cuda=True, skip_mpu_initialization=True, training=True
+    )
 
     install_policy.assert_called_once_with(
         AutotunePolicy(modules=('my_kernels',)), deterministic=True

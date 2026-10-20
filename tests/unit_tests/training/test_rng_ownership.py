@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.training import arguments, checkpointing, global_vars, initialize
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.config.common_config import RNGConfig
 
 
@@ -47,7 +48,7 @@ def test_tracker_cli_flags_populate_rng_config(enabled):
 @pytest.mark.parametrize("te_tracker", [False, True])
 @pytest.mark.parametrize("inference_tracker", [False, True])
 def test_container_derives_tracker_fields_one_way(
-    run_config, model_kind, inference, te_tracker, inference_tracker
+    monkeypatch, run_config, model_kind, inference, te_tracker, inference_tracker
 ):
     from megatron.core.transformer import TransformerConfig
     from megatron.training.config import (
@@ -75,19 +76,23 @@ def test_container_derives_tracker_fields_one_way(
     )
     cfg.model = model
     cfg.rng = RNGConfig(te_rng_tracker=te_tracker, inference_rng_tracker=inference_tracker)
+    if not inference:
+        cfg.train.micro_batch_size = 1
     before = asdict(cfg.rng)
     for _ in range(2):
         cfg.validate()
         assert transformer.use_te_rng_tracker is not te_tracker
         assert transformer.inference_rng_tracker is not inference_tracker
         assert asdict(cfg.rng) == before
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
     cfg.finalize()
     assert transformer.use_te_rng_tracker is te_tracker
     assert transformer.inference_rng_tracker is inference_tracker
     assert asdict(cfg.rng) == before
 
 
-def test_native_cuda_graph_requirement_is_resolved_before_seeding(run_config):
+def test_native_cuda_graph_requirement_is_resolved_before_seeding(monkeypatch, run_config):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
     from megatron.core.transformer import TransformerConfig
     from megatron.training.models import GPTModelConfig
 
@@ -95,6 +100,7 @@ def test_native_cuda_graph_requirement_is_resolved_before_seeding(run_config):
     transformer.cuda_graph_impl = "transformer_engine"
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.rng = RNGConfig()
+    run_config.train.micro_batch_size = 1
     run_config.validate()
     assert run_config.rng.te_rng_tracker is False
     run_config.finalize()
@@ -152,9 +158,12 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
     monkeypatch, lazy, skip, te_tracker, inference_tracker, run_config
 ):
     args = _args_without_rng()
-    args.lazy_mpu_init = lazy
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    cfg.dist.lazy_mpu_init = lazy
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     for name in (
+        "initialize_runtime_services",
         "setup_logging",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
@@ -173,11 +182,11 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
         te_rng_tracker=te_tracker,
         inference_rng_tracker=inference_tracker,
     )
-    run_config.rng = rng
+    cfg.rng = rng
     finish = initialize.initialize_megatron(
         allow_no_cuda=True, skip_random_seed=skip, skip_dependency_compilation=True
     )
-    assert run_config._finalized
+    assert cfg._finalized
     if lazy:
         seed.assert_not_called()
         finish()
@@ -271,6 +280,7 @@ def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, r
     from megatron.training.distillation import utils_logits
 
     args = Namespace(seed=999, seq_length=32, train_samples=16)
+    run_config.train.train_samples = 16
     monkeypatch.setattr(utils_logits, "get_args", lambda: args)
     monkeypatch.setattr(utils_logits, "_blend_identifiers", lambda args: {"mock": True})
     run_config.rng.seed = 123

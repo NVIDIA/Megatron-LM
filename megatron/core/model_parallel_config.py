@@ -287,7 +287,8 @@ class ModelParallelConfig:
        fused_weight_gradient_mlp_cuda module. To use gradient_accumulation_fusion you must install
        APEX with --cpp_ext and --cuda_ext. For example: "pip install --global-option=\"--cpp_ext\"
        --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
-       must turn off gradient accumulation fusion.
+       must turn off gradient accumulation fusion. VocabParallelEmbedding then also adds its weight
+       gradient into main_grad in its backward.
     """
 
     use_te_rng_tracker: bool = field(

@@ -115,7 +115,7 @@ class FsdpParameterGroup:
     grad_comm_dtype: torch.dtype
     _unsharded_model_weight: DBuffer | QuantizedDBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
-    grad_divisor: int
+    grad_scale: float
 
     def __init__(
         self,
@@ -126,7 +126,7 @@ class FsdpParameterGroup:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        grad_divisor: int = 1,
+        grad_scale: float = 1.0,
         use_symmetric_memory: bool = False,
         # TODO: Revisit passing owner assignments into the group constructor in a future PR.
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
@@ -144,8 +144,8 @@ class FsdpParameterGroup:
             mixed_precision_policy: Precision policy for main weights and gradients.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
-            grad_divisor: Additional divisor applied on top of the mesh-size
-                averaging. See ``fully_shard``.
+            grad_scale: Multiplier applied after the mesh-size averaging.
+                See ``fully_shard``.
             parameter_to_owner: Construction-time mapping from original parameters to
                 owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
                 entries for other parameters and non-TensorAtomic groups are ignored.
@@ -155,7 +155,7 @@ class FsdpParameterGroup:
         )
         self._owning_module = ref(owning_module)
         self.mesh = mesh
-        self.grad_divisor = grad_divisor
+        self.grad_scale = grad_scale
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -564,8 +564,8 @@ class FsdpParameterGroup:
 
         # Scale this backward's contribution before accumulating it so repeated
         # backwards do not repeatedly scale the running total.
-        if self.grad_divisor != 1:
-            reduced_grad.local_buffer.div_(self.grad_divisor)
+        if self.grad_scale != 1:
+            reduced_grad.local_buffer.mul_(self.grad_scale)
 
         if reduced_grad is not self.main_grad:
             if has_sharded_grads:

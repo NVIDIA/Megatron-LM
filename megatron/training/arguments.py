@@ -1137,13 +1137,6 @@ def validate_args(args, defaults={}):
     # data
     assert args.num_dataset_builder_threads > 0
 
-    # Consumed tokens.
-    args.consumed_train_samples = 0
-    args.skipped_train_samples = 0
-    args.consumed_valid_samples = 0
-    if args.rl_use_sequence_packing:
-        args.consumed_train_bins = 0
-
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
     if args.train_iters and not args.skip_train:
@@ -2231,7 +2224,9 @@ def _add_inference_args(parser):
                        choices=['raw_logprobs', 'processed_logprobs'],
                        help='How returned inference log-probs are computed engine-wide. '
                             '"raw_logprobs" (default) uses the unmodified model logits; '
-                            '"processed_logprobs" uses temperature and filters by top-k/top-p.')
+                            '"processed_logprobs" applies temperature and top-k/top-p to '
+                            'sampled-token and top-N log-probs. Prompt log-probs, '
+                            'including prompt top-N, are always raw.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
@@ -2323,7 +2318,6 @@ def _add_network_size_args(parser):
         "gated_linear_unit",
         "bias_activation_fusion",
         "activation_func_fp8_input_store",
-        "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
         "fp8_dot_product_attention",
@@ -2980,6 +2974,9 @@ def _add_distributed_args(parser):
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
+    group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
+                       help="Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2.")
+
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '
@@ -3139,10 +3136,6 @@ def _add_distributed_args(parser):
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
     group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
-    group.add_argument('--fake-process-group', action='store_true', default=False,
-                       help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
-                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
-                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
     return parser
 
 
