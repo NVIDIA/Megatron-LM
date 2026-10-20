@@ -2500,7 +2500,7 @@ def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_b
         model_config.pre_wrap_hooks.append(freeze_hook)
 
 
-def _forward_backward_grad_context(model_config):
+def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
     Returns a tuple of (grad_context, forward_only).
@@ -2509,8 +2509,8 @@ def _forward_backward_grad_context(model_config):
     autograd graph. Otherwise returns a no-op context.
     forward_only is True when all layers are frozen, False otherwise.
     """
-    grad_context = torch.no_grad() if model_config.freeze_all_layers else nullcontext()
-    forward_only = model_config.freeze_all_layers
+    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
+    forward_only = getattr(args, "freeze_all_layers", False)
     return grad_context, forward_only
 
 
@@ -2518,7 +2518,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     """Build the model using a finalized DDP config, or legacy args if omitted."""
     cfg = get_run_config()
     args = get_args()
-    freeze_all_layers = cfg.model.freeze_all_layers
     if config is None:
         config = cfg.model.transformer
     args.model_type = model_type
@@ -2590,7 +2589,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [model]
 
     # For rare operations like post-training logits saving
-    if freeze_all_layers:
+    if args.freeze_all_layers:
         _freeze_all_model_chunks(model)
     elif config.freeze_base_model_for_mtp:
         _freeze_base_model_for_mtp(model)
@@ -2895,7 +2894,7 @@ def setup_model_and_optimizer(
             # gradient storage for parameters that remain trainable (matching get_model behavior).
             _add_model_freeze_pre_wrap_hook(
                 model_config,
-                freeze_all_layers=cfg.model.freeze_all_layers,
+                freeze_all_layers=args.freeze_all_layers,
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
             )
 
@@ -3399,7 +3398,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        grad_context, forward_only = _forward_backward_grad_context(cfg.model)
+        grad_context, forward_only = _forward_backward_grad_context(args)
         _fb_cm = (
             span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
@@ -3763,7 +3762,7 @@ def training_log(
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
         learning_rate, group=_lr_mp_group
     )
-    if learning_rate is None and cfg.model.freeze_all_layers:
+    if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):

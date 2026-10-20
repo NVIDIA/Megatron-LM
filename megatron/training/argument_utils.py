@@ -619,9 +619,6 @@ def gpt_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
-    kwargs["freeze_all_layers"] = getattr(args, "freeze_all_layers", False)
-
-
     kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
@@ -705,7 +702,7 @@ def hybrid_config_from_args(
     """
     assert issubclass(model_config_cls, HybridModelConfig)
 
-    kwargs = {"freeze_all_layers": getattr(args, "freeze_all_layers", False)}
+    kwargs = {}
     if config is None:
         transformer_cfg = core_transformer_config_from_args(args)
     else:
@@ -804,7 +801,6 @@ def model_provider_config_from_args(
         rope_scaling_factor=args.rope_scaling_factor,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
         tp_comm_overlap_cfg=args.tp_comm_overlap_cfg,
-        freeze_all_layers=args.freeze_all_layers,
     )
 
 

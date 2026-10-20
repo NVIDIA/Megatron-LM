@@ -144,9 +144,6 @@ class ModelConfig:
     restore_modelopt_state: bool = False
     """Restore ModelOpt quantization/sparsity state."""
 
-    freeze_all_layers: bool = False
-    """Freeze all model parameters, for example when saving teacher logits."""
-
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
     may be useful when extending Megatron-Core models, e.g. converting to/from HuggingFace.
