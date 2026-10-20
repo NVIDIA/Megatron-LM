@@ -3405,7 +3405,7 @@ def load_checkpoint(
                 'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
                 'identical to those saved. Load the optimizer state to avoid this.'
             )
-        if (cfg.optimizer.fp16 or cfg.optimizer.bf16) and optimizer is not None:
+        if (args.fp16 or args.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
