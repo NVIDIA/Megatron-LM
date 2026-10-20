@@ -199,11 +199,17 @@ class FsdpModule:
         """
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
-            module.register_full_backward_hook(
-                lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
-                    cast(FsdpModule, hooked_module)
-                )
-            )
+
+            def grad_checking_post_backward_hook(module, grad_input, _grad_output):
+                if all(grad is None for grad in grad_input):
+                    # With no input gradients, this hook runs before internal backward.
+                    module.context._delayed_post_backward_callbacks.append(
+                        (module, post_backward_hook)
+                    )
+                else:
+                    post_backward_hook(module)
+
+            module.register_full_backward_hook(grad_checking_post_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
