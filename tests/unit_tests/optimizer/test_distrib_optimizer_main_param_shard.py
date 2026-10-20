@@ -21,6 +21,8 @@ class _FakeInnerOptimizer:
 
 def _distrib_optimizer(inner, model_params, use_precision_aware):
     optimizer = object.__new__(DistributedOptimizer)
+    optimizer.is_stub_optimizer = False
+    optimizer.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
     optimizer.optimizer = inner
     optimizer.config = SimpleNamespace(
         use_precision_aware_optimizer_no_fp8_or_ds_fp8=use_precision_aware
@@ -113,6 +115,23 @@ def test_chained_optimizer_returns_shard_from_owning_optimizer():
     assert chained.get_main_param_shard(dense) is dense_shard
     assert chained.get_main_param_shard(expert) is expert_shard
     assert chained.get_main_param_shard(unowned) is None
+
+
+@pytest.mark.parametrize("stub, use_megatron_fsdp", [(True, False), (False, True)])
+def test_main_param_shard_is_none_without_param_index(stub, use_megatron_fsdp):
+    """Stub optimizers and Megatron-FSDP return from __init__ before building the param index
+    map. A ChainedOptimizer asks them first when, e.g., the dense params are frozen and only the
+    experts train, so they must answer None instead of raising."""
+    expert = torch.nn.Parameter(torch.ones(1))
+    expert_shard = torch.zeros(1)
+    unindexed = object.__new__(DistributedOptimizer)
+    unindexed.is_stub_optimizer = stub
+    unindexed.ddp_config = SimpleNamespace(use_megatron_fsdp=use_megatron_fsdp)
+    chained = object.__new__(ChainedOptimizer)
+    chained.chained_optimizers = [unindexed, _FakeChainedMember({expert: expert_shard})]
+
+    assert unindexed.get_main_param_shard(expert) is None
+    assert chained.get_main_param_shard(expert) is expert_shard
 
 
 def test_mimo_optimizer_returns_shard_from_owning_module_optimizer():

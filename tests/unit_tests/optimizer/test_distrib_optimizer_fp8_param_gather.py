@@ -10,8 +10,10 @@ from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import get_megatron_optimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -352,9 +354,33 @@ def test_param_remainders_through_fp32_buffers(
             assert torch.equal(loading.get_main_param_shard(model.module.weight), saved_shard)
 
 
-def test_fp32_master_weights_are_not_loaded_as_param_remainders(model_parallel, tmp_path_dist_ckpt):
-    """The --ckpt-format torch parameter state does not record its master weight format, so FP32
-    master weights loaded into a run with param remainders must be rejected, not truncated."""
+@pytest.mark.parametrize(("save_remainders", "load_remainders"), [(False, None), (None, False)])
+def test_torch_format_rejects_mismatched_param_remainders(
+    model_parallel, tmp_path_dist_ckpt, save_remainders, load_remainders
+):
+    """--ckpt-format torch records the master weight format too, so loading either format as the
+    other must raise on every rank instead of silently corrupting the master weights."""
+    name = f"torch_format_mismatch_{save_remainders}_{load_remainders}"
+    with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
+        model = _ddp_model()
+        _, optimizer = _get_optimizer(model, None, store_param_remainders=save_remainders)
+        _train_step(model, optimizer)
+        (saving,) = optimizer.chained_optimizers
+        _save_parameter_state(saving, model, "torch", ckpt_dir)
+
+        _, optimizer = _get_optimizer(model, None, store_param_remainders=load_remainders)
+        (loading,) = optimizer.chained_optimizers
+        assert saving._stores_param_remainders() != loading._stores_param_remainders()
+        with pytest.raises(RuntimeError, match="silently corrupt"):
+            _load_parameter_state(loading, model, "torch", ckpt_dir)
+
+
+def test_unrecorded_fp32_master_weights_are_not_loaded_as_param_remainders(
+    model_parallel, tmp_path_dist_ckpt
+):
+    """A --ckpt-format torch parameter state saved before the format was recorded is assumed to
+    match this run's store_param_remainders. FP32 master weights loaded into a run with param
+    remainders must then still be rejected, not truncated to int16."""
     with TempNamedDir(tmp_path_dist_ckpt / "fp32_masters_as_remainders", sync=True) as ckpt_dir:
         model = _ddp_model()
         _, optimizer = _get_optimizer(model, None, store_param_remainders=False)
@@ -362,9 +388,36 @@ def test_fp32_master_weights_are_not_loaded_as_param_remainders(model_parallel, 
         (saving,) = optimizer.chained_optimizers
         assert not saving._stores_param_remainders()
         _save_parameter_state(saving, model, "torch", ckpt_dir)
+        if saving.data_parallel_group.rank() == 0:
+            state_dict = torch.load(ckpt_dir / "param_state.pt")
+            del state_dict["param_state_param_remainders"]
+            torch.save(state_dict, ckpt_dir / "param_state.pt")
+        torch.distributed.barrier()
 
         _, optimizer = _get_optimizer(model, None)
         (loading,) = optimizer.chained_optimizers
         assert loading._stores_param_remainders()
         with pytest.raises(RuntimeError, match="stores full main params"):
             _load_parameter_state(loading, model, "torch", ckpt_dir)
+
+
+@pytest.mark.parametrize(
+    ("stored", "loading_config", "fix"),
+    [
+        (False, dict(fp8_recipe=None), "Set --no-store-param-remainders"),
+        (True, dict(fp8_recipe="tensorwise"), "Set --store-param-remainders"),
+        (True, dict(fp8_recipe=None, main_params_dtype=torch.float16), "cannot store"),
+        (True, dict(fp8_recipe=None, optimizer_cpu_offload=True), "cannot store"),
+        (True, dict(fp8_recipe=None, optimizer_cuda_graph=True), "cannot store"),
+    ],
+)
+def test_param_remainders_mismatch_error_names_a_working_fix(stored, loading_config, fix):
+    """The error must only suggest --store-param-remainders where this run can store them."""
+    if not is_te_min_version("2.1.0"):
+        pytest.skip("TE FusedAdam stores param remainders from TE 2.1")
+    loading = object.__new__(DistributedOptimizer)
+    loading.config = _optimizer_config(**loading_config).resolve_fp8_param_gather(False)
+    assert loading._stores_param_remainders() != stored
+
+    error = loading._param_remainders_mismatch(stored)
+    assert "silently corrupt" in error and fix in error
