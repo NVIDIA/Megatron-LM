@@ -283,14 +283,20 @@ def test_config_includes_mtp_ratio_and_derives_dimensions():
 
 
 def test_config_requires_contiguous_context_parallelism(monkeypatch):
-    """The canonical layout option maps to dev's contiguous CP partition contract."""
+    """Static CP needs contiguous layout, but THD metadata may be supplied directly."""
     monkeypatch.setattr(
         "megatron.core.transformer.transformer_config.is_te_min_version", lambda *_a, **_k: True
     )
     with pytest.raises(ValueError, match="cp_partition_mode='contiguous'"):
         _make_config(context_parallel_size=2)
-    with pytest.raises(ValueError, match="requires THD inputs"):
-        _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
+    config = _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
+    assert config.sequence_packing_scheduler is None
+    assert config.cp_partition_mode == "contiguous"
+    assert config.linear_cp_layout == config.attention_cp_layout == "contiguous"
+    with pytest.raises(ValueError, match="uniform attention/linear CP layout"):
+        _make_config(
+            context_parallel_size=2, attention_cp_layout="zigzag", linear_cp_layout="contiguous"
+        )
     config = _make_config(
         context_parallel_size=2,
         attention_cp_layout="contiguous",

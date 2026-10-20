@@ -2092,10 +2092,20 @@ def validate_args(args, defaults={}):
                 "instance) would under-reduce Muon gradients across the full data-parallel domain."
             )
         else:
-            assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
-                "Padded LayerWise parameter layout does not support FP8/FP4 parameter gather; "
-                "use the compact layout for supported FP8 recipes."
-            )
+            assert not getattr(
+                args, 'fp4_param_gather', False
+            ), "Padded LayerWise parameter layout does not support FP4 parameter gather."
+            if args.fp8_param_gather:
+                # Main's padded MXFP8 path stages masters through the BF16 grad buffer
+                # before the fixed-size gather. Other recipes still use dev's compact path.
+                assert args.fp8_recipe == 'mxfp8', (
+                    "Padded LayerWise parameter layout supports FP8 parameter gather only "
+                    "with fp8_recipe='mxfp8'; use the compact layout for blockwise FP8."
+                )
+                assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                    "Padded LayerWise MXFP8 parameter gather requires "
+                    "--reuse-grad-buf-for-mxfp8-param-ag."
+                )
 
     assert not (args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight), (
         "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "

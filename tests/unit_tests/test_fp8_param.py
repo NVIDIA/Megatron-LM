@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
@@ -313,12 +314,23 @@ class TestFP8Param:
                 pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
-        if getattr(args, "use_layer_wise_distributed_optimizer", False):
-            has_param_layout = getattr(gpt_model[0], "full_param_layout", None) is not None
-            assert has_param_layout == args.use_layer_wise_param_layout, (
-                "LayerWise test did not enter the requested parameter-layout path: "
-                f"requested={args.use_layer_wise_param_layout}, actual={has_param_layout}"
+        if not inference and getattr(args, "use_layer_wise_distributed_optimizer", False):
+            # Full model metadata also covers sibling Adam buffers in compact mode;
+            # its presence does not identify the LayerWise storage/synchronization path.
+            assert gpt_model[0].ddp_config.use_layer_wise_param_layout == (
+                args.use_layer_wise_param_layout
             )
+            pending = [optimizer]
+            layerwise = []
+            while pending:
+                current = pending.pop()
+                if isinstance(current, LayerWiseDistributedOptimizer):
+                    layerwise.append(current)
+                pending.extend(getattr(current, "chained_optimizers", ()))
+            assert layerwise, "The requested LayerWise optimizer must actually be constructed"
+            for current in layerwise:
+                assert current.decouple_ddp_layout == (not args.use_layer_wise_param_layout)
+                assert current.use_buffer_param_sync == args.use_layer_wise_param_layout
         self._on_model_built(gpt_model, optimizer, args)
 
         # Hard coded to use cuda_graph_impl="transformer_engine"

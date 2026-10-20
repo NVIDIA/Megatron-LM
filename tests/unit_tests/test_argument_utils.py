@@ -135,6 +135,27 @@ def test_layerwise_fp8_validation_respects_layout_support(monkeypatch, padded_la
         assert args.use_layer_wise_distributed_optimizer
 
 
+@pytest.mark.parametrize("reuse_grad_buffer", [False, True])
+def test_padded_layerwise_mxfp8_requires_grad_buffer_transport(monkeypatch, reuse_grad_buffer):
+    args = _minimal_training_args(monkeypatch)
+    args.world_size = 1
+    args.freeze_base_model_for_mtp = False
+    args.optimizer = 'muon'
+    args.use_distributed_optimizer = True
+    args.use_layer_wise_param_layout = True
+    args.bf16 = True
+    args.fp8 = 'e4m3'
+    args.fp8_recipe = 'mxfp8'
+    args.fp8_param_gather = True
+    args.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buffer
+    if reuse_grad_buffer:
+        validate_args(args)
+        assert args.use_layer_wise_distributed_optimizer
+    else:
+        with pytest.raises(AssertionError, match="reuse-grad-buf-for-mxfp8-param-ag"):
+            validate_args(args)
+
+
 def _minimal_training_args(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
     args = parse_args()
