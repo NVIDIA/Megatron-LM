@@ -42,6 +42,9 @@ def test_warnings_suppressed_off_rank_zero(rank, expect_warning, monkeypatch):
     pytree_logger = logging.getLogger("torch.utils._pytree")
     original_level = pytree_logger.level
     try:
+        # The launcher already suppresses this logger on real nonzero ranks.
+        # Start each simulated rank from the same state; rank zero leaves it unchanged.
+        pytree_logger.setLevel(logging.NOTSET)
         # catch_warnings restores both the filter list and showwarning on exit.
         with warnings.catch_warnings(record=True) as raised:
             warnings.simplefilter("always")
