@@ -184,8 +184,6 @@ class OptimizerConfig:
     """Whether model parameters are stored (and all-gathered) as FP8 tensors, read through the
        fp8_param_gather property. Not user settable: it is a property of the model, so
        get_megatron_optimizer takes it from ddp_config.fp8_param_gather (resolve_fp8_param_gather).
-       Until then it is None, which is treated as possibly quantized, so MCore keeps FP32 main
-       params.
     """
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
@@ -205,17 +203,17 @@ class OptimizerConfig:
         int16 remainder of the 16 bits the BF16 parameter holds. This lowers GPU memory usage, and
         the optimizer checkpoint then holds int16 remainders instead of FP32 master weights.
 
-        None (default) resolves to True, except when:
+        None (default) defaults to False when:
             - FP32 main params and
             - a non-delayed FP8 recipe and
             - no optimizer_cpu_offload.
-        Otherwise, resolves to False. 
-        This is for backwards-compatibility for checkpoints written  in this case 
-        by Megatron Core versions that did not record the master weight format, which hold
-        MCore-managed FP32 main params. Setting it to True saves memory, but makes
-        old optimizer checkpoints incompatible.
-        Only takes effect with BF16 params and FP32 main params: TE FusedAdam stores no remainders
-        for FP16 main params.
+        and True in all other cases.
+
+        This is for backwards-compatibility for checkpoints written when this condition applies 
+        by Megatron Core versions that did not record the master weight format. 
+        Such versions did not enable store_param_remainders. Explicitly setting this flag to True
+        saves memory, but makes old optimizer checkpoints incompatible.
+        Only takes effect with BF16 model params and FP32 main params.
         The value in effect is the resolved_store_param_remainders property.
     """
 

@@ -1778,6 +1778,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         stored = state_dict.get('param_state_param_remainders')
         if stored is None:
+            # This information was not previously stored. Try to infer it.
             stored = self._param_remainders_in_checkpoint_without_format()
         current = self._stores_param_remainders()
         if stored == current:
