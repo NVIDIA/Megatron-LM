@@ -3,6 +3,7 @@
 import logging
 import math
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.tokenizers import MegatronTokenizer
 
 MEGATRON_TOKENIZERS = ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETokenizer']
@@ -133,14 +134,19 @@ def build_tokenizer(args, **kwargs):
     return tokenizer
 
 
-def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
+def vocab_size_with_padding(
+    orig_vocab_size: int,
+    make_vocab_size_divisible_by: int,
+    tensor_model_parallel_size: int,
+    logging_enabled=True,
+):
     """Pad vocab size so it is divisible by model parallel size and
     still having GPU friendly size."""
 
     after = orig_vocab_size
-    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
+    multiple = make_vocab_size_divisible_by * tensor_model_parallel_size
     after = int(math.ceil(after / multiple) * multiple)
-    if args.rank == 0 and logging_enabled:
+    if safe_get_rank() == 0 and logging_enabled:
         logger.info(
             f' > padded vocab (size: {orig_vocab_size}) with '
             f'{after - orig_vocab_size} dummy tokens '
@@ -152,4 +158,9 @@ def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
 def _set_padded_vocab_size(args, tokenizer):
     """Sets padded vocab size if None."""
     if getattr(args, "padded_vocab_size", None) is None:
-        args.padded_vocab_size = vocab_size_with_padding(tokenizer.vocab_size, args)
+        args.padded_vocab_size = vocab_size_with_padding(
+            tokenizer.vocab_size,
+            args.make_vocab_size_divisible_by,
+            args.tensor_model_parallel_size,
+            args,
+        )
