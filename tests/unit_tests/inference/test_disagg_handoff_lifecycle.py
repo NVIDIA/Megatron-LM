@@ -662,8 +662,15 @@ def test_handoff_records_rl_metadata_only_on_final_decode(
     sink.payload_stager = mock.Mock()
     sink.payload_stager.stage.return_value = RequestPayloadStageResult()
     sink.socket_for_receiving_requests = mock.Mock()
+    sink._staging_tasks = set()
     request.status = Status.COMPLETED
-    sink._send_requests_to_coordinator([request])
+
+    async def send_and_drain():
+        # Staging runs as a task on the engine loop; wait for it as shutdown would.
+        sink._send_requests_to_coordinator([request])
+        await sink._drain_staging_tasks()
+
+    handoff_loop.run_until_complete(send_and_drain())
     sink.payload_stager.stage.assert_called_once()
     stage = sink.payload_stager.stage.call_args
     assert stage.args[0] == source.uid
