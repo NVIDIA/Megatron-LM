@@ -309,7 +309,6 @@ def test_flashinfer_row_kernels_replay(kernel):
     assert_replays_bit_exact(fn, args, backward=False, what=kernel)
 
 
-
 @pytest.mark.skipif(
     not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage needs Blackwell",
