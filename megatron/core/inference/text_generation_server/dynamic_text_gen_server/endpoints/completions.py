@@ -16,6 +16,7 @@ from .common import (
     failed_requests_response,
     generation_finish_reason,
     parse_sampling_params,
+    parse_stream_options,
     reply_prompt_length,
     run_inference,
     sampling_params_for_choice,
@@ -206,6 +207,11 @@ try:
         if offload_params_error is not None:
             return offload_params_error, 400
 
+        try:
+            include_usage = parse_stream_options(req)
+        except ValueError as e:
+            return str(e), 400
+
         # --- 1. Parse Prompt ---
         try:
             prompts_as_tokens, prompts_as_strings = parse_prompt(req.get("prompt"), tokenizer)
@@ -281,7 +287,6 @@ try:
             return f"Error submitting request: {e}", 500
 
         if stream_requested:
-            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             response = Response(
                 openai_stream(
                     streams,
