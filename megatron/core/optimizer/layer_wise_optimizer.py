@@ -1221,9 +1221,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         return self._managed_optimizer_state_offload_indices
 
     def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
-        """Prefetch all masters and the managed Muon child's first state chunk."""
+        """Prefetch all masters and, unless an outer chain deferred it to the step, the managed
+        Muon child's first state chunk."""
 
         self.prefetch_optimizer_master_weights_for_step()
+        if self._defer_optimizer_state_prefetch_to_step:
+            return
         managed_indices = self._managed_optimizer_state_offload_child_indices()
         if managed_indices:
             self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
