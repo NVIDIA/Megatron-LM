@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -72,6 +73,36 @@ def test_is_decode_only_is_false_during_the_mtp_commit_pass(using_cuda_graph):
     assert context.is_decode_only() is False
 
 
+def _processed_rows_context(sampling_and_counts, num_sampled=None):
+    """Build a sampling context and final-row indices for expected processed log-probs.
+
+    Args:
+        sampling_and_counts: Per active request, its sampling kwargs and row count.
+        num_sampled: Number of leading requests whose final row is engine-sampled.
+            Defaults to every request.
+
+    Returns:
+        Tuple of the context namespace and the sampled rows' indices.
+    """
+    expected_context = SimpleNamespace(
+        total_request_count=len(sampling_and_counts),
+        paused_request_count=0,
+        active_request_metadata={
+            name: torch.tensor([sp[name] for sp, _ in sampling_and_counts], dtype=dtype)
+            for name, dtype in (
+                ("temperature", torch.float32),
+                ("top_k", torch.long),
+                ("top_p", torch.float32),
+            )
+        },
+    )
+    counts = torch.tensor([count for _, count in sampling_and_counts])
+    sampled_rows = counts.cumsum(0) - 1
+    if num_sampled is not None:
+        sampled_rows = sampled_rows[:num_sampled]
+    return expected_context, sampled_rows
+
+
 class TestDynamicContext:
 
     @classmethod
@@ -113,6 +144,9 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        expert_model_parallel_size: int = 1,
+        reserve_recurrent_state_dummy_slot: bool = False,
+        mamba_memory_ratio: float = None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -135,6 +169,8 @@ class TestDynamicContext:
                 num_layers=num_layers,
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
+                expert_model_parallel_size=expert_model_parallel_size,
+                num_moe_experts=2 if expert_model_parallel_size > 1 else None,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
@@ -153,6 +189,8 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
+                mamba_memory_ratio=mamba_memory_ratio,
             ),
         )
         return dynamic_context
@@ -1780,7 +1818,8 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("logprobs_mode", ["raw_logprobs", "processed_logprobs"])
-    def test_calculate_and_store_log_probs(self, logprobs_mode):
+    @pytest.mark.parametrize("partial_chunk", [False, True])
+    def test_calculate_and_store_log_probs(self, logprobs_mode, partial_chunk):
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1839,44 +1878,38 @@ class TestDynamicContext:
         # Supplies log_probs_kernel for processed mode (unused by raw mode).
         sampling = TorchSampling(rng=torch.Generator(), vocab_size=vocab_size)
 
-        def expected_log_probs(logits, active_id_and_counts):
+        def expected_log_probs(logits, active_id_and_counts, num_sampled=None):
             """Mode-aware expected log-probs over every active-token row.
 
-            For processed mode, each active request's params are repeated across its token
-            count, mirroring the request->row mapping in `_processed_log_probs`.
+            Prompt rows are always raw. In processed mode, each request's final
+            (engine-sampled) row uses that request's sampling params.
 
             Args:
                 logits (Tensor): Raw logits for the active token rows.
                 active_id_and_counts: Request IDs paired with their row counts.
+                num_sampled: Number of leading requests whose final row is
+                    engine-sampled. Defaults to every request.
 
             Returns:
-                Tensor: Expected raw or sampling-processed log probabilities.
+                Tensor: Expected log probabilities.
             """
             logits_2d = logits.squeeze(0).float()
+            expected = torch.nn.functional.log_softmax(logits_2d, dim=-1)
             if logprobs_mode == "raw_logprobs":
-                return torch.nn.functional.log_softmax(logits_2d, dim=-1)
-            temperatures, top_ks, top_ps, request_counts = [], [], [], []
-            for active_id, count in active_id_and_counts:
-                sp = request_data[active_id]["sampling"]
-                temperatures.append(sp["temperature"])
-                top_ks.append(sp["top_k"])
-                top_ps.append(sp["top_p"])
-                request_counts.append(count)
-            expected_context = SimpleNamespace(
-                total_request_count=len(active_id_and_counts),
-                paused_request_count=0,
-                active_request_metadata={
-                    "temperature": torch.tensor(temperatures, dtype=torch.float32),
-                    "top_k": torch.tensor(top_ks, dtype=torch.long),
-                    "top_p": torch.tensor(top_ps, dtype=torch.float32),
-                },
+                return expected
+            expected_context, sampled_rows = _processed_rows_context(
+                [
+                    (request_data[active_id]["sampling"], count)
+                    for active_id, count in active_id_and_counts
+                ],
+                num_sampled=num_sampled,
             )
-            row_to_request = torch.arange(len(request_counts)).repeat_interleave(
-                torch.tensor(request_counts)
+            expected[sampled_rows] = sampling.log_probs_kernel(
+                logits_2d[sampled_rows],
+                expected_context,
+                token_to_request_index=torch.arange(len(sampled_rows)),
             )
-            return sampling.log_probs_kernel(
-                logits_2d, expected_context, token_to_request_index=row_to_request
-            )
+            return expected
 
         def assert_sampled_log_prob(actual, expected_full, logits, row, token, req_sampling):
             """Sampled tokens outside the processed support floor to the tempered
@@ -1888,6 +1921,11 @@ class TestDynamicContext:
             scaled = logits.squeeze(0)[row].float() / max(req_sampling["temperature"], 1e-6)
             tempered = (scaled[token] - scaled.logsumexp(0)).item()
             assert actual == pytest.approx(tempered, rel=1e-5, abs=1e-6)
+
+        if partial_chunk:
+            # Treat the last active request as a partial chunk. Its final row scores
+            # its next prompt token, so it stays raw even in processed mode.
+            dynamic_context.chunked_prefill_request_id = 1003
 
         # Populate gpu_view for calculate_log_probs (which reads from gpu_view).
         dynamic_context.initialize_attention_state()
@@ -1911,8 +1949,15 @@ class TestDynamicContext:
 
         # Calculate expected prefill log probs for the selected tokens
         prefill_active = [(req_id, request_data[req_id]["prefill_len"]) for req_id in request_data]
-        expected_prefill_full = expected_log_probs(prefill_logits, prefill_active)
+        expected_prefill_full = expected_log_probs(
+            prefill_logits,
+            prefill_active,
+            num_sampled=len(prefill_active) - 1 if partial_chunk else None,
+        )
         assert torch.allclose(prefill_log_probs_full, expected_prefill_full, atol=1e-6)
+        if partial_chunk:
+            # The partial chunk's final row keeps the full raw support despite top-k.
+            assert torch.isfinite(prefill_log_probs_full[total_active_tokens - 1]).all()
         expected_prefill_log_probs = expected_prefill_full.to(torch.float32).cpu()
 
         for i, (req_id, data) in enumerate(request_data.items()):
@@ -1941,6 +1986,10 @@ class TestDynamicContext:
                         prefill_log_probs[i][j]
                         == expected_prefill_log_probs[initial_token_offset + j, token].item()
                     )
+
+        if partial_chunk:
+            # Complete the chunk so the remaining steps run as ordinary decode.
+            dynamic_context.chunked_prefill_request_id = -1
 
         # Simulate decode step
         # All requests are active, so the mask will be all ones for the current active requests
@@ -2198,6 +2247,87 @@ class TestDynamicContext:
             context._allocate_mamba_cache(32 / 1024**3)
 
         assert "room for 3 durable slots on this pipeline stage" in str(error.value)
+
+    def _get_context_with_attention_only_stage(self, **inference_config_kwargs):
+        """Build a PP=2 context for layout ``M*|**``; stage 1 holds no recurrent layer."""
+        params_dtype = torch.float32
+        if parallel_state.get_pipeline_model_parallel_rank() == 0:
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA, Symbols.ATTENTION],
+                (544, 4),
+                (8, 64, 16),
+                params_dtype,
+                params_dtype,
+            )
+        else:
+            mamba_inference_state_config = None
+        return DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=4,
+                kv_channels=64,
+                num_attention_heads=8,
+                pipeline_model_parallel_size=2,
+                tensor_model_parallel_size=1,
+                pipeline_dtype=params_dtype,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=16,
+                max_tokens=1024,
+                unified_memory_level=0,
+                mamba_inference_state_config=mamba_inference_state_config,
+                **inference_config_kwargs,
+            ),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mamba_prefix_cache_rejects_pipeline_stage_without_recurrent_layers(self):
+        """Every stage raises when a Mamba cache budget meets a stage without recurrent layers.
+
+        The recurrent stage would otherwise wait alone in the Mamba cache-capacity
+        collective, and the stages would skip different prompt tokens.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            with pytest.raises(ValueError, match="every pipeline stage of a hybrid model"):
+                self._get_context_with_attention_only_stage(
+                    enable_prefix_caching=True, prefix_caching_mamba_gb=0.05
+                )
+        finally:
+            self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("enable_prefix_caching", [False, True])
+    def test_pipeline_stage_without_recurrent_layers_initializes(self, enable_prefix_caching):
+        """A stage without recurrent layers initializes without a Mamba cache budget.
+
+        Every stage learns that the pipeline holds recurrent layers, so memory-only prefix
+        caching skips the same (zero) prompt tokens on every stage.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            context = self._get_context_with_attention_only_stage(
+                enable_prefix_caching=enable_prefix_caching
+            )
+            rank = parallel_state.get_pipeline_model_parallel_rank()
+            assert context.is_hybrid_model is (rank == 0)
+            assert context.pipeline_has_recurrent_layers
+            assert context.mamba_slot_allocator is None
+
+            pool_size = torch.tensor(
+                [context.kv_block_allocator.pool_size], device="cuda", dtype=torch.long
+            )
+            gathered = [torch.zeros_like(pool_size) for _ in range(2)]
+            torch.distributed.all_gather(
+                gathered, pool_size, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            assert len({t.item() for t in gathered}) == 1
+        finally:
+            self._restore_model_parallel()
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2538,10 +2668,73 @@ class TestDynamicContext:
             assert (slow_mamba >= 0).all(), "slow path should allocate valid mamba slots"
             assert fast_mamba.unique().numel() == N, "fast path mamba slots must be unique"
 
+    def _get_hybrid_ep_context(self, **overrides):
+        args = dict(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+            expert_model_parallel_size=2,
+        )
+        args.update(overrides)
+        return self._get_dynamic_context(**args)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self):
+        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16)
+        ctx = self._get_hybrid_ep_context(
+            num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True
+        )
+        assert ctx.kv_block_allocator.pool_size == baseline.kv_block_allocator.pool_size
+        assert ctx.max_requests == baseline.max_requests
+        metadata = ctx.mamba_metadata
+        retained_slots = metadata.batch_allocate_slots(ctx.max_requests)
+        assert retained_slots is not None
+        assert metadata.mamba_state_free_slot_count == 0
+
+        ctx.initialize_attention_state(
+            is_expert_parallel_dummy_cuda_graph_step=True, transfer_bookkeeping_to_gpu=False
+        )
+
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+        assert ctx._cpu_mamba_batch_indices_decode[0] == metadata.dummy_state_idx
+        ctx.reset()
+        assert metadata.mamba_state_free_slot_count == 0
+
+    @pytest.mark.internal
+    @rounder_override(1)
+    def test_hybrid_ep_dummy_requires_positive_request_capacity(self):
+        with pytest.raises(ValueError, match="leaves no request capacity"):
+            self._get_hybrid_ep_context(
+                reserve_recurrent_state_dummy_slot=True, mamba_memory_ratio=1e-12
+            )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_ep_dummy_fails_cleanly_without_a_free_state_slot(self):
+        ctx = self._get_hybrid_ep_context(num_cuda_graphs=16)
+        metadata = ctx.mamba_metadata
+        assert metadata.batch_allocate_slots(ctx.max_requests) is not None
+        dummy_dimensions = InferenceBatchDimensions(
+            token_count=ctx.num_speculative_tokens + 1, prefill_req_count=0, decode_req_count=1
+        )
+
+        with pytest.raises(AssertionError, match="No free recurrent-state slots"):
+            ctx.add_dummy_requests_for_expert_parallel_step(dummy_dimensions)
+
     @pytest.mark.internal
     def test_gqa_high_tp_partition_heads(self):
         """Tests that TP > GQA results in 1 attention head per partition."""
         tp_size = 8
+        if Utils.world_size < tp_size:
+            pytest.skip(f"requires {tp_size} ranks, got {Utils.world_size}")
         self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
 
         model_config = TransformerConfig(

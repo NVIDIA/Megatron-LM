@@ -508,8 +508,7 @@ def initialize_real_model(
 
 def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-        with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-            return load_checkpoint(*args, **kwargs)
+        return load_checkpoint(*args, restore_training_state=True, **kwargs)
 
 
 class TestDistributedOptimizer:

@@ -72,6 +72,7 @@ jobs:
     with:
       is-maintainer: true
       source-sha: ${{ github.sha }}
+      include-gcp-h100: true
       lts: false
       timeout-minutes: 180
       verify-cache: true
@@ -97,9 +98,12 @@ jobs:
         run: |
           yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/h100/unit-tests.yaml > h100.json
           yq -o json '[.products[].test_case[]]' tests/test_utils/recipes/gb200/unit-tests.yaml > gb200.json
+          # Testmon keys H100 data by recipe platform and bucket, not by cloud.
+          # Publish one H100 baseline (AWS) to avoid concurrent writers for the
+          # same cache key; the Singapore image build remains a separate matrix job.
           MATRIX=$(jq -cn --argjson builds "$BUILDS" --arg sha "$SOURCE_SHA" \
             --slurpfile h100 h100.json --slurpfile gb200 gb200.json '
-            [$builds.include[] as $build
+            [$builds.include[] | select(.cloud != "gcp-h100") as $build
               | (if $build.cloud == "aws-h100" then {platform: "dgx_h100", buckets: $h100[0]}
                  elif $build.cloud == "gb-gpu" then {platform: "dgx_gb200", buckets: $gb200[0]}
                  else error("Unsupported unit-test platform") end) as $suite

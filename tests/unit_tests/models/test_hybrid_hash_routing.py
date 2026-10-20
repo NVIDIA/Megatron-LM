@@ -6,7 +6,7 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import recompute as recompute_module
+from megatron.core import tensor_parallel
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
@@ -225,7 +225,7 @@ def test_hybrid_stack_omits_input_ids_keyword_when_not_provided():
 
 def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature(monkeypatch):
     monkeypatch.setattr(
-        recompute_module.tensor_parallel,
+        tensor_parallel,
         "checkpoint",
         lambda function, _distribute_saved_activations, *args: function(*args),
     )

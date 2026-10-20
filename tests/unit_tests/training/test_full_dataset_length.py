@@ -34,7 +34,9 @@ def test_cp_deduplicated_dataloader_length_reaches_every_rank():
 
 @pytest.mark.parametrize("iteration", [None, 0, 100])
 @pytest.mark.parametrize("owns_data", [False, True])
-def test_length_probe_preserves_iteration_and_skips_restore(monkeypatch, iteration, owns_data):
+def test_length_probe_preserves_iteration_and_skips_restore(
+    monkeypatch, iteration, owns_data, run_config
+):
     args = SimpleNamespace(
         train_iters=None, train_samples=None, deduplicate_dataloader_across_context_parallel=True
     )
@@ -56,16 +58,16 @@ def test_length_probe_preserves_iteration_and_skips_restore(monkeypatch, iterati
 
 
 @pytest.mark.parametrize("field", ["train_iters", "train_samples"])
-def test_length_probe_rejects_explicit_horizon(field):
+def test_length_probe_rejects_explicit_horizon(field, run_config):
     args = SimpleNamespace(train_iters=None, train_samples=None)
-    setattr(args, field, 10)
+    setattr(run_config.train, field, 10)
     provider = Mock(supports_train_full_dataset=True)
     with pytest.raises(ValueError, match="cannot be combined"):
         training._get_train_full_dataset_sample_count(args, provider)
     provider.assert_not_called()
 
 
-def test_length_probe_rejects_provider_without_opt_in():
+def test_length_probe_rejects_provider_without_opt_in(run_config):
     provider = Mock(supports_train_full_dataset=False)
     with pytest.raises(ValueError, match="supports_train_full_dataset"):
         training._get_train_full_dataset_sample_count(SimpleNamespace(), provider)

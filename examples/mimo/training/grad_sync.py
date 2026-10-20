@@ -12,6 +12,7 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.training.global_vars import get_run_config
 
 # Sentinel set per modality submodule when this rank had that modality's input this step.
 _PARTICIPATED_ATTR = "_mimo_rank_processed_input"
@@ -201,10 +202,11 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
     mimo_model.config.grad_scale_func = lambda loss: loss
 
     if getattr(args, "overlap_grad_reduce", False):
+        cfg = get_run_config()
         assert mimo_model.config.no_sync_func is None, (
             "MIMO overlap owns config.no_sync_func; a second synchronization context "
             "cannot be composed safely"
         )
         mimo_model.config.no_sync_func = mimo_model.no_sync
-        if getattr(args, "align_grad_reduce", False):
+        if cfg.dist.align_grad_reduce:
             mimo_model.config.grad_sync_func = mimo_model.start_grad_sync
