@@ -38,7 +38,6 @@ from megatron.core.inference.utils import (
     get_attention_mask,
     get_language_model,
     model_eos_token_ids,
-    resolve_logits_dtype,
     set_decode_expert_padding,
     set_moe_metadata_sync,
 )
@@ -295,6 +294,10 @@ class TextGenerationController(MTPControllerMixin):
     # it) for batched `torch.isin`. Empty => the model declares a single eos.
     extra_eos_token_id_set: frozenset = frozenset()
 
+    # Inference consumes logits in fp32, so they are held and broadcast in fp32.
+    # The LM head emits them in fp32 when it can; otherwise they are upcast out of the model.
+    _logits_dtype: torch.dtype = torch.float32
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
@@ -318,11 +321,6 @@ class TextGenerationController(MTPControllerMixin):
         self._language_model = get_language_model(unwrap_model(self.inference_wrapped_model.model))
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
         self.vocab_size = self._language_model.vocab_size
-        # The LM head emits `inference_config.logits_dtype` when it can, else its own dtype; the
-        # buffers and broadcasts below follow it.
-        self._logits_dtype = resolve_logits_dtype(
-            self.inference_wrapped_model.model, self.model_config, inference_config.logits_dtype
-        )
 
         if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
             language_model = self._language_model
@@ -983,6 +981,8 @@ class TextGenerationController(MTPControllerMixin):
             self._select_async_sched_routing_buffer()
             logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
             # logits shape: [1, seq_len, vocab_size]
+        if logits is not None:
+            logits = logits.float()
 
         if not context.config.materialize_only_last_token_logits:
             assert logits_seq_len == input_ids.shape[1]
@@ -3925,7 +3925,7 @@ class TextGenerationController(MTPControllerMixin):
                 )
                 assert batch_prompt_tokens.shape[0] == batch_size, batch_prompt_tokens.shape[0]
                 if is_pipeline_last_stage(self.pp_group):
-                    logits = logits[:batch_size]
+                    logits = logits[:batch_size].float()
 
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
@@ -3941,8 +3941,6 @@ class TextGenerationController(MTPControllerMixin):
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
-
-                logits = logits.float()
 
                 # Turn on symmetric all reduce kernels for decode stage
                 # if we turned it off for prefill

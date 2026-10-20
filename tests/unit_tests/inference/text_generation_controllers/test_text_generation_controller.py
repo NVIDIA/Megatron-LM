@@ -8,7 +8,7 @@ import string
 import time
 from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Dict, List
 from unittest import mock
 
 import numpy as np
@@ -101,8 +101,6 @@ class TextGenerationControllerTestBase:
         transformer_impl: str = None,
         position_embedding_type: str = None,
         mtp_use_repeated_layer: bool = False,
-        logit_dtype: torch.dtype = None,
-        logits_dtype: Optional[torch.dtype] = torch.float32,  # InferenceConfig's default
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -173,7 +171,6 @@ class TextGenerationControllerTestBase:
                 hybrid_layer_pattern=hybrid_layer_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
-                logit_dtype=logit_dtype,
             ).cuda()
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
@@ -201,7 +198,6 @@ class TextGenerationControllerTestBase:
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=position_embedding_type,
-                logit_dtype=logit_dtype,
             ).cuda()
 
         model.eval()
@@ -228,7 +224,6 @@ class TextGenerationControllerTestBase:
                     max_requests=max_requests,
                     mamba_inference_state_config=mamba_inference_state_config,
                     sampling_backend=sampling_backend,
-                    logits_dtype=logits_dtype,
                 ),
             )
 
@@ -398,7 +393,6 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
     controller._enable_cuda_graph = False
-    controller._logits_dtype = torch.float32
     controller._sampling_backend = "torch"
     controller._async_sched_forward = AsyncScheduleForwardState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
@@ -4299,25 +4293,13 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize(
-        "pp_size, logits_dtype, logit_dtype, expected",
-        [
-            (1, torch.bfloat16, None, torch.bfloat16),
-            (1, torch.float32, None, torch.float32),
-            (1, None, torch.float32, torch.float32),
-            (2, torch.float32, None, torch.float32),
-        ],
-        ids=["pp1-compute-dtype", "pp1-fp32", "pp1-head-fp32", "pp2-fp32"],
-    )
-    def test_logits_keep_the_head_dtype(self, pp_size, logits_dtype, logit_dtype, expected):
-        """Inference holds logits in the dtype the head emits: `InferenceConfig.logits_dtype`,
-        or the head's own (`logit_dtype`) when that is None. The CUDA-graph buffer is
-        allocated in it, so fp32 logits are not narrowed to `params_dtype` by the controller
-        copy, and at PP 2 the first stage receives the broadcast in it. Generation with and
+    @pytest.mark.parametrize("pp_size", [1, 2], ids=["pp1", "pp2"])
+    def test_logits_are_fp32(self, pp_size):
+        """Inference holds logits in fp32: the CUDA-graph buffer is allocated in it and at PP 2
+        the first stage receives the broadcast in it. The bf16 head emits fp32 directly when TE
+        general_gemm is available and is upcast on the way in otherwise. Generation with and
         without the buffer samples the same tokens (both run the same eager kernels here).
         """
-        if expected is torch.float32 and te_general_gemm is None:
-            pytest.skip("fp32 logits from a bf16 head need Transformer Engine general_gemm")
         generated = {}
         for cuda_graph_impl in ("none", "local"):
             if generated:
@@ -4329,45 +4311,26 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 static=False,
                 use_training_random_init=True,
                 cuda_graph_impl=cuda_graph_impl,
-                logit_dtype=logit_dtype,
-                logits_dtype=logits_dtype,
             )
             controller = self.text_generation_controller
-            assert controller._logits_dtype == expected
-            # The head reads the same request from the context the wrapper passes it; the
-            # harness wraps bf16 models in Float16Module, which skips its fp32 upcast under an
-            # active engine.
             context = controller.inference_wrapped_model.inference_context
-            assert controller._language_model.inference_logits_dtype(context) == (
-                None if logits_dtype is None else expected
+            assert controller._language_model.inference_logits_dtype(context) is (
+                torch.float32 if te_general_gemm is not None else None
             )
             generated[cuda_graph_impl] = self._generate_dynamic()
-            assert controller._all_logits_cuda.dtype == expected
+            assert controller._all_logits_cuda.dtype is torch.float32
         assert generated["none"] == generated["local"]
 
     @pytest.mark.parametrize("static", [True, False])
     @pytest.mark.parametrize("tp_size", [1, 2])
     @pytest.mark.parametrize("pp_size", [1, 2])
-    @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float32])
-    def test_sampled_tokens_match_with_parallelism(self, static, tp_size, pp_size, logits_dtype):
-        """Verify that sampled tokens match across all parallel ranks, with the head keeping
-        its compute dtype or emitting fp32 logits (`InferenceConfig.logits_dtype`), which
-        every rank must keep through the pipeline broadcast."""
+    def test_sampled_tokens_match_with_parallelism(self, static, tp_size, pp_size):
+        """Verify that sampled tokens match across all parallel ranks."""
         if tp_size == 1 and pp_size == 1:
             pytest.skip(reason="Test requires model parallel size > 1.")
 
         if not static and not is_fa_min_version("2.7.3"):
             pytest.skip(reason="Need latest flash attn for dynamic batching")
-
-        if static and logits_dtype is not torch.float32:
-            pytest.skip(reason="StaticInferenceContext builds its own InferenceConfig")
-
-        expected = logits_dtype
-        if logits_dtype is torch.float32 and te_general_gemm is None:
-            if not static:
-                pytest.skip(reason="fp32 logits need Transformer Engine general_gemm")
-            # The static context's default falls back to the compute dtype.
-            expected = torch.bfloat16
 
         self.setup_model(
             dtype=torch.bfloat16,
@@ -4375,9 +4338,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             pipeline_model_parallel_size=pp_size,
             static=static,
             use_training_random_init=True,
-            logits_dtype=logits_dtype,
         )
-        assert self.text_generation_controller._logits_dtype == expected
 
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1

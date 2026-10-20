@@ -1439,7 +1439,6 @@ class DynamicInferenceEngine(AbstractEngine):
                                     ),
                                     depth=depth,
                                     cache_key=("mtp", n, depth),
-                                    logits_dtype=controller._logits_dtype,
                                 )
 
                         # KV-aware MTP graph: when the MTP KV cache is enabled, capture a graph
@@ -1467,7 +1466,6 @@ class DynamicInferenceEngine(AbstractEngine):
                                     depth=depth,
                                     mtp_inference_context=context,
                                     cache_key=("mtp_kv", n, depth),
-                                    logits_dtype=controller._logits_dtype,
                                 )
                                 context.mtp_metadata.advance_decode_step()
                             context.mtp_metadata.end_forward()
