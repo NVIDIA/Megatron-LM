@@ -36,6 +36,7 @@ def _loss(**kwargs):
     "requested,torch_enabled", [(False, False), (True, False), (False, True), (True, True)]
 )
 def test_aux_loss_dispatch(monkeypatch, supports_deterministic, requested, torch_enabled):
+    """Only the explicit request selects deterministic TE dispatch."""
     calls = []
     result = torch.tensor(0.01)
 
@@ -57,15 +58,14 @@ def test_aux_loss_dispatch(monkeypatch, supports_deterministic, requested, torch
         moe_utils, "te_supports_deterministic_moe_aux_loss", lambda: supports_deterministic
     )
     torch.use_deterministic_algorithms(torch_enabled)
-    effective = requested or torch_enabled
 
-    if effective and not supports_deterministic:
+    if requested and not supports_deterministic:
         with pytest.raises(ValueError, match="deterministic"):
             _loss(fused=True, deterministic=requested)
         assert not calls
     else:
         assert _loss(fused=True, deterministic=requested) is result
-        assert calls == [effective if supports_deterministic else None]
+        assert calls == [requested if supports_deterministic else None]
 
 
 @pytest.mark.internal
