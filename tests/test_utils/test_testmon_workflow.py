@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -757,3 +758,125 @@ def test_full_test_guards_override_selective_requests(
     summary = (tmp_path / "summary").read_text()
     assert f"| `unit_testmon_requested` | `{str(requested).lower()}` |" in summary
     assert "| `unit_testmon_eligible` | `false` |" in summary
+
+
+@pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
+def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
+    # Hosted runners provide zstd, but the existing GPU baselines use gzip.
+    zstd = tmp_path / "zstd"
+    zstd.write_text("#!/bin/sh\nprintf '1.5.7\\n'\n")
+    zstd.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+    result, compression = _run(
+        _step("_unit-tests.yml", "select", "cache-compression")["run"],
+        tmp_path,
+        {**environment, "RUNNER_TEMP": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    restore = _step("_unit-tests.yml", "select", "baseline")
+    assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    assert all(
+        "PATH" not in step.get("env", {})
+        for step in workflow["jobs"]["select"]["steps"]
+        if step.get("id") != "baseline"
+    )
+    probe = subprocess.run(
+        ["zstd", "--quiet", "--version"],
+        env={**environment, "PATH": compression["path"]},
+        text=True,
+        capture_output=True,
+    )
+    # The pinned cache action uses gzip when the version probe emits no output.
+    assert probe.stdout == probe.stderr == ""
+    assert probe.returncode != 0
+    assert (
+        subprocess.check_output(["zstd", "--quiet", "--version"], env=environment, text=True)
+        == "1.5.7\n"
+    )
+
+    bucket = "tests/unit_tests/test_example.py"
+    result, outputs = _run(
+        _step("_unit-tests.yml", "select", "result")["run"],
+        tmp_path,
+        {
+            "PLAN_MODE": "selected",
+            "HAS_TESTS": str(has_tests).lower(),
+            "PLAN_OUTCOME": "success",
+            "UPLOAD_OUTCOME": "success",
+            "PLAN_ARTIFACT": "plan",
+            "BUCKET": bucket,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs == {
+        "mode": "selected",
+        "has_tests": str(has_tests).lower(),
+        "plan_artifact": "plan",
+    }
+    assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
+    assert workflow["jobs"]["run"]["needs"] == "select"
+    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
+    needs = SimpleNamespace(
+        select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
+    )
+    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    context = {"needs": needs, "inputs": inputs}
+    assert eval(expression, {"__builtins__": {}}, context) == has_tests
+    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
+    mode = mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
+    assert eval(mode, {"__builtins__": {}}, context) == "preselected"
+
+    # Setup failures must fail on CPU rather than move selection onto the GPU.
+    needs.select.result = "failure"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    needs.select.result = "success"
+
+    # When CPU selection requires the full bucket, GPU execution receives full.
+    result, full = _run(
+        _step("_unit-tests.yml", "select", "result")["run"],
+        tmp_path,
+        {
+            "PLAN_MODE": "full",
+            "HAS_TESTS": "true",
+            "PLAN_OUTCOME": "success",
+            "UPLOAD_OUTCOME": "skipped",
+            "PLAN_ARTIFACT": "plan",
+            "BUCKET": bucket,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert full == {"mode": "full", "has_tests": "true", "plan_artifact": ""}
+    needs.select.outputs = SimpleNamespace(**full)
+    assert eval(expression, {"__builtins__": {}}, context)
+    assert eval(mode, {"__builtins__": {}}, context) == "full"
+
+    for platform in ("dgx_h100", "dgx_gb200"):
+        directory = tmp_path / f"unit-test-plan-{platform}"
+        directory.mkdir()
+        (directory / "plan.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "source_sha": "a" * 40,
+                    "bucket": bucket,
+                    "platform": platform,
+                    "mode": "selected",
+                    "phases": {"prod": [bucket] if has_tests else [], "experimental": []},
+                }
+            )
+        )
+    result, outputs = _run(
+        _step("cicd-main.yml", "Coverage", "coverage")["run"],
+        tmp_path,
+        {
+            "SELECTIVE": "true",
+            "H100_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "GB200_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "SOURCE_SHA": "a" * 40,
+        },
+    )
+    # Missing coverage is valid only when every bucket selected no tests.
+    assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
+    assert outputs == ({} if has_tests else {"has_coverage": "false"})

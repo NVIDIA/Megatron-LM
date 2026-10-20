@@ -1,10 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Generate a rank-zero Testmon baseline or select tests from a private copy."""
+"""Record Testmon baselines, select tests, and prepare CPU selection plans."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -120,8 +121,60 @@ def _run(args: argparse.Namespace) -> int:
     return 0 if result == 5 else result
 
 
+def _run_plan(argv: list[str]) -> int:
+    """Write a CPU selection or full-run decision and prepare it for execution."""
+    from testmon_plan import prepare, select
+
+    parser = argparse.ArgumentParser(description="Select tests on CPU or prepare a saved plan.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    select_parser = commands.add_parser("select")
+    select_parser.add_argument("--matched-key", required=True)
+    select_parser.add_argument("--pr-files-dir", type=Path, required=True)
+    select_parser.add_argument("--output", type=Path, required=True)
+    prepare_parser = commands.add_parser("prepare")
+    prepare_parser.add_argument("--plan", type=Path, required=True)
+    for child in (select_parser, prepare_parser):
+        child.add_argument("--cache-dir", type=Path, required=True)
+        child.add_argument("--bucket", required=True)
+        child.add_argument("--platform", required=True)
+        child.add_argument("--source-sha", required=True)
+    args = parser.parse_args(argv)
+    if args.command == "prepare":
+        try:
+            prepare(
+                json.loads(args.plan.read_text()),
+                args.cache_dir,
+                args.bucket,
+                args.platform,
+                args.source_sha,
+            )
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
+            print(f"Unit Testmon plan unavailable: {error}", file=sys.stderr)
+            return 2
+        return 0
+    plan = select(
+        Path.cwd(),
+        args.cache_dir,
+        args.bucket,
+        args.platform,
+        args.source_sha,
+        args.matched_key,
+        args.pr_files_dir,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(plan, sort_keys=True, indent=2) + "\n")
+    has_tests = plan["mode"] != "selected" or any(plan["phases"].values())
+    print(f"mode={plan['mode']}")
+    print(f"has_tests={str(has_tests).lower()}")
+    print(f"Unit Testmon CPU selection: {plan['reason']}", file=sys.stderr)
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="CPU commands: select --help, prepare --help. Distributed modes: --mode baseline|select.",
+    )
     parser.add_argument("--mode", choices=("baseline", "select"), required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--phase", choices=PHASES, required=True)
@@ -130,6 +183,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("select", "prepare"):
+        return _run_plan(argv)
     args = _parser().parse_args(argv)
     try:
         return _run(args)
