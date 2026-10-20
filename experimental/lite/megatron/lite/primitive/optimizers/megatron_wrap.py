@@ -86,6 +86,12 @@ def build_dist_opt_optimizer_config(
         args["optimizer_offload_fraction"] = offload
         args["overlap_cpu_optimizer_d2h_h2d"] = True
         args["optimizer_cpu_offload"] = True
+    if getattr(opt, "chunked_state_offload", None):
+        args["chunked_optimizer_state_offload"] = True
+        args["optimizer_state_offload_fraction"] = 1.0
+        args["optimizer_state_offload_chunk_size_mb"] = (
+            getattr(opt, "state_offload_chunk_size_mb", None) or 0
+        )
     if getattr(opt, "adam_beta1", None) is not None:
         args["adam_beta1"] = opt.adam_beta1
     if getattr(opt, "adam_beta2", None) is not None:

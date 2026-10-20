@@ -18,18 +18,15 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-_VLLM_ASYNC_SERVER_MODULE = (
-    "verl.workers.rollout.vllm_rollout.vllm_async_server"
-)
-_VLLM_ROLLOUT_CONSUMER_MODULE = (
-    "verl.workers.rollout.vllm_rollout.vllm_rollout"
-)
+_VLLM_ASYNC_SERVER_MODULE = "verl.workers.rollout.vllm_rollout.vllm_async_server"
+_VLLM_ROLLOUT_CONSUMER_MODULE = "verl.workers.rollout.vllm_rollout.vllm_rollout"
 _REGISTERED_HF_CONFIG_TYPES: set[str] = set()
 
 _VLLM_IMPORTABLE: bool | None = None
 
 
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+
 
 def _vllm_importable() -> bool:
     """Whether ``import vllm`` succeeds in THIS process.
@@ -72,10 +69,25 @@ def _register_opaque_hf_config() -> bool:
 
     from transformers import AutoConfig, PretrainedConfig
 
+    def __init__(self, **kwargs):
+        text = kwargs.get("text_config")
+        PretrainedConfig.__init__(self, **kwargs)
+        if isinstance(text, dict):
+            # Multimodal checkpoints (DS4.1) keep the decoder under ``text_config``;
+            # VERL and Transformers read it as a config object. Field-for-field copy:
+            # no RoPE standardization or validation of foreign keys.
+            config = PretrainedConfig()
+            config.__dict__.update(text)
+            self.text_config = config
+
+    def get_text_config(self, *args, **kwargs):
+        text = getattr(self, "text_config", None)
+        return text if isinstance(text, PretrainedConfig) else self
+
     config_cls = type(
         "MLiteOpaqueConfig",
         (PretrainedConfig,),
-        {"model_type": model_type},
+        {"model_type": model_type, "__init__": __init__, "get_text_config": get_text_config},
     )
     try:
         AutoConfig.register(model_type, config_cls)
@@ -121,10 +133,7 @@ def _install_vllm_thin_finder() -> bool:
     # own (container/SM90) vllm.
     if _vllm_site_ld_library_path(site):
         return False
-    if any(
-        getattr(finder, "_verl_mlite_vllm_thin_finder", False)
-        for finder in sys.meta_path
-    ):
+    if any(getattr(finder, "_verl_mlite_vllm_thin_finder", False) for finder in sys.meta_path):
         return False
     sys.meta_path.insert(0, _VllmThinFinder(site))
     return True
@@ -156,9 +165,7 @@ def _patch_transformers_vision2seq_alias() -> bool:
     except Exception:  # pragma: no cover - transformers internals moved
         lazy_cls = None
 
-    if lazy_cls is not None and not getattr(
-        lazy_cls, "_mlite_vision2seq_patched", False
-    ):
+    if lazy_cls is not None and not getattr(lazy_cls, "_mlite_vision2seq_patched", False):
         _orig_getattr = lazy_cls.__getattr__
 
         def _getattr_with_vision2seq_alias(self, name):
@@ -241,10 +248,7 @@ def _vllm_server_profile_env() -> dict[str, str]:
     pythonpath_entries = _vllm_site_pythonpath_prefixes(site) + [site]
     if pythonpath:
         pythonpath_entries.append(pythonpath)
-    result = {
-        "PYTHONPATH": os.pathsep.join(pythonpath_entries),
-        "PYTHONNOUSERSITE": "1",
-    }
+    result = {"PYTHONPATH": os.pathsep.join(pythonpath_entries), "PYTHONNOUSERSITE": "1"}
     ld_library_entries = _vllm_site_ld_library_path(site)
     if ld_library_entries:
         existing_ld = os.environ.get("LD_LIBRARY_PATH", "").strip()
@@ -280,19 +284,13 @@ class _RayActorClassProfile:
 
 
 def _patch_verl_vllm_headless_api_server_count() -> bool:
-    """Normalize vLLM's headless API server count for VERL's direct caller."""
-    if not os.environ.get("VERL_MLITE_VLLM_SITE", "").strip():
-        return False
+    """Normalize the direct API independently of optional overlay profiling."""
     if not _vllm_importable():
         return False
 
     server_module = importlib.import_module(_VLLM_ASYNC_SERVER_MODULE)
     original_run_headless = server_module.run_headless
-    if getattr(
-        original_run_headless,
-        "_verl_mlite_api_server_count_patch",
-        False,
-    ):
+    if getattr(original_run_headless, "_verl_mlite_api_server_count_patch", False):
         return False
 
     @wraps(original_run_headless)
@@ -359,11 +357,10 @@ def _patch_verl_vllm_device_uuid() -> bool:
     if getattr(original_get_device_uuid, "_verl_mlite_visible_device_patch", False):
         patched_get_device_uuid = original_get_device_uuid
     else:
+
         @wraps(original_get_device_uuid)
         def patched_get_device_uuid(device_id: int) -> str:
-            return original_get_device_uuid(
-                _normalize_vllm_visible_device_id(device_id)
-            )
+            return original_get_device_uuid(_normalize_vllm_visible_device_id(device_id))
 
         patched_get_device_uuid._verl_mlite_visible_device_patch = True
         utils.get_device_uuid = patched_get_device_uuid
@@ -485,14 +482,10 @@ def _trace_runtime_patch(stage: str, result: Any = None) -> None:
         return missing, "absent"
 
     alias, alias_source = raw_binding("AutoModelForVision2Seq")
-    replacement, replacement_source = raw_binding(
-        "AutoModelForImageTextToText"
-    )
+    replacement, replacement_source = raw_binding("AutoModelForImageTextToText")
     payload = {
         "alias_is_replacement": (
-            alias is not missing
-            and replacement is not missing
-            and alias is replacement
+            alias is not missing and replacement is not missing and alias is replacement
         ),
         "alias_source": alias_source,
         "changed": result,
@@ -504,10 +497,7 @@ def _trace_runtime_patch(stage: str, result: Any = None) -> None:
         "transformers_id": id(transformers) if transformers is not None else None,
         "transformers_loaded": transformers is not None,
     }
-    sys.stderr.write(
-        "VERL_MLITE_RUNTIME_PATCH_TRACE "
-        f"{json.dumps(payload, sort_keys=True)}\n"
-    )
+    sys.stderr.write("VERL_MLITE_RUNTIME_PATCH_TRACE " f"{json.dumps(payload, sort_keys=True)}\n")
     sys.stderr.flush()
 
 
@@ -628,6 +618,7 @@ def _recreate_dense_fp8_linear_params(model) -> int:
     the single post-load process_weights_after_loading matches cold load bit-for-bit
     (see module block above). Returns the count recreated."""
     import torch
+
     try:
         from vllm.model_executor.layers.linear import LinearBase
         from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
@@ -635,8 +626,10 @@ def _recreate_dense_fp8_linear_params(model) -> int:
         return 0
     recreated = 0
     for _name, layer in model.named_modules():
-        if not (isinstance(layer, LinearBase)
-                and isinstance(getattr(layer, "quant_method", None), Fp8LinearMethod)):
+        if not (
+            isinstance(layer, LinearBase)
+            and isinstance(getattr(layer, "quant_method", None), Fp8LinearMethod)
+        ):
             continue
         qm = layer.quant_method
         if not getattr(qm, "block_quant", False):
@@ -659,9 +652,7 @@ def _recreate_dense_fp8_linear_params(model) -> int:
         except Exception as _re:
             sys.stderr.write(f"VERL_MLITE_DENSE_RECREATE_SKIP {_name}: {_re!r}\n")
             sys.stderr.flush()
-            raise RuntimeError(
-                f"failed to recreate dense FP8 parameters for {_name}"
-            ) from _re
+            raise RuntimeError(f"failed to recreate dense FP8 parameters for {_name}") from _re
     return recreated
 
 
@@ -696,7 +687,8 @@ def _patch_verl_dsv4_prepare_recreates_dense() -> bool:
                 if n:
                     sys.stderr.write(
                         f"VERL_MLITE_DENSE_RECREATE recreated {n} dense FP8 linear "
-                        "param set(s) to checkpoint layout before resync load\n")
+                        "param set(s) to checkpoint layout before resync load\n"
+                    )
                     sys.stderr.flush()
         except Exception as exc:
             sys.stderr.write(f"VERL_MLITE_DENSE_RECREATE error: {exc!r}\n")
@@ -782,9 +774,7 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
     try:
         fp8_utils = importlib.import_module("verl.utils.vllm.vllm_fp8_utils")
         dsv4_utils = importlib.import_module("verl.utils.vllm.vllm_dsv4_fp8_utils")
-        rollout_utils = importlib.import_module(
-            "verl.workers.rollout.vllm_rollout.utils"
-        )
+        rollout_utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
     except Exception:
         return False
     original_prepare = getattr(fp8_utils, "prepare_quanted_weights_for_loading", None)
@@ -808,15 +798,11 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
         # updated directly by VERL's buffer path (or restored below).  Keeping
         # them out of the meta restore prevents ``copy_`` into a meta buffer
         # from silently discarding router state between IPC buckets.
-        SKIP_TENSORS.update(
-            {"tid2eid", "expert_bias", "e_score_correction_bias", "attn_sink"}
-        )
+        SKIP_TENSORS.update({"tid2eid", "expert_bias", "e_score_correction_bias", "attn_sink"})
         with set_current_vllm_config(model_runner.vllm_config):
             initialize_layerwise_reload(model)
         model._verl_mlite_ds4_layerwise_reload_active = True
-        sys.stderr.write(
-            "VERL_MLITE_DSV4_LAYERWISE_RELOAD initialized native vLLM reload\n"
-        )
+        sys.stderr.write("VERL_MLITE_DSV4_LAYERWISE_RELOAD initialized native vLLM reload\n")
         sys.stderr.flush()
         return _DSV4_LAYERWISE_RELOAD_STATE
 
@@ -830,8 +816,7 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
         try:
             with set_current_vllm_config(model_runner.vllm_config):
                 finalize_layerwise_processing(
-                    model_runner.model,
-                    model_runner.vllm_config.model_config,
+                    model_runner.model, model_runner.vllm_config.model_config
                 )
         finally:
             model_runner.model._verl_mlite_ds4_layerwise_reload_active = False
@@ -878,9 +863,7 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
                 if records is None:
                     records = []
                     model._verl_mlite_weight_fingerprint = records
-                records.extend(
-                    tensor_fingerprint_record(name, tensor) for name, tensor in weights
-                )
+                records.extend(tensor_fingerprint_record(name, tensor) for name, tensor in weights)
             # Layerwise reload may retain loader arguments across multiple IPC
             # callbacks.  The receiver reuses its communication buffer after
             # each callback, so persist every tensor until its logical layer is
@@ -912,9 +895,7 @@ def _patch_verl_dsv4_fp8_process_weights() -> bool:
     if not _vllm_importable():
         return False
     try:
-        utils = importlib.import_module(
-            "verl.workers.rollout.vllm_rollout.utils"
-        )
+        utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
     except Exception:
         return False
     ext_cls = getattr(utils, "vLLMColocateWorkerExtension", None)
@@ -998,11 +979,7 @@ class _SyncBucketProducer:
                 break
 
             layer_key = self._layer_cluster_key(name)
-            if (
-                bucket_meta
-                and bucket_layer_key is not None
-                and layer_key != bucket_layer_key
-            ):
+            if bucket_meta and bucket_layer_key is not None and layer_key != bucket_layer_key:
                 self._pending = (name, weight)
                 break
 
@@ -1120,7 +1097,9 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                 except queue.Empty:
                     if worker_future.done():
                         worker_future.result()
-                        raise RuntimeError("MLite weight prefetch stopped without a terminal result")
+                        raise RuntimeError(
+                            "MLite weight prefetch stopped without a terminal result"
+                        )
                     continue
 
                 kind, metadata_or_name, direct_weight, used_bytes, ready, is_last, held_slot = (
@@ -1149,9 +1128,7 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                 free_slots.put_nowait(held_slot)
                 held_slot = None
 
-                self.socket.send_pyobj(
-                    {"bucket_meta": metadata_or_name, "is_last": is_last}
-                )
+                self.socket.send_pyobj({"bucket_meta": metadata_or_name, "is_last": is_last})
                 self.socket.recv()
                 if is_last:
                     break
@@ -1172,12 +1149,7 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
 
 
 def _weight_sync_probe_enabled() -> bool:
-    return os.getenv("MLITE_WEIGHT_SYNC_PROBE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return os.getenv("MLITE_WEIGHT_SYNC_PROBE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _weight_sync_fingerprint_enabled() -> bool:
@@ -1342,6 +1314,152 @@ def _patch_bucketed_weight_sender() -> bool:
     return changed
 
 
+_DSV41_RELOAD_STATE = object()
+
+
+def _is_deepseek_v41(model: Any) -> bool:
+    return type(model).__name__.startswith("DeepseekV41")
+
+
+def _patch_verl_dsv41_layerwise_reload() -> bool:
+    """DS4.1 resync = vLLM's own checkpoint-format reload, nothing else.
+
+    The trainer exports release-format tensors (block-FP8 / MXFP4 codes and
+    scales, BF16/FP32 rest; ``deepseek_v41.lite.export``).  On the rollout side
+    VERL's FP8 refit would requantize or restage them; instead hand them to the
+    model's ``load_weights`` under vLLM's layerwise reload lifecycle, which
+    re-runs each layer's post-load processing and copies the result into the
+    live (CUDA-graph-captured) storage, exactly as a cold load produces it.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        quant_utils = importlib.import_module("verl.utils.vllm.vllm_quant_utils")
+        rollout_utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
+    except Exception:
+        return False
+    original_prepare = getattr(quant_utils, "prepare_quanted_weights_for_loading", None)
+    original_process = getattr(quant_utils, "process_quanted_weights_after_loading", None)
+    original_load = getattr(rollout_utils, "load_quanted_weights", None)
+    if original_prepare is None or original_process is None or original_load is None:
+        return False
+    if getattr(original_load, "_verl_mlite_dsv41", False):
+        return True
+
+    def _vllm_config(model):
+        for module in model.modules():
+            config = getattr(module, "vllm_config", None)
+            if config is not None:
+                return config
+        raise RuntimeError("DS4.1 layerwise reload: no vllm_config on the rollout model")
+
+    @wraps(original_prepare)
+    def prepare_quanted_weights_for_loading(model, *args, **kwargs):
+        if not _is_deepseek_v41(model):
+            return original_prepare(model, *args, **kwargs)
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+        with set_current_vllm_config(_vllm_config(model)):
+            initialize_layerwise_reload(model)
+        model._verl_mlite_dsv41_reload_active = True
+        # DS4.1 ``load_weights`` derives the mHC broadcast weight from layer
+        # ``start_layer``'s ``hc_attn_fn`` at the end of every call. VERL streams
+        # buckets, so a call can end while that layer is still staged (meta);
+        # derive it once after the whole reload instead, as a cold load does.
+        deferred = [
+            m for m in model.modules() if hasattr(type(m), "finalize_mhc_broadcast_weights")
+        ]
+        for module in deferred:
+            module.finalize_mhc_broadcast_weights = lambda: None
+        model._verl_mlite_dsv41_deferred = deferred
+        return _DSV41_RELOAD_STATE
+
+    @wraps(original_process)
+    def process_quanted_weights_after_loading(model, reload_state, *args, **kwargs):
+        if reload_state is not _DSV41_RELOAD_STATE:
+            return original_process(model, reload_state, *args, **kwargs)
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+
+        config = _vllm_config(model)
+        try:
+            with set_current_vllm_config(config):
+                finalize_layerwise_processing(model, config.model_config)
+                for module in getattr(model, "_verl_mlite_dsv41_deferred", ()):
+                    del module.finalize_mhc_broadcast_weights
+                    module.finalize_mhc_broadcast_weights()
+                model._verl_mlite_dsv41_deferred = ()
+        finally:
+            model._verl_mlite_dsv41_reload_active = False
+        # Layerwise staging tensors are dead now; return their blocks before the
+        # colocated trainer/rollout memory handoff.
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
+
+    @wraps(original_load)
+    def load_quanted_weights(weights, model_runner, is_drafter=False, *args, **kwargs):
+        model = model_runner.model
+        if is_drafter or not getattr(model, "_verl_mlite_dsv41_reload_active", False):
+            return original_load(weights, model_runner, is_drafter, *args, **kwargs)
+        # The receiver reuses its bucket buffer after this callback, while the
+        # layerwise loader may hold tensors until their layer is complete.
+        weights = [(name, tensor.clone()) for name, tensor in weights]
+        try:
+            from vllm.model_executor.model_loader.mtp_validation import (
+                disable_mtp_completeness_check,
+            )
+        except ImportError:
+            from contextlib import nullcontext as disable_mtp_completeness_check
+        from vllm.config import set_current_vllm_config
+
+        with set_current_vllm_config(_vllm_config(model)), disable_mtp_completeness_check():
+            return model.load_weights(weights)
+
+    for fn in (
+        prepare_quanted_weights_for_loading,
+        process_quanted_weights_after_loading,
+        load_quanted_weights,
+    ):
+        fn._verl_mlite_dsv41 = True
+    quant_utils.prepare_quanted_weights_for_loading = prepare_quanted_weights_for_loading
+    quant_utils.process_quanted_weights_after_loading = process_quanted_weights_after_loading
+    quant_utils.load_quanted_weights = load_quanted_weights
+    # utils.py binds load_quanted_weights at import time.
+    rollout_utils.load_quanted_weights = load_quanted_weights
+    return True
+
+
+def _patch_vllm_rollout_sleep_level() -> bool:
+    """Pin the hybrid rollout sleep level (``VERL_MLITE_ROLLOUT_SLEEP_LEVEL``).
+
+    Level 1 backs every GPU weight up to host; level 2 discards them and relies on
+    the actor sync. DS4.1 syncs only the trained tensors (Engram tables are host
+    memory and survive either level), so level 2 needs the dspark drafter kept via
+    vLLM ``sleep_preserve_parameter_names=['draft.*']``.
+    """
+    level = os.environ.get("VERL_MLITE_ROLLOUT_SLEEP_LEVEL", "").strip()
+    if level not in ("1", "2") or not _vllm_importable():
+        return False
+    try:
+        server = importlib.import_module("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    except Exception:
+        return False
+    cls = getattr(server, "vLLMHttpServer", None)
+    if cls is None or getattr(cls._sleep_hybrid, "_verl_mlite_level", None) == level:
+        return cls is not None
+
+    async def _sleep_hybrid(self):
+        await self.engine.sleep(level=int(level))
+        await self.engine.reset_encoder_cache()
+
+    _sleep_hybrid._verl_mlite_level = level
+    cls._sleep_hybrid = _sleep_hybrid
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_transformers_vision2seq_alias()
@@ -1368,6 +1486,12 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
     result = _patch_verl_dsv4_native_layerwise_reload()
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
+    result = _patch_verl_dsv41_layerwise_reload()
+    _trace_runtime_patch("08d.verl_dsv41_layerwise_reload", result)
+    result = _patch_vllm_rollout_sleep_level()
+    _trace_runtime_patch("08e.vllm_rollout_sleep_level", result)
+    result = _patch_verl_vllm_headless_api_server_count()
+    _trace_runtime_patch("08f.headless_api_server_count", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")

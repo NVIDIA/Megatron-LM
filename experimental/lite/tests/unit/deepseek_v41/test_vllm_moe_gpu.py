@@ -9,7 +9,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytestmark = [pytest.mark.gpus, pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')]
+pytestmark = [
+    pytest.mark.gpus(1, min_architecture="blackwell"),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA'),
+]
 
 
 def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):

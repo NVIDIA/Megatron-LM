@@ -6,6 +6,7 @@ from megatron.lite.model.deepseek_v41.lite.protocol import (
     build_model_config,
     forward_step,
     load_hf_weights,
+    unpack_forward_output,
     validate_impl_cfg_keys,
 )
 

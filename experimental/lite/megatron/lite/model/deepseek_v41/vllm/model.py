@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.utils import ensure_params_ready
 from megatron.lite.model.deepseek_v41.lite.components.block import DS41Block
 from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model as NativeModel
 
@@ -66,6 +67,9 @@ class DeepseekV41Model(NativeModel):
             mixes.aggregate = aggregate.__get__(mixes, type(mixes))
 
     def forward(self, *args, labels=None, loss_mask=None, calculate_entropy=False, **kwargs):
+        # Keep the module pipeline, but publish buckets also for functional
+        # mHC/expert reads which bypass their owning leaf module's pre-hook.
+        ensure_params_ready(self.parameters())
         if labels is None or not self.layout.has_head:
             return super().forward(
                 *args,

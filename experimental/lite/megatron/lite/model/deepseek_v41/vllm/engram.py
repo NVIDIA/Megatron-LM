@@ -62,7 +62,10 @@ class _Post(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         with torch.enable_grad(), torch.autocast(device_type=grad.device.type, enabled=False):
-            leaves = [x.detach().requires_grad_() for x in ctx.saved_tensors]
+            leaves = [
+                (x.float() if i >= 2 else x).detach().requires_grad_()
+                for i, x in enumerate(ctx.saved_tensors)
+            ]
             output = reference(*leaves, ctx.eps, ctx.mask)
             gradients = torch.autograd.grad(output, leaves, grad)
         return *gradients, None, None
