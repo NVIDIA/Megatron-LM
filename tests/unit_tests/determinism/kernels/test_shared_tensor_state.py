@@ -15,6 +15,9 @@ from tests.unit_tests.determinism.kernels.harness import (
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.test_stateful_module import (  # pylint: disable=unused-import
+    te_rng_tracker,
+)
 
 
 class _Region(nn.Module):

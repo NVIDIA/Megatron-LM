@@ -15,6 +15,25 @@ from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 
 
+@pytest.fixture
+def te_rng_tracker(monkeypatch):
+    """Provide seeded graph-safe RNG without leaking MCore or TE tracker state."""
+    te_distributed = pytest.importorskip("transformer_engine.pytorch.distributed")
+    from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+    from megatron.core.tensor_parallel import random as rng
+
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    previous = te_distributed.get_all_rng_states()
+    tracker = TECudaRNGStatesTracker()
+    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER", tracker)
+    monkeypatch.setattr(rng, "_CUDA_RNG_STATE_TRACKER_INITIALIZED", True)
+    try:
+        tracker.add(rng._MODEL_PARALLEL_RNG_TRACKER_NAME, 123)
+        yield tracker
+    finally:
+        te_distributed.set_all_rng_states(previous)
+
+
 @pytest.fixture(autouse=True)
 def local_device():
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
@@ -196,6 +215,9 @@ def test_real_graph_slots_preserve_two_outstanding_microbatches(backend, dtype):
             torch.testing.assert_close(x.grad, y.grad)
         for p, q in zip(actual.parameters(), reference.parameters()):
             torch.testing.assert_close(p.grad, q.grad)
+    pending.clear()
+    del hidden, state, expected, ref_state, loss, ref_loss
+    graphs.close()
 
 
 def test_graph_rejects_changed_profile_and_unused_differentiable_output():
@@ -207,6 +229,9 @@ def test_graph_rejects_changed_profile_and_unused_differentiable_output():
     hidden, _ = graphs.run(x, {})
     with pytest.raises(RuntimeError, match="Every differentiable"):
         hidden.sum().backward()
+    graphs.abort()
+    del hidden, _
+    graphs.close()
 
 
 def test_te_graph_rejects_legacy_rng_before_capture_and_recovers(te_rng_tracker):

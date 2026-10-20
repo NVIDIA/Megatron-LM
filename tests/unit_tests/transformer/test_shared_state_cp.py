@@ -13,6 +13,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.test_stateful_module import (  # pylint: disable=unused-import
+    te_rng_tracker,
+)
 
 
 @pytest.fixture
