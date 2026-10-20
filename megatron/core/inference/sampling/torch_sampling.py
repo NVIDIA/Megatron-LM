@@ -232,8 +232,8 @@ class TorchSampling(Sampling):
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
             no_top_k, no_top_p: Batch-level dispatch flags (part of the shared kernel
-                contract); ignored here since the exact per-bucket sort already handles
-                any top-k / top-p combination.
+                contract). Used only to gate the all-greedy argmax shortcut; the exact
+                per-bucket sort otherwise handles any top-k / top-p combination.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
