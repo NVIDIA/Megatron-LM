@@ -3215,11 +3215,10 @@ def megatron_rl_inference_mode(
 
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
-    # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
-    # as it tries to reuse frequences tensors cached in inference mode.
-    has_lru_cache = rotary_module is not None and hasattr(rotary_module.forward, "cache_parameters")
-    if has_lru_cache:
-        rotary_module.forward.cache_clear()
+    # Release ordinary embeddings while retaining constants used by live CUDA graphs.
+    clear_rotary_cache = getattr(rotary_module, "clear_cache", None)
+    if clear_rotary_cache is not None:
+        clear_rotary_cache()
 
     with torch.no_grad():
 
@@ -3297,8 +3296,8 @@ def megatron_rl_inference_mode(
         training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
         training_lang_module.train()
 
-        if has_lru_cache:
-            rotary_module.forward.cache_clear()
+        if clear_rotary_cache is not None:
+            clear_rotary_cache()
 
         logger.debug(f"[{dist.get_rank()}] Exiting inference mode")
 

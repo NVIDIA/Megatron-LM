@@ -12,17 +12,14 @@ if TYPE_CHECKING:
 
 import logging
 import math
-from functools import lru_cache
+from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import (  # for backward compatibility; pylint: disable=unused-import
-    _apply_rotary_pos_emb_bshd,
-    _apply_rotary_pos_emb_thd,
-    _rotate_half,
-    apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
 from megatron.core.utils import deprecate_inference_params, internal_api
@@ -31,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = ['RotaryEmbedding', 'MultimodalRotaryEmbedding']
+
+
+@dataclass(frozen=True)
+class _RotaryCacheKey:
+    seq_len: int
+    offset: int
+    packed_seq: bool
+    cp_group: Optional[torch.distributed.ProcessGroup]
+    device: torch.device
+    dtype: torch.dtype
 
 
 class RotaryEmbedding(nn.Module):
@@ -54,6 +61,9 @@ class RotaryEmbedding(nn.Module):
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
             Defaults to None.
     """
+
+    # Maximum number of entries not retained by CUDA graphs.
+    CACHE_CAPACITY = 32
 
     def __init__(
         self,
@@ -88,6 +98,66 @@ class RotaryEmbedding(nn.Module):
             if cp_group is not None
             else parallel_state.get_context_parallel_group(check_initialized=False)
         )
+        self._embedding_cache: OrderedDict[_RotaryCacheKey, tuple[Tensor, float]] = OrderedDict()
+        self._cuda_graph_cache_keys: set[_RotaryCacheKey] = set()
+
+    def clear_cache(self, *, include_cuda_graphs: bool = False) -> None:
+        """Release cached embeddings, retaining constants used by captured CUDA graphs.
+
+        Args:
+            include_cuda_graphs: Also release captured constants. Callers must destroy all
+                graphs using this embedding before requesting this.
+        """
+        if include_cuda_graphs:
+            self._embedding_cache.clear()
+            self._cuda_graph_cache_keys.clear()
+        else:
+            for key in list(self._embedding_cache):
+                if key not in self._cuda_graph_cache_keys:
+                    del self._embedding_cache[key]
+
+    def _get_emb_and_scale(self, max_seq_len: int, offset: int) -> tuple[Tensor, float]:
+        """Compute an uncached embedding and its attention scaling factor."""
+        return self.get_emb(max_seq_len, offset), 1.0
+
+    def _get_cached_emb(
+        self,
+        max_seq_len: int,
+        offset: int,
+        packed_seq: bool,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> tuple[Tensor, float]:
+        """Share constants across calls without allowing graph references to be evicted."""
+        if cp_group is None:
+            cp_group = self.cp_group
+        # CPU initialization defers frequency tensors' transfer until the first forward.
+        device = self.inv_freq.device
+        if device.type == "cpu":
+            device = torch.device("cuda", torch.cuda.current_device())
+        key = _RotaryCacheKey(
+            max_seq_len, offset, packed_seq, cp_group, device, self.inv_freq.dtype
+        )
+        capturing = torch.cuda.is_current_stream_capturing()
+        if key not in self._embedding_cache:
+            # These constants must also be usable by training backward after rollout.
+            # An inference tensor cannot be saved for backward, even without gradients.
+            with torch.inference_mode(False), torch.no_grad():
+                emb, scale = self._get_emb_and_scale(max_seq_len, offset)
+                if cp_group is not None and cp_group.size() > 1 and not packed_seq:
+                    emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            self._embedding_cache[key] = (emb, scale)
+        self._embedding_cache.move_to_end(key)
+        if capturing:
+            # A cache hit during capture must retain the pre-existing warmup tensor too.
+            self._cuda_graph_cache_keys.add(key)
+        # Bound ordinary entries as before. Captured constants live until explicitly
+        # released with their graphs, or until this embedding instance is destroyed.
+        if len(self._embedding_cache) > self.CACHE_CAPACITY + len(self._cuda_graph_cache_keys):
+            for oldest_key in self._embedding_cache:
+                if oldest_key not in self._cuda_graph_cache_keys:
+                    del self._embedding_cache[oldest_key]
+                    break
+        return self._embedding_cache[key]
 
     def _apply_scaling(
         self,
@@ -178,7 +248,6 @@ class RotaryEmbedding(nn.Module):
         emb = emb[:, None, None, :]
         return emb
 
-    @lru_cache(maxsize=32)
     @internal_api
     def forward(
         self,
@@ -199,15 +268,7 @@ class RotaryEmbedding(nn.Module):
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
-        emb = self.get_emb(max_seq_len, offset)
-        if cp_group is None:
-            cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
-
-        return emb
+        return self._get_cached_emb(max_seq_len, offset, packed_seq, cp_group)[0]
 
     def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
         """Materialize cached cos/sin tensors for ``[seq_len, ..., dim]``."""
