@@ -1460,8 +1460,41 @@ def _patch_vllm_rollout_sleep_level() -> bool:
     return True
 
 
+def _patch_verl_padding_helpers() -> bool:
+    """Reuse VERL's pure-Torch padding helpers when FlashAttention is absent."""
+    try:
+        module = importlib.import_module("verl.utils.attention_utils")
+    except ModuleNotFoundError as error:
+        if error.name and error.name.startswith("verl"):
+            return False
+        raise
+    original = module._get_attention_functions
+    if getattr(original, "_verl_mlite_padding", False):
+        return True
+
+    @wraps(original)
+    def functions():
+        try:
+            return original()
+        except ModuleNotFoundError as error:
+            if error.name not in ("flash_attn", "flash_attn.bert_padding"):
+                raise
+            # VERL already vendors these device-independent Torch operations.
+            helpers = importlib.import_module("verl.utils.npu_flash_attn_utils")
+            return tuple(
+                getattr(helpers, name)
+                for name in ("index_first_axis", "pad_input", "rearrange", "unpad_input")
+            )
+
+    functions._verl_mlite_padding = True
+    module._get_attention_functions = functions
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
+    result = _patch_verl_padding_helpers()
+    _trace_runtime_patch("00b.verl_padding_helpers", result)
     result = _patch_transformers_vision2seq_alias()
     _trace_runtime_patch("01.transformers_alias", result)
     result = _register_opaque_hf_config()
