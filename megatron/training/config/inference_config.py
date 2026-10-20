@@ -147,6 +147,10 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
     "torch" with a warning if the flashinfer package is not installed."""
 
+    inference_dynamic_batching_fp64_sampling_noise: bool = False
+    """Draw the torch sampling backend's race noise from float64 uniforms, so tokens far below a
+    row's top token are drawn at their softmax rate. Requires the torch sampling backend."""
+
     offset_sampling_seed_by_dp_rank: bool = True
     """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
     generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
@@ -469,6 +473,7 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
+            fp64_sampling_noise=self.inference_dynamic_batching_fp64_sampling_noise,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,

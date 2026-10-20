@@ -50,3 +50,31 @@ def test_request_noise_replays_and_preserves_logical_coordinates():
     fill_request_seed_noise(changed, [0, 0, 0, None, 123], [19] * 5)
     for row in (0, 1, 2):
         assert not torch.equal(full[row], changed[row])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fp64_request_noise_replays_and_preserves_logical_coordinates():
+    seeds = [0, 1 << 32, (1 << 63) - 1, None, 123]
+    positions = [(1 << 32) + 19, 19, 20, 0, 19]
+
+    def noise():
+        result = torch.full((5, 4099), -1.0, device="cuda", dtype=torch.float64)
+        fill_request_seed_noise(result, seeds, positions)
+        return result
+
+    reference, _ = assert_replays_bit_exact(
+        noise, (), backward=False, contention=True, what="request_seed_noise_fp64"
+    )
+    full = reference["out"]
+    assert torch.equal(full[3], torch.full_like(full[3], -1.0))
+    seeded = full[[0, 1, 2, 4]]
+    # 52-bit midpoint uniforms: noise lies in [-log(1 - 2^-53), 52 log 2 + log 2].
+    assert (seeded >= 1.1e-16).all() and (seeded <= 36.8).all()
+    for row in (0, 1, 2, 4):
+        alone = torch.empty((1, 4099), device="cuda", dtype=torch.float64)
+        fill_request_seed_noise(alone, [seeds[row]], [positions[row]])
+        assert torch.equal(full[row], alone[0])
+    # The fp32 stream is unchanged by the fp64 option.
+    narrow = torch.full((5, 4099), -1.0, device="cuda")
+    fill_request_seed_noise(narrow, seeds, positions)
+    assert not torch.equal(narrow[0].double(), full[0])

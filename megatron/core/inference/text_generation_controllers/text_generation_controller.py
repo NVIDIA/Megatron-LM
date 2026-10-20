@@ -448,7 +448,9 @@ class TextGenerationController(MTPControllerMixin):
                 enable_cuda_graph=self._enable_cuda_graph,
             )
         else:
-            self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
+            self._sampling: Sampling = TorchSampling(
+                self.sampling_rng, self.vocab_size, fp64_noise=context.config.fp64_sampling_noise
+            )
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
