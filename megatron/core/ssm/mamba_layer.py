@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Union
 
@@ -16,6 +17,7 @@ try:
 except ImportError:
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -118,6 +120,11 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         )
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        self.recompute_mamba_mixer = (
+            self.config.recompute_granularity == "selective"
+            and self.config.recompute_modules is not None
+            and "mamba" in self.config.recompute_modules
+        )
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the mamba layer for cudagraphs."""
@@ -240,6 +247,51 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
         return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
+    def _run_mamba_mixer(
+        self,
+        hidden_states: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        packed_seq_params: Optional[PackedSeqParams],
+        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Run the Mamba mixer, checkpointing it when selective recompute is enabled."""
+        mixer_kwargs = {
+            "inference_context": inference_context,
+            "packed_seq_params": packed_seq_params,
+        }
+        if packed_sequence_cp_metadata is not None:
+            mixer_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+
+        if self.recompute_mamba_mixer and self.training and inference_context is None:
+            # CUDA graphs capture the mixer directly; nested activation checkpointing cannot
+            # run inside graph warmup/capture. Keep the TE path consistent with
+            # tensor_parallel.checkpoint, which has the same bypass internally.
+            from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+            if is_graph_warmup() or is_graph_capturing():
+                return self.mixer(hidden_states, **mixer_kwargs)
+
+            if self.config.fp8 or self.config.fp4:
+                # TE checkpointing enters the activation-recompute phase so quantized
+                # amax/scaling state is not updated again during the backward recompute.
+                # Import here to avoid a circular import.
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                return te_checkpoint(
+                    self.mixer,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.tp_group,
+                    hidden_states,
+                    **mixer_kwargs,
+                )
+
+            return tensor_parallel.checkpoint(
+                functools.partial(self.mixer, **mixer_kwargs), False, hidden_states
+            )
+
+        return self.mixer(hidden_states, **mixer_kwargs)
+
     def _get_residual_connection(self):
         """Return an optional architecture-owned connection around the Mamba mixer."""
 
@@ -299,19 +351,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                if packed_sequence_cp_metadata is None:
-                    mixer_out_with_bias = self.mixer(
-                        hidden_states,
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                    )
-                else:
-                    mixer_out_with_bias = self.mixer(
-                        hidden_states,
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                        packed_sequence_cp_metadata=packed_sequence_cp_metadata,
-                    )
+                mixer_out_with_bias = self._run_mamba_mixer(
+                    hidden_states, inference_context, packed_seq_params, packed_sequence_cp_metadata
+                )
 
             hidden_states = self._apply_mixer_update(
                 mixer_out_with_bias, residual, connection_state, recompute_context=recompute_context
