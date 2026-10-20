@@ -295,6 +295,9 @@ class TextGenerationController(MTPControllerMixin):
     # it) for batched `torch.isin`. Empty => the model declares a single eos.
     extra_eos_token_id_set: frozenset = frozenset()
 
+    # Whether the model's LM head reads `inference_context.config.logits_dtype` (T5 does not).
+    _model_reads_logits_dtype: bool = True
+
     def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
         self.model_config = self.inference_wrapped_model.model.config
@@ -318,9 +321,12 @@ class TextGenerationController(MTPControllerMixin):
         self._language_model = get_language_model(unwrap_model(self.inference_wrapped_model.model))
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
         self.vocab_size = self._language_model.vocab_size
-        # Logits live in the dtype the LM head emits, not necessarily `params_dtype`.
+        # The LM head emits `inference_config.logits_dtype` when it can, else its own dtype; the
+        # buffers and broadcasts below follow it.
         self._logits_dtype = resolve_logits_dtype(
-            self.inference_wrapped_model.model, self.model_config.params_dtype
+            self.inference_wrapped_model.model,
+            self.model_config,
+            inference_config.logits_dtype if self._model_reads_logits_dtype else None,
         )
 
         if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):

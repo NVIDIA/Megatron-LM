@@ -863,7 +863,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
         logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            hidden_states,
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            output_dtype=self.inference_logits_dtype(inference_context),
         )
 
         # Apply MuP output scaling to logits

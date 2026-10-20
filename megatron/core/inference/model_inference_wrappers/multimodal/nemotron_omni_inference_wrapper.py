@@ -352,7 +352,6 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             num_frames=inference_input.get("num_frames"),
             inference_context=self.inference_context,
             runtime_gather_output=True,
-            **self._model_forward_kwargs,
         )
         return output[0] if isinstance(output, tuple) else output
 

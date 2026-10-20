@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -552,7 +553,7 @@ class Float16Module(MegatronModule):
     def set_input_tensor(self, input_tensor):  # pylint: disable=missing-function-docstring
         return self.module.set_input_tensor(input_tensor)
 
-    def forward(self, *inputs, fp32_output=True, **kwargs):
+    def forward(self, *inputs, fp32_output=None, **kwargs):
         """
         Execute the wrapped module in model precision and optionally upcast outputs to fp32.
 
@@ -565,10 +566,10 @@ class Float16Module(MegatronModule):
         Args:
             *inputs: Positional inputs forwarded to the wrapped module (converted to fp16/bf16 on
                 the pipeline first stage).
-            fp32_output (bool, keyword-only): If True (default), upcast outputs to fp32 on the
-                pipeline last stage. Has no effect on non-last stages. Set to False to keep outputs
-                in model precision when downstream consumers expect half precision or to avoid
-                extra casts.
+            fp32_output (bool, keyword-only): If True, upcast outputs to fp32 on the pipeline
+                last stage. Has no effect on non-last stages. Set to False to keep outputs in
+                model precision when downstream consumers expect half precision or to avoid
+                extra casts. None (default) upcasts unless an inference engine is active.
             **kwargs: Keyword arguments forwarded to the wrapped module.
 
         Returns:
@@ -589,6 +590,9 @@ class Float16Module(MegatronModule):
         if is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(pp_group):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
+        if fp32_output is None:
+            # Inference keeps logits in the LM head's output dtype; the upcast only serves training.
+            fp32_output = not InferenceMode.is_active()
         if (
             is_vp_last_stage(self.vp_stage, self.vp_size)
             and is_pp_last_stage(pp_group)
