@@ -25,8 +25,7 @@ def should_use_modelopt_config(args) -> bool:
     """Return whether CLI inputs require the ModelOpt-aware model configuration.
 
     ModelOpt is used when ``--modelopt-enabled`` is set, for a checkpoint with ModelOpt
-    state, or for distillation. Without one of these, layer-spec options are ignored and
-    training options that need a ModelOpt model raise.
+    state, or for distillation.
     """
     from megatron.post_training.checkpointing import has_modelopt_state
     from megatron.training import print_rank_0
@@ -38,36 +37,6 @@ def should_use_modelopt_config(args) -> bool:
         return True
     if getattr(args, "export_kd_teacher_load", None) is not None:
         return True
-
-    spec_options = {
-        "--export-te-mcore-model": getattr(args, "export_te_mcore_model", False),
-        "--export-default-te-spec": getattr(args, "export_default_te_spec", False),
-        "--export-force-local-attention": getattr(args, "export_force_local_attention", False),
-        "--export-real-quant-cfg": getattr(args, "export_real_quant_cfg", "None") != "None",
-    }
-    ignored = [flag for flag, is_set in spec_options.items() if is_set]
-    if ignored:
-        print_rank_0(
-            f"WARNING: ignoring {', '.join(ignored)}: not a ModelOpt run (no ModelOpt "
-            "checkpoint, teacher, or --modelopt-enabled)."
-        )
-
-    refinements = {
-        "--export-kd-teacher-model-config": getattr(args, "export_kd_teacher_model_config", None)
-        is not None,
-        "--export-kd-teacher-ckpt-format": getattr(args, "export_kd_teacher_ckpt_format", None)
-        is not None,
-        "--export-kd-cfg": getattr(args, "export_kd_cfg", None) is not None,
-        "--qad-train-target": getattr(args, "qad_train_target", None) is not None,
-        "--freeze-base-for-mtp": getattr(args, "freeze_base_for_mtp", False),
-        "--lsq-scale-lr": getattr(args, "lsq_scale_lr", None) is not None,
-    }
-    misplaced = [flag for flag, is_set in refinements.items() if is_set]
-    if misplaced:
-        raise ValueError(
-            f"{', '.join(misplaced)} only apply to ModelOpt runs, which need a checkpoint "
-            "with ModelOpt state, --export-kd-teacher-load, or --modelopt-enabled."
-        )
     return False
 
 

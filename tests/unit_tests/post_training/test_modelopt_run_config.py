@@ -30,25 +30,18 @@ def test_modelopt_config_selection_from_explicit_options(option):
 
 
 @pytest.mark.parametrize(
-    "option,flag",
-    [
-        ({"qad_train_target": "base"}, "--qad-train-target"),
-        ({"lsq_scale_lr": 1e-4}, "--lsq-scale-lr"),
-        ({"export_kd_cfg": "/kd.yaml"}, "--export-kd-cfg"),
-    ],
-)
-def test_modelopt_refinement_without_modelopt_run_is_rejected(option, flag):
-    args = _make_args(**option)
-    args.load = None
-    with pytest.raises(ValueError, match=flag):
-        modelopt_utils.should_use_modelopt_config(args)
-
-
-@pytest.mark.parametrize(
     "option",
     [
         {"export_te_mcore_model": True},
         {"export_default_te_spec": True},
+        {"export_force_local_attention": True},
+        {"export_real_quant_cfg": "fp8_real_quant"},
+        {"export_kd_teacher_model_config": "/teacher.yaml"},
+        {"export_kd_teacher_ckpt_format": "torch_dist"},
+        {"export_kd_cfg": "/kd.yaml"},
+        {"qad_train_target": "base"},
+        {"freeze_base_for_mtp": True},
+        {"lsq_scale_lr": 1e-4},
         {"qk_l2_norm": True},
         {"enable_gpt_oss": True},
         {"export_offline_model": True},
