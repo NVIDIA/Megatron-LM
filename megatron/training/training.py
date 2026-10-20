@@ -1366,6 +1366,12 @@ def num_floating_point_operations(
         return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
 
     # Main entrypoint for FLOPs calculation.
+    if getattr(args, 'dsv4_version', 'v4') == 'v4.1':
+        from megatron.training.models.deepseek_v41 import estimate_v41_training_flops
+
+        return estimate_v41_training_flops(
+            args, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+        )
     if is_hybrid_model(args):
         # Calculate the number of each type of layer.
         from operator import itemgetter
@@ -3605,6 +3611,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
     """Return tracker slots and active CSA indexer modules for loss logging."""
     tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
+    if getattr(args, 'dsv4_version', 'v4') == 'v4.1':
+        return tracker_layers, len(args.csa2_index_source_layers)
     if args.csa_compress_ratios is None:
         return tracker_layers, None
 
