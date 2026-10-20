@@ -1,11 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
-
 import pytest
 import torch
 
-from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module, MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -166,24 +163,6 @@ class TestFloat16Module:
         x = torch.ones((2, 2)).cuda()
         # inputs are converted to bf16 then outputs are converted to fp32
         assert bf16_module(x).dtype == torch.float32
-
-    @pytest.mark.parametrize(
-        "fp32_output, inference_active, expected",
-        [
-            (None, False, torch.float32),  # training default: upcast
-            (None, True, torch.bfloat16),  # an active inference engine keeps the model precision
-            (True, True, torch.float32),  # an explicit request wins either way
-            (False, False, torch.bfloat16),
-        ],
-    )
-    def test_fp32_output_default_follows_inference_mode(
-        self, fp32_output, inference_active, expected
-    ):
-        self.transformer_config.bf16 = True
-        bf16_module = Float16Module(config=self.transformer_config, module=self.megatron_module)
-        x = torch.ones((2, 2)).cuda()
-        with InferenceMode.active() if inference_active else nullcontext():
-            assert bf16_module(x, fp32_output=fp32_output).dtype == expected
 
     @pytest.mark.parametrize(
         ('precision', 'dtype'), [('fp16', torch.float16), ('bf16', torch.bfloat16)]

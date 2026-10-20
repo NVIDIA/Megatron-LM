@@ -621,7 +621,6 @@ class MTPControllerMixin:
                         if context.using_cuda_graph_this_step()
                         else None
                     ),
-                    logits_dtype=self._logits_dtype,
                     **mtp_context_kwarg,
                 )
                 if mtp_kv_cache_on:
@@ -633,7 +632,7 @@ class MTPControllerMixin:
                 mtp_logits = mtp_logits[:active_request_count]
 
                 # mtp_logits: [active_request_count, 1, vocab_size]
-                mtp_logits_2d = mtp_logits.squeeze(1)  # [active_request_count, vocab_size]
+                mtp_logits_2d = mtp_logits.squeeze(1).float()  # [active_request_count, vocab]
 
             # Broadcast MTP logits across pipeline stages.
             if self.model_is_pipeline_parallel:
@@ -766,12 +765,11 @@ class MTPControllerMixin:
                             if not mtp_forward_eager
                             else None
                         ),
-                        logits_dtype=self._logits_dtype,
                         **mtp_context_kwarg,
                     )
                     if mtp_context_kwarg:
                         context.mtp_metadata.advance_decode_step()
-                    mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
+                    mtp_logits_2d = mtp_logits.squeeze(1).float()  # [padded_count, vocab_size]
 
                 # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
                 if self.model_is_pipeline_parallel:

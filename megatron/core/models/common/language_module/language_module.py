@@ -338,16 +338,15 @@ class LanguageModule(MegatronModule):
             return self.output_layer.weight
         return None
 
+    def _inference_lm_head_dtype(self) -> Optional[torch.dtype]:
+        """fp32 when `output_layer` can emit it, else `None` for its own dtype."""
+        return torch.float32 if lm_head_can_emit(self.config, torch.float32) else None
+
     def inference_logits_dtype(self, inference_context) -> Optional[torch.dtype]:
         """Output dtype to ask of `output_layer` under `inference_context`.
 
         Returns `None` for the head's own dtype."""
-        if inference_context is None:
-            return None
-        requested = inference_context.config.logits_dtype
-        if requested is None or not lm_head_can_emit(self.config, requested):
-            return None
-        return requested
+        return None if inference_context is None else self._inference_lm_head_dtype()
 
     @torch.inference_mode()
     def compute_mtp_single_step(
@@ -359,7 +358,6 @@ class LanguageModule(MegatronModule):
         eager: bool = False,
         cache_key=None,
         mtp_inference_context=None,
-        logits_dtype: Optional[torch.dtype] = None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
@@ -377,8 +375,6 @@ class LanguageModule(MegatronModule):
                 function signature. Explictly including them removes the need for a monkey-patch,
                 and makes it straightforward to call the same method with and without eager mode.
                 These arguments are consumed by `CudaGraphManager`, if it exists.
-            logits_dtype (torch.dtype, optional): Output dtype to ask of the LM head;
-                the caller resolves it (`resolve_logits_dtype`). None keeps the head's own dtype.
 
         Returns:
             tuple: (new_hidden_states, logits [N, 1, vocab_size]).
@@ -398,8 +394,12 @@ class LanguageModule(MegatronModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
+        # Speculative decoding is inference-only.
         logits, _ = self.output_layer(
-            mtp_hidden, weight=output_weight, runtime_gather_output=True, output_dtype=logits_dtype
+            mtp_hidden,
+            weight=output_weight,
+            runtime_gather_output=True,
+            output_dtype=self._inference_lm_head_dtype(),
         )
         logits = self._scale_logits(logits)
 
