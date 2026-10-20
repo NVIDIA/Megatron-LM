@@ -52,9 +52,6 @@ class TrainState(Stateful):
             "floating_point_operations_so_far": torch.tensor(
                 self.num_floating_point_operations_so_far, dtype=torch.float64
             ),
-            "do_train": torch.tensor(self.do_train, dtype=torch.bool),
-            "do_valid": torch.tensor(self.do_valid, dtype=torch.bool),
-            "do_test": torch.tensor(self.do_test, dtype=torch.bool),
             "release": torch.tensor(self.release, dtype=torch.bool),
         }
 
@@ -71,7 +68,4 @@ class TrainState(Stateful):
         self.num_floating_point_operations_so_far = int(
             state_dict["floating_point_operations_so_far"].item()
         )
-        self.do_train = state_dict["do_train"].item()
-        self.do_valid = state_dict["do_valid"].item()
-        self.do_test = state_dict["do_test"].item()
         self.release = state_dict.get("release", torch.tensor(False, dtype=torch.bool)).item()

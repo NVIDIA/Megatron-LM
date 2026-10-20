@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.training import arguments, global_vars, initialize
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 @pytest.mark.parametrize("load_checkpoint", [False, True])
@@ -76,6 +77,8 @@ def test_resume_updates_microbatches_before_setup_validation(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.skip_train = True  # Evaluation-only setup must also restore the calculator.
+    run_config.validation.skip_train = True
+    run_config.train.micro_batch_size = 1
     args.load = "checkpoint"
     args.data_parallel_size = 1
     args.micro_batch_size = 1
@@ -203,6 +206,8 @@ def test_inference_distributed_initialization_without_training_fields(
         "result_rejected_tracker_filename",
     ):
         delattr(args, name)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "initialize_runtime_services", Mock())
     monkeypatch.setattr(initialize, "setup_logging", Mock())
@@ -229,7 +234,10 @@ def test_inference_distributed_initialization_without_training_fields(
 
 
 def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch, run_config):
-    monkeypatch.setattr(initialize, "get_args", lambda: Namespace(tp_comm_overlap=True))
+    args = Namespace(tp_comm_overlap=True)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)
     with pytest.raises(ValueError, match="fixed training user buffers"):
@@ -259,6 +267,8 @@ def test_distributed_training_services_require_explicit_opt_in(
     args.seq_length, args.decoder_seq_length = 64, 96
     args.decoder_tp_comm_overlap = decoder_overlap
     args.micro_batch_size = 7  # Deliberately stale; cfg.train owns the input.
+    args.batch_parallel_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     run_config.train.micro_batch_size = 3
     if native_model:
         run_config.model = GPTModelConfig(
