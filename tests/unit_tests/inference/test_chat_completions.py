@@ -54,7 +54,8 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _sanitize_tools_for_template,
     _serialize_eos_token_ids,
     _suffix_tokens_after_prefix,
-    _tokenize_with_media_slots_sync,
+    _tokenize_chat_template_sync,
+    _tokenize_with_media_slots,
 )
 from tests.unit_tests.inference.test_endpoints_common import (
     CHAT_BODY,
@@ -737,7 +738,7 @@ def test_tokenize_with_media_slots_lowers_slots_to_model_tokens(
     )
 
     with expectation:
-        tokens = _tokenize_with_media_slots_sync(
+        tokens = _tokenize_chat_template_sync(
             tokenizer,
             messages=[],
             media_slots=[("__S0__", modality, 0)],
@@ -790,13 +791,9 @@ def _endpoint_prompt_tokens(messages, prompt_config):
         messages, prompt_config
     )
     template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
-    return _tokenize_with_media_slots_sync(
-        _SegmentTokenizer(),
-        template_messages,
-        media_slots,
-        prompt_config,
-        tools=None,
-        chat_template_kwargs={},
+    tokenizer = _SegmentTokenizer()
+    return _tokenize_with_media_slots(
+        tokenizer.apply_chat_template(template_messages), media_slots, tokenizer, prompt_config
     )
 
 
@@ -922,12 +919,12 @@ def test_media_tokenization_is_synchronous_so_it_can_be_offloaded_whole():
     function is what lets the endpoint hand the whole thing to the tokenize
     executor in one hop, on the thread that owns the private tokenizer copy.
     """
-    assert not inspect.iscoroutinefunction(_tokenize_with_media_slots_sync)
+    assert not inspect.iscoroutinefunction(_tokenize_chat_template_sync)
     # And the endpoint must not have kept a direct call that skips the executor.
     src = inspect.getsource(chat_completions_module.chat_completions)
-    assert "_tokenize_with_media_slots_sync" in src
+    assert "_tokenize_chat_template_sync" in src
     for line in src.splitlines():
-        if "_tokenize_with_media_slots_sync" in line:
+        if "_tokenize_chat_template_sync" in line:
             assert "await" not in line, f"must be dispatched via the executor, got: {line.strip()}"
 
 
@@ -1456,7 +1453,7 @@ async def test_multimodal_prefix_stitching_submits_exact_prefix_and_compact_suff
     app, client = _prefix_stitching_app(tokenizer=tokenizer_cls())
 
     with mock.patch.object(
-        chat_completions_module, "_tokenize_with_media_slots_sync", side_effect=tokenize
+        chat_completions_module, "_tokenize_chat_template_sync", side_effect=tokenize
     ):
         response = await app.test_client().post(CHAT_PATH, json=request_json)
 
@@ -1474,13 +1471,11 @@ async def test_offloaded_prefix_stitching_metadata_covers_text_and_multimodal_hi
 ):
     app, client = _prefix_stitching_app()
     history = _MEDIA_HISTORY if prefix_has_media else _TEXT_HISTORY
-    # A text-only history renders through the plain template path.
-    tokenize_helper = (
-        "_tokenize_with_media_slots_sync" if prefix_has_media else "_apply_chat_template_sync"
-    )
 
     with mock.patch.object(
-        chat_completions_module, tokenize_helper, side_effect=_fake_tokenize(history, [30])
+        chat_completions_module,
+        "_tokenize_chat_template_sync",
+        side_effect=_fake_tokenize(history, [30]),
     ):
         response = await app.test_client().post(
             CHAT_PATH,
