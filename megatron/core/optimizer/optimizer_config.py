@@ -535,12 +535,15 @@ class OptimizerConfig:
             )
 
         if self.overlap_param_gather:
-            assert self.use_distributed_optimizer or ddp_config.use_megatron_fsdp \
-                or self.optimizer == 'dist_muon', \
-                '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
-            assert ddp_config.overlap_grad_reduce, \
-                'Must use --overlap-param-gather with --overlap-grad-reduce'
-        
+            assert (
+                self.use_distributed_optimizer
+                or ddp_config.use_megatron_fsdp
+                or self.optimizer == 'dist_muon'
+            ), '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
+            assert (
+                ddp_config.overlap_grad_reduce
+            ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
+
         if self.optimizer not in ('sgd', 'adam'):
             if self.optimizer == 'dist_muon':
                 warn_rank_0(
@@ -562,20 +565,25 @@ class OptimizerConfig:
         )
 
         if self.use_distributed_optimizer:
-            assert not use_torch_fsdp2, \
-                "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
+            assert (
+                not use_torch_fsdp2
+            ), "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
 
         if self.overlap_param_gather_with_optimizer_step:
-            assert self.use_distributed_optimizer, \
-                '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
-            assert self.overlap_param_gather, \
-                'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
+            assert (
+                self.use_distributed_optimizer
+            ), '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
+            assert (
+                self.overlap_param_gather
+            ), 'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
 
         if self.overlap_param_gather_with_optimizer_step:
-            assert virtual_pipeline_model_parallel_size is not None, \
-                '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
-            assert ckpt_format == "torch", \
-                '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
+            assert (
+                virtual_pipeline_model_parallel_size is not None
+            ), '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
+            assert (
+                ckpt_format == "torch"
+            ), '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
     def finalize_optimizer_config(self) -> None:
         # Map string data-type to torch.dtype.
