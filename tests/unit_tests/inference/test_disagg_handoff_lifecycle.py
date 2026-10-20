@@ -144,6 +144,11 @@ class _SchedulerHarness:
 
 
 class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
+    _validate_prompt_logprob_continuation = (
+        DynamicInferenceEngine._validate_prompt_logprob_continuation
+    )
+    _bind_prompt_logprob_continuation = DynamicInferenceEngine._bind_prompt_logprob_continuation
+
     def __init__(self, loop, *, hybrid=False, available=0, extra_eos_token_id_set=()):
         self._loop = loop
         # Ids a model declares beyond the request's own termination_id, e.g. nanov3p5's

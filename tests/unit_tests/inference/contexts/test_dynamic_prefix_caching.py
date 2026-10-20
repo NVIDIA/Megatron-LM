@@ -7,6 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgpack
 import numpy as np
 import pytest
 import torch
@@ -3503,9 +3504,18 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 staged.append(payload)
                 return SimpleNamespace(response_metadata={"sidecar_test": True})
 
+            async def stage_finished_request():
+                assert engine._record_and_serialize_finished_request(exact) is None
+                await engine._drain_staging_tasks()
+
             with monkeypatch.context() as staging:
+                socket = Mock()
                 staging.setattr(engine, "payload_stager", SimpleNamespace(stage=stage))
-                reply = engine._serialize_finished_request(exact, None)
+                staging.setattr(engine, "socket_for_receiving_requests", socket)
+                asyncio.run(stage_finished_request())
+                socket.send_multipart.assert_called_once()
+                frames = socket.send_multipart.call_args.args[0]
+                reply = msgpack.unpackb(frames[1], raw=False)
             assert len(staged) == 1
             assert staged[0].prompt_log_probs == exact.prompt_log_probs
             assert len(staged[0].prompt_log_probs) == prompt_length - 1
