@@ -40,6 +40,13 @@ class OptimizerStateChunk:
     params: tuple[torch.Tensor, ...]
 
 
+_STAGING_ALIGNMENT_BYTES = 256
+
+
+def _align_staging_offset(offset: int) -> int:
+    return -(-offset // _STAGING_ALIGNMENT_BYTES) * _STAGING_ALIGNMENT_BYTES
+
+
 @dataclasses.dataclass
 class _StatePrefetch:
     """Prefetch token whose existence also records a scheduled no-copy chunk."""
@@ -49,11 +56,14 @@ class _StatePrefetch:
 
 @dataclasses.dataclass
 class _StateStagingSlot:
-    """Reusable GPU storage for one optimizer-state pipeline window."""
+    """Reusable GPU storage for one optimizer-state pipeline window.
 
-    buffers: Dict[tuple[torch.device, torch.dtype], torch.Tensor] = dataclasses.field(
-        default_factory=dict
-    )
+    One byte buffer per device backs every state dtype, so a chunk whose dtype mix differs
+    from the previous one reuses the same storage instead of leaving the old dtype's buffer
+    allocated next to the new one.
+    """
+
+    buffers: Dict[torch.device, torch.Tensor] = dataclasses.field(default_factory=dict)
 
 
 class _StagingSlotPool:
@@ -65,8 +75,7 @@ class _StagingSlotPool:
     them: freed storage still marked by ``record_stream()`` for an in-flight D2H is withheld
     from the allocator, so the next child would allocate a fresh window and every child's
     window could stay resident until the chain finished. Reuse needs no extra wait, because
-    every H2D already waits for the shared D2H stream. Buffers are keyed by device and dtype,
-    so children whose state dtypes differ hold one window per dtype.
+    every H2D already waits for the shared D2H stream.
     """
 
     def __init__(self) -> None:
@@ -91,18 +100,6 @@ class _StagingSlotPool:
             self._holds -= 1
             if self._holds == 0:
                 self.release()
-
-    def retain_only(self, keys: set[tuple[torch.device, torch.dtype]]) -> None:
-        """Free the windows of every other (device, dtype), even while held.
-
-        A chain child whose state dtypes differ from its predecessor's would otherwise keep
-        the predecessor's windows through its whole step. Their views were marked with
-        ``record_stream()``, so the allocator reuses the storage only after its copies finish.
-        """
-
-        for slot in self.slots:
-            for key in [key for key in slot.buffers if key not in keys]:
-                del slot.buffers[key]
 
     def release(self) -> None:
         """Drop CUDA ownership unless a chain is still stepping through the pool."""
@@ -781,20 +778,17 @@ class ChunkedOptimizerStateOffloader:
         """Return state views backed by the next reusable CUDA staging slot."""
 
         entries = []
-        required_numel = collections.defaultdict(int)
+        required_bytes = collections.defaultdict(int)
         for param in chunk.params:
             state = self.optimizer.state.get(param, {})
             for key, cpu_tensor in self._cpu_state.get(param, {}).items():
                 current = state.get(key)
                 if not isinstance(current, torch.Tensor) or current.is_cuda:
                     continue
-                pool_key = (self._param_devices[param], cpu_tensor.dtype)
-                entries.append((param, key, cpu_tensor, pool_key))
-                alignment_numel = max(1, 256 // cpu_tensor.element_size())
-                required_numel[pool_key] = (
-                    (required_numel[pool_key] + alignment_numel - 1) // alignment_numel
-                ) * alignment_numel
-                required_numel[pool_key] += cpu_tensor.numel()
+                device = self._param_devices[param]
+                offset = _align_staging_offset(required_bytes[device])
+                entries.append((param, key, cpu_tensor, device, offset))
+                required_bytes[device] = offset + cpu_tensor.numel() * cpu_tensor.element_size()
 
         if not entries:
             return []
@@ -802,21 +796,20 @@ class ChunkedOptimizerStateOffloader:
         pool = self._staging_pool
         slot = pool.slots[pool.next_slot]
         pool.next_slot = (pool.next_slot + 1) % len(pool.slots)
-        for (device, dtype), numel in required_numel.items():
-            buffer = slot.buffers.get((device, dtype))
-            if buffer is None or buffer.numel() < numel:
-                slot.buffers[(device, dtype)] = torch.empty(numel, dtype=dtype, device=device)
+        for device, nbytes in required_bytes.items():
+            buffer = slot.buffers.get(device)
+            if buffer is None or buffer.numel() < nbytes:
+                slot.buffers[device] = torch.empty(nbytes, dtype=torch.uint8, device=device)
 
-        offsets = collections.defaultdict(int)
         views = []
-        for param, key, cpu_tensor, pool_key in entries:
-            alignment_numel = max(1, 256 // cpu_tensor.element_size())
-            offset = (
-                (offsets[pool_key] + alignment_numel - 1) // alignment_numel
-            ) * alignment_numel
-            buffer = slot.buffers[pool_key]
-            gpu_tensor = buffer.narrow(0, offset, cpu_tensor.numel()).view(cpu_tensor.shape)
-            offsets[pool_key] = offset + cpu_tensor.numel()
+        for param, key, cpu_tensor, device, offset in entries:
+            nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+            gpu_tensor = (
+                slot.buffers[device]
+                .narrow(0, offset, nbytes)
+                .view(cpu_tensor.dtype)
+                .view(cpu_tensor.shape)
+            )
             views.append((param, key, cpu_tensor, gpu_tensor))
         return views
 
@@ -1030,13 +1023,6 @@ class ChunkedOptimizerStateOffloader:
             self.optimizer.step()
             return
 
-        self._staging_pool.retain_only(
-            {
-                (self._param_devices[param], tensor.dtype)
-                for param, states in self._cpu_state.items()
-                for tensor in states.values()
-            }
-        )
         self.prefetch_for_step()
         self._wait_master_h2d()
 

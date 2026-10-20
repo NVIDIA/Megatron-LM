@@ -55,9 +55,11 @@ next chunk, optimizer compute for the current chunk, and D2H for the previous ch
 The normal tensor-state staging bound is therefore about
 `2 * optimizer_state_offload_chunk_size_mb` per manager that is actively stepping, not one
 chunk; a single parameter's atomic tensor-state payload can exceed the target and produces a
-runtime warning. A chain of managers, such as dense and expert `DistributedOptimizer` children
-or the outer split Muon + Adam chain, steps them one after another: only the first child restores
-its first chunk ahead of the update, and each later child restores its own when its step begins.
+runtime warning. Each window is one byte buffer per device shared by every state dtype, so
+chunks that mix FP32 and BF16 state or masters reuse it rather than adding to the bound. A chain
+of managers, such as dense and expert `DistributedOptimizer` children or the outer split Muon +
+Adam chain, steps them one after another: only the first child restores its first chunk ahead of
+the update, and each later child restores its own when its step begins.
 LayerWise has at most one non-empty Muon child, so its internal state manager uses the same
 two-slot bound and counts as the first child of the outer chain.
 
@@ -67,12 +69,11 @@ would not bound the chain: a window whose last D2H copy is still in flight stays
 caching allocator until that copy finishes, so the next child would allocate its own, and every
 child's window could stay resident until the chain finished. The handover needs no extra wait,
 because every H2D already waits for the shared D2H stream. The chain therefore stays within one
-manager's two windows per state dtype; children with different state dtypes each add a window for
-theirs. The windows are freed when the chain's step ends. Temporary state and master
-windows are allocated on the current compute stream so their reserved memory returns to the same
-allocator pool used by forward/backward; the H2D stream waits for both that compute stream and
-the D2H stream before writing them. D2H completion does not block the host at the forward
-boundary.
+manager's two windows, whatever each child's state dtypes. The windows are freed when the
+chain's step ends. Temporary state and master windows are allocated on the current compute stream
+so their reserved memory returns to the same allocator pool used by forward/backward; the H2D
+stream waits for both that compute stream and the D2H stream before writing them. D2H completion
+does not block the host at the forward boundary.
 
 Every `ChainedOptimizer` recursively shares one copy-stream pair and one two-slot staging pool
 across its LayerWise and sibling `DistributedOptimizer` managers, including ordinary Adam
