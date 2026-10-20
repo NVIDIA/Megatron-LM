@@ -10,6 +10,9 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 class TorchFullyShardedDataParallelConfig(DistributedDataParallelConfig):
     """Configuration for TorchFullyShardedDataParallel."""
 
+    use_torch_fsdp2: bool = True
+    """Select the Torch FSDP2 wrapper for this backend-specific configuration."""
+
     reshard_after_forward: Union[bool, int] = True
     """
     Controls the parameter behavior after forward.

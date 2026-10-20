@@ -203,7 +203,7 @@ _embedding_pg_cache: dict = {}
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
     """Create a HyperCommGrid (base view) plus a dense expert view, matching the topology builder.
 
-    These tests are dense (ep=1); the expert view relabels the base axes over the same ranks
+    These tests are dense; with CP=1, the expert view relabels the base axes over the same ranks
     (expt_tp=tp, ep=cp=1, expt_dp=dp), so the optimizer's expert groups resolve to the dense
     collapse (tp_ep_pp = tp x pp, expt_dp = dp) without changing the base rank layout.
     """
@@ -649,7 +649,9 @@ def get_mimo_model(
         module_to_grid_map=module_to_grid_map,
     )
 
-    mimo_model = MimoModel(mimo_config, cp_group=language_pg.cp, tp_group=language_pg.tp)
+    mimo_model = MimoModel(
+        mimo_config, cp_group=language_pg.cp, tp_group=language_pg.tp, tp_cp_group=language_pg.tp_cp
+    )
     mimo_model.to(torch.device("cuda"))
     if bf16:
         mimo_model.to(torch.bfloat16)

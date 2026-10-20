@@ -208,5 +208,5 @@ def configure_grad_sync(args, mimo_model: MimoModel, topology: HeteroTopology) -
             "cannot be composed safely"
         )
         mimo_model.config.no_sync_func = mimo_model.no_sync
-        if getattr(args, "align_grad_reduce", False):
+        if cfg.dist.align_grad_reduce:
             mimo_model.config.grad_sync_func = mimo_model.start_grad_sync

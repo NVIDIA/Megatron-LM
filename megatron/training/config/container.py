@@ -48,19 +48,39 @@ class ConfigContainerBase:
     """
     Configuration container base class for Megatron configurations.
 
-    Provides sub-config validation and YAML/Dict serialization and deserialization.
+    Provides validation, runtime finalization, and YAML/Dict serialization.
     """
 
+    _finalized: bool = field(default=False, init=False, repr=False, compare=False)
+
     def validate(self) -> None:
-        """Run each sub-config's explicit validation before runtime initialization."""
-        rng = getattr(self, "rng", None)
-        if rng is not None:
-            rng.finalize_model_config(getattr(self, "model", None))
+        """Check sub-configs without mutation; callers may validate repeatedly."""
         for config_field in dataclass_fields(self):
             config = getattr(self, config_field.name)
             validate = getattr(config, "validate", None)
             if callable(validate):
                 validate()
+
+    def finalize(self) -> None:
+        """Validate and apply runtime derivations once, before runtime initialization.
+
+        Called by ``initialize_megatron``, not by configuration-editing code.
+        Re-entering initialization (e.g. an in-process restart) does not apply the
+        derivations again. After finalization, treat layout and RNG policy as fixed;
+        create a new container for a differently configured run. The lifecycle flag
+        is private and is not saved in YAML/checkpoint configuration metadata.
+        """
+        if self._finalized:
+            return
+        self.validate()
+        self._finalize()
+        self._finalized = True
+
+    def _finalize(self) -> None:
+        """Apply shared runtime derivations after all validation has succeeded."""
+        rng = getattr(self, "rng", None)
+        if rng is not None:
+            rng.finalize_model_config(getattr(self, "model", None))
     
     @classmethod
     def from_dict(
@@ -276,9 +296,9 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
 
-    def finalize(self) -> None:
+    def _finalize_ddp_config(self) -> None:
         """Resolve wrapper-derived model and optimizer inputs before runtime setup."""
-        if self.dist.use_torch_fsdp2:
+        if self.ddp.use_torch_fsdp2:
             if is_te_min_version("2.0.0"):
                 self.ddp.fp8_param_gather = False
             if not is_te_min_version("2.7.0.dev0"):
@@ -322,11 +342,74 @@ class PretrainConfigContainer(ConfigContainerBase):
                 if transformer.cuda_graph_impl == "full_iteration":
                     self.ddp.fsdp_all_gather_in_start_param_sync = False
 
+
+    def _resolve_batch_sizes(
+        self, batch_parallel_size: int | None = None
+    ) -> tuple[int | None, int | None, int | None]:
+        """Check effective train/eval batch sizes without mutating configuration."""
+        micro_batch_size = self.train.micro_batch_size
+        if batch_parallel_size is not None:
+            assert batch_parallel_size > 0
+            assert micro_batch_size is not None, "Training requires a micro batch size"
+        if micro_batch_size is not None:
+            assert micro_batch_size > 0, "Training micro batch size must be positive"
+        global_batch_size = self.train.global_batch_size
+        if global_batch_size is None and batch_parallel_size is not None:
+            global_batch_size = micro_batch_size * batch_parallel_size
+        if global_batch_size is not None:
+            assert global_batch_size > 0, "Training global batch size must be positive"
+        batch_multiple = micro_batch_size
+        if batch_multiple is not None and batch_parallel_size is not None:
+            batch_multiple *= batch_parallel_size
+        # Reduction mode and schedules validate the effective/current batch in the
+        # calculator; a schedule may resume after entries for a different topology.
+        if (
+            not self.train.decrease_batch_size_if_needed
+            and self.train.step_batch_size_schedule is None
+            and global_batch_size is not None
+            and batch_multiple is not None
+        ):
+            assert global_batch_size % batch_multiple == 0, (
+                "Training global batch size must be divisible by its microbatch size "
+                "times batch parallel size"
+            )
+        eval_global_batch_size = self.validation.eval_global_batch_size
+        if eval_global_batch_size is None:
+            eval_global_batch_size = global_batch_size
+        eval_micro_batch_size = self.validation.eval_micro_batch_size
+        if eval_micro_batch_size is None:
+            eval_micro_batch_size = micro_batch_size
+        if eval_micro_batch_size is not None:
+            assert eval_micro_batch_size > 0, "Evaluation micro batch size must be positive"
+        if eval_global_batch_size is not None:
+            assert eval_global_batch_size > 0, "Evaluation global batch size must be positive"
+        eval_batch_multiple = eval_micro_batch_size
+        if eval_batch_multiple is not None and batch_parallel_size is not None:
+            eval_batch_multiple *= batch_parallel_size
+        if eval_global_batch_size is not None and eval_batch_multiple is not None:
+            assert eval_global_batch_size % eval_batch_multiple == 0, (
+                "Evaluation global batch size must be divisible by its microbatch size "
+                "times batch parallel size"
+            )
+        return global_batch_size, eval_global_batch_size, eval_micro_batch_size
+
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
+        # Check the effective optimizer-owned layout without mutating the saved config.
+        effective_ddp = copy.copy(self.ddp)
+        effective_ddp.reuse_grad_buf_for_mxfp8_param_ag = (
+            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp
+        )
+        self.rl.validate_ddp_config(effective_ddp)
         super().validate()
+        global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._validate_ddp_config()
+        self._validate_rl_config(global_batch_size)
+
+    def _validate_ddp_config(self) -> None:
+        """Check wrapper requirements without deriving or mutating other configs."""
         transformer = getattr(self.model, "transformer", None)
-        if self.dist.use_torch_fsdp2:
+        if self.ddp.use_torch_fsdp2:
             if not isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
                 raise ValueError("Torch FSDP2 requires TorchFullyShardedDataParallelConfig.")
             if self.ddp.use_megatron_fsdp:
@@ -338,7 +421,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             if self.checkpoint.ckpt_format not in ("torch_dist", "torch_dcp"):
                 raise ValueError("Torch FSDP2 requires torch_dist or torch_dcp checkpoints.")
         elif isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
-            raise ValueError("TorchFullyShardedDataParallelConfig requires dist.use_torch_fsdp2.")
+            raise ValueError("TorchFullyShardedDataParallelConfig requires ddp.use_torch_fsdp2.")
         if self.optimizer.overlap_param_gather:
             if not (
                 self.optimizer.use_distributed_optimizer
@@ -356,7 +439,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("Megatron FSDP requires the SGD or Adam optimizer.")
             if self.checkpoint.ckpt_format != "fsdp_dtensor":
                 raise ValueError("Megatron FSDP requires the fsdp_dtensor checkpoint format.")
-        if self.dist.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
+        if self.ddp.use_torch_fsdp2 or self.ddp.use_megatron_fsdp:
             if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
                 raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
             if transformer is not None and transformer.moe_shortcut_connection:
@@ -366,7 +449,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("FP8 parameter gathering requires FP8 compute.")
             if self.ddp.fp4_param_gather and not transformer.fp4:
                 raise ValueError("FP4 parameter gathering requires FP4 compute.")
-            if self.dist.use_torch_fsdp2:
+            if self.ddp.use_torch_fsdp2:
                 if transformer.pipeline_model_parallel_size != 1:
                     raise ValueError("Torch FSDP2 does not support pipeline parallelism.")
                 if transformer.expert_model_parallel_size != 1:
@@ -394,16 +477,38 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.ddp.use_megatron_fsdp and self.ddp.nccl_ub
         ):
             raise ValueError("Manual FSDP registration requires Megatron FSDP with NCCL user buffers.")
+
+    def _validate_rl_config(self, global_batch_size: int | None) -> None:
+        """Check RL policy against the supplied or resolved training batch size."""
+        transformer = getattr(self.model, "transformer", None)
         cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
         self.rl.validate_run(
             cuda_graph_impl=cuda_graph_impl,
             micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=self.train.global_batch_size,
+            global_batch_size=global_batch_size,
             skip_train=self.validation.skip_train,
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+
+    def _finalize(self) -> None:
+        from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
+        from megatron.training import get_args
+
+        # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
+        # Keep this temporary args dependency in framework finalization, not validation.
+        batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
+        self._validate_rl_config(batch_sizes[0])
+        (
+            self.train.global_batch_size,
+            self.validation.eval_global_batch_size,
+            self.validation.eval_micro_batch_size,
+        ) = batch_sizes
+        super()._finalize()
+        self._finalize_ddp_config()
+        if self.rl.perform_rl_step:
+            self.rl.finalize_ddp_config(self.ddp)
 
 
 @dataclass(kw_only=True)
