@@ -7,7 +7,7 @@ import math
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -76,6 +76,32 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
         buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
     ]
     return sharded_buffer
+
+
+def _scale_tensors_(
+    tensors: List[torch.Tensor], scaling_factor: Union[float, torch.Tensor]
+) -> None:
+    """Multiply `tensors` in place by `scaling_factor`.
+
+    For a 0-D `scaling_factor` on the tensors' device, `tensor *= scaling_factor` runs PyTorch's
+    generic broadcasting, dtype-casting elementwise kernel, which reaches only a fraction of HBM
+    bandwidth. `torch._foreach_mul_` takes its fused path only when the factor's dtype matches the
+    tensors', so the factor is cast to each tensor dtype first. Results are bitwise identical:
+    the elementwise path also casts the factor to the tensor dtype before multiplying.
+    """
+    if not (
+        isinstance(scaling_factor, torch.Tensor)
+        and scaling_factor.dim() == 0
+        and all(tensor.device == scaling_factor.device for tensor in tensors)
+    ):
+        for tensor in tensors:
+            tensor *= scaling_factor
+        return
+    tensors_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
+    for tensor in tensors:
+        tensors_by_dtype.setdefault(tensor.dtype, []).append(tensor)
+    for dtype, group in tensors_by_dtype.items():
+        torch._foreach_mul_(group, scaling_factor.to(dtype))
 
 
 def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
@@ -1627,11 +1653,9 @@ class _ParamAndGradBuffer:
         )
         self.nvfp4_packed_numel_unpadded = sum(nvfp4_packed_per_bucket_numel_unpadded)
 
-    def scale_gradients(self, scaling_factor: float) -> None:
+    def scale_gradients(self, scaling_factor: Union[float, torch.Tensor]) -> None:
         """Scale the gradient data by `scaling_factor`."""
-        self.grad_data *= scaling_factor
-        for grad in self.extra_main_grads:
-            grad *= scaling_factor
+        _scale_tensors_([self.grad_data, *self.extra_main_grads], scaling_factor)
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
