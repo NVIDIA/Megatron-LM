@@ -653,6 +653,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-load-balancing-type | Load balancing: aux_loss, sinkhorn, seq_aux_loss, none | aux_loss |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |
+| --moe-router-sigmoid-input-scaling | Scale sigmoid input logits by `sqrt(num_experts / hidden_size)` | False |
 | --moe-router-pre-softmax | Softmax before top-k | False |
 | --moe-router-num-groups | Groups for group-limited routing | None |
 | --moe-router-group-topk | Selected groups in group-limited routing | None |
@@ -661,6 +662,15 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-fusion | Enable router fusion | False |
 | --moe-router-dtype | Router precision: fp32, fp64 | None |
 | --moe-router-padding-for-fp8 | Pad for FP8 alignment | False |
+
+With `--moe-router-score-function sigmoid --moe-router-sigmoid-input-scaling`, the
+router computes `sigmoid(sqrt(num_experts / hidden_size) * logits)`. For example,
+256 experts and hidden size 8192 give a fixed multiplier of approximately 0.1768.
+The scaled logits are shared by training, auxiliary losses, z-loss, diagnostics,
+and inference. Expert bias is added after sigmoid and remains unscaled. This is
+independent of `--moe-router-topk-scaling-factor`, which multiplies selected output
+probabilities. The option adds no parameters or checkpoint tensors, is disabled
+by default, and does not support Sinkhorn balancing.
 
 ### Loss and Regularization
 | Argument | Description | Default |
