@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from functools import lru_cache
-from math import ceil, lcm, log2
+from math import lcm
 from typing import Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import torch
@@ -1041,30 +1040,3 @@ def align_sample_id_groups(
                 "number of input samples or reduce microbatch_group_size_per_vp_stage."
             )
     return sample_id_groups
-
-
-# =============================================================================
-# Workload estimation helpers for dynamic CP scheduling
-# =============================================================================
-
-
-@lru_cache(maxsize=128)
-def dcp_gpus_needed(
-    seq_len: int,
-    max_seq_len_per_rank: int,
-    min_cp_size: int = 1,
-    valid_group_sizes: Optional[Tuple[int, ...]] = None,
-) -> int:
-    """Return the smallest configured runtime CP group that can hold a sequence."""
-    if max_seq_len_per_rank < 1:
-        raise ValueError("max_seq_len_per_rank must be positive")
-
-    required_ranks = max(min_cp_size, ceil(seq_len / max_seq_len_per_rank), 1)
-    if valid_group_sizes is not None:
-        for group_size in valid_group_sizes:
-            if group_size >= required_ranks:
-                return group_size
-        return required_ranks
-
-    raw = max(1, 2 ** ceil(log2(max(required_ranks, 1))))
-    return max(min_cp_size, raw)
