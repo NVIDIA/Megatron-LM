@@ -39,10 +39,12 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_tensor_model_parallel_group,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import modelopt_inference_config_from_args
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
@@ -190,7 +192,7 @@ if __name__ == "__main__":
     # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
     # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
     # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
-    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    model = build_inference_models(cfg)
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")
 

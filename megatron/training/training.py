@@ -2880,6 +2880,8 @@ def setup_model_and_optimizer(
             start_memory_history_recording(cfg_container.profiling)
 
             model_config = cfg.model
+            builder_cls = model_config.get_builder_cls()
+            builder = builder_cls(model_config)
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
@@ -2889,7 +2891,7 @@ def setup_model_and_optimizer(
                 freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
             )
 
-            return cfg.build_models(
+            return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
@@ -2899,6 +2901,8 @@ def setup_model_and_optimizer(
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                checkpoint=cfg.checkpoint,
+                distillation=cfg.distillation,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."

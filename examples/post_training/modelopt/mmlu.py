@@ -21,10 +21,12 @@ import modelopt.torch.quantization as mtq
 from modelopt.torch.utils.plugins import megatron_mmlu
 from utils import get_hf_tokenizer
 
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import modelopt_inference_config_from_args
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
@@ -101,7 +103,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    model = build_inference_models(cfg)
     report_current_memory_info()
 
     # Materialize the model from meta device to gpu before loading the checkpoint.

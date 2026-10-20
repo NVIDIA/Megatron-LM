@@ -91,7 +91,7 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
         cfg = pretrain_cfg_container_from_args(args, model)
         cfg.distillation = mc.distillation_config_from_args(args, model)
     else:
-        cfg = mc.modelopt_inference_config_from_args(args, device="cpu")
+        cfg = mc.modelopt_inference_config_from_args(args)
     path = tmp_path / "run.yaml"
     cfg.to_yaml(str(path))
     assert "modelopt_gpt_layer_spec" not in path.read_text()
@@ -101,11 +101,6 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     assert restored.model.get_builder_cls() is (HybridModelBuilder if hybrid else GPTModelBuilder)
     assert restored.checkpoint.load == "/student"
     assert restored.model.transformations == model.transformations
-    if training:
-        assert "model_build" not in cfg.to_dict()
-        assert not hasattr(restored, "model_build")
-    else:
-        assert restored.model_build == cfg.model_build
     assert not hasattr(restored.model.transformations, "load")
     if training and kd:
         assert restored.distillation.teacher_load == str(tmp_path)
@@ -133,34 +128,14 @@ def test_tokenizer_finalizes_same_model_used_for_build():
     model.vocab_size = None
     resolve_tokenizer_vocab_size(cfg, 32768)
     with (
-        patch.object(cfg, "validate") as validate,
+        patch("megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"),
         patch.object(GPTModelBuilder, "build_distributed_models") as build,
     ):
-        cfg.build_models(Mock())
-    validate.assert_not_called()
+        mc.build_inference_models(cfg)
     assert cfg.model is model
     assert model.vocab_size == 32768
     assert model.should_pad_vocab is False
     build.assert_called_once()
-
-
-def test_rejects_placement_conflict_before_build():
-    cfg = mc.modelopt_inference_config_from_args(_make_args(), device="cpu")
-    cfg.dist.use_torch_fsdp2 = True
-    with patch.object(GPTModelBuilder, "build_distributed_models") as build:
-        with pytest.raises(ValueError, match="FSDP"):
-            cfg.build_models(Mock())
-    build.assert_not_called()
-
-
-def test_build_models_reads_fsdp_from_owning_sections():
-    args = _make_args()
-    cfg = pretrain_cfg_container_from_args(args, mc.modelopt_model_config_from_args(args))
-    cfg.ddp.use_megatron_fsdp = True
-    with patch.object(GPTModelBuilder, "build_distributed_models") as build:
-        cfg.build_models(Mock())
-    assert build.call_args.kwargs["use_megatron_fsdp"] is True
-    assert build.call_args.kwargs["use_torch_fsdp2"] is False
 
 
 @pytest.mark.parametrize(
@@ -184,24 +159,6 @@ def test_direct_training_config_rejects_manual_gc(tmp_path):
     cfg.train.manual_gc = True
     with pytest.raises(ValueError, match="manual_gc"):
         cfg.validate()
-
-
-def test_build_models_passes_run_distillation_to_builder(tmp_path):
-    args = _make_args(export_kd_teacher_load=str(tmp_path))
-    model = mc.modelopt_model_config_from_args(args)
-    cfg = pretrain_cfg_container_from_args(args, model)
-    cfg.distillation = mc.distillation_config_from_args(args, model)
-    with patch.object(GPTModelBuilder, "build_distributed_models") as build:
-        cfg.build_models(Mock())
-    assert build.call_args.kwargs["distillation"] is cfg.distillation
-    with pytest.raises(ValueError, match="container.distillation"):
-        cfg.build_models(Mock(), distillation=None)
-
-
-def test_build_policy_conflict_is_rejected():
-    cfg = mc.modelopt_inference_config_from_args(_make_args(), device="cpu")
-    with pytest.raises(ValueError, match="conflicts"):
-        cfg.build_models(Mock(), device="cuda")
 
 
 def test_serialized_builder_is_ignored():
@@ -245,8 +202,7 @@ def test_legacy_inference_helper_reuses_declared_model():
     model = cfg.model
     with (
         patch("megatron.training.global_vars.get_run_config", return_value=cfg),
-        patch("megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"),
-        patch.object(cfg, "build_models") as build,
+        patch.object(mc, "build_inference_models") as build,
         patch.object(mc, "modelopt_inference_config_from_args") as translate,
     ):
         mc.build_modelopt_models(args)
@@ -273,13 +229,12 @@ def test_inference_uses_config_without_cli_enable_flag():
         model=Mock(transformations=object()),
         checkpoint=Namespace(load="/configured", ckpt_format="torch_dist"),
     )
-    cfg.build_models.return_value = [stage]
     loaded = []
     with (
         patch.object(utils, "get_args", return_value=args),
         patch("megatron.training.global_vars.get_run_config", return_value=cfg),
         patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
-        patch.object(utils.ProcessGroupCollection, "use_mpu_process_groups"),
+        patch.object(utils, "build_inference_models", return_value=[stage]) as build,
         patch.object(utils, "get_model_builder") as legacy_builder,
         patch.object(
             utils,
@@ -289,5 +244,5 @@ def test_inference_uses_config_without_cli_enable_flag():
     ):
         assert utils.get_model_for_inference() is stage
     legacy_builder.assert_not_called()
-    cfg.build_models.assert_called_once()
+    build.assert_called_once_with(cfg)
     assert loaded == [[stage]]

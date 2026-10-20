@@ -246,45 +246,49 @@ def apply_modelopt_model_config(
     return model_config
 
 
-def modelopt_inference_config_from_args(
-    args: Namespace,
-    *,
-    disable_moe_grouped_gemm: bool = False,
-    device: str = "cuda",
-    mixed_precision: bool = True,
-):
+def modelopt_inference_config_from_args(args: Namespace, *, disable_moe_grouped_gemm: bool = False):
     """Translate CLI once; build later from the populated inference run container.
 
     Tokenizer vocabulary is finalized after runtime services initialize. Legacy
     services can still use get_args(); model construction uses this container.
     """
     from megatron.training.argument_utils import inference_cfg_container_from_args
-    from megatron.training.models.build import ModelBuildConfig
 
     if args.init_model_with_meta_device:
         args.use_cpu_initialization = True
     model = modelopt_model_config_from_args(
         args, disable_moe_grouped_gemm=disable_moe_grouped_gemm, vocab_size_from_tokenizer=True
     )
-    cfg = inference_cfg_container_from_args(args, model_cfg=model)
-    cfg.model_build = ModelBuildConfig(
-        device=device, wrap_with_ddp=False, mixed_precision=mixed_precision
+    return inference_cfg_container_from_args(args, model_cfg=model)
+
+
+def build_inference_models(cfg, *, device: str = "cuda", mixed_precision: bool = True) -> list:
+    """Build an inference container's model on the global MPU process groups, without DDP.
+
+    ``cfg.checkpoint`` is passed so the ModelOpt pre-wrap hooks restore its ModelOpt state.
+    """
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    kwargs = {} if mixed_precision else {"mixed_precision_wrapper": None}
+    builder = cfg.model.get_builder_cls()(cfg.model)
+    return builder.build_distributed_models(
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        wrap_with_ddp=False,
+        device=device,
+        checkpoint=cfg.checkpoint,
+        **kwargs,
     )
-    return cfg
 
 
 def build_modelopt_models(args: Namespace) -> list:
     """Bridge legacy inference callers that initialize a run container without a model.
 
     New entry points should translate with modelopt_inference_config_from_args
-    before initialization and call cfg.build_models directly.
+    before initialization and call build_inference_models directly.
     """
-    from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.training.global_vars import get_run_config
 
     cfg = get_run_config()
     if cfg.model is None or cfg.model.transformations is None:
-        translated = modelopt_inference_config_from_args(args)
-        cfg.model = translated.model
-        cfg.model_build = translated.model_build
-    return cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+        cfg.model = modelopt_inference_config_from_args(args).model
+    return build_inference_models(cfg)

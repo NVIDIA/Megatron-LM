@@ -14,10 +14,12 @@ import torch
 from modelopt.torch.export import import_mcore_gpt_from_hf
 
 from megatron.core.parallel_state import destroy_model_parallel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import modelopt_inference_config_from_args
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
@@ -91,7 +93,7 @@ if __name__ == "__main__":
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     check_arguments(args)
-    cfg = modelopt_inference_config_from_args(args, mixed_precision=False)
+    cfg = modelopt_inference_config_from_args(args)
     set_run_config(cfg)
     initialize_megatron(training=True)
 
@@ -109,7 +111,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    model = build_inference_models(cfg, mixed_precision=False)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]

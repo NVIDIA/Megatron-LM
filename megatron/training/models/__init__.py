@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.training.models.base import ModelBuilder, ModelConfig, Serializable, compose_hooks
-from megatron.training.models.build import ModelBuildConfig
 from megatron.training.models.dist_utils import (
     build_virtual_pipeline_stages,
     unimodal_build_distributed_models,
@@ -18,7 +17,6 @@ __all__ = [
     "DistillationConfig",
     "ModelTransformConfig",
     "ModelBuilder",
-    "ModelBuildConfig",
     "ModelConfig",
     "Serializable",
     "compose_hooks",

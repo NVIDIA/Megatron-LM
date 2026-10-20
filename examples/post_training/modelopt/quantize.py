@@ -56,10 +56,12 @@ from utils import build_lm_batch_from_input_ids, get_hf_tokenizer
 
 from megatron.core import parallel_state
 from megatron.core.parallel_state import get_context_parallel_group
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import modelopt_inference_config_from_args
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import print_distributed_quant_summary, report_current_memory_info
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
@@ -501,7 +503,7 @@ if __name__ == "__main__":
 
     tokenizer = get_hf_tokenizer()
 
-    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    model = build_inference_models(cfg)
 
     report_current_memory_info()
 

@@ -33,7 +33,10 @@ from megatron.training import print_rank_0
 from megatron.training.global_vars import set_run_config
 
 try:
-    from megatron.post_training.model_config import modelopt_inference_config_from_args
+    from megatron.post_training.model_config import (
+        build_inference_models,
+        modelopt_inference_config_from_args,
+    )
     from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
@@ -154,7 +157,7 @@ def main(model_type: str = "gpt"):
     with load_context:
         if use_modelopt:
             # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
-            model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+            model = build_inference_models(cfg)
         else:
             builder = get_model_builder(args, provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()

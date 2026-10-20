@@ -113,23 +113,23 @@ original argparse namespace.
 
 Setup runs in this order: restore ModelOpt state, apply QAD freezing and LSQ
 setup, register checkpoint key remapping, run user pre-wrap hooks (including
-training freezes), then convert for KD. `cfg.build_models()` passes the run's
-`distillation` to the builder; a runner using the builders directly passes it to
-`build_distributed_models(..., distillation=...)`. Teacher weights are loaded after wrapping
-by `load_kd_teacher_checkpoint(models, cfg.distillation)`, which such a runner must also call.
+training freezes), then convert for KD. The training loop passes the run's
+`checkpoint` and `distillation` to `build_distributed_models(..., checkpoint=...,
+distillation=...)`; a custom runner using the builders directly must do the same. Teacher
+weights are loaded after wrapping by `load_kd_teacher_checkpoint(models, cfg.distillation)`,
+which such a runner must also call.
 
-The run container owns the stock model config, student checkpoint, and
-`ModelBuildConfig` execution policy. `model.transformations` contains only
-`ModelTransformConfig` options (QAD, LSQ, TE key mapping); it does not duplicate
-checkpoint locations. The teacher's own checkpoint reference is in
+The run container owns the stock model config and student checkpoint.
+`model.transformations` contains only `ModelTransformConfig` options (QAD, LSQ,
+TE key mapping); it does not duplicate checkpoint locations. The teacher's own checkpoint reference is in
 `DistillationConfig`. Inference containers have no distillation section.
 
 Post-training CLI entry points use `modelopt_inference_config_from_args(args)`
 once, before runtime initialization. After tokenizer setup,
 `resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)` finalizes the same
-model config. Call `cfg.build_models(pg_collection)` to construct it.
-CPU export selects `cfg.model_build.device = "cpu"`; conversion can disable the
-precision wrapper with `cfg.model_build.mixed_precision = False`.
+model config. Call `build_inference_models(cfg)` to construct it without DDP.
+CPU export passes `device="cpu"`; conversion disables the precision wrapper with
+`mixed_precision=False`.
 
 There are no ModelOpt-specific model-config subclasses or model builders.
 Whole-run YAML loading preserves stock builder metadata and transformation

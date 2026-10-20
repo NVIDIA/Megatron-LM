@@ -12,10 +12,12 @@ import torch
 from modelopt.torch.speculative.plugins.megatron_eagle import MegatronARValidation
 from utils import get_hf_tokenizer
 
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import modelopt_inference_config_from_args
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
@@ -120,7 +122,7 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_hf_tokenizer()
-    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    model = build_inference_models(cfg)
 
     report_current_memory_info()
 

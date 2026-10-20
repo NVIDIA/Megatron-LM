@@ -11,10 +11,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from examples.post_training.modelopt.finetune import SFTDataset
 from megatron.core import mpu
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import modelopt_inference_config_from_args
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -57,7 +59,7 @@ if __name__ == "__main__":
 
     args = get_args()
     tokenizer = get_tokenizer()
-    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    model = build_inference_models(cfg)
 
     load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
     print_rank_0("Done loading checkpoint")

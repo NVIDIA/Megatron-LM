@@ -316,11 +316,14 @@ class TestModelOptModelConfigFromArgs:
 
     @pytest.mark.parametrize("device", ["cpu", "cuda"])
     def test_post_training_execution_device_is_explicit(self, device):
-        cfg = mc.modelopt_inference_config_from_args(
-            _make_args(use_cpu_initialization=True), device=device
-        )
-        with patch.object(GPTModelBuilder, "build_distributed_models") as build:
-            cfg.build_models(Mock())
+        cfg = mc.modelopt_inference_config_from_args(_make_args(use_cpu_initialization=True))
+        with (
+            patch(
+                "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
+            ),
+            patch.object(GPTModelBuilder, "build_distributed_models") as build,
+        ):
+            mc.build_inference_models(cfg, device=device)
         assert build.call_args.kwargs["device"] == device
         assert build.call_args.kwargs["checkpoint"] is cfg.checkpoint
         assert build.call_args.kwargs["wrap_with_ddp"] is False

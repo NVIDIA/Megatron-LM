@@ -34,7 +34,7 @@ from megatron.training.checkpointing import (
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
 
 try:
-    from megatron.post_training.model_config import build_modelopt_models
+    from megatron.post_training.model_config import build_inference_models, build_modelopt_models
     from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
@@ -187,7 +187,7 @@ def get_model_for_inference(
             raise ValueError(
                 "Custom inference process groups are not supported by the ModelOpt builder"
             )
-        model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+        model = build_inference_models(cfg)
     elif pg_collection is None and HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args):
         model = build_modelopt_models(args)
     else:

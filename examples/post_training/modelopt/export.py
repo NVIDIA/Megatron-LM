@@ -12,10 +12,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import modelopt.torch.export as mtex
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_config import modelopt_inference_config_from_args
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
@@ -68,7 +70,7 @@ if __name__ == "__main__":
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     args.use_cpu_initialization = True
-    cfg = modelopt_inference_config_from_args(args, device="cpu")
+    cfg = modelopt_inference_config_from_args(args)
     set_run_config(cfg)
     initialize_megatron(training=True)
 
@@ -86,7 +88,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = cfg.build_models(ProcessGroupCollection.use_mpu_process_groups())
+    model = build_inference_models(cfg, device="cpu")
 
     unwrapped_model = unwrap_model(model)[0]
 
