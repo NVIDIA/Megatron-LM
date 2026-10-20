@@ -133,6 +133,10 @@ def test_sparse_recipe_forwards_contract_to_existing_ray(tmp_path):
         '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHMLA_SPARSE_DSV41'
         in argv
     )
+    assert '+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides={head_dtype:float32}' in argv
+    assert not any(
+        arg.startswith('+actor_rollout_ref.rollout.engine_kwargs.vllm.head_dtype=') for arg in argv
+    )
     assert '++ray_kwargs.ray_init.runtime_env.env_vars.VERL_MLITE_SKIP_RUNTIME_PATCHES="0"' in argv
     for name in ('MXFP8_GEMM', 'BF16_GEMM', 'MXFP8_PREQUANT', 'MHC_OVERLAP', 'REPLAY_STAGE_LAYERS'):
         assert any(
