@@ -36,8 +36,12 @@ def build_model(model_cfg, *, impl_cfg):
 
 
 def export_hf_weights(chunks, model_cfg, ps, **kwargs):
+    if kwargs.get("target") == "vllm":
+        kwargs["target"] = "release"  # FP8 wo_a, matching the deployment forward.
     yield from native.export_hf_weights(chunks, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
+    if kwargs.get("target") == "vllm":
+        kwargs["target"] = "release"
     return native.save_hf_weights(chunks, path, model_cfg, ps, **kwargs)

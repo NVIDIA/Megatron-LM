@@ -151,6 +151,8 @@ class _Sparse(torch.autograd.Function):
 class _InverseRoPE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, positions, cache, groups):
+        if not x.is_cuda:
+            raise RuntimeError("Deployment inverse RoPE requires CUDA")
         from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
             fused_inv_rope_fp8_quant,
         )
@@ -175,6 +177,118 @@ class _InverseRoPE(torch.autograd.Function):
     def backward(ctx, grad):
         positions, cache = ctx.saved_tensors
         return _rotate(grad.reshape(ctx.shape), positions, cache), None, None, None
+
+
+def inverse_rope_bf16(x, positions, cache, groups):
+    """LoRA wo_a input: native BF16 inverse-RoPE before FP8 quantization.
+
+    This is independent of the base path's FP8 codes; callers opt in only when
+    a delta needs it. Never reconstruct this activation from dequantized FP8.
+    """
+    return _InverseRoPE.apply(x, positions, cache, groups)
+
+
+class _FP8OutputProjection(torch.autograd.Function):
+    """Native inverse-RoPE/FP8 einsum, with the decoded-operand STE adjoint."""
+
+    @staticmethod
+    def forward(ctx, x, weight, positions, cache, groups):
+        if not x.is_cuda or not weight.is_cuda:
+            raise RuntimeError("Deployment FP8 wo_a requires CUDA")
+        from types import SimpleNamespace
+
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            deepgemm_post_process_fp8_weight_block,
+        )
+        from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+            fused_inv_rope_fp8_quant,
+        )
+        from vllm.models.deepseek_v4.nvidia.ops.o_proj import _compile_einsum_configs
+        from vllm.utils.deep_gemm import fp8_einsum
+
+        from megatron.lite.model.deepseek_v41.lite.export import to_release
+        from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
+
+        from .experts import dequantize_activation, unpack_scales
+
+        heads, dim = x.shape[-2:]
+        inner = heads * dim // groups
+        rank = weight.numel() // (groups * inner)
+        ctx.shape, ctx.weight_shape, ctx.weight_dtype = (x.shape, weight.shape, weight.dtype)
+        if x.shape[0] == 0:
+            ctx.save_for_backward(
+                x.new_empty((0, groups, inner)),
+                weight.reshape(groups, rank, inner),
+                positions,
+                cache,
+            )
+            return x.new_empty((0, groups, rank))
+        encoded, scale = fused_inv_rope_fp8_quant(
+            x,
+            positions,
+            cache,
+            n_groups=groups,
+            heads_per_group=heads // groups,
+            nope_dim=dim - cache.shape[-1],
+            rope_dim=cache.shape[-1],
+            quant_group_size=32,
+            tma_aligned_scales=True,
+            quantize=True,
+        )
+        # Exactly the serialization used for live publication, including its
+        # canonicalization. Do not independently requantize each output row.
+        tensors = dict(
+            to_release("layers.0.attn.wo_a.weight", weight.reshape(groups * rank, inner))
+        )
+        codes, descale = (tensors["layers.0.attn.wo_a.weight"], tensors["layers.0.attn.wo_a.scale"])
+        decoded_w = (
+            dequantize_block_fp8(codes, descale, (32, 32)).reshape(groups, rank, inner).to(x.dtype)
+        )
+        codes, native_scale = deepgemm_post_process_fp8_weight_block(
+            codes, descale, (32, 32), True, is_bmm=True, bmm_batch_size=groups
+        )
+        decoded_x = torch.stack(
+            [
+                dequantize_activation(encoded[:, g], unpack_scales(scale[:, g], inner // 32))
+                for g in range(groups)
+            ],
+            1,
+        ).to(x.dtype)
+        _compile_einsum_configs(
+            x.shape[0],
+            SimpleNamespace(weight=codes),
+            native_scale,
+            cache,
+            n_groups=groups,
+            heads_per_group=heads // groups,
+            nope_dim=dim - cache.shape[-1],
+            rope_dim=cache.shape[-1],
+            o_lora_rank=rank,
+            einsum_recipe=(1, 1, 32),
+            tma_aligned_scales=True,
+        )
+        result = x.new_empty((x.shape[0], groups, rank))
+        fp8_einsum(
+            "bhr,hdr->bhd", (encoded, scale), (codes, native_scale), result, recipe=(1, 1, 32)
+        )
+        ctx.save_for_backward(decoded_x, decoded_w, positions, cache)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad):
+        activation, weight, positions, cache = ctx.saved_tensors
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            g = grad.float()
+            dx = torch.einsum('tgd,gdk->tgk', g, weight.float()).to(activation.dtype)
+            dw = torch.einsum('tgd,tgk->gdk', g, activation.float()).to(ctx.weight_dtype)
+        # Inverse-RoPE's adjoint is the forward rotation; quantization is STE.
+        return (
+            _rotate(dx.reshape(ctx.shape), positions, cache),
+            dw.reshape(ctx.weight_shape),
+            None,
+            None,
+            None,
+        )
 
 
 def swa_forward(attention, hidden, positions, rope_cache, *, observe=None, source=None):
@@ -231,16 +345,7 @@ def swa_forward(attention, hidden, positions, rope_cache, *, observe=None, sourc
     emit('core_attn', out)
     weight = attention.linear_o_group_proj
     groups = attention.config.o_groups
-    unrotated = _InverseRoPE.apply(out, positions, rope_cache, groups)
-    emit('inverse_rope', unrotated)
-    weight = weight.reshape(groups, attention.config.o_lora_rank, -1)
-    z = torch.stack(
-        [
-            linear(unrotated[:, g].contiguous(), weight[g], fp8=False).bfloat16()
-            for g in range(groups)
-        ],
-        1,
-    )
+    z = _FP8OutputProjection.apply(out, weight, positions, rope_cache, groups)
     emit('wo_a', z)
     result = linear(z.flatten(1), attention.linear_proj.weight, fp8=True).bfloat16()
     emit('wo_b', result)
