@@ -3649,6 +3649,10 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.calculate_per_token_loss
             ), "Dynamic context parallelism must be used with calculate_per_token_loss"
+            # The router z-loss still scales by the static TP x CP group, not the runtime one.
+            assert (
+                self.moe_z_loss_coeff is None
+            ), "Dynamic context parallelism not supported with moe_z_loss_coeff"
 
         if self.cuda_graph_scope is not None:
             assert self.cuda_graph_modules in (
