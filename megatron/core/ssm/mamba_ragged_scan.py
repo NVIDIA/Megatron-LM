@@ -18,9 +18,15 @@ sibling's length.
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
 from torch import Tensor
 from torch.autograd.function import once_differentiable
+
+# einops is optional for megatron-core; mamba-ssm, which the shared-prefix paths require,
+# depends on it.
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
 
 try:
     from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_bwd, _bmm_chunk_fwd

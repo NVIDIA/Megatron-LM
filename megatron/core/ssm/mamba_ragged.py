@@ -16,10 +16,16 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
-from einops import rearrange
 
 from megatron.core.shared_prefix_layout import SharedPrefixForestLayout, SharedPrefixLayout
 from megatron.core.ssm.mamba_mixer import MAMBA_HAS_STATE_DTYPE, MambaMixer, causal_conv1d_fn
+
+# einops is optional for megatron-core; mamba-ssm, which the shared-prefix paths require,
+# depends on it.
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
 
 
 # IDX is tl.int32, or tl.int64 when a tensor reaches 2^31 elements (see _index_dtype).
