@@ -125,6 +125,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_skip_masked_score_fill": True,
     "dsa_indexer_skip_topk_offset": 0,
     "dsa_indexer_topk": None,
+    "dsa_indexer_topk_backend": "cudnn",
     "dsa_indexer_use_sparse_loss": False,
     "dsa_indexer_topk_freq": 1,
     "dsa_indexer_weights_proj_use_quantization": True,

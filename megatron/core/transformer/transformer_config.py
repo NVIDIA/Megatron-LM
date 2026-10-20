@@ -458,6 +458,31 @@ class TransformerConfig(ModelParallelConfig):
     and clamps every reader to the kernel's per-row column limit. Other scorer paths, and
     frontends without the switch, keep the prefill. Disable for A/B comparisons."""
 
+    dsa_indexer_topk_backend: Literal["cudnn", "deepselect"] = "cudnn"
+    """Kernel of the non-deterministic DSA indexer top-k on the cuDNN fused DSA path.
+
+    ``'cudnn'`` runs the cuDNN frontend radix top-k in scratch-bounded row chunks.
+    ``'deepselect'`` selects every row in one DeepSelect launch with no scratch, using the
+    GLM-5.2 ``ds_tune`` build if it imports, else upstream ``deep_select``. On GB300 (CUDA
+    graph) ``ds_tune`` took 5.90 ms against 14.34 ms per GLM-5.2 1M CP64 rank-0 call and
+    0.43 ms against 0.57 ms at 128K, ``deep_select`` 7.94 ms at 1M; both are slower than
+    cuDNN on narrow rows. It applies only where DeepSelect is installed, validated and fast
+    (SM 10.3: the sm_100a kernels for GB200 have not run on a GPU, so SM 10.0 keeps cuDNN with
+    a warning; FP32 scores starting 16-byte aligned with a row stride that is a multiple of
+    1024 bytes, row width from 65536 for ``ds_tune`` (81920 for calls of more than 4096 rows)
+    or 524288 for ``deep_select`` to below 2**23, a compiled config for top-k <= 4096 and
+    top-k a multiple of 8); every other call, and deterministic mode, keeps the cuDNN top-k,
+    and the choice is logged once per reason.
+    ``ds_tune`` is built against one torch version and does not import under another, which
+    also falls back with one warning: check for the "DSA indexer top-k uses DeepSelect" log
+    line. Selected sets equal cuDNN's except for which equal scores fill the last slots. A
+    query row longer than top-k that sees a NaN score selects its first top-k in-row columns
+    with NaN scores, so with the sparse indexer loss (selected scores kept) it ends with
+    ``topk_length`` 0 and attends to no key, and without it attends to those first columns;
+    cuDNN keeps top-k - 1 real keys there. Requires ``dsa_kernel_backend='cudnn'``. KPool
+    selection (``dsa_indexer_kpool > 1``) does not run this top-k, so the option has no
+    effect there."""
+
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision of the DSA indexer scorer that produces the scores for Top-K selection.
 
@@ -2707,6 +2732,20 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
                 f"and {self.experimental_attention_variant=}."
+            )
+        if self.dsa_indexer_topk_backend not in ("cudnn", "deepselect"):
+            raise ValueError(
+                "dsa_indexer_topk_backend must be 'cudnn' or 'deepselect', "
+                f"got {self.dsa_indexer_topk_backend!r}."
+            )
+        if self.dsa_indexer_topk_backend == "deepselect" and (
+            self.experimental_attention_variant != "dsa" or self.dsa_kernel_backend != "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_topk_backend='deepselect' replaces the top-k of the cuDNN fused DSA "
+                "indexer and requires experimental_attention_variant='dsa' with "
+                f"dsa_kernel_backend='cudnn', got {self.experimental_attention_variant!r} and "
+                f"{self.dsa_kernel_backend!r}."
             )
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
