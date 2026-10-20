@@ -221,6 +221,7 @@ def warn_if_mamba_env_ignored(policy) -> None:
     logger.warning(
         "MAMBA_DETERMINISTIC=1 only affects the external mamba_ssm package. Megatron's "
         "Triton kernels, including megatron.core.ssm.ops, follow deterministic_mode "
-        "(on by default; see --disable-deterministic-mode) or torch.use_deterministic_algorithms(True); set one of "
-        "those, or AutotunePolicy(mode='pinned'), to pin their configurations."
+        "(on by default; see --disable-deterministic-mode) or "
+        "torch.use_deterministic_algorithms(True); set one of those, or "
+        "AutotunePolicy(mode='pinned'), to pin their configurations."
     )
