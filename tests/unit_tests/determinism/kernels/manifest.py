@@ -255,6 +255,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_fused_triton_kernels.py",
             "tests/unit_tests/transformer/test_single_pass_mhc.py",
+            "tests/unit_tests/models/test_v41_state_integration.py",
         ),
         kind="triton",
         notes="Sinkhorn / h_aggregate / h_post_bda / proj_rms_compute_h on the triton, native (torch.compile) and cuTile backends.",

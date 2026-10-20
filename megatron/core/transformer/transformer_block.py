@@ -280,6 +280,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         vp_stage: Optional[int] = None,
         name: str | None = None,
     ):
+        if config.mhc_single_pass and config.recompute_granularity == 'full':
+            raise ValueError("Single-pass full recompute requires the explicit HybridStack adapter")
         super().__init__(config=config)
 
         if pg_collection is None:
