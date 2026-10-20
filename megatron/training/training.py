@@ -3744,12 +3744,24 @@ def training_log(
         wandb_writer.log(packed_sequence_stats, iteration)
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    _lr_mp_group = pg_collection.mp if pg_collection is not None else None
+    mp_group = pg_collection.mp if pg_collection is not None else None
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
-        learning_rate, group=_lr_mp_group
+        learning_rate, group=mp_group
     )
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
+    model_config = get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
+    if (
+        model_config is not None
+        and model_config.log_max_attention_logit
+        and cfg.logger.tensorboard_dir
+        and iteration % cfg.logger.tensorboard_log_interval == 0
+    ):
+        # Every rank must participate, including stages without transformer layers.
+        # DP/CP maxima are already reduced by clip_qk; include all PP layers and TP heads.
+        max_attention_logit = reduce_max_stat_across_model_parallel_group(
+            max_attention_logit, group=mp_group
+        )
     # Tensorboard values.
     if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -3811,7 +3823,6 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
-        model_config = get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
         if model_config is not None and model_config.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
