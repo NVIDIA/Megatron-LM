@@ -39,6 +39,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -393,7 +394,10 @@ class TestMegatronFsdpFullyShard:
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_local_linear_fused_wgrad_accumulation(self, shard_strategy, dtype, use_fsdp_unit):
+    @pytest.mark.parametrize("prepare_moe_main_grad", [False, True], ids=["local", "moe-hook"])
+    def test_local_linear_fused_wgrad_accumulation(
+        self, shard_strategy, dtype, use_fsdp_unit, prepare_moe_main_grad
+    ):
         """Retain every microbatch, then reset the gradient for the next optimization cycle."""
         device_mesh = build_distributed_environment((1, Utils.world_size, 1, 1))
         config = TransformerConfig(
@@ -414,6 +418,13 @@ class TestMegatronFsdpFullyShard:
             gather_output=False,
             tp_group=device_mesh[TP].get_group(),
         ).cuda()
+        if prepare_moe_main_grad:
+            # Exercise the real MoE preparation helper before a fused wgrad writer reads
+            # FSDP's policy, without requiring the op-fuser's grouped-GEMM backend.
+            layer.fuse_wgrad_accumulation = True
+            layer.register_forward_pre_hook(
+                lambda module, _: TEGroupedMLP._ensure_main_grad(module)
+            )
         model = fully_shard_model(
             torch.nn.Sequential(layer),
             device_mesh=device_mesh,
