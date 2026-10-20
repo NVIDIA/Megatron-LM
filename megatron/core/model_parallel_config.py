@@ -171,7 +171,7 @@ class ModelParallelConfig:
 
     Applies before sequence-parallel sharding. MXFP8 also requires a multiple of
     32 after SP sharding; that requirement is combined with this alignment.
-    Padding is represented as a masked dummy sequence, as in dev's eager path.
+    Padding is represented as a masked dummy sequence.
     """
 
     expert_model_parallel_size: int = 1
