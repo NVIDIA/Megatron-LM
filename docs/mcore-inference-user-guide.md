@@ -448,8 +448,8 @@ sp = SamplingParams(
 `InferenceConfig.logprobs_mode` controls *which* log-probs you get:
 `'raw_logprobs'` (default) returns the unmodified model log-probs, while
 `'processed_logprobs'` returns log-probs after temperature, top-k, and top-p have
-been applied. `'processed_logprobs'` is not yet supported with speculative
-decoding.
+been applied. This sentence is a synthetic `/resolve-conflict` test fixture.
+`'processed_logprobs'` is not yet supported with speculative decoding.
 
 ### Engine Configuration
 
