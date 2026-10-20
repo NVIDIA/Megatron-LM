@@ -132,16 +132,13 @@ def load_checkpoint_to_model(args):
     from model_provider import model_provider
     from gpt_builders import gpt_builder
     from transformers import MixtralForCausalLM, MixtralConfig
-    from megatron.training.global_vars import get_run_config
 
     # Load Huggingface model.
 
     hf_model = MixtralForCausalLM.from_pretrained(args.load, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(
-        get_run_config().optimizer.params_dtype
-    )
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -226,6 +223,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('position_embedding_type')
     check_for_arg('tokenizer_type')
     check_for_arg('disable_bias_linear')
+    check_for_arg('params_dtype')
     check_for_arg('swiglu')
 
     # Determine how to make our models.
@@ -236,8 +234,6 @@ def _load_checkpoint(queue, args):
     LanguageModule.embedding_warning_printed = True 
 
     cfg = inference_cfg_container_from_args(margs, build_model_config=False)
-    # Derives optimizer.params_dtype from --fp16/--bf16; not run by set_global_variables.
-    cfg.optimizer.finalize_optimizer_config()
     set_global_variables(margs, cfg, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
@@ -260,8 +256,8 @@ def _load_checkpoint(queue, args):
     md.num_attention_heads = margs.num_attention_heads
     md.max_position_embeddings = margs.max_position_embeddings
     md.tokenizer_type = margs.tokenizer_type
-    md.iteration = margs.iteration
-    md.params_dtype = cfg.optimizer.params_dtype
+    md.iteration = 1
+    md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
