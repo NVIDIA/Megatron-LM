@@ -102,7 +102,7 @@ class _RecordingLayer:
         # belongs to no RecomputeSegment and the segment hooks are skipped.
         self.recompute_segment = None
 
-    def get_fp8_context(self):
+    def get_low_precision_context(self):
         return nullcontext()
 
     def release_state(self):
@@ -415,11 +415,25 @@ def _assert_close_grads(overlap_gradients, reference_gradients, rtol=5e-3, atol=
             reference_gradients[name],
             rtol=rtol,
             atol=atol,
-            msg=f"Gradient mismatch for {name}",
+            msg=lambda detail, parameter_name=name: (
+                f"Gradient mismatch for {parameter_name}:\n{detail}"
+            ),
         )
 
 
 class TestMhcA2AOverlapNumerics:
+    @pytest.fixture(autouse=True)
+    def _isolated_compiler_cache(self):
+        # Previous graph/shape cases can exhaust Dynamo's specialization budget.
+        # A partially compiled BF16 reference then has different fusion/rounding
+        # from a fresh scheduled model. Isolate cases without disabling compilation
+        # or increasing its limit; both paths retain the original numeric checks.
+        torch.compiler.reset()
+        try:
+            yield
+        finally:
+            torch.compiler.reset()
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,

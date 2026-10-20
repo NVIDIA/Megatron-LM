@@ -7,8 +7,10 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -18,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -28,18 +31,22 @@ from megatron.core.transformer.multi_latent_attention import (
     MultiLatentAttention,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version, is_torch_min_version, unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 
 def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
@@ -1658,7 +1665,15 @@ class TestMLAClipQK:
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, output_gate, gate_granularity
+    tmp_path_dist_ckpt,
+    rope_type,
+    apply_rope_fusion,
+    tp,
+    sp,
+    cp,
+    output_gate,
+    gate_granularity,
+    run_config,
 ):
     if output_gate and (rope_type != "yarn" or apply_rope_fusion):
         pytest.skip("Gated MLA parallel coverage uses one representative YARN configuration.")
@@ -1788,8 +1803,7 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-                load_checkpoint(gpt_model, None, None)
+            load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank
         cp_group = parallel_state.get_context_parallel_group()
@@ -1878,6 +1892,160 @@ def test_parallel_multi_latent_attention_correctness(
     os.environ.update(_environ)
 
 
+@pytest.mark.parametrize("mla_down_proj_fusion", [False, True])
+def test_moe_pre_mlp_layernorm_has_residual(mla_down_proj_fusion):
+    """The MoE pre-MLP norm of both MLA specs declares its residual, so that
+    ``fused_residual_rmsnorm`` fuses the residual-gradient add into the norm backward."""
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
+        num_experts=8,
+        moe_grouped_gemm=True,
+        multi_latent_attention=True,
+        mla_down_proj_fusion=mla_down_proj_fusion,
+    )
+    assert submodules.pre_mlp_layernorm is backend.layer_norm(has_residual=True)
+
+
+@pytest.mark.skipif(not is_te_min_version("1.13.0"), reason="Requires TE >= 1.13.0")
+class TestFusedMLAPreMLPResidualNorm:
+    """``fused_residual_rmsnorm`` on a MoE layer built from the ``mla_down_proj_fusion`` spec."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        yield
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build_layer(fused_residual_rmsnorm):
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            normalization="RMSNorm",
+            fused_residual_rmsnorm=fused_residual_rmsnorm,
+            mla_down_proj_fusion=True,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=256,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=config.num_moe_experts,
+            multi_latent_attention=True,
+            mla_down_proj_fusion=True,
+        )
+        return TransformerLayer(config, submodules).cuda()
+
+    @staticmethod
+    def _assert_close_up_to_rounding(actual, expected, name):
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error < 1e-2, f"{name}: relative error {error.item():.2e}"
+
+    def test_fused_residual_norm_matches_unfused(self):
+        """Fusing the residual-gradient add into the norm backward keeps the forward bitwise and
+        the gradients equal up to the rounding of that add."""
+        reference = self._build_layer(fused_residual_rmsnorm=False)
+        fused = self._build_layer(fused_residual_rmsnorm=True)
+        fused.load_state_dict(reference.state_dict())
+        assert not reference.pre_mlp_layernorm.returns_residual
+        assert fused.pre_mlp_layernorm.returns_residual
+
+        seq_len, batch, hidden_size = 64, 2, reference.config.hidden_size
+        torch.manual_seed(0)
+        hidden_states = torch.randn(
+            seq_len, batch, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        output_grad = torch.randn_like(hidden_states)
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+
+        results = []
+        for layer in (reference, fused):
+            layer_input = hidden_states.clone().requires_grad_(True)
+            output, _ = layer(hidden_states=layer_input, attention_mask=attention_mask)
+            output.backward(output_grad)
+            grads = {
+                name: param.grad
+                for name, param in layer.named_parameters()
+                if param.grad is not None
+            }
+            results.append((output.detach(), layer_input.grad, grads))
+        (ref_output, ref_input_grad, ref_grads), (output, input_grad, grads) = results
+
+        torch.testing.assert_close(output, ref_output, rtol=0, atol=0)
+        # The MoE backward runs before the residual-gradient add, so its gradients are unchanged.
+        # The gradients that flow through the add differ only by its bf16 rounding.
+        assert grads.keys() == ref_grads.keys()
+        for name, ref_grad in ref_grads.items():
+            if name.startswith("mlp."):
+                torch.testing.assert_close(grads[name], ref_grad, rtol=0, atol=0)
+            else:
+                self._assert_close_up_to_rounding(grads[name], ref_grad, name)
+        self._assert_close_up_to_rounding(input_grad, ref_input_grad, "input")
+
+
+class TestMLAUpProjectionInput:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_local_up_projection_reads_the_slice_without_a_copy(self):
+        """Only Transformer Engine projections get the vectorized copy; a local (non-TE)
+        up-projection receives the row-strided kv slice of the down-projection output as it is."""
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True
+        ).self_attention.submodules
+        submodules.linear_q_up_proj = ColumnParallelLinear
+        submodules.linear_kv_up_proj = ColumnParallelLinear
+        attention = MLASelfAttention(
+            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        ).cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        received = []
+        hook = attention.linear_kv_up_proj.register_forward_pre_hook(
+            lambda module, args: received.append(args[0])
+        )
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            attention(hidden_states, attention_mask)
+        hook.remove()
+        assert copy.call_count == 0
+        assert len(received) == 1 and not received[0].is_contiguous()
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestFusedMLASelfAttention:
 
@@ -1939,6 +2107,20 @@ class TestFusedMLASelfAttention:
 
         assert attention.linear_q_up_proj.eps == pytest.approx(1.0e-6)
         assert attention.linear_kv_up_proj.eps == pytest.approx(1.0e-6)
+
+    def test_up_projection_inputs_copied_as_contiguous_rows(self):
+        config = self.transformer_config
+        self.fused_attention.cuda()
+        seq_len, batch = 32, 2
+        hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device="cuda")
+        with mock.patch.object(
+            mla_module, "contiguous_rows", wraps=mla_module.contiguous_rows
+        ) as copy:
+            self.fused_attention(hidden_states, attention_mask)
+        # The q and kv slices of the fused down-projection output take the vectorized copy.
+        assert copy.call_count == 2
+        assert not any(call.args[0].is_contiguous() for call in copy.call_args_list)
 
     def test_fused_weight_shape(self):
         config = self.transformer_config
@@ -2202,3 +2384,289 @@ class TestFusedMLARequiresQLora:
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_partial_rope_does_not_dispatch_fused_q_up_projection(monkeypatch):
+    """Even an eligible Q-up projection must fall back when no fused RoPE tables exist."""
+    from types import SimpleNamespace
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            qk_layernorm=True,
+            rope_type="rope",
+            rotary_percent=0.5,
+            apply_rope_fusion=True,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        attention = (
+            MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(qk_layernorm=True),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        # This is a negative dispatch check, not a claim that H100 runs the SM100 kernel.
+        attention._use_fused_q_uproj = True
+        monkeypatch.setattr(
+            mla_module,
+            "FusedMLAQUpProjFunction",
+            SimpleNamespace(apply=lambda *_: pytest.fail("partial RoPE must not use fused Q-up")),
+        )
+        hidden = torch.randn(16, 1, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        query, key, value, _, _ = attention.get_query_key_value_tensors(hidden)
+        assert all(torch.isfinite(tensor).all() for tensor in (query, key, value))
+        (query.float().sum() + key.float().sum() + value.float().sum()).backward()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    get_device_arch_version() < 10,
+    reason="Fused MLA Q up-projection requires Blackwell architecture",
+)
+class TestFusedMLAQUpProjIntegration:
+    """Exercise Megatron MLA forward/backward through TE's fused Q projection."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_fused_vs_unfused_q_forward(self):
+        """MXFP8 Q from the cuDNN fused kernel matches unfused MXFP8 GEMM + Triton-RoPE + quantize.
+
+        Runs the same inputs through:
+          Fused:   FusedMLAQUpProjRopeQuant (cuDNN MXFP8 GEMM+RoPE+quant in one kernel)
+          Unfused: TE general_gemm MXFP8 GEMM (layout="TN", same as TE Linear forward)
+                   + fused_apply_mla_rope_for_q (Megatron Triton RoPE)
+                   + mxfp8_quantize_only (same quantizer used for K/V in the attention block)
+
+        Both the rowwise Q (used in QK^T) and columnwise Q (used in dK GEMM in the attention
+        backward) are compared, since a bug in the columnwise output would silently degrade
+        K-path gradients without any other test catching it.
+        """
+        fused_q_up_proj = mla_module.FusedMLAQUpProjRopeQuant
+        if fused_q_up_proj is None or not fused_q_up_proj.is_supported():
+            pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
+        if mla_module.fused_apply_mla_rope_for_q is None:
+            pytest.skip("fused_apply_mla_rope_for_q not available")
+
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            mxfp8_quantize_only,
+        )
+        from transformer_engine.pytorch.cpp_extensions import general_gemm as _te_general_gemm
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+
+        fused_apply_rope = mla_module.fused_apply_mla_rope_for_q
+
+        # DSv3 671B dims
+        S, B = 256, 1
+        NH = 128
+        QK_HEAD_DIM = 128  # NOPE head dim
+        QK_ROPE_DIM = 64  # ROPE head dim
+        Q_HEAD_DIM = QK_HEAD_DIM + QK_ROPE_DIM  # 192
+        Q_LORA_RANK = 1536
+        PROJ_DIM = NH * Q_HEAD_DIM  # 24576
+        BLOCK = 32
+        E8M0_BIAS = 127
+        device = torch.device("cuda")
+
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        x = torch.randn(S * B, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        w_bf16 = torch.randn(PROJ_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        w_mxfp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(
+            w_bf16
+        )
+        x_fused_mxfp8 = MXFP8Quantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
+        )(x)
+
+        # cos/sin in (tokens, QK_ROPE_DIM) — the format both paths expect.
+        # Asymmetric halves (left ≠ right) to expose any half-swapping bugs.
+        inv_freq = 1.0 / (
+            10000
+            ** (torch.arange(0, QK_ROPE_DIM, 2, dtype=torch.float32, device=device) / QK_ROPE_DIM)
+        )
+        t = torch.arange(S, dtype=torch.float32, device=device)
+        freqs = torch.cat([torch.outer(t, inv_freq), torch.outer(t, inv_freq * 0.5)], dim=-1)
+        cos_flat = freqs.cos().to(torch.bfloat16)  # (S, 64)
+        sin_flat = freqs.sin().to(torch.bfloat16)  # (S, 64)
+
+        # ── Fused path ──────────────────────────────────────────────────────────────
+        query_fused, _ = fused_q_up_proj.run(x_fused_mxfp8, w_mxfp8, cos_flat, sin_flat, S, B)
+
+        # ── Unfused path ─────────────────────────────────────────────────────────────
+        # Step 1: MXFP8 GEMM.  Same as TE Linear's forward under fp8_autocast.
+        # layout="TN": A=weight is transposed (transa=True), B=input is not (transb=False).
+        # Both are unwrapped from their rowwise MXFP8 data before the cuBLAS call.
+        x_mxfp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(x)
+        q_linear_out = _te_general_gemm(
+            w_mxfp8,  # A = weight (PROJ_DIM, Q_LORA_RANK), transposed in GEMM → Q_LORA_RANK rows
+            x_mxfp8,  # B = input  (S*B,       Q_LORA_RANK), not transposed
+            layout="TN",
+            out_dtype=torch.bfloat16,
+        )[0].view(
+            S, B, NH, Q_HEAD_DIM
+        )  # → (S*B, PROJ_DIM) then reshape
+
+        # Step 2: RoPE.  fused_apply_mla_rope_for_q expects (S, B, NH, Q_HEAD_DIM) when
+        # cu_seqlens_q=None, and cos/sin as (tokens, QK_ROPE_DIM).
+        query_bf16 = fused_apply_rope(
+            q_linear_out,
+            cos_flat,
+            sin_flat,
+            QK_HEAD_DIM,
+            QK_ROPE_DIM,
+            None,  # cu_seqlens_q
+            0,  # cp_rank
+            1,  # cp_size
+        )  # → (S, B, NH, Q_HEAD_DIM) bf16
+
+        # Step 3: Quantize.  Same quantizer + format as _QuantizeKVForFusedAttn uses for K/V.
+        q_quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        (query_unfused,) = mxfp8_quantize_only([(query_bf16.contiguous(), q_quantizer)], "sbhd")
+
+        # ── Compare ───────────────────────────────────────────────────────────────────
+        # Compare MXFP8 Q from both paths directly.  Each path applies E4M3 quantization
+        # (≤6.25% relative error) on top of a GEMM that may differ by ~2% between the
+        # cuDNN and cuBLAS accumulators, giving a worst-case combined rtol of ~0.14.
+        # Use the combined rtol=0.14 bound; exceeding it would indicate a systematic
+        # bias beyond normal FP8 quantization noise.
+        def _deq_row(t: MXFP8Tensor) -> torch.Tensor:
+            tokens = S * B
+            q_2d = MXFP8Tensor(
+                shape=(tokens, PROJ_DIM),
+                dtype=torch.bfloat16,
+                rowwise_data=t._rowwise_data.view(tokens, PROJ_DIM),
+                rowwise_scale_inv=t._rowwise_scale_inv.view(tokens, PROJ_DIM // BLOCK),
+                columnwise_data=None,
+                columnwise_scale_inv=None,
+                quantizer=t._quantizer,
+                requires_grad=False,
+                fp8_dtype=t._fp8_dtype,
+                with_gemm_swizzled_scales=False,
+            )
+            return q_2d.dequantize().to(torch.bfloat16).view(S, B, NH, Q_HEAD_DIM)
+
+        def _deq_col(t: MXFP8Tensor) -> torch.Tensor:
+            tokens = S * B
+            fp8_col = t._columnwise_data.view(tokens, NH, Q_HEAD_DIM)
+            scale_col = t._columnwise_scale_inv.view(tokens // BLOCK, NH, Q_HEAD_DIM)
+            inv = torch.pow(2.0, scale_col.to(torch.float32) - E8M0_BIAS).unsqueeze(1)
+            # TE's C++ quantizer stores _columnwise_data as uint8 (raw E4M3 bit patterns).
+            # The cuDNN kernel returns out_fp8_col as float8_e4m3fn.
+            # Either way, reinterpret the bits as float8_e4m3fn before converting to float32.
+            if fp8_col.dtype == torch.uint8:
+                fp8_col = fp8_col.view(torch.float8_e4m3fn)
+            return (
+                fp8_col.to(torch.float32)
+                .view(tokens // BLOCK, BLOCK, NH, Q_HEAD_DIM)
+                .mul_(inv)
+                .reshape(S, B, NH, Q_HEAD_DIM)
+                .to(torch.bfloat16)
+            )
+
+        torch.testing.assert_close(
+            _deq_row(query_fused), _deq_row(query_unfused), atol=1.0, rtol=0.14
+        )
+        torch.testing.assert_close(
+            _deq_col(query_fused), _deq_col(query_unfused), atol=1.0, rtol=0.14
+        )
+
+    def test_end_to_end_backward_uses_te_autograd(self, monkeypatch):
+        with mock.patch.dict(
+            os.environ,
+            {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0", "NVTE_FUSED_MLA_Q_UPROJ": "1"},
+            clear=False,
+        ):
+            fused_uproj = mla_module.FusedMLAQUpProjRopeQuant
+            if fused_uproj is None or not fused_uproj.is_supported():
+                pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
+
+            config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=256,
+                num_attention_heads=128,
+                attention_dropout=0.0,
+                use_cpu_initialization=True,
+                qk_layernorm=True,
+                fp8="hybrid",
+                fp8_recipe="mxfp8",
+                fp8_dot_product_attention=True,
+                q_lora_rank=1536,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=128,
+                qk_pos_emb_head_dim=64,
+                rope_type="yarn",
+                rotary_base=10000,
+                original_max_position_embeddings=256,
+                apply_rope_fusion=True,
+                use_fused_mla_q_uproj=True,
+                layernorm_epsilon=1.0e-5,
+                attention_latent_norm_epsilon=1.0e-6,
+            )
+            attention = (
+                MLASelfAttention(
+                    config,
+                    get_mla_self_attn_submodules(),
+                    layer_number=1,
+                    attn_mask_type=AttnMaskType.causal,
+                )
+                .cuda()
+                .bfloat16()
+            )
+
+            assert attention._use_fused_q_uproj
+            assert (
+                mla_module.FusedMLAQUpProjFunction.__module__
+                == "transformer_engine.pytorch.attention.fused_mla_q_uproj"
+            )
+            original_apply = mla_module.FusedMLAQUpProjFunction.apply
+            seen_epsilons = []
+
+            def record_apply(*args):
+                seen_epsilons.append(args[15])
+                return original_apply(*args)
+
+            monkeypatch.setattr(mla_module.FusedMLAQUpProjFunction, "apply", record_apply)
+
+            hidden_states = torch.randn(
+                256, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
+            )
+            with get_fp8_context(config):
+                output, _ = attention(hidden_states, None)
+            output.float().square().mean().backward()
+            assert seen_epsilons and all(eps == 1.0e-6 for eps in seen_epsilons)
+
+            for grad in (
+                hidden_states.grad,
+                attention.linear_q_up_proj.weight.grad,
+                attention.linear_q_up_proj.layer_norm_weight.grad,
+            ):
+                assert grad is not None
+                assert torch.isfinite(grad).all()
+                assert torch.count_nonzero(grad) > 0

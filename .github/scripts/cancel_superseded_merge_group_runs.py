@@ -61,7 +61,9 @@ class GitHubClient:
                 delay = min(int(error.headers.get("Retry-After", 2**attempt)), 30)
             except (TimeoutError, urllib.error.URLError) as error:
                 if attempt == 4:
-                    raise RuntimeError(f"GitHub API {method} {path} failed after retries: {error}") from error
+                    raise RuntimeError(
+                        f"GitHub API {method} {path} failed after retries: {error}"
+                    ) from error
                 delay = 2**attempt
 
             print(f"GitHub API {method} {path} failed transiently; retrying in {delay}s")
@@ -75,8 +77,12 @@ class GitHubClient:
         while True:
             query = urllib.parse.urlencode({**parameters, "per_page": "100", "page": str(page)})
             response = self._request(f"{endpoint}?{query}")
-            if not isinstance(response, dict) or not isinstance(response.get("workflow_runs"), list):
-                raise RuntimeError(f"GitHub API returned an invalid workflow-runs response for {endpoint}")
+            if not isinstance(response, dict) or not isinstance(
+                response.get("workflow_runs"), list
+            ):
+                raise RuntimeError(
+                    f"GitHub API returned an invalid workflow-runs response for {endpoint}"
+                )
 
             page_runs = response["workflow_runs"]
             runs.extend(page_runs)
@@ -144,8 +150,12 @@ def _select_superseded_runs(
             generation_order[head_branch] = run_order
 
     current_order = _run_order(current_run)
-    generation_order[current_head] = min(generation_order.get(current_head, current_order), current_order)
-    if any(head != current_head and order > current_order for head, order in generation_order.items()):
+    generation_order[current_head] = min(
+        generation_order.get(current_head, current_order), current_order
+    )
+    if any(
+        head != current_head and order > current_order for head, order in generation_order.items()
+    ):
         print(f"A newer merge-group generation exists for PR #{current_pr}; this cleanup is stale")
         return []
 
@@ -184,10 +194,14 @@ def main() -> None:
     if current_pr is None:
         raise ValueError(f"Unexpected merge-group head branch: {current_run['head_branch']}")
     active_heads = {
-        str(run.get("head_branch", "")) for run in active_runs if _pr_number(run.get("head_branch")) == current_pr
+        str(run.get("head_branch", ""))
+        for run in active_runs
+        if _pr_number(run.get("head_branch")) == current_pr
     }
     active_heads.add(str(current_run["head_branch"]))
-    trigger_runs = client.list_trigger_workflow_runs(int(os.environ["TRIGGER_WORKFLOW_ID"]), active_heads)
+    trigger_runs = client.list_trigger_workflow_runs(
+        int(os.environ["TRIGGER_WORKFLOW_ID"]), active_heads
+    )
     superseded_runs = _select_superseded_runs(active_runs, trigger_runs, current_run)
 
     canceled = 0
@@ -200,7 +214,9 @@ def main() -> None:
                 print(f"Run {run_id} became terminal before cancellation")
                 continue
             raise
-        print(f"Canceled superseded {run.get('name', 'workflow')} run {run_id} ({run.get('head_branch')})")
+        print(
+            f"Canceled superseded {run.get('name', 'workflow')} run {run_id} ({run.get('head_branch')})"
+        )
         canceled += 1
 
     print(f"Canceled {canceled} superseded merge-group run(s)")

@@ -8,7 +8,7 @@ per-chunk ``cu_seqlens``, causal offsets, padding and score gathering.
 Real multi-chunk kernel numerics are
 ``TestRealKernelIndexerTopk.test_real_indexer_topk_row_chunked_matches_single_pass``
 and ``test_real_indexer_topk_thd_row_chunked_matches_single_pass`` in
-``test_csa_fused_sparse_attention.py``.
+``test_csa_fused_sparse_attention_dev.py``.
 """
 
 import gc

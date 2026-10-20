@@ -333,26 +333,11 @@ class LoggerConfig:
     log_l2_norm_grad_to_tensorboard: bool = False
     """Enable gradients logging to tensorboard."""
 
-    log_num_zeros_in_grad: bool = False
-    """If set, calculate and log the number of zeros in gradient."""
-
-    log_max_attention_logit: bool = False
-    """Enable max attention logit logging to tensorboard."""
-
     log_runtime_to_tensorboard: bool = False
     """Enable runtime metrics logging to tensorboard."""
 
     runtime_time_unit: str = "hours"
     """Time unit to use for time logging. """
-
-    barrier_with_L1_time: bool = field(
-        default=True,
-        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
-    )
-    """If not disabled, use barrier with level 1 time measurements. Note that this is up to the user to
-    make sure calling barrier with their timers will not result in hangs. This can happen if for
-    example the user adds a level 1 timer that is not called by all ranks.
-    """
 
     log_world_size_to_tensorboard: bool = False
     """Enable world size logging to tensorboard."""
@@ -407,6 +392,52 @@ class LoggerConfig:
 
     moe_routing_trace_dump_weights: bool = False
     """Save router weight tensors to a .pt sidecar file."""
+
+    enable_one_logger: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-one-logger"]}}
+    )
+    """Enable/disable using one_logger to track E2E metrics.
+    Note that one_logger is an internal tool and not available externally.
+    For installation, please go to
+    https://confluence.nvidia.com/display/MLWFO/Package+Repositories for more details.
+    """
+
+    one_logger_project: str = "megatron-lm"
+    """The one-logger project name. Ignored if --no-one-logger is set."""
+
+    one_logger_run_name: str | None = None
+    """The one-logger run name displayed. Ignored if --no-one-logger is set."""
+
+    one_logger_async: bool = False
+    """Run one-logger asynchronously."""
+
+    app_tag_run_name: str | None = None
+    """Application run name shared across training jobs."""
+
+    app_tag_run_version: str = "0.0.0"
+    """Application version associated with performance metrics."""
+
+    otel_enabled: bool = False
+    """Enable OpenTelemetry telemetry (traces and metrics).
+    See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.
+    """
+
+    otel_service_name: str | None = None
+    """Override OTEL_SERVICE_NAME for this training run."""
+
+    otel_span_groups: str | None = None
+    """Comma-separated span-group spec controlling which OTel instrumentation boundaries are active.
+    Accepts preset keywords ("default", "per_step", "full", "all") or individual group names
+    ("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", "step",
+    "forward_backward", "optimizer", "microbatch"), or a mix.
+    Defaults to "default" (coarse job/checkpoint/evaluate spans only).
+    Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.
+    """
+
+    def validate(self) -> None:
+        """Check logging requirements shared by CLI and native configurations."""
+        if self.log_memory_interval is not None:
+            assert self.log_memory_interval % self.log_interval == 0
 
 
 @dataclass(kw_only=True)
@@ -550,8 +581,8 @@ class CheckpointConfig:
     async_save: bool = False
     """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
 
-    async_strategy: Literal["nvrx", "mcore"] = "nvrx"
-    """Which async save strategy to use. Available strategies: nvrx, mcore."""
+    async_strategy: Literal["nvrx"] = "nvrx"
+    """Which async save strategy to use. Deprecated and will be removed."""
 
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
@@ -655,7 +686,10 @@ class CheckpointConfig:
         "ignore_all",
     ] = "assume_ok_unexpected"
     """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model.
+    For fsdp_dtensor checkpoints it covers model weights a partial load cannot supply, and
+    assume_ok_unexpected raises like raise_unexpected there because a partial load never raises
+    on its own. Use ignore_all to opt out."""
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.
@@ -693,18 +727,10 @@ class CheckpointConfig:
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in [
-            "nvrx",
-            "mcore",
-        ], f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx, mcore."
+            "nvrx"
+        ], f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
-        if not self.async_save:
-            self.async_strategy = "mcore"
-
-        if (
-            self.async_save
-            and self.async_strategy == "nvrx"
-            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
-        ):
+        if self.async_save and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
             assert has_nvrx_checkpointing_async_support(), (
                 "A compatible nvidia-resiliency-ext installation is required to enable "
                 "async save with async_strategy='nvrx'."
@@ -799,3 +825,6 @@ class TokenizerConfig:
 
     chat_template: Optional[str] = None
     """Custom chat template in jinja format for conversation formatting."""
+
+    use_gigatoken: Optional[bool] = False
+    """Whether to use faster implementation of tokenizers (gigatoken)"""

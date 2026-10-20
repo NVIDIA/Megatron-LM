@@ -9,27 +9,12 @@ _PROGRAM_START_TIME = time.time()
 
 import json
 
-# Suppress warnings on all ranks but rank 0.
-import os
-import warnings
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
-rank = int(os.environ.get('RANK', 0))
-if rank != 0:
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-    # Some libraries (e.g., CUTLASS DSL) use warnings.catch_warnings() with
-    # simplefilter("always"), which overrides the filters above. Override
-    # showwarning as a fallback to suppress warnings that slip through.
-    _original_showwarning = warnings.showwarning
-
-    def _rank0_only_showwarning(message, category, filename, lineno, file=None, line=None):
-        if issubclass(category, (UserWarning, FutureWarning, DeprecationWarning)):
-            return
-        _original_showwarning(message, category, filename, lineno, file, line)
-
-    warnings.showwarning = _rank0_only_showwarning
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
@@ -65,11 +50,21 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    pretrain_cfg_container_from_args,
+    resolve_tokenizer_vocab_size,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import (
+    get_run_config,
+    initialize_runtime_services,
+    set_run_config,
+)
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -436,6 +431,8 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
+    """Build the GPT (or FIM) dataset config from parsed CLI args."""
+    cfg = get_run_config()
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -449,7 +446,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             sequences_per_dataset = json.load(f)
 
     data_args = {
-        "random_seed": args.seed,
+        "random_seed": cfg.rng.seed,
         "sequence_length": args.seq_length,
         "blend": blend,
         "blend_per_split": blend_per_split,
@@ -464,6 +461,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "reset_attention_mask": args.reset_attention_mask,
         "eod_mask_loss": args.eod_mask_loss,
         "create_attention_mask": args.create_attention_mask_in_dataloader,
+        "inter_document_masking": args.dataloader_inter_document_masking,
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
@@ -522,7 +520,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         is_packed_sequence = True  # SFT always uses packed sequence
     elif args.use_varlen_dataset:
         # Variable-length packed (THD) dataset, independent of --sft.
-        # Reuses SFTDataset's THD/dynamic-cp packing internally but is gated
+        # Reuses SFTDataset's THD packing internally but is gated
         # by its own top-level flag.
         if args.mock_data:
             dataset_type = MockVarlenDataset
@@ -588,10 +586,15 @@ if __name__ == "__main__":
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = gpt_config_from_args(args, model_config_cls=ModelOptModelConfig)
+        model_cfg = gpt_config_from_args(
+            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
+        )
     else:
-        model_cfg = gpt_config_from_args(args)
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(full_config)
+    initialize_runtime_services(args, training=True)
+    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

@@ -192,7 +192,7 @@ def _worker_custom_pgs_match_mpu(rank, world_size, port):
     grads_mpu = _full_grads(block_mpu, mpu_gtp_group)
 
     del block_mpu
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     # ---------------- Topology 2: custom collection, permuted gtp ranks ----------------
     mpu_ranks = sorted(dist.get_process_group_ranks(mpu_gtp_group))
@@ -279,6 +279,106 @@ def _worker_partial_pgs_fall_back_to_mpu(rank, world_size, port):
     ps.initialize_model_parallel()
 
 
+def _worker_gdp_uses_custom_gtp_group(rank, world_size, port):
+    """GDP projections must use the caller-owned GTP group when MPU owns another topology."""
+    from megatron.core import parallel_state as ps
+    from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP_SIZE
+    )
+    mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'cp', 'gtp_remat', 'expt_gtp_remat']
+    )
+    mpu_ranks = sorted(dist.get_process_group_ranks(mpu_pgs.gtp_remat))
+    custom_gtp_group = _pick_permuted_gtp_group(rank, mpu_ranks)
+    custom_pgs = ProcessGroupCollection(
+        tp=mpu_pgs.tp,
+        cp=mpu_pgs.cp,
+        gtp_remat=custom_gtp_group,
+        expt_gtp_remat=mpu_pgs.expt_gtp_remat,
+    )
+    model_parallel_cuda_manual_seed(
+        42, gtp_remat_rank=custom_gtp_group.rank(), egtp_remat_rank=0, force_reset_rng=True
+    )
+
+    config = _make_config()
+    config.mamba_num_heads = 4
+    config.mamba_head_dim = 64
+    config.mamba_num_groups = 2
+    config.mamba_state_dim = 128
+    mixer = GatedDeltaProductMixer(
+        config,
+        gdp_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+        config.hidden_size,
+        layer_number=1,
+        pg_collection=custom_pgs,
+    ).cuda()
+
+    for name, param in (("in_proj", mixer.in_proj.weight), ("out_proj", mixer.out_proj.weight)):
+        assert isinstance(param, GTPShardedParam), f"GDP {name} was not GTP-sharded"
+        assert (
+            param.group is custom_gtp_group
+        ), f"GDP {name} used the MPU-global GTP group instead of the caller-owned group"
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+
+
+def _worker_mtp_eh_proj_uses_custom_gtp_group(rank, world_size, port):
+    """MTP's eh_proj must use the caller-owned GTP group, not the MPU globals.
+
+    eh_proj was built with ``tp_group`` alone, so it resolved its axis through the MPU
+    fallback. Under MIMO those globals are never created and it came out unsharded; here the
+    MPU owns a different pairing, so reading them yields a valid-but-wrong group.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.multi_token_prediction import get_mtp_layer_spec
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP_SIZE
+    )
+    mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['tp', 'cp', 'pp', 'gtp_remat', 'expt_gtp_remat']
+    )
+    mpu_ranks = sorted(dist.get_process_group_ranks(mpu_pgs.gtp_remat))
+    custom_gtp_group = _pick_permuted_gtp_group(rank, mpu_ranks)
+    custom_pgs = ProcessGroupCollection(
+        tp=mpu_pgs.tp,
+        cp=mpu_pgs.cp,
+        pp=mpu_pgs.pp,
+        gtp_remat=custom_gtp_group,
+        expt_gtp_remat=mpu_pgs.expt_gtp_remat,
+    )
+    model_parallel_cuda_manual_seed(
+        42, gtp_remat_rank=custom_gtp_group.rank(), egtp_remat_rank=0, force_reset_rng=True
+    )
+
+    config = _make_config()
+    config.mtp_num_layers = 1
+    spec = get_mtp_layer_spec(
+        get_gpt_layer_with_transformer_engine_spec(), use_transformer_engine=True
+    )
+    layer = spec.module(config, spec.submodules, pg_collection=custom_pgs).cuda()
+
+    weight = layer.eh_proj.weight
+    assert isinstance(weight, GTPShardedParam), "MTP eh_proj was not GTP-sharded"
+    assert (
+        weight.group is custom_gtp_group
+    ), "MTP eh_proj used the MPU-global GTP group instead of the caller-owned group"
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+
+
 def _worker_seed_custom_gtp_groups_without_mpu(rank, world_size, port):
     """Explicit GTP groups must seed their trackers without MPU groups."""
     from megatron.core import parallel_state as ps
@@ -330,6 +430,16 @@ class TestGTPCustomProcessGroups:
         """Omitting gtp_remat must fall back to the MPU group, not silently disable sharding."""
         _requires_multi_gpu(WORLD)
         _run_distributed(_worker_partial_pgs_fall_back_to_mpu, WORLD)
+
+    def test_gdp_projections_use_custom_gtp_group(self):
+        """GDP leaf linears must honor a MIMO-owned GTP group instead of MPU globals."""
+        _requires_multi_gpu(WORLD)
+        _run_distributed(_worker_gdp_uses_custom_gtp_group, WORLD)
+
+    def test_mtp_eh_proj_uses_custom_gtp_group(self):
+        """MTP's eh_proj must honor a MIMO-owned GTP group instead of MPU globals."""
+        _requires_multi_gpu(WORLD)
+        _run_distributed(_worker_mtp_eh_proj_uses_custom_gtp_group, WORLD)
 
     def test_custom_gtp_groups_seed_without_mpu(self):
         """Explicit GTP groups must not depend on MPU rank or world-size state."""

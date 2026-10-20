@@ -57,8 +57,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety i
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
+from ..dsa_cudnn_kernels import (
+    _get_head_padding,
+    _get_score_recompute_topk_alignment,
+    _pad_attn_target_heads,
+    _pad_sparse_backward_topk,
+)
 from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
-from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
+from .csa_teacher_lse import csa_teacher_lse_unsupported_reason, fused_csa_teacher_lse
 
 # ---------------------------------------------------------------------------
 # Output inverse-RoPE fused into the sparse-attention Functions
@@ -811,7 +817,7 @@ def _csa_fwd_flash_mla(
     ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
     _ensure_flash_mla()
 
-    _total_S_q, _H, _D = q.shape
+    _total_S_q, actual_num_heads, _D = q.shape
     TopK = topk_idxs.shape[-1]
     topk_align = get_flash_mla_topk_alignment()
     TopK_padded = (TopK + topk_align - 1) // topk_align * topk_align
@@ -821,6 +827,16 @@ def _csa_fwd_flash_mla(
 
     kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
+
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    if padded_num_heads != actual_num_heads:
+        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+        q_padded[:, :actual_num_heads, :] = q
+        q = q_padded
+        if attn_sink is not None:
+            attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
+            attn_sink_padded[:actual_num_heads] = attn_sink
+            attn_sink = attn_sink_padded
 
     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
         res = _flash_mla_sparse_fwd(
@@ -839,6 +855,12 @@ def _csa_fwd_flash_mla(
             out, _max_logits, lse = res
             lse_indexer = None
 
+    if padded_num_heads != actual_num_heads:
+        out = out[:, :actual_num_heads, :]
+        lse = lse[:, :actual_num_heads]
+        if lse_indexer is not None:
+            lse_indexer = lse_indexer[:, :actual_num_heads]
+
     if indexer_topk > 0:
         # When indexer_topk == total TopK, lse_indexer should equal lse but
         # the kernel may not snapshot correctly; fall back to lse.
@@ -854,7 +876,7 @@ def _undo_output_rope_for_backward(
     """Recover the pre-RoPE ``(O, dO)`` pair that the cuDNN backward expects.
 
     ``dO`` is un-rotated in place; the gradient buffer is exclusively ours.
-    ``O`` is un-rotated into a fresh buffer because the saved output aliases the
+    ``O`` is un-rotated in a fresh contiguous clone because the saved output aliases the
     tensor the downstream output projection saved for its own backward, and a
     triton in-place write would corrupt it without tripping autograd's version
     counter.
@@ -868,8 +890,11 @@ def _undo_output_rope_for_backward(
     """
     if out_rope is None:
         return out_flat, dO_flat
-    o_unrot = torch.empty_like(out_flat)
-    out_rope.undo(out_flat, out=o_unrot)
+    # Head-padding removal can leave a view with a padded row stride. The RoPE
+    # kernel shares input/output strides, so clone into one owned dense buffer
+    # and undo in place there without changing the saved module output.
+    o_unrot = out_flat.clone(memory_format=torch.contiguous_format)
+    out_rope.undo(o_unrot)
     dO_flat = dO_flat.contiguous()
     out_rope.undo(dO_flat)
     return o_unrot, dO_flat
@@ -1171,28 +1196,22 @@ def _compute_full_csa_teacher_lse(
     max_seqlen_kv: Optional[int] = None,
     q_causal_offsets: Optional[Tensor] = None,
 ) -> Tensor:
-    """Return the full CSA teacher LSE through Triton or the eager reference.
+    """Return the full CSA teacher LSE without allocating eager score matrices.
 
     The Triton path streams both key domains through online reductions and
-    emits only the per-row/per-head LSE. Unsupported layouts and dtypes retain
-    the eager implementation as a correctness fallback.
+    emits only the per-row/per-head LSE, for both SBHD and dev's packed CP.
+    The eager helpers remain available as test oracles, not production fallbacks.
     """
-    if can_use_fused_csa_teacher_lse(
+    unsupported_reason = csa_teacher_lse_unsupported_reason(
         query_flat, full_kv_flat, compressed_kv, attn_sink, window_indices
-    ):
-        if query.ndim == 4:
-            batch, seqlen_q = query.shape[:2]
-            return fused_csa_teacher_lse(
-                query_flat,
-                full_kv_flat,
-                compressed_kv,
-                attn_sink,
-                window_indices,
-                softmax_scale,
-                ratio,
-                batch_size=batch,
-                seqlen_q=seqlen_q,
-            )
+    )
+    if unsupported_reason is not None:
+        raise RuntimeError(
+            f"Fused CSA teacher LSE is unavailable: {unsupported_reason}. "
+            "Refusing the eager score-matrix fallback."
+        )
+    if query.ndim == 4:
+        batch, seqlen_q = query.shape[:2]
         return fused_csa_teacher_lse(
             query_flat,
             full_kv_flat,
@@ -1201,35 +1220,21 @@ def _compute_full_csa_teacher_lse(
             window_indices,
             softmax_scale,
             ratio,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_kv,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_kv,
-            q_causal_offsets=q_causal_offsets,
+            batch_size=batch,
+            seqlen_q=seqlen_q,
         )
-
-    non_compressed_lse_flat = _compute_csa_non_compressed_lse(
-        query_flat, full_kv_flat, attn_sink, window_indices, softmax_scale
-    )
-    if query.ndim == 4:
-        batch, seqlen_q, num_heads = query.shape[:3]
-        non_compressed_lse = (
-            non_compressed_lse_flat.reshape(seqlen_q, batch, num_heads)
-            .permute(1, 0, 2)
-            .contiguous()
-        )
-    else:
-        non_compressed_lse = non_compressed_lse_flat
-    return _compute_dense_csa_teacher_lse(
-        query,
+    return fused_csa_teacher_lse(
+        query_flat,
+        full_kv_flat,
         compressed_kv,
-        non_compressed_lse,
+        attn_sink,
+        window_indices,
         softmax_scale,
         ratio,
         cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=cu_seqlens_kv,
+        cu_seqlens_k=cu_seqlens_kv,
         max_seqlen_q=max_seqlen_q,
-        max_seqlen_kv=max_seqlen_kv,
+        max_seqlen_k=max_seqlen_kv,
         q_causal_offsets=q_causal_offsets,
     )
 
@@ -1959,7 +1964,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
 
         out, dO = _undo_output_rope_for_backward(ctx.out_rope, out, dO)
 
-        result = _DSA.sparse_attention_backward_wrapper(
+        dq, dkv, d_sink = _csa_sparse_attention_backward(
             q,
             kv,
             out,
@@ -1982,7 +1987,6 @@ class CSASparseAttnFunc(torch.autograd.Function):
                 cuda_graph=getattr(ctx, "cuda_graph", False),
             ),
         )
-        dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
         return dq, dkv, d_sink, None, None, None, None, None, None, None, None
 
 
@@ -2882,6 +2886,13 @@ def _compute_attn_target(
     else:
         q_bshd, k_bsd, lse_bsh, topk_bst = q_attn, k_attn, lse, topk_indices
 
+    q_bshd, lse_bsh, qhead_per_kv_head = _pad_attn_target_heads(q_bshd, lse_bsh)
+    logical_topk = topk_bst.size(-1)
+    if topk_bst.is_cuda:
+        alignment = _get_score_recompute_topk_alignment()
+        padded_topk = (logical_topk + alignment - 1) // alignment * alignment
+        if padded_topk != logical_topk:
+            topk_bst = torch.nn.functional.pad(topk_bst, (0, padded_topk - logical_topk), value=-1)
     result = _DSA.sparse_attn_score_recompute_wrapper(
         q_bshd,
         k_bsd,
@@ -2891,7 +2902,7 @@ def _compute_attn_target(
         qhead_per_kv_head=qhead_per_kv_head,
         topk_indices_global=topk_indices_global,
     )
-    target = result["target"]
+    target = result["target"][..., :logical_topk].contiguous()
     if is_thd:
         target = target.squeeze(0)
     return target
@@ -3597,6 +3608,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                         sm_scale=indexer_softmax_scale,
                         compute_grad_w=_requires_native_deterministic_indexer_grad_w(bwd_q),
                     )
+                if bwd_q.is_cuda:
+                    bwd_attn, bwd_idx, bwd_topk = _pad_sparse_backward_topk(
+                        bwd_attn, bwd_idx, bwd_topk, 128
+                    )
                 ig = _DSA.indexer_backward_wrapper(
                     bwd_q,
                     bwd_w,
@@ -3746,7 +3761,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
 
         out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
 
-        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+        dq, dkv, d_sink = _csa_sparse_attention_backward(
             q_flat,
             kv_flat,
             out_flat,
@@ -3770,12 +3785,11 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             ),
         )
         if is_thd:
-            grad_query = attn_bwd["dq"]
-            grad_kv_full = attn_bwd["dkv"]
+            grad_query = dq
+            grad_kv_full = dkv
         else:
-            grad_query = attn_bwd["dq"].reshape(sq, b, np_, d)
-            grad_kv_full = attn_bwd["dkv"].reshape(skv, b, d)
-        d_sink = attn_bwd["d_sink"]
+            grad_query = dq.reshape(sq, b, np_, d)
+            grad_kv_full = dkv.reshape(skv, b, d)
 
         # ---- 2. Scale pre-computed indexer grads by grad_loss. ---------------
         grad_q_indexer, grad_k_indexer, grad_weights = _scale_indexer_grads(
@@ -3971,6 +3985,10 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                         grad_loss=unit_grad_loss,
                         sm_scale=indexer_softmax_scale,
                         compute_grad_w=_requires_native_deterministic_indexer_grad_w(bwd_q),
+                    )
+                if bwd_q.is_cuda:
+                    bwd_attn, bwd_idx, bwd_topk = _pad_sparse_backward_topk(
+                        bwd_attn, bwd_idx, bwd_topk, 128
                     )
                 ig = _DSA.indexer_backward_wrapper(
                     bwd_q,
@@ -4203,7 +4221,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
 
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
-        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+        dq, dkv, d_sink = _csa_sparse_attention_backward(
             query,
             kv_full,
             out_flat,
@@ -4238,7 +4256,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                     f"got {grad_k_indexer_rank_major.shape[0]} rows, "
                     f"expected {expected_indexer_rows}."
                 )
-            grad_compressed_kv = attn_bwd["dkv"][ctx.compressed_kv_start :]
+            grad_compressed_kv = dkv[ctx.compressed_kv_start :]
             expected_rows = ctx.local_compressed_kv_rows * cp_group.size()
             if grad_compressed_kv.shape[0] != expected_rows:
                 raise RuntimeError(
@@ -4285,9 +4303,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             grad_k_indexer = None
 
         gradients = (
-            attn_bwd["dq"],
-            attn_bwd["dkv"],
-            attn_bwd["d_sink"],
+            dq,
+            dkv,
+            d_sink,
             None,
             grad_q_indexer,
             grad_k_indexer,
@@ -4520,3 +4538,60 @@ __all__ = [
     "prepare_thd_compact_indexer_workspace",
     "pack_thd_compact_k",
 ]
+
+
+def _csa_sparse_attention_backward(
+    q: Tensor,
+    kv: Tensor,
+    out: Tensor,
+    d_out: Tensor,
+    lse: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    topk_length: Optional[Tensor],
+    **backward_kwargs,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Run cuDNN sparse-attention backward with FlashMLA-compatible head padding."""
+    _ensure_dsa_namespace()
+
+    actual_num_heads = q.size(1)
+    padded_num_heads = _get_head_padding(actual_num_heads) if q.is_cuda else actual_num_heads
+    if padded_num_heads != actual_num_heads:
+        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+        q_padded[:, :actual_num_heads, :] = q
+        q = q_padded
+
+        out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
+        out_padded[:, :actual_num_heads, :] = out
+        out = out_padded
+
+        d_out_padded = d_out.new_zeros((d_out.size(0), padded_num_heads, d_out.size(2)))
+        d_out_padded[:, :actual_num_heads, :] = d_out
+        d_out = d_out_padded
+
+        lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
+        lse_padded[:, :actual_num_heads] = lse
+        lse = lse_padded
+
+        attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
+        attn_sink_padded[:actual_num_heads] = attn_sink
+        attn_sink = attn_sink_padded
+
+    result = _DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        d_out,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+        **backward_kwargs,
+    )
+    dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+    if padded_num_heads != actual_num_heads:
+        dq = dq[:, :actual_num_heads, :].contiguous()
+        d_sink = d_sink[:actual_num_heads].contiguous()
+    return dq, dkv, d_sink

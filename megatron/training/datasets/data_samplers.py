@@ -109,12 +109,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
+    # Own generator: otherwise _BaseDataLoaderIter draws _base_seed from the default CPU generator
+    # on ITERATOR creation, after load_checkpoint has restored it. initial_seed() reads the seed
+    # without consuming a draw.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
     if args.sequence_packing_scheduler is not None and args.num_workers > 0 and not is_eval:
-        # Packing schedulers draw a whole global batch, global_batch_size /
-        # (micro_batch_size * DP) items on every DP rank, at the start of each
-        # step. Keeping that many items in flight lets the workers and the
-        # pin-memory thread build the next step's batch while the current step
-        # trains, at the cost of host memory for one more global batch.
+        # Keep a full next global batch in flight for packing schedulers.
         items_per_step = args.global_batch_size // (
             micro_batch_size * mpu.get_data_parallel_world_size()
         )
@@ -126,6 +127,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        generator=loader_generator,
         **extra_kwargs,
     )
 

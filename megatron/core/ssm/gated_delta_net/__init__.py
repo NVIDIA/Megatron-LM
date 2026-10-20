@@ -6,6 +6,7 @@ This package replaces the former ``megatron/core/ssm/gated_delta_net.py`` module
 at the same import path; the names below preserve that module's public surface.
 """
 
+from megatron.core.extensions.transformer_engine import HAVE_TE_GDN
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
@@ -34,8 +35,9 @@ from megatron.core.ssm.gated_delta_net.kda import (
 
 __all__ = [
     "HAVE_FLA",
-    "HAVE_FLA_GDN2",
     "HAVE_FLA_KDA",
+    "HAVE_FLA_GDN2",
+    "HAVE_TE_GDN",
     "GatedDeltaNet",
     "GatedDeltaNet2",
     "GatedDeltaNetSubmodules",

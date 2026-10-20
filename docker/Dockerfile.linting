@@ -24,7 +24,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
 
 # Keep this in the internal-only stage so public CI has no internal service dependency.
 ARG CI_SERVER_URL
-ARG CERNO_COMMIT=3219afcbfcdbddd1d55e013d94e54a15986e2b1f
+ARG CERNO_COMMIT=f0cf5b75a6c52dfec2d01ce7886a3e7d850be0c0
 RUN --mount=type=secret,id=CERNO_TOKEN \
       GIT_CONFIG_COUNT=1 \
       GIT_CONFIG_KEY_0=http.extraHeader \

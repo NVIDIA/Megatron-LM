@@ -73,7 +73,10 @@ def _scatter_intermediate_ssm_kernel(
     dst = out_ptr + pid_slot.to(tl.int64) * out_row_stride + cols.to(tl.int64)
 
     val = tl.load(src, mask=mask)
-    tl.store(dst, val, mask=mask)
+    # Convert on store: the source states carry the kernel's working dtype,
+    # which need not match the cache dtype (the GDP chunk scan hands back BF16
+    # states even when the cache is FP32). A no-op when they already agree.
+    tl.store(dst, val.to(dst.dtype.element_ty), mask=mask)
 
 
 def scatter_intermediate_ssm(
@@ -176,7 +179,7 @@ def _scatter_intermediate_conv_kernel(
         dst = out_ptr + slot_base + c_idxs.to(tl.int64) * D_CONV + j
 
         val = tl.load(src, mask=c_mask)
-        tl.store(dst, val, mask=c_mask)
+        tl.store(dst, val.to(dst.dtype.element_ty), mask=c_mask)
 
 
 def scatter_intermediate_conv(

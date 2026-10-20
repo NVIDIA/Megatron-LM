@@ -56,6 +56,7 @@ def _make_gpt_args(
     args.hidden_size = hidden_size
     args.num_attention_heads = num_attention_heads
     args.seq_length = seq_length
+    args.decoder_seq_length = None
     args.padded_vocab_size = padded_vocab_size
     args.swiglu = swiglu
     args.ffn_hidden_size = ffn_hidden_size if ffn_hidden_size is not None else 4 * hidden_size
@@ -83,6 +84,7 @@ def _make_gpt_args(
     args.linear_num_key_heads = None
     args.linear_num_value_heads = None
     args.linear_conv_kernel_dim = None
+    args.gdp_num_householder = 3
     # MLA fields (unused but referenced).
     args.q_lora_rank = None
     args.qk_head_dim = None
@@ -108,7 +110,6 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_head_dim = 64
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
-    args.gdp_num_householder = 3
     return args
 
 
@@ -224,6 +225,15 @@ class TestBSHDBackwardCompat:
         )
 
         assert default_flops == explicit_flops
+
+    def test_multimodal_defaults_use_decoder_sequence_length(self):
+        multimodal_args = _make_gpt_args(seq_length=256)
+        multimodal_args.decoder_seq_length = 4096
+        language_args = _make_gpt_args(seq_length=4096)
+
+        assert num_floating_point_operations(
+            multimodal_args, batch_size=8
+        ) == num_floating_point_operations(language_args, batch_size=8)
 
 
 class TestMTPE2ETVFlops:
@@ -1900,7 +1910,11 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers
     self_attn_term = mla_proj_per_layer * num_layers + dsa_extra_token
     self_attn_core_term = sparse_core_per_layer * num_layers + dsa_extra_core
 
-    return total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+    # The public TrainState FLOPs counter is integral. Preserve the independent
+    # formula's fractional estimates until converting the complete sum once.
+    return int(
+        total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+    )
 
 
 class TestDSA:
@@ -1934,6 +1948,7 @@ class TestDSA:
             total_real_tokens_in_batch=total_tokens,
         )
         expected = _dsa_golden_flops(args, total_tokens, thd_sum_sq)
+        assert isinstance(flops, int)
         assert flops == expected
         # THD must be strictly less than BSHD.
         bshd_flops = num_floating_point_operations(args, batch_size)

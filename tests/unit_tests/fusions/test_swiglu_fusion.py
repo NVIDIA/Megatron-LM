@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situ_glu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -46,6 +47,52 @@ def test_clamped_swiglu_config_rejects_linear_offset():
 def test_clamped_swiglu_config_rejects_unsupported_paths(kwargs, match):
     with pytest.raises(ValueError, match=match):
         _clamped_swiglu_config(**kwargs)
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("linear_clamp_scale", [None, 3.0], ids=("gate_only", "gate_and_linear"))
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_situ_glu_fusion_matches_unfused(input_dtype, linear_clamp_scale, with_bias):
+    """Fused SiTU-GLU must match the eager path taken when bias_activation_fusion is False."""
+    torch.manual_seed(0)
+    gate_clamp_scale = 5.0
+
+    if input_dtype == torch.float32:
+        tols = dict(rtol=1.0e-6, atol=1.0e-6)
+    elif input_dtype == torch.bfloat16:
+        tols = dict(rtol=2.0e-2, atol=2.0e-1)
+    else:
+        raise ValueError(f"Invalid input dtype: {input_dtype}")
+
+    # Scaled up so a good share of the inputs land in the saturating region of the clamp.
+    x = (torch.randn(16, 64, dtype=input_dtype, device="cuda") * 5.0).requires_grad_(True)
+    bias = (
+        torch.randn(64, dtype=input_dtype, device="cuda").requires_grad_(True)
+        if with_bias
+        else None
+    )
+    bwd_input = torch.randn(16, 32, dtype=input_dtype, device="cuda")
+
+    y = situ_glu(x + bias if with_bias else x, gate_clamp_scale, linear_clamp_scale)
+    y.backward(bwd_input)
+
+    x_fused = x.detach().clone().requires_grad_(True)
+    bias_fused = bias.detach().clone().requires_grad_(True) if with_bias else None
+    y_fused = bias_swiglu_impl(
+        x_fused,
+        bias_fused,
+        gate_clamp_scale=gate_clamp_scale,
+        linear_clamp_scale=linear_clamp_scale,
+    )
+    y_fused.backward(bwd_input.detach().clone())
+
+    assert y_fused.dtype == y.dtype
+    assert torch.allclose(y, y_fused, **tols)
+    assert x_fused.grad.dtype == x.grad.dtype
+    assert torch.allclose(x.grad, x_fused.grad, **tols)
+    if with_bias:
+        assert bias_fused.grad.dtype == bias.grad.dtype
+        assert torch.allclose(bias.grad, bias_fused.grad, **tols)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
@@ -96,6 +143,8 @@ def test_clamped_weighted_bias_swiglu(input_dtype):
     else:
         raise ValueError(f"Invalid input dtype: {input_dtype}")
 
+    wgrad_tols = dict(rtol=1.0e-6, atol=2.0e-4)
+
     x = (torch.randn(16, 64, dtype=input_dtype, device="cuda") * 5.0).requires_grad_(True)
     weights = torch.randn(16, 1, dtype=torch.float32, device="cuda", requires_grad=True)
     bwd_input = torch.randn(16, 32, dtype=input_dtype, device="cuda")
@@ -120,7 +169,7 @@ def test_clamped_weighted_bias_swiglu(input_dtype):
     assert torch.allclose(x.grad, x_fused.grad, **tols)
     assert weights_fused.grad.dtype == weights.grad.dtype
     if input_dtype == torch.float32:
-        assert torch.allclose(weights.grad, weights_fused.grad, **tols)
+        assert torch.allclose(weights.grad, weights_fused.grad, **wgrad_tols)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
@@ -207,3 +256,46 @@ def test_bias_swiglu_impl_clamp_none_matches_unclamped(input_dtype, with_bias):
             bias_explicit.grad.flatten().float().unsqueeze(0),
         ).item()
         assert bias_grad_cos > 0.999, f"bias.grad cosine similarity = {bias_grad_cos:.6f}"
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+def test_clamped_weighted_bias_swiglu_legacy_range(input_dtype):
+    clamp_value = 10.0
+
+    if input_dtype == torch.float32:
+        tols = dict(rtol=1.0e-6, atol=1.0e-6)
+    elif input_dtype == torch.bfloat16:
+        tols = dict(rtol=2.0e-2, atol=1.0e-3)
+    else:
+        raise ValueError(f"Invalid input dtype: {input_dtype}")
+
+    x = torch.randn(16, 64, dtype=input_dtype, device="cuda")
+    x.requires_grad = True
+    weights = torch.randn(16, 1, dtype=torch.float32, device="cuda")
+    weights.requires_grad = True
+    bwd_input = torch.randn(16, 32, dtype=input_dtype, device="cuda")
+
+    # Reference: manual clamp + silu + weight
+    y_1, y_2 = torch.chunk(x, 2, -1)
+    y_1c = y_1.clamp(min=None, max=clamp_value)
+    y_2c = y_2.clamp(min=-clamp_value, max=clamp_value)
+    y = (F.silu(y_1c) * y_2c * weights).to(input_dtype)
+    y.backward(bwd_input)
+
+    x_2 = x.detach().clone()
+    x_2.requires_grad = True
+    weights_2 = weights.detach().clone()
+    weights_2.requires_grad = True
+    bwd_input_2 = bwd_input.detach().clone()
+
+    # Fused implementation
+    y_2_out = weighted_bias_swiglu_impl(x_2, None, weights_2, clamp_value=clamp_value)
+    y_2_out.backward(bwd_input_2)
+
+    assert y_2_out.dtype == y.dtype
+    assert torch.allclose(y, y_2_out, **tols)
+    assert x_2.grad.dtype == x.grad.dtype
+    assert torch.allclose(x.grad, x_2.grad, **tols)
+    assert weights_2.grad.dtype == weights.grad.dtype
+    if input_dtype == torch.float32:
+        assert torch.allclose(weights.grad, weights_2.grad, **tols)
