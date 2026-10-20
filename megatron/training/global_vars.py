@@ -293,7 +293,8 @@ def _build_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     _GLOBAL_TOKENIZER = build_tokenizer(args)
-    # Resolve the declared model field once, before any args-to-config conversion.
+    # Legacy bootstrap callers may still need this binding. Config-first callers
+    # already resolve hash vocabulary in the args adapter, without global services.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (
         getattr(args, 'moe_num_hash_layers', 0) > 0

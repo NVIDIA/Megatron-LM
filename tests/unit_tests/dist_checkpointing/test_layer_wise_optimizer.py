@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from copy import deepcopy
+from functools import partial
 from unittest import mock
 
 import pytest
@@ -9,6 +10,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -29,6 +31,7 @@ from tests.unit_tests.dist_checkpointing import (
     setup_model_and_optimizer,
     setup_moe_model_and_optimizer,
 )
+from tests.unit_tests.dist_checkpointing.utils import initialize_quantized_gpt_model
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -126,6 +129,45 @@ class TestLayerWiseOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("fp8_param_gather", [False, True])
+    def test_compact_refresh_gathers_master_weights_on_all_ranks(self, fp8_param_gather):
+        """Resume refresh uses the actual compact Muon and sibling DistOpt collectives."""
+        Utils.initialize_model_parallel(1, 1)
+        model, optimizer = setup_model_and_optimizer(
+            seed=2,
+            tp=1,
+            pp=1,
+            bf16=True,
+            dist_opt=True,
+            optimizer="dist_muon",
+            use_param_layout=True,
+            use_layer_wise_param_layout=False,
+            fp8_param_gather=fp8_param_gather,
+            initialize_fn=(
+                partial(initialize_quantized_gpt_model, recipe="blockwise")
+                if fp8_param_gather
+                else initialize_gpt_model
+            ),
+        )
+        members = optimizer.chained_optimizers
+        layerwise = next(
+            item for item in members if isinstance(item, LayerWiseDistributedOptimizer)
+        )
+        if fp8_param_gather:
+            assert layerwise.use_fp8_param_sync
+            assert not layerwise.layerwise_param_sync_via_bucket_group
+            assert any(is_float8tensor(param) for param in model[0].parameters())
+        assert len(members) > 1, "Exercise compact Muon alongside DistributedOptimizer"
+
+        with torch.no_grad():
+            for param in optimizer.get_parameters():
+                param.fill_(0.125)
+        optimizer.quantize_and_sync_model_params_from_main_params()
+        torch.cuda.synchronize()
+        for param in model[0].parameters():
+            actual = param.float()
+            torch.testing.assert_close(actual, torch.full_like(actual, 0.125), rtol=0, atol=0)
 
     @pytest.mark.parametrize(
         ("source_offload", "destination_offload"), [(False, True), (True, False)]

@@ -322,7 +322,7 @@ class ContiguousPackedCPRollContext(MTPSequenceRollContext):
             "labels": labels,
             "loss_mask": loss_mask,
             "padding_mask": padding_mask,
-            "mtp_input_mask": mtp_input_mask,
+            "mtp_input_mask": mtp_input_mask.bool() if mtp_input_mask is not None else None,
         }
         sequence_fields = []
         present_tensors: List[Tensor] = []
@@ -2093,6 +2093,8 @@ def _process_mtp_e2e_tv_loss(
     sequence_roll_context: Optional[MTPSequenceRollContext],
     derived_labels_from_input_ids: bool,
     original_num_tokens: Optional[Tensor],
+    main_hidden_states: Optional[Tensor] = None,
+    mtp_input_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Apply the end-to-end TV objective to MTP draft hidden states.
 
@@ -2119,6 +2121,9 @@ def _process_mtp_e2e_tv_loss(
     # dimension. Keep vocabulary before sequence while preparing target alignment.
     target_logits = target_logits.permute(1, 2, 0)
     current_loss_mask = loss_mask
+    if mtp_input_mask is not None:
+        assert mtp_input_mask.shape == loss_mask.shape, "MTP input mask must match loss mask."
+        mtp_input_mask = mtp_input_mask.bool()
     chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
     tv_distances = []
 
@@ -2132,18 +2137,32 @@ def _process_mtp_e2e_tv_loss(
             cp_layout=config.attention_cp_layout,
             fill_values=[0],
         )[0]
-        current_loss_mask = roll_tensor(
-            [current_loss_mask],
+        mask_fields = [current_loss_mask]
+        mask_names = ["loss_mask"]
+        if mtp_input_mask is not None:
+            mask_fields.append(mtp_input_mask)
+            mask_names.append("mtp_input_mask")
+        rolled_masks = roll_tensor(
+            mask_fields,
             shifts=-1,
             dims=-1,
             cp_group=cp_group,
             packed_seq_params=packed_seq_params,
             cp_layout=config.attention_cp_layout,
-            roll_context=sequence_roll_context,
-            sequence_fields=["loss_mask"],
+            # RL labels have already advanced once; conditioning validity has not.
+            roll_context=(
+                None
+                if derived_labels_from_input_ids and mtp_input_mask is not None
+                else sequence_roll_context
+            ),
+            sequence_fields=mask_names,
             roll_depth=mtp_layer_number + int(derived_labels_from_input_ids),
-        )[0]
+        )
+        current_loss_mask = rolled_masks[0]
         chain_valid &= current_loss_mask.bool()
+        if mtp_input_mask is not None:
+            mtp_input_mask = rolled_masks[1]
+            chain_valid &= mtp_input_mask
 
         draft_logits, _ = output_layer(
             hidden_states_list[mtp_layer_number + 1],
@@ -2200,7 +2219,8 @@ def _process_mtp_e2e_tv_loss(
         normalized_loss = (
             config.mtp_loss_scaling_factor * masked_e2e_tv_loss / num_tokens.clamp(min=1)
         )
-    return MTPLossAutoScaler.apply(hidden_states, normalized_loss)
+    main_output = hidden_states if main_hidden_states is None else main_hidden_states
+    return MTPLossAutoScaler.apply(main_output, normalized_loss)
 
 
 def process_mtp_loss(
@@ -2310,7 +2330,9 @@ def process_mtp_loss(
     if config.mtp_loss_type == "e2e_tv":
         assert output_weight is not None
         return _process_mtp_e2e_tv_loss(
-            hidden_states_list=(hidden_states, *hidden_states_list[1:]),
+            # The first MTP chunk is already in the draft's CP layout. The separate
+            # decoder output may use a different layout and is only the return payload.
+            hidden_states_list=hidden_states_list,
             loss_mask=loss_mask,
             output_layer=output_layer,
             output_weight=output_weight,
@@ -2319,12 +2341,14 @@ def process_mtp_loss(
             config=config,
             cp_group=cp_group,
             tp_group=tp_group,
-            dp_cp_group=dp_cp_group,
+            dp_cp_group=metric_avg_group,
             packed_seq_params=packed_seq_params,
             scale_logits_fn=scale_logits_fn,
             sequence_roll_context=sequence_roll_context,
             derived_labels_from_input_ids=derived_labels_from_input_ids,
             original_num_tokens=original_num_tokens,
+            main_hidden_states=main_hidden_states,
+            mtp_input_mask=mtp_input_mask,
         )
 
     fuse_linear_cross_entropy = (

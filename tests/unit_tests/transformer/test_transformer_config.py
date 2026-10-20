@@ -106,6 +106,111 @@ def test_dsa_kpool_requires_topk():
         _make_dsa_kpool_config(dsa_indexer_kpool=4)
 
 
+def test_dsa_kpool_cudnn_accepts_unquantized_fp32_weights_projection():
+    config = _make_dsa_kpool_config(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=8,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_weights_proj_output_dtype="fp32",
+        dsa_indexer_weights_proj_use_quantization=False,
+    )
+    assert config.dsa_indexer_kpool == 4
+
+
+def test_per_token_cudnn_still_rejects_fp32_weights_projection():
+    with pytest.raises(ValueError, match="for per-token DSA"):
+        _make_dsa_kpool_config(
+            dsa_indexer_kpool=1,
+            dsa_indexer_topk=8,
+            dsa_kernel_backend="cudnn",
+            dsa_indexer_weights_proj_output_dtype="fp32",
+            dsa_indexer_weights_proj_use_quantization=False,
+        )
+
+
+def test_hybrid_gdn_does_not_require_gpt_layer_frequency():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        is_hybrid_model=True,
+        experimental_attention_variant="gated_delta_net",
+    )
+    assert config.linear_attention_freq is None
+
+
+@pytest.mark.parametrize(
+    "legacy_fusion, expected", [(None, "cudnn"), (True, "cudnn"), (False, "none")]
+)
+def test_programmatic_dsv4_kernel_default_respects_legacy_switch(legacy_fusion, expected):
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="dsv4_hybrid",
+        apply_dsa_kernel_fusion=legacy_fusion,
+        csa_compress_ratios=[4],
+    )
+    assert config.dsa_kernel_backend == expected
+
+
+def test_static_dsv4_contiguous_cp_accepts_explicit_packed_metadata_without_scheduler():
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="dsv4_hybrid",
+        context_parallel_size=2,
+        attention_cp_layout="contiguous",
+        csa_compress_ratios=[4],
+    )
+    assert config.sequence_packing_scheduler is None
+    assert config.cp_partition_mode == "contiguous"
+
+
+def test_deprecated_dsv4_selector_normalizes_layout_before_validation():
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    common = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        context_parallel_size=2,
+        cp_partition_mode="contiguous",
+        apply_dsa_kernel_fusion=False,
+        csa_compress_ratios=[4],
+    )
+    canonical = MLATransformerConfig(experimental_attention_variant="dsv4_hybrid", **common)
+    with pytest.warns(UserWarning, match="linear_attention_type is deprecated"):
+        legacy = MLATransformerConfig(linear_attention_type="dsv4_hybrid", **common)
+    assert legacy.linear_attention_type is None
+    for name in (
+        "experimental_attention_variant",
+        "attention_cp_layout",
+        "linear_cp_layout",
+        "dsa_kernel_backend",
+    ):
+        assert getattr(legacy, name) == getattr(canonical, name)
+
+
+def test_ncclep_static_shape_flag_cannot_silently_ignore_a_capacity():
+    with pytest.raises(ValueError, match="moe_ncclep_static_shape=False conflicts"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            moe_expert_rank_capacity_factor=1.0,
+            moe_ncclep_static_shape=False,
+        )
+
+
 def _make_scheduled_release_config(moe_ncclep_zero_copy: bool) -> TransformerConfig:
     return TransformerConfig(
         num_layers=1,

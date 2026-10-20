@@ -778,6 +778,31 @@ def test_vision_cache_accounts_for_retained_cuda_storage_once():
     assert engine._vision_cache_entry_nbytes(entry) == backing.untyped_storage().nbytes()
 
 
+def test_schedule_requests_handles_cuda_profiler_headers(monkeypatch):
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.is_mp_coordinator = True
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine.model_parallel_publisher_socket = mock.Mock()
+    engine._pending_signals = deque()
+    engine._poll_pending_kv_imports = mock.Mock(return_value=0)
+    engine._poll_pending_kv_pushes = mock.Mock(return_value=0)
+    engine._generation_epoch = None
+    engine.requests = {}
+    engine.failed_request_ids = []
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+        [msgpack.packb([Headers.START_CUDA_PROFILER.value])],
+        [msgpack.packb([Headers.STOP_CUDA_PROFILER.value])],
+        dynamic_engine.zmq.Again,
+    ]
+    cudart = mock.Mock()
+    monkeypatch.setattr(torch.cuda, 'cudart', lambda: cudart)
+    assert engine.schedule_requests() == 2
+    cudart.cudaProfilerStart.assert_called_once_with()
+    cudart.cudaProfilerStop.assert_called_once_with()
+    assert not engine._pending_signals
+
+
 def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.is_mp_coordinator = True

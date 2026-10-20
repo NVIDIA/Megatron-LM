@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
 
 
@@ -48,6 +49,9 @@ class _FakeOptimizer:
         if self.is_stub_optimizer:
             return
         self._log.append(('stage', self._name))
+
+    def _sync_unbuffered_model_params(self):
+        pass
 
 
 def _build(reuse_grad_buf, share_chunk=True, with_stub=False):
@@ -146,6 +150,9 @@ def test_gather_uses_the_chain_s_own_model_chunks():
         def _stage_model_params_from_main_params(self):
             log.append(('stage', self._name))
 
+        def _sync_unbuffered_model_params(self):
+            pass
+
     chained = ChainedOptimizer([_MemberWithoutChunks('a'), _MemberWithoutChunks('b')])
     assert chained.model_chunks == [], "members expose no chunks, so __init__ finds none"
 
@@ -182,6 +189,47 @@ def test_a_nested_chained_optimizer_stages_its_own_members():
     staged = [entry[1] for entry in log if entry[0] == 'stage']
     assert staged == ['inner_a', 'inner_b', 'outer'], log
     assert log.count(('sync', 'chunk', True)) == 1, log
+
+
+@pytest.mark.parametrize("bucket_sync", [False, True])
+@pytest.mark.parametrize("with_sibling", [False, True])
+def test_compact_layerwise_resume_respects_its_own_gather_policy(bucket_sync, with_sibling):
+    log = []
+    config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False)
+    chunk = _FakeModelChunk(log, 'shared')
+    muon_group = SimpleNamespace(
+        name='muon', ddp_config=SimpleNamespace(param_sync_via_bucket_group=bucket_sync)
+    )
+    chunk.bucket_groups = [muon_group]
+    chunk.expert_parallel_bucket_groups = []
+    chunk._start_bucket_group_param_sync = lambda group, force_sync: log.append(
+        ('bucket', group.name, force_sync)
+    )
+    layerwise = LayerWiseDistributedOptimizer.__new__(LayerWiseDistributedOptimizer)
+    ChainedOptimizer.__init__(layerwise, [_FakeOptimizer(log, 'muon', config, [chunk])])
+    layerwise.layerwise_param_sync_via_bucket_group = bucket_sync
+    layerwise.allgather_params = lambda: log.append(('whole_params', 'muon'))
+    optimizer = layerwise
+    if with_sibling:
+        chunk.bucket_groups.append(
+            SimpleNamespace(
+                name='adam', ddp_config=SimpleNamespace(param_sync_via_bucket_group=True)
+            )
+        )
+        optimizer = ChainedOptimizer([layerwise, _FakeOptimizer(log, 'adam', config, [chunk])])
+
+    optimizer.quantize_and_sync_model_params_from_main_params()
+
+    stages = [entry for entry in log if entry[0] == 'stage']
+    assert stages == [('stage', 'muon')] + ([('stage', 'adam')] if with_sibling else [])
+    assert log[: len(stages)] == stages
+    if bucket_sync:
+        assert log[len(stages) :] == [('sync', 'shared', True)]
+    else:
+        expected = [('whole_params', 'muon')]
+        if with_sibling:
+            expected.append(('bucket', 'adam', True))
+        assert log[len(stages) :] == expected
 
 
 def test_an_empty_chain_refreshes_without_touching_config():

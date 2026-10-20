@@ -64,6 +64,7 @@ HAVE_DENSE_ROUTER_FUSION = (
     "backend,routing_map_mode,num_experts,capacity_factor,expected_dtype",
     [
         ("deepep", "bool", 8, None, torch.int64),
+        ("deepepv2", "bool", 8, None, torch.int64),
         ("ncclep", "bool", 8, None, torch.int64),
         ("hybridep", "bool", 8, None, None),
         ("hybridep", "indices", 1 << 15, None, torch.int16),

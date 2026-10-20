@@ -831,7 +831,9 @@ def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex
 
     layer = object.__new__(MoELayer)
     torch.nn.Module.__init__(layer)
-    layer.config = SimpleNamespace(cuda_graph_impl="local", moe_latent_size=None)
+    layer.config = SimpleNamespace(
+        cuda_graph_impl="local", moe_latent_size=None, sequence_parallel=False
+    )
     layer.shared_expert_overlap = False
     layer.token_dispatcher = _FlexSpy() if flex else _OtherSpy()
     hidden_states = torch.zeros(4, 8)

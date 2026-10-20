@@ -30,7 +30,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
@@ -131,11 +131,21 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             "features. Please reference the migration guide "
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
-        if config.moe_num_hash_layers > 0:
-            raise ValueError(
-                "Hash-routed MoE is supported only by HybridModel because GPTModel does not "
-                "forward token IDs to transformer layers."
-            )
+        layout = config.pipeline_model_parallel_layout
+        if (
+            config.enable_hyper_connections
+            and config.mtp_num_layers
+            and config.pipeline_model_parallel_size > 1
+            and layout is not None
+        ):
+            for stage in layout.layout:
+                for chunk in stage:
+                    if LayerType.mtp in chunk and LayerType.decoder not in chunk:
+                        raise ValueError(
+                            "GPT mHC with pipeline parallelism requires MTP and the final "
+                            "decoder layer in the same pipeline chunk; standalone MTP chunks "
+                            "do not carry both contracted and multistream decoder outputs."
+                        )
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
         if self.config.freeze_base_model_for_mtp and (

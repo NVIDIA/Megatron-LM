@@ -761,6 +761,41 @@ class TestCompressor:
         assert output.dtype == torch.bfloat16
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_packed_unfused_rope_uses_explicit_row_positions(self, compress_ratio):
+        from dataclasses import replace
+
+        config = replace(self.config, apply_rope_fusion=False)
+        compressor = Compressor(
+            config=config,
+            submodules=_make_compressor_submodules(),
+            compress_ratio=compress_ratio,
+            head_dim=config.v_head_dim,
+            rotate=False,
+            rotary_pos_emb=self.rotary_pos_emb,
+            pg_collection=self.pg_collection,
+        ).cuda()
+        hidden = torch.randn(
+            3 * compress_ratio,
+            1,
+            config.hidden_size,
+            dtype=torch.bfloat16,
+            device='cuda',
+            requires_grad=True,
+        )
+        output = compressor.forward_packed(
+            hidden,
+            torch.tensor([0, 2, 3], dtype=torch.int32, device='cuda'),
+            max_seqlen_q=2 * compress_ratio,
+            compressed_group_ids=torch.tensor([0, 1, 0], device='cuda'),
+            compressed_position_ids=torch.tensor([0, compress_ratio, 0], device='cuda'),
+        )
+        assert output.shape == (3, 1, config.v_head_dim)
+        assert torch.isfinite(output).all()
+        output.float().sum().backward()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        assert torch.count_nonzero(hidden.grad) > 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_compressor_too_short_input(self, compress_ratio):
         """Test that compressor returns None when input is shorter than compress_ratio."""
         short_len = compress_ratio - 1

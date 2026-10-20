@@ -464,12 +464,16 @@ def _normalize_dynamic_context_parallel_args(args):
 
 def validate_args(args, defaults={}):
     _normalize_dynamic_context_parallel_args(args)
+    # Preserve dev's padded hash-table checkpoint shape when its legacy flag is used.
+    if not hasattr(args, '_legacy_hash_moe_vocab'):
+        args._legacy_hash_moe_vocab = getattr(args, 'moe_n_hash_layers', 0) > 0
     enabled_mhc = args.enable_hyper_connections or args.enable_mhc_connections
     args.enable_hyper_connections = args.enable_mhc_connections = enabled_mhc
     for legacy, canonical, default in (
         ("num_residual_streams", "mhc_num_residual_streams", 4),
         ("o_groups", "output_projection_groups", 8),
         ("o_lora_rank", "output_projection_lora_rank", 1024),
+        ("moe_n_hash_layers", "moe_num_hash_layers", 0),
     ):
         old = getattr(args, legacy, None)
         new = getattr(args, canonical, default)
@@ -1929,6 +1933,11 @@ def validate_args(args, defaults={}):
     # so it validates the final resolved scheduler; the varlen path picks its
     # default after the earlier generic validation has run.
     if args.sequence_packing_scheduler is not None:
+        args.variable_seq_lengths = True
+        # Packed microbatches contain different numbers of real tokens.
+        assert (
+            args.calculate_per_token_loss
+        ), 'Sequence packing must be used with --calculate-per-token-loss'
         if args.sequence_packing_scheduler == 'dp_balanced':
             total_cp_ranks = args.context_parallel_size
         else:
@@ -1943,55 +1952,6 @@ def validate_args(args, defaults={}):
             f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
             f'must be >= single sequence max length ({args.seq_length})'
         )
-
-    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
-    # because they are mutually-exclusive top-level dataset selectors that both
-    # drive the packed-sequence (THD) path. These stay in validate_args: the
-    # selectors are CLI-level args, not core config fields.
-    if args.use_varlen_dataset:
-        assert not args.sft, (
-            "--use-varlen-dataset and --sft are mutually exclusive; both "
-            "select the packed-sequence dataset family. Pick one."
-        )
-        if args.varlen_sbhd_validation:
-            assert args.sequence_packing_scheduler is None, (
-                "--varlen-sbhd-validation does not use a sequence packing "
-                "scheduler; drop --sequence-packing-scheduler."
-            )
-            # SBHD validation is a real-data numerical-reference path only;
-            # MockVarlenDataset does not implement it.
-            assert not args.mock_data, (
-                "--varlen-sbhd-validation is not supported with --mock-data; "
-                "SBHD validation requires a real dataset."
-            )
-        else:
-            # VarlenDataset emits one unpacked sample per __getitem__; it
-            # relies on an upstream packing scheduler to group variable-length
-            # samples into THD batches. Auto-pick ``dp_balanced`` when the
-            # user did not request one explicitly.
-            if args.sequence_packing_scheduler is None:
-                args.sequence_packing_scheduler = 'dp_balanced'
-
-    # Runs after the varlen auto-select above so it sees the final resolved
-    # scheduler. Scheduler-name and max-seqlen validation live in
-    # ModelParallelConfig.__post_init__; only the buffer-size check stays here
-    # because seq_length is not a core config field. The None case for
-    # max_seqlen_per_dp_cp_rank is rejected by the config check.
-    if args.sequence_packing_scheduler is not None:
-        args.variable_seq_lengths = True
-        # Packed microbatches carry different numbers of valid tokens, so the
-        # default per-microbatch loss averaging would weight tokens unevenly
-        # depending on how samples happened to be packed (same reasoning as
-        # the hybrid-context-parallel check above).
-        assert (
-            args.calculate_per_token_loss
-        ), 'Sequence packing must be used with --calculate-per-token-loss'
-        if args.max_seqlen_per_dp_cp_rank is not None:
-            total_cp_ranks = args.context_parallel_size
-            assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
-                f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-                f'must be >= single sequence max length ({args.seq_length})'
-            )
 
     # Data blend checks
     assert (
@@ -2130,6 +2090,11 @@ def validate_args(args, defaults={}):
                 "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
                 "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
                 "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
+        else:
+            assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+                "Padded LayerWise parameter layout does not support FP8/FP4 parameter gather; "
+                "use the compact layout for supported FP8 recipes."
             )
 
     assert not (args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight), (
@@ -4381,6 +4346,7 @@ def _add_distributed_args(parser):
         '--no-use-layer-wise-param-layout',
         action='store_false',
         dest='use_layer_wise_param_layout',
+        default=False,
         help='Use the compact decoupled LayerWise parameter layout (the default). '
         'Muon parameters use compact LayerWise buffers while other parameters remain in '
         'the sibling optimizer. --use-layer-wise-param-layout selects the padded layout.',
@@ -4491,6 +4457,15 @@ def _add_distributed_args(parser):
         help="Enable persistent buffer pools for Megatron FSDP communications. "
         "The legacy option name does not fix capacity at two; --fsdp-buffer-count controls "
         "the pool size. Persistent buffers are required for NCCL user-buffer registration.",
+    )
+    group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers per Megatron FSDP communication pool. "
+        "Combined 1F1B overlap with forward prefetch requires at least three. "
+        "A non-default value requires --fsdp-double-buffer, --use-nccl-ub, "
+        "or --megatron-fsdp-max-pool-double-buffer.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',

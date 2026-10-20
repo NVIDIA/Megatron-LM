@@ -1177,10 +1177,10 @@ try:
                 top_p = 0.0
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
-            return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
+            return_log_probs = bool(_get_non_none(req, "logprobs", False))
+            top_n_logprobs = int(_get_non_none(req, "top_logprobs", 0)) if return_log_probs else 0
             skip_prompt_log_probs = bool(_get_non_none(req, "skip_prompt_log_probs", True))
-            add_BOS = bool(req.get("add_BOS", False))
+            add_BOS = bool(_get_non_none(req, "add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
             # input. Since we pre-tokenize via apply_chat_template, we must handle

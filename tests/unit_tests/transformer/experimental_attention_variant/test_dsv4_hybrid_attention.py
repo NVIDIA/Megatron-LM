@@ -35,6 +35,7 @@ class _CpuProjectionStub(IdentityOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.weight = torch.nn.Parameter(torch.empty(1))
+        self.pg_collection = kwargs.get("pg_collection")
 
 
 @pytest.fixture
@@ -526,6 +527,7 @@ def test_compress_ratio_resolution_precedence(
     )
 
     assert attention._dsv4_compress_ratio == expected_ratio
+    assert attention.linear_q_up_proj.pg_collection is attention.pg_collection
 
 
 def test_constructor_requires_explicit_process_groups():

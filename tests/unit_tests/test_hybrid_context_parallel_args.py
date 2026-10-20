@@ -105,3 +105,36 @@ def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     validate_args(args)
     assert args.cuda_graph_impl == "none"
+
+
+@pytest.mark.parametrize("capacity", [None, 1024])
+def test_dynamic_cp_buffer_capacity_uses_dp_times_cp(monkeypatch, capacity):
+    args = _hybrid_cp_args(
+        monkeypatch,
+        world_size=8,
+        global_batch_size=8,
+        seq_length=8192,
+        max_position_embeddings=8192,
+        max_seqlen_per_dp_cp_rank=capacity,
+    )
+    validate_args(args)
+    assert args.data_parallel_size == 8
+    assert args.context_parallel_size == 1
+    assert args.max_seqlen_per_dp_cp_rank == 1024
+    assert args.sequence_packing_scheduler == "default_dynamic_cp"
+    assert args.variable_seq_lengths is True
+
+
+def test_static_packing_buffer_capacity_does_not_include_dp(monkeypatch):
+    args = _hybrid_cp_args(
+        monkeypatch,
+        world_size=8,
+        global_batch_size=8,
+        seq_length=8192,
+        max_position_embeddings=8192,
+        hybrid_context_parallel=False,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=1024,
+    )
+    with pytest.raises(AssertionError, match="Packed sequence buffer size"):
+        validate_args(args)

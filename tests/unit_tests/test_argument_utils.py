@@ -88,6 +88,53 @@ def test_muon_syrk_cli_flag_reaches_optimizer_config_kwargs(enabled):
     assert config_kwargs["muon_use_syrk"] is enabled
 
 
+@pytest.mark.parametrize(
+    "flags, expected",
+    [
+        ([], False),
+        (["--use-layer-wise-param-layout"], True),
+        (["--no-use-layer-wise-param-layout"], False),
+        (["--use-layer-wise-param-layout", "--no-use-layer-wise-param-layout"], False),
+        (["--no-use-layer-wise-param-layout", "--use-layer-wise-param-layout"], True),
+    ],
+)
+def test_layer_wise_layout_cli_defaults_to_compact(flags, expected):
+    parser = add_megatron_arguments(ArgumentParser())
+    args = parser.parse_args(flags)
+    assert args.use_layer_wise_param_layout is expected
+    kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
+    assert kwargs["use_layer_wise_param_layout"] is expected
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_fsdp_buffer_count_cli_reaches_ddp_config(count):
+    parser = add_megatron_arguments(ArgumentParser())
+    args = parser.parse_args(["--fsdp-double-buffer", "--fsdp-buffer-count", str(count)])
+    kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
+    assert kwargs["fsdp_buffer_count"] == count
+    assert kwargs["fsdp_double_buffer"] is True
+
+
+@pytest.mark.parametrize("padded_layout", [False, True])
+def test_layerwise_fp8_validation_respects_layout_support(monkeypatch, padded_layout):
+    args = _minimal_training_args(monkeypatch)
+    args.world_size = 1
+    args.freeze_base_model_for_mtp = False
+    args.optimizer = 'muon'
+    args.use_distributed_optimizer = True
+    args.use_layer_wise_param_layout = padded_layout
+    args.bf16 = True
+    args.fp8 = 'hybrid'
+    args.fp8_recipe = 'blockwise'
+    args.fp8_param_gather = True
+    if padded_layout:
+        with pytest.raises(AssertionError, match="Padded LayerWise parameter layout"):
+            validate_args(args)
+    else:
+        validate_args(args)
+        assert args.use_layer_wise_distributed_optimizer
+
+
 def _minimal_training_args(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
     args = parse_args()
@@ -148,6 +195,50 @@ def test_hash_moe_vocab_is_initialized_before_config_conversion(
     assert args.hash_moe_vocab_size == expected
     assert args.vocab_size == 100000
     assert args.padded_vocab_size == 100352
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('explicit_size', [None, 100007])
+@pytest.mark.parametrize('declared_vocab_size', [None, 100000])
+def test_hash_config_resolves_vocabulary_before_runtime_services(
+    monkeypatch, legacy, explicit_size, declared_vocab_size
+):
+    from megatron.training import argument_utils, global_vars
+
+    args = add_megatron_arguments(ArgumentParser()).parse_args([])
+    args.params_dtype = torch.float32
+    args.moe_n_hash_layers = int(legacy)
+    args.moe_num_hash_layers = int(not legacy)
+    args.hash_moe_vocab_size = explicit_size
+    args.vocab_size = declared_vocab_size
+    args.tokenizer_type = 'HuggingFaceTokenizer'
+    args.padded_vocab_size = None
+    initialized_tokenizer = global_vars._GLOBAL_TOKENIZER
+
+    def probe(received_args):
+        assert received_args is args
+        args.padded_vocab_size = 100352
+        return SimpleNamespace(vocab_size=100003)
+
+    tokenizer_factory = MagicMock(side_effect=probe)
+    monkeypatch.setattr(argument_utils, 'build_tokenizer', tokenizer_factory)
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+    assert config.hash_moe_vocab_size == (
+        explicit_size if explicit_size is not None else 100352 if legacy else 100003
+    )
+    assert tokenizer_factory.call_count == int(explicit_size is None)
+    assert global_vars._GLOBAL_TOKENIZER is initialized_tokenizer
+
+
+def test_legacy_hash_config_keeps_restored_padded_vocab_without_tokenizer(monkeypatch):
+    args = add_megatron_arguments(ArgumentParser()).parse_args([])
+    args.params_dtype = torch.float32
+    args.moe_n_hash_layers = 1
+    args.padded_vocab_size = 100352
+    with patch('megatron.training.argument_utils.build_tokenizer') as tokenizer_factory:
+        config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+    tokenizer_factory.assert_not_called()
+    assert config.hash_moe_vocab_size == 100352
 
 
 # ---------------------------------------------------------------------------
@@ -469,15 +560,53 @@ class TestHybridConfigFromArgs:
         assert config.hybrid_stack_spec is static_spec
 
     @patch("megatron.training.argument_utils.import_module")
-    def test_rejects_config_aware_spec_factory(self, mock_import_module):
-        spec_factory = MagicMock()
+    def test_resolves_config_aware_spec_factory(self, mock_import_module):
+        resolved_spec = ModuleSpec(module=object)
+        spec_factory = MagicMock(return_value=resolved_spec)
         mock_import_module.return_value = spec_factory
         transformer_config = self._transformer_config()
 
-        with pytest.raises(TypeError, match="static ModuleSpec"):
-            hybrid_config_from_args(self._args(), config=transformer_config)
+        config = hybrid_config_from_args(self._args(), config=transformer_config)
 
-        spec_factory.assert_not_called()
+        spec_factory.assert_called_once_with(transformer_config)
+        assert config.hybrid_stack_spec is resolved_spec
+
+    @pytest.mark.parametrize("spec", [object(), lambda _config: object()])
+    @patch("megatron.training.argument_utils.import_module")
+    def test_rejects_invalid_spec_or_factory_result(self, mock_import_module, spec):
+        mock_import_module.return_value = spec
+        with pytest.raises(TypeError, match="ModuleSpec or a config-to-ModuleSpec factory"):
+            hybrid_config_from_args(self._args(), config=self._transformer_config())
+
+    def test_retained_dsv4_recipe_factory_builds_real_layer_specs(self):
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+            DSv4HybridSelfAttention,
+        )
+        from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+        args = self._args()
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_dsv4_stack_spec"]
+        args.hybrid_layer_pattern = "DCHW"
+        transformer = MLATransformerConfig(
+            num_layers=4,
+            hidden_size=128,
+            num_attention_heads=4,
+            is_hybrid_model=True,
+            experimental_attention_variant="dsv4_hybrid",
+            csa_compress_ratios=[4, 4, 128, 0],
+        )
+        config = hybrid_config_from_args(args, config=transformer)
+        layers = config.hybrid_stack_spec.submodules
+        for name, ratio in (
+            ("dsa_layer", None),
+            ("csa_layer", 4),
+            ("hca_layer", 128),
+            ("window_layer", 0),
+        ):
+            attention = getattr(layers, name).submodules.self_attention
+            assert attention.module is DSv4HybridSelfAttention
+            if ratio is not None:
+                assert attention.params["compress_ratio"] == ratio
 
 
 class TestArgumentGroupFactoryBasic:

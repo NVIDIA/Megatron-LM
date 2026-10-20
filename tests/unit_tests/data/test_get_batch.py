@@ -89,6 +89,51 @@ def initialize_test_environment(
     return args
 
 
+def test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages():
+    """The real Hybrid entry moves CPU masks to CUDA and broadcasts them over TP."""
+    if Utils.world_size < 8:
+        pytest.skip("TP2 x PP4 validation needs eight ranks")
+    args = initialize_test_environment(
+        tp_size=2, pp_size=4, cp_size=1, seq_length=32, micro_batch_size=2, global_batch_size=2
+    )
+    args.use_varlen_dataset = True
+    args.varlen_sbhd_validation = True
+    assert pretrain_hybrid.is_dataset_built_on_rank() == (mpu.get_tensor_model_parallel_rank() == 0)
+    mask = torch.arange(32).expand(2, 32) >= torch.tensor([[21], [27]])
+    tokens = torch.arange(64).reshape(2, 32)
+    data = {
+        "tokens": tokens,
+        "labels": tokens.clone(),
+        "loss_mask": (~mask).float(),
+        "position_ids": torch.arange(32).expand(2, 32),
+        "attention_mask": None,
+        "padding_mask": mask,
+    }
+    try:
+        result = pretrain_hybrid.get_batch(iter([data])).get_batch()
+        assert result["padding_mask"].is_cuda
+        torch.testing.assert_close(result["padding_mask"], mask.cuda())
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_gpt_dataset_config_preserves_inter_document_masking():
+    args = initialize_test_environment(
+        tp_size=1,
+        pp_size=1,
+        cp_size=1,
+        seq_length=32,
+        micro_batch_size=1,
+        global_batch_size=Utils.world_size,
+    )
+    args.dataloader_inter_document_masking = True
+    try:
+        config = pretrain_gpt.core_gpt_dataset_config_from_args(args)
+        assert config.inter_document_masking is True
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def create_sft_data_iterator(max_seq_length: int = 1024):
     """Create a mock SFT data iterator matching the old SFTDataset output after DataLoader collation.
 
@@ -517,6 +562,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
     batch = cp_batch.get_batch()
     (
         attention_mask,
+        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -527,7 +573,6 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
-    padding_mask = batch.get("padding_mask")
     packed_seq_params = cp_batch.get_packed_seq_params()
 
     assert padding_mask is None
@@ -899,6 +944,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
     batch = cp_batch.get_batch()
     (
         attention_mask,
+        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -909,7 +955,6 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
-    padding_mask = batch.get("padding_mask")
     packed_seq_params = cp_batch.get_packed_seq_params()
 
     assert padding_mask is None
@@ -1431,6 +1476,7 @@ def test_pretrain_batch(
     batch = cp_batch.get_batch()
     (
         attention_mask,
+        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -1441,7 +1487,6 @@ def test_pretrain_batch(
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
-    padding_mask = batch.get("padding_mask")
     packed_seq_params = cp_batch.get_packed_seq_params()
 
     assert padding_mask is None
@@ -1833,6 +1878,7 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
     batch = cp_batch.get_batch()
     (
         attention_mask,
+        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -1843,7 +1889,6 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
-    padding_mask = batch.get("padding_mask")
     packed_seq_params = cp_batch.get_packed_seq_params()
 
     assert padding_mask is None

@@ -108,7 +108,7 @@ class _CP1:
 
 
 def test_packed_deterministic_mode_is_rejected():
-    """Do not silently run external nondeterministic backward for an explicit mode request."""
+    """The retained main helper rejects its unsupported mode; dev's runtime path is separate."""
     cu = torch.tensor([0, 4], dtype=torch.int32)
     packed = PackedSeqParams(
         qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=4, max_seqlen_kv=4
@@ -290,8 +290,6 @@ def test_packed_cp_matches_full_attention_and_gradients(
             attention_cp_layout="contiguous",
             linear_cp_layout="contiguous",
             # This fixture constructs the scheduler's THD inputs directly below.
-            sequence_packing_scheduler="dp_balanced",
-            max_seqlen_per_dp_cp_rank=physical_cu[-1] // cp_size,
             qk_layernorm=True,
             apply_rope_fusion=rope_fusion,
             gradient_accumulation_fusion=True,
@@ -299,7 +297,7 @@ def test_packed_cp_matches_full_attention_and_gradients(
             recompute_modules=["mla_up_proj"] if recompute else [],
         )
         # Isolate CP: keep the packed layout, backend and recompute settings identical.
-        ref_cfg = replace(cfg, context_parallel_size=1, max_seqlen_per_dp_cp_rank=physical_cu[-1])
+        ref_cfg = replace(cfg, context_parallel_size=1)
         model = _build_attention(cfg, 1, pg).cuda()
         reference = _build_attention(ref_cfg, 1, ref_pg).cuda()
         reference.load_state_dict(model.state_dict())

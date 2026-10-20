@@ -2239,7 +2239,8 @@ def _get_pipeline_hidden_size(config) -> int:
     """Return the residual width carried across every logical pipeline boundary.
 
     Supported mHC layouts expand at pre_process and contract at post_process.
-    GPTModel rejects mHC with PP and MTP, where the decoder can contract earlier.
+    GPTModel keeps mHC MTP with its final decoder layer in the same pipeline chunk,
+    preserving the multistream payload until the local MTP block consumes it.
     All communicating stages therefore carry every residual stream, including
     the last physical rank sending to the next virtual chunk on the first rank.
     """

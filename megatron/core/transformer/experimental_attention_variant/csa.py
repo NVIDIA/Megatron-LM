@@ -14,7 +14,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_out_of_place,
 )
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (
     async_gather_from_sequence_parallel_region,
@@ -59,6 +59,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     use_fused_dsa_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    get_compact_indexer_workspace_registry,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -1687,7 +1690,10 @@ class Compressor(MegatronModule):
                 self.head_dim - self.qk_pos_emb_head_dim,
                 self.qk_pos_emb_head_dim,
                 self.config,
-                self.pg_collection.cp,
+                # Frequencies are already selected for each physical compressed row;
+                # do not index them again through the packed-sequence helper.
+                cu_seqlens=None,
+                cp_group=self.pg_collection.cp,
             )
         return rotate_activation(compressed) if self.rotate else compressed
 
@@ -2145,12 +2151,7 @@ class _CompactIndexerWorkspaceStore:
 
 def _shared_compact_indexer_workspace_store(config, device: torch.device):
     """Return the store shared by all CSA layers built from ``config`` on ``device``."""
-    stores = getattr(config, "_compact_indexer_workspace_stores", None)
-    if stores is None:
-        stores = {}
-        # Plain attribute on the (non-frozen) dataclass: not a field, so it is invisible to
-        # ``dataclasses.asdict``/``replace``; ``__deepcopy__`` above keeps copies from cloning it.
-        setattr(config, "_compact_indexer_workspace_stores", stores)
+    stores = get_compact_indexer_workspace_registry(config)
     key = (device.type, device.index)
     store = stores.get(key)
     if store is None:
@@ -2890,9 +2891,7 @@ class CompressedSparseAttention(MegatronModule):
         nvtx_range_push("compressed_sparse_attn")
 
         _orig_cp_group = self.pg_collection.cp
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
+        self.pg_collection.cp = resolve_cp_group(_orig_cp_group, packed_seq_params)
 
         cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None

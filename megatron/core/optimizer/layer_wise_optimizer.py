@@ -1435,6 +1435,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if optimizer_idx == 0:
             self.chained_optimizers[managed_indices[0]].prefetch_optimizer_state_for_step()
 
+    def _sync_unbuffered_model_params(self) -> None:
+        """Restore compact LayerWise shards using the same gather policy as a normal step."""
+        if not self.is_stub_optimizer and not self.layerwise_param_sync_via_bucket_group:
+            self.allgather_params()
+
     def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
         """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
 

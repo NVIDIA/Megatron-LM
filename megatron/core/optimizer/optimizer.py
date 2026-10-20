@@ -345,6 +345,10 @@ class MegatronOptimizer(ABC):
         """
         self._stage_model_params_from_main_params()
 
+    def _sync_unbuffered_model_params(self) -> None:
+        """Synchronize optimizer-owned parameters not gathered by DDP bucket groups."""
+        return
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -1889,12 +1893,31 @@ class ChainedOptimizer(MegatronOptimizer):
             return
         for optimizer in self.chained_optimizers:
             optimizer._stage_model_params_from_main_params()
+        self._sync_unbuffered_model_params()
         # self.model_chunks, not a walk over the members: __init__ collects chunks only from
         # members that expose a model_chunks attribute, which Float16OptimizerWithFloat16Params
         # does not. LayerWiseDistributedOptimizer therefore reassigns self.model_chunks after
         # super().__init__(), and recomputing here would discard that and gather nothing.
         for model_chunk in self.model_chunks:
-            model_chunk.start_param_sync(force_sync=True)
+            bucket_groups = getattr(model_chunk, 'bucket_groups', []) + getattr(
+                model_chunk, 'expert_parallel_bucket_groups', []
+            )
+            if any(not group.ddp_config.param_sync_via_bucket_group for group in bucket_groups):
+                # Compact LayerWise may own its gather while sibling DistOpt buckets
+                # still use DDP. Never send the former through a DistOpt collective.
+                for group in bucket_groups:
+                    if group.ddp_config.param_sync_via_bucket_group:
+                        model_chunk._start_bucket_group_param_sync(group, force_sync=True)
+            else:
+                model_chunk.start_param_sync(force_sync=True)
+
+    @override
+    def _sync_unbuffered_model_params(self) -> None:
+        """Run optimizer-owned gathers only after every member has staged its shards."""
+        if self.is_stub_optimizer:
+            return
+        for optimizer in self.chained_optimizers:
+            optimizer._sync_unbuffered_model_params()
 
     def state_dict(self):
         if len(self.chained_optimizers) == 1:

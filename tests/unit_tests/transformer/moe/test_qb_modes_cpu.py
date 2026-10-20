@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from megatron.core.distributed.finalize_model_grads import (
+    _update_router_expert_bias_with_quantile,
+    _update_router_qb_beta,
     finalize_model_grads,
     reset_model_temporary_tensors,
 )
@@ -38,6 +40,26 @@ def _config(scope, **kwargs):
 def _groups():
     group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
     return SimpleNamespace(tp=group, cp=group, expt_tp=group, tp_cp=group, tp_dp_cp=group)
+
+
+@pytest.mark.parametrize("scope", ["global_batch", "micro_batch"])
+def test_hash_routing_has_no_learned_qb_state_to_finalize(scope, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    config = _config(scope, moe_num_hash_layers=1, hash_moe_vocab_size=16)
+    router = TopKRouter(config, pg_collection=_groups(), layer_number=1)
+    model = torch.nn.Module()
+    model.router = router
+    all_reduce = mock.Mock(side_effect=AssertionError("hash routing must not reduce QB state"))
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    _update_router_expert_bias_with_quantile([model], config, _groups().tp)
+    _update_router_qb_beta([model], config, _groups().tp)
+    all_reduce.assert_not_called()
+    assert router.tid2eid.shape == (16, config.moe_router_topk)
+    for name in ("expert_bias", "qb_histogram", "qb_bin_bounds", "qb_beta_accum", "qb_beta"):
+        assert getattr(router, name) is None
+    learned = TopKRouter(config, pg_collection=_groups(), layer_number=2)
+    state_name = "qb_histogram" if scope == "global_batch" else "qb_beta_accum"
+    assert getattr(learned, state_name) is not None
 
 
 @pytest.mark.parametrize("scope", ["global_batch", "micro_batch"])
@@ -111,6 +133,16 @@ def test_micro_batch_routing_ema_and_retry_lifecycle(monkeypatch):
     assert not router.qb_beta_accum.any()
     assert router.qb_beta_count.item() == 0
     torch.testing.assert_close(router.qb_beta, expected_beta)
+
+
+def test_micro_batch_qb_rejects_padding_before_updating_estimator(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    router = TopKRouter(_config("micro_batch"), pg_collection=_groups())
+    mask = torch.tensor([[False], [False], [True], [True]])
+    with pytest.raises(AssertionError, match="does not support padding masks"):
+        router.routing(torch.randn(4, 1, 4), padding_mask=mask)
+    assert router.qb_beta_count.item() == 0
+    assert not router.qb_beta_accum.any()
 
 
 def test_micro_batch_inference_uses_frozen_beta(monkeypatch):

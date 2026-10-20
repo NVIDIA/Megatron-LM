@@ -324,6 +324,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     layer = build_module(

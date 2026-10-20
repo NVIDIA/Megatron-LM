@@ -391,6 +391,13 @@ class TopKRouter(Router):
         self.expert_bias = None
         self.use_quantile_balancing = False
         self.use_micro_batch_quantile_balancing = False
+        # Global-batch finalization discovers routers by their accumulator buffers,
+        # not only by the mode flags. A fixed hash table has no learned routing bias.
+        self.qb_histogram = None
+        self.qb_bin_bounds = None
+        self.qb_beta = None
+        self.qb_beta_accum = None
+        self.qb_beta_count = None
 
     def _maintain_float32_expert_bias(self):
         """
@@ -1116,6 +1123,10 @@ class TopKRouter(Router):
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.use_micro_batch_quantile_balancing:
+            assert padding_mask is None, (
+                "Micro-batch quantile balancing does not support padding masks; "
+                "padded tokens must not enter its quantile estimator."
+            )
             probs, routing_map = self.quantile_balancing(logits)
         else:
             # Activation checkpointing runs the original forward under no-grad and its

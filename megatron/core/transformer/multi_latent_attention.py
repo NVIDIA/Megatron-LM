@@ -1048,7 +1048,7 @@ class MLASelfAttention(MultiLatentAttention):
             """
             use_fused_q_uproj = (
                 self._use_fused_q_uproj
-                and self.config.apply_rope_fusion
+                and use_fused_rope
                 and self.config.q_lora_rank is not None
                 and q_compressed.ndim == 3
                 and self.pg_collection.cp.size() == 1
@@ -1081,7 +1081,7 @@ class MLASelfAttention(MultiLatentAttention):
                     b,
                     self.tp_group,
                     self.config.sequence_parallel,
-                    self.config.layernorm_epsilon,
+                    self.config.attention_latent_norm_epsilon,
                     self.config.normalization,
                     self.config.layernorm_zero_centered_gamma,
                 )

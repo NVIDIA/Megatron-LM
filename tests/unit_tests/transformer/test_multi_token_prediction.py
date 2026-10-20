@@ -3016,6 +3016,11 @@ class TestMultiTokenPrediction:
         """An empty field group is a no-op."""
         assert roll_tensor([]) == []
 
+    def test_roll_tensor_none_input(self):
+        """The legacy single-field API preserves its None payload and reduction."""
+        result, sum_value = roll_tensor(None, shifts=-1, dims=-1)
+        assert result is None and sum_value is None
+
     def test_roll_tensor_return_sum_false(self):
         """Disabling return_sum preserves values and omits the unused reduction."""
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)

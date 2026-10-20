@@ -2386,6 +2386,57 @@ class TestFusedMLARequiresQLora:
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_partial_rope_does_not_dispatch_fused_q_up_projection(monkeypatch):
+    """Even an eligible Q-up projection must fall back when no fused RoPE tables exist."""
+    from types import SimpleNamespace
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            qk_layernorm=True,
+            rope_type="rope",
+            rotary_percent=0.5,
+            apply_rope_fusion=True,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        attention = (
+            MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(qk_layernorm=True),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        # This is a negative dispatch check, not a claim that H100 runs the SM100 kernel.
+        attention._use_fused_q_uproj = True
+        monkeypatch.setattr(
+            mla_module,
+            "FusedMLAQUpProjFunction",
+            SimpleNamespace(apply=lambda *_: pytest.fail("partial RoPE must not use fused Q-up")),
+        )
+        hidden = torch.randn(16, 1, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        query, key, value, _, _ = attention.get_query_key_value_tensors(hidden)
+        assert all(torch.isfinite(tensor).all() for tensor in (query, key, value))
+        (query.float().sum() + key.float().sum() + value.float().sum()).backward()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     get_device_arch_version() < 10,
@@ -2545,7 +2596,7 @@ class TestFusedMLAQUpProjIntegration:
             _deq_col(query_fused), _deq_col(query_unfused), atol=1.0, rtol=0.14
         )
 
-    def test_end_to_end_backward_uses_te_autograd(self):
+    def test_end_to_end_backward_uses_te_autograd(self, monkeypatch):
         with mock.patch.dict(
             os.environ,
             {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0", "NVTE_FUSED_MLA_Q_UPROJ": "1"},
@@ -2575,6 +2626,8 @@ class TestFusedMLAQUpProjIntegration:
                 original_max_position_embeddings=256,
                 apply_rope_fusion=True,
                 use_fused_mla_q_uproj=True,
+                layernorm_epsilon=1.0e-5,
+                attention_latent_norm_epsilon=1.0e-6,
             )
             attention = (
                 MLASelfAttention(
@@ -2592,6 +2645,14 @@ class TestFusedMLAQUpProjIntegration:
                 mla_module.FusedMLAQUpProjFunction.__module__
                 == "transformer_engine.pytorch.attention.fused_mla_q_uproj"
             )
+            original_apply = mla_module.FusedMLAQUpProjFunction.apply
+            seen_epsilons = []
+
+            def record_apply(*args):
+                seen_epsilons.append(args[15])
+                return original_apply(*args)
+
+            monkeypatch.setattr(mla_module.FusedMLAQUpProjFunction, "apply", record_apply)
 
             hidden_states = torch.randn(
                 256, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
@@ -2599,6 +2660,7 @@ class TestFusedMLAQUpProjIntegration:
             with get_fp8_context(config):
                 output, _ = attention(hidden_states, None)
             output.float().square().mean().backward()
+            assert seen_epsilons and all(eps == 1.0e-6 for eps in seen_epsilons)
 
             for grad in (
                 hidden_states.grad,

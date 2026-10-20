@@ -10,7 +10,7 @@ from model_provider import count_parameters_in_layer
 
 
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    """Build a HybridModel from an explicit static layer specification."""
+    """Build a HybridModel from a static spec or a config-aware spec factory."""
     print_rank_0('building Hybrid model ...')
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
@@ -25,8 +25,10 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
+        if not isinstance(hybrid_stack_spec, ModuleSpec) and callable(hybrid_stack_spec):
+            hybrid_stack_spec = hybrid_stack_spec(config)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
-            raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
+            raise TypeError("--spec must provide a ModuleSpec or a config-to-ModuleSpec factory.")
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 

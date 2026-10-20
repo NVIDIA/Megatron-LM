@@ -35,6 +35,29 @@ from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize("layout, pp_size", [("Et|mL", 2), ("Et|m|L", 3)])
+def test_gpt_mhc_rejects_standalone_mtp_pipeline_chunks(layout, pp_size):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=pp_size,
+        pipeline_model_parallel_layout=layout,
+        enable_hyper_connections=True,
+        mtp_num_layers=1,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="requires MTP and the final decoder layer"):
+        GPTModel(
+            config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=8,
+        )
+
+
 def test_mhc_mtp_preserves_multistream_on_pipeline_stages():
     """Dev's PP path must pass pre-contraction streams to the real MTP block."""
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
@@ -153,24 +176,45 @@ class TestGPTModel:
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
 
-    def test_constructor_rejects_hash_routed_moe(self):
+    @pytest.mark.parametrize("add_bias_linear", [False, True])
+    def test_hash_routed_moe_receives_token_ids_and_backpropagates(self, add_bias_linear):
         config = TransformerConfig(
             num_layers=2,
-            hidden_size=12,
+            hidden_size=64,
             num_attention_heads=4,
+            ffn_hidden_size=128,
             num_moe_experts=4,
             moe_num_hash_layers=1,
             hash_moe_vocab_size=100,
             use_cpu_initialization=True,
+            add_bias_linear=add_bias_linear,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
         )
-
-        with pytest.raises(ValueError, match="supported only by HybridModel"):
-            GPTModel(
-                config=config,
-                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-                vocab_size=100,
-                max_sequence_length=4,
-            )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
+            vocab_size=128,
+            max_sequence_length=8,
+        ).cuda()
+        router = model.decoder.layers[0].mlp.router
+        assert router.is_hash_layer
+        assert not model.decoder.layers[1].mlp.router.is_hash_layer
+        received = []
+        router.register_forward_pre_hook(
+            lambda module, args, kwargs: received.append(kwargs['input_ids'].clone()),
+            with_kwargs=True,
+        )
+        tokens = torch.arange(16, device='cuda').reshape(2, 8)
+        positions = torch.arange(8, device='cuda').expand_as(tokens)
+        loss = model(tokens, positions, None, labels=tokens)
+        torch.testing.assert_close(received[0], tokens)
+        assert torch.isfinite(loss).all()
+        loss.mean().backward()
+        grad = model.embedding.word_embeddings.weight.grad
+        assert grad is not None and torch.isfinite(grad).all() and torch.count_nonzero(grad) > 0
 
     @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
     def test_hsm_requires_two_mtp_layers(self, mtp_num_layers):

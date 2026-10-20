@@ -851,7 +851,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # Without dropout, the shared-expert add of `postprocess` and the residual add of
         # `mlp_bda` run as one kernel that is bit-identical to the two adds.
         fuse_residual_add = (
-            shared_expert_output is not None
+            not is_mhc_layer
+            and shared_expert_output is not None
             and layer.mlp_bda is get_bias_dropout_add
             and (layer.hidden_dropout == 0.0 or not layer.training)
         )

@@ -393,7 +393,11 @@ class MLP(MegatronModule):
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly
             # without doing bda later.
-            output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
+            # TE may return a view from its custom autograd Function. Preserve the
+            # in-place add's output dtype without mutating that view and its history.
+            output = (output + output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)).to(
+                output.dtype
+            )
             output_bias = None
 
         return output, output_bias

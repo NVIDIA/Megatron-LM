@@ -225,6 +225,7 @@ class DSv4HybridAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
         )
 
         if (
@@ -462,6 +463,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='q_up_proj',
             tp_group=pg_collection.tp,
+            pg_collection=pg_collection,
             name=(name + ".linear_q_up_proj") if name is not None else None,
         )
         # DSv4 hybrid packs each query head as [qk_head_dim | qk_pos_emb_head_dim]
@@ -484,6 +486,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
+            pg_collection=pg_collection,
             name=(name + ".linear_kv_proj") if name is not None else None,
         )
         self.kv_layernorm = submodules.kv_layernorm(

@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
@@ -413,6 +414,37 @@ def _model_rng_config(args: Namespace) -> RNGConfig:
     return _default_config_from_args(RNGConfig, args)
 
 
+def _resolve_hash_moe_vocab_from_args(args):
+    """Resolve vocabulary-dependent hash config without initializing global services.
+
+    Most model vocabulary is bound after runtime tokenizer setup. Hash routing must
+    validate its table size during core config construction, so probe the tokenizer
+    only when neither explicit sizes nor a restored checkpoint size suffice. Do not
+    cache a tokenizer object on args: args are serialized in checkpoints.
+    """
+    explicit_size = getattr(args, 'hash_moe_vocab_size', None)
+    if explicit_size is None:
+        explicit_size = getattr(args, 'actual_vocab_size', None)
+    if explicit_size is not None:
+        return explicit_size
+    if not (getattr(args, 'moe_n_hash_layers', 0) or getattr(args, 'moe_num_hash_layers', 0)):
+        return args.vocab_size
+    legacy = getattr(args, '_legacy_hash_moe_vocab', getattr(args, 'moe_n_hash_layers', 0) > 0)
+    if legacy:
+        size = getattr(args, 'padded_vocab_size', None)
+    else:
+        # A configured tokenizer can add tokens beyond the declared base vocabulary.
+        # Only tokenizer-free config construction may use the raw size directly.
+        size = args.vocab_size if getattr(args, 'tokenizer_type', None) is None else None
+    if size is None:
+        tokenizer = build_tokenizer(args)
+        size = getattr(args, 'padded_vocab_size', None) if legacy else tokenizer.vocab_size
+        if size is None:
+            size = tokenizer.vocab_size
+    args.hash_moe_vocab_size = size
+    return size
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import situlu, squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -448,7 +480,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     if kw_args.get('hash_moe_vocab_size') is None:
-        kw_args['hash_moe_vocab_size'] = args.vocab_size
+        kw_args['hash_moe_vocab_size'] = _resolve_hash_moe_vocab_from_args(args)
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
@@ -779,8 +811,12 @@ def hybrid_config_from_args(
                 kwargs["hybrid_stack_spec"] = hybrid_stack_spec
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
+        # Preserve dev's config-aware specs at the construction boundary. ModuleSpec
+        # itself is callable, so do not instantiate an already resolved static spec.
+        if not isinstance(hybrid_stack_spec, ModuleSpec) and callable(hybrid_stack_spec):
+            hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
-            raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
+            raise TypeError("--spec must provide a ModuleSpec or a config-to-ModuleSpec factory.")
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy

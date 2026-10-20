@@ -1830,6 +1830,15 @@ _CHAT_LOGPROBS = {
             id="logprobs",
         ),
         pytest.param(
+            {"logprobs": True, "top_logprobs": None, "add_BOS": None},
+            {},
+            None,
+            {"content": "<30><31>"},
+            "stop",
+            _CHAT_LOGPROBS,
+            id="logprobs-with-null-optionals",
+        ),
+        pytest.param(
             {},
             {},
             ("answer", {"reasoning": "why"}),

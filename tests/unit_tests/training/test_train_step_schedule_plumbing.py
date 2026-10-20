@@ -25,7 +25,7 @@ class _Rerun:
         return False, True, 0  # (checkpoint, exit, code)
 
 
-def _run(*, args_overrides=None, model=None, optimizer=None, **kwargs):
+def _run(*, args_overrides=None, model=None, optimizer=None, return_result=False, **kwargs):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -52,7 +52,7 @@ def _run(*, args_overrides=None, model=None, optimizer=None, **kwargs):
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
     ):
-        training_mod.train_step(
+        result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
             data_iterator=iter([]),
             model=model,
@@ -63,7 +63,16 @@ def _run(*, args_overrides=None, model=None, optimizer=None, **kwargs):
             iteration=0,
             **kwargs,
         )
-    return captured
+    return result if return_result else captured
+
+
+def test_train_step_early_exit_keeps_normal_result_field_order():
+    result = _run(return_result=True)
+    assert len(result) == 12
+    assert result[:5] == ({}, True, False, True, 0)
+    assert result[5:8] == (None, None, None)
+    assert result[8] == 1  # num_microbatches, not an exit-path placeholder
+    assert result[11] is None  # samples_seen is not computed before early exit
 
 
 def test_train_step_forwards_schedule_plumbing():

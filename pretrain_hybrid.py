@@ -16,7 +16,7 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 # cannot reach them.
 suppress_duplicate_logs_off_rank0()
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
 
 import torch
@@ -95,6 +95,7 @@ stimer = StragglerDetector()
 
 BATCH_KEYS = [
     'attention_mask',
+    'padding_mask',
     'cu_seqlens',
     'cu_seqlens_padded',
     'hybrid_cp_group',
@@ -112,6 +113,7 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch_keys = [
         "attention_mask",
+        "padding_mask",
         "cu_seqlens",
         "cu_seqlens_padded",
         "hybrid_cp_group",
@@ -167,6 +169,9 @@ def get_batch(data_iterator, vp_stage=None):
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    needs_padding_mask = getattr(args, "use_varlen_dataset", False) and getattr(
+        args, "varlen_sbhd_validation", False
+    )
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -179,6 +184,7 @@ def get_batch(data_iterator, vp_stage=None):
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
+        and not needs_padding_mask
     ):
         return ContextParallelBatch(
             boundary_layout=config.linear_cp_layout,
@@ -211,17 +217,21 @@ def get_batch(data_iterator, vp_stage=None):
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        needs_padding_mask=needs_padding_mask,
     )
+    # Non-validation TP receivers do not allocate this optional field.
+    batch.setdefault("padding_mask", None)
 
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert has_cu_seqlens
+        assert has_cu_seqlens or needs_padding_mask
         batch = {
             **dict.fromkeys(BATCH_KEYS),
-            'cu_seqlens': batch['cu_seqlens'],
-            'cu_seqlens_padded': batch['cu_seqlens_padded'],
-            'max_seqlen': batch['max_seqlen'],
+            'cu_seqlens': batch.get('cu_seqlens'),
+            'cu_seqlens_padded': batch.get('cu_seqlens_padded'),
+            'max_seqlen': batch.get('max_seqlen'),
+            'padding_mask': batch.get('padding_mask'),
         }
 
     additional_layouts = set()
@@ -250,6 +260,23 @@ def get_batch(data_iterator, vp_stage=None):
 SPIKY_LOSS_FACTOR = 10
 
 
+@lru_cache(maxsize=1)
+def _build_cached_logits_loss_func(
+    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+):
+    """Construct the offline teacher-logit reader once per process."""
+    from megatron.training.distillation import LossFuncCallable
+
+    return LossFuncCallable(
+        logprobs_dir=logprobs_dir,
+        decode_threads=decode_threads,
+        prefetch_factor=prefetch_factor,
+        msc_prefetch_depth=msc_prefetch_depth,
+        kd_loss_alpha=kd_loss_alpha,
+        ignore_errors=ignore_errors,
+    )
+
+
 def loss_func(
     loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None
 ):
@@ -266,7 +293,17 @@ def loss_func(
             the data parallel ranks
     """
     args = get_args()
-    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    if getattr(args, 'logits_load_dir', None) is not None:
+        loss_func_cached_logits = _build_cached_logits_loss_func(
+            logprobs_dir=args.logits_load_dir,
+            decode_threads=args.logits_load_decode_threads,
+            prefetch_factor=args.logits_load_prefetch_factor,
+            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
+            kd_loss_alpha=args.logits_load_kd_loss_alpha,
+            ignore_errors=args.logits_load_ignore_errors,
+        )
+        loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
+    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
@@ -365,7 +402,11 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or (
+        getattr(args, 'use_varlen_dataset', False)
+        and getattr(args, 'varlen_sbhd_validation', False)
+    ):
+        # Every PP stage needs its padding metadata, even without packed THD inputs.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,

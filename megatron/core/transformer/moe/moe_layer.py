@@ -567,6 +567,22 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
+    def _align_batch_first_to_sequence_parallel(self, value, hidden_states):
+        """Align batch-first token metadata with the local sequence-parallel activations."""
+        if (
+            value is not None
+            and self.config.sequence_parallel
+            and value.shape[1] != hidden_states.shape[0]
+        ):
+            value = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    value.transpose(0, 1).contiguous(), group=self.tp_group
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+        return value
+
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(
         self,
@@ -581,24 +597,8 @@ class MoELayer(BaseMoELayer):
         producing routing probabilities and a mapping. The input padding mask is batch-first;
         routing consumes it sequence-first to align with ``hidden_states``.
         """
-        if self.config.sequence_parallel:
-            local_length = hidden_states.shape[0]
-            if padding_mask is not None and padding_mask.shape[1] != local_length:
-                padding_mask = (
-                    tensor_parallel.scatter_to_sequence_parallel_region(
-                        padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
-            if input_ids is not None and input_ids.shape[1] != local_length:
-                input_ids = (
-                    tensor_parallel.scatter_to_sequence_parallel_region(
-                        input_ids.transpose(0, 1).contiguous(), group=self.tp_group
-                    )
-                    .transpose(0, 1)
-                    .contiguous()
-                )
+        padding_mask = self._align_batch_first_to_sequence_parallel(padding_mask, hidden_states)
+        input_ids = self._align_batch_first_to_sequence_parallel(input_ids, hidden_states)
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = apply_module(self.router)(
@@ -618,8 +618,8 @@ class MoELayer(BaseMoELayer):
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The optional padding mask is the batch-first mask given to ``route``; it is
-        passed through untouched and the dispatcher decides whether its backend excludes padded
-        rows.
+        aligned with the local sequence-parallel activations before the dispatcher decides
+        whether its backend excludes padded rows.
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -651,6 +651,7 @@ class MoELayer(BaseMoELayer):
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
             # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            padding_mask = self._align_batch_first_to_sequence_parallel(padding_mask, hidden_states)
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
                 hidden_states, routing_map, probs, padding_mask=padding_mask
             )

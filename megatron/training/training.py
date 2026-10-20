@@ -4917,11 +4917,11 @@ def train_step(
             exit_code,
             None,
             None,
-            0,
             None,
             num_microbatches,
             seqlen_sum_this_global_batch,
             seqlen_squared_sum_this_global_batch,
+            None,
         )
 
     # Empty unused memory.
@@ -5524,7 +5524,7 @@ def training_log(
             vision_total_tokens_in_batch=vision_total_tokens_in_batch,
             vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
             vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
+        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
 
@@ -7381,6 +7381,7 @@ def evaluate(
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
+                    config.timers = get_timers()
                     break
             else:
                 packed_data_iterator = data_iterator

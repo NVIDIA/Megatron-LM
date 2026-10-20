@@ -1349,12 +1349,10 @@ class TransformerConfig(ModelParallelConfig):
             }
         },
     )
-    """NCCL-EP expert-view compatibility policy. None follows the current API:
-    a rank capacity selects static shapes and no capacity selects eager shapes.
-    False retains the legacy bounded dynamic view (narrow for experts, pad for combine).
-    True explicitly requests static shapes and requires a rank capacity.
-    Static quantized compute requires the CuTe grouped GEMM; dynamic narrowed
-    views use BF16 wire payloads and do not support zero-copy buffers."""
+    """Compatibility check for NCCL-EP shape policy, not an independent backend switch.
+    A rank capacity selects static shapes; omitting it selects eager shapes. Explicit
+    True/False must agree with that canonical capacity setting. Bounded dynamic views
+    cannot be requested by setting this flag to False while retaining a rank capacity."""
 
     moe_ncclep_use_symm_mem: bool = False
     """Compatibility alias for moe_ncclep_zero_copy, now implemented by NCCL-EP."""
@@ -1933,6 +1931,13 @@ class TransformerConfig(ModelParallelConfig):
 
     def _normalize_sync_compatibility_fields(self) -> None:
         """Normalize branch-compatible names before validating the shared configuration."""
+        if self.linear_attention_type is not None:
+            warnings.warn(
+                "linear_attention_type is deprecated, "
+                "use experimental_attention_variant instead."
+            )
+            self.experimental_attention_variant = self.linear_attention_type
+            self.linear_attention_type = None
         self.moe_hybridep_pad_variable_tokens = (
             self.moe_hybridep_pad_variable_tokens or self.moe_hybridep_pad_uneven_dispatch_inputs
         )
@@ -1977,6 +1982,16 @@ class TransformerConfig(ModelParallelConfig):
         ):
             raise ValueError(
                 "moe_ncclep_static_shape=True requires moe_expert_rank_capacity_factor."
+            )
+        if (
+            self.moe_flex_dispatcher_backend == "ncclep"
+            and self.moe_ncclep_static_shape is False
+            and self.moe_expert_rank_capacity_factor is not None
+        ):
+            raise ValueError(
+                "moe_ncclep_static_shape=False conflicts with moe_expert_rank_capacity_factor; "
+                "NCCL-EP shape policy is selected by the rank capacity, "
+                "not this compatibility flag."
             )
         self._linear_cp_mode_was_default = self.linear_cp_mode is None
         if self.linear_cp_mode is None:
@@ -2160,7 +2175,10 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.dsa_kernel_backend is None:
             self.dsa_kernel_backend = (
-                "cudnn" if self.experimental_attention_variant == "dsv4_hybrid" else "none"
+                "cudnn"
+                if self.experimental_attention_variant == "dsv4_hybrid"
+                and self.apply_dsa_kernel_fusion is None
+                else "none"
             )
 
         if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
@@ -2283,30 +2301,6 @@ class TransformerConfig(ModelParallelConfig):
                 f"got {self.gdn_kernel_backend!r}."
             )
 
-        if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
-            raise ValueError(
-                "dsa_indexer_weights_proj_output_dtype must be either 'bf16' or 'fp32', got "
-                f"{self.dsa_indexer_weights_proj_output_dtype!r}."
-            )
-        if (
-            self.dsa_indexer_weights_proj_use_quantization
-            and self.dsa_indexer_weights_proj_output_dtype == "fp32"
-        ):
-            raise ValueError(
-                "dsa_indexer_weights_proj_output_dtype='fp32' requires "
-                "dsa_indexer_weights_proj_use_quantization=False because quantized "
-                "TELinear does not guarantee a true-FP32 output for this projection."
-            )
-        if (
-            self.dsa_indexer_weights_proj_output_dtype == "fp32"
-            and self.dsa_kernel_backend == "cudnn"
-        ):
-            raise ValueError(
-                "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
-                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
-                "Use dsa_kernel_backend='tilelang' or 'none'."
-            )
-
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if (
                 self.experimental_attention_variant != "kda"
@@ -2321,18 +2315,10 @@ class TransformerConfig(ModelParallelConfig):
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
             # symbol 'G', where linear_attention_freq is unused; the GPT experimental
             # attention route raises a clear error downstream if it is missing.
-            if self.experimental_attention_variant == "gdn":
+            if self.experimental_attention_variant == "gdn" and not self.is_hybrid_model:
                 assert (
                     self.linear_attention_freq is not None
                 ), "linear_attention_freq must be set for linear gdn."
-
-        if self.linear_attention_type is not None:
-            warnings.warn(
-                "linear_attention_type is deprecated, "
-                "use experimental_attention_variant instead."
-            )
-            self.experimental_attention_variant = self.linear_attention_type
-            self.linear_attention_type = None
 
         if self.experimental_attention_variant is not None:
             self.experimental_attention_variant = normalize_experimental_attention_variant(
@@ -2351,12 +2337,17 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            if self.sequence_packing_scheduler is None:
+            if self.sequence_packing_scheduler is None and not (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and not self.dynamic_context_parallel
+            ):
                 raise ValueError(
                     "cp_partition_mode='contiguous' with context parallelism requires THD "
                     "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
                     "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
                 )
+            # Static DSv4 callers may supply THD metadata directly (main #7469).
+            # CSA validates the actual input format at runtime and still rejects SBHD CP.
             if (
                 (self.mtp_num_layers or 0) > 0
                 and self.tensor_model_parallel_size > 1

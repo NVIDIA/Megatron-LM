@@ -272,6 +272,7 @@ def setup_model_and_optimizer(
     fp8_param_gather=False,
     fp4_param_gather=False,
     reuse_grad_buf_for_mxfp8_param_ag=False,
+    use_layer_wise_param_layout=None,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -320,6 +321,8 @@ def setup_model_and_optimizer(
         mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        if use_layer_wise_param_layout is not None:
+            mock_args.use_layer_wise_param_layout = use_layer_wise_param_layout
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
         model = get_model(

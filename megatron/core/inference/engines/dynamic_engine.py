@@ -4483,6 +4483,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
+            elif header == Headers.START_CUDA_PROFILER:
+                # Apply this side effect on every MP rank; it is not a state transition.
+                torch.cuda.cudart().cudaProfilerStart()
+            elif header == Headers.STOP_CUDA_PROFILER:
+                torch.cuda.cudart().cudaProfilerStop()
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)

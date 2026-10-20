@@ -2451,6 +2451,7 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    needs_padding_mask: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2491,6 +2492,7 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        needs_padding_mask (bool): Broadcast a batch-first padding mask on every PP stage.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
@@ -2714,6 +2716,16 @@ def get_batch_on_this_tp_rank(
             'local_cp_size': local_cp_size,
             'hybrid_cp_group': None,
         }
+
+    if needs_padding_mask:
+        if tp_rank != 0:
+            batch['padding_mask'] = torch.empty(
+                (micro_batch_size, seq_length), dtype=torch.bool, device=torch.cuda.current_device()
+            )
+        assert batch.get('padding_mask') is not None, "SBHD validation requires a padding mask"
+        assert batch['padding_mask'].dtype == torch.bool
+        assert batch['padding_mask'].shape == (micro_batch_size, seq_length)
+        _broadcast(batch['padding_mask'])
 
     return batch
 

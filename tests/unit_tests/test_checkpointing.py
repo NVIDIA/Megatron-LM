@@ -888,6 +888,28 @@ def test_save_checkpoint(
         assert args.memory_snapshot_path == "stale.pickle"
 
 
+def test_kd_teacher_flag_does_not_reenter_removed_modelopt_loader(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, run_config, monkeypatch
+):
+    """A real load round trip must not import the removed nested teacher loader."""
+    pytest.importorskip("modelopt", reason="ModelOpt checkpoint integration requires ModelOpt")
+    from megatron.training import checkpointing
+
+    create_ckpt_load_args.export_kd_teacher_load = "teacher-checkpoint"
+    monkeypatch.setattr(checkpointing, "has_nvidia_modelopt", True)
+    monkeypatch.setattr(checkpointing, "print_distributed_quant_summary", mock.Mock())
+    test_load_checkpoint(
+        init_model_parallel,
+        create_ckpt_load_args,
+        tmp_path_dist_ckpt,
+        "torch",
+        False,
+        0,
+        run_config,
+        {},
+    )
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 @pytest.mark.parametrize("owned_rng", [False, True])
 @pytest.mark.parametrize("iteration", [0, 123])
