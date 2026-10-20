@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU lifecycle controls; these do not establish CUDA reload or RL parity."""
+import os
+import shlex
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -106,3 +109,37 @@ def test_ds41_reload_missing_native_config_fails(native_reload):
     del model.vllm_config
     with pytest.raises(RuntimeError, match='no vllm_config'):
         quant.prepare_quanted_weights_for_loading(model)
+
+
+def test_sparse_recipe_forwards_contract_to_existing_ray(tmp_path):
+    script = Path(__file__).resolve().parents[3] / 'examples/verl/scripts/run_deepseek_v41_dapo.sh'
+    env = dict(
+        os.environ,
+        MODEL_PATH='/unused',
+        TRAIN_FILES='/unused/train.parquet',
+        VAL_FILES='/unused/val.parquet',
+        OUTPUT_ROOT=str(tmp_path),
+        DRY_RUN='1',
+        NNODES='2',
+        NGPUS_PER_NODE='4',
+        ROLLOUT_SPEC='False',
+        ROLLOUT_SLEEP_LEVEL='1',
+        GRAD_OFFLOAD='False',
+    )
+    argv = shlex.split(subprocess.check_output(['bash', str(script)], env=env, text=True))
+    assert 'actor_rollout_ref.rollout.data_parallel_size=4' in argv
+    assert 'actor_rollout_ref.rollout.expert_parallel_size=4' in argv
+    assert (
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHMLA_SPARSE_DSV41'
+        in argv
+    )
+    assert '++ray_kwargs.ray_init.runtime_env.env_vars.VERL_MLITE_SKIP_RUNTIME_PATCHES="0"' in argv
+    for name in ('MXFP8_GEMM', 'BF16_GEMM', 'MXFP8_PREQUANT', 'MHC_OVERLAP', 'REPLAY_STAGE_LAYERS'):
+        assert any(
+            arg.startswith('++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_BI_' + name + '=')
+            for arg in argv
+        )
+    assert not any('MEGA_ATTN' in arg or 'grad_offload=' in arg for arg in argv)
+    env['ROLLOUT_SLEEP_LEVEL'] = '2'
+    rejected = subprocess.run(['bash', str(script)], env=env, capture_output=True, text=True)
+    assert rejected.returncode != 0 and 'level-2 reload not admitted' in rejected.stderr

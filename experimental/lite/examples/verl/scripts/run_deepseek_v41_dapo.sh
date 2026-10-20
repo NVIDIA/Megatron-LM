@@ -95,6 +95,7 @@ unset VLLM_BI_MEGA_ATTN VLLM_BI_MEGA_GATE VLLM_BI_MEGA_MHC
 [[ "$GRAD_OFFLOAD" =~ ^(False|false|0)$ ]] || { echo "Independent grad release is not admitted" >&2; exit 2; }
 export VLLM_BI_REPLAY_STAGE_LAYERS=2
 export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}" NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+export VERL_MLITE_SKIP_RUNTIME_PATCHES=0
 
 case "${PROMPT_MODE}" in
   chat|thinking) ;;
@@ -129,6 +130,23 @@ fi
 VLLM="actor_rollout_ref.rollout.engine_kwargs.vllm"
 CAPTURE="${CAPTURE_SIZES:-[1,2,4,8,16]}"
 REPLAY="${REPLAY_SIZES:-[1,2,4,8,16]}"
+
+# A pre-existing Ray cluster inherits its service environment, not this shell.
+# Forward the paired kernel/compatibility contract explicitly, without secrets.
+mapfile -t RUNTIME_ENV_ARGS < <(python3 -S - <<'PY'
+import json, os
+names = ('VLLM_BATCH_INVARIANT', 'VLLM_BI_MXFP8_GEMM', 'VLLM_BI_BF16_GEMM',
+         'VLLM_BI_MXFP8_PREQUANT', 'VLLM_BI_MHC_OVERLAP', 'VLLM_BI_REPLAY_STAGE_LAYERS',
+         'VERL_MLITE_SKIP_RUNTIME_PATCHES', 'VERL_MLITE_HF_CONFIG_MODEL_TYPE',
+         'VERL_MLITE_ROLLOUT_SLEEP_LEVEL', 'VERL_FULL_DETERMINISM',
+         'VLLM_BATCH_INVARIANT_KERNEL_LIB', 'CUBLAS_WORKSPACE_CONFIG')
+for name in names:
+    if name in os.environ:
+        print('++ray_kwargs.ray_init.runtime_env.env_vars.' + name + '=' + json.dumps(os.environ[name]))
+if os.environ.get('DS41_RAY_PY_EXECUTABLE'):
+    print('++ray_kwargs.ray_init.runtime_env.py_executable=' + json.dumps(os.environ['DS41_RAY_PY_EXECUTABLE']))
+PY
+)
 
 COMMAND=(
   python3 -m verl.trainer.main_ppo
@@ -263,6 +281,7 @@ COMMAND=(
   "+reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0"
   "+reward.reward_kwargs.overlong_buffer_cfg.log=False"
   "${OPTIM_ARGS[@]}"
+  "${RUNTIME_ENV_ARGS[@]}"
   "$@"
 )
 
