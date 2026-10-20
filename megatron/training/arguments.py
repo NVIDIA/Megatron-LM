@@ -941,6 +941,8 @@ def validate_args(args, defaults={}):
             '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         assert args.untie_embeddings_and_output_weights, \
             '--use-torch-fsdp2 requires --untie-embeddings-and-output-weights'
+        assert not args.fp16, \
+            '--use-torch-fsdp2 not supported with fp16 yet'
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 

@@ -606,10 +606,6 @@ class OptimizerConfig:
             assert ckpt_format == "torch", \
                 '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
-        if self.fp16:
-            assert not use_torch_fsdp2, \
-                '--use-torch-fsdp2 not supported with fp16 yet'
-
     def finalize_optimizer_config(self) -> None:
         # Map string data-type to torch.dtype.
         dtype_map = {
