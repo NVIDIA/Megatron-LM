@@ -3,6 +3,7 @@
 import inspect
 import logging
 import os
+import sys
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -537,6 +538,108 @@ class TestGPTModelWithCustomPG:
         assert logits.shape[0] == sequence_length
         assert logits.shape[1] == micro_batch_size
         assert logits.shape[2] == self.gpt_model.config.hidden_size
+
+
+def _forbid_global_tp(patch):
+    """Make the global TP accessors and the collection shim raise, including by-name imports."""
+    for name in dir(parallel_state):
+        if not name.startswith(("get_tensor_model_parallel", "get_expert_tensor_parallel")):
+            continue
+        original = getattr(parallel_state, name)
+
+        def forbid(*args, _name=name, **kwargs):
+            raise AssertionError(f"read of the global grid: parallel_state.{_name}")
+
+        for module in list(sys.modules.values()):
+            if getattr(module, "__name__", "").startswith("megatron.") and (
+                getattr(module, "__dict__", {}).get(name) is original
+            ):
+                patch.setattr(module, name, forbid)
+
+    def forbid_shim(cls, *args, **kwargs):
+        raise AssertionError("read of the global grid: use_mpu_process_groups")
+
+    patch.setattr(ProcessGroupCollection, "use_mpu_process_groups", classmethod(forbid_shim))
+
+
+class TestGPTModelPaddingMaskSequenceParallel:
+    def setup_method(self, method):
+        # The global grid has TP=1; the model gets its own TP=2 groups.
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        Utils.world_size < 2 or Utils.world_size % 2 != 0, reason="needs an even number of ranks"
+    )
+    def test_padding_mask_is_split_over_model_tp_group(self, monkeypatch):
+        """With sequence parallelism the decoder sees this rank's chunk of the padding mask."""
+        grid = HyperCommGrid([2, 1, 1, Utils.world_size // 2], ["tp", "cp", "pp", "dp"])
+        try:
+            tp_group = grid.create_pg("tp")
+            pg_collection = ProcessGroupCollection(
+                tp=tp_group,
+                cp=grid.create_pg("cp"),
+                pp=grid.create_pg("pp"),
+                # Single pipeline stage: no embedding groups and no GTP axis.
+                embd=None,
+                pos_embd=None,
+                gtp_remat=None,
+                expt_gtp_remat=None,
+            )
+            model_parallel_cuda_manual_seed(123, tp_rank=tp_group.rank())
+            config = TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                tensor_model_parallel_size=2,
+                sequence_parallel=True,
+            )
+            batch_size, sequence_length = 2, 8
+            input_ids = torch.randint(
+                0,
+                100,
+                (batch_size, sequence_length),
+                device="cuda",
+                generator=torch.Generator(device="cuda").manual_seed(0),
+            )
+            position_ids = torch.arange(sequence_length, device="cuda").repeat(batch_size, 1)
+            # True marks padding; make each sample end with a different amount of it.
+            padding_mask = torch.zeros(
+                (batch_size, sequence_length), dtype=torch.bool, device="cuda"
+            )
+            padding_mask[0, 3:] = True
+            padding_mask[1, 6:] = True
+
+            layer_inputs = {}
+            with monkeypatch.context() as patch:
+                _forbid_global_tp(patch)
+                model = GPTModel(
+                    config=config,
+                    transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                    vocab_size=100,
+                    max_sequence_length=sequence_length,
+                    pg_collection=pg_collection,
+                ).cuda()
+                model.decoder.layers[0].register_forward_pre_hook(
+                    lambda module, args, kwargs: layer_inputs.update(kwargs), with_kwargs=True
+                )
+                model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=None,
+                    padding_mask=padding_mask,
+                )
+
+            # The mask must cover the same tokens as this rank's [s/tp, b, h] hidden states.
+            chunk = sequence_length // tp_group.size()
+            start = tp_group.rank() * chunk
+            assert layer_inputs["hidden_states"].shape[0] == chunk
+            assert torch.equal(layer_inputs["padding_mask"], padding_mask[:, start : start + chunk])
+        finally:
+            grid.destroy()
 
 
 class TestGPTWithDynamicInference:
