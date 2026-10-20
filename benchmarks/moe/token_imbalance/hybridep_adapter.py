@@ -227,7 +227,7 @@ class HybridEPAdapter:
 
     def close(self):
         from megatron.core.transformer.moe import fused_a2a
-        from megatron.core.transformer.moe.moe_utils import destroy_moe_metrics_tracker
+        from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
         from megatron.core.transformer.moe.router_replay import RouterReplay
         from megatron.core.transformer.moe.virtual_expert_load_balancer import (
             VirtualExpertLoadBalancer,

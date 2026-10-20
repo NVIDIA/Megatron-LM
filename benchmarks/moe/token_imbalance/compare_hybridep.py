@@ -12,6 +12,7 @@ import json
 import os
 import socket
 import sys
+from functools import partialmethod
 from pathlib import Path
 
 import torch
@@ -66,6 +67,10 @@ def main():
 
     parallel_state.initialize_model_parallel(expert_model_parallel_size=world)
     pg = ProcessGroupCollection.use_mpu_process_groups()
+    from megatron.core.transformer.moe.fused_a2a import HybridEPBuffer
+
+    # Benchmark-only cache reuse, as in the upstream virtual-expert parity test.
+    HybridEPBuffer.__init__ = partialmethod(HybridEPBuffer.__init__, load_cached_kernels=True)
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / f"rank{rank}.jsonl"
     failed = False
@@ -92,8 +97,8 @@ def main():
                                 for name, parameter in parameters.items():
                                     parameter.copy_(initial[name])
                         # Warmup has no updates; reset all accumulated gradients each call.
-                        for iteration in range(-args.warmup, args.steps):
-                            step = max(iteration, 0)
+                        for iteration in range(-args.warmup * args.steps, args.steps):
+                            step = iteration % args.steps
                             ids, _ = routing_for_step(
                                 workload,
                                 geometry.experts,

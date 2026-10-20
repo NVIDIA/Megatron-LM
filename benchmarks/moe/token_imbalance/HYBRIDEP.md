@@ -16,7 +16,7 @@ NVTE_GROUPED_LINEAR_SINGLE_PARAM=0 torchrun --standalone --nproc_per_node=2 \
   --out results/training-step
 ```
 
-The default runs seven existing W workloads, six steps each, with two warmups per
+The default runs seven existing W workloads, six steps each, with two full route-sequence warmups per
 adapter and workload. W6 rotates after three steps; W7 includes burst and recovery.
 There is no W2 in the existing workload contract. Routes are replayed through the
 real router; learned gate scores remain differentiable. Source token counts and
@@ -27,8 +27,8 @@ Each rank writes complete per-step JSONL: logical expert/rank loads, actual rout
 and input hashes, output/gradient/parameter hashes, virtual runtime token counts,
 all-rank times and max/mean ratios. Timing covers router, forward, backward and
 optional SGD, excluding CPU evidence copies and metric reductions. The same seeds,
-inputs, initial state and route sequence are used for both backends. Warmup does
-not update weights. Gradient accumulation buffers are reset every call.
+inputs, initial state and route sequence are used for both backends. Warmup covers the full route sequence without updating weights. The runner enables
+HybridEP kernel-cache reuse, matching the upstream virtual-expert parity test. Gradient accumulation buffers are reset every call.
 
 The numerical gate is relative L2 <= 0.01 and peak-normalized absolute error <=
 0.05 for every output, input/probability/parameter gradient and updated parameter.
