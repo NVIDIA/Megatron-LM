@@ -2533,8 +2533,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
             if self.moe_shared_expert_intermediate_size is None:
                 raise ValueError("MOK requires a shared expert")
-            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
-                raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
+            if self.moe_shared_expert_overlap:
+                raise ValueError("MOK does not support MCore shared-expert overlap")
             if self.moe_latent_size is not None:
                 # Native latent MoE projects only the routed branch; its shared expert
                 # stays in the original hidden space. MOK currently fuses both branches.

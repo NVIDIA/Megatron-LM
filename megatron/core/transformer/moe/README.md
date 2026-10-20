@@ -614,17 +614,16 @@ The equivalent backend-specific CLI value is a JSON object:
 
 MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
 image already installs the supported
-[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/a2ad2d0ce2366c1817d15498cdbaf8ead5966117)
-through `docker/common/install_mok.sh`, including the compatibility patch in
-`docker/patches/mok.patch`. Use that image or its installation helper rather than an unpatched
-source installation. The AMD64 image skips MOK because its H100 target is unsupported.
-The pinned API does not provide the optional shared-expert output gate used by newer MOK versions.
+[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
+through `docker/common/install_mok.sh`. Use that image or its installation helper to retain the
+supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
+target is unsupported.
 
 | Area | Current MOK support |
 |------|---------------------|
 | GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
 | Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
-| Shared experts | Required; BF16; same intermediate size as routed experts |
+| Shared experts | Required; BF16; same intermediate size as routed experts; optional BF16 sigmoid output gate via `moe_shared_expert_gate` |
 | Activation | SwiGLU, without a linear offset or tanh clamp |
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
 | Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
@@ -637,6 +636,9 @@ Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the re
 precision: FP32 retains FP32 contributions, while BF16 rounds each contribution before adding it
 to the BF16 gradient buffer. This is independent of the BF16 shared-expert weight dtype.
 The pinned MOK entrypoint requires shared and routed expert main-grad buffers to use the same dtype.
+The optional shared output gate aliases the native shared-expert parameter and accumulates into
+its FP32 or BF16 `main_grad`. It supports Qwen3.5's gated shared-expert MoE without changing native
+parameter ownership or checkpoint keys; the GDN and attention layers retain their existing paths.
 
 With `reuse_grad_buf_for_mxfp8_param_ag`, MCore completes parameter all-gather, requantizes into
 native TE storage, and clears the staging buffer before MOK runs. Single-grouped MXFP8 parameters
@@ -650,7 +652,7 @@ static input token counts alone do not establish that lifecycle.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
-wgrad, native shared-expert overlap/gating, shared-expert-only
+wgrad, native shared-expert overlap, shared-expert-only
 recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
 partial MoE CUDA Graph replay, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import MethodType, SimpleNamespace
+import sys
+from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -372,12 +373,13 @@ def test_mxfp8_split_scale_and_descriptor_cache_refreshes_per_iteration(monkeypa
     assert [call[-1] for call in view_calls] == [None, None, first[0], first[1]]
 
 
-def _shared_module(fc1_weight, fc2_weight):
+def _shared_module(fc1_weight, fc2_weight, gate_weight=None):
     shared = torch.nn.Module()
     shared.linear_fc1 = torch.nn.Module()
     shared.linear_fc2 = torch.nn.Module()
     shared.linear_fc1.register_parameter("weight", fc1_weight)
     shared.linear_fc2.register_parameter("weight", fc2_weight)
+    shared.register_parameter("gate_weight", gate_weight)
     return shared
 
 
@@ -394,8 +396,8 @@ def test_register_shared_weights_rejects_non_bf16_parameters():
         module._register_shared_weights(shared)
 
 
-@pytest.mark.parametrize("single_grouped", [False, True])
-def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
+@pytest.mark.parametrize("single_grouped,gated", [(False, False), (True, False), (False, True)])
+def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped, gated):
     experts = torch.nn.Module()
     experts.linear_fc1 = torch.nn.Module()
     experts.linear_fc2 = torch.nn.Module()
@@ -418,13 +420,16 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
             "experts.linear_fc2.weight0": torch.full_like(routed_fc2, 5.0),
         }
 
-    shared_fc1 = torch.nn.Parameter(torch.zeros((8, 8)))
-    shared_fc2 = torch.nn.Parameter(torch.zeros((8, 4)))
-    shared = _shared_module(shared_fc1, shared_fc2)
+    shared_fc1 = torch.nn.Parameter(torch.zeros((8, 8), dtype=torch.bfloat16))
+    shared_fc2 = torch.nn.Parameter(torch.zeros((8, 4), dtype=torch.bfloat16))
+    gate_weight = torch.nn.Parameter(torch.zeros((1, 8), dtype=torch.bfloat16)) if gated else None
+    shared = _shared_module(shared_fc1, shared_fc2, gate_weight)
 
     mok = mok_backend.MoKMegakernel.__new__(mok_backend.MoKMegakernel)
     torch.nn.Module.__init__(mok)
     mok.native_single_grouped_weights = single_grouped
+    mok.intermediate_size = 4
+    mok.hidden_size = 8
     mok._routed_weight_view_cache = object()
     mok._split_main_grad_descriptor_cache = object()
     mok.is_first_microbatch = False
@@ -436,8 +441,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
         mok._routed_fc2_parameter_names = ("routed_fc2_weight0",)
         mok.register_parameter("routed_fc1_weight0", routed_fc1)
         mok.register_parameter("routed_fc2_weight0", routed_fc2)
-    mok.register_parameter("shared_fc1_weight", shared_fc1)
-    mok.register_parameter("shared_fc2_weight", shared_fc2)
+    mok._register_shared_weights(shared, use_output_gate=gated)
 
     parent = torch.nn.Module()
     parent.add_module("experts", experts)
@@ -445,6 +449,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
     parent.add_module("megakernel_experts", mok)
     checkpoint = {
         **routed_checkpoint,
+        **({"shared_experts.gate_weight": torch.full_like(gate_weight, 13.0)} if gated else {}),
         "shared_experts.linear_fc1.weight": torch.full_like(shared_fc1, 7.0),
         "shared_experts.linear_fc2.weight": torch.full_like(shared_fc2, 11.0),
     }
@@ -452,6 +457,7 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
     assert set(parent.state_dict()) == set(checkpoint)
     assert list(dict(parent.named_parameters())) == list(checkpoint)
     assert len(list(parent.parameters())) == len(checkpoint)
+    assert mok.shared_output_gate_weight is gate_weight
     assert mok.sharded_state_dict(prefix="megakernel_experts.") == {}
     parent.load_state_dict(checkpoint, strict=True)
 
@@ -459,6 +465,86 @@ def test_checkpoint_uses_only_canonical_mcore_parameters(single_grouped):
     torch.testing.assert_close(routed_fc2, tuple(routed_checkpoint.values())[1])
     torch.testing.assert_close(shared_fc1, checkpoint["shared_experts.linear_fc1.weight"])
     torch.testing.assert_close(shared_fc2, checkpoint["shared_experts.linear_fc2.weight"])
+    if gated:
+        torch.testing.assert_close(gate_weight, checkpoint["shared_experts.gate_weight"])
+        assert mok.shared_output_gate_weight is shared.gate_weight
     assert mok._routed_weight_view_cache is None
     assert mok._split_main_grad_descriptor_cache is None
     assert mok.is_first_microbatch
+
+
+@pytest.mark.parametrize(
+    "gated,main_grad_dtype", [(True, torch.float32), (True, torch.bfloat16), (False, torch.float32)]
+)
+def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, main_grad_dtype):
+    module = _split_module(use_mxfp8_weights=False)
+    gate = torch.nn.Parameter(torch.full((1, 8), 3.0, dtype=torch.bfloat16)) if gated else None
+    shared = _shared_module(
+        torch.nn.Parameter(torch.zeros((8, 8), dtype=torch.bfloat16)),
+        torch.nn.Parameter(torch.zeros((8, 4), dtype=torch.bfloat16)),
+        gate,
+    )
+    module._register_shared_weights(shared, use_output_gate=gated)
+    module.mok_config = module.ep_group = object()
+    module._split_main_grad_descriptor_cache = None
+    module.num_local_experts = module.topk = 2
+    module.swiglu_limit = None
+    parameters = tuple(module.parameters())
+    for parameter in parameters:
+        parameter.main_grad = torch.zeros_like(parameter, dtype=main_grad_dtype)
+    functional = ModuleType("mok.functional")
+    package = ModuleType("mok")
+    package.functional = functional
+    package.ops = SimpleNamespace(make_routed_d_weight_storage_table=lambda _: object())
+    monkeypatch.setitem(sys.modules, "mok", package)
+    monkeypatch.setitem(sys.modules, "mok.functional", functional)
+    functional.get_workspace = functional.build_schedule = lambda *args, **kwargs: object()
+    monkeypatch.setattr(
+        module,
+        "quantized_routed_weights",
+        lambda: (module.routed_fc1_parameters[0], module.routed_fc2_parameters[0]),
+    )
+
+    def forward(*args, **kwargs):
+        assert kwargs.get("shared_output_gate_weight") is gate
+        assert ("shared_output_gate_weight" in kwargs) == gated
+        return args[3].clone(), object()
+
+    def backward(*args, **kwargs):
+        assert kwargs.get("shared_output_gate_weight") is gate
+        if gated:
+            assert kwargs["shared_output_gate_main_grad"] is gate.main_grad
+            gate.main_grad.add_(0.25)
+        else:
+            assert "shared_output_gate_main_grad" not in kwargs
+        return torch.ones_like(args[5]), torch.ones_like(args[6])
+
+    functional.forward, functional.backward = forward, backward
+    x = torch.zeros((4, 8), dtype=torch.bfloat16, requires_grad=True)
+    probs = torch.zeros((4, 2), requires_grad=True)
+    experts = torch.zeros((4, 2), dtype=torch.int32)
+    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+    # MCore DDP consumes the hook-only sentinel and clears .grad; numerical
+    # gradients must remain in the original main_grad buffer across microbatches.
+    handles = [
+        parameter.register_post_accumulate_grad_hook(lambda param: setattr(param, "grad", None))
+        for parameter in parameters
+    ]
+    try:
+        for microbatch in range(3):
+            if gated and microbatch == 2:
+                gate.main_grad.zero_()
+            x.grad = probs.grad = None
+            module(x, probs, experts).backward(torch.ones_like(x))
+            torch.testing.assert_close(x.grad, torch.ones_like(x))
+            torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+            assert all(param.grad is None and param.grad_added_to_main_grad for param in parameters)
+            if gated:
+                expected = 0.25 if microbatch == 2 else 0.25 * (microbatch + 1)
+                torch.testing.assert_close(
+                    gate.main_grad, torch.full_like(gate.main_grad, expected)
+                )
+                torch.testing.assert_close(gate, torch.full_like(gate, 3.0))
+    finally:
+        for handle in handles:
+            handle.remove()
