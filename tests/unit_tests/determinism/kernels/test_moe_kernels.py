@@ -739,8 +739,9 @@ def test_group_limited_topk_replays():
     ],
 )
 @pytest.mark.parametrize("all_padding", [False, True])
-@pytest.mark.parametrize("deterministic_source", ["explicit", "torch"])
-def test_switch_load_balancing_loss_replays(fused, all_padding, deterministic_source):
+@pytest.mark.parametrize("torch_enabled", [False, True])
+def test_switch_load_balancing_loss_replays(fused, all_padding, torch_enabled):
+    """An explicit deterministic request replays with either PyTorch global setting."""
     seeded()
     routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
     if all_padding:
@@ -759,17 +760,17 @@ def test_switch_load_balancing_loss_replays(fused, all_padding, deterministic_so
             256,
             1e-2,
             fused=fused,
-            deterministic=deterministic_source == "explicit",
+            deterministic=True,
         )
 
-    with deterministic_algorithms(deterministic_source == "torch"):
+    with deterministic_algorithms(torch_enabled):
         assert_replays_bit_exact(
             fn,
             (probs,),
             replays=4,
             contention=True,
             what=f"aux loss[fused={fused}, all_padding={all_padding}, "
-            f"deterministic={deterministic_source}]",
+            f"torch_deterministic={torch_enabled}]",
         )
 
 
@@ -779,7 +780,7 @@ def test_switch_load_balancing_loss_replays(fused, all_padding, deterministic_so
     reason="Negative control: floating-point atomic accumulation may repeat on some hardware.",
 )
 def test_default_fused_aux_loss_is_the_racy_path():
-    """The default atomic branch remains non-deterministic when neither policy requests it."""
+    """The default atomic branch remains non-deterministic without an explicit request."""
     seeded()
     routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
     tokens_per_expert = routing_map.sum(dim=0)
