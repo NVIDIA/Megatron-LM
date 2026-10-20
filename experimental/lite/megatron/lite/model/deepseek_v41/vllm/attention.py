@@ -57,6 +57,11 @@ class _QueryInputs(torch.autograd.Function):
 class _SWAInsert(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, positions, cache, eps):
+        ctx.empty = q.shape[0] == 0
+        if ctx.empty:
+            if kv.shape[0] != 0:
+                raise ValueError('Empty SWA queries require empty KV rows')
+            return q.clone(), kv.clone()
         from vllm.models.deepseek_v41.common.ops.cache_utils import dequantize_and_gather_k_cache
 
         rows, heads, dim = q.shape
@@ -89,6 +94,8 @@ class _SWAInsert(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dq, dkv):
+        if ctx.empty:
+            return dq, dkv, None, None, None
         positions, cache = ctx.saved_tensors
         return (
             _rotate(dq, positions, cache, True),

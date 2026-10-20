@@ -178,38 +178,6 @@ class DeepseekV41Model(MegatronModule):
         head.weight.is_embedding_or_output_parameter = True
         return norm, head
 
-    def module_inventory(self):
-        rows = []
-        for key, block in self.layers.items():
-            index = int(key)
-            source = block.attention.core_attention
-            policy = self.context.policies[index]
-            ratio = source.ratio
-            kv_owner = ratio > 0 and policy.kv == index
-            index_owner = ratio > 0 and policy.index == index
-            if ratio == 0:
-                assert source.native.compressor is None and source.native.indexer is None
-            elif ratio == 2:
-                assert source.native.compressor is not None and source.native.indexer is not None
-                assert bool(list(source.native.compressor.parameters())) == kv_owner
-                assert (source.native.indexer.linear_wq_b.linear is not None) == index_owner
-            else:
-                assert hasattr(source, "main_projection") == kv_owner
-                assert hasattr(source, "index_key") == kv_owner
-                assert (source.index_q.linear is not None) == index_owner
-            rows.append(
-                dict(
-                    layer=index,
-                    ratio=ratio,
-                    kv_owner=policy.kv,
-                    index_owner=policy.index,
-                    owns_kv=kv_owner,
-                    owns_index=index_owner,
-                    candidate=policy.candidate,
-                )
-            )
-        return rows
-
     def set_input_tensor(self, value):
         self._input_tensor = value[0] if isinstance(value, (tuple, list)) else value
 

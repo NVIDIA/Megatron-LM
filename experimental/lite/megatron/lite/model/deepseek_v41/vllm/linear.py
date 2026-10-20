@@ -109,20 +109,3 @@ def linear(x, weight, *, fp8, activation=None):
     if activation is not None:
         raise ValueError("BF16 linear cannot consume MXFP8 prequant")
     return _BF16Linear.apply(x, weight)
-
-
-# Inherit Core's allocation/parameter metadata; replace only its local TP1 GEMM.
-from megatron.core.extensions.transformer_engine import TELinear
-
-
-class BF16Linear(TELinear):
-    fp8 = False
-
-    def forward(self, x, weight=None, **kwargs):
-        if self.bias is not None:
-            raise ValueError('DS4.1 BI projections do not support bias')
-        return linear(x, self.weight if weight is None else weight, fp8=self.fp8), None
-
-
-class MXFP8Linear(BF16Linear):
-    fp8 = True

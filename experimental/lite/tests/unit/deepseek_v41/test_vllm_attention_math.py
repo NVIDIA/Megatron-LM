@@ -2,7 +2,30 @@
 """CPU adjoint check for the owned rotary VJP; no deployment forward claim."""
 import torch
 
-from megatron.lite.model.deepseek_v41.vllm.attention import _rotate
+from megatron.lite.model.deepseek_v41.vllm.attention import _rotate, _SWAInsert
+
+
+def test_zero_row_swa_has_empty_finite_gradients_without_importing_vllm(monkeypatch):
+    import builtins
+
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name == 'vllm' or name.startswith('vllm.'):
+            raise AssertionError('Empty SWA must not import or launch vLLM kernels')
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    q = torch.empty(0, 72, 512, dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.empty(0, 512, dtype=torch.bfloat16, requires_grad=True)
+    output, decoded = _SWAInsert.apply(
+        q, kv, torch.empty(0, dtype=torch.int64), torch.empty(1, 64), 1e-6
+    )
+    assert output.shape == q.shape and decoded.shape == kv.shape
+    assert output.dtype == decoded.dtype == torch.bfloat16
+    (output.float().sum() + decoded.float().sum()).backward()
+    assert q.grad is not None and q.grad.shape == q.shape and torch.isfinite(q.grad).all()
+    assert kv.grad is not None and kv.grad.shape == kv.shape and torch.isfinite(kv.grad).all()
 
 
 def test_rotary_vjp_is_transpose_for_query_and_shared_kv():
