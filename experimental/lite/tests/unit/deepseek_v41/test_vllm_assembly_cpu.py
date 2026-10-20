@@ -66,3 +66,33 @@ def test_deployment_keeps_native_pipeline_and_explicit_output_boundary():
         inspect.signature(DeepseekV41Model.forward).parameters['labels'].kind
         is inspect.Parameter.KEYWORD_ONLY
     )
+
+
+def test_native_hf_construction_recovers_release_token_map(tmp_path):
+    from unittest.mock import Mock
+
+    impl = protocol.ImplConfig(hf_path=str(tmp_path))
+    model_cfg = SimpleNamespace(engram_layer_ids=[1])
+    native_build = Mock(return_value=object())
+    with patch.object(protocol, "release_token_map", return_value=[2, 0, 1]) as recover:
+        with patch.object(native, "build_model", native_build):
+            protocol.build_model(model_cfg, impl_cfg=impl)
+            recovered = native_build.call_args.kwargs["impl_cfg"]
+            assert recovered.token_map == [2, 0, 1]
+            assert impl.token_map is None
+            recover.assert_called_once_with(str(tmp_path))
+            recover.reset_mock()
+            (tmp_path / "token_map.pt").write_bytes(b"existence-only: native loader owns bytes")
+            protocol.build_model(model_cfg, impl_cfg=impl)
+            assert native_build.call_args.kwargs["impl_cfg"] is impl
+            recover.assert_not_called()
+
+
+def test_native_hf_construction_keeps_explicit_token_map(tmp_path):
+    from unittest.mock import Mock
+
+    impl = protocol.ImplConfig(hf_path=str(tmp_path), token_map=[1, 0])
+    with patch.object(protocol, "release_token_map", side_effect=AssertionError("recomputed")):
+        with patch.object(native, "build_model", Mock()) as build:
+            protocol.build_model(SimpleNamespace(engram_layer_ids=[1]), impl_cfg=impl)
+            assert build.call_args.kwargs["impl_cfg"] is impl
