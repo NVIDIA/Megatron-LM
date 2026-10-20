@@ -688,7 +688,7 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     x = torch.full((1, 1), float(rank + 1), device=device)
     with microbatch(context, is_last=False):
         model(x).sum().backward()
-        model(x).sum().backward()
+    model(x).sum().backward()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()

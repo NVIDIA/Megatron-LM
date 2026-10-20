@@ -183,7 +183,7 @@ if __name__ == "__main__":
     check_arguments(args)
     cfg = modelopt_inference_config_from_args(args, disable_moe_grouped_gemm=True)
     set_run_config(cfg)
-    initialize_megatron(training=True)
+    initialize_megatron(training=False)
 
     args = get_args()
 

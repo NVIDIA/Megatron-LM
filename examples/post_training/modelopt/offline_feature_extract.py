@@ -55,7 +55,7 @@ if __name__ == "__main__":
     # migrated settings use config; remaining settings still use legacy args.
     cfg = modelopt_inference_config_from_args(args)
     set_run_config(cfg)
-    initialize_megatron(training=True)
+    initialize_megatron(training=False)
 
     args = get_args()
     tokenizer = get_tokenizer()

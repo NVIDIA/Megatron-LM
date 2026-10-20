@@ -72,7 +72,7 @@ if __name__ == "__main__":
     args.use_cpu_initialization = True
     cfg = modelopt_inference_config_from_args(args)
     set_run_config(cfg)
-    initialize_megatron(training=True)
+    initialize_megatron(training=False)
 
     args = get_args()
 

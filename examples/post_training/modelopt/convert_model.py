@@ -105,7 +105,7 @@ if __name__ == "__main__":
     cfg = modelopt_inference_config_from_args(args)
     configure_moe_grouped_gemm(args, cfg)
     set_run_config(cfg)
-    initialize_megatron(training=True)
+    initialize_megatron(training=False)
 
     args = get_args()
 

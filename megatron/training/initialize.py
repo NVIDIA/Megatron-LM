@@ -234,9 +234,7 @@ def initialize_megatron(
             _initialize_tp_communicators(
                 transformer_config,
                 sequence_length=sequence_length,
-                micro_batch_size=(
-                    cfg.train.micro_batch_size if hasattr(cfg, "train") else args.micro_batch_size
-                ),
+                micro_batch_size=cfg.train.micro_batch_size,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )
 
@@ -600,6 +598,7 @@ def set_jit_fusion_options(tp_size=None):
 
 def _warmup_jit_function(tp_size=None):
     """Compilie JIT functions before the main training steps"""
+    cfg = get_run_config()
     args = get_args()
     if args.bf16:
         dtype = torch.bfloat16
@@ -649,7 +648,7 @@ def _warmup_jit_function(tp_size=None):
     input = torch.rand(
         (
             args.seq_length // args.context_parallel_size,
-            args.micro_batch_size,
+            cfg.train.micro_batch_size,
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
         dtype=dtype,
@@ -693,12 +692,12 @@ def _warmup_jit_function(tp_size=None):
     else:
         seq_length = args.seq_length
     input = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )
     residual = torch.rand(
-        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
         dtype=dtype,
         device="cuda",
     )
