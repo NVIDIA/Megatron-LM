@@ -11,11 +11,11 @@
 
 Deterministic training guarantees that two runs with identical inputs produce identical outputs at every step. Useful for debugging regressions and for reproducibility studies.
 
-Pass `--deterministic-mode` to any Megatron training entry point (e.g. `pretrain_hybrid.py`):
+Deterministic mode is on by default in Megatron-LM. Pass `--disable-deterministic-mode` to any Megatron training entry point to disable deterministic mode (e.g. `pretrain_hybrid.py`):
 
 ```bash
 python pretrain_hybrid.py \
-  --deterministic-mode \
+  --disable-deterministic-mode \
   <other args ...>
 ```
 
