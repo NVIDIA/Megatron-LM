@@ -153,7 +153,7 @@ class TestApplyRotaryPosEmbTHD:
         with (
             patch.object(rope_utils_module, "fused_apply_rotary_pos_emb", sbhd_mock),
             patch.object(rope_utils_module, "fused_apply_rotary_pos_emb_thd", thd_mock),
-            pytest.warns(UserWarning, match="per-token RoPE frequencies"),
+            patch.object(rope_utils_module, "warn_single_rank") as warn_mock,
         ):
             output = apply_rotary_pos_emb(
                 t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group, max_seqlen=4
@@ -161,6 +161,10 @@ class TestApplyRotaryPosEmbTHD:
 
         sbhd_mock.assert_not_called()
         thd_mock.assert_not_called()
+        warn_mock.assert_called_once_with(
+            "apply_rope_fusion supports per-token RoPE frequencies only with one row per "
+            "token and no context parallelism. Using unfused implementation."
+        )
         torch.testing.assert_close(output, expected)
 
     def test_fused_max_seqlen_freqs_use_thd_kernel(self):

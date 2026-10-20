@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import warn_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -402,7 +403,7 @@ def apply_rotary_pos_emb(
                     return fused_apply_rotary_pos_emb(
                         t.unsqueeze(1), freqs, interleaved=config.rotary_interleaved
                     ).squeeze(1)
-                warnings.warn(
+                warn_single_rank(
                     "apply_rope_fusion supports per-token RoPE frequencies only with one row per "
                     "token and no context parallelism. Using unfused implementation."
                 )
