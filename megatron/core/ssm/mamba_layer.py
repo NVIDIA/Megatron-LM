@@ -168,7 +168,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     ) -> tuple[ResidualBranchInput, ResidualStreamRecomputeContext | None]:
         """Prepare the ordinary branch and its saved residual for the shared schedule.
 
-        Subclasses choose their own local write state and replay policy. Ordinary Mamba
+        Subclasses choose their own local state and replay policy. Ordinary Mamba
         does not register residual-stream checkpoints, even when a context is supplied.
         """
 
@@ -179,17 +179,17 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     def _apply_mixer_update(
         self,
         mixer_out_with_bias,
-        write_state: Any,
+        state: Any,
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor:
         """Complete the ordinary mixer update using its saved residual."""
 
-        return self._apply_mixer_bda(mixer_out_with_bias, write_state)
+        return self._apply_mixer_bda(mixer_out_with_bias, state)
 
-    def _pack_two_stage_output(self, ssm_output: Tensor, write_state: Any) -> tuple:
+    def _pack_two_stage_output(self, ssm_output: Tensor, state: Any) -> tuple:
         """Keep the ordinary two-stage API's ``(ssm_output, residual)`` result."""
 
-        return ssm_output, write_state
+        return ssm_output, state
 
     def forward_pre_attn_and_core_attn(
         self,
@@ -232,7 +232,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             packed_seq_params=packed_seq_params,
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
-        return self._pack_two_stage_output(ssm_output, prepared.write_state)
+        return self._pack_two_stage_output(ssm_output, prepared.state)
 
     def forward_post_core_attn(
         self,
@@ -318,7 +318,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
                     )
 
             hidden_states = self._apply_mixer_update(
-                mixer_out_with_bias, prepared.write_state, recompute_context=recompute_context
+                mixer_out_with_bias, prepared.state, recompute_context=recompute_context
             )
 
             return hidden_states

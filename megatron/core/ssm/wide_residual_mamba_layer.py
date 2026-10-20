@@ -124,18 +124,18 @@ class WideResidualMambaLayer(MambaLayer):
     def _apply_mixer_update(
         self,
         mixer_out_with_bias,
-        write_state: ResidualConnectionState,
+        state: ResidualConnectionState,
         recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor:
         """Write the mixer update, replaying only nonterminal residual writes."""
 
-        if write_state is None:
+        if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
         if recompute_context is not None and not recompute_context.is_block_end:
             return checkpoint_residual_write(
                 self.residual_write,
                 mixer_out_with_bias,
-                write_state,
+                state,
                 recompute_context,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
@@ -143,17 +143,17 @@ class WideResidualMambaLayer(MambaLayer):
         with self.bias_dropout_add_exec_handler():
             return apply_module(self.residual_write)(
                 mixer_out_with_bias,
-                state=write_state,
+                state=state,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
             )
 
     def _pack_two_stage_output(
-        self, ssm_output: Tensor, write_state: ResidualConnectionState
+        self, ssm_output: Tensor, state: ResidualConnectionState
     ) -> tuple[Tensor, Tensor, ResidualConnectionState]:
         """Keep WR's existing two-stage tuple for ShortcutMoE callers."""
 
-        return ssm_output, write_state[0], write_state
+        return ssm_output, state[0], state
 
     def forward_post_core_attn(
         self,

@@ -166,11 +166,11 @@ def test_parent_eager_parity(wide, fp32, mode, backward_hooks):
 def test_prepared_result_is_immutable_and_does_not_impose_state_layout():
     branch = torch.randn(2, 8, requires_grad=True)
     for state in (None, branch, (branch,), SimpleNamespace(residual=None)):
-        result = ResidualBranchInput(branch, state)
+        result = ResidualBranchInput(branch_input=branch, state=state)
         assert result.branch_input is branch
-        assert result.write_state is state
+        assert result.state is state
         with pytest.raises(AttributeError):
-            result.write_state = None
+            result.state = None
 
 
 @pytest.mark.parametrize("two_stage", [False, True], ids=["normal", "two_stage"])
@@ -185,11 +185,11 @@ def test_shared_schedule_keeps_state_opaque_and_call_local(monkeypatch, two_stag
         contexts.append(state)
         return ResidualBranchInput(value, state), None
 
-    def update(output, write_state, recompute_context=None):
+    def update(output, state, recompute_context=None):
         assert recompute_context is None
-        assert any(write_state is context for context in contexts)
-        updates.append(write_state)
-        return output[0] + write_state.residual
+        assert any(state is context for context in contexts)
+        updates.append(state)
+        return output[0] + state.residual
 
     monkeypatch.setattr(layer, "_prepare_mixer_state", prepare)
     monkeypatch.setattr(layer, "_apply_mixer_update", update)
@@ -305,9 +305,7 @@ def test_replay_selection_stays_in_layer_binding(wide, is_block_end):
     value = torch.randn(2, 1, 24 if wide else 8, requires_grad=True)
     prepared, active_context = layer._prepare_mixer_state(value, context)
     assert active_context is (context if wide else None)
-    layer._apply_mixer_update(
-        layer.mixer(prepared.branch_input), prepared.write_state, active_context
-    )
+    layer._apply_mixer_update(layer.mixer(prepared.branch_input), prepared.state, active_context)
     assert len(context.calls) == (2 + (not is_block_end) if wide else 0)
     if wide:
         assert context.calls[0] == "run_read"
@@ -320,7 +318,7 @@ def test_wr_registration_and_legacy_load_are_unchanged():
     before = [(name, id(param)) for name, param in layer.named_parameters()]
     expected = {name: value.detach().clone() for name, value in layer.state_dict().items()}
     prepared, _ = layer._prepare_mixer_state(torch.randn(2, 1, 24))
-    layer._apply_mixer_update(layer.mixer(prepared.branch_input), prepared.write_state)
+    layer._apply_mixer_update(layer.mixer(prepared.branch_input), prepared.state)
     assert [(name, id(param)) for name, param in layer.named_parameters()] == before
     assert not isinstance(prepared, nn.Module)
     assert not set(map(id, layer.residual_read.parameters())) & set(
