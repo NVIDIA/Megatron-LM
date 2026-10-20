@@ -8,7 +8,6 @@ from typing import Any, cast
 
 import torch
 from torch.distributed.tensor import DTensor
-from torch.optim.optimizer import ParamsT
 
 try:
     import emerging_optimizers  # pylint: disable=unused-import
@@ -67,37 +66,27 @@ class FsdpMuon(Muon):
     ranks must agree on which parameters have gradients. Parameter membership and
     optimizer-group order must remain fixed after construction.
 
-    Non-2D parameters are skipped. Use a separate optimizer for them and for matrices
-    you exclude from Muon, such as embeddings and output projections. This optimizer
-    refreshes its FSDP model weights itself, so it does not need
-    ``fully_shard_optimizer``. Quantized buffers and tensor parallelism are unsupported.
-    Weight decay is deferred: this custom step does not call EO's weight-decay
-    implementation, and FSDP does not apply it elsewhere. It must therefore be zero.
+    This optimizer refreshes its FSDP model weights itself, so it does not need
+    ``fully_shard_optimizer``.
     Momentum is initialized lazily as DTensors in the standard optimizer state.
-    MCore's optimizer and distributed-checkpoint adapter is a separate integration.
+
+    Limitations:
+        - Non-2D parameters are skipped. Use a separate optimizer for them and for
+          matrices you exclude from Muon, such as embeddings and output projections.
+        - Tensor parallelism is unsupported.
 
     Args:
-        params: FSDP-sharded parameters or optimizer parameter-group dictionaries.
-        lr: Learning rate.
-        momentum: Momentum coefficient.
-        weight_decay: Must be zero, including in optimizer parameter-group dictionaries.
-        **kwargs: Remaining keyword options accepted by EO's ``Muon``, such as ``nesterov``.
+        *args: Positional arguments passed unchanged to EO's ``Muon``.
+        **kwargs: Keyword arguments passed unchanged to EO's ``Muon``.
     """
 
     _fsdp_group_assignments: list[_FsdpGroupAssignment]
 
-    def __init__(
-        self,
-        params: ParamsT,
-        lr: float = 3e-4,
-        momentum: float = 0.95,
-        weight_decay: float = 0.0,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay, **kwargs)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
 
         # Preserve discovery order: communication must be posted identically on every rank.
-        fsdp_groups: list[FsdpParameterGroup] = []
+        fsdp_groups: dict[FsdpParameterGroup, None] = {}
         param_to_optimizer_group_index: dict[torch.nn.Parameter, int] = {}
         for group_index, group in enumerate(self.param_groups):
             for param in group["params"]:
@@ -107,8 +96,7 @@ class FsdpMuon(Muon):
                 fsdp_group: FsdpParameterGroup | None = get_containing_parameter_group(param)
                 if fsdp_group is None:
                     raise ValueError("FsdpMuon requires parameters sharded by MFSDP v2.")
-                if fsdp_group not in fsdp_groups:
-                    fsdp_groups.append(fsdp_group)
+                fsdp_groups[fsdp_group] = None
                 param_to_optimizer_group_index[param] = group_index
         self._fsdp_group_assignments = []
         for fsdp_group, tensor_to_owner_rank in zip(
@@ -129,26 +117,19 @@ class FsdpMuon(Muon):
 
     def _validate_parameter_groups(self) -> None:
         """Validate optimizer parameters and the FSDP buffers that contain them."""
-        for group in self.param_groups:
-            if group["weight_decay"] != 0:
-                raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             if fsdp_group.mesh.ndim != 1:
                 raise NotImplementedError("FsdpMuon requires a one-dimensional DP mesh.")
-            for buffer in (fsdp_group.main_weight, fsdp_group.main_grad, fsdp_group.model_weight):
+            for buffer in (fsdp_group.main_weight, fsdp_group.main_grad):
                 if not isinstance(buffer, DBuffer):
-                    raise ValueError("FsdpMuon requires non-quantized buffers.")
+                    raise ValueError("FsdpMuon requires non-quantized main weights and gradients.")
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> None:
         """Update sharded parameters and refresh their model weights."""
         if closure is not None:
             raise ValueError("closure is not supported")
-
-        for group in self.param_groups:
-            if group["weight_decay"] != 0:
-                raise NotImplementedError("FsdpMuon does not support nonzero weight decay yet.")
 
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
@@ -202,7 +183,7 @@ class FsdpMuon(Muon):
     def _compute_momentum_inputs(
         self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
     ) -> DBuffer:
-        """Update sharded momentum and build the inputs for orthogonalization."""
+        """Apply local weight decay, update momentum, and build inputs for orthogonalization."""
         buffer: DBuffer = fsdp_group.main_weight
         momentum_inputs: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
@@ -217,6 +198,22 @@ class FsdpMuon(Muon):
             local_input: torch.Tensor = momentum_inputs.get_tensor_view(i)
             momentum: torch.Tensor = state["momentum_buffer"].to_local()
             grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
+            # Match EO's decay before momentum without calling its private helper.
+            weight_decay: float = group["weight_decay"]
+            if weight_decay != 0:
+                weight: torch.Tensor = param.to_local()
+                lr: float = group["lr"]
+                match self.weight_decay_method:
+                    case "decoupled":
+                        weight.add_(weight, alpha=-(weight_decay * lr))
+                    case "independent":
+                        weight.add_(weight, alpha=-weight_decay)
+                    case "l2":
+                        grad.add_(weight, alpha=weight_decay)
+                    case "palm":
+                        weight.add_(weight, alpha=-(weight_decay * lr * lr))
+                    case _:
+                        raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
             # EO's OrthogonalizedOptimizer.step implements momentum inline, without a helper.
             momentum.lerp_(grad, 1 - group["momentum"])
             update: torch.Tensor = (

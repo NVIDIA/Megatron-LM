@@ -68,6 +68,7 @@ def _parameter_groups(params):
             "params": [params["block1.2.weight"], params["block2.2.weight"]],
             "lr": 0.02,
             "momentum": 0.8,
+            "weight_decay": 0.0,
         },
     ]
 
@@ -85,6 +86,7 @@ def _reference_shard(param, full):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize(
     "nesterov,kernel_options",
     [
@@ -101,7 +103,9 @@ def _reference_shard(param, full):
         ),
     ],
 )
-def test_muon_matches_reference(distributed_setup, monkeypatch, dtype, nesterov, kernel_options):
+def test_muon_matches_reference(
+    distributed_setup, monkeypatch, dtype, weight_decay_method, nesterov, kernel_options
+):
     """Match weights and momentum over steps, including a checkpoint round trip."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
@@ -120,7 +124,9 @@ def test_muon_matches_reference(distributed_setup, monkeypatch, dtype, nesterov,
         fully_shard(model.block1, mesh=mesh, placements=_placements())
         fully_shard(model.block2, mesh=mesh, placements=_placements())
     params = dict(model.named_parameters())
-    kwargs = dict(momentum=0.9, nesterov=nesterov, **kernel_options)
+    kwargs = dict(
+        momentum=0.9, nesterov=nesterov, weight_decay_method=weight_decay_method, **kernel_options
+    )
     owner_assignment_calls = []
     assign_owner_work = muon.assign_owner_work
 
@@ -137,7 +143,7 @@ def test_muon_matches_reference(distributed_setup, monkeypatch, dtype, nesterov,
     reference_groups = _parameter_groups(reference_params)
     for group in reference_groups:
         group["params"] = [param for param in group["params"] if param.ndim == 2]
-    reference_optimizer = Muon(reference_groups, weight_decay=0.0, **kwargs)
+    reference_optimizer = Muon(reference_groups, **kwargs)
     excluded_names = ["block2.3.weight", "block2.3.bias"]
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
