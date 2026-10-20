@@ -431,6 +431,7 @@ class OptimizerConfig:
         virtual_pipeline_model_parallel_size: int | None,
         ckpt_format: str | None,
     ) -> None:
+        """Check the validity of the config, alone and against the rest of the run."""
         if self.lr is not None and self.min_lr is not None:
             assert self.min_lr <= self.lr
 
@@ -526,8 +527,9 @@ class OptimizerConfig:
         # Optimizer CPU offload check
         if self.optimizer_cpu_offload:
             assert self.use_precision_aware_optimizer, (
-                "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
-                "as the hybrid device optimizer reuses the code path of this flag."
+                "The optimizer cpu offload must be used in conjunction with "
+                "`--use-precision-aware-optimizer`, as the hybrid device optimizer reuses the "
+                "code path of this flag."
             )
             assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
                 "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
@@ -539,7 +541,10 @@ class OptimizerConfig:
                 self.use_distributed_optimizer
                 or ddp_config.use_megatron_fsdp
                 or self.optimizer == 'dist_muon'
-            ), '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
+            ), (
+                '--overlap-param-gather only supported with distributed optimizer, '
+                'megatron fsdp, or dist_muon'
+            )
             assert (
                 ddp_config.overlap_grad_reduce
             ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
@@ -570,22 +575,26 @@ class OptimizerConfig:
             ), "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
 
         if self.overlap_param_gather_with_optimizer_step:
-            assert (
-                self.use_distributed_optimizer
-            ), '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
+            assert self.use_distributed_optimizer, (
+                '--overlap-param-gather-with-optimizer-step only supported with '
+                'distributed optimizer'
+            )
             assert (
                 self.overlap_param_gather
             ), 'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
 
         if self.overlap_param_gather_with_optimizer_step:
-            assert (
-                virtual_pipeline_model_parallel_size is not None
-            ), '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
-            assert (
-                ckpt_format == "torch"
-            ), '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
+            assert virtual_pipeline_model_parallel_size is not None, (
+                '--overlap-param-gather-with-optimizer-step only supported with '
+                'interleaved pipeline parallelism'
+            )
+            assert ckpt_format == "torch", (
+                '--overlap-param-gather-with-optimizer-step not supported with '
+                'distributed checkpointing yet'
+            )
 
     def finalize_optimizer_config(self) -> None:
+        """Resolve dtypes, derived flags and optimizer aliases once the config is validated."""
         # Map string data-type to torch.dtype.
         dtype_map = {
             'fp32': torch.float32,
