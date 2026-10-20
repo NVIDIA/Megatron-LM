@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""GPT/Hybrid block graph constants must outlive the RoPE/YaRN LRU caches."""
+"""GPT/Hybrid block graph constants must survive positional embedding cache cleanup."""
 
 import gc
 import types
@@ -29,7 +29,7 @@ class _RotaryConsumer(torch.nn.Module):
 
 @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
 @pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
-def test_block_graph_rotary_survives_lru_invalidation(model_type, position_embedding_type):
+def test_block_graph_rotary_survives_cache_clear(model_type, position_embedding_type):
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
     model = None
@@ -114,26 +114,28 @@ def test_block_graph_rotary_survives_lru_invalidation(model_type, position_embed
 
             for seq_len in (64, 128):
                 context.max_sequence_length = seq_len
-                # Populate the LRU before capture so the graph reads an existing tensor.
-                forward()
+                # Capture must retain the same constant used by warmup.
+                expected = forward().clone()
                 graph = torch.cuda.CUDAGraph()
                 with model.rotary_pos_emb.register_forward_hook(record_rotary):
                     with torch.cuda.graph(graph):
-                        forward()
-                graphs.append(graph)
+                        output = forward()
+                graphs.append((graph, output, expected))
 
-            model.rotary_pos_emb.forward.cache_clear()
+            model.rotary_pos_emb.clear_cache()
             gc.collect()
             torch.cuda.empty_cache()
 
-            # After we attempted to clear the LRU, the cached positional embeddings should still be present
             assert len(refs) == 2
             for ref in refs:
                 assert ref() is not None, "block graph lost its cached positional embedding"
-                assert any(tensor is ref() for tensor in model.rotary_pos_emb_cache.values())
+                assert any(
+                    tensor is ref() for tensor, _ in model.rotary_pos_emb._embedding_cache.values()
+                )
+            for graph, output, expected in graphs:
+                graph.replay()
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
     finally:
         InferenceMode.unset_active()
-        if model is not None:
-            model.rotary_pos_emb.forward.cache_clear()
         Utils.destroy_model_parallel()
