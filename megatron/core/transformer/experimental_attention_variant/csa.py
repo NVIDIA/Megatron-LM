@@ -136,6 +136,9 @@ def _apply_rope(
     rotary_seq_len: int,
     ratio: int = 1,
     cp_group: torch.distributed.ProcessGroup = None,
+    *,
+    inplace: bool = True,
+    rotary_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Apply RoPE to the last ``qk_pos_emb_head_dim`` dims, leaving the rest unchanged.
 
@@ -160,7 +163,7 @@ def _apply_rope(
         # rotation as the unfused split-rotate path (DSv4 "pure
         # rotation" contract).
         rotary_pos_cos, rotary_pos_sin = rotary_pos_emb_module.get_cached_cos_sin(
-            total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
+            total_seq_len, dtype=rotary_dtype or x.dtype, packed_seq=False, mscale=mscale
         )
         rotary_pos_emb = None
         assert (
@@ -190,7 +193,7 @@ def _apply_rope(
         x = x.unsqueeze(-2)
     if config.apply_rope_fusion:
         out = fused_mla_rope_inplace(
-            x,
+            x if inplace else x.clone(),
             rotary_pos_cos,
             rotary_pos_sin,
             nope_dim,

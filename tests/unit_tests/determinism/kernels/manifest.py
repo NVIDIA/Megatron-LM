@@ -185,6 +185,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py",
         ),
         tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_fused_activations.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
         ),
@@ -853,6 +854,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
+        name="csa2_shared_attention",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa2.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_candidates.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_indexer.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_teacher_lse.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_context_parallel.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/thd_utils.py",
+        ),
+        tests=("tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",),
+        kind="triton",
+        notes="CPU owner-gradient and packed-capacity contracts, plus window/sink teacher GPU parity "
+        "and bit-exact replay. Full FlashMLA attention and shared-K atomic gradients remain "
+        "unqualified for deterministic mode; this draft rejects that mode.",
+    ),
+    KernelEntry(
         name="csa_teacher_lse",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa_teacher_lse.py",
@@ -870,6 +887,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_layout.py",
         ),
         tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa2.py",
             K + "test_csa_packed_kernels.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
         ),
