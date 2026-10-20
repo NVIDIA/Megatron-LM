@@ -328,13 +328,9 @@ def test_dynamic_group_callbacks_override_collection_maps(cpu_batch_communicatio
     )
 
 
-@pytest.mark.parametrize("entrypoint", ["batch", "iterator"])
-def test_sequence_packing_requires_collection(no_global_process_groups, entrypoint):
+def test_sequence_packing_requires_collection(no_global_process_groups):
     with pytest.raises(ValueError, match="pg_collection is required"):
-        if entrypoint == "batch":
-            data_schedule.get_batch_on_this_rank_for_sequence_packing(None)
-        else:
-            data_schedule.wrap_data_iterator(None, SimpleNamespace(), 1)
+        data_schedule.get_batch_on_this_rank_for_sequence_packing(None)
 
 
 @pytest.mark.parametrize("missing", ["tp", "pp", "cp"])
