@@ -10,7 +10,6 @@ MLM_DEFAULT_ARGS="
     --distributed-timeout-minutes 60 \
     --finetune \
     --auto-detect-ckpt-format \
-    --export-te-mcore-model \
 "
 
 if [ -z ${HF_TOKEN} ]; then

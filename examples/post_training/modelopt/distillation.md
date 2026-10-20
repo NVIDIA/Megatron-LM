@@ -61,7 +61,6 @@ Distillation is triggered by calling `pretrain_gpt.py` or `pretrain_hybrid.py` w
 
 ```bash
 --export-kd-teacher-load <path-to-teacher-checkpoint>
---export-te-mcore-model
 ```
 
 optionally alongside the additional following arguments:

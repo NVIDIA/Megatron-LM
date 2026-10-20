@@ -292,11 +292,11 @@ def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> 
         if options.qad_train_target is not None:
             register(qad_freeze_hook(options.qad_train_target))
         register(lsq_hook(options.lsq_scale_lr))
-        if options.remap_te_layernorm:
+        if not options.default_te_spec:
             register(te_load_state_dict_hook())
 
     hooks.extend(model_config.pre_wrap_hooks)
     if distillation is not None:
-        remap_te_layernorm = options.remap_te_layernorm if options else False
+        remap_te_layernorm = options is not None and not options.default_te_spec
         register(kd_convert_hook(model_config, distillation, remap_te_layernorm))
     return compose_hooks(hooks)

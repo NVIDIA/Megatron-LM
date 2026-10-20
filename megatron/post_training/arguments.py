@@ -18,10 +18,8 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
-        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
-        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
-        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
+        help="Deprecated and ignored. The ModelOpt-local spec always loads and saves "
+        "layernorms under the fused Transformer-Engine checkpoint keys.",
     )
     group.add_argument(
         "--export-default-te-spec",

@@ -89,7 +89,7 @@ class TestDefaultLayerSpecDispatch:
         mock_get_spec.return_value = spec
         config = _make_dispatch_config()
         config.transformations = ModelTransformConfig(
-            force_local_attention=True, real_quant_cfg="fp8_real_quant", remap_te_layernorm=True
+            force_local_attention=True, real_quant_cfg="fp8_real_quant"
         )
 
         result = default_layer_spec(config, vp_stage=None)

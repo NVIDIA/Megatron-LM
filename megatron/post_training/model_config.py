@@ -207,24 +207,15 @@ def apply_modelopt_model_config(
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
     _check_model_type(model_config, args)
 
-    remap_te_layernorm = args.export_te_mcore_model
-    if isinstance(model_config, HybridModelConfig):
-        if args.export_default_te_spec and remap_te_layernorm:
-            logger.warning(
-                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
-                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
-            )
-            remap_te_layernorm = False
-    else:
-        if args.export_offline_model:
-            transformer_config = model_config.transformer
-            # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
-            transformer_config.original_num_layers = transformer_config.num_layers
-            # Set num_layers to 0 for base model in offline mode
-            transformer_config.num_layers = 0
-            # SP is not used for offline
-            # TODO: DSR1 MTP may require SP
-            transformer_config.sequence_parallel = False
+    if not isinstance(model_config, HybridModelConfig) and args.export_offline_model:
+        transformer_config = model_config.transformer
+        # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
+        transformer_config.original_num_layers = transformer_config.num_layers
+        # Set num_layers to 0 for base model in offline mode
+        transformer_config.num_layers = 0
+        # SP is not used for offline
+        # TODO: DSR1 MTP may require SP
+        transformer_config.sequence_parallel = False
     qad_train_target = getattr(args, 'qad_train_target', None)
     if args.freeze_base_for_mtp:
         if qad_train_target not in (None, 'mtp'):
@@ -240,7 +231,6 @@ def apply_modelopt_model_config(
         moe_grouped_gemm=not disable_moe_grouped_gemm,
         qad_train_target=qad_train_target,
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
-        remap_te_layernorm=remap_te_layernorm,
     )
     return model_config
 

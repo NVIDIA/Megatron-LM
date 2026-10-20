@@ -14,7 +14,6 @@ MLM_DEFAULT_ARGS=" \
     --modelopt-enabled \
     --distributed-timeout-minutes 60 \
     --auto-detect-ckpt-format \
-    --export-te-mcore-model \
 "
 
 

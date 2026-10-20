@@ -81,7 +81,7 @@ def _modelopt_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
     return get_gpt_modelopt_spec(
         config=transformer_cfg,
         local_core_attention=local_core_attention,
-        remap_te_layernorm=options.remap_te_layernorm,
+        remap_te_layernorm=True,
         real_quant_cfg=options.real_quant_cfg,
         use_arbitrary_attention_mask=False,
     )

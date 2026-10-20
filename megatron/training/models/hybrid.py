@@ -135,7 +135,7 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
         _check_modelopt_spec_supported(use_wide_residual)
         options = model_config.transformations
         return get_hybrid_stack_modelopt_spec(
-            remap_te_layernorm=options.remap_te_layernorm,
+            remap_te_layernorm=not options.default_te_spec,
             use_default_te_spec=options.default_te_spec,
             moe_grouped_gemm=options.moe_grouped_gemm,
         )

@@ -192,9 +192,7 @@ class TestDistillationConfig:
 class TestModelOptModelConfigFromArgs:
     def test_gpt_uses_stock_builder_and_modelopt_spec(self):
         args = make_modelopt_test_args(
-            export_te_mcore_model=True,
-            export_force_local_attention=True,
-            export_real_quant_cfg="None",
+            export_force_local_attention=True, export_real_quant_cfg="None"
         )
 
         config = mc.modelopt_model_config_from_args(args)
@@ -228,7 +226,7 @@ class TestModelOptModelConfigFromArgs:
         assert get_spec.call_args.args[1] is False  # moe_grouped_gemm
 
     def test_hybrid_sets_stack_spec(self):
-        args = make_modelopt_test_args(hybrid_layer_pattern="M*-", export_te_mcore_model=True)
+        args = make_modelopt_test_args(hybrid_layer_pattern="M*-")
         stack_spec = ModuleSpec(module=object)
 
         config = mc.modelopt_model_config_from_args(args, disable_moe_grouped_gemm=True)
@@ -297,7 +295,6 @@ class TestModelOptModelConfigFromArgs:
         args = make_modelopt_test_args(
             freeze_base_for_mtp=True,
             lsq_scale_lr=1e-3,
-            export_te_mcore_model=True,
             export_kd_teacher_load="/ckpt/teacher",
             hybrid_layer_pattern="M*" if builder_cls is HybridModelBuilder else None,
         )
@@ -404,19 +401,21 @@ class TestModelType:
                 mc.apply_modelopt_model_config(config, args)
 
     def test_entry_point_config_is_updated_in_place(self):
-        args = make_modelopt_test_args(export_te_mcore_model=True)
+        args = make_modelopt_test_args()
         config = hybrid_config_from_args(args)
         assert mc.apply_modelopt_model_config(config, args) is config
-        assert config.transformations.remap_te_layernorm is True
+        assert config.transformations is not None
 
-    def test_hybrid_default_te_spec_disables_remap_without_touching_args(self):
-        args = make_modelopt_test_args(
-            hybrid_layer_pattern="M*-", export_te_mcore_model=True, export_default_te_spec=True
+    @pytest.mark.parametrize("default_te_spec", [False, True])
+    def test_te_load_hook_registered_unless_default_te_spec(self, monkeypatch, default_te_spec):
+        te_hook = Mock(return_value=lambda models: models)
+        monkeypatch.setattr(model_hooks, "te_load_state_dict_hook", te_hook)
+        monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_: lambda models: models)
+        config = mc.modelopt_model_config_from_args(
+            make_modelopt_test_args(export_default_te_spec=default_te_spec)
         )
-        config = mc.modelopt_model_config_from_args(args)
-        assert config.transformations.remap_te_layernorm is False
-        assert config.transformations.default_te_spec is True
-        assert args.export_te_mcore_model is True
+        config.get_builder_cls()(config).pre_wrap_hook()([Mock()])
+        assert te_hook.called is not default_te_spec
 
 
 class TestLoadTeacherModelConfig:
