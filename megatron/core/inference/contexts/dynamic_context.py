@@ -1704,6 +1704,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
+        if self.cache_dsa_indexer_keys:
+            self._allocate_dsa_row_metadata()
+
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
         # we fix the underlying storage so views are reusable across steps. The number of entries
@@ -2109,6 +2112,96 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.memory_buffer[1, attention_layer_number],
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
+
+    def _allocate_dsa_row_metadata(self) -> None:
+        """Allocate the per-token row metadata of DSA sparse attention.
+
+        DSA attention treats every query token as a row: row ``t`` belongs to active
+        request ``dsa_row_requests[t]`` and attends among keys ``[0, dsa_row_lengths[t])``.
+        The indexer scores rows in blocks of consecutive rows of one request, so a prefill
+        chunk's rows share each key tile. Padding rows and blocks are empty. Built on the CPU
+        in initialize_attention_state() and copied with the bookkeeping, so CUDA graphs read
+        static buffers.
+        """
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
+            SCORE_ROW_BLOCK,
+        )
+
+        self.dsa_score_row_block = SCORE_ROW_BLOCK
+        # A request with q query tokens takes ceil(q / block) <= q / block + 1 blocks.
+        self.dsa_max_score_blocks = self.max_requests + -(-self.max_tokens // SCORE_ROW_BLOCK)
+        sizes = [self.max_tokens, self.max_tokens] + [self.dsa_max_score_blocks] * 3
+        self._cpu_dsa_row_buf = torch.zeros(sum(sizes), dtype=torch.int32, pin_memory=True)
+        self._gpu_dsa_row_buf = torch.zeros(
+            sum(sizes), dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        cpu_views, gpu_views, offset = [], [], 0
+        for size in sizes:
+            cpu_views.append(self._cpu_dsa_row_buf[offset : offset + size])
+            gpu_views.append(self._gpu_dsa_row_buf[offset : offset + size])
+            offset += size
+        (
+            self._cpu_dsa_row_requests,
+            self._cpu_dsa_row_lengths,
+            self._cpu_dsa_block_starts,
+            self._cpu_dsa_block_rows,
+            self._cpu_dsa_block_requests,
+        ) = cpu_views
+        (
+            self.dsa_row_requests,
+            self.dsa_row_lengths,
+            self.dsa_block_starts,
+            self.dsa_block_rows,
+            self.dsa_block_requests,
+        ) = gpu_views
+        self.dsa_num_score_blocks = 0
+
+    def _fill_dsa_row_metadata(
+        self, real_bs: int, padded_bs: int, query_lengths: Tensor, kv_lengths: Tensor
+    ) -> None:
+        """Fill this step's DSA rows and score blocks on the CPU, padding included."""
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
+            build_row_metadata,
+        )
+
+        row_requests, row_lengths, block_starts, block_rows, block_requests = build_row_metadata(
+            query_lengths[:real_bs], kv_lengths[:real_bs], self.dsa_score_row_block
+        )
+        real_tokens, num_blocks = row_requests.numel(), block_starts.numel()
+        padded_tokens = self.padded_active_token_count
+        self._cpu_dsa_row_requests[:real_tokens] = row_requests
+        self._cpu_dsa_row_lengths[:real_tokens] = row_lengths
+        self._cpu_dsa_row_requests[real_tokens:padded_tokens] = -1
+        self._cpu_dsa_row_lengths[real_tokens:padded_tokens] = 0
+        # The block count depends only on the padded dimensions, so a CUDA graph's launch
+        # covers any batch that fits them.
+        self.dsa_num_score_blocks = padded_bs + -(-padded_tokens // self.dsa_score_row_block)
+        assert num_blocks <= self.dsa_num_score_blocks <= self.dsa_max_score_blocks
+        self._cpu_dsa_block_starts[:num_blocks] = block_starts
+        self._cpu_dsa_block_rows[:num_blocks] = block_rows
+        self._cpu_dsa_block_requests[:num_blocks] = block_requests
+        self._cpu_dsa_block_starts[num_blocks : self.dsa_num_score_blocks] = 0
+        self._cpu_dsa_block_rows[num_blocks : self.dsa_num_score_blocks] = 0
+        self._cpu_dsa_block_requests[num_blocks : self.dsa_num_score_blocks] = 0
+
+    def dsa_row_metadata(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int]:
+        """This step's DSA rows and score blocks (see _allocate_dsa_row_metadata).
+
+        Returns:
+            ``(row_requests, row_lengths, block_starts, block_rows, block_requests,
+            num_blocks)`` for the step's padded tokens.
+        """
+        assert self.cache_dsa_indexer_keys, "DSA row metadata is not enabled."
+        rows = self.padded_active_token_count
+        blocks = self.dsa_num_score_blocks
+        return (
+            self.dsa_row_requests[:rows],
+            self.dsa_row_lengths[:rows],
+            self.dsa_block_starts[:blocks],
+            self.dsa_block_rows[:blocks],
+            self.dsa_block_requests[:blocks],
+            blocks,
+        )
 
     def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
         """Append learned simplified-indexer keys to their paged cache."""
@@ -2945,6 +3038,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             max_seqlen_k=max_seqlen_k,
         )
 
+        if self.cache_dsa_indexer_keys:
+            self._fill_dsa_row_metadata(
+                real_bs, padded_bs, self._cpu_mha_query_lengths, self._cpu_mha_kv_seq_lengths
+            )
+
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
             # because it writes to GPU buffers. Store the parameters here.
@@ -3120,6 +3218,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
         # bytes. Nothing else to do here for MHA.
+
+        if self.cache_dsa_indexer_keys:
+            self._gpu_dsa_row_buf.copy_(self._cpu_dsa_row_buf, non_blocking=record_done_event)
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
