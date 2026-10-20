@@ -29,7 +29,7 @@ _SequenceLength = TypeVar('_SequenceLength', int, torch.Tensor)
 def get_packed_sequence_alignment(config, tp_size: int) -> tuple[int, bool]:
     """Return CP-local alignment and whether post-pack padding is enabled.
 
-    The user-facing alignment has dev's pre-SP units. MXFP8's quantization
+    The user-facing alignment is in pre-SP units. MXFP8's quantization
     block constraint applies after SP and must therefore include the TP size.
     """
     requested = getattr(config, 'pad_packed_seq_alignment', None)
@@ -59,7 +59,7 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
     Preserve compact logical boundaries and existing physical gaps. Align each
     physical sequence for zigzag CP, then append a masked dummy sequence to
     reach the requested CP-local alignment. The dummy has equal logical and
-    physical lengths, matching dev's eager THD padding representation.
+    physical lengths.
     """
     alignment, enabled = get_packed_sequence_alignment(config, tp_size)
     if not enabled:
