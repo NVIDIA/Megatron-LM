@@ -306,6 +306,14 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             apply_prefix_mapping(sharded_state_dict, prefixed_map)
         return sharded_state_dict
 
+    def _te_cuda_graph_capture(self, hidden_states, **kwargs):
+        """Adapt TE's flat capture inputs to the mixer's shared invocation."""
+        kwargs = {name: value for name, value in kwargs.items() if value is not None}
+        aux_inputs = kwargs.pop("aux_inputs", None)
+        if aux_inputs is None:
+            aux_inputs = LayerAuxInputs(**kwargs)
+        return self.forward(hidden_states, aux_inputs=aux_inputs)
+
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """
         CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
@@ -313,6 +321,17 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         However, CUDA graph accepts only Tensor inputs.
         Hence, `inference_context` is excluded from input list.
         """
+        aux_inputs = kwargs.pop("aux_inputs", None)
+        if aux_inputs is not None:
+            # Only execution state consumed by this layer belongs at the TE boundary.
+            # Non-tensor metadata remains subject to the existing replay validation.
+            for name in (
+                "inference_context",
+                "packed_seq_params",
+                "packed_sequence_cp_metadata",
+                "residual_stream_recompute_context",
+            ):
+                kwargs[name] = getattr(aux_inputs, name)
         assert kwargs.get('inference_context') is None, (
             "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
             "For inference cuda graph, please use cuda_graph_impl=local instead."

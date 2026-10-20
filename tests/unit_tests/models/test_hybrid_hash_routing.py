@@ -416,8 +416,11 @@ def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
     output, bias = TransformerLayer._run_mlp(
         layer,
         hidden_states,
-        LayerAuxInputs(padding_mask=padding_mask, input_ids=input_ids),
-        residual=hidden_states,
+        hidden_states,
+        padding_mask,
+        None,
+        input_ids=input_ids,
+        aux_inputs=LayerAuxInputs(padding_mask=padding_mask, input_ids=input_ids),
     )
 
     assert bias is None

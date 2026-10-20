@@ -464,7 +464,13 @@ def test_mlp_shared_binding_preserves_bias_and_checkpoint_tensor_boundary(
     mask = ids % 2 == 0
     packed = object()
     output, bias = layer._run_mlp(
-        x, LayerAuxInputs(padding_mask=mask, input_ids=ids, packed_seq_params=packed), residual=x
+        x,
+        x,
+        mask,
+        None,
+        input_ids=ids,
+        packed_seq_params=packed,
+        aux_inputs=LayerAuxInputs(padding_mask=mask, input_ids=ids, packed_seq_params=packed),
     )
     assert bias is core.bias
     torch.testing.assert_close(output, (x * 2).square())
@@ -498,7 +504,7 @@ def test_mlp_te_partial_capture_preserves_intermediate_outputs(monkeypatch):
     monkeypatch.setattr(
         "megatron.core.transformer.transformer_layer.is_graph_capturing", lambda: True
     )
-    assert layer._run_mlp(x, LayerAuxInputs(), residual=x) is intermediates
+    assert layer._run_mlp(x, x, None, None) is intermediates
 
 
 def test_shortcut_atomic_call_accepts_any_layer_with_shared_inputs():
@@ -571,8 +577,9 @@ def test_recompute_preserves_call_style_and_replays_gradients(config_cls, method
         assert fields["packed_sequence_cp_metadata"] is metadata
 
 
-@pytest.mark.parametrize("shared", [False, True])
-def test_transformer_stages_pack_only_explicit_inputs(shared):
+@pytest.mark.parametrize("call_style", ["legacy", "shared", "aux_keyword"])
+def test_transformer_preserves_shared_inputs_and_legacy_core_calls(call_style):
+    shared = call_style != "legacy"
     layer = bare(TransformerLayer)
     layer.layer_number = 1
     layer.config = SimpleNamespace(inference_fuse_tp_communication=False)
@@ -580,28 +587,41 @@ def test_transformer_stages_pack_only_explicit_inputs(shared):
     layer._padding_mask_shape_seen = None
     x = torch.randn(2, 1, 4)
     mask, ids = torch.ones(1, 2, dtype=torch.bool), torch.ones(1, 2, dtype=torch.long)
-    inputs = LayerAuxInputs(padding_mask=mask, input_ids=ids)
+    context = torch.randn_like(x)
+    inputs = LayerAuxInputs(padding_mask=mask, input_ids=ids, context=context)
     layer._run_input_layernorm = Mock(return_value=(x, x, ()))
-    layer._run_self_attention = Mock(return_value=(x, None))
-    layer.attention_bda_and_cross_attention = Mock(return_value=(x, None))
+    layer.self_attention = nn.Module()
+    layer.self_attention.forward = Mock(return_value=(x, LayerAuxOutputs() if shared else None))
+    layer.attention_bda_and_cross_attention = Mock(return_value=(x, context))
     layer._pre_mlp_layernorm_and_residual = Mock(return_value=(x, x, ()))
     layer._maybe_unflatten_for_moe = Mock(return_value=(x, mask, ids, None))
     layer._run_mlp = Mock(return_value=(x, None))
     layer._apply_mlp_bda_step = Mock(return_value=x)
 
-    if shared:
-        output, _ = layer.forward(x, inputs)
+    if call_style == "shared":
+        output, auxiliary = layer.forward(x, inputs)
     else:
-        output, _ = layer.forward(x, padding_mask=mask, input_ids=ids)
+        output, auxiliary = layer.forward(
+            x,
+            padding_mask=mask,
+            input_ids=ids,
+            context=context,
+            aux_inputs=inputs if shared else None,
+        )
+    if shared:
+        assert isinstance(auxiliary, LayerAuxOutputs)
+        assert auxiliary.bias is None
+        assert layer.self_attention.forward.call_args.args == (x, inputs)
+        assert layer.self_attention.forward.call_args.kwargs == {}
+        assert layer._run_mlp.call_args.kwargs["aux_inputs"] is inputs
+    else:
+        assert auxiliary is context
+        assert layer.self_attention.forward.call_args.args == (x,)
+        assert "aux_inputs" not in layer.self_attention.forward.call_args.kwargs
+        assert layer._run_mlp.call_args.kwargs["aux_inputs"] is None
     assert output is x
-    attention_inputs = layer._run_self_attention.call_args.args[1]
-    mlp_inputs = layer._run_mlp.call_args.args[1]
-    for received in (attention_inputs, mlp_inputs):
-        assert received.padding_mask is mask
-        assert received.input_ids is ids
-        assert (received is inputs) == shared
-    if not shared:
-        assert attention_inputs is not mlp_inputs
+    assert layer._run_mlp.call_args.args[2] is mask
+    assert layer._run_mlp.call_args.kwargs["input_ids"] is ids
 
 
 def test_hybrid_stack_eager_and_full_recompute_use_the_same_call():
@@ -932,9 +952,7 @@ def test_cross_attention_binds_context_and_preserves_bias(direct):
     bda = Mock(side_effect=lambda pair, residual, dropout: residual + pair[0] + pair[1])
     layer.cross_attn_bda = Mock(return_value=bda)
 
-    output, output_context = layer._run_cross_attention(
-        x, LayerAuxInputs(context=context, context_mask=mask)
-    )
+    output, output_context = layer._run_cross_attention(x, context, mask, None)
     assert_bit_exact(output, {}, x + x + bias, {})
     assert output_context is context
     assert bda.call_args.args[0][1] is bias
@@ -1156,11 +1174,11 @@ def test_transformer_local_graph_inputs_exclude_unconsumed_scheduling_state():
     module(x, inputs)
     _, args, kwargs = module.cudagraph_manager.call_args.args
     assert args == ()
-    assert set(kwargs) == {"hidden_states", "aux_inputs"}
-    graph_inputs = kwargs["aux_inputs"]
-    assert graph_inputs.rotary_pos_emb is rope
-    assert graph_inputs.embedding is None
-    assert graph_inputs.execution_context is None
+    assert kwargs["hidden_states"] is x
+    assert kwargs["rotary_pos_emb"] is rope
+    assert "aux_inputs" not in kwargs
+    assert "embedding" not in kwargs
+    assert "execution_context" not in kwargs
     assert inputs.embedding is not None and inputs.execution_context is not None
 
 
@@ -1359,7 +1377,7 @@ def test_mhc_per_call_setup_runs_before_graph_dispatch():
     def graph(module, args, kwargs):
         seen.append(module._mhc_recompute_manager)
         assert "mhc_recompute_manager" not in kwargs
-        assert kwargs["aux_inputs"].mhc_recompute_manager is None
+        assert "aux_inputs" not in kwargs
         return x, LayerAuxOutputs()
 
     module.cudagraph_manager = Mock(side_effect=graph)
@@ -1498,17 +1516,27 @@ def test_stack_preserves_mhc_stream_in_named_aux_outputs():
 
 @pytest.mark.parametrize("present", [False, True])
 @pytest.mark.parametrize("routing", ["dense", "learned", "hash"])
-def test_transformer_optional_args_are_filtered_only_for_te_replay(present, routing):
+def test_transformer_te_replay_filters_none_after_binding(present, routing):
     module = bare(TransformerLayer)
-    module.config = SimpleNamespace(fine_grained_activation_offloading=False)
+    module.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=[],
+        fine_grained_activation_offloading=False,
+        delay_offload_until_cuda_graph=False,
+        overlap_moe_expert_parallel_comm=False,
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
+        context_parallel_size=1,
+    )
     module.is_moe_layer = routing != "dense"
     module.mlp = (
         SimpleNamespace(router=SimpleNamespace(is_hash_layer=routing == "hash"))
         if module.is_moe_layer
         else SimpleNamespace()
     )
-    x = torch.randn(2, 4)
-    value = torch.randn(2, 4) if present else None
+    x = torch.randn(2, 1, 4)
+    mask = torch.zeros(1, 1, 2, 2)
+    value = torch.randn(2, 1, 4) if present else None
     optional = dict.fromkeys(
         (
             "context",
@@ -1522,14 +1550,13 @@ def test_transformer_optional_args_are_filtered_only_for_te_replay(present, rout
         ),
         value,
     )
-    module._call_with_bound_args = Mock(return_value=(x, LayerAuxOutputs()))
-    inputs = LayerAuxInputs(attention_mask=x, **optional)
-    module(x, inputs)
-    assert module._call_with_bound_args.call_args.kwargs["aux_inputs"] is inputs
-    # Only the TE boundary unpacks the layer's explicit stage signature.
-    _, bound = module.bind_layer_inputs(x, inputs, forward=module._forward_attention)
-    bound.pop("aux_inputs")
-
+    inputs = LayerAuxInputs(attention_mask=mask if present else None, **optional)
+    graph = Mock(return_value=(x, value) if present else (x,))
+    module.cuda_graphs = [graph]
+    module.cuda_graph_manual_hooks = []
+    module._te_cuda_graph_padding_mask = Mock(return_value=None)
+    module.bind_layer_inputs = Mock(wraps=module.bind_layer_inputs)
+    module._te_cuda_graph_replay = Mock(wraps=module._te_cuda_graph_replay)
     te = Mock()
     with (
         patch.dict(
@@ -1537,18 +1564,69 @@ def test_transformer_optional_args_are_filtered_only_for_te_replay(present, rout
             {"transformer_engine": Mock(pytorch=te), "transformer_engine.pytorch": te},
         ),
         patch("megatron.core.transformer.transformer_layer.is_te_min_version", return_value=True),
+        patch("megatron.core.transformer.transformer_layer.torch.zeros", return_value=mask),
     ):
-        args, kwargs = module._get_te_cuda_graph_replay_args(**bound)
-    assert len(args) == 1 and args[0] is x
-    assert kwargs["attention_mask"] is x
-    assert kwargs["inference_context"] is None
-    assert kwargs["packed_seq_params"] is None
+        output, aux_outputs = module(x, inputs)
+    assert output is x and aux_outputs.bias is None
+    module.bind_layer_inputs.assert_called_once()
+    assert module._te_cuda_graph_replay.call_args.kwargs["aux_inputs"] is inputs
+    assert graph.call_args.args == (x,)
+    kwargs = graph.call_args.kwargs
+    assert kwargs["attention_mask"] is mask
+    assert "aux_inputs" not in kwargs
+    assert all(value is not None for value in kwargs.values())
     for name in optional:
         if present and (name != "input_ids" or routing == "hash"):
             assert kwargs[name] is value
         else:
             assert name not in kwargs
-        assert name in bound and bound[name] is value
+
+
+def test_mamba_te_capture_and_replay_adapt_only_at_graph_boundary():
+    class Layer(MambaLayer):
+        @bind_layer_interface
+        def forward(self, hidden_states, aux_inputs):
+            self.received_inputs = aux_inputs
+            return hidden_states.sin()
+
+    module = bare(Layer)
+    module.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine", fine_grained_activation_offloading=False
+    )
+    module.cuda_graphs = []
+    module.cuda_graph_manual_hooks = []
+    x = torch.randn(2, 4)
+    with patch("megatron.core.transformer.cuda_graphs.is_graph_capturing", return_value=True):
+        # TE's static capture signature supplies only hidden states.
+        captured = module(x)
+    torch.testing.assert_close(captured, x.sin())
+    assert isinstance(module.received_inputs, LayerAuxInputs)
+
+    inputs = LayerAuxInputs(embedding=object(), execution_context=object())
+    graph = Mock(return_value=captured)
+    module.cuda_graphs = [graph]
+    output, aux_outputs = module(x, inputs)
+    assert output is captured and aux_outputs.bias is None
+    assert graph.call_args.args == (x,)
+    assert graph.call_args.kwargs == {"is_first_microbatch": True}
+    assert inputs.embedding is not None and inputs.execution_context is not None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "inference_context",
+        "packed_seq_params",
+        "packed_sequence_cp_metadata",
+        "residual_stream_recompute_context",
+    ],
+)
+def test_mamba_te_replay_rejects_non_tensor_execution_state(field):
+    module = bare(MambaLayer)
+    with pytest.raises(AssertionError, match="CUDA graph accepts only Tensor inputs"):
+        module._te_cuda_graph_replay(
+            hidden_states=torch.randn(2, 4), aux_inputs=LayerAuxInputs(**{field: object()})
+        )
 
 
 @pytest.mark.parametrize("with_context", [False, True])
@@ -1570,7 +1648,9 @@ def test_transformer_te_capture_preserves_raw_intermediates(with_context, partia
 
     # TE's capture helper invokes the module with explicit tensor arguments.
     with patch("megatron.core.transformer.cuda_graphs.is_graph_capturing", return_value=True):
-        captured = module(x, context=context)
+        captured = module(x, context=context, aux_inputs=LayerAuxInputs(context=context))
+    assert "aux_inputs" not in module._forward_attention.call_args.kwargs
+    assert all(value is not None for value in module._forward_attention.call_args.kwargs.values())
     expected = intermediates + ((context,) if with_context else ())
     assert len(captured) == len(expected)
     assert all(actual is wanted for actual, wanted in zip(captured, expected))

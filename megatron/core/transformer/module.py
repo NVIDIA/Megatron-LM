@@ -355,6 +355,7 @@ class GraphableMegatronModule(MegatronModule):
         CUDA Graph capture for this layer using TE interface.
         Normally it's just a forward pass if we're capturing the entire layer.
         """
+        kwargs = {name: value for name, value in kwargs.items() if value is not None}
         return self.forward(*args, **kwargs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -373,6 +374,11 @@ class GraphableMegatronModule(MegatronModule):
 
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+        # Prepare required inputs (for example a missing attention mask) before
+        # dropping absent optional keywords from TE's captured call signature.
+        cudagraph_kwargs = {
+            name: value for name, value in cudagraph_kwargs.items() if value is not None
+        }
 
         for hook, hook_args in self.cuda_graph_manual_hooks:
             hook(*hook_args)
@@ -424,10 +430,14 @@ class GraphableMegatronModule(MegatronModule):
             and (is_graph_capturing() or self.cuda_graphs)
         )
 
+    def _local_cuda_graph(self, *args, **kwargs):
+        """Capture or replay local graphs after input binding."""
+        return self.cudagraph_manager(self, args, kwargs)
+
     def _call_with_bound_args(self, *args, **kwargs):
         """Select capture/replay after shared inputs have become ordinary arguments."""
         if self._should_call_local_cudagraph(*args, **kwargs):
-            return self.cudagraph_manager(self, args, kwargs)
+            return self._local_cuda_graph(*args, **kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.

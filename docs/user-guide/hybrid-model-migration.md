@@ -432,7 +432,8 @@ def forward(self, hidden_states, aux_inputs: LayerAuxInputs):
 The binder passes that object unchanged as a keyword argument, so hooks and the
 `bind_layer_inputs` and `bind_layer_outputs` hooks run once. Shortcut and the hybrid mHC wrapper use
 this form, as do HybridStack and MambaLayer. TransformerLayer also accepts explicit
-arguments for non-hybrid callers, packing them at its attention and MLP stages.
+arguments for non-hybrid callers. It carries Hybrid's existing container to attention
+and MLP cores without packing legacy calls.
 HybridModel constructs one base input
 snapshot and composition layers carry it to their children. Scheduling and MTP state
 changes derive snapshots; checkpoint replay and graph boundaries reconstruct their inputs.
@@ -441,8 +442,8 @@ manager before invoking a complete inner layer.
 
 GPT, ViT, RADIO, BERT, and T5 keep their explicit model-facing arguments.
 TransformerBlock forwards them to TransformerLayer without constructing auxiliary-input
-containers. `_forward_attention` and `_forward_mlp` pack explicit arguments at their
-boundaries and reuse an existing container when Hybrid supplies one. GPTModel's MTP call uses
+containers. `_forward_attention` and `_forward_mlp` retain their legacy execution and
+argument lists, with optional `aux_inputs` plumbing for Hybrid calls. GPTModel's MTP call uses
 explicit arguments, packed at the MultiTokenPredictionBlock boundary. Hybrid MTP
 continues to receive the existing container from HybridModel.
 
@@ -492,10 +493,11 @@ def bind_layer_outputs(self, result):
     return hidden_states, LayerAuxOutputs(mhc_multistream=stream)
 ```
 
-Mamba omits absent optional state in its input hook. TransformerLayer uses the
-default input hook and keeps optional `None` values during ordinary execution and
-local CUDA graphs. Its TE replay-argument preparation omits unused optional keywords
-and non-hash token IDs to preserve the captured input signature.
+TransformerLayer uses the default input hook to expose the existing arguments and
+carry Hybrid's container. Its local and TE graph hooks remove the container after
+binding. TE replay drops `None` keywords centrally after argument preparation, so
+required attention masks can be synthesized first. TransformerLayer's TE argument
+preparation also removes non-hash token IDs to match the captured signature.
 
 The container and layer forwards both use `packed_sequence_cp_metadata`, so this
 field binds directly by name. A forwarding method with `*args, **kwargs` must expose
@@ -602,28 +604,37 @@ Layers never return updated input fields through the checkpoint.
 Transformer's raw attention/MLP helpers and `_run_mlp` carry `LayerAuxInputs` through
 to their cores. Chunked MLP execution replaces only the mask and token-ID slices.
 The `_forward_attention` and `_forward_mlp` entry points used by graph and pipeline
-schedulers retain their explicit tensor arguments; they construct inputs only when
-no auxiliary container was supplied. Checkpoint callbacks retain only the metadata
-consumed by the core.
+schedulers retain their explicit tensor arguments. Only Hybrid calls supply a container;
+legacy calls continue invoking cores with explicit arguments. Checkpoint callbacks
+reconstruct the core's inputs from the existing checkpoint arguments instead of retaining
+unrelated Hybrid tensors. Local/TE graphs and split-stage overlap retain their explicit
+execution interfaces.
 
-Mamba's mixer and Transformer's self-attention and MLP/MoE calls use shared inputs.
+This is transitional plumbing: a future PR will have HybridModel call the underlying
+layers' bound forwards directly, removing the TransformerLayer adapter.
+
+Mamba's mixer and Hybrid's eager self-attention and MLP/MoE calls use shared inputs.
 Dense MLP bindings ignore routing fields; MoE bindings select the fields they consume.
 Chunked MLP execution slices token IDs and padding masks alongside hidden states.
 Checkpoint and residual-fusion boundaries extract `aux_outputs.bias` and retain tensor
 outputs. TE partial MoE capture keeps its existing flat intermediate-output contract.
 
 `MegatronModule` binds shared inputs before module hooks and CUDA-graph selection.
-Hooks see the ordinary forward arguments and legacy result; output conversion
-happens after execution or graph replay. Direct `.forward(...)` calls also accept
+Hooks see the ordinary forward arguments and the forward's result; output binding
+happens after execution or graph replay. TransformerLayer's forward returns
+`(hidden_states, LayerAuxOutputs())` when `aux_inputs` is present, including an explicit
+`aux_inputs=` call, and its legacy `(hidden_states, context)` otherwise. The outer
+binding preserves an already-bound result. Direct `.forward(...)` calls also accept
 the container, but bypass module hooks and graph selection as usual. Graphable
-modules dispatch through `_call_with_bound_args`; per-call setup that must run
-after binding and before graph selection belongs at that boundary. The existing
-Transformer TE replay preparation omits token IDs for non-hash layers and absent
-optional recompute/context arguments. Eager execution and local CUDA graphs retain
-these execution arguments. HybridStack consumes and clears its CP layout dictionary
-and plan before invoking layers; MTP keeps its embedding module outside depth inputs.
+modules use `_call_with_bound_args` only to dispatch already-bound calls to the local
+or TE graph hooks, or ordinary execution. TransformerLayer has no dispatch override;
+graph-specific adaptation belongs in those hooks. HybridStack consumes and clears its
+CP layout dictionary and plan before invoking layers; MTP keeps its embedding module
+outside depth inputs.
 Mamba carries the prepared auxiliary inputs directly into local graphs without a
-dispatch override. Transformer retains its local graph input filtering.
+dispatch override. Its TE capture hook constructs auxiliary inputs from TE's flat
+tensor signature; replay exposes only consumed execution state, retaining the
+non-tensor-input validation. Transformer retains its local graph input filtering.
 TE capture uses explicit tensor arguments and preserves its flat
 intermediate outputs. TE replay completes the layer and returns its natural hidden-state/context pair; the shared binding does not inspect graph dispatch or
 interpret capture intermediates. EP-overlap replay retains its scheduler-specific
