@@ -37,7 +37,6 @@ from megatron.core.transformer.layer_interface import LayerAuxInputs, LayerAuxOu
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
-    MultiTokenPredictionInputs,
     MultiTokenPredictionLayer,
     _initialize_hidden_state_mixing_rng_tracker,
     _mix_hidden_state_history,
@@ -3623,16 +3622,11 @@ class TestMultiTokenPredictionHybrid:
                 self.forward_impl = mtp
 
             def prepare_cp_layout(self, **kwargs):
-                return MultiTokenPredictionInputs(
-                    input_ids=kwargs["input_ids"],
-                    position_ids=kwargs["position_ids"],
-                    hidden_states=kwargs["hidden_states"],
-                    decoder_input=kwargs["decoder_input"],
-                    mhc_multistream=kwargs["mhc_multistream"],
-                    labels=kwargs["labels"],
-                    loss_mask=kwargs["loss_mask"],
-                    mtp_input_mask=kwargs["mtp_input_mask"],
-                    packed_seq_params=kwargs["packed_seq_params"],
+                return (
+                    kwargs["hidden_states"],
+                    kwargs["labels"],
+                    kwargs["loss_mask"],
+                    kwargs["aux_inputs"],
                 )
 
             def __call__(self, hidden_states, aux_inputs=None, **kwargs):

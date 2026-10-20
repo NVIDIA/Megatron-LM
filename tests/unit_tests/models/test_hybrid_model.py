@@ -393,7 +393,12 @@ class TestHybridModel:
                 self.mtp_input_mask = None
 
             def prepare_cp_layout(self, **kwargs):
-                return SimpleNamespace(**kwargs)
+                return (
+                    kwargs["hidden_states"],
+                    kwargs["labels"],
+                    kwargs["loss_mask"],
+                    kwargs["aux_inputs"],
+                )
 
             def forward(self, hidden_states, aux_inputs):
                 from megatron.core.transformer.layer_interface import LayerAuxOutputs

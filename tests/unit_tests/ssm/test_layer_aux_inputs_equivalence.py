@@ -2,13 +2,10 @@
 """Bitwise forward/backward checks of legacy and canonical output/bias entry points."""
 
 import copy
-from dataclasses import replace
-from functools import partial
 
 import pytest
 import torch
 
-from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
@@ -159,8 +156,7 @@ class TestLayerAuxInputsEquivalence:
             ("flex", True),
         ],
     )
-    @pytest.mark.parametrize("pre_norm", [False, True])
-    def test_moe_output_pair_and_pre_norm(self, dispatcher, overlap, pre_norm):
+    def test_moe_output_pair(self, dispatcher, overlap):
         if dispatcher == "flex":
             if not HAVE_DEEP_EP:
                 pytest.skip("DeepEP not installed")
@@ -169,16 +165,9 @@ class TestLayerAuxInputsEquivalence:
             Utils.destroy_model_parallel()
             Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
         ep_size = 2 if dispatcher == "flex" else 1
-        spec = hybrid_stack_spec
-        if pre_norm:
-            moe_layer = spec.submodules.moe_layer
-            mlp = moe_layer.submodules.mlp
-            mlp = partial(mlp, submodules=replace(mlp.keywords["submodules"], pre_norm=TENorm))
-            moe_layer = replace(moe_layer, submodules=replace(moe_layer.submodules, mlp=mlp))
-            spec = replace(spec, submodules=replace(spec.submodules, moe_layer=moe_layer))
         stack = make_stack(
             "E",
-            stack_spec=spec,
+            stack_spec=hybrid_stack_spec,
             moe_token_dispatcher_type=dispatcher,
             moe_shared_expert_overlap=overlap,
             moe_flex_dispatcher_backend="deepep" if dispatcher == "flex" else None,
@@ -192,7 +181,7 @@ class TestLayerAuxInputsEquivalence:
             assert aux_outputs.bias is None
             return output
 
-        assert_forward_backward(core, x, lambda value: core(core.pre_norm(value))[0], adapted)
+        assert_forward_backward(core, x, lambda value: core(value)[0], adapted)
 
     @pytest.mark.parametrize("symbol", ["*", "-", "M"])
     def test_residual_stream_recompute(self, symbol):

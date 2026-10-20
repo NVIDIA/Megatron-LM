@@ -1188,7 +1188,7 @@ class TestHybridBlock:
             def fail_if_mlp_runs(*args, **kwargs):
                 pytest.fail("attention shortcut output projection must not execute an MLP")
 
-            monkeypatch.setattr(attn_layer, "_forward_mlp_with_inputs", fail_if_mlp_runs)
+            monkeypatch.setattr(attn_layer, "_forward_mlp", fail_if_mlp_runs)
 
         output = block(
             hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)

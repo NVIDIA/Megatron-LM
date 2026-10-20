@@ -30,7 +30,6 @@ from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -542,7 +541,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
         Perform the forward pass through the transformer block.
 
-        Model-facing arguments are packed once here for the shared layer interface.
+        Layers receive explicit arguments and pack them at their attention and MLP stages.
 
         This method handles the core computation of the transformer, including
         self-attention, optional cross-attention, and feed-forward operations.
@@ -679,7 +678,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_mhc_recompute=use_mhc_recompute,
         )
 
-        aux_inputs = LayerAuxInputs(
+        layer_kwargs = dict(
             attention_mask=attention_mask,
             context=context,
             context_mask=context_mask,
@@ -701,10 +700,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_states, intermediate_hidden_states = checkpointed_forward(
                     self,
                     hidden_states,
-                    aux_inputs,
                     use_inner_quantization_context=use_inner_quantization_context,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    **layer_kwargs,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
@@ -730,10 +729,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
+                    extra_layer_kwargs = (
+                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
+                    )
                     with self.offload_context, inner_quantization_context:
-                        aux_inputs = aux_inputs.update(mhc_recompute_manager=mhc_manager)
-                        hidden_states, aux_outputs = layer(hidden_states, aux_inputs)
-                        assert aux_outputs.bias is None, "TransformerBlock requires complete layers"
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states, **layer_kwargs, **extra_layer_kwargs
+                        )
+                        layer_kwargs["context"] = context
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,

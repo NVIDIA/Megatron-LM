@@ -23,12 +23,13 @@ else:
 def checkpointed_forward(
     self: MegatronModule,
     hidden_states: Tensor,
-    aux_inputs: LayerAuxInputs,
+    aux_inputs: LayerAuxInputs | None = None,
     *,
     use_inner_quantization_context: bool,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
+    **layer_kwargs,
 ) -> tuple[Tensor, list[Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -40,8 +41,8 @@ def checkpointed_forward(
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
-        aux_inputs (LayerAuxInputs): Auxiliary layer inputs, including packed-sequence CP metadata
-            and token IDs. Checkpointed tensors are restored into this container on replay.
+        aux_inputs (LayerAuxInputs, optional): Hybrid auxiliary inputs restored on replay.
+            Other callers supply explicit layer arguments through ``layer_kwargs``.
 
     Returns:
         Hidden states and extracted intermediate tensors.
@@ -49,13 +50,18 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
-    if isinstance(aux_inputs.rotary_pos_emb, (tuple, list)):
-        assert len(aux_inputs.rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
+    shared_inputs = aux_inputs is not None
+    if shared_inputs and layer_kwargs:
+        raise TypeError("Pass either auxiliary inputs or explicit layer arguments")
+    input_fields = vars(aux_inputs) if shared_inputs else layer_kwargs
+    rotary_pos_emb = input_fields.get("rotary_pos_emb")
+    if isinstance(rotary_pos_emb, (tuple, list)):
+        assert len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
 
-    def custom(start: int, end: int, chunk_inputs: LayerAuxInputs):
+    def custom(start: int, end: int):
         # Checkpoint functions accept only tensors. Keep non-tensor metadata in
         # the closure, and reconstruct immutable input snapshots for each replay.
-        leaves, input_spec = tree_flatten(vars(chunk_inputs))
+        leaves, input_spec = tree_flatten(input_fields)
         tensor_indices = [i for i, value in enumerate(leaves) if isinstance(value, Tensor)]
         tensor_inputs = tuple(leaves[i] for i in tensor_indices)
         for i in tensor_indices:
@@ -65,7 +71,8 @@ def checkpointed_forward(
             restored = list(leaves)
             for i, tensor in zip(tensor_indices, input_tensors):
                 restored[i] = tensor
-            aux_inputs = LayerAuxInputs(**tree_unflatten(restored, input_spec))
+            layer_kwargs = tree_unflatten(restored, input_spec)
+            layer_inputs = LayerAuxInputs(**layer_kwargs) if shared_inputs else None
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
@@ -74,7 +81,12 @@ def checkpointed_forward(
                     hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                         index, hidden_states
                     )
-                    aux_inputs = aux_inputs.update(packed_seq_params=layer_packed_seq_params)
+                    if layer_inputs is not None:
+                        layer_inputs = layer_inputs.update(
+                            packed_seq_params=layer_packed_seq_params
+                        )
+                    else:
+                        layer_kwargs["packed_seq_params"] = layer_packed_seq_params
                 # Keep both residuals in the layer's layout, inside the CP conversions.
                 residual_accumulator = hidden_states
 
@@ -95,8 +107,15 @@ def checkpointed_forward(
                     inner_quantization_context = nullcontext()
 
                 with inner_quantization_context:
-                    hidden_states, aux_outputs = layer(hidden_states, aux_inputs)
-                    assert aux_outputs.bias is None, "Recompute requires complete residual layers"
+                    if layer_inputs is not None:
+                        hidden_states, aux_outputs = layer(hidden_states, layer_inputs)
+                        assert (
+                            aux_outputs.bias is None
+                        ), "Recompute requires complete residual layers"
+                    else:
+                        hidden_states, layer_kwargs["context"] = layer(
+                            hidden_states=hidden_states, **layer_kwargs
+                        )
 
                 observe_layer_residuals(layer, residual_accumulator, hidden_states)
                 if cp_layout_state is not None:
@@ -107,7 +126,7 @@ def checkpointed_forward(
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states
-        cf, tensor_inputs = custom(start, end, aux_inputs)
+        cf, tensor_inputs = custom(start, end)
         args = (hidden_states, *tensor_inputs)
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,

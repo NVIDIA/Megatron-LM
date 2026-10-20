@@ -2024,21 +2024,6 @@ class MultiTokenPredictionBlockSubmodules:
     layer_specs: Optional[List[ModuleSpec]] = None
 
 
-@dataclass(eq=False)
-class MultiTokenPredictionInputs:
-    """Inputs prepared in the CP layout consumed by an MTP block."""
-
-    input_ids: Optional[Tensor]
-    position_ids: Optional[Tensor]
-    hidden_states: Tensor
-    decoder_input: Optional[Tensor]
-    mhc_multistream: Optional[Tensor]
-    labels: Optional[Tensor]
-    loss_mask: Optional[Tensor]
-    mtp_input_mask: Optional[Tensor]
-    packed_seq_params: Optional[PackedSeqParams]
-
-
 def _get_mtp_block_submodules(
     config: TransformerConfig, spec: Union[MultiTokenPredictionBlockSubmodules, ModuleSpec]
 ) -> MultiTokenPredictionBlockSubmodules:
@@ -2190,18 +2175,14 @@ class MultiTokenPredictionBlock(MegatronModule):
 
     def prepare_cp_layout(
         self,
-        input_ids: Tensor,
-        position_ids: Tensor,
         hidden_states: Tensor,
-        decoder_input: Optional[Tensor],
-        mhc_multistream: Optional[Tensor],
+        aux_inputs: LayerAuxInputs,
+        *,
         labels: Optional[Tensor],
         loss_mask: Optional[Tensor],
-        mtp_input_mask: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
         cp_batch: Optional[ContextParallelBatch],
-    ) -> MultiTokenPredictionInputs:
-        """Prepare activations and token-aligned inputs for the MTP block's CP layout."""
+    ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor], LayerAuxInputs]:
+        """Return hidden states, labels, loss mask, and auxiliary inputs in MTP's CP layout."""
         source_layout = (
             cp_batch.boundary_layout if cp_batch is not None else self.config.linear_cp_layout
         )
@@ -2209,7 +2190,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         requires_conversion = self.cp_group.size() > 1 and source_layout != target_layout
 
         if requires_conversion:
-            if mtp_input_mask is not None:
+            if aux_inputs.mtp_input_mask is not None:
                 raise ValueError("mtp_input_mask is not supported with CP layout conversion")
             if cp_batch is None:
                 raise ValueError("cp_batch is required when MTP uses a different CP layout")
@@ -2223,6 +2204,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 self.tp_cp_group,
                 cp_batch.thd_plan,
             )
+            decoder_input = aux_inputs.decoder_input
             if decoder_input is not None:
                 decoder_input = convert_cp_layout(
                     decoder_input,
@@ -2234,6 +2216,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     self.tp_cp_group,
                     cp_batch.thd_plan,
                 )
+            mhc_multistream = aux_inputs.mhc_multistream
             if mhc_multistream is not None:
                 mhc_multistream = convert_cp_layout(
                     mhc_multistream,
@@ -2245,24 +2228,18 @@ class MultiTokenPredictionBlock(MegatronModule):
                     self.tp_cp_group,
                     cp_batch.thd_plan,
                 )
-            packed_seq_params = cp_batch.get_packed_seq_params(target_layout)
             layout_batch = cp_batch.get_batch(target_layout)
-            input_ids = layout_batch["tokens"]
-            position_ids = layout_batch["position_ids"]
             labels = layout_batch["labels"]
             loss_mask = layout_batch["loss_mask"]
+            aux_inputs = aux_inputs.update(
+                input_ids=layout_batch["tokens"],
+                position_ids=layout_batch["position_ids"],
+                decoder_input=decoder_input,
+                mhc_multistream=mhc_multistream,
+                packed_seq_params=cp_batch.get_packed_seq_params(target_layout),
+            )
 
-        return MultiTokenPredictionInputs(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            decoder_input=decoder_input,
-            mhc_multistream=mhc_multistream,
-            labels=labels,
-            loss_mask=loss_mask,
-            mtp_input_mask=mtp_input_mask,
-            packed_seq_params=packed_seq_params,
-        )
+        return hidden_states, labels, loss_mask, aux_inputs
 
     def _build_layers(self, pg_collection):
         # Determine number of depths to build

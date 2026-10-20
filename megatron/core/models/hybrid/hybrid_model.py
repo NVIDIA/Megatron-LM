@@ -729,16 +729,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         mtp_hidden_states = hidden_states
         mtp_inputs = None
         if mtp_forward_ran:
-            mtp_inputs = self.mtp.prepare_cp_layout(
-                input_ids=input_ids,
-                position_ids=position_ids,
+            mtp_hidden_states, mtp_labels, mtp_loss_mask, mtp_inputs = self.mtp.prepare_cp_layout(
                 hidden_states=hidden_states,
-                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
-                mhc_multistream=mhc_multistream,
+                aux_inputs=aux_inputs.update(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    mhc_multistream=mhc_multistream,
+                    packed_sequence_cp_metadata=None,
+                    inference_context=None,
+                    embedding=self.embedding,
+                    decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
+                    mtp_input_mask=mtp_input_mask,
+                ),
                 labels=labels,
                 loss_mask=loss_mask,
-                mtp_input_mask=mtp_input_mask,
-                packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
             )
             if mtp_inputs.decoder_input is None:
@@ -746,20 +750,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "MTP requires both input_ids and position_ids when precomputed "
                     "decoder_input embeddings are not provided."
                 )
-            mtp_hidden_states, _ = self.mtp(
-                mtp_inputs.hidden_states,
-                aux_inputs.update(
-                    input_ids=mtp_inputs.input_ids,
-                    position_ids=mtp_inputs.position_ids,
-                    mhc_multistream=mtp_inputs.mhc_multistream,
-                    packed_seq_params=mtp_inputs.packed_seq_params,
-                    packed_sequence_cp_metadata=None,
-                    inference_context=None,
-                    embedding=self.embedding,
-                    decoder_input=mtp_inputs.decoder_input,
-                    mtp_input_mask=mtp_inputs.mtp_input_mask,
-                ),
-            )
+            mtp_hidden_states, _ = self.mtp(mtp_hidden_states, mtp_inputs)
 
         if not self.post_process:
             return mtp_hidden_states if mtp_forward_ran else hidden_states
@@ -786,8 +777,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
                     hidden_states=mtp_hidden_states,
-                    labels=mtp_inputs.labels,
-                    loss_mask=mtp_inputs.loss_mask,
+                    labels=mtp_labels,
+                    loss_mask=mtp_loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
                     runtime_gather_output=runtime_gather_output,

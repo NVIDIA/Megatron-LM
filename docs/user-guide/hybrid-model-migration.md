@@ -431,17 +431,18 @@ def forward(self, hidden_states, aux_inputs: LayerAuxInputs):
 
 The binder passes that object unchanged as a keyword argument, so hooks and the
 `bind_layer_inputs` and `bind_layer_outputs` hooks run once. Shortcut and the hybrid mHC wrapper use
-this form, as do HybridStack, TransformerLayer, and MambaLayer.
-Their ordinary forwards require `(hidden_states, aux_inputs)`; they no longer rebuild
-containers from individual execution keywords. HybridModel constructs one base input
+this form, as do HybridStack and MambaLayer. TransformerLayer also accepts explicit
+arguments for non-hybrid callers, packing them at its attention and MLP stages.
+HybridModel constructs one base input
 snapshot and composition layers carry it to their children. Scheduling and MTP state
 changes derive snapshots; checkpoint replay and graph boundaries reconstruct their inputs.
 Shortcut replaces its child CP/recompute state, while mHC clears its wrapper-owned
 manager before invoking a complete inner layer.
 
 GPT, ViT, RADIO, BERT, and T5 keep their explicit model-facing arguments.
-TransformerBlock packs them once for the new TransformerLayer interface; GPTModel
-neither constructs nor passes auxiliary-input containers. Its MTP call likewise uses
+TransformerBlock forwards them to TransformerLayer without constructing auxiliary-input
+containers. `_forward_attention` and `_forward_mlp` pack explicit arguments at their
+boundaries and reuse an existing container when Hybrid supplies one. GPTModel's MTP call uses
 explicit arguments, packed at the MultiTokenPredictionBlock boundary. Hybrid MTP
 continues to receive the existing container from HybridModel.
 
@@ -555,10 +556,10 @@ Unused attention/rotary/padding arguments have been removed from Mamba's pre-cor
 signature; shared callers can continue supplying them in `LayerAuxInputs`, and the
 binding selects only the arguments the stage consumes.
 
-MambaLayer selects packed-sequence CP metadata at the mixer call sites, in both
-ordinary and split-stage execution. It forwards the metadata only when the configured
-mixer has `chunkwise_context_parallel` enabled; otherwise the mixer receives `None`.
-This selection belongs to the wrapper's mixer call, independently of input binding.
+MambaLayer passes its existing auxiliary inputs directly to the mixer. Default binding
+ignores packed-sequence CP metadata for MambaMixer and GDN, whose forward signatures
+do not consume it; GDP declares the field and receives it. The explicit split-stage
+mixer call still forwards the metadata only when `chunkwise_context_parallel` is enabled.
 
 Completed Transformer and Mamba split stages return `(hidden_states, aux_outputs)`.
 Their `forward_post_core_attn` methods use `@bind_layer_output_stage`, which calls the
@@ -566,16 +567,20 @@ same `bind_layer_outputs(result)` hook without needing the original inputs.
 Shortcut consumes the completed output pair directly. Core projection stages retain
 their internal `(output, bias)` contract for residual fusion.
 
-TransformerBlock invokes layers through `LayerAuxInputs`, including the optional mHC
+TransformerBlock invokes layers with explicit arguments, including the optional mHC
 manager. Cross-attention reads context from its inputs without replacing it.
-Mamba carries the same inputs to its mixer, deriving a replacement only when it must
-clear CP metadata that the configured mixer does not consume.
+Mamba carries the same input object to its mixer without inspecting the mixer configuration.
 
 Stack and recompute callers pass available CP metadata in `LayerAuxInputs` without
 inspecting layer types. Mamba's mixer call consumes it only in chunkwise mode.
 Mamba's pre-core stage applies the same chunkwise-only policy. Transformer pre-core
 stages do not declare CP metadata and ignore it in shared calls. Shortcut orchestration
 does not select metadata for individual layer types.
+
+MTP's `prepare_cp_layout` accepts hidden states and the existing `LayerAuxInputs`,
+with labels, loss mask, and CP batch supplied separately. It returns
+`(hidden_states, labels, loss_mask, aux_inputs)`, updating auxiliary fields only when
+layout conversion is required. HybridModel passes the returned inputs directly to MTP.
 
 MTP's `_proj_and_transformer_layer` and `_checkpointed_forward` accept
 `(hidden_states, aux_inputs, *, decoder_input=...)` and forward the shared inputs to
@@ -588,28 +593,24 @@ embeddings stay local to the depth; precomputed embeddings advance without carry
 depth-local padding fills forward. The single-position inference entry point still
 constructs its input snapshot at that boundary.
 
-The stack-level `checkpointed_forward` helper takes
-`(stack, hidden_states, aux_inputs, *, ...)` and returns hidden states and extracted
+The stack-level `checkpointed_forward` helper accepts Hybrid's auxiliary inputs or
+TransformerBlock's explicit keyword arguments and returns hidden states and extracted
 intermediate tensors. Checkpoint primitives receive input tensors explicitly; replay
-reconstructs the input snapshot while non-tensor metadata stays in the closure.
+preserves the caller's input representation while non-tensor metadata stays in the closure.
 Layers never return updated input fields through the checkpoint.
 
 Transformer's raw attention/MLP helpers and `_run_mlp` carry `LayerAuxInputs` through
 to their cores. Chunked MLP execution replaces only the mask and token-ID slices.
 The `_forward_attention` and `_forward_mlp` entry points used by graph and pipeline
-schedulers retain their explicit tensor arguments; they construct inputs at that
-boundary. Checkpoint callbacks retain only the metadata consumed by the core.
+schedulers retain their explicit tensor arguments; they construct inputs only when
+no auxiliary container was supplied. Checkpoint callbacks retain only the metadata
+consumed by the core.
 
 Mamba's mixer and Transformer's self-attention and MLP/MoE calls use shared inputs.
 Dense MLP bindings ignore routing fields; MoE bindings select the fields they consume.
 Chunked MLP execution slices token IDs and padding masks alongside hidden states.
 Checkpoint and residual-fusion boundaries extract `aux_outputs.bias` and retain tensor
 outputs. TE partial MoE capture keeps its existing flat intermediate-output contract.
-
-`MoESubmodules.pre_norm` is available for core input normalization and defaults
-to `IdentityOp`; MoELayer's `bind_layer_inputs` override applies it only for
-shared calls, including ordinary
-Transformer MLP execution and each MLP chunk.
 
 `MegatronModule` binds shared inputs before module hooks and CUDA-graph selection.
 Hooks see the ordinary forward arguments and legacy result; output conversion

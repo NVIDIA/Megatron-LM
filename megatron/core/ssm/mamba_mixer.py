@@ -524,14 +524,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         """Apply the Mamba output projection to an SSM output tensor."""
         return self.out_proj(y)
 
-    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
-        """Reject unsupported packed-sequence metadata before executing the mixer."""
-        if aux_inputs.packed_sequence_cp_metadata is not None:
-            raise NotImplementedError(
-                "MambaMixer does not support packed-sequence chunkwise CP metadata."
-            )
-        return super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
-
     @bind_layer_interface
     def forward(
         self,

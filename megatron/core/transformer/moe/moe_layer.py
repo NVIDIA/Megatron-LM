@@ -15,7 +15,6 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_rout
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
-from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import LayerInterface, bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -36,7 +35,6 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
@@ -174,7 +172,6 @@ class MoESubmodules:
     experts: ExpertsBuilder
     shared_experts: SharedExpertsBuilder | None = None
     router: RouterBuilder = TopKRouter
-    pre_norm: ModuleSpec | type = IdentityOp
 
 
 class BaseMoELayer(MegatronModule, ABC):
@@ -262,12 +259,6 @@ class MoELayer(BaseMoELayer, LayerInterface):
             layer_number=layer_number,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
-        )
-        self.pre_norm = build_module(
-            self.submodules.pre_norm,
-            config=config,
-            hidden_size=config.hidden_size,
-            eps=config.layernorm_epsilon,
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
@@ -697,10 +688,6 @@ class MoELayer(BaseMoELayer, LayerInterface):
         probs, routing_map = self.route(hidden_states)
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
-
-    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
-        """Apply the configured core input norm only for shared-interface calls."""
-        return super().bind_layer_inputs(self.pre_norm(hidden_states), aux_inputs, **kwargs)
 
     @bind_layer_interface
     def forward(

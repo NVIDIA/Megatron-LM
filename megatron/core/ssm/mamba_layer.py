@@ -251,23 +251,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return None
 
-    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
-        """Omit absent optional state from the mixer's execution arguments."""
-        args, bound = super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
-        for name in ("packed_sequence_cp_metadata", "residual_stream_recompute_context"):
-            if bound.get(name) is None:
-                bound.pop(name, None)
-        return args, bound
-
     @bind_layer_interface
     def forward(self, hidden_states: Tensor, aux_inputs: LayerAuxInputs):
         """Run the mixer and residual update, carrying shared invocation inputs."""
-        residual_stream_recompute_context = aux_inputs.residual_stream_recompute_context
-        mixer_inputs = (
-            aux_inputs
-            if getattr(self.mixer, "chunkwise_context_parallel", False)
-            else aux_inputs.update(packed_sequence_cp_metadata=None)
-        )
         # Whole-layer + mixer lens spans, mirroring transformer_layer.py so the hybrid
         # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
         # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
@@ -278,7 +264,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             hidden_states, residual, connection_state, recompute_context = (
                 self._prepare_mixer_state(
                     hidden_states,
-                    residual_stream_recompute_context=residual_stream_recompute_context,
+                    residual_stream_recompute_context=aux_inputs.residual_stream_recompute_context,
                 )
             )
 
@@ -286,7 +272,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                mixer_output, aux_outputs = self.mixer(hidden_states, mixer_inputs)
+                mixer_output, aux_outputs = self.mixer(hidden_states, aux_inputs)
 
             hidden_states = self._apply_mixer_update(
                 (mixer_output, aux_outputs.bias),
