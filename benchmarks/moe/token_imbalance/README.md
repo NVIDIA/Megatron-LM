@@ -1,11 +1,84 @@
 # MoE runtime token-imbalance benchmark (standard all-to-all baseline)
 
-A reproducible benchmark for the MoE token-imbalance problem: a **fixed logical routing
-workload** is executed through the **existing standard all-to-all dispatcher**, checked
-against an exact oracle, and measured per rank.
+A reproducible benchmark for the MoE token-imbalance problem: a routing workload is executed
+through the **existing standard all-to-all dispatcher**, checked against an exact oracle, and
+measured per rank, together with the **rank-level load** it puts on each EP rank.
 
 This is the first slice of the "public runtime token-imbalance benchmark" work item. It
 deliberately does **not** implement ECHO / MoonEP / UltraEP or a runtime-aware scheduler.
+
+## What is measured: rank-level load
+
+For dropless MoE with EP, uneven expert routing turns into uneven work across EP ranks, and
+the busiest rank sets the step time. Per-expert statistics alone cannot describe that: the
+same hot experts can sit on one rank or be spread across several. Every arm therefore records,
+per step, the destination load of every EP rank and three summaries of it
+(`rank_load.py`):
+
+| Quantity | Definition | Reads as |
+|---|---|---|
+| rank load `L_r` | token-expert assignments whose expert lives on EP rank `r`, after top-k expansion (contiguous expert placement, as in Megatron) | the full vector is kept |
+| `maxvio` | `max_r L_r / mean_r L_r` | 1 when balanced; `maxvio - 1` is the busiest rank's relative overload |
+| concentration | `1 - H(p) / log R`, `p_r = L_r / sum(L)` | 0 for a uniform load, 1 when one rank gets everything; separates loads with equal `maxvio`, e.g. `[40, 20, 20, 20, 0]` (0.172) vs `[40, 15, 15, 15, 15]` (0.065) |
+| hot-rank persistence | share of consecutive-step transitions whose busiest rank is unchanged | 1 for a static hotspot, 0 when it moves every step |
+
+Per-expert counts, max/mean and CV are still recorded alongside.
+
+## Two experiments
+
+They answer different questions and are reported in separate tables.
+
+* **`trace_replay` (W\* workloads).** One fixed **logical** routing, defined from global
+  expert ids alone, replayed at any EP layout. The rank-level imbalance it produces is a
+  property of the layout; it is reported, not controlled.
+* **`rank_target` (R\* workloads).** A routing **constructed for the given layout** so that
+  every EP rank receives a chosen load exactly. This is where severity, concentration and
+  temporal persistence are varied one at a time.
+
+### trace_replay workloads
+
+Seeded by `(workload, seed, step)` only; identical at every EP/ETP layout. Every row carries
+exactly `topk` distinct experts. "Hot block" = the first `max(topk, E/4)` experts.
+
+| ID | Construction | What it isolates |
+|---|---|---|
+| `W0_balanced` | round-robin distinct top-k | exact balance control |
+| `W1_hot_expert_set` | 3/4 of the rows draw only from the hot block | per-expert heat, contiguous placement |
+| `W3_spread_hot_experts` | W1 with expert ids relabeled so the hot block is strided across the expert range | **placement only**: per-expert counts are W1's exactly, as a multiset |
+| `W4_random_balanced` | uniform random distinct top-k | sampling fluctuation around balance, vs W0's exact round-robin |
+| `W5_zero_expert_rank` | the lower half of the experts is never selected | zero-load experts and ranks |
+| `W6_rotating_hotspot` | W1's hot block moves by its own width every 3 steps | stale plans across steps (needs `--steps >= 4`) |
+| `W7_burst` | 3 steady steps, 1 burst step, recovery, period 4 | a burst hidden in steady-state numbers (needs `--steps >= 5`) |
+
+### rank_target workloads
+
+Built for `--ep`; each rank's load is spread evenly over its local experts, so only the
+rank-level shape varies. The realized per-rank load equals the target **exactly** and is a
+hard oracle check. `--hot-maxvio` (default 2.0) sets the busiest rank's load as a multiple of
+the mean.
+
+| ID | Rank-load vector (EP=5, total 100, `--hot-maxvio 2`) | What it isolates |
+|---|---|---|
+| `R0_balanced` | `[20, 20, 20, 20, 20]` | balance control |
+| `R1_hot_rank_spread` | `[40, 15, 15, 15, 15]` | severity: one hot rank, remaining load spread evenly |
+| `R2_hot_rank_concentrated` | `[40, 20, 20, 20, 0]` | concentration: same busiest-rank load (identical `maxvio`), remainder on as few ranks as possible |
+
+With two ranks the hot rank's share fixes the other one, so R1 and R2 coincide at EP=2;
+concentration needs EP >= 3.
+
+**Temporal persistence** is varied with `--schedule`, which only changes *which* rank carries
+each load slot; the per-step load multiset, and therefore `maxvio` and concentration, stay the
+same at every step:
+
+| `--schedule` | Hot rank over steps | Needs |
+|---|---|---|
+| `static` (default) | always rank 0 | `--steps >= 1` |
+| `rotate` | moves to the next rank every `--schedule-period` steps | `--steps >= period + 1` |
+| `random` | a seeded random rank permutation per step | `--steps >= 2` |
+
+A per-step workload or a non-static schedule **refuses to run** with fewer steps than it
+needs, rather than replaying only its first step. Every measured iteration runs all
+`--steps` steps in order, and each step is also timed on its own (`per_step_median_ms`).
 
 ## Modes
 
@@ -14,100 +87,24 @@ Every mode states what it includes and what it must not be used to claim.
 | Mode | Includes | Must NOT be used to claim |
 |---|---|---|
 | `dispatch_only` | dispatcher preprocess/dispatch/postprocess, a stand-in local expert computation, and combine | GEMM cost, or a training-step result |
-| `moe_fwd_bwd` | real `MoELayer` forward and backward, router included | full-model throughput or convergence |
-| `training_step` | the above plus a real optimizer update | long-run convergence or full-size model performance |
+| `moe_fwd_bwd` | real `MoELayer` forward and backward; the router runs and its top-k is replaced by the workload through `RouterReplay` | full-model throughput or convergence |
+| `training_step` | `moe_fwd_bwd` plus a real optimizer update | long-run convergence or full-size model performance |
+
+In the model modes the routing map the layer actually used is captured and compared with the
+workload at every step (`replayed_routing_exact`), so a model-mode number is always the
+workload's number.
 
 ## What is inside the timed window
 
-* **Included:** the dispatcher's four stages, the local expert computation, and the backward
-  pass in the model modes.
+* **Included:** the dispatcher's four stages and the local expert computation; the router,
+  backward pass and optimizer update in the model modes.
 * **Excluded:** metric reduction, JSON writing, printing, and warmup iterations.
-* The router **is** part of `training_step`/`moe_fwd_bwd` because it is part of a real step.
-  In `dispatch_only` the routing is fixed input and the router is not executed.
-
-## Workloads
-
-Routing is determined by `(workload, seed, step)` alone, so the same logical workload is
-reproduced regardless of execution method or EP/ETP layout. Every row carries exactly `topk`
-distinct experts.
-
-| ID | Construction | What it separates |
-|---|---|---|
-| `W0_balanced` | round-robin distinct top-k | fully balanced control (expert max/mean = 1.000) |
-| `W1_hot_expert_set` | a fixed small expert set takes most selections | per-expert skew |
-| `W2_hot_rank` | hot experts owned by one EP rank | per-rank skew, holding expert heat similar to W1 |
-| `W3_spread_hot_experts` | same expert heat, hotspot spread across ranks | placement, not heat |
-| `W4_source_ragged` | uneven per-rank source tokens | pre-dispatch skew |
-| `W5_zero_expert_rank` | half the experts never selected | zero-load experts / ranks (expert max/mean = 2.000) |
-| `W6_rotating_hotspot` | hotspot moves every 3 steps | stale plan/count across steps |
-| `W7_burst` | 3 steady steps, 1 burst step, then recovery | hiding a re-plan in steady-state numbers |
-
-Imbalance is configuration dependent: it grows as each rank holds fewer tokens, because a
-fixed hot set then covers a larger share of a smaller local batch. Both measured points are
-recorded rather than one being presented as "the" number.
-
-**EP=4, 128 tokens per rank, topk 2** (group-global histogram):
-
-| workload | expert max/mean | expert CV (pop.) |
-|---|---|---|
-| W0_balanced | 1.000 | 0.000 |
-| W1_hot_expert_set | 3.312 | 1.309 |
-| W2_hot_rank | 3.219 | 1.272 |
-| W3_spread_hot_experts | 1.281 | 0.159 |
-| W4_source_ragged | 1.281 | 0.141 |
-| W5_zero_expert_rank | 2.156 | 1.007 |
-| W6_rotating_hotspot | 3.312 | 1.319 |
-| W7_burst | 1.219 | 0.126 |
-
-**EP=4, 512 tokens per rank, topk 4**:
-
-| workload | expert max/mean | expert CV (pop.) | rank max/mean |
-|---|---|---|---|
-| W0_balanced | 1.000 | 0.000 | 1.000 |
-| W1_hot_expert_set | 1.781 | 0.744 | 1.000 |
-| W2_hot_rank | 1.770 | 0.747 | 1.000 |
-| W3_spread_hot_experts | 1.047 | 0.031 | 1.000 |
-| W4_source_ragged | 1.086 | 0.046 | 1.000 |
-| W5_zero_expert_rank | 2.000 | 1.000 | n/a |
-| W6_rotating_hotspot | 1.770 | 0.742 | 1.000 |
-| W7_burst | 1.066 | 0.040 | 1.000 |
-
-`max/mean` is `max(counts) / mean(counts)`; the CV is the population CV. At the topk-4 point
-W1/W2/W6 land in the same heat band (1.770-1.781), so the W1-vs-W2 difference there is
-placement rather than heat.
-
-## Measured results
-
-Step time by workload at a fixed configuration, worst rank, median over 20 measured iterations
-after 5 warmups. Only the logical routing changes down each row.
-
-| configuration | W0 | W1 | W2 | W3 | W4 | W5 | W6 | W7 | spread |
-|---|---|---|---|---|---|---|---|---|---|
-| `dispatch_only` EP=1 k=2 T=128 | 1.346 | 1.275 | 1.436 | 1.191 | 1.305 | **1.108** | 1.297 | **1.313** | 1.296x |
-| `dispatch_only` EP=2 k=2 T=128 | 1.806 | 3.606 | 4.714 | 1.956 | **4.866** | 4.746 | 4.427 | **1.831** | 2.694x |
-| `dispatch_only` EP=4 k=2 T=128 | **4.710** | 3.292 | 1.568 | 1.589 | 1.579 | 2.570 | **4.791** | 1.611 | 3.056x |
-| `dispatch_only` EP=2 k=4 T=512 | **4.941** | 1.644 | 1.751 | 2.624 | 1.730 | 2.686 | 2.763 | 1.782 | 3.007x |
-| `dispatch_only` EP=2 k=2 T=2048 | 2.314 | 2.665 | 2.457 | 2.729 | 2.457 | **1.915** | 3.113 | **5.206** | 2.718x |
-| `moe_fwd_bwd` EP=1 k=2 T=128 | 2.661 | 2.083 | 1.981 | 2.745 | 1.519 | **1.202** | 2.315 | **2.544** | 2.285x |
-| `moe_fwd_bwd` EP=2 k=2 T=128 | 3.252 | 3.001 | 3.113 | 2.749 | 3.017 | **3.722** | 3.023 | **3.024** | 1.354x |
-| `training_step` EP=1 k=2 T=64 | **13.099** | 14.118 | **15.566** | 9.166 | 9.352 | 9.083 | 9.737 | 9.278 | 1.714x |
-| `training_step` EP=2 k=2 T=64 | **12.764** | 12.944 | 12.416 | 11.923 | **9.820** | 11.666 | 10.750 | 12.529 | 1.318x |
-
-These are absolute times from one shared node, so they are not a cross-configuration
-comparison: EP is varied at a fixed per-rank token count, which makes the total token count
-grow with EP (weak scaling). Read a row, not a column.
-
-Correctness: **72 of 72 arms across the nine configurations passed every oracle check**,
-covering `assignments_match_T_times_k`, `combine_factor_is_topk`, `counts_len_ok`,
-`distinct_topk_ok`, `global_histogram_exact`, `id_range_ok`, `local_counts_sum_ok`,
-`recv_splits_assignments_ok`, `roundtrip_exact`, `roundtrip_matches_calibrated_factor`, and the
-three `training_step` gates.
 
 ## Correctness oracle
 
-Checked per rank, outside the timed window, with exact integer comparisons:
+Checked per rank, outside the timed window, with exact integer comparisons, at every step:
 
-* every valid token row has exactly `topk` **distinct** experts;
+* every token row has exactly `topk` **distinct** experts;
 * `sum_e assignments[e] == tokens * topk`, and the group histogram equals
   `tokens * topk * world`;
 * dispatch -> identity expert -> combine restores every row exactly. The sentinel values are
@@ -117,7 +114,9 @@ Checked per rank, outside the timed window, with exact integer comparisons:
   in the dispatcher's contract fails the run instead of silently rescaling the comparison;
 * the dispatcher's receive splits are summed across ranks and reconciled against the global
   assignment count;
-* `training_step` additionally requires a finite loss and non-zero gradients.
+* `rank_target`: the realized per-rank load equals the target (`rank_target_exact`);
+* model modes: the layer routed exactly the workload (`replayed_routing_exact`), the loss is
+  finite and gradients are non-zero.
 
 Two protocol facts this harness had to accommodate, both verified against the source:
 
@@ -131,15 +130,15 @@ Two protocol facts this harness had to accommodate, both verified against the so
 
 ## Trace v1
 
-A workload can be persisted and replayed:
+With `--write-trace DIR`, every step of a workload is persisted as `DIR/<workload>/stepNNNN/`:
 
 ```
-<trace-dir>/
+stepNNNN/
   manifest.json
   tensors/{token_ids,gates,source_rank,expert_ids}.pt
 ```
 
-Validation on load rejects:
+Validation on load (`trace.load_trace`) rejects:
 
 * an unsupported `schema_version`, a missing required field, or a missing tensor file;
 * a tensor whose sha256 does not match the manifest;
@@ -156,51 +155,54 @@ raises.
 ## Usage
 
 ```bash
-# one arm
+# trace_replay arms at EP=2, with every per-step workload exercised
 torchrun --standalone --nproc_per_node=2 benchmark.py \
-    --mode dispatch_only --ep 2 --topk 2 --tokens 128 \
-    --out results/arm1
+    --mode dispatch_only --ep 2 --topk 2 --tokens 128 --steps 6 \
+    --workloads W0_balanced,W1_hot_expert_set,W3_spread_hot_experts,W6_rotating_hotspot,W7_burst \
+    --out results/trace-ep2
 
-# persist the workload
-torchrun --standalone --nproc_per_node=2 benchmark.py \
-    --mode dispatch_only --ep 2 --out results/arm1 --write-trace /abs/path/traces
+# rank_target arms at EP=4: equal maxvio, different concentration, rotating hotspot
+torchrun --standalone --nproc_per_node=4 benchmark.py \
+    --mode moe_fwd_bwd --ep 4 --steps 4 --schedule rotate --schedule-period 1 \
+    --workloads R0_balanced,R1_hot_rank_spread,R2_hot_rank_concentrated \
+    --out results/target-ep4
 
 # validation tests (CPU only)
-python test_trace.py
+pytest test_workload.py test_rank_load.py test_trace.py
 ```
 
 Run `--help` for the full flag list. `--capability-json` writes the backend capability probe
-result so a run records what the backend actually supported.
+result so a run records what the backend actually supported. `report.py RESULTS_ROOT` turns a
+results tree into the per-experiment step-time and rank-level tables.
 
 ## Capability probe
 
 `backend_adapter.py` reports what the backend supports **here**, from imports and measurement,
-never from documentation. Unknown items are reported as `UNVERIFIED`. On a node without
-`transformer_engine` it reports `grouped_gemm: UNSUPPORTED`, which means the expert computation
-is a per-expert loop: absolute step times from such a run are **not** comparable with a
-TE-enabled node, though baseline/patch comparisons on the same node remain valid.
+never from documentation. Unknown items are reported as `UNVERIFIED`. The expert computation
+is a per-expert loop in every mode (`moe_grouped_gemm=False`), so absolute step times are
+**not** comparable with a grouped-GEMM run, though comparisons between workloads at one
+configuration remain valid.
 
 ## Metrics
 
-Per arm, per rank: median/mean/p95/min step time (CUDA events, ranks aligned outside the
-measured interval), logical tokens/s, assignments/s, expert and rank imbalance, raw
-per-expert and per-rank counts, peak allocated and reserved bytes, and the full correctness
-record.
+Per arm, per rank: median/mean/p95/min step time and the per-step medians (CUDA events, ranks
+aligned outside the measured interval), logical tokens/s, assignments/s, per-expert counts and
+their max/mean and CV, and per step the destination rank loads, `maxvio`, concentration, and
+the hot-rank persistence across steps; peak allocated and reserved bytes, and the full
+correctness record. `recv_splits_per_source_rank` is the dispatcher's receive layout on this
+rank (what it got from each source rank), which is not a rank-load measure.
 
 An arm's headline number is the **worst rank** (max over ranks), because surfacing the
 straggler is the point of a token-imbalance benchmark; averaging would hide it.
 
 ## Scope and known limitations
 
-* **`dev` was not surveyed.** The MoE roadmap states that this work item is based on the `dev`
-  branch. The node used for this work could not reach it, so this implementation is based on
-  `main` (`d564dd01d`). Landing it may require layout changes.
-* **Router replay is not wired in.** Routing is supplied at the dispatcher level, or produced
-  by the real router in `training_step`. This is a separate path from the model's
-  `RouterReplay`, and the two should not be treated as interchangeable.
+* **Every source rank sends the same routing block.** The workloads describe one source rank's
+  rows and every rank replays them, so source-side (pre-dispatch) skew is not modeled; that is
+  a sender-side dimension separate from the destination rank load measured here.
 * **Only the standard all-to-all backend exists.** There is no ECHO / MoonEP / UltraEP adapter;
   adding one should reuse that method's own code and configuration.
-* **The grouped-GEMM path is untested** on nodes without `transformer_engine`.
+* **The grouped-GEMM expert path is not exercised.**
 * **`strong` vs `weak` scaling is not a recorded field.** Increasing EP at fixed per-rank tokens
   increases the total token count, so results across EP widths are weak-scaling comparisons and
   must not be read as "EP=N is faster".

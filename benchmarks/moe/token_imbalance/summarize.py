@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """B1 summarizer: per-arm metrics and the baseline-vs-patch speed table.
 
-Reads the per-rank JSONL emitted by b1_benchmark.py and never mixes runs that disagree on
+Reads the per-rank JSONL emitted by benchmark.py and never mixes runs that disagree on
 base SHA, dtype, workload checksum, mode, or configuration. Failing arms are kept in the
 output marked with their status; they are never silently dropped or averaged in.
 
@@ -131,21 +131,23 @@ def main() -> int:
     # ---- 1. imbalance characterisation (config-independent view) -------------------
     emit("## 1. Workload imbalance (group-global expert histogram)")
     emit()
-    emit("| workload | expert max/mean | expert CV (pop.) | rank max/mean | assignments |")
-    emit("|---|---|---|---|---|")
+    emit("| workload | expert max/mean | expert CV (pop.) | rank maxvio (worst step) | "
+         "rank concentration | assignments |")
+    emit("|---|---|---|---|---|---|")
     # one representative configuration per workload: the widest EP, then the most tokens,
     # so the imbalance numbers describe the configuration where imbalance actually bites.
     for wl in sorted({a.workload_id for a in arms}):
         cands = [a for a in arms if a.workload_id == wl and a.tree == args.reference
                  and a.status() == "OK"]
         if not cands:
-            emit(f"| {wl} | n/a | n/a | n/a | n/a |")
+            emit(f"| {wl} | n/a | n/a | n/a | n/a | n/a |")
             continue
         a = max(cands, key=lambda x: (x.ep, x.tokens, x.topk))
         r0 = a.ranks[0]
         c = r0.get("correctness") or {}
         emit(f"| {a.workload_id} | {_f(r0.get('expert_imbalance'))} | {_f(r0.get('expert_cv'))} "
-             f"| {_f(r0.get('rank_imbalance'))} | {c.get('global_assignments')} "
+             f"| {_f(r0.get('maxvio_max'))} | {_f(r0.get('concentration_at_maxvio_max'))} "
+             f"| {(c.get('global_assignments_per_step') or [None])[0]} "
              f"(ep={a.ep}, T={a.tokens}, k={a.topk}) |")
     emit()
 

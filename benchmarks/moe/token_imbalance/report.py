@@ -15,10 +15,18 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-WORKLOAD_ORDER = [
-    "W0_balanced", "W1_hot_expert_set", "W2_hot_rank", "W3_spread_hot_experts",
-    "W4_source_ragged", "W5_zero_expert_rank", "W6_rotating_hotspot", "W7_burst",
-]
+# Kept in step with benchmark.WORKLOADS without importing it (this script needs no torch).
+EXPERIMENTS = {
+    "trace_replay": [
+        "W0_balanced", "W1_hot_expert_set", "W3_spread_hot_experts", "W4_random_balanced",
+        "W5_zero_expert_rank", "W6_rotating_hotspot", "W7_burst",
+    ],
+    "rank_target": ["R0_balanced", "R1_hot_rank_spread", "R2_hot_rank_concentrated"],
+}
+WORKLOAD_ORDER = [w for ws in EXPERIMENTS.values() for w in ws]
+RANK_LEVEL_FIELDS = (
+    "maxvio_max", "concentration_at_maxvio_max", "hot_rank_persistence", "rank_loads_per_step",
+)
 
 
 def load(root: Path) -> dict[str, dict[str, dict]]:
@@ -38,7 +46,7 @@ def load(root: Path) -> dict[str, dict[str, dict]]:
             c = r.get("correctness") or {}
             entry["rank"] = max(entry["rank"], r.get("rank", 0))
             # these are top-level fields on the arm record, not part of `correctness`
-            for k in ("expert_imbalance", "expert_cv", "rank_imbalance"):
+            for k in ("expert_imbalance", "expert_cv") + RANK_LEVEL_FIELDS:
                 v = r.get(k)
                 if v is None:
                     v = c.get(k)
@@ -76,39 +84,48 @@ def main() -> int:
 
     emit("## 1. Step time by workload, at fixed configuration (ms, worst rank)")
     emit()
-    emit("The point of the benchmark: only the logical routing changes down each column.")
-    emit()
-    header = "| configuration | " + " | ".join(w.split("_")[0] for w in WORKLOAD_ORDER) + \
-             " | spread |"
-    emit(header)
-    emit("|" + "---|" * (len(WORKLOAD_ORDER) + 2))
-    for cfg in sorted(data):
-        vals = []
-        for wl in WORKLOAD_ORDER:
-            e = data[cfg].get(wl)
-            vals.append(e["median_ms"] if e and e["median_ms"] else None)
-        if any(v is None for v in vals):
-            continue
-        lo, hi = min(vals), max(vals)
-        cells = " | ".join(f"{v:.3f}" for v in vals)
-        emit(f"| {cfg} | {cells} | **{hi / lo:.3f}x** |")
+    emit("Only the routing changes along a row. The two experiments are separate tables: a "
+         "trace_replay row replays one logical trace, a rank_target row is built for its "
+         "layout.")
+    for experiment, order in EXPERIMENTS.items():
+        emit()
+        emit(f"### {experiment}")
+        emit()
+        emit("| configuration | " + " | ".join(w.split("_")[0] for w in order) + " | spread |")
+        emit("|" + "---|" * (len(order) + 2))
+        for cfg in sorted(data):
+            vals = [(data[cfg].get(wl) or {}).get("median_ms") or None for wl in order]
+            present = [v for v in vals if v is not None]
+            if not present:
+                continue
+            cells = " | ".join(f"{v:.3f}" if v is not None else "n/a" for v in vals)
+            spread = f"**{max(present) / min(present):.3f}x**" if len(present) > 1 else "n/a"
+            emit(f"| {cfg} | {cells} | {spread} |")
     emit()
 
     emit("## 2. Imbalance that goes with each workload (group-global histogram)")
     emit()
-    emit("| workload | expert max/mean | expert CV (pop.) |")
-    emit("|---|---|---|")
-    ref_cfg = next((c for c in sorted(data) if "ep4" in c), sorted(data)[0])
-    for wl in WORKLOAD_ORDER:
-        e = data[ref_cfg].get(wl)
-        if not e:
-            continue
-        im = e.get("expert_imbalance")
-        cv = e.get("expert_cv")
-        emit(f"| {wl} | {im:.3f} | {cv:.3f} |" if im is not None and cv is not None
-             else f"| {wl} | n/a | n/a |")
+    emit("Rank loads count token-expert assignments per destination EP rank after top-k "
+         "expansion. maxvio = max/mean rank load (worst step); concentration = 1 - H(p)/log R "
+         "at that step; persistence = share of step transitions whose busiest rank stays.")
     emit()
-    emit(f"(from `{ref_cfg}`)")
+    emit("| configuration | workload | expert max/mean | expert CV (pop.) | rank loads (step 0) "
+         "| maxvio | concentration | persistence |")
+    emit("|---|---|---|---|---|---|---|---|")
+
+    def _f(v, digits=3):
+        return f"{v:.{digits}f}" if isinstance(v, (int, float)) else "n/a"
+
+    for cfg in sorted(data):
+        for wl in WORKLOAD_ORDER:
+            e = data[cfg].get(wl)
+            if not e:
+                continue
+            loads = (e.get("rank_loads_per_step") or [None])[0]
+            emit(f"| {cfg} | {wl} | {_f(e.get('expert_imbalance'))} | {_f(e.get('expert_cv'))} "
+                 f"| {loads if loads is not None else 'n/a'} | {_f(e.get('maxvio_max'))} "
+                 f"| {_f(e.get('concentration_at_maxvio_max'))} "
+                 f"| {_f(e.get('hot_rank_persistence'), 2)} |")
     emit()
 
     emit("## 3. Correctness oracle")
