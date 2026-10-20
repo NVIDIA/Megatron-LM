@@ -713,6 +713,37 @@ These values are model-specific results, not defaults or a universal muP rule.
 With nonzero gate bias, calibrate the logit multiplier directly because it scales
 both the gate's weight contribution and bias.
 
+### Expert Sigmoid Input Scaling
+
+The independent `--moe-latent-sigmoid-input-scale KAPPA` option defaults to `1.0`.
+It changes only routed latent experts' sigmoid argument:
+
+```text
+SwiGLU(gate, linear) = gate * sigmoid(kappa * gate) * linear
+SiTU(gate, linear) = s * tanh(gate / s) * sigmoid(kappa * gate) * linear
+```
+
+This expert activation scale is independent of the router logit scale above.
+The gate's multiplicative factor and the linear branch retain their original inputs;
+SiTU tanh arguments and any linear-branch tanh clamp stay unchanged. Dense/shared
+experts and routing are unaffected.
+For example, `--moe-latent-size 3584 --moe-latent-sigmoid-input-scale 1.41421356237`
+adjusts only the expert activation sigmoid sensitivity. The scale must
+be finite; non-unit values require latent MoE with gated SiLU. Reuse the same scale
+when loading a checkpoint to reproduce its computation.
+
+The fused custom backward includes the `kappa` chain-rule factor and uses the same
+sigmoid scale for the router-probability gradient in weighted fusions. TE native
+activations fall back to the standard activation path for non-unit scales. The TE op fuser cannot express this
+option; disable `--use-transformer-engine-op-fuser` and use `--bias-activation-fusion`
+for the custom fused activation instead.
+Inference-optimized MoE kernels reject non-unit scales; use standard grouped or
+sequential experts instead. CPU reference comparisons verify the activation math;
+GPU compiler replay, distributed training, and quality ablations remain separate
+validation. Calibrate this expert activation scale separately from the router scale; the router
+calibration criterion above does not determine the expert activation scale. Record
+activation saturation and routed-branch RMS alongside loss.
+
 ### Loss and Regularization
 | Argument | Description | Default |
 |----------|-------------|---------|

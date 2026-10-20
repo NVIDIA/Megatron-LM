@@ -1127,6 +1127,23 @@ class TestMoEModules:
             ("allgather", 1, {}),
             ("alltoall", 1, {}),
             pytest.param(
+                "allgather",
+                1,
+                {"moe_latent_size": 512, "moe_latent_sigmoid_input_scale": 1.7},
+                id="allgather-latent-sigmoid-scale",
+            ),
+            pytest.param(
+                "alltoall",
+                1,
+                {
+                    "moe_latent_size": 512,
+                    "moe_latent_sigmoid_input_scale": 1.7,
+                    "activation_func_tanh_clamp_scale": 5.0,
+                    "activation_func_tanh_clamp_scale_linear": 3.0,
+                },
+                id="alltoall-latent-situ-sigmoid-scale",
+            ),
+            pytest.param(
                 "alltoall",
                 1,
                 {
@@ -1161,6 +1178,8 @@ class TestMoEModules:
         ],
     )
     def test_moe_layer_replays(self, dispatcher, ep, extra):
+        if extra.get("moe_latent_size") is not None and not HAVE_TE:
+            pytest.skip("Latent MoE projections require Transformer Engine")
         if Utils.world_size % ep != 0 or (ep > 1 and Utils.world_size < ep):
             pytest.skip(f"needs a world size divisible by EP={ep}")
         self._init(ep=ep)

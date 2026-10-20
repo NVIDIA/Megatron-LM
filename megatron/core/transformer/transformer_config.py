@@ -938,6 +938,11 @@ class TransformerConfig(ModelParallelConfig):
     Non-identity values require sigmoid MoE routing without Sinkhorn balancing.
     Defaults to 1.0 (unchanged behavior) and adds no checkpoint tensors."""
 
+    moe_latent_sigmoid_input_scale: float = 1.0
+    """Scale only the sigmoid argument of routed latent experts' SwiGLU or SiTU gates.
+    Leaves linear factors and tanh inputs unchanged; independent of router logit scaling.
+    A non-unit value requires latent MoE with gated SiLU. Must be finite. Defaults to 1.0."""
+
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
@@ -2296,6 +2301,25 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
                     "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                )
+
+        if not math.isfinite(self.moe_latent_sigmoid_input_scale):
+            raise ValueError("moe_latent_sigmoid_input_scale must be finite.")
+        if self.moe_latent_sigmoid_input_scale != 1.0:
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "Non-unit moe_latent_sigmoid_input_scale is not supported by the TE op fuser; "
+                    "disable use_transformer_engine_op_fuser and use bias_activation_fusion."
+                )
+            if self.moe_latent_size is None or self.moe_latent_size <= 0:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires a positive moe_latent_size."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError("moe_latent_sigmoid_input_scale requires num_moe_experts.")
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires gated SiLU (SwiGLU/SiTU)."
                 )
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
