@@ -96,11 +96,6 @@ class TestModelConfigDefaults:
         assert cfg.pre_wrap_hooks == []
         assert cfg.post_wrap_hooks == []
 
-    def test_restore_modelopt_state_is_deprecated(self):
-        cfg = DummyModelConfig(restore_modelopt_state=True)
-        with pytest.warns(DeprecationWarning, match="deprecated and ignored"):
-            cfg.validate()
-
     def test_invalid_real_quant_config_is_rejected(self):
         cfg = DummyModelConfig(
             transformations=ModelTransformConfig(real_quant_cfg="unsupported")

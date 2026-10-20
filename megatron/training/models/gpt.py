@@ -12,7 +12,6 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
@@ -22,6 +21,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
@@ -112,6 +112,25 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
             transformer_cfg.qk_layernorm,
             transformer_cfg.multi_latent_attention,
             qk_l2_norm=transformer_cfg.qk_l2_norm,
+        )
+    elif config.restore_modelopt_state:
+        ## Layer specification for quantization with ModelOpt. ##
+
+        # arbitrary attention mask is used for speculative decoding training
+        # When context parallel > 1, only causal mask type is supported
+        from megatron.core import parallel_state
+
+        use_arbitrary_attention_mask = (
+            config.use_arbitrary_attention_mask
+            if config.use_arbitrary_attention_mask is not None
+            else parallel_state.get_context_parallel_world_size() == 1
+        )
+        return get_gpt_modelopt_spec(
+            config=config.transformer,
+            local_core_attention=False,
+            remap_te_layernorm=True,
+            real_quant_cfg="None",
+            use_arbitrary_attention_mask=use_arbitrary_attention_mask,
         )
     elif transformer_cfg.experimental_attention_variant is not None:
         return get_transformer_block_with_experimental_attention_variant_spec(config=transformer_cfg, vp_stage=vp_stage)

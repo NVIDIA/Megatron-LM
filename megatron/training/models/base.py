@@ -4,7 +4,6 @@ import abc
 import functools
 import importlib
 import inspect
-import warnings
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
@@ -110,7 +109,7 @@ class ModelConfig:
 
     # === ModelOpt ===
     restore_modelopt_state: bool = False
-    """Deprecated compatibility field; ignored by Megatron-LM model builders."""
+    """Restore ModelOpt quantization/sparsity state."""
 
     transformations: ModelTransformConfig | None = None
     """Declarative ModelOpt layer-spec and hook setup used by GPT/Hybrid builders."""
@@ -133,13 +132,6 @@ class ModelConfig:
 
     def validate(self) -> None:
         """Validate transformations before allocating models or loading checkpoints."""
-        if self.restore_modelopt_state:
-            warnings.warn(
-                "ModelConfig.restore_modelopt_state is deprecated and ignored by "
-                "Megatron-LM model builders; configure ModelOpt through transformations instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         if self.transformations is not None:
             target = self.transformations.qad_train_target
             if target not in (None, "mtp", "base", "both"):

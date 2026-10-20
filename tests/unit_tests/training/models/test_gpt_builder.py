@@ -105,8 +105,10 @@ class TestDefaultLayerSpecDispatch:
         )
         assert result is spec
 
-    @patch("megatron.training.models.gpt.get_gpt_layer_local_spec")
-    def test_restore_modelopt_state_does_not_change_selected_spec(self, mock_get_spec):
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_spec")
+    @patch("megatron.core.parallel_state")
+    def test_returns_modelopt_spec_when_restore_modelopt_state_true(self, mock_ps, mock_get_spec):
+        mock_ps.get_context_parallel_world_size.return_value = 1
         spec = Mock(spec=ModuleSpec)
         mock_get_spec.return_value = spec
         config = _make_dispatch_config()
@@ -114,8 +116,43 @@ class TestDefaultLayerSpecDispatch:
 
         result = default_layer_spec(config, vp_stage=None)
 
-        mock_get_spec.assert_called_once()
+        mock_get_spec.assert_called_once_with(
+            config=config.transformer,
+            local_core_attention=False,
+            remap_te_layernorm=True,
+            real_quant_cfg="None",
+            use_arbitrary_attention_mask=True,
+        )
         assert result is spec
+
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_spec")
+    @patch("megatron.core.parallel_state")
+    def test_modelopt_arbitrary_attention_mask_explicit_value(self, mock_ps, mock_get_spec):
+        mock_ps.get_context_parallel_world_size.return_value = 4
+        mock_get_spec.return_value = Mock(spec=ModuleSpec)
+        config = _make_dispatch_config()
+        config.restore_modelopt_state = True
+        config.use_arbitrary_attention_mask = True
+
+        default_layer_spec(config, vp_stage=None)
+
+        assert mock_get_spec.call_args.kwargs["use_arbitrary_attention_mask"] is True
+
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_spec")
+    @patch("megatron.core.parallel_state")
+    def test_modelopt_arbitrary_attention_mask_derived_from_cp_world_size(
+        self, mock_ps, mock_get_spec
+    ):
+        mock_ps.get_context_parallel_world_size.return_value = 4
+        mock_get_spec.return_value = Mock(spec=ModuleSpec)
+        config = _make_dispatch_config()
+        config.restore_modelopt_state = True
+        config.use_arbitrary_attention_mask = None
+
+        default_layer_spec(config, vp_stage=None)
+
+        # cp_world_size=4 → use_arbitrary_attention_mask=False
+        assert mock_get_spec.call_args.kwargs["use_arbitrary_attention_mask"] is False
 
     @patch(
         "megatron.training.models.gpt.get_transformer_block_with_experimental_attention_variant_spec"
