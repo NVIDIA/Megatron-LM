@@ -101,7 +101,7 @@ def test_adapter_rejects_fla_releases_without_kda_recompute_contract(monkeypatch
 
     monkeypatch.setattr(adapter, "chunk_kda_fwd_intra", legacy_fwd_intra)
 
-    with pytest.raises(ImportError, match="flash-linear-attention >= 0.5.2"):
+    with pytest.raises(ImportError, match="flash-linear-attention >= 0.5.1"):
         adapter._check_fla_kda_contract()
 
 

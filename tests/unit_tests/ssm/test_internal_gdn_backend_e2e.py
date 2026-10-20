@@ -2,6 +2,7 @@
 
 """GB200 end-to-end correctness and performance coverage for internal GDR."""
 
+import math
 import os
 from statistics import median
 
@@ -329,3 +330,203 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, rag
     assert cute_ms <= fla_ms * 1.10, (
         f"CuTe path regressed: {cute_ms:.3f} ms vs FLA {fla_ms:.3f} ms " f"({speedup:.2f}x)"
     )
+
+
+# --------------------------------------------------------------------------------------------
+# KDA: FLA's Triton kernels plus the in-tree CuTe DSL CP pre-processing in its per-key gate mode.
+# --------------------------------------------------------------------------------------------
+
+_KDA_HEADS = 8  # the CuTe CP dispatcher needs a multiple of four value heads
+_KDA_LOWER_BOUND = -5.0
+# Rank-independent: a TP shard holds the same A_log / dt_bias on every CP rank.
+_KDA_PARAM_SEED = 4242
+_KDA_NAMES = ("out", "dq", "dk", "dv", "dg", "dbeta", "dA_log", "ddt_bias")
+# Relative-L2 limits against FLA's own CP path on the same operands. On GB300 (CP4 and CP8) the
+# output and dq are bit-identical and the other gradients sit at 3.7e-3..5.4e-3; the limits
+# leave headroom for bf16 accumulation-order noise.
+_KDA_REL_L2_LIMITS = {
+    "out": 1e-2,
+    "dq": 1e-2,
+    "dk": 2e-2,
+    "dv": 2e-2,
+    "dg": 5e-2,
+    "dbeta": 2e-2,
+    "dA_log": 5e-2,
+    "ddt_bias": 5e-2,
+}
+
+
+def _cutedsl_cp_device(cp_size):
+    """Skip unless this is a Blackwell CUDA-13 rank of a ``cp_size``-rank distributed run."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    if torch.cuda.get_device_capability(device)[0] != 10:
+        pytest.skip("the CuTe DSL CP kernels require a Blackwell data-center GPU (SM10x)")
+    if not torch.version.cuda or int(torch.version.cuda.split(".", 1)[0]) < 13:
+        pytest.skip("the CuTe DSL CP kernels require CUDA 13+")
+    pytest.importorskip("cutlass")
+    pytest.importorskip("cuda.bindings.driver")
+    pytest.importorskip("fla.ops.kda")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size != cp_size:
+        pytest.skip(f"CP{cp_size} coverage requires exactly {cp_size} distributed ranks")
+    return device
+
+
+def _make_kda_inputs(device, *, head_dim, seed):
+    """Operands shaped like KimiDeltaAttention hands them to chunk_kda (B=1, [1, T, H, D])."""
+    gen = torch.Generator().manual_seed(seed)
+    param_gen = torch.Generator().manual_seed(_KDA_PARAM_SEED)
+    shape = (1, _SEQUENCE_LENGTH, _KDA_HEADS, head_dim)
+
+    def rnd(*size):
+        return torch.randn(*size, generator=gen).to(device)
+
+    # Megatron L2-normalises q/k before the kernel (use_qk_l2norm_in_kernel=False) and passes
+    # the raw gate logits; the kernel applies A_log / dt_bias (use_gate_in_kernel=True).
+    q = F.normalize(rnd(*shape), dim=-1).to(torch.bfloat16)
+    k = F.normalize(rnd(*shape), dim=-1).to(torch.bfloat16)
+    v = (0.1 * rnd(*shape)).to(torch.bfloat16)
+    g = rnd(*shape).to(torch.bfloat16)
+    beta = torch.sigmoid(rnd(*shape[:-1])).float()
+    A_log = torch.log(torch.empty(_KDA_HEADS).uniform_(1.0, 16.0, generator=param_gen)).to(device)
+    dt_min, dt_max = 1e-3, 1e-1
+    dt = torch.exp(
+        torch.rand(_KDA_HEADS * head_dim, generator=param_gen)
+        * (math.log(dt_max) - math.log(dt_min))
+        + math.log(dt_min)
+    ).clamp(min=1e-4)
+    # Inverse softplus, as KimiDeltaAttention._reset_dt_bias.
+    dt_bias = (dt + torch.log(-torch.expm1(-dt))).to(device)
+    inputs = tuple(t.requires_grad_() for t in (q, k, v, g, beta, A_log, dt_bias))
+    return inputs, rnd(*shape).to(torch.bfloat16)
+
+
+def _kda_forward_backward(chunk_kda, inputs, grad_output, *, cp_context):
+    q, k, v, g, beta, A_log, dt_bias = inputs
+    output, _ = chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        use_gate_in_kernel=True,
+        safe_gate=True,
+        lower_bound=_KDA_LOWER_BOUND,
+        cp_context=cp_context,
+    )
+    return output, torch.autograd.grad(output, inputs, grad_outputs=grad_output)
+
+
+def _relative_l2(actual, expected):
+    expected = expected.detach().float()
+    diff = torch.linalg.vector_norm(actual.detach().float() - expected)
+    denom = torch.linalg.vector_norm(expected)
+    return (diff / denom).item() if denom > 0 else diff.item()
+
+
+def _build_kda_cp_context(device, cp_size, *, ragged, request):
+    from fla.ops.cp import build_cp_context
+
+    from megatron.core import parallel_state
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import prepare_cp_context_metadata
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(context_parallel_size=cp_size)
+    request.addfinalizer(Utils.destroy_model_parallel)
+    group = parallel_state.get_context_parallel_group()
+    global_tokens = _SEQUENCE_LENGTH * cp_size
+    if ragged:
+        cu_seqlens = _ragged_cu_seqlens(global_tokens, device)
+    else:
+        cu_seqlens = torch.tensor([0, global_tokens], device=device, dtype=torch.int32)
+    cp_context = build_cp_context(cu_seqlens=cu_seqlens, group=group, conv1d_kernel_size=4)
+    prepare_cp_context_metadata(
+        cp_context, global_num_sequences=cu_seqlens.numel() - 1, global_cu_seqlens=cu_seqlens
+    )
+    return cp_context, torch.distributed.get_rank(group=group)
+
+
+@pytest.mark.parametrize("ragged", [False, True], ids=["aligned", "ragged"])
+@pytest.mark.parametrize("cp_size", [2, 4], ids=["cp2", "cp4"])
+def test_internal_kda_cute_cp_preprocess_matches_fla(monkeypatch, cp_size, ragged, request):
+    """Strict ``cute`` mode at the Kimi head geometry (K == V == 128): the CuTe CP pre-processing
+    must launch in both directions, never fall back, and match FLA's own CP path on the output
+    and all seven gradients."""
+    device = _cutedsl_cp_device(cp_size)
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import chunk_kda
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_cp_cute
+
+    cp_context, rank = _build_kda_cp_context(device, cp_size, ragged=ragged, request=request)
+    inputs, grad_output = _make_kda_inputs(device, head_dim=_HEAD_DIM, seed=1234 + rank)
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
+    monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "0")
+    reference = _kda_forward_backward(chunk_kda, inputs, grad_output, cp_context=cp_context)
+
+    forward_before = fused_gdr_cp_cute.get_cutedsl_fused_launch_count()
+    backward_before = fused_gdr_cp_cute.get_cutedsl_fused_bwd_launch_count()
+    fused_gdr_cp_cute.reset_cutedsl_fallback_reasons()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
+    monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "1")
+    actual = _kda_forward_backward(chunk_kda, inputs, grad_output, cp_context=cp_context)
+    # One CuTe boundary launch per direction. Strict mode raises on a fallback; the empty
+    # fallback-reason map is the second witness that the dispatcher never declined.
+    assert fused_gdr_cp_cute.get_cutedsl_fused_launch_count() == forward_before + 1
+    assert fused_gdr_cp_cute.get_cutedsl_fused_bwd_launch_count() == backward_before + 1
+    assert fused_gdr_cp_cute.get_cutedsl_fallback_reasons() == {}
+
+    torch.testing.assert_close(actual[0], reference[0], atol=1e-2, rtol=1e-2)
+    for name, got, expected in zip(
+        _KDA_NAMES, (actual[0], *actual[1]), (reference[0], *reference[1])
+    ):
+        assert torch.isfinite(got).all(), f"{name} is not finite"
+        relative_l2 = _relative_l2(got, expected)
+        assert (
+            relative_l2 <= _KDA_REL_L2_LIMITS[name]
+        ), f"{name}: relative L2 {relative_l2:.3e} > {_KDA_REL_L2_LIMITS[name]:.1e} vs FLA"
+
+
+@pytest.mark.parametrize("cp_size", [2, 4], ids=["cp2", "cp4"])
+def test_internal_kda_head_dim_outside_cute_envelope_is_not_silent(monkeypatch, cp_size, request):
+    """Head dims other than 128 cannot pass as CuTe coverage: ``cute`` mode raises with the
+    dispatcher's reason, and ``auto`` mode records the fallback while matching FLA's output.
+
+    Only the output is compared: with 64-dim heads FLA's own CP backward is not run-to-run
+    reproducible on GB300 (fla-core 0.5.1 and 0.5.2 alike, two FLA runs differ by ~10 % relative
+    L2 on dk/dv/dg/dbeta while the output and dq are bit-identical), so gradient closeness says
+    nothing about the adapter here; the 128-dim tests above cover the gradients.
+    """
+    device = _cutedsl_cp_device(cp_size)
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import chunk_kda
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_cp_cute
+
+    cp_context, rank = _build_kda_cp_context(device, cp_size, ragged=False, request=request)
+    inputs, grad_output = _make_kda_inputs(device, head_dim=64, seed=1234 + rank)
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
+    monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "1")
+    with pytest.raises(RuntimeError, match=r"K=64,V=64 \(need K==V==128\)"):
+        _kda_forward_backward(chunk_kda, inputs, grad_output, cp_context=cp_context)
+
+    forward_before = fused_gdr_cp_cute.get_cutedsl_fused_launch_count()
+    fused_gdr_cp_cute.reset_cutedsl_fallback_reasons()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    auto = _kda_forward_backward(chunk_kda, inputs, grad_output, cp_context=cp_context)
+    assert fused_gdr_cp_cute.get_cutedsl_fused_launch_count() == forward_before
+    assert "K=64,V=64 (need K==V==128)" in fused_gdr_cp_cute.get_cutedsl_fallback_reasons()
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
+    monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "0")
+    reference = _kda_forward_backward(chunk_kda, inputs, grad_output, cp_context=cp_context)
+    torch.testing.assert_close(auto[0], reference[0], atol=1e-2, rtol=1e-2)
+    for name, got in zip(_KDA_NAMES[1:], auto[1]):
+        assert torch.isfinite(got).all(), f"{name} is not finite"

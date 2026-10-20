@@ -3,6 +3,7 @@
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
 import math
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional
@@ -153,6 +154,39 @@ class KimiDeltaAttention(_GDNBase):
         self.gated_delta_rule = (
             internal_chunk_kda if self.config.gdn_gdr_backend == "internal" else chunk_kda
         )
+        if self.config.gdn_gdr_backend == "internal":
+            KimiDeltaAttention._warn_if_internal_cp_preprocess_cannot_apply(self)
+
+    def _warn_if_internal_cp_preprocess_cannot_apply(self) -> None:
+        """Warn when the in-tree CuTe DSL CP pre-processing cannot serve this layer.
+
+        The CuTe kernels take ``K == V == 128`` and a multiple of four local value heads.
+        Outside that envelope the ``internal`` backend still runs, but its CP boundary
+        pre-processing is FLA's Triton path (the dispatcher declines and the shims fall
+        back), so the layer is not exercising the in-tree kernels. Headwise CP and CP=1
+        never reach the pre-processing, so nothing is reported for them.
+        """
+        config = self.config
+        if config.linear_cp_mode != "chunkwise" or config.context_parallel_size <= 1:
+            return
+        reasons = []
+        if config.linear_key_head_dim != 128 or config.linear_value_head_dim != 128:
+            reasons.append(
+                f"head dims K={config.linear_key_head_dim}, V={config.linear_value_head_dim} "
+                "(the CuTe CP kernels need K == V == 128)"
+            )
+        if self.num_k_heads_local_tp % 4 != 0:
+            reasons.append(
+                f"{self.num_k_heads_local_tp} local heads (the CuTe CP kernels need a multiple of 4)"
+            )
+        if reasons:
+            warnings.warn(
+                "gdn_gdr_backend='internal': the in-tree CuTe DSL context-parallel "
+                f"pre-processing does not apply to this KDA layer ({'; '.join(reasons)}); "
+                "FLA's Triton pre-processing runs instead. Set MCORE_GDN_INTERNAL_BACKEND=cute "
+                "to turn this fallback into an error.",
+                stacklevel=2,
+            )
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int]:
         """Return KDA qkv/raw-g/output-gate split sizes for runtime headwise CP."""

@@ -1,9 +1,10 @@
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
-# Portions of this file follow the MIT-licensed FLA v0.5.2 KDA autograd
-# contract (fla/ops/kda/chunk.py, chunk_fwd.py and chunk_bwd.py). The CP
-# boundary pre-processing is redirected to the in-tree CuTe DSL kernels.
+# Portions of this file follow the MIT-licensed FLA v0.5.1 KDA autograd
+# contract (fla/ops/kda/chunk.py, chunk_intra.py and chunk_bwd.py; the
+# autograd module and every primitive signature are unchanged in v0.5.2).
+# The CP boundary pre-processing is redirected to the in-tree CuTe DSL kernels.
 
 """Autograd orchestration for KDA: FLA Triton kernels + in-tree CP pre-processing.
 
@@ -58,10 +59,11 @@ _KNOWN_KWARGS = frozenset({"A_log", "dt_bias", "chunk_size", "transpose_state_la
 
 
 def _check_fla_kda_contract() -> None:
-    """Refuse FLA releases whose KDA primitives predate the 0.5.2 recompute contract.
+    """Refuse FLA releases whose KDA primitives predate the 0.5.1 recompute contract.
 
-    The adapter copies FLA 0.5.2's ``chunk_kda_fwd`` / ``chunk_kda_bwd`` bodies. It
-    relies on ``chunk_kda_fwd_intra`` taking ``disable_recompute`` (so ``qg`` is only
+    The adapter copies the ``ChunkKDAFunction`` forward/backward bodies of FLA 0.5.1
+    (the release Megatron pins; byte-identical in 0.5.2). It relies on
+    ``chunk_kda_fwd_intra`` taking ``disable_recompute`` (so ``qg`` is only
     materialised when it is saved), on ``recompute_w_u_fwd`` taking ``q`` (so the
     backward can materialise ``qg`` for the CP pre-process), and on the gated delta
     ``fwd_h`` primitive taking ``gk`` plus ``cu_seqlens_cpu``.
@@ -84,7 +86,7 @@ def _check_fla_kda_contract() -> None:
         or (fwd_h is not None and ("gk" not in fwd_h or "cu_seqlens_cpu" not in fwd_h))
     ):
         raise ImportError(
-            "The internal KDA adapter requires flash-linear-attention >= 0.5.2 (KDA chunk "
+            "The internal KDA adapter requires flash-linear-attention >= 0.5.1 (KDA chunk "
             "primitives with disable_recompute / qg materialisation); the installed release "
             "exposes an older KDA kernel signature."
         )
@@ -172,7 +174,7 @@ def _kda_internal_support_reason(
 
 
 class InternalChunkKDAFunction(torch.autograd.Function):
-    """FLA 0.5.2 ``ChunkKDAFunction`` with the CP pre-processing redirected in-tree."""
+    """FLA 0.5.1 ``ChunkKDAFunction`` with the CP pre-processing redirected in-tree."""
 
     @staticmethod
     @input_guard

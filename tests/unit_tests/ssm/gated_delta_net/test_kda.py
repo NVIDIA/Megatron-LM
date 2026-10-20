@@ -2,6 +2,7 @@
 
 import copy
 import os
+import warnings
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -183,6 +184,31 @@ def test_kda_binds_gated_delta_rule_by_backend(backend):
         # Every other backend value keeps FLA's chunk_kda (None when FLA is absent).
         assert shell.gated_delta_rule is kda_module.chunk_kda
     assert shell.in_proj_split_names == ["query", "key", "value", "g", "gate"]
+
+
+def test_kda_internal_backend_warns_when_cutedsl_cp_preprocess_cannot_apply():
+    """Under chunkwise CP the internal backend names the layouts the CuTe CP kernels decline."""
+
+    def setup(**overrides):
+        config = replace(
+            _make_config(cp_size=2, linear_cp_mode="chunkwise"),
+            gdn_gdr_backend="internal",
+            **overrides,
+        )
+        shell = _kda_shell(config)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            KimiDeltaAttention._setup_variant_attrs(shell)
+        return [str(w.message) for w in caught if "CuTe DSL context-parallel" in str(w.message)]
+
+    # The test config's 32-dim heads are outside the kernels' K == V == 128 envelope.
+    (message,) = setup()
+    assert "K=32, V=32" in message and "K == V == 128" in message
+    # Kimi's geometry (128-dim heads, a multiple of four heads) raises nothing.
+    assert setup(linear_key_head_dim=128, linear_value_head_dim=128) == []
+    # Headwise CP and CP=1 never reach the CP pre-processing.
+    assert setup(linear_cp_mode="headwise") == []
+    assert setup(context_parallel_size=1) == []
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])

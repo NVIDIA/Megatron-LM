@@ -114,3 +114,11 @@ with no CuTeDSL fallback. The GB200 test
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` checks the forward and
 backward launch-counter deltas and requires the fallback-reason map to remain
 empty, in addition to comparing the output and five gradients with pure FLA.
+The same file covers the per-key (`gk`) gate mode through the KDA adapter at
+the Kimi head geometry (K == V == 128) under CP2 and CP4 in strict `cute`
+mode: one launch per direction, no fallback, output and all seven gradients
+against FLA's own CP path; a companion test pins down that head dims outside
+the kernels' envelope raise in `cute` mode and are recorded as fallbacks in
+`auto` mode instead of passing silently. The tests skip unless the pytest
+process group has exactly `cp_size` ranks (run them under `torchrun
+--nproc_per_node=2` and `=4`).
