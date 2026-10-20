@@ -17,10 +17,6 @@ from .linear import linear
 from .routing import route
 
 
-def _gather(x, group):
-    return gather_from_sequence_parallel_region(x, group=group)
-
-
 def combine(slots, indices, shared):
     result = torch.zeros_like(shared, dtype=torch.float32) + shared.float()
     for slot in range(indices.shape[1]):
@@ -46,7 +42,9 @@ class MegaMoE(MoELayer):
             raise ValueError('MegaMoE requires the Core contiguous global expert ownership map')
         logits = linear(x, self.router.weight, fp8=False)
         weights, indices = route(logits, self.router, input_ids)
-        counts = _gather(torch.tensor([x.shape[0]], dtype=torch.int64, device=x.device), group)
+        counts = gather_from_sequence_parallel_region(
+            torch.tensor([x.shape[0]], dtype=torch.int64, device=x.device), group=group
+        )
         capacity = max(1, int(counts.max()))
         codes, scale = experts.quantize_activation(x)
         limit = self.config.activation_func_clamp_value
@@ -57,7 +55,9 @@ class MegaMoE(MoELayer):
         )
 
         def gather(value, fill=0):
-            return _gather(pad(value, (0, 0, 0, capacity - value.shape[0]), value=fill), group)
+            return gather_from_sequence_parallel_region(
+                pad(value, (0, 0, 0, capacity - value.shape[0]), value=fill), group=group
+            )
 
         encoded = gather(codes.view(torch.uint8)), gather(scale, 1)
         live, scores, routes = gather(x), gather(weights), gather(indices, -1)

@@ -85,7 +85,6 @@ class _SWAInsert(torch.autograd.Function):
         lengths = torch.tensor([rows], dtype=torch.int32, device=q.device)
         dequantize_and_gather_k_cache(decoded, packed, lengths, None, table, block, 0)
         ctx.save_for_backward(positions, cache)
-        ctx.heads = heads
         return rotated[:, :heads], decoded[0]
 
     @staticmethod
