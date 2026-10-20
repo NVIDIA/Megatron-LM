@@ -27,8 +27,8 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
     set_run_config,
 )
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
@@ -228,10 +228,11 @@ class TestMoESingleGroupedWeightNumerics:
             raise ValueError(f"Unknown precision test case: {precision}")
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
         set_run_config(pretrain_cfg_container_from_args(args))
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def get_batch(self):
@@ -527,7 +528,9 @@ class TestMoESingleGroupedWeightNumerics:
         args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
             single_weight=load_single_weight, checkpoint_dir=checkpoint_dir
         )
-        loaded_iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+        loaded_iteration, _ = load_checkpoint(
+            model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+        )
         assert loaded_iteration == 2
         return self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
 

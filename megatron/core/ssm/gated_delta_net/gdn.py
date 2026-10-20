@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -27,15 +28,10 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.gdp import fused_recurrent_gated_delta_rule_update
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
-
-try:
-    from fla.modules.convolution import causal_conv1d_update
-    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
-except ImportError:
-    causal_conv1d_update = None
-    fused_recurrent_gated_delta_rule = None
 
 
 def get_parameter_local_cp_headwise(
@@ -102,12 +98,42 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
-
-        if self.config.deterministic_mode:
-            self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
-            self.gated_delta_rule = chunk_gated_delta_rule
         self.chunk_size = 64
+
+        backend = self.config.gdn_kernel_backend
+        if self.config.deterministic_mode and backend != "torch":
+            raise ValueError(
+                "deterministic_mode=True requires gdn_kernel_backend='torch' for " "Gated DeltaNet."
+            )
+
+        if backend == "torch":
+            self.gdn_backend = "torch"
+            self.gated_delta_rule = torch_chunk_gated_delta_rule
+            return
+
+        if backend == "fla":
+            self.gdn_backend = "fla"
+            self.gated_delta_rule = chunk_gated_delta_rule
+            return
+
+        if not HAVE_TE_GDN:
+            raise ImportError(
+                "gdn_kernel_backend='transformer_engine' requires TransformerEngine's "
+                "GatedDeltaNetAttention (GDN) support."
+            )
+
+        # Q/K are expanded to the value-head count by
+        # `_prepare_input_for_gated_delta_rule`, so this DPA instance operates on
+        # the local head shard produced by the TP/CP all-to-all plumbing above.
+        self.gdn_backend = "transformer_engine"
+        num_local_heads = self.num_v_heads_local_tp // self.cp_size
+        self.core_attention = TEGatedDeltaNetAttention(
+            num_attention_heads=num_local_heads,
+            qk_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            layer_number=self.layer_number,
+        )
+        self.gated_delta_rule = self.core_attention
 
     @jit_fuser
     def _compute_gates(
@@ -311,9 +337,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
         if inference_context is not None:
             if inference_context.is_dynamic_batching():
-                assert (
-                    not self.config.deterministic_mode
-                ), "GDN dynamic inference requires the FLA recurrent kernels."
+                if self.gdn_backend != "fla":
+                    raise ValueError(
+                        "GDN dynamic inference requires gdn_kernel_backend='fla' because "
+                        "only the FLA recurrent kernels are supported."
+                    )
                 assert (
                     not self.config.batch_invariant_mode
                 ), "GDN dynamic inference does not support batch-invariant mode."
@@ -379,42 +407,37 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         intermediate_conv_state: torch.Tensor | None = None,
         intermediate_ssm_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run one CUDA-graph-compatible GDN decode token per request."""
+        """Run one CUDA-graph-compatible GDN decode token per request.
+
+        Both kernels read and write the state caches in place at `batch_indices`;
+        a `-1` (padding) row gets a zero output without reading inputs or state.
+        """
         batch, seq_len, _ = projected.shape
         assert seq_len == 1, "GDN speculative decoding is not supported."
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDN speculative decoding state capture is not supported."
-        assert causal_conv1d_update is not None and fused_recurrent_gated_delta_rule is not None
 
         qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len)
-        read_indices = batch_indices.clamp(min=0)
-
-        active_conv_state = conv_state[read_indices].contiguous()
-        qkv_dtype = qkv.dtype
-        qkv, active_conv_state = causal_conv1d_update(
-            x=qkv.to(conv_state.dtype),
-            cache=active_conv_state,
-            weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
-            bias=self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,
-            activation=self.activation,
-        )
-        qkv = qkv.to(qkv_dtype)
-        tensor_masked_update(conv_state, batch_indices, active_conv_state)
+        qkv = causal_conv1d_update(
+            qkv.to(conv_state.dtype),
+            conv_state,
+            self.conv1d.weight.squeeze(1).to(conv_state.dtype),
+            self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,
+            self.activation,
+            conv_state_indices=batch_indices,
+        ).to(qkv.dtype)
 
         kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, batch, seq_len)
-        active_ssm_state = ssm_state[read_indices].contiguous()
-        core_attn_out, final_ssm_state = fused_recurrent_gated_delta_rule(
+        core_attn_out, _ = fused_recurrent_gated_delta_rule_update(
             **kernel_inputs,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
-            initial_state=active_ssm_state,
-            output_final_state=True,
+            state=ssm_state,
+            state_indices=batch_indices,
             use_qk_l2norm_in_kernel=self.use_qk_l2norm,
-            use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
         )
-        tensor_masked_update(ssm_state, batch_indices, final_ssm_state)
         return self._apply_gated_norm(core_attn_out, gate).reshape(batch, seq_len, -1)
 
     def ssm_prefill(
@@ -679,7 +702,7 @@ def torch_chunk_gated_delta_rule(
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        value.new_zeros((batch_size, num_heads, k_head_dim, v_head_dim))
         if initial_state is None
         else initial_state.to(value)
     )

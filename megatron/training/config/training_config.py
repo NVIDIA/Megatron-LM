@@ -112,9 +112,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    eval_iters: int | None = 100
+    eval_iters: int | list[int | None] | None = field(
+        default=100, metadata={"argparse_meta": {"type": int}}
+    )
     """Number of iterations to run for evaluation. Used for both validation and test. If not set,
-    evaluation will not run."""
+    evaluation will not run. Full/multiple validation resolves this to per-dataset counts."""
 
     eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
@@ -140,9 +142,6 @@ class ValidationConfig:
 
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
-
-    test_mode: bool = False
-    """Run all real-time test alongside the experiment."""
 
     full_validation: bool = False
     """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""
@@ -315,23 +314,11 @@ class LoggerConfig:
     log_l2_norm_grad_to_tensorboard: bool = False
     """Enable gradients logging to tensorboard."""
 
-    log_num_zeros_in_grad: bool = False
-    """If set, calculate and log the number of zeros in gradient."""
-
-    log_max_attention_logit: bool = False
-    """Enable max attention logit logging to tensorboard."""
-
     log_runtime_to_tensorboard: bool = False
     """Enable runtime metrics logging to tensorboard."""
 
     runtime_time_unit: str = "hours"
     """Time unit to use for time logging. """
-
-    barrier_with_L1_time: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}})
-    """If not disabled, use barrier with level 1 time measurements. Note that this is up to the user to
-    make sure calling barrier with their timers will not result in hangs. This can happen if for
-    example the user adds a level 1 timer that is not called by all ranks.
-    """
 
     log_world_size_to_tensorboard: bool = False
     """Enable world size logging to tensorboard."""
@@ -386,6 +373,53 @@ class LoggerConfig:
 
     moe_routing_trace_dump_weights: bool = False
     """Save router weight tensors to a .pt sidecar file."""
+
+    enable_one_logger: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-one-logger"]}},
+    )
+    """Enable/disable using one_logger to track E2E metrics.
+    Note that one_logger is an internal tool and not available externally.
+    For installation, please go to
+    https://confluence.nvidia.com/display/MLWFO/Package+Repositories for more details.
+    """
+
+    one_logger_project: str = "megatron-lm"
+    """The one-logger project name. Ignored if --no-one-logger is set."""
+
+    one_logger_run_name: str | None = None
+    """The one-logger run name displayed. Ignored if --no-one-logger is set."""
+
+    one_logger_async: bool = False
+    """Run one-logger asynchronously."""
+
+    app_tag_run_name: str | None = None
+    """Application run name shared across training jobs."""
+
+    app_tag_run_version: str = "0.0.0"
+    """Application version associated with performance metrics."""
+
+    otel_enabled: bool = False
+    """Enable OpenTelemetry telemetry (traces and metrics).
+    See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.
+    """
+
+    otel_service_name: str | None = None
+    """Override OTEL_SERVICE_NAME for this training run."""
+
+    otel_span_groups: str | None = None
+    """Comma-separated span-group spec controlling which OTel instrumentation boundaries are active.
+    Accepts preset keywords ("default", "per_step", "full", "all") or individual group names
+    ("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", "step",
+    "forward_backward", "optimizer", "microbatch"), or a mix.
+    Defaults to "default" (coarse job/checkpoint/evaluate spans only).
+    Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.
+    """
+
+    def validate(self) -> None:
+        """Check logging requirements shared by CLI and native configurations."""
+        if self.log_memory_interval is not None:
+            assert self.log_memory_interval % self.log_interval == 0
 
 
 @dataclass(kw_only=True)
@@ -647,6 +681,17 @@ class CheckpointConfig:
 
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
+
+    stream_ckpt_dequant: bool = False
+    """Inference-only load path for models with quantized params (--fp8-param-gather or
+    --fp4-param-gather). The distributed checkpoint load quantizes each destination param in place
+    from a per-tensor high-precision scratch, instead of dequantizing the entire state dict to high
+    precision before the load starts, which allocates a full high-precision replica of the model
+    and can OOM on large models. The loaded state dict then holds the quantized params themselves,
+    so it is weights-only: it requires --no-load-optim, refuses --finetune,
+    --load-main-params-from-ckpt and any optimizer. Supports the tensorwise, mxfp8, blockwise and
+    nvfp4 recipes (not delayed scaling) and, with --ckpt-fully-parallel-load, only the broadcast
+    exchange algorithm. Pass it explicitly on the inference command line."""
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support

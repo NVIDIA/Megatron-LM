@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import inspect
 import os
 import sys
 
@@ -11,6 +12,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -42,6 +44,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudaGraphRunner,
     create_cudagraphs,
     delete_cuda_graphs,
+    is_graph_warmup,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -58,6 +61,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model, is_te_min_version
 from megatron.training import arguments as training_arguments
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -590,8 +594,8 @@ class TestPackedSeqCudagraphs:
             pad_between_seqs=True,
         )
 
-    @pytest.mark.parametrize("cp_size", [1, pytest.param(2, marks=pytest.mark.flaky_in_dev)])
-    def test_thd_capture_with_pad_between_seqs(self, cp_size):
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    def test_thd_capture_with_pad_between_seqs(self, cp_size, monkeypatch):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
         model_parallel_cuda_manual_seed(123)
@@ -668,8 +672,28 @@ class TestPackedSeqCudagraphs:
         assert padded_cu_seqlens_metadata.is_cudagraph_input
         eager_out.sum().backward()
 
+        # Graph warmup must see the recorded offsets, not zero-filled placeholders:
+        # TE's THD context-parallel backward indexes with them and asserts out of bounds on zeros.
+        # Resolved by TransfomerEngine#3205.
+        warmup_offsets = []
+        attention_forward = TEDotProductAttention.forward
+
+        def recording_forward(module, *args, **kwargs):
+            if is_graph_warmup():
+                bound = inspect.signature(attention_forward).bind(module, *args, **kwargs)
+                params = bound.arguments["packed_seq_params"]
+                warmup_offsets.append(
+                    (params.cu_seqlens_q.clone(), params.cu_seqlens_q_padded.clone())
+                )
+            return attention_forward(module, *args, **kwargs)
+
+        monkeypatch.setattr(TEDotProductAttention, "forward", recording_forward)
         # This is the primary function under test.
         create_cudagraphs()
+        assert warmup_offsets
+        for cu_seqlens, cu_seqlens_padded in warmup_offsets:
+            assert torch.equal(cu_seqlens, packed_seq_params.cu_seqlens_q)
+            assert torch.equal(cu_seqlens_padded, packed_seq_params.cu_seqlens_q_padded)
 
         runners = []
         for layer in block.layers:
@@ -1539,7 +1563,7 @@ class TestPartialCudaGraph:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size, cp_size):

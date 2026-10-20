@@ -34,7 +34,6 @@ def load_args_from_checkpoint(args):
     args.untie_embeddings_and_output_weights = True
     args.seq_length = 4096
     args.global_batch_size = 1024
-    args.iteration = 1 # '0', 'release' don't work
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
@@ -163,9 +162,9 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables, set_run_config
         from megatron.training.argument_utils import inference_cfg_container_from_args
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -223,7 +222,6 @@ def _load_checkpoint(queue, args):
     check_for_arg('max_position_embeddings')
     check_for_arg('position_embedding_type')
     check_for_arg('tokenizer_type')
-    check_for_arg('iteration')
     check_for_arg('disable_bias_linear')
     check_for_arg('params_dtype')
     check_for_arg('swiglu')
@@ -235,10 +233,8 @@ def _load_checkpoint(queue, args):
     # Suppress warning about torch.distributed not being initialized.
     LanguageModule.embedding_warning_printed = True 
 
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(margs, build_model_config=False))
-    set_global_variables(margs, build_tokenizer=False)
+    cfg = inference_cfg_container_from_args(margs, build_model_config=False)
+    set_global_variables(margs, cfg, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
@@ -260,7 +256,7 @@ def _load_checkpoint(queue, args):
     md.num_attention_heads = margs.num_attention_heads
     md.max_position_embeddings = margs.max_position_embeddings
     md.tokenizer_type = margs.tokenizer_type
-    md.iteration = margs.iteration
+    md.iteration = 1
     md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights
