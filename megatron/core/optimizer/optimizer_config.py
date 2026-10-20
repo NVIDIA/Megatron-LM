@@ -611,15 +611,6 @@ class OptimizerConfig:
                 '--use-torch-fsdp2 not supported with fp16 yet'
 
     def finalize_optimizer_config(self) -> None:
-        # Parameters dtype.
-        if self.fp16:
-            assert not self.bf16
-            self.params_dtype = torch.half
-
-        if self.bf16:
-            assert not self.fp16
-            self.params_dtype = torch.bfloat16
-
         # Map string data-type to torch.dtype.
         dtype_map = {
             'fp32': torch.float32,

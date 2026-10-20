@@ -1083,7 +1083,12 @@ def validate_args(args, defaults={}):
         assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
 
     # Parameters dtype.
+    args.params_dtype = torch.float
     if args.fp16:
+        assert not args.bf16
+        args.params_dtype = torch.half
+        # Turn off checking for NaNs in loss and grads if using dynamic loss scaling,
+        # where NaNs in grads / loss are signal to the loss scaler.
         if not args.loss_scale:
             args.check_for_nan_in_loss_and_grad = False
             warn_rank_0('Setting args.check_for_nan_in_loss_and_grad to False since '
@@ -1092,6 +1097,10 @@ def validate_args(args, defaults={}):
     # OptimizerConfig.finalize_optimizer_config.
     main_grads_is_fp32 = args.main_grads_dtype in ('fp32', torch.float32)
     if args.bf16:
+        assert not args.fp16
+        args.params_dtype = torch.bfloat16
+        # bfloat16 requires gradient accumulation and all-reduce to
+        # be done in fp32.
         if args.accumulate_allreduce_grads_in_fp32:
             assert main_grads_is_fp32, \
                 "--main-grads-dtype can only be fp32 when --accumulate-allreduce-grads-in-fp32 is set"
