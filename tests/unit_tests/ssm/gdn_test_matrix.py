@@ -7,6 +7,7 @@
 # and every layout x pre-fusion x recompute triple, without the 96-case product.
 # Keep the packed pre-fusion CP2 case that exposed the previous CI timeout,
 # and cover packed pre-fusion plus recompute on CP4 without growing the matrix.
+# Preserve CP4's single-batch unpacked layout alongside its packed cases.
 POST_FUSION_DISTRIBUTED_CASES = (
     (1, 2, False, 1, True, True, False, 16),
     (1, 4, False, 1, True, True, True, 16),
@@ -14,7 +15,7 @@ POST_FUSION_DISTRIBUTED_CASES = (
     (4, 1, True, 1, False, True, True, 64),
     (2, 2, True, 2, False, True, True, 16),
     (1, 2, False, 1, True, False, True, 64),
-    (4, 1, True, 1, False, False, False, 16),
+    (1, 4, False, 1, False, False, True, 16),
     (1, 4, False, 2, False, True, False, 64),
     (1, 2, False, 1, False, True, False, 16),
     (1, 2, False, 2, False, False, True, 16),
