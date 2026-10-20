@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import logging
 import math
 import os
 import random
@@ -22,12 +23,15 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.activations import squared_relu
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
@@ -38,16 +42,23 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
+    FinishedRequestRecord,
+    RequestPayloadStageResult,
+    RequestPromptPreparationResult,
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
+    unwrap_serialized_tensors,
 )
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -158,19 +169,33 @@ def _make_vision_cache_entry(
     )
 
 
-def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded, media_cache_key=None):
+def _call_build_vlm_request(
+    engine,
+    tokens,
+    *,
+    media_tokens_preexpanded,
+    media_cache_key=None,
+    offload_params=None,
+    imgs_sizes=None,
+    sampling_params=None,
+):
+    if imgs_sizes is None:
+        imgs_sizes = torch.tensor([[2, 2]])
+    if sampling_params is None:
+        sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=0)
     with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
         return engine._build_vlm_request(
             request_id=1,
             prompt_str=None,
             tokens=tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            sampling_params=sampling_params,
             imgs=torch.ones(1, 2, 4),
             num_tiles=None,
             num_img_embeddings_per_tile=0,
-            imgs_sizes=torch.tensor([[2, 2]]),
+            imgs_sizes=imgs_sizes,
             media_tokens_preexpanded=media_tokens_preexpanded,
             media_cache_key=media_cache_key,
+            offload_params=offload_params,
         )
 
 
@@ -222,7 +247,6 @@ def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
     request = _call_build_vlm_request(engine, tokens, media_tokens_preexpanded=True)
 
     assert torch.equal(request.prompt_tokens, tokens)
-    assert request.compact_prompt_tokens is None
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
     wrapper.expand_image_tokens.assert_not_called()
     wrapper.resolve_media_token_id.assert_not_called()
@@ -269,22 +293,268 @@ def test_build_vlm_request_keeps_compact_expansion_path():
     assert encoder_kwargs["num_image_tiles"] is None
     assert torch.equal(encoder_kwargs["imgs_sizes"], torch.tensor([[2, 2]]))
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
-    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+
+def test_build_vlm_request_stitches_expanded_multimodal_prefix():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 2, 30, 40], dtype=torch.int64)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1, -1, -1, -1], dtype=torch.int64
+    )
+    stitching_metadata = {
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
+        PREFIX_MEDIA_COUNT_FIELD: 1,
+        PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7,
+    }
+
+    request = _call_build_vlm_request(
+        engine, stitched_tokens, media_tokens_preexpanded=False, offload_params=stitching_metadata
+    )
+
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 7, 8, 2, 30, 40]
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1, -1, -1, -1, -1, -1]
+    assert request.media_tokens_preexpanded is True
+    assert request.offload_params is None
+    assert wrapper.build_preexpanded_media_token_mask.call_args.args[0].tolist() == [
+        10,
+        99,
+        99,
+        20,
+        7,
+        8,
+        2,
+    ]
+    wrapper.expand_image_tokens.assert_not_called()
+
+
+def test_build_vlm_request_rejects_expanded_prefix_longer_than_prompt():
+    engine, _ = _build_mock_vlm_engine(torch.ones(2, 4))
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 10}
+
+    with pytest.raises(ValueError, match="exceeds the prompt length"):
+        _call_build_vlm_request(
+            engine,
+            torch.tensor([10, 99, 99, 20], dtype=torch.int64),
+            media_tokens_preexpanded=False,
+            offload_params=stitching_metadata,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stitched_tokens", "imgs_sizes", "expected", "found"),
+    [
+        ([10, 99, 99, 20, 7, 2, 30, 99, 99], [[2, 2], [3, 3]], 1, 2),
+        ([10, 99, 99, 20, 7, 2, 30, 99], [[2, 2]], 0, 1),
+    ],
+    ids=["preexpanded-suffix", "placeholder-without-new-media"],
+)
+def test_build_vlm_request_rejects_unexpected_placeholders_after_expanded_prefix(
+    stitched_tokens, imgs_sizes, expected, found
+):
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(4, 4))
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1, -1, -1], dtype=torch.int64
+    )
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6}
+
+    with pytest.raises(
+        ValueError, match=rf"Expected {expected} compact media placeholder\(s\) .* found {found}"
+    ):
+        _call_build_vlm_request(
+            engine,
+            torch.tensor(stitched_tokens, dtype=torch.int64),
+            media_tokens_preexpanded=False,
+            offload_params=stitching_metadata,
+            imgs_sizes=torch.tensor(imgs_sizes),
+        )
+    wrapper.expand_image_tokens.assert_not_called()
+
+
+def test_expanded_prefix_metadata_reports_every_missing_preparer_field():
+    with pytest.raises(ValueError) as error:
+        dynamic_engine._take_expanded_prefix_stitching_metadata({PREFIX_MEDIA_COUNT_FIELD: 1})
+
+    message = str(error.value)
+    assert PREFIX_EXPANDED_TOKEN_COUNT_FIELD in message
+    assert "RequestPromptPreparer must be configured" in message
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        (PREFIX_EXPANDED_TOKEN_COUNT_FIELD, -1),
+        (PREFIX_EXPANDED_TOKEN_COUNT_FIELD, True),
+        (PREFIX_MEDIA_COUNT_FIELD, -1),
+        (PREFIX_MEDIA_COUNT_FIELD, "1"),
+    ],
+)
+def test_expanded_prefix_metadata_validates_each_field(field, bad_value):
+    metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
+    metadata[field] = bad_value
+
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        dynamic_engine._take_expanded_prefix_stitching_metadata(metadata)
+
+
+def test_build_vlm_request_expands_only_new_suffix_media():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(4, 4))
+    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 11, 30, 99, 40], dtype=torch.int64)
+    wrapper.expand_image_tokens.return_value = ([[30, -1, -1, 40]], [[None, 0, 1, None]])
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1, -1, -1, -1], dtype=torch.int64
+    )
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
+
+    request = _call_build_vlm_request(
+        engine,
+        stitched_tokens,
+        media_tokens_preexpanded=False,
+        offload_params=stitching_metadata,
+        imgs_sizes=torch.tensor([[2, 2], [3, 3]]),
+    )
+
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 7, 8, 11, 30, 99, 99, 40]
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, -1]
+    wrapper.expand_image_tokens.assert_called_once()
+    assert wrapper.expand_image_tokens.call_args.args[0] == [[30, 99, 40]]
+    assert torch.equal(
+        wrapper.expand_image_tokens.call_args.kwargs["imgs_sizes"], torch.tensor([[3, 3]])
+    )
+
+
+def test_build_vlm_request_preexpanded_stitched_prompt_is_not_expanded_again():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(4, 4))
+    stitched_tokens = torch.tensor([10, 99, 99, 20, 7, 8, 2, 30, 99, 99, 40], dtype=torch.int64)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, -1], dtype=torch.int64
+    )
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
+
+    request = _call_build_vlm_request(
+        engine,
+        stitched_tokens,
+        media_tokens_preexpanded=True,
+        offload_params=stitching_metadata,
+        imgs_sizes=torch.tensor([[2, 2], [3, 3]]),
+    )
+
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 7, 8, 2, 30, 99, 99, 40]
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1, -1, -1, -1, -1, 2, 3, -1]
+    assert request.media_tokens_preexpanded is True
+    wrapper.expand_image_tokens.assert_not_called()
+
+
+def test_build_vlm_request_offsets_suffix_embeddings_after_multiple_prefix_media():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(6, 4))
+    wrapper.expand_image_tokens.return_value = ([[30, -1, -1, 40]], [[None, 0, 1, None]])
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1, 2, 3, -1, -1, -1], dtype=torch.int64
+    )
+    stitching_metadata = {PREFIX_MEDIA_COUNT_FIELD: 2, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 9}
+
+    request = _call_build_vlm_request(
+        engine,
+        torch.tensor([10, 99, 99, 20, 99, 99, 21, 7, 2, 30, 99, 40], dtype=torch.int64),
+        media_tokens_preexpanded=False,
+        offload_params=stitching_metadata,
+        imgs_sizes=torch.tensor([[2, 2], [3, 3], [4, 4]]),
+    )
+
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20, 99, 99, 21, 7, 2, 30, 99, 99, 40]
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1, 2, 3, -1, -1, -1, -1, 4, 5, -1]
+    assert torch.equal(
+        wrapper.expand_image_tokens.call_args.kwargs["imgs_sizes"], torch.tensor([[4, 4]])
+    )
+
+
+def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
+    result = dynamic_engine._slice_suffix_media_metadata(
+        2,
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]]),
+        num_frames=torch.tensor([2, 1, 3]),
+        video_frame_indices=[[0, 1], [5], [10, 11, 12]],
+        video_fps=[24.0, 30.0, 60.0],
+    )
+
+    assert result["suffix_media_count"] == 1
+    assert torch.equal(result["imgs_sizes"], torch.tensor([[4, 4], [5, 5], [6, 6]]))
+    assert torch.equal(result["num_frames"], torch.tensor([3]))
+    assert result["video_frame_indices"] == [[10, 11, 12]]
+    assert result["video_fps"] == [60.0]
+
+
+def test_slice_suffix_static_tiling_metadata_uses_logical_media_count():
+    result = dynamic_engine._slice_suffix_media_metadata(
+        1,
+        num_tiles=torch.tensor([2, 3]),
+        imgs_sizes=None,
+        num_frames=None,
+        video_frame_indices=None,
+        video_fps=None,
+    )
+
+    assert result["suffix_media_count"] == 1
+    assert torch.equal(result["num_tiles"], torch.tensor([3]))
+
+
+def test_slice_suffix_metadata_rejects_prefix_media_overcount():
+    with pytest.raises(ValueError, match="prefix media count exceeds"):
+        dynamic_engine._slice_suffix_media_metadata(
+            2,
+            num_tiles=None,
+            imgs_sizes=torch.tensor([[2, 2]]),
+            num_frames=None,
+            video_frame_indices=None,
+            video_fps=None,
+        )
+
+
+def test_build_vlm_request_passes_temporal_video_metadata_to_expansion():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    wrapper.multimodal_prompt_config = MultimodalPromptConfig(
+        video_spec=MediaPromptSpec(expansion_mode="temporal_patch")
+    )
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+    frame_indices = [[0, 30]]
+    fps = [30.0]
+
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        request = engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=torch.tensor([10, 42, 20], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            imgs=torch.ones(1, 2, 4),
+            num_tiles=None,
+            num_img_embeddings_per_tile=0,
+            imgs_sizes=torch.tensor([[2, 2], [2, 2]]),
+            num_frames=torch.tensor([2]),
+            video_frame_indices=frame_indices,
+            video_fps=fps,
+        )
+
+    expansion_kwargs = wrapper.expand_image_tokens.call_args.kwargs
+    assert expansion_kwargs["tokenizer"] is engine.controller.tokenizer
+    assert expansion_kwargs["video_frame_indices"] is frame_indices
+    assert expansion_kwargs["video_fps"] is fps
+    assert request.video_frame_indices is frame_indices
+    assert request.video_fps is fps
 
 
 def test_build_vlm_request_preserves_adjacent_compact_media_placeholders():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     compact_tokens = torch.tensor([10, 42, 42, 20], dtype=torch.int64)
     # The expanded sequence is structurally ambiguous: it could also represent
-    # one placeholder expanded to two positions. The saved compact prompt is
+    # one placeholder expanded to two positions. The admission mask is
     # therefore required for lossless multi-turn reconstruction.
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
 
     assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
-    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
 
 
 def test_build_vlm_request_enables_media_salted_prefix_caching():
@@ -542,6 +812,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
         msgpack.packb([submit, 17, params.serialize(), media_meta], use_bin_type=True),
         msgpack.packb([10, 99], use_bin_type=True),
         b"not-a-msgpack-payload",
+        msgpack.packb(None, use_bin_type=True),
     ]
     engine.socket_for_receiving_requests = mock.Mock()
     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
@@ -558,7 +829,11 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.add_request.assert_called_once()
     args, kwargs = engine.add_request.call_args
     assert args[:2] == (17, [10, 99])
-    assert kwargs == {"media_cache_key": "shared-image", "media_tokens_preexpanded": True}
+    assert kwargs == {
+        "offload_params": None,
+        "media_cache_key": "shared-image",
+        "media_tokens_preexpanded": True,
+    }
 
 
 def teardown_module(module):
@@ -585,6 +860,13 @@ def set_rounder(value):
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
+def reset_rounder():
+    """Restore the production rounders; set_rounder(64) would leave REQUEST_ROUNDER at 64."""
+    DynamicInferenceContext.ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
+
+
 def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
     """Mock forward function to avoid numerics issues with random inputs."""
     return torch.randn(
@@ -603,8 +885,7 @@ class DynamicEngineTestConfig:
     random_seed = 123
     vocab_size = 100
 
-    set_rounder(4)
-    num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1, 1)
+    num_requests: int = 8
     min_prompt_length: int = 4
     max_prompt_length: int = 16
     num_tokens_to_generate: Optional[int] = 4
@@ -639,6 +920,7 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
     # HybridModel, and only the layer pattern and stack spec (and so the
@@ -651,6 +933,11 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    # Hybrid (Mamba) models need a Mamba-state cache budget for prefix caching to skip any
+    # prefill. Left None, `DynamicInferenceContext` logs a warning and runs in memory-only
+    # mode: prefixes are deduplicated but `prefix_skip_tokens` is forced to 0, so every token
+    # is recomputed and `engine._prefill_tokens_skipped` stays 0.
+    prefix_caching_mamba_gb: Optional[float] = None
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
         PrefixCachingEvictionPolicy.REF_ZERO
     )
@@ -660,6 +947,7 @@ class DynamicEngineTestConfig:
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
+    moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -672,7 +960,22 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
-    position_embedding_type: str = "learned_absolute"
+    # A repeated (rather than per-depth) MTP head is one of the gates on
+    # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
+    mtp_use_repeated_layer: bool = False
+    # Required by TextGenerationController when cuda_graph_impl == "local" and EP > 1: the
+    # graphs are captured with expert padding enabled, so the router must keep it on.
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+    # Layer block for ONE MTP depth in the hybrid pattern ("<main>/<mtp>/<mtp>/..."); every
+    # depth section must be identical. "M" (recurrent) is the historical default. A head that
+    # is exactly one attention layer -- e.g. "*-" -- is what enables the MTP draft KV cache;
+    # a recurrent head has no KV to append, so the gate stays off. See
+    # DynamicInferenceContext.enable_mtp_kv_cache.
+    mtp_layer_pattern: str = "M"
+    # Required by transformer_config validation when transformer_impl == "inference_optimized"
+    # and num_moe_experts is set: fp32 routing avoids dtype conversions during decode.
+    moe_router_dtype: Optional[str] = None
+    position_embedding_type: Optional[str] = None
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
     temperature: float = 1.0
@@ -692,6 +995,10 @@ class DynamicEngineTestConfig:
     softmax_type: str = "vanilla"
 
     def __post_init__(self):
+        if self.position_embedding_type is None:
+            self.position_embedding_type = (
+                "none" if self.num_speculative_tokens else "learned_absolute"
+            )
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -839,6 +1146,7 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 # this is for compatibility with the LTS environment
@@ -885,8 +1193,27 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
+                # An explicit `moe_router_dtype` on the test config wins; otherwise fall back to
+                # fp32 for inference-optimized MoE, which `TransformerConfig.__post_init__`
+                # requires (it raises otherwise). Scenarios such as the async-scheduling
+                # "topology:ep" pair rely on that fallback instead of setting the field.
+                moe_router_dtype=(
+                    test_config.moe_router_dtype
+                    if test_config.moe_router_dtype is not None
+                    else (
+                        "fp32"
+                        if test_config.transformer_impl == "inference_optimized"
+                        and test_config.expert_model_parallel_size > 1
+                        else None
+                    )
+                ),
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
@@ -925,15 +1252,10 @@ class DynamicInferenceEngineTestBase:
                     and test_config.expert_model_parallel_size > 1
                     else torch.nn.functional.gelu
                 ),
-                moe_router_dtype=(
-                    "fp32"
-                    if test_config.transformer_impl == "inference_optimized"
-                    and test_config.expert_model_parallel_size > 1
-                    else None
-                ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
@@ -982,10 +1304,16 @@ class DynamicInferenceEngineTestBase:
             # Transformer config.
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=test_config.flash_attention_version,
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
+                moe_router_dtype=test_config.moe_router_dtype,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
@@ -1023,6 +1351,7 @@ class DynamicInferenceEngineTestBase:
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
+                moe_enable_routing_replay=test_config.moe_enable_routing_replay,
                 normalization=(
                     "RMSNorm"
                     if is_gdn or test_config.transformer_impl == "inference_optimized"
@@ -1036,7 +1365,7 @@ class DynamicInferenceEngineTestBase:
             # Hybrid model.
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = "/M" * test_config.num_speculative_tokens
+            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
@@ -1252,6 +1581,59 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
 
 
+def test_post_process_zero_token_handoff_keeps_resume_log_prob():
+    request = DynamicInferenceRequest(
+        request_id=17,
+        prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=0,
+            termination_id=-1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            do_kv_handoff=True,
+        ),
+    )
+    future = mock.Mock()
+    future.done.return_value = False
+    entry = types.SimpleNamespace(
+        record=DynamicInferenceRequestRecord.from_request(request), future=future
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        kv_block_allocator=types.SimpleNamespace(), remove_vlm_request_data=mock.Mock()
+    )
+    engine.requests = {request.request_id: entry}
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine._prepare_handoff_metadata_batch = mock.Mock(return_value={request.request_id: "meta"})
+    engine._capture_handoff_meta = mock.Mock()
+
+    active_request_ids, finished_requests = engine.post_process_requests(
+        request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        finished_request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        evict_request_ids=torch.empty(0, dtype=torch.int64),
+        step_time=0.0,
+        sample=torch.tensor([99], dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[[-0.25]],
+        consumed_chunked_prefill_request_id=-1,
+        finished_handoff_block_ids={request.request_id: [10]},
+        finished_handoff_decode_tokens={request.request_id: [99]},
+    )
+
+    assert active_request_ids == []
+    assert len(finished_requests) == 1
+    finished_request = finished_requests[0]
+    assert finished_request.generated_tokens == []
+    assert not finished_request.generated_log_probs
+    assert engine._prepare_handoff_metadata_batch.call_args.args[2] == {request.request_id: [-0.25]}
+    engine._capture_handoff_meta.assert_called_once_with(request, "meta")
+    future.set_result.assert_called_once_with(finished_request)
+
+
 @pytest.mark.asyncio
 async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     """Normal and failed completion each expose their one future-owned flat request."""
@@ -1280,7 +1662,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     engine.controller = types.SimpleNamespace(
         tokenizer=types.SimpleNamespace(
             detokenize=lambda tokens: f"<{','.join(str(token) for token in tokens)}>"
-        )
+        ),
+        terminating_token_ids=mock.Mock(return_value=frozenset()),
     )
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -1307,6 +1690,8 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     assert active_ids == []
     assert merge.call_count == 1
     assert future.result() is finished
+    assert finished.finish_reason == "length"
+    engine.controller.terminating_token_ids.assert_called_with(-1, stop_token_ids=None)
     assert finished.generated_log_probs == [-0.25]
     assert finished.generated_top_n_logprobs == [{"<12>": -0.25, "<13>": -1.0}]
     assert finished.tpot == [0.25]
@@ -1327,8 +1712,9 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
         dynamic_engine.msgpack.packb([submit, 42, params.serialize(), None], use_bin_type=True),
         dynamic_engine.msgpack.packb([3, 4], use_bin_type=True),
         dynamic_engine.msgpack.packb(None, use_bin_type=True),
+        dynamic_engine.msgpack.packb(None, use_bin_type=True),
     ]
-    engine.add_request = lambda *_: engine._handle_failed_request(42)
+    engine.add_request = lambda *_, **__: engine._handle_failed_request(42)
     socket = engine.socket_for_receiving_requests = mock.Mock()
     socket.recv_multipart.side_effect = [message, dynamic_engine.zmq.Again]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
@@ -1376,7 +1762,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
     engine.unified_memory_level = 0
     engine.use_coordinator = False
@@ -1406,10 +1792,130 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
 
     assert engine.context.deallocate_inference_state_buffers.call_count == 1
     assert engine.context.reinitialize_inference_state_buffers.call_count == 1
-    engine.controller._async_sched_logits.clear.assert_called_once_with()
+    engine.controller._async_sched_forward.clear.assert_called_once_with()
     assert engine.state == EngineState.RUNNING
     replayed = [call.args[0].request_id for call in engine._add_request.call_args_list]
     assert replayed == [23, 24, 26, 25]
+
+
+def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
+    """Requests holding no KV at resume must hash under the post-refit weights.
+
+    Under PERSIST the prefix cache survives the refit. A request still waiting
+    at suspend, or submitted while suspended (the coordinator loop keeps
+    admitting), would otherwise match blocks the old weights computed. Requests
+    with prefill or decode progress keep their original salt.
+    """
+    block_size = 4
+    prompt = list(range(100, 100 + 4 * block_size))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        block_size_tokens=block_size,
+        enable_prefix_caching=True,
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+        add_vlm_request_data=mock.Mock(),
+    )
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(validate_input_modalities=mock.Mock())
+    )
+    engine.requests = {}
+    engine.waiting_request_ids = deque()
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine.allow_stale_multimodal_embeddings = True
+    engine.vision_embedding_cache_max_bytes = 0
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+
+    def register(request, *, is_resume=False):
+        if not is_resume:
+            engine.requests[request.request_id] = types.SimpleNamespace(
+                record=DynamicInferenceRequestRecord.from_request(request)
+            )
+            engine.waiting_request_ids.append(request.request_id)
+
+    engine._add_request = mock.Mock(side_effect=register)
+
+    def hashes(salt):
+        return compute_block_hashes_batched(
+            torch.tensor(prompt, dtype=torch.int64), block_size, cache_salt=salt
+        )
+
+    with (
+        mock.patch.object(torch.cuda, "current_device", return_value="cpu"),
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        # Served under the pre-refit weights; its blocks stay published under PERSIST.
+        engine.add_request(1, prompt)
+        published = set(engine.get_request(1).precomputed_block_hashes)
+        decoding = engine.get_request(1)
+        decoding.finished_chunk_token_count = len(prompt)
+        decoding.generated_tokens = [7]
+        engine.waiting_request_ids.remove(1)
+
+        # Part-way through a chunked prefill under the old weights.
+        engine.add_request(2, prompt)
+        partial = engine.get_request(2)
+        partial.finished_chunk_token_count = block_size
+        partial.remaining_prompt_tokens = partial.prompt_tokens[block_size:]
+
+        # Still waiting when the refit begins.
+        engine.add_request(3, prompt)
+        engine._add_request(
+            DynamicVLMInferenceRequest(
+                request_id=5,
+                prompt_tokens=torch.tensor(prompt, dtype=torch.int64),
+                sampling_params=SamplingParams(),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
+                block_hash_salt=dynamic_engine._weight_scoped_salt(0, "img-a"),
+                media_cache_key="img-a",
+                num_img_embeddings_per_tile=0,
+                imgs=None,
+                num_tiles=None,
+                decoder_seq_length=0,
+                image_embeddings=torch.zeros(1),
+                image_token_mask=torch.zeros(1),
+            )
+        )
+
+        engine.suspend()
+        # Submitted while suspended for the refit.
+        engine.add_request(4, prompt)
+        assert set(engine.get_request(4).precomputed_block_hashes) <= published
+
+        engine.resume()
+        engine.add_request(6, prompt)
+
+    new_salt = dynamic_engine._weight_scoped_salt(1, None)
+    for request_id in (3, 4):
+        request = engine.get_request(request_id)
+        assert request.block_hash_salt == new_salt
+        assert request.precomputed_block_hashes == hashes(new_salt)
+        assert published.isdisjoint(request.precomputed_block_hashes)
+        assert request.num_matched_prefix_blocks == 0
+    # A post-resume arrival hashes identically, so the two can still share KV.
+    assert engine.get_request(6).precomputed_block_hashes == hashes(new_salt)
+
+    vlm_salt = dynamic_engine._weight_scoped_salt(1, "img-a")
+    assert engine.get_request(5).block_hash_salt == vlm_salt
+    assert engine.get_request(5).precomputed_block_hashes == hashes(vlm_salt)
+
+    # Requests with progress keep the generation their leading blocks were computed by.
+    for request_id in (1, 2):
+        request = engine.get_request(request_id)
+        assert request.block_hash_salt is None
+        assert request.precomputed_block_hashes == hashes(None)
 
 
 def test_add_request_defaults_sampling_params():
@@ -1466,7 +1972,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
     engine.num_speculative_tokens = 0
     engine.requests = {}
@@ -1509,7 +2015,7 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     assert not engine._vision_embedding_cache
     assert engine._vision_embedding_cache_bytes == 0
     engine.context.reset.assert_called_once_with()
-    engine.controller._async_sched_logits.clear.assert_called_once_with()
+    engine.controller._async_sched_forward.clear.assert_called_once_with()
 
 
 def test_drained_reset_rejects_suspended_state_before_context_mutation():
@@ -1519,14 +2025,14 @@ def test_drained_reset_rejects_suspended_state_before_context_mutation():
     engine.state = EngineState.SUSPENDED
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
     with pytest.raises(RuntimeError, match="only be reset while RUNNING or PAUSED"):
         engine.reset()
 
     engine.context.reset.assert_not_called()
-    engine.controller._async_sched_logits.clear.assert_not_called()
+    engine.controller._async_sched_forward.clear.assert_not_called()
 
 
 def test_drained_reset_rejects_outstanding_requests_before_mutation():
@@ -1538,7 +2044,7 @@ def test_drained_reset_rejects_outstanding_requests_before_mutation():
     engine.requests = requests
     engine.context = types.SimpleNamespace(reset=mock.Mock())
     engine.controller = types.SimpleNamespace(
-        _async_sched_logits=types.SimpleNamespace(clear=mock.Mock())
+        _async_sched_forward=types.SimpleNamespace(clear=mock.Mock())
     )
 
     with pytest.raises(RuntimeError, match="must drain all requests before reset"):
@@ -1546,7 +2052,7 @@ def test_drained_reset_rejects_outstanding_requests_before_mutation():
 
     assert engine.requests is requests
     engine.context.reset.assert_not_called()
-    engine.controller._async_sched_logits.clear.assert_not_called()
+    engine.controller._async_sched_forward.clear.assert_not_called()
 
 
 def _make_request_entry(loop, request_id: int, status: Status, resolve: bool = True):
@@ -1637,7 +2143,6 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     request = DynamicVLMInferenceRequest(
         request_id=31,
         prompt_tokens=torch.tensor([99, 99, 5]),
-        compact_prompt_tokens=torch.tensor([99, 5]),
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         num_img_embeddings_per_tile=0,
         imgs=torch.ones(1),
@@ -1672,7 +2177,45 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     assert not engine._vision_embedding_cache
     assert engine._vision_embedding_cache_bytes == 0
     assert request.image_embeddings is None
-    assert request.image_token_mask is None
+    assert request.image_token_mask.tolist() == [0, 1, -1]
+
+
+def test_finished_vlm_reply_omits_input_only_tensors():
+    request = DynamicVLMInferenceRequest(
+        request_id=31,
+        prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        num_frames=torch.tensor([1]),
+        video_frame_indices=[[0]],
+        video_fps=[30.0],
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(1, 1, 4),
+        image_token_mask=torch.tensor([0, -1]),
+    )
+    request.generated_tokens = [7]
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.payload_stager = None
+
+    engine.local_metadata_ledger_enabled = False
+    serialized = engine._serialize_finished_request(request)
+
+    assert serialized["generated_tokens"] == [7]
+    for key in (
+        "imgs",
+        "num_tiles",
+        "imgs_sizes",
+        "num_frames",
+        "video_frame_indices",
+        "video_fps",
+        "image_embeddings",
+        "image_token_mask",
+    ):
+        assert key in serialized
+        assert serialized[key] is None
 
 
 def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
@@ -1688,26 +2231,26 @@ def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
     assert engine._vision_embedding_cache_bytes == 4
 
 
-def test_refresh_vlm_request_recomputes_embeddings_and_mask():
+def test_refresh_vlm_request_recomputes_embeddings_from_preserved_mask():
     request = DynamicVLMInferenceRequest(
         request_id=32,
         prompt_tokens=torch.tensor([99, 99, 5, 7]),
-        compact_prompt_tokens=torch.tensor([99, 5]),
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         block_hash_salt="w7\0media",
         media_cache_key="media",
         num_img_embeddings_per_tile=0,
         imgs=torch.ones(1),
-        num_tiles=torch.tensor([1]),
+        num_tiles=None,
         imgs_sizes=torch.tensor([[1, 1]]),
+        num_frames=torch.tensor([1]),
+        video_frame_indices=[[0]],
+        video_fps=[30.0],
         decoder_seq_length=0,
         image_embeddings=None,
-        image_token_mask=None,
+        image_token_mask=torch.tensor([0, 1, -1]),
     )
     wrapper = types.SimpleNamespace(
-        resolve_media_token_id=mock.Mock(return_value=99),
-        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
-        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4))
     )
     retained_imgs = mock.Mock()
     device_imgs = torch.ones(1)
@@ -1723,12 +2266,74 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
     retained_imgs.to.assert_called_once_with(device=request.prompt_tokens.device)
     encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
     assert encoder_args[0] is device_imgs
-    assert encoder_kwargs["num_image_tiles"].device == request.prompt_tokens.device
+    assert encoder_kwargs["num_image_tiles"] is None
     assert encoder_kwargs["imgs_sizes"].device == request.prompt_tokens.device
+    assert encoder_kwargs["num_frames"].device == request.prompt_tokens.device
     assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
     assert request.image_token_mask.tolist() == [0, 1, -1, -1]
     engine._cache_vision_embedding.assert_called_once()
     assert engine._cache_vision_embedding.call_args.args[0] == "media"
+    engine.context.add_vlm_request_data.assert_called_once_with(
+        request.request_id,
+        image_embeddings=request.image_embeddings,
+        image_token_mask=request.image_token_mask,
+    )
+
+
+def test_refresh_vlm_request_without_mask_fails_for_compact_admitted_request():
+    request = DynamicVLMInferenceRequest(
+        request_id=34,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=None,
+        image_token_mask=None,
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(), tokenizer=object()
+    )
+
+    with pytest.raises(RuntimeError, match="media token mask was not retained"):
+        engine._refresh_vlm_request_data(request)
+
+
+def test_refresh_stitched_request_preserves_generated_media_token_as_text():
+    original_mask = torch.tensor([0, 1, -1])
+    request = DynamicVLMInferenceRequest(
+        request_id=33,
+        # The last 99 was generated and must remain text rather than becoming
+        # a third media embedding position during a weight-refit refresh.
+        prompt_tokens=torch.tensor([99, 99, 5, 99]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        media_tokens_preexpanded=True,
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=None,
+        image_token_mask=original_mask,
+    )
+    wrapper = types.SimpleNamespace(
+        build_preexpanded_media_token_mask=mock.Mock(
+            side_effect=AssertionError("the preserved stitched mask must be reused")
+        ),
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper)
+    engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
+    engine._cache_vision_embedding = mock.Mock()
+
+    engine._refresh_vlm_request_data(request)
+
+    assert request.image_token_mask.tolist() == [0, 1, -1, -1]
+    wrapper.build_preexpanded_media_token_mask.assert_not_called()
     engine.context.add_vlm_request_data.assert_called_once_with(
         request.request_id,
         image_embeddings=request.image_embeddings,
@@ -1744,7 +2349,6 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     original_request = DynamicVLMInferenceRequest(
         request_id=33,
         prompt_tokens=torch.tensor([99, 99, 5], device=device),
-        compact_prompt_tokens=torch.tensor([99, 5], device=device),
         sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
         block_hash_salt="media",
         media_cache_key="media",
@@ -1775,9 +2379,7 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     engine.requests = {checkpointed_request.request_id: types.SimpleNamespace(record=record)}
     refreshed_embeddings = torch.ones(2, 1, 4, device=device)
     wrapper = types.SimpleNamespace(
-        resolve_media_token_id=mock.Mock(return_value=99),
-        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
-        _forward_vision_encoder=mock.Mock(return_value=refreshed_embeddings),
+        _forward_vision_encoder=mock.Mock(return_value=refreshed_embeddings)
     )
     engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
     engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
@@ -1788,7 +2390,6 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
 
     assert checkpointed_request.prompt_tokens.tolist() == [99, 99, 5, 7, 8]
     assert checkpointed_request.prompt_tokens.device == device
-    assert checkpointed_request.compact_prompt_tokens is original_request.compact_prompt_tokens
     assert checkpointed_request.imgs is imgs
     assert checkpointed_request.imgs_sizes is imgs_sizes
     assert checkpointed_request.media_cache_key == "media"
@@ -1838,6 +2439,373 @@ def test_streaming_partials_are_sent():
     assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
 
 
+class _RecordingStager:
+    """RequestPayloadStager test double: keeps every staged (uid, payload)."""
+
+    def __init__(self):
+        self.staged = []
+
+    def stage(self, uid, payload, *, finished_metadata, offload_params=None):
+        self.staged.append((uid, payload))
+        self.finished_metadata = finished_metadata
+        self.offload_params = offload_params
+        return RequestPayloadStageResult()
+
+
+def _reply_request(uid, status, log_probs, *, streaming=False, return_prompt_tokens=False):
+    request = DynamicInferenceRequest(
+        request_id=1,
+        uid=uid,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=2,
+            termination_id=0,
+            return_log_probs=True,
+            streaming=streaming,
+            return_prompt_tokens=return_prompt_tokens,
+        ),
+        generated_tokens=[10, 11],
+    )
+    request.status = status
+    request.generated_log_probs = log_probs
+    return request
+
+
+@pytest.mark.parametrize(
+    ("with_stager", "streaming", "expected_offloaded"),
+    [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_payload_offload_stages_only_eligible_completed_replies(
+    with_stager, streaming, expected_offloaded
+):
+    """A stager offloads completed non-streaming replies only.
+
+    Failed and streaming requests are neither staged nor stripped, and replies are untouched
+    without a stager. An offloaded reply never carries the prompt tensors, even when the
+    request opted into return_prompt_tokens (the stager holds the prompt ids); a reply that
+    is not offloaded still honours the opt-in. The ledger is a separate mechanism and stays
+    off here.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = False
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = _RecordingStager() if with_stager else None
+    engine.socket_for_receiving_requests = mock.Mock()
+    completed = _reply_request(
+        "chatcmpl-ok",
+        Status.COMPLETED,
+        [-0.5, -0.25],
+        streaming=streaming,
+        return_prompt_tokens=True,
+    )
+    failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+
+    engine._send_requests_to_coordinator([completed, failed])
+
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+    header, _ = msgpack.unpackb(frames[0], raw=False)
+    ok_wire, failed_wire = [msgpack.unpackb(frame, raw=False) for frame in frames[1:]]
+    assert header == Headers.ENGINE_REPLY.value
+    assert failed_wire["payload_offloaded"] is False
+    assert engine.local_metadata_ledger == {}
+    assert ok_wire["payload_offloaded"] is expected_offloaded
+    if expected_offloaded:
+        ((uid, payload),) = engine.payload_stager.staged
+        assert uid == "chatcmpl-ok"
+        assert payload.prompt_token_ids == [1, 2, 3]
+        assert payload.generated_token_ids == [10, 11]
+        assert payload.generated_log_probs == [-0.5, -0.25]
+        assert ok_wire["payload_offloaded"] is True and ok_wire["generated_log_probs"] is None
+        for prompt_field in ("prompt_tokens", "remaining_prompt_tokens"):
+            assert ok_wire[prompt_field] is None, prompt_field
+    else:
+        assert not getattr(engine.payload_stager, "staged", [])
+        assert ok_wire["generated_log_probs"] == [-0.5, -0.25]
+        assert ok_wire["payload_stage_metadata"] == {}
+        unwrapped = unwrap_serialized_tensors(ok_wire)
+        assert unwrapped["prompt_tokens"] == [1, 2, 3]
+        assert unwrapped["remaining_prompt_tokens"] == [1, 2, 3]
+    # prompt_length is always reported; generated token ids stay on the wire, and the drop is
+    # wire-only: the request keeps its prompt and log probs.
+    assert ok_wire["prompt_length"] == 3
+    assert ok_wire["generated_tokens"] == [10, 11]
+    assert completed.generated_log_probs == [-0.5, -0.25]
+    assert completed.prompt_tokens.tolist() == [1, 2, 3]
+
+
+def test_finished_request_record_is_built_once_for_ledger_and_stager():
+    """With both the ledger and a stager on, one FinishedRequestRecord per completed request
+    is shared by both; failed requests build none."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = True
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = _RecordingStager()
+    engine.socket_for_receiving_requests = mock.Mock()
+    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
+    failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+
+    with mock.patch.object(
+        FinishedRequestRecord, "from_request", wraps=FinishedRequestRecord.from_request
+    ) as from_request:
+        engine._send_requests_to_coordinator([completed, failed])
+
+    from_request.assert_called_once_with(completed)
+    record = engine.local_metadata_ledger["chatcmpl-ok"]
+    assert record is engine.payload_stager.finished_metadata
+    assert record.num_evictions == 0
+    ((uid, _),) = engine.payload_stager.staged
+    assert uid == "chatcmpl-ok"
+
+
+def _submit_request_message(request_id, sampling_params, prompt, offload_params):
+    """A SUBMIT_REQUEST as the coordinator forwards it: metadata, prompt, media, offload."""
+    return [
+        msgpack.packb([Headers.SUBMIT_REQUEST.value, request_id, sampling_params, None]),
+        msgpack.packb(prompt, use_bin_type=True),
+        msgpack.packb(None, use_bin_type=True),
+        msgpack.packb(offload_params, use_bin_type=True),
+    ]
+
+
+@pytest.mark.parametrize("offload_params", [None, {"destination": "payload-store"}])
+def test_schedule_kv_handoff_preserves_optional_offload_metadata(offload_params):
+    params = SamplingParams(num_tokens_to_generate=2)
+    kv_meta = {"resume_tokens": [99]}
+    message = [
+        msgpack.packb([Headers.SUBMIT_REQUEST_WITH_KV.value, 42, params.serialize(), kv_meta]),
+        msgpack.packb([3, 4]),
+        msgpack.packb([7]),
+    ]
+    if offload_params is not None:
+        message.append(msgpack.packb(offload_params))
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine.add_request_with_kv_handoff = mock.Mock()
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine.socket_for_receiving_requests.recv_multipart.side_effect = [
+        message,
+        dynamic_engine.zmq.Again,
+    ]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    assert engine.schedule_requests() == 1
+    engine.add_request_with_kv_handoff.assert_called_once_with(
+        42, [3, 4], params, kv_meta, [7], offload_params=offload_params
+    )
+
+
+def test_engine_prepares_prompt_before_model_parallel_broadcast():
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            metadata = dict(offload_params or {})
+            metadata["prepared"] = True
+            return RequestPromptPreparationResult(prompt=[1, 2, *prompt], offload_params=metadata)
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    sampling_params = SamplingParams(temperature=0.5).serialize()
+    message = _submit_request_message(
+        17, sampling_params, [3, 4], {"ng_capture": {"rollout_id": "r0"}}
+    )
+
+    prepared = engine._prepare_submit_request_message(message)
+
+    # Only the prompt and offload frames are rewritten; the metadata frame is
+    # the very object that came off the wire, never repacked.
+    assert prepared[0] is message[0]
+    assert msgpack.unpackb(prepared[1], raw=False) == [1, 2, 3, 4]
+    assert prepared[2] is message[2]
+    assert msgpack.unpackb(prepared[3], raw=False) == {
+        "ng_capture": {"rollout_id": "r0"},
+        "prepared": True,
+    }
+
+
+def test_engine_skips_prompt_preparation_without_offload_params():
+    """A None offload frame passes through with no frame decoded and no preparer call."""
+
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            raise AssertionError("preparer must not run without offload params")
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    undecodable = b"\xc1not-valid-msgpack"
+    message = [undecodable, undecodable, undecodable, msgpack.packb(None, use_bin_type=True)]
+
+    assert engine._prepare_submit_request_message(message) is message
+
+
+def test_engine_defers_expanded_multimodal_stitching_past_prompt_preparer():
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            raise AssertionError("expanded multimodal stitching must run after media expansion")
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    params = {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 7}
+    message = _submit_request_message(
+        17, SamplingParams(temperature=0.5).serialize(), [10, 99, 99, 20, 7, 8, 2, 30], params
+    )
+
+    assert engine._prepare_submit_request_message(message) is message
+
+
+def test_engine_prompt_preparer_materializes_deferred_multimodal_prefix():
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            assert prompt == [10, 42, 2, 20, 2, 30, 42]
+            assert offload_params[PREFIX_MEDIA_COUNT_FIELD] == 1
+            assert offload_params["template_prefix_token_ids"] == [10, 42, 2, 20, 2]
+            return RequestPromptPreparationResult(
+                prompt=[100, 99, 99, 101, 200, 2, 30, 42],
+                offload_params={
+                    **offload_params,
+                    PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6,
+                    "stager_metadata": {"key": "value"},
+                },
+            )
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    params = {
+        PREFIX_EOS_TOKEN_ID_FIELD: [2],
+        PREFIX_MEDIA_COUNT_FIELD: 1,
+        "template_prefix_token_ids": [10, 42, 2, 20, 2],
+    }
+    message = _submit_request_message(
+        17, SamplingParams(temperature=0.5).serialize(), [10, 42, 2, 20, 2, 30, 42], params
+    )
+
+    prepared = engine._prepare_submit_request_message(message)
+    prepared_params = msgpack.unpackb(prepared[3], raw=False)
+    stitching_metadata, remaining = dynamic_engine._take_expanded_prefix_stitching_metadata(
+        prepared_params
+    )
+
+    assert msgpack.unpackb(prepared[1], raw=False) == [100, 99, 99, 101, 200, 2, 30, 42]
+    assert stitching_metadata == {PREFIX_MEDIA_COUNT_FIELD: 1, PREFIX_EXPANDED_TOKEN_COUNT_FIELD: 6}
+    assert remaining == {"stager_metadata": {"key": "value"}}
+
+
+@pytest.mark.parametrize("bad_output", ["numpy_prompt", "tensor_in_params"])
+def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_output):
+    """An unserializable preparer result fails the request instead of killing rank 0."""
+    import numpy as np
+
+    class _Preparer:
+        def prepare_prompt(self, prompt, *, offload_params=None):
+            if bad_output == "numpy_prompt":
+                return RequestPromptPreparationResult(
+                    prompt=[np.int64(1), *prompt], offload_params=offload_params
+                )
+            return RequestPromptPreparationResult(
+                prompt=prompt,
+                offload_params={**(offload_params or {}), "embedding": torch.tensor([1.0])},
+            )
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = _Preparer()
+    sampling_params = SamplingParams(temperature=0.5).serialize()
+    original_params = {"ng_capture": {"rollout_id": "r0"}}
+    message = _submit_request_message(17, sampling_params, [3, 4], original_params)
+
+    prepared = engine._prepare_submit_request_message(message)
+    offload_params = msgpack.unpackb(prepared[3], raw=False)
+
+    assert prepared[0] is message[0]
+    assert msgpack.unpackb(prepared[1], raw=False) == [3, 4]
+    assert prepared[2] is message[2]
+    assert offload_params["ng_capture"] == {"rollout_id": "r0"}
+    assert offload_params[dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        pytest.param(
+            [
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 41, {}, None, {"k": "v"}]),
+                msgpack.packb([1], use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+            ],
+            id="offload_params_in_metadata",
+        ),
+        pytest.param(
+            [
+                msgpack.packb([Headers.SUBMIT_REQUEST.value, 41, {}, None]),
+                msgpack.packb([1], use_bin_type=True),
+                msgpack.packb(None, use_bin_type=True),
+            ],
+            id="missing_offload_frame",
+        ),
+    ],
+)
+def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
+    """A malformed SUBMIT_REQUEST is dropped, and the next request in the batch still admits.
+
+    schedule_requests runs the same broadcast list on every MP rank, so raising
+    here would take the whole engine down for one version-skewed client, while a
+    drop is collective: every rank skips the same message.
+    """
+    params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
+    good = _submit_request_message(42, params.serialize(), [3, 4], {"ng_capture": {"r": "0"}})
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.prompt_preparer = None
+    engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
+    engine.requests, engine.failed_request_ids = {}, []
+    engine.add_request = mock.Mock()
+    engine._fail_submission = mock.Mock()
+    socket = engine.socket_for_receiving_requests = mock.Mock()
+    socket.recv_multipart.side_effect = [malformed, good, dynamic_engine.zmq.Again]
+    engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
+    engine.local_metadata_ledger_enabled = False
+    engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
+    engine._collect_failed_requests = mock.Mock(return_value=[])
+
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+        assert engine.schedule_requests() == 2
+
+    assert "dropping malformed SUBMIT_REQUEST" in caplog.text
+    engine._fail_submission.assert_not_called()
+    engine.add_request.assert_called_once()
+    args, kwargs = engine.add_request.call_args
+    assert args[0] == 42 and args[1] == [3, 4]
+    assert kwargs == {"offload_params": {"ng_capture": {"r": "0"}}}
+    # Both messages, dropped or not, were still broadcast to the other MP ranks.
+    broadcast = engine.model_parallel_publisher_socket.send_multipart.call_args.args[0]
+    assert msgpack.unpackb(broadcast[1], raw=False) == [len(malformed), len(good)]
+
+
+def test_handle_failed_request_releases_vlm_request_data():
+    """Media registered before admission is dropped when the request fails."""
+    request = DynamicInferenceRequest(
+        request_id=42,
+        prompt_tokens=torch.tensor([3, 4]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1),
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    entry = types.SimpleNamespace(record=record)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.requests = {42: entry}
+    engine.failed_request_ids = []
+    engine.rank, engine.use_coordinator = 1, False
+    engine.context = mock.Mock()
+    engine._complete_request = mock.Mock(return_value=record[-1])
+
+    engine._handle_failed_request(42)
+
+    engine.context.remove_vlm_request_data.assert_called_once_with(42)
+    engine._complete_request.assert_called_once_with(entry)
+    assert (record[-1].status, engine.failed_request_ids) == (Status.FAILED, [42])
+
+
 def test_streaming_partials_buffer_until_token_interval():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
@@ -1861,6 +2829,89 @@ def test_streaming_partials_buffer_until_token_interval():
 
     engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
+
+
+def _collect_streamed_partials(engine, streamed):
+    """Run `_try_send_streaming_partials` and accumulate its frames per request id."""
+    engine.socket_for_receiving_requests.send_multipart.reset_mock()
+    engine._try_send_streaming_partials()
+    for call in engine.socket_for_receiving_requests.send_multipart.call_args_list:
+        for frame in call.args[0][1:]:
+            partial = msgpack.unpackb(frame, raw=False)
+            out = streamed.setdefault(
+                partial["request_id"], {"tokens": [], "log_probs": [], "top_n": []}
+            )
+            out["tokens"].extend(partial["new_tokens"])
+            out["log_probs"].extend(partial.get("new_log_probs", []))
+            out["top_n"].extend(partial.get("new_top_n_logprobs", []))
+
+
+@pytest.mark.parametrize("streaming_interval", [1, 3])
+@pytest.mark.parametrize("stop_word_holdback", [False, True])
+def test_streaming_partials_continue_across_checkpoint(streaming_interval, stop_word_holdback):
+    """Streaming must stay aligned with `record.merge()` across an eviction checkpoint.
+
+    Eviction (and recompute on suspend) calls `record.checkpoint()`, which appends
+    a new segment whose prompt absorbs the earlier generations and whose
+    `generated_tokens` restart at 0. The stream offset is tracked over the whole
+    record, so indexing only the latest segment with it skips the first
+    `already` tokens generated after the resume.
+    """
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._partial_emit_lengths = {}
+    engine.socket_for_receiving_requests = mock.Mock()
+
+    request = DynamicInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=21,
+            termination_id=-1,
+            streaming=True,
+            streaming_interval=streaming_interval,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+        ),
+        stop_word_ids=[[900, 901, 902]] if stop_word_holdback else None,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine.requests = {7: RequestEntry(record=record, future=None)}
+
+    def generate(token):
+        segment = record[-1]
+        segment.generated_tokens.append(token)
+        if segment.generated_log_probs is None:
+            segment.generated_log_probs = []
+            segment.generated_top_n_logprobs = []
+        segment.generated_log_probs.append(-token / 100.0)
+        segment.generated_top_n_logprobs.append({str(token): -token / 100.0})
+
+    streamed = {}
+    next_token = 100
+    # Two evictions: 5 tokens, then 4 (fewer than already streamed), then 12.
+    segment_lengths = (5, 4, 12)
+    for segment_length in segment_lengths:
+        for _ in range(segment_length):
+            generate(next_token)
+            next_token += 1
+            _collect_streamed_partials(engine, streamed)
+        if segment_length != segment_lengths[-1]:
+            record.checkpoint()
+            # Nothing new to send right after a checkpoint.
+            _collect_streamed_partials(engine, streamed)
+
+    merged = record.merge()
+    assert len(record.requests) == 3
+    assert merged.generated_tokens == list(range(100, 121))
+    out = streamed[7]
+    sent = len(out["tokens"])
+    assert out["tokens"] == merged.generated_tokens[:sent]
+    # Holdback / interval may keep a tail unsent; the final reply carries it.
+    holdback = 2 if stop_word_holdback else 0
+    assert sent >= len(merged.generated_tokens) - holdback - (streaming_interval - 1)
+    assert sent == engine._partial_emit_lengths[7]
+    assert out["log_probs"] == merged.generated_log_probs[:sent]
+    assert out["top_n"] == merged.generated_top_n_logprobs[:sent]
 
 
 def _generated_event_tokens(request):
@@ -2030,7 +3081,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
@@ -2097,7 +3148,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
                 [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
                 [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
-                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 35, 20, 49, 28, 34, 81],
+                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 73, 20, 49, 28, 34, 81],
                 [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
                 [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
                 [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
@@ -2463,6 +3514,102 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert allocator.pool_avail == allocator.pool_size - 1
         assert context.total_request_count == 0
         assert context.paused_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_streaming_partials_match_merged_record_after_eviction(self) -> None:
+        """Streamed token/logprob deltas equal `record.merge()` for evicted requests.
+
+        A KV pool too small for all requests with no paused-block budget forces
+        evictions. An evicted request resumes as a new record segment whose
+        `generated_tokens` restart at 0, while its stream offset is already
+        non-zero; the stream must continue from the merged position instead of
+        skipping (or stalling on) tokens generated after the resume.
+        """
+        num_requests = 8
+        prompt_length = 256
+        num_tokens_to_generate = 48
+        block_size_tokens = 256
+        pool_block_count = 6
+
+        probe_env = self._build_test_env(DynamicEngineTestConfig())
+        block_size_bytes = probe_env.engine.context.block_size_bytes
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=num_requests,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            context_block_size_tokens=block_size_tokens,
+            context_buffer_size_gb=(pool_block_count * block_size_bytes + 1) / 1024**3,
+            context_paused_buffer_size_gb=0.0,
+            context_max_requests=num_requests,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        context = engine.context
+        vocab_size = test_config.vocab_size
+
+        # Deterministic, position-dependent tokens (next = input + 1) so a skipped
+        # or repeated token changes the streamed sequence, not just its length.
+        def mock_increment_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            next_tokens = (tokens + 1) % (vocab_size - 1)
+            logits.scatter_(-1, next_tokens.unsqueeze(-1), 100.0)
+            if test_config.materialize_only_last_token_logits:
+                logits = context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        engine.controller.inference_wrapped_model.model.forward = mock_increment_forward
+
+        for request in env.requests:
+            request.sampling_params.termination_id = -1
+            request.sampling_params.streaming = True
+            engine._add_request(request)
+
+        # Mirror the coordinator branch of `async_bookkeep`: drop finished
+        # requests' offsets, then stream deltas for the remaining requests.
+        engine._partial_emit_lengths = {}
+        engine.socket_for_receiving_requests = mock.Mock()
+        streamed = {}
+        segments_seen = {}
+        finished_requests = []
+        for _ in range(4000):
+            if not engine.has_unfinished_requests():
+                break
+            step_finished = engine.step_modern()["finished_requests"]
+            finished_requests.extend(step_finished)
+            for request in step_finished:
+                engine._partial_emit_lengths.pop(request.request_id, None)
+            for rid, entry in engine.requests.items():
+                segments_seen[rid] = max(segments_seen.get(rid, 1), len(entry.record.requests))
+            _collect_streamed_partials(engine, streamed)
+
+        assert not engine.has_unfinished_requests()
+        assert engine.evicted_request_count > 0, "no request was evicted"
+        assert len(finished_requests) == num_requests
+
+        resumed_and_streamed = 0
+        for request in finished_requests:
+            assert len(request.generated_tokens) == num_tokens_to_generate
+            out = streamed.get(request.request_id, {"tokens": [], "log_probs": []})
+            sent = len(out["tokens"])
+            assert out["tokens"] == request.generated_tokens[:sent], request.request_id
+            assert out["log_probs"] == request.generated_log_probs[:sent], request.request_id
+            # Only the final step's token(s) may be left to the final reply.
+            assert sent >= num_tokens_to_generate - 1, (request.request_id, sent)
+            if segments_seen.get(request.request_id, 1) > 1:
+                resumed_and_streamed += 1
+        assert resumed_and_streamed > 0, "no evicted request streamed after resuming"
         assert context.active_token_count == 0
 
     @pytest.mark.internal
@@ -3680,31 +4827,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_chunked_prefill_avoid_single_token_chunk(self):
-        """
-        Test that chunked prefill scheduling avoids leaving exactly 1 token for the final chunk.
-        This leads to a known bug in the Flash Attention kernel:
-        https://github.com/Dao-AILab/flash-attention/issues/1537
+    def test_chunked_prefill_single_token_final_chunk(self):
+        """Chunked prefill leaves a one-token final chunk rather than reshaping the split.
 
-        Scenario:
-            - Max tokens per step (Chunk Size): 256
-            - Request prompt length: 513
-
-        Default scheduling would do:
-            1. Chunk 256 (Remaining 257)
-            2. Chunk 256 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
-            3. Chunk 1
-
-        Fixed scheduling should do:
-            1. Chunk 256 (Remaining 257) -> 513 - 256 == 257. Schedule full 256.
-            2. Chunk 255 (Remaining 2)   -> 257 tokens left. If we take 256, 1 remains.
-                                            So we reduce chunk to 255.
-            3. Chunk 2   (Remaining 0)
+        Prompt of 513 tokens with a 256-token budget: chunks of 256, 256, then 1. Numerical
+        correctness of one-token chunks is covered by
+        test_single_token_prefill_chunks_match_unchunked_baseline.
         """
         prefill_chunk_size = 256
-        # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
-        # 256 + 255 + 2 = 513
-        prompt_len = 513
+        prompt_len = 2 * prefill_chunk_size + 1
 
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -3722,64 +4853,29 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ctx = env.engine.context
 
         # Mock the model forward function to avoid possible numerics issues
-        # caused by random inputs
         model_instance = env.engine.controller.inference_wrapped_model.model
         model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
-        # Create a request with length 513
-        req_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
         req = DynamicInferenceRequest(
             request_id=1,
-            prompt_tokens=req_tokens,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=1),
         )
-
         env.engine._add_request(req)
 
-        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
-
-        # --- Step 1 (async primer) ---
-        # Available: 256. Remaining: 513.
-        # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
         env.engine.step_modern()
+        assert ctx.request_query_lengths[0].item() == prefill_chunk_size
+        assert req.finished_chunk_token_count == prefill_chunk_size
 
-        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
-        assert ctx.request_query_lengths[0].item() == 256
-
-        assert (
-            req.finished_chunk_token_count == 256
-        ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
-
-        # --- Step 2 ---
-        # Resolve the first chunk and launch the second.
-        # Available: 256. Remaining un-prefilled: 257.
-        # Logic: 257 - 256 = 1. This is the edge case!
-        # Fix should reduce chunk size by 1 (to 255).
         env.engine.step_modern()
+        assert ctx.request_query_lengths[0].item() == prefill_chunk_size
+        assert req.finished_chunk_token_count == 2 * prefill_chunk_size
 
-        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
-        assert ctx.request_query_lengths[0].item() == 255
-
-        # 256 (previous) + 255 (this step) = 511
-        assert req.finished_chunk_token_count == 511, (
-            "Step 2: Expected 511 tokens processed (256+255), "
-            f"got {req.finished_chunk_token_count}. "
-        )
-
-        # --- Step 3 ---
-        # Resolve the second chunk and launch the final chunk.
-        # Remaining un-prefilled: 2. Available: 256.
-        # Logic: 2 <= 256. Schedule 2.
         env.engine.step_modern()
-
-        assert ctx.total_request_count == 1
         assert ctx.num_prefill_requests == 1
-        assert ctx.request_query_lengths[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 1
 
-        # --- Step 4 ---
-        # Resolve the final prefill output and complete the request.
         env.engine.step_modern()
-
         assert ctx.num_prefill_requests == 0
         assert req.status == Status.COMPLETED
 
@@ -3788,29 +4884,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_chunked_prefill_delay_scheduling_for_unavoidable_single_token_chunk(self):
-        """
-        Test that chunked prefill scheduling delays execution when the only available
-        option is to schedule a chunk of size 1 that leaves exactly 1 token remaining.
+    def test_chunked_prefill_schedules_single_token_chunk_into_leftover_budget(self):
+        """A one-token leftover budget is used rather than deferring the next request.
 
-        Scenario:
-            - Max tokens per step: 256
-            - Request A: 254 token prompt
-            - Request B: 2 token prompt
-
-        Sequence:
-            1. Step 1 async primer:
-               - Request A is scheduled (255 tokens).
-               - Context has 1 token available (256 - 255).
-               - Request B has 2 tokens remaining.
-               - If we schedule 1 token for B, it leaves exactly 1 token for its final chunk,
-                 crashing FA3. Since chunk_length is 1, we can't safely reduce it.
-                 The engine MUST delay scheduling Request B.
-            2. Step 2 resolves Request A and schedules Request B.
-               - Request A completes after its prefill sample is resolved.
-               - Context has all 256 tokens available.
-               - Request B is now safely scheduled for its full 2 tokens.
-            3. Step 3 resolves Request B's prefill sample.
+        Max tokens per step is 256. Request A (255 tokens) leaves 1 token of budget, so
+        request B (2 tokens) is split into two one-token chunks instead of waiting a step.
         """
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -3831,51 +4909,34 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         model_instance = env.engine.controller.inference_wrapped_model.model
         model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
-        # Add Request A (Length 255)
-        req_a_tokens = torch.randint(0, test_config.vocab_size, (255,), device='cuda')
         req_a = DynamicInferenceRequest(
             request_id=1,
-            prompt_tokens=req_a_tokens,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (255,), device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (2,), device='cuda'),
             sampling_params=SamplingParams(num_tokens_to_generate=1),
         )
         env.engine._add_request(req_a)
-
-        # Add Request B (Length 2)
-        req_b_tokens = torch.randint(0, test_config.vocab_size, (2,), device='cuda')
-        req_b = DynamicInferenceRequest(
-            request_id=2,
-            prompt_tokens=req_b_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=1),
-        )
         env.engine._add_request(req_b)
 
-        # --- Step 1 (async primer) ---
-        # Schedule and launch Request A fully (255), but delay Request B.
+        # Step 1: A's full prompt plus B's first token fill the 256-token budget.
         env.engine.step_modern()
+        assert ctx.total_request_count == 2
+        assert ctx.active_token_count == 256
+        assert req_b.finished_chunk_token_count == 1
+        assert ctx.request_query_lengths[1].item() == 1
 
-        assert ctx.total_request_count == 1
-        assert ctx.active_token_count == 255
-
-        # Request B MUST be delayed (0 tokens processed) to avoid the FA3 bug
-        assert (
-            req_b.finished_chunk_token_count == 0
-        ), "Request B should have been delayed to avoid leaving a 1-token chunk"
-        assert len(env.engine.waiting_request_ids) == 1
-        assert env.engine.waiting_request_ids[0] == 2
-
-        # --- Step 2 ---
-        # Resolve Request A, then schedule and launch Request B's full 2-token prompt.
+        # Step 2: B's final one-token chunk.
         env.engine.step_modern()
-
         assert req_a.status == Status.COMPLETED
-        assert ctx.total_request_count == 1
         assert ctx.request_ids[0].item() == 2
-        assert ctx.request_query_lengths[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 1
 
-        # --- Step 3 ---
-        # Resolve Request B's prefill output.
+        # Step 3: resolve B's prefill output.
         env.engine.step_modern()
-
         assert req_b.status == Status.COMPLETED
         assert len(env.engine.waiting_request_ids) == 0
 
@@ -3961,12 +5022,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_prefix_caching_avoid_single_token_effective_chunk(self):
-        """
-        Test that prefix caching combined with chunked prefill avoids leaving exactly
-        1 token for the effective prefill chunk. A 1-token prefill chunk routes to
-        the Flash Attention decode kernel, which crashes due to shape mismatches.
-        """
+    def test_prefix_caching_single_token_effective_chunk(self):
+        """A prefix-cache hit on all but the last prompt token computes only that token."""
         block_size = 16
         prompt_len = 17  # 1 full block (16) + 1 token
 
@@ -4019,13 +5076,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env.engine._add_request(req_b)
         env.engine.step_modern()
 
-        # Verify that `_compute_prefix_match` successfully clamped the skip.
+        # The cached block is skipped in full, leaving a one-token chunk.
         req_b_idx = ctx.request_ids.tolist().index(2)
-
-        assert ctx.request_query_lengths[req_b_idx].item() == 17, (
-            f"Expected effective chunk length to be backed off to 17, "
-            f"but got {ctx.request_query_lengths[req_b_idx].item()}."
-        )
+        assert ctx.request_query_lengths[req_b_idx].item() == 1
+        assert req_b.num_cached_tokens == block_size
 
     @pytest.mark.internal
     @torch.inference_mode()
@@ -4050,6 +5104,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ctx.block_size_tokens = block_size
         ctx.enable_prefix_caching = True
         ctx.is_hybrid_model = True
+        # This case is about the Mamba restore depth; the MTP draft plane is off, so neither
+        # the speculative block reserve nor the draft-slot back-off applies.
+        ctx.num_speculative_tokens = 0
+        ctx.enable_mtp_kv_cache = False
         ctx.kv_block_allocator = types.SimpleNamespace(
             kv_hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
         )
@@ -4057,16 +5115,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
         )
 
-        (
-            matched_block_ids,
-            num_blocks_from_pool,
-            already_allocated_blocks,
-            overall_required_blocks,
-            prefix_skip_tokens,
-            effective_prefill_chunk_length,
-        ) = DynamicInferenceContext._compute_prefix_match(
+        _m = DynamicInferenceContext._compute_prefix_match(
             ctx, req, prefill_chunk_length=211, record_mamba_match=True
         )
+        matched_block_ids = _m.matched_block_ids
+        num_blocks_from_pool = _m.num_blocks_from_pool
+        already_allocated_blocks = _m.already_allocated_blocks
+        overall_required_blocks = _m.overall_required_blocks
+        prefix_skip_tokens = _m.prefix_skip_tokens
+        effective_prefill_chunk_length = _m.effective_prefill_chunk_length
 
         assert matched_block_ids == [7]
         assert num_blocks_from_pool == 0
@@ -4758,6 +5815,67 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert list(ledger.keys()) == [finished_request.uid]
         assert ledger[finished_request.uid].policy_epoch == [(0, 3)]
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_payload_offload_mode(self):
+        """With a stager attached, a finished request's per-token payload is staged, keyed by
+        the response uid, and dropped from the reply sent to the coordinator."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 4
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+        engine.payload_stager = _RecordingStager()
+
+        engine._add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.ones(
+                    PROMPT_LEN, dtype=torch.int64, device=torch.cuda.current_device()
+                ),
+                # The RL client shape: return_log_probs is the compute trigger;
+                # under offload the values are staged, not sent.
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=NUM_TOKENS,
+                    termination_id=-1,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=True,
+                ),
+            )
+        )
+        finished_requests = []
+        while engine.has_unfinished_requests():
+            finished_requests.extend(engine.step_modern()["finished_requests"])
+        finished = finished_requests[0]
+
+        # The staged payload is the exact per-token data of the request, keyed by its uid.
+        ((uid, payload),) = engine.payload_stager.staged
+        assert uid == finished.uid
+        assert payload.prompt_token_ids == finished.prompt_tokens.tolist()
+        assert payload.generated_token_ids == list(finished.generated_tokens)
+        assert len(payload.generated_log_probs) == len(payload.generated_token_ids)
+
+        # The reply drops the staged payload and marks the takeover; token ids stay.
+        engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+        frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+        header, _ = msgpack.unpackb(frames[0], raw=False)
+        wire = msgpack.unpackb(frames[1], raw=False)
+        assert header == Headers.ENGINE_REPLY.value
+        assert wire["uid"] == finished.uid and wire["payload_offloaded"] is True
+        assert wire["generated_log_probs"] is None and wire["routing_indices"] is None
+        assert wire["generated_tokens"] == list(finished.generated_tokens)
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -4895,11 +6013,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # MUST go to the second block.
         token_blocks = context.token_to_block_idx[: context.active_token_count].tolist()
 
-        assert token_blocks == [
-            second_block,
-            second_block,
-            second_block,
-        ], f"Expected all new tokens to go to block {second_block}, but got {token_blocks}."
+        assert token_blocks == [second_block, second_block, second_block], (
+            f"Expected all new tokens to go to block {second_block}, but got {token_blocks}. "
+            f"The prompt exactly filled block {assigned_blocks[0].item()}, so every speculative "
+            f"token crosses into the block prefill reserved for them."
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -5084,6 +6202,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             for i in range(len(finished_req.generated_tokens) - 2)
         ]
         assert [7, 8, 9] in token_triplets
+        # A stop sequence longer than the draft depth can reach back past the step that
+        # triggered it, removing tokens earlier `acceptance_step_lengths` entries counted. The
+        # list must still sum to the output length, or a client reconstructing acceptance from
+        # it reads more tokens than were emitted.
+        assert sum(finished_req.acceptance_step_lengths) == len(finished_req.generated_tokens), (
+            f"acceptance_step_lengths {finished_req.acceptance_step_lengths} sums to "
+            f"{sum(finished_req.acceptance_step_lengths)} but the request emitted "
+            f"{len(finished_req.generated_tokens)} tokens"
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -6693,6 +7820,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert all(t == 0 for t in req.generated_tokens), (
                 f"Request {req.request_id}: expected all token 0, " f"got {req.generated_tokens}"
             )
+            # A suspend/resume splits the request into segments whose `generated_tokens` and
+            # `acceptance_step_lengths` are concatenated by `merge()`. The per-step lengths must
+            # still sum to the emitted token count across that boundary, or a client
+            # reconstructing acceptance reads a length the request never produced.
+            assert sum(req.acceptance_step_lengths) == len(req.generated_tokens), (
+                f"Request {req.request_id}: acceptance_step_lengths "
+                f"{req.acceptance_step_lengths} sums to {sum(req.acceptance_step_lengths)} "
+                f"across {len(record.requests)} segment(s), but the request emitted "
+                f"{len(req.generated_tokens)} tokens"
+            )
 
         assert engine.context.active_token_count == 0
         assert engine.context.total_request_count == 0
@@ -7111,7 +8248,7 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     @staticmethod

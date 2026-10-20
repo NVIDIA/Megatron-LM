@@ -89,6 +89,7 @@ def build_tokenizer(args, **kwargs):
         )
         kwargs['image_tag_type'] = args.image_tag_type
         kwargs['force_system_message'] = args.force_system_message
+        kwargs['keep_history_thinking'] = getattr(args, 'tokenizer_keep_history_thinking', False)
         kwargs['use_gigatoken'] = args.use_gigatoken
     elif args.tokenizer_type == 'SFTTokenizer':
         tokenizer_library = 'sft'

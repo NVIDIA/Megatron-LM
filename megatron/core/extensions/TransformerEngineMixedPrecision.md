@@ -25,9 +25,20 @@ like `--first-last-layers-bf16`.
 
 ## Limitations
 
-Relying on the module name to match against a configuration means the match is
-executed post-initialization, and initialization customization for a recipe
-override such as `fp4-param` and `fp8-param` are not in scope.
+Parameter-storage precision is selected while each matched module is initialized.
+`fp8_param` remains a boolean with a default of `false`; `null` is not supported.
+Training retains this BF16 storage default. Set `inherit_model_init_context: true`
+to inherit the enclosing storage policy, including `first_last_layers_bf16`,
+instead of specifying `fp8_param` or `fp4_param` in that recipe.
+
+With `transformer_impl="inference_optimized"`, a matching MXFP8 recipe inherits
+automatically when global MXFP8 parameter storage is enabled and the recipe omits
+all three options: `fp8_param`, `fp4_param`, and `inherit_model_init_context`.
+This is resolved from the original recipe before defaults are applied; the shared
+recipe is not modified. Explicit `fp8_param: false` or
+`inherit_model_init_context: false` disables automatic inheritance. BF16 recipes
+and other backends retain their existing storage defaults. The inference exception
+does not depend on gradient mode or `model.eval()`.
 
 The validation precision configurations rely on self.training. They have not
 yet been verified compatible with cuda-graphs and/or activation recompute.
@@ -70,6 +81,13 @@ configs:
       fp4_quantization_recipe: "nvfp4"
     evaluation_recipe: {}
 ```
+
+For inference-optimized models with a matching global MXFP8 parameter policy,
+these MXFP8 recipes automatically leave the enclosing model-init context in
+control, including BF16 boundary layers. To request the same storage inheritance
+for training, add `inherit_model_init_context: true` to the MXFP8 recipe. Otherwise
+training keeps BF16 parameter storage while using MXFP8 compute. Use an explicit
+`fp8_param` or `fp4_param` when the recipe should override the enclosing policy.
 
 Recipes are selected by matchers. Currently implemented are glob style
 expressions.

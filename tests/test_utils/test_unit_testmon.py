@@ -159,6 +159,27 @@ def test_nonzero_baseline_rank_runs_without_recording(project, tmp_path):
 
 
 @pytest.mark.parametrize("rank", (0, 3))
+def test_baseline_can_start_spawned_checkpoint_workers(project, tmp_path, rank):
+    (project / "tests/test_app.py").write_text(textwrap.dedent(f"""\
+            import multiprocessing
+            import sys
+            from pathlib import Path
+
+            def test_spawned_checkpoint_worker():
+                script_dir = Path({str(WRAPPER_PATH.parent)!r}).resolve()
+                assert all(Path(entry or '.').resolve() != script_dir for entry in sys.path)
+                assert 'tests.unit_tests' not in sys.modules
+                with multiprocessing.get_context('spawn').Manager() as manager:
+                    queue = manager.Queue()
+                    queue.put('checkpoint-worker-ready')
+                    assert queue.get(timeout=5) == 'checkpoint-worker-ready'
+            """))
+    result = _invoke(project, tmp_path / "spawn-cache", "baseline", rank=rank)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout
+
+
+@pytest.mark.parametrize("rank", (0, 3))
 def test_zero_selection_uses_private_copy_and_keeps_cache_readonly(project, cache, rank):
     phase = cache / "prod"
     before = _snapshot(phase)
@@ -369,6 +390,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
                 "run_testmon_phase() { return 0; }",
                 'merge_rank_selections() { mkdir -p "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1"; '
                 'echo tests/unit_tests/test_example.py > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/selected-tests"; }',
+                'apply_mandatory_tests() { : > "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$1/mandatory-tests"; }',
                 "run_selected_phase() { return 1; }",
                 "run_full_tests() { echo UNEXPECTED_FULL_BUCKET; }",
                 "run_enforced_tests() {" + _function(runner, "run_enforced_tests") + "\n}",

@@ -12,8 +12,10 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     InferenceRequest,
+    OffloadedRequestPayload,
     Status,
     compute_block_hashes_batched,
     compute_media_cache_key,
@@ -148,6 +150,24 @@ def test_preexpanded_multimodal_request_round_trip():
     assert resolved["media_cache_key"] == wire["media_cache_key"]
     assert torch.equal(resolved["imgs"], media["image"]["imgs"])
     assert torch.equal(resolved["imgs_sizes"], media["image"]["imgs_sizes"])
+
+
+def test_preprocessed_video_timing_metadata_round_trip():
+    media = {
+        "video": {
+            "imgs": torch.ones(1, 2, 4),
+            "imgs_sizes": torch.tensor([[2, 2], [2, 2]]),
+            "num_frames": torch.tensor([2]),
+            "video_frame_indices": [[3, 7]],
+            "video_fps": [29.97],
+        }
+    }
+
+    wire = serialize_multimodal_data(media)
+    resolved = resolve_multimodal_data_for_engine(wire)
+
+    assert resolved["video_frame_indices"] == [[3, 7]]
+    assert resolved["video_fps"] == [29.97]
 
 
 def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
@@ -483,6 +503,38 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert finished_cd.policy_epoch is None and finished_cd.num_evictions == 0
 
 
+def test_vlm_checkpoint_preserves_video_timing_metadata_and_mask():
+    image_token_mask = torch.tensor([0, 1, -1])
+    request = DynamicVLMInferenceRequest(
+        request_id=5,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+        generated_tokens=[7, 8],
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(2, 3, 4, 4),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 1], [1, 1]]),
+        num_frames=torch.tensor([2]),
+        video_frame_indices=[[3, 7]],
+        video_fps=[29.97],
+        media_tokens_preexpanded=True,
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(2, 1, 4),
+        image_token_mask=image_token_mask,
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+
+    record.checkpoint()
+
+    checkpoint = record[-1]
+    assert isinstance(checkpoint, DynamicVLMInferenceRequest)
+    assert checkpoint.prompt_tokens.tolist() == [99, 99, 5, 7, 8]
+    assert checkpoint.video_frame_indices == [[3, 7]]
+    assert checkpoint.video_fps == [29.97]
+    assert checkpoint.image_token_mask is image_token_mask
+    assert checkpoint.media_tokens_preexpanded is True
+
+
 def test_checkpoint_preserves_runtime_state_without_aliasing():
     """Checkpointing preserves state that controls re-admission and generation."""
     sampling_params = SamplingParams(num_tokens_to_generate=5, termination_id=0)
@@ -544,25 +596,24 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
 @pytest.mark.parametrize(
     (
         "return_prompt_tokens",
+        "payload_offloaded",
         "expected_prompt_field",
-        "expected_compact_prompt_field",
         "expected_remaining_prompt_field",
     ),
     [
-        (False, None, None, None),  # default: prompt state dropped from payload
-        (True, [1, 2, 3, 4], [1, 99, 4], [1, 2, 3, 4]),
+        (False, False, None, None),  # default: prompt state dropped from payload
+        (True, False, [1, 2, 3, 4], [1, 2, 3, 4]),  # opt-in: prompt state preserved
+        (True, True, None, None),  # offload drops the prompt even when opted in
     ],
 )
 def test_dynamic_inference_request_serialize_return_prompt_tokens(
-    return_prompt_tokens,
-    expected_prompt_field,
-    expected_compact_prompt_field,
-    expected_remaining_prompt_field,
+    return_prompt_tokens, payload_offloaded, expected_prompt_field, expected_remaining_prompt_field
 ):
     """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
     (the API uses it for `usage.prompt_tokens` on the response) and drops the
     prompt_tokens tensor from the wire payload unless
-    SamplingParams.return_prompt_tokens is True. This is the load-bearing
+    SamplingParams.return_prompt_tokens is True. Payload offload always drops
+    them: the stager already holds the prompt ids. This is the load-bearing
     wire-cost optimization for long agentic-RL prompts. The same call must
     (a) leave self.prompt_tokens intact on the local instance — the drop is
     wire-only — and (b) keep the routing_indices shape check honest, which
@@ -572,40 +623,51 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
         num_tokens_to_generate=5, termination_id=0, return_prompt_tokens=return_prompt_tokens
     )
     prompt = torch.tensor([1, 2, 3, 4])
-    compact_prompt = torch.tensor([1, 99, 4])
     # prompt_len=4 + generated=[10] → total_tokens=5 → routing_indices.shape[0] must be 4.
     routing = np.zeros((4, 2, 1), dtype=np.int32)
     req = _make_dynamic_request(
-        prompt_tokens=prompt,
-        compact_prompt_tokens=compact_prompt,
-        sampling_params=sp,
-        generated_tokens=[10],
-        routing_indices=routing,
+        prompt_tokens=prompt, sampling_params=sp, generated_tokens=[10], routing_indices=routing
     )
 
-    obj = req.serialize()
+    obj = req.serialize(payload_offloaded=payload_offloaded)
     unwrapped_obj = unwrap_serialized_tensors(obj)
 
     # prompt_length is always populated (independent of the drop).
     assert obj["prompt_length"] == 4
-    # Payload either preserves the serialized tensor values or drops them.
+    # Payload either preserves the serialized tensor values or drops them (present but None).
     assert unwrapped_obj["prompt_tokens"] == expected_prompt_field
-    assert unwrapped_obj["compact_prompt_tokens"] == expected_compact_prompt_field
     assert unwrapped_obj["remaining_prompt_tokens"] == expected_remaining_prompt_field
+    assert obj["payload_offloaded"] is payload_offloaded
     # Local instance is unaffected — the drop is wire-only.
     assert req.prompt_tokens is prompt
-    assert req.compact_prompt_tokens is compact_prompt
-    # routing_indices survives the drop path (shape check would have crashed on
-    # the temporarily-None self.prompt_tokens if the fix used self.prompt_tokens).
-    assert isinstance(obj["routing_indices"], tuple) and obj["routing_indices"][0] == "ndarray"
+    # routing_indices survives the prompt-only drop path, but payload offload strips it.
+    # The former's shape check would crash if it used temporarily-None self.prompt_tokens.
+    if payload_offloaded:
+        assert obj["routing_indices"] is None
+    else:
+        assert isinstance(obj["routing_indices"], tuple)
+        assert obj["routing_indices"][0] == "ndarray"
+
+
+def test_dynamic_inference_request_serialize_without_sampling_params_drops_prompt():
+    """With sampling_params=None nothing can opt in to return_prompt_tokens, so the
+    prompt tensors stay off the wire (prompt_length is still reported)."""
+    prompt = torch.tensor([1, 2, 3, 4])
+    req = _make_dynamic_request(prompt_tokens=prompt, sampling_params=None)
+
+    obj = req.serialize()
+
+    assert obj["prompt_length"] == 4
+    assert obj["prompt_tokens"] is None
+    assert obj["remaining_prompt_tokens"] is None
+    assert obj["payload_offloaded"] is False
+    assert req.prompt_tokens is prompt
 
 
 def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(monkeypatch):
     """A serialization failure must not clear prompt state on the live request."""
     request = _make_dynamic_request()
     prompt_tokens = request.prompt_tokens
-    request.compact_prompt_tokens = torch.tensor([1, 99, 4])
-    compact_prompt_tokens = request.compact_prompt_tokens
     request.remaining_prompt_tokens = request.prompt_tokens[2:]
     remaining_prompt_tokens = request.remaining_prompt_tokens
 
@@ -618,7 +680,6 @@ def test_dynamic_inference_request_serialize_restores_prompt_state_after_error(m
         request.serialize()
 
     assert request.prompt_tokens is prompt_tokens
-    assert request.compact_prompt_tokens is compact_prompt_tokens
     assert request.remaining_prompt_tokens is remaining_prompt_tokens
 
 
@@ -789,3 +850,84 @@ def test_supplied_block_hashes_are_not_re_salted():
         block_hash_salt="w9",
     )
     assert request.precomputed_block_hashes == [11, 22]
+
+
+def test_payload_staging_metadata_survives_checkpoint_and_stays_off_reply():
+    admission = {"rollout_id": "r0", "model_call_id": "c1"}
+    media_tensors = {"imgs": torch.ones(1, 2, 4)}
+    request = _make_dynamic_request(
+        uid="chatcmpl-fixed",
+        offload_params={"ng_capture": admission},
+        media_tensors=media_tensors,
+        generated_tokens=[10],
+    )
+    request.generated_log_probs = [-0.25]
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    assert record.requests[-1].media_tensors is media_tensors
+    merged = record.merge()
+
+    assert merged.uid == "chatcmpl-fixed"
+    assert merged.offload_params == {"ng_capture": admission}
+    assert merged.media_tensors is media_tensors
+
+    serialized = merged.serialize(
+        payload_offloaded=True,
+        payload_stage_metadata={"ng_commit_coords": {"staging_key": "r0/c1"}},
+    )
+    assert serialized["uid"] == "chatcmpl-fixed"
+    assert "offload_params" not in serialized
+    assert "media_tensors" not in serialized
+    assert serialized["generated_log_probs"] is None
+    assert serialized["payload_offloaded"] is True
+    assert serialized["payload_stage_metadata"] == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+    round_trip = DynamicInferenceRequest.deserialize(unwrap_serialized_tensors(serialized))
+    assert round_trip.payload_offloaded is True
+    assert round_trip.payload_stage_metadata == {"ng_commit_coords": {"staging_key": "r0/c1"}}
+
+
+def test_offloaded_request_payload_and_serialize():
+    """The payload copies a finished request's per-token data as plain host-side lists;
+    serialize(payload_offloaded=True) drops that data from the wire, marks the reply, and
+    restores local state; defaults are unchanged."""
+    routing = np.array([[1], [2], [3], [4]])  # total_tokens - 1 rows
+    imgs = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+
+    def make_request(multimodal=False):
+        req = DynamicInferenceRequest(
+            request_id=7,
+            prompt_tokens=torch.tensor([1, 2, 3]),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+            generated_tokens=[10, 11],
+            media_tensors={"imgs": imgs} if multimodal else None,
+        )
+        req.generated_log_probs = [-0.5, -0.25]
+        req.prompt_log_probs = torch.tensor([-1.0, -2.0])
+        req.routing_indices = routing
+        return req
+
+    req = make_request()
+    payload = OffloadedRequestPayload.from_request(req)
+    assert payload.prompt_token_ids == [1, 2, 3]
+    assert payload.generated_token_ids == [10, 11]
+    assert payload.generated_log_probs == [-0.5, -0.25]
+    assert payload.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
+    assert payload.routing_indices is routing
+    assert payload.media_tensors is None
+
+    vlm_payload = OffloadedRequestPayload.from_request(make_request(multimodal=True))
+    assert torch.equal(vlm_payload.media_tensors["imgs"], imgs)
+    assert vlm_payload.media_tensors["imgs"].device.type == "cpu"
+
+    obj = req.serialize(payload_offloaded=True)
+    assert obj["payload_offloaded"] is True
+    assert obj["generated_log_probs"] is None
+    assert obj["prompt_log_probs"] is None and obj["routing_indices"] is None
+    assert obj["generated_tokens"] == [10, 11]  # token ids stay: they are the response
+    # The drop is wire-only: local state is restored after the send.
+    assert req.generated_log_probs == [-0.5, -0.25] and req.routing_indices is routing
+
+    obj = make_request().serialize()
+    assert obj["payload_offloaded"] is False
+    assert obj["generated_log_probs"] == [-0.5, -0.25]
+    assert obj["routing_indices"][0] == "ndarray"

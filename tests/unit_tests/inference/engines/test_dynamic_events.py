@@ -15,6 +15,7 @@ import torch
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     MaxSequenceLengthOverflowError,
+    PromptPreparationError,
     RequestOverflowError,
     TokenOverflowError,
 )
@@ -241,6 +242,13 @@ def test_error_event_serialization_with_context_error_factory():
             MaxSequenceLengthOverflowError,
             4,
             "Sequence too long",
+            False,
+        ),
+        (
+            DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            PromptPreparationError,
+            5,
+            "Prefix fetch failed",
             False,
         ),
     ]

@@ -50,14 +50,27 @@ class ServeConfig:
     Must already be bound to a real port; when set, `host` / `port` are not used for binding.
     """
 
-    default_temperature: float = 1.0
-    """Default temperature value when an HTTP request omits `temperature`."""
+    default_temperature: float | None = None
+    """Server-level temperature default when an HTTP request omits `temperature`.
 
-    default_top_p: float = 1.0
-    """Default top-p value when an HTTP request omits `top_p`."""
+    Only takes precedence over the model's own `generation_config.json` when
+    explicitly set here. Unset (`None`) leaves that tier free to apply; the
+    final fallback if neither is set is `1.0`.
+    """
 
-    default_top_k: int = 0
-    """Default top-k value when an HTTP request omits `top_k`."""
+    default_top_p: float | None = None
+    """Server-level top-p default when an HTTP request omits `top_p`.
+
+    Same precedence as `default_temperature`: explicit here > model's
+    `generation_config.json` > hardcoded `1.0`.
+    """
+
+    default_top_k: int | None = None
+    """Server-level top-k default when an HTTP request omits `top_k`.
+
+    Same precedence as `default_temperature`: explicit here > model's
+    `generation_config.json` > hardcoded `0`.
+    """
 
     eval_mode: bool = False
     """Use evaluation defaults instead of RL-oriented response behavior.

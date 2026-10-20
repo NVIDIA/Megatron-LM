@@ -32,6 +32,12 @@ from tests.unit_tests.test_utilities import Utils
 ENCODER = "images"
 
 
+@pytest.fixture(autouse=True)
+def runtime_config(mimo_run_config):
+    mimo_run_config.rng.seed = 1234
+    return mimo_run_config
+
+
 def _args(**overrides):
     ddp_defaults = vars(DistributedDataParallelConfig())
     base = dict(
@@ -382,6 +388,42 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
         match=f"MIMO {hook_stage}-wrap hooks must return exactly one outer model; got {model_count}",
     ):
         builder.build_distributed_models(mocker.Mock(), ddp_config=DistributedDataParallelConfig())
+
+
+def test_configure_module_rng_forwards_rng_tracker_options(mocker, run_config):
+    run_config.rng.te_rng_tracker = True
+    run_config.rng.inference_rng_tracker = True
+    pg_collection = SimpleNamespace(
+        pp=object(),
+        dp=object(),
+        tp=object(),
+        ep=object(),
+        expt_tp=object(),
+        gtp_remat=object(),
+        expt_gtp_remat=object(),
+    )
+    set_random_seed = mocker.patch("examples.mimo.training.runtime._set_random_seed")
+
+    configure_module_rng(
+        _args(te_rng_tracker=False, inference_rng_tracker=False, cuda_graph_impl="local"),
+        pg_collection,
+        role_seed_offset=10,
+        data_parallel_random_init=True,
+    )
+
+    assert set_random_seed.call_args.args == (1244, True)
+    assert set_random_seed.call_args.kwargs == {
+        "te_rng_tracker": True,
+        "inference_rng_tracker": True,
+        "use_cudagraphable_rng": True,
+        "pp_group": pg_collection.pp,
+        "dp_group": pg_collection.dp,
+        "tp_group": pg_collection.tp,
+        "ep_group": pg_collection.ep,
+        "etp_group": pg_collection.expt_tp,
+        "gtp_remat_group": pg_collection.gtp_remat,
+        "egtp_remat_group": pg_collection.expt_gtp_remat,
+    }
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")

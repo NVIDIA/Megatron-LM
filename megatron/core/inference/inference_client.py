@@ -36,6 +36,18 @@ except:
     HAVE_MSGPACK = False
 
 
+class InferenceRequestError(RuntimeError):
+    """Terminal request failure reported by the inference coordinator."""
+
+    def __init__(self, reason: str, *, source_safe: bool = False):
+        super().__init__(reason)
+        self.source_safe = source_safe
+
+
+class InferenceRequestAborted(InferenceRequestError):
+    """The local consumer cancelled; remote source-safety still requires an ACK."""
+
+
 class InferenceClient:
     """
     An asynchronous client for communicating with an inference coordinator service.
@@ -104,8 +116,16 @@ class InferenceClient:
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
+        self.coordinator_instance_id: str | None = None
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
+        # Cancellation and local shutdown do not prove remote transfers safe.
+        # Only a terminal reply or explicit source-safe acknowledgement removes an ID.
+        self._pending_source_requests: set[int] = set()
+        # Resolves when abort cleanup makes transferred state safe to reuse.
+        self.abort_futures: dict[int, asyncio.Future] = {}
+        # Background socket receiver for request, stream, and abort replies.
+        self.listener_task: asyncio.Task | None = None
         self.block_size_tokens = block_size_tokens
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
 
@@ -151,6 +171,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        offload_params: Optional[dict] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -175,15 +196,20 @@ class InferenceClient:
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
+            offload_params: Opaque JSON/msgpack-compatible metadata forwarded
+                to the engine's payload stager.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
         """
-        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
-            1
-        ]
+        return self.add_request_with_id(
+            prompt,
+            sampling_params,
+            multi_modal_data=multi_modal_data,
+            offload_params=offload_params,
+        )[1]
 
     def add_request_with_id(
         self,
@@ -191,6 +217,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        offload_params: Optional[dict] = None,
     ) -> tuple[int, asyncio.Future]:
         """Submit a request and return its id alongside its completion future.
 
@@ -212,16 +239,20 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
+        frames = self._pack_submit_frames(
+            request_id, prompt, sampling_params, multi_modal_data, offload_params=offload_params
+        )
         return request_id, self._submit_request(frames, request_id)
 
-    def _pack_submit_frames(self, request_id, prompt, sampling_params, multi_modal_data):
+    def _pack_submit_frames(
+        self, request_id, prompt, sampling_params, multi_modal_data, *, offload_params=None
+    ):
         """Build the multipart frames for a SUBMIT_REQUEST.
 
         Shared by the blocking and streaming submit paths so the wire format is
         defined once.
 
-        Four frames, each with a different contract:
+        Five frames, each with a different contract:
 
         0 metadata
             Decoded and repacked by the coordinator on every request, so
@@ -242,15 +273,23 @@ class InferenceClient:
             Never decoded by the coordinator, forwarded to the engine verbatim.
             Same reasoning as the prompt but a larger payload: raw image or
             video bytes, or serialized preprocessed tensors.
+        4 offload params
+            Never decoded by the coordinator, forwarded to the engine verbatim.
+            Opaque client-supplied metadata for the engine's prompt preparer and
+            payload stager, so it is unbounded and cannot share frame 0. Decoded
+            on MP rank 0 by the prompt preparer before the broadcast, and by every
+            rank at admission.
 
-        The frame count is fixed rather than varying with media, so a malformed
-        submission is caught by an arity check at the coordinator; a text-only
-        request pays one byte for a None media frame.
+        The frame count is fixed rather than varying with media or offload
+        params, so a malformed submission is caught by an arity check at the
+        coordinator; a text-only request without params pays one byte each for
+        a None media frame and a None offload frame.
 
         Returns:
             list: The frames to send, in wire order.
         """
         media_meta, media_payload = split_multimodal_data(
+            # If multi_modal_data is already serialized, then this is an identity function.
             serialize_multimodal_data(multi_modal_data)
         )
         return [
@@ -265,6 +304,7 @@ class InferenceClient:
             # prompt was shorter than one block.
             msgpack.packb(self._block_hashes(prompt, media_meta), use_bin_type=True),
             msgpack.packb(media_payload, use_bin_type=True),
+            msgpack.packb(offload_params, use_bin_type=True),
         ]
 
     @staticmethod
@@ -373,18 +413,48 @@ class InferenceClient:
     def release_handoff(self, request_id: int) -> None:
         """Tell the coordinator to release the KV blocks pinned for `request_id`.
 
-        Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
-        engines without that request_id ignore the message.
+        Sends a two-field RELEASE_KV message without a coordinator instance ID
+        and does not wait for an acknowledgement. The coordinator targets the
+        registered source, or broadcasts if ownership is unknown; engines
+        without that request_id ignore the message.
         """
         payload = [Headers.RELEASE_KV.value, int(request_id)]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def abort_request(self, request_id: int) -> None:
-        """Cancel an in-flight request and close its local response stream."""
+        """Cancel an in-flight request, ending its stream with InferenceRequestAborted."""
+
+        self._send_abort(request_id)
+
+    def abort_request_and_wait(self, request_id: int) -> asyncio.Future:
+        """Cancel a request and return its source-safety acknowledgement."""
+
+        request_id = int(request_id)
+        if not 0 <= request_id < self.next_request_id:
+            raise ValueError(f"Unknown request ID: {request_id}")
+        existing = self.abort_futures.get(request_id)
+        if existing is not None:
+            return existing
+        abort_future = self._new_abort_future(request_id)
+        if request_id not in self._pending_source_requests:
+            abort_future.set_result(True)
+        else:
+            self._send_abort(request_id)
+        return abort_future
+
+    def _mark_source_safe(self, request_id: int) -> None:
+        """Resolve cancellation even when normal completion wins the race."""
+        self._pending_source_requests.discard(request_id)
+        future = self.abort_futures.get(request_id)
+        if future is not None and not future.done():
+            future.set_result(True)
+
+    def _send_abort(self, request_id: int) -> None:
         request_id = int(request_id)
         stream = self.streams.pop(request_id, None)
         future = self.completion_futures.pop(request_id, None)
-        if stream is None and future is None:
+        abort_future = self.abort_futures.get(request_id)
+        if stream is None and future is None and abort_future is None:
             # Already completed (or never submitted): _submit_request and
             # _submit_stream register synchronously and _recv_task pops only
             # immediately before delivering, so absence from both means the
@@ -394,7 +464,7 @@ class InferenceClient:
             # nothing ever removes and the ABORT_REQUEST send would be wasted.
             return
         if stream is not None:
-            stream.finish()
+            stream.finish(exception=InferenceRequestAborted("Inference request cancelled"))
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
@@ -402,12 +472,27 @@ class InferenceClient:
         payload = [Headers.ABORT_REQUEST.value, request_id]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
+    def _new_abort_future(self, request_id: int) -> asyncio.Future:
+        """Create a future for the request's source-safety acknowledgement."""
+
+        future = asyncio.get_running_loop().create_future()
+        self.abort_futures[request_id] = future
+        future.add_done_callback(functools.partial(self._discard_abort_future, request_id))
+        return future
+
+    def _discard_abort_future(self, request_id: int, future: asyncio.Future) -> None:
+        """Remove a completed acknowledgement without discarding a newer waiter."""
+
+        if self.abort_futures.get(request_id) is future:
+            self.abort_futures.pop(request_id)
+
     def add_request_streaming(
         self,
         prompt: Union[str, List[int]],
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        offload_params: Optional[dict] = None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -438,6 +523,8 @@ class InferenceClient:
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
+            offload_params: Opaque JSON/msgpack-compatible metadata forwarded
+                to the engine's payload stager.
 
         Returns:
             AsyncStream[dict]: Per-step partial and final reply frames.
@@ -445,11 +532,14 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
+        frames = self._pack_submit_frames(
+            request_id, prompt, sampling_params, multi_modal_data, offload_params=offload_params
+        )
         return self._submit_stream(frames, request_id)
 
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
+        self._pending_source_requests.add(request_id)
         self.socket.send_multipart(frames)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
@@ -459,6 +549,7 @@ class InferenceClient:
 
     def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
+        self._pending_source_requests.add(request_id)
         self.socket.send_multipart(frames)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
@@ -488,6 +579,7 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id = data[1]
+                    self._mark_source_safe(request_id)
                     if request_id in self.aborted_request_ids:
                         self.aborted_request_ids.discard(request_id)
                         continue
@@ -506,7 +598,12 @@ class InferenceClient:
                         stream.put({"final": completed_request})
                         stream.finish()
                         continue
-                    completion_future = self.completion_futures.pop(request_id)
+                    completion_future = self.completion_futures.pop(request_id, None)
+                    if completion_future is None:
+                        logging.warning(
+                            "Client: ignoring late ENGINE_REPLY for request %d", request_id
+                        )
+                        continue
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
@@ -519,6 +616,25 @@ class InferenceClient:
                     stream = self.streams.get(request_id)
                     if stream is not None:
                         stream.put({"partial": msgpack.unpackb(frames[1], raw=False)})
+                elif header == Headers.REQUEST_ERROR:
+                    request_id, reason, source_safe = data[1:]
+                    self.request_submission_times.pop(request_id, None)
+                    error = InferenceRequestError(str(reason), source_safe=bool(source_safe))
+                    if source_safe:
+                        self._mark_source_safe(request_id)
+                        self.aborted_request_ids.discard(request_id)
+                    stream = self.streams.pop(request_id, None)
+                    if stream is not None:
+                        stream.finish(exception=error)
+                        continue
+                    future = self.completion_futures.pop(request_id, None)
+                    if future is not None and not future.done():
+                        future.set_exception(error)
+                elif header == Headers.REQUEST_ABORTED:
+                    request_id, source_safe = int(data[1]), bool(data[2])
+                    if source_safe:
+                        self._mark_source_safe(request_id)
+                        self.aborted_request_ids.discard(request_id)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -540,6 +656,7 @@ class InferenceClient:
             raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
         reply = msgpack.unpackb(self.socket.recv_multipart()[0], raw=False)
         assert Headers(reply[0]) == Headers.CONNECT_ACK
+        self.coordinator_instance_id = str(reply[1]) if len(reply) > 1 else None
 
     def start(
         self,
@@ -641,7 +758,7 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        if hasattr(self, 'listener_task') and not self.listener_task.done():
+        if self.listener_task is not None and not self.listener_task.done():
             self.listener_task.cancel()
         # Wake up any listeners.
         for future in self.completion_futures.values():
@@ -652,6 +769,10 @@ class InferenceClient:
         for stream in self.streams.values():
             stream.finish()
         self.streams.clear()
+        for future in self.abort_futures.values():
+            if not future.done():
+                future.cancel()
+        self.abort_futures.clear()
         self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()

@@ -3,6 +3,7 @@
 import logging
 import math
 import re
+from itertools import chain
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -11,8 +12,9 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import get_model_config, get_pg_rank, get_pg_size, log_single_rank
 
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
@@ -177,6 +179,27 @@ def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
     return rid
 
 
+class GraphedGradCopyFloat16Optimizer(Float16OptimizerWithFloat16Params):
+    """Float16 optimizer whose gradient conversion replays in the training graph's pool.
+
+    Layer-wise DDP owns persistent main_grad buffers, so their FP32 conversion can
+    reuse forward/backward scratch once the full-iteration training graph has finished.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cudagraphed_grad_copy = FullIterationGradCopy()
+
+    def _copy_model_grads_to_main_grads(self):
+        self._cudagraphed_grad_copy.copy(
+            super()._copy_model_grads_to_main_grads,
+            chain(
+                zip(self.float16_groups, self.fp32_from_float16_groups),
+                ((group, group) for group in self.fp32_from_fp32_groups),
+            ),
+        )
+
+
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
@@ -282,8 +305,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             m, n = param.data.shape
             if getattr(param, 'is_gtp_weight_remat', False):
                 m = m * getattr(param, 'gtp_remat_size', 1)
-            big, small = max(m, n), min(m, n)
-            return big * small * small
+            small = min(m, n)
+            return m * n * small
 
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
@@ -457,6 +480,44 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         )
 
     @staticmethod
+    def _assign_ns_homes(params: list, specs: list, gtp_remat_size: int, tp_size: int) -> dict:
+        """Assign each sharded param an NS home ``(g_home, t_home)`` in the domain.
+
+        Longest Processing Time (LPT) bin-packing over ``gtp_remat_size * tp_size`` bins:
+        params sorted by ``ParamShardSpec.ns_cost`` descending, each placed in the bin
+        with the least accumulated cost. REPLICATED params are omitted: they are whole on
+        every rank of the domain, so every rank orthogonalizes its own copy instead of
+        electing a home, and giving them a bin would charge one rank for work all of
+        them do.
+
+        Args:
+            params: The domain's parameters.
+            specs: ``ParamShardSpec`` per param (same order).
+            gtp_remat_size: Size of the gtp_remat axis.
+            tp_size: Size of the tp axis.
+
+        Returns:
+            Dict mapping ``id(param)`` -> ``(g_home, t_home)``.
+        """
+        from megatron.core.optimizer.layer_sharded_muon import ParamSharding
+
+        num_bins = gtp_remat_size * tp_size
+        candidates = [
+            (spec.ns_cost, p)
+            for p, spec in zip(params, specs)
+            if spec.sharding is not ParamSharding.REPLICATED
+        ]
+        candidates.sort(key=lambda c: -c[0])  # stable: equal costs keep param order
+        bin_cost = [0] * num_bins
+        assignment = {}
+        for cost, p in candidates:
+            min_bin = min(range(num_bins), key=lambda b: bin_cost[b])
+            # Bin b -> (g_home, t_home) = (b // tp_size, b % tp_size).
+            assignment[id(p)] = (min_bin // tp_size, min_bin % tp_size)
+            bin_cost[min_bin] += cost
+        return assignment
+
+    @staticmethod
     def compute_full_param_layout(
         params: List[torch.nn.Parameter],
         bucket_size: Optional[int],
@@ -624,17 +685,32 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         'LayerWiseDistributedOptimizer expects base torch optimizers, '
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                optimizers[i] = Float16OptimizerWithFloat16Params(
+                wrapper = Float16OptimizerWithFloat16Params
+                if (
+                    model_chunks
+                    and getattr(get_model_config(model_chunks[0]), "cuda_graph_impl", "none")
+                    == "full_iteration"
+                    and not config.optimizer_cuda_graph
+                    and not config.optimizer_cpu_offload
+                ):
+                    wrapper = GraphedGradCopyFloat16Optimizer
+                optimizers[i] = wrapper(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
 
         self.tp_group = self.pg_collection.tp
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
+        # The module's own GTP axes: a MIMO module's grid carries these, and MPU has no
+        # globals to fall back on there (see param_is_not_gtp_duplicate).
+        self.gtp_group = getattr(self.pg_collection, 'gtp_remat', None)
+        self.expert_gtp_group = getattr(self.pg_collection, 'expt_gtp_remat', None)
         for optimizer in optimizers:
             # Child optimizers perform duplicate filtering and gradient-stat reductions.
             optimizer.grad_stats_parallel_group = self.grad_stats_parallel_group
             optimizer.tp_group = self.tp_group
             optimizer.expert_tp_group = self.expert_tp_group
+            optimizer.gtp_group = self.gtp_group
+            optimizer.expert_gtp_group = self.expert_gtp_group
 
         super().__init__(optimizers)
 
@@ -645,12 +721,108 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # ``for model_chunk in self.model_chunks`` actually iterates.
         self.model_chunks = model_chunks if model_chunks is not None else []
 
+        # Wire up layer sharding NS home assignment for LayerShardedMuon. After
+        # shard_params, group["params"] contains only this DP rank's assigned params;
+        # dense and expert params are sharded over *different* domains, so the domain is
+        # resolved per param group inside the helper.
+        self._wire_layer_sharding_ns_homes(optimizers, pg_collection)
+
         # TODO(kunlun, deyuf): potential future perf optimization
         # since allreduce is unchanged and handled by megatron DDP, they're already in
         # contiguous gbuf. So instead of shard param by layer randomly, we can shard by
         # buf range but keep some "extras" to keep boundary weight not sharded.
         # This way each rank do some duplicated work but allgather_v is no longer needed
         # All current distopt optimization can also be potentially applied
+
+    def _wire_layer_sharding_ns_homes(self, optimizers, pg_collection) -> None:
+        """Wire up NS home assignments for any LayerShardedMuon inner optimizers.
+
+        Each param group is matched to the domain it is sharded over, dense params over
+        ``(gtp_remat, tp)`` and expert params over ``(expt_gtp_remat, expt_tp)``; every
+        param's sharding is read once (``ParamShardSpec.from_param``), the domain's params
+        are pooled so LPT balances all of them at once, and the ``(g_home, t_home)``
+        assignments are pushed onto the ``LayerShardedMuon``.
+
+        Params of a single-rank domain get no home; ``LayerShardedMuon.step`` runs plain
+        local Newton-Schulz on them. Nothing here creates process groups or issues a
+        collective: this code runs with rank-local inventory, which differs across
+        pipeline and multimodal stages.
+        """
+        from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, ParamShardSpec
+
+        dense_axes = (getattr(pg_collection, 'gtp_remat', None), getattr(pg_collection, 'tp', None))
+        expert_axes = (
+            getattr(pg_collection, 'expt_gtp_remat', None),
+            getattr(pg_collection, 'expt_tp', None),
+        )
+
+        for opt in optimizers:
+            # Unwrap Float16OptimizerWithFloat16Params / FP32Optimizer if present.
+            inner = getattr(opt, 'optimizer', opt)
+            if not isinstance(inner, LayerShardedMuon):
+                continue
+
+            # Domain per param group (group['is_expert_parallel'] is the param-group-level
+            # expert marker), pooling the params of groups that share a domain.
+            group_axes: Dict[int, Tuple] = {}
+            domains: Dict[Tuple, List] = {}
+            for group_index, group in enumerate(inner.param_groups):
+                axes = expert_axes if group.get('is_expert_parallel', False) else dense_axes
+                group_axes[group_index] = axes
+                domains.setdefault(axes, []).extend(group['params'])
+
+            assignment: Dict[int, Tuple[int, int]] = {}
+            for (gtp_remat_group, tp_group), domain_params in domains.items():
+                gtp_remat_size = get_pg_size(gtp_remat_group)
+                tp_size = get_pg_size(tp_group)
+                if not domain_params or gtp_remat_size * tp_size <= 1:
+                    continue
+                # Classifying here (not only in step()) surfaces a misconfiguration at
+                # optimizer construction instead of after data loading and the first
+                # forward/backward.
+                specs = [
+                    ParamShardSpec.from_param(p, gtp_remat_size, tp_size) for p in domain_params
+                ]
+                self._check_gtp_group_matches(domain_params, specs, gtp_remat_group)
+                homes = self._assign_ns_homes(domain_params, specs, gtp_remat_size, tp_size)
+                assignment.update(homes)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f'LayerShardedMuon: assigned {len(homes)} params across '
+                    f'{tp_size} x {gtp_remat_size} (TP x GTP_remat) NS homes.',
+                )
+
+            if not assignment:
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    'LayerShardedMuon: no NS homes to assign (single-rank domains or '
+                    'replicated params only); step() runs local Newton-Schulz.',
+                )
+            inner.set_group_process_groups(group_axes)
+            inner.set_param_ns_homes(assignment)
+
+    @staticmethod
+    def _check_gtp_group_matches(params: list, specs: list, gtp_remat_group) -> None:
+        """The GTP layer records the group it sharded a weight over on the param
+        (``p.group``); the gtp_remat axis picked for the domain must have the same ranks,
+        or the stage-1 exchange would concatenate shards from the wrong ranks."""
+        expected = None
+        for p, spec in zip(params, specs):
+            recorded = getattr(p, 'group', None)
+            if not spec.gtp_sharded or recorded is None:
+                continue
+            if expected is None:
+                expected = torch.distributed.get_process_group_ranks(gtp_remat_group)
+            recorded_ranks = torch.distributed.get_process_group_ranks(recorded)
+            if recorded_ranks != expected:
+                raise ValueError(
+                    f"LayerShardedMuon wiring: param of shape {tuple(p.shape)} was GTP-sharded "
+                    f"over ranks {recorded_ranks} but its param group resolves to the "
+                    f"gtp_remat axis with ranks {expected}; check the group's "
+                    "is_expert_parallel marker against the module's process groups."
+                )
 
     def shard_params(self, optimizers, full_param_layouts=None):
         """Shard params across ranks according to the computed param layout.
@@ -984,6 +1156,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             tp_group=self.tp_group,
             expert_tp_group=self.expert_tp_group,
+            gtp_group=self.gtp_group,
+            expert_gtp_group=self.expert_gtp_group,
         )
 
     def start_param_sync_for_bucket_group_subset(self) -> None:

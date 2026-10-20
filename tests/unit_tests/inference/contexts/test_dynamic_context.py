@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -23,6 +24,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -51,8 +53,24 @@ def test_is_decode_only_uses_current_execution_snapshot(
     context._using_cuda_graph_this_step = using_cuda_graph
     context.num_prefill_requests = num_prefill_requests
     context.padded_batch_dimensions = mock.Mock(prefill_req_count=padded_prefill_requests)
+    # Must be explicitly falsy: a bare Mock attribute is truthy, which would short-circuit
+    # `is_decode_only` to False and make every case below pass for the wrong reason.
+    context.mtp_metadata = mock.Mock(is_varlen_forward=False)
 
     assert context.is_decode_only() is expected
+
+
+@pytest.mark.parametrize("using_cuda_graph", [False, True])
+def test_is_decode_only_is_false_during_the_mtp_commit_pass(using_cuda_graph):
+    """The commit pass is a varlen forward, so it overrides a decode-only request count."""
+    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    context._using_cuda_graph_this_step = using_cuda_graph
+    # Request counts that would otherwise classify this step as decode-only.
+    context.num_prefill_requests = 0
+    context.padded_batch_dimensions = mock.Mock(prefill_req_count=0)
+    context.mtp_metadata = mock.Mock(is_varlen_forward=True)
+
+    assert context.is_decode_only() is False
 
 
 class TestDynamicContext:
@@ -96,6 +114,9 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        expert_model_parallel_size: int = 1,
+        reserve_recurrent_state_dummy_slot: bool = False,
+        mamba_memory_ratio: float = None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -118,6 +139,8 @@ class TestDynamicContext:
                 num_layers=num_layers,
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
+                expert_model_parallel_size=expert_model_parallel_size,
+                num_moe_experts=2 if expert_model_parallel_size > 1 else None,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
@@ -136,6 +159,8 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
+                mamba_memory_ratio=mamba_memory_ratio,
             ),
         )
         return dynamic_context
@@ -143,6 +168,114 @@ class TestDynamicContext:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_prefill_batch_never_advertises_max_seqlen_q_of_one(self):
+        """A batch containing prefill must not publish max_seqlen_q == 1.
+
+        FlashAttention-2 reads max_seqlen_q == 1 as one query token per sequence and, under GQA,
+        reshapes q assuming total_q == num_seqs, which a padded prefill batch violates.
+        """
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.01,
+            block_size_tokens=16,
+            max_tokens=64,
+            max_requests=16,
+        )
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=9),
+            )
+        )
+        assert ctx.num_prefill_requests == 1
+        ctx.initialize_attention_state()
+        _, max_seqlen_q = ctx.cu_query_lengths()
+        assert max_seqlen_q >= 2
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("flash_attention_version", [2, 4])
+    def test_one_token_prefill_metadata_is_correct_under_flash_attention(
+        self, flash_attention_version
+    ):
+        """Flash attention on the metadata published for padded one-token prefills is correct.
+
+        Eager padding rounds tokens and requests independently, so total_q != num_seqs here,
+        which FlashAttention-2's GQA single-query path cannot handle.
+        """
+        if flash_attention_version == 2:
+            varlen = pytest.importorskip("flash_attn").flash_attn_varlen_func
+        else:
+            varlen = pytest.importorskip("flash_attn.cute").flash_attn_varlen_func
+        block_size = 256  # FA2 paged KV requires a multiple of 256.
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=1024,
+            buffer_size_gb=0.05,
+            block_size_tokens=block_size,
+            max_tokens=512,
+        )
+        for request_id in range(3):
+            ctx.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.tensor([request_id + 1], device='cpu'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+                )
+            )
+        ctx.initialize_attention_state()
+        ctx.transfer_bookkeeping_to_gpu()
+
+        cu_q, max_seqlen_q = ctx.cu_query_lengths()
+        cu_k, kv_lengths, max_seqlen_k = ctx.cu_kv_lengths()
+        block_table = ctx.active_attn_metadata["mha_metadata"].state_data["block_table"]
+        total_q = ctx.padded_active_token_count
+        assert total_q != cu_q.numel() - 1, "test needs total_q != num_seqs"
+
+        num_heads, num_kv_heads, head_dim = 8, 2, 128
+        num_blocks = int(block_table.max().item()) + 1
+        q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(
+            num_blocks, block_size, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+        if flash_attention_version == 2:
+            out = varlen(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=True,
+                block_table=block_table,
+            )
+        else:
+            out, _ = varlen(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                seqused_k=kv_lengths,
+                page_table=block_table,
+                causal=True,
+            )
+
+        expected = reference_paged_attention(q, k, v, cu_q, kv_lengths, block_table)
+        real = slice(0, cu_q[-1].item())
+        torch.testing.assert_close(out[real].float(), expected[real], atol=2e-2, rtol=2e-2)
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -2074,6 +2207,87 @@ class TestDynamicContext:
 
         assert "room for 3 durable slots on this pipeline stage" in str(error.value)
 
+    def _get_context_with_attention_only_stage(self, **inference_config_kwargs):
+        """Build a PP=2 context for layout ``M*|**``; stage 1 holds no recurrent layer."""
+        params_dtype = torch.float32
+        if parallel_state.get_pipeline_model_parallel_rank() == 0:
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA, Symbols.ATTENTION],
+                (544, 4),
+                (8, 64, 16),
+                params_dtype,
+                params_dtype,
+            )
+        else:
+            mamba_inference_state_config = None
+        return DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=4,
+                kv_channels=64,
+                num_attention_heads=8,
+                pipeline_model_parallel_size=2,
+                tensor_model_parallel_size=1,
+                pipeline_dtype=params_dtype,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=16,
+                max_tokens=1024,
+                unified_memory_level=0,
+                mamba_inference_state_config=mamba_inference_state_config,
+                **inference_config_kwargs,
+            ),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_mamba_prefix_cache_rejects_pipeline_stage_without_recurrent_layers(self):
+        """Every stage raises when a Mamba cache budget meets a stage without recurrent layers.
+
+        The recurrent stage would otherwise wait alone in the Mamba cache-capacity
+        collective, and the stages would skip different prompt tokens.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            with pytest.raises(ValueError, match="every pipeline stage of a hybrid model"):
+                self._get_context_with_attention_only_stage(
+                    enable_prefix_caching=True, prefix_caching_mamba_gb=0.05
+                )
+        finally:
+            self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("enable_prefix_caching", [False, True])
+    def test_pipeline_stage_without_recurrent_layers_initializes(self, enable_prefix_caching):
+        """A stage without recurrent layers initializes without a Mamba cache budget.
+
+        Every stage learns that the pipeline holds recurrent layers, so memory-only prefix
+        caching skips the same (zero) prompt tokens on every stage.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            context = self._get_context_with_attention_only_stage(
+                enable_prefix_caching=enable_prefix_caching
+            )
+            rank = parallel_state.get_pipeline_model_parallel_rank()
+            assert context.is_hybrid_model is (rank == 0)
+            assert context.pipeline_has_recurrent_layers
+            assert context.mamba_slot_allocator is None
+
+            pool_size = torch.tensor(
+                [context.kv_block_allocator.pool_size], device="cuda", dtype=torch.long
+            )
+            gathered = [torch.zeros_like(pool_size) for _ in range(2)]
+            torch.distributed.all_gather(
+                gathered, pool_size, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            assert len({t.item() for t in gathered}) == 1
+        finally:
+            self._restore_model_parallel()
+
     @pytest.mark.internal
     @rounder_override(64)
     def test_uneven_decoder_pp_layer_map_matches_get_num_layers_to_build(self):
@@ -2413,10 +2627,73 @@ class TestDynamicContext:
             assert (slow_mamba >= 0).all(), "slow path should allocate valid mamba slots"
             assert fast_mamba.unique().numel() == N, "fast path mamba slots must be unique"
 
+    def _get_hybrid_ep_context(self, **overrides):
+        args = dict(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+            expert_model_parallel_size=2,
+        )
+        args.update(overrides)
+        return self._get_dynamic_context(**args)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self):
+        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16)
+        ctx = self._get_hybrid_ep_context(
+            num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True
+        )
+        assert ctx.kv_block_allocator.pool_size == baseline.kv_block_allocator.pool_size
+        assert ctx.max_requests == baseline.max_requests
+        metadata = ctx.mamba_metadata
+        retained_slots = metadata.batch_allocate_slots(ctx.max_requests)
+        assert retained_slots is not None
+        assert metadata.mamba_state_free_slot_count == 0
+
+        ctx.initialize_attention_state(
+            is_expert_parallel_dummy_cuda_graph_step=True, transfer_bookkeeping_to_gpu=False
+        )
+
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+        assert ctx._cpu_mamba_batch_indices_decode[0] == metadata.dummy_state_idx
+        ctx.reset()
+        assert metadata.mamba_state_free_slot_count == 0
+
+    @pytest.mark.internal
+    @rounder_override(1)
+    def test_hybrid_ep_dummy_requires_positive_request_capacity(self):
+        with pytest.raises(ValueError, match="leaves no request capacity"):
+            self._get_hybrid_ep_context(
+                reserve_recurrent_state_dummy_slot=True, mamba_memory_ratio=1e-12
+            )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_ep_dummy_fails_cleanly_without_a_free_state_slot(self):
+        ctx = self._get_hybrid_ep_context(num_cuda_graphs=16)
+        metadata = ctx.mamba_metadata
+        assert metadata.batch_allocate_slots(ctx.max_requests) is not None
+        dummy_dimensions = InferenceBatchDimensions(
+            token_count=ctx.num_speculative_tokens + 1, prefill_req_count=0, decode_req_count=1
+        )
+
+        with pytest.raises(AssertionError, match="No free recurrent-state slots"):
+            ctx.add_dummy_requests_for_expert_parallel_step(dummy_dimensions)
+
     @pytest.mark.internal
     def test_gqa_high_tp_partition_heads(self):
         """Tests that TP > GQA results in 1 attention head per partition."""
         tp_size = 8
+        if Utils.world_size < tp_size:
+            pytest.skip(f"requires {tp_size} ranks, got {Utils.world_size}")
         self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
 
         model_config = TransformerConfig(
@@ -3395,7 +3672,9 @@ class TestDynamicContext:
         prefix_skip = 2 * bs - 1
         eff_chunk = chunk_length - prefix_skip
 
-        _, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, chunk_length)
+        _m = ctx._compute_prefix_match(req2, chunk_length)
+        prefix_skip = _m.prefix_skip_tokens
+        eff_chunk = _m.effective_prefill_chunk_length
         expected_active = tokens_before_chunk_2 + eff_chunk
         assert ctx.active_token_count == expected_active
 

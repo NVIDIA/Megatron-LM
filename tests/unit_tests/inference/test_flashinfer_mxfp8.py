@@ -7,8 +7,13 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
-from megatron.core.inference.moe.flashinfer_mxfp8 import select_routed_mxfp8_active_rows
+from megatron.core.inference.moe.flashinfer_mxfp8 import (
+    HAVE_FLASHINFER_ROUTED_MXFP8,
+    select_routed_mxfp8_active_rows,
+)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -17,6 +22,14 @@ def reset_inference_mode():
     InferenceMode.unset_active()
     yield
     InferenceMode.unset_active()
+
+
+def _mxfp8_weight():
+    return MXFP8Tensor(
+        data=torch.empty(1, dtype=torch.float8_e4m3fn),
+        scale=torch.empty(1, dtype=torch.uint8),
+        backend="triton",
+    )
 
 
 def test_inference_mode_tracks_bounded_mxfp8_rows():
@@ -81,6 +94,32 @@ def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
     assert config.expert_model_parallel_size == 2
 
 
+def test_flashinfer_mxfp8_config_accepts_batch_invariant_mode():
+    config = _make_bounded_mxfp8_config(
+        batch_invariant_mode=True,
+        params_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
+    )
+
+    assert config.batch_invariant_mode
+
+
+def test_flashinfer_bf16_config_rejects_batch_invariant_mode():
+    with pytest.raises(ValueError, match="only for an MXFP8 model configuration"):
+        _make_bounded_mxfp8_config(
+            fp8=None,
+            fp8_param=False,
+            inference_flashinfer_mxfp8_token_capacity=None,
+            batch_invariant_mode=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+
+
 def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     config = _make_bounded_mxfp8_config(
         fp8=None,
@@ -92,6 +131,56 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     assert config.fp8 is None
 
 
+def test_vllm_backend_accepts_mxfp8_config_for_per_layer_dispatch():
+    config = _make_bounded_mxfp8_config(
+        inference_grouped_gemm_backend="vllm",
+        inference_flashinfer_mxfp8_token_capacity=None,
+        expert_model_parallel_size=1,
+    )
+
+    assert config.inference_grouped_gemm_backend.value == "vllm"
+
+
+def test_vllm_mxfp8_layer_dispatches_to_mcore_path():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    expected = (object(), None)
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=True,
+        _uses_mxfp8_weights=True,
+        _fc1_weight=_mxfp8_weight(),
+        _fc2_weight=_mxfp8_weight(),
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.VLLM,
+        _mcore_fused_moe_forward=lambda hidden, probs, routing_map: expected,
+        _vllm_forward=lambda *args, **kwargs: pytest.fail("BF16 vLLM path was selected"),
+    )
+
+    with InferenceMode.active():
+        actual = InferenceGroupedMLP.forward(
+            grouped_mlp,
+            torch.empty(1, 1),
+            None,
+            torch.empty(1, 1),
+            routing_map=torch.zeros(1, 1, dtype=torch.int64),
+        )
+
+    assert actual is expected
+
+
+def test_lazy_weight_build_rejects_partially_selected_expert_projection():
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped_mlp = SimpleNamespace(
+        num_local_experts=1,
+        linear_fc1=SimpleNamespace(weight0=_mxfp8_weight()),
+        linear_fc2=SimpleNamespace(weight0=torch.empty(1, dtype=torch.bfloat16)),
+    )
+
+    with pytest.raises(TypeError, match="select both expert projections"):
+        InferenceGroupedMLP._expert_weights_use_mxfp8(grouped_mlp)
+
+
 @pytest.mark.parametrize("activation_func", [F.gelu, F.silu, F.relu])
 def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func):
     with pytest.raises(ValueError, match="supports only non-gated squared-ReLU experts"):
@@ -101,13 +190,6 @@ def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func)
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        (
-            {
-                "inference_grouped_gemm_backend": "vllm",
-                "inference_flashinfer_mxfp8_token_capacity": None,
-            },
-            "vLLM Triton fused MoE only supports BF16",
-        ),
         ({"fp8_param": False}, "fp8_param must be enabled"),
         ({"fp8": None, "fp8_param": False}, "requires.*FP8 enabled"),
         ({"inference_moe_token_dispatcher_type": "nccl"}, "requires.*nvls"),
@@ -145,6 +227,102 @@ def test_flashinfer_mxfp8_refresh_reports_noop_before_weight_build():
     assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
 
 
+def test_flashinfer_mxfp8_refresh_skips_bf16_expert_weights():
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    grouped_mlp = SimpleNamespace(
+        _concatenated_weights_built=True,
+        _uses_mxfp8_weights=False,
+        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER,
+        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
+    )
+
+    assert InferenceGroupedMLP.refresh_flashinfer_mxfp8_weights(grouped_mlp) is False
+
+
+def _blackwell_or_newer() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@pytest.mark.skipif(
+    not HAVE_FLASHINFER_ROUTED_MXFP8 or not _blackwell_or_newer(),
+    reason="FlashInfer routed MXFP8 requires Blackwell and FlashInfer >= 0.6.4",
+)
+@pytest.mark.parametrize("local_expert_offset", [0, 2, 4, 6])
+def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
+    """A token's local-EP output must not depend on its batch or row position."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        flashinfer_routed_mxfp8_moe,
+        prepare_routed_mxfp8_weights,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    torch.manual_seed(1234)
+    num_experts, hidden_size, intermediate_size, topk = 8, 256, 256, 2
+
+    def _prepare_weight(weight: torch.Tensor):
+        quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
+        stacked = MXFP8Tensor(
+            data=torch.stack([expert.data for expert in quantized]).contiguous(),
+            scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
+            backend="triton",
+            dtype=torch.bfloat16,
+        )
+        return prepare_routed_mxfp8_weights(stacked)
+
+    fc1_weight = _prepare_weight(
+        torch.randn(
+            num_experts, intermediate_size, hidden_size, device="cuda", dtype=torch.bfloat16
+        )[local_expert_offset : local_expert_offset + 2]
+    )
+    fc2_weight = _prepare_weight(
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, device="cuda", dtype=torch.bfloat16
+        )[local_expert_offset : local_expert_offset + 2]
+    )
+    target = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    target_experts = torch.tensor([2, 5], device="cuda", dtype=torch.int64)
+    target_probs = torch.tensor([0.625, 0.375], device="cuda", dtype=torch.float32)
+
+    def _run(active_tokens: int, target_row: int) -> torch.Tensor:
+        num_tokens = 512
+        hidden_states = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        routing_map = torch.full((num_tokens, topk), -1, device="cuda", dtype=torch.int64)
+        routing_map[:active_tokens, 0] = 2
+        routing_map[:active_tokens, 1] = 3
+        probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
+        probs[:active_tokens].fill_(0.5)
+        hidden_states[target_row].copy_(target)
+        routing_map[target_row].copy_(target_experts)
+        probs[target_row].copy_(target_probs)
+        return flashinfer_routed_mxfp8_moe(
+            hidden_states,
+            routing_map,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+            activation_type=6,
+        )[target_row]
+
+    with torch.no_grad():
+        output_alone = _run(1, 0)
+        output_batched = _run(128, 73)
+
+    assert torch.equal(output_alone, output_batched), (
+        "FlashInfer routed MXFP8 output changed with the batch; max abs diff: "
+        f"{(output_alone.float() - output_batched.float()).abs().max().item()}"
+    )
+    if not any(
+        local_expert_offset <= expert < local_expert_offset + 2
+        for expert in target_experts.tolist()
+    ):
+        assert torch.count_nonzero(output_alone).item() == 0
+
+
 def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     from megatron.core.transformer.moe import experts
 
@@ -161,6 +339,7 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     )
 
     grouped_mlp = SimpleNamespace(
+        _uses_mxfp8_weights=False,
         _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _flashinfer_activation_type=object(),

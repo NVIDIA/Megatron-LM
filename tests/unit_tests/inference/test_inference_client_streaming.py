@@ -11,7 +11,7 @@ import zmq
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestAborted
 from megatron.core.inference.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.asyncio
@@ -68,11 +68,15 @@ async def test_add_request_streaming_emits_partials_then_final():
     assert isinstance(iterator, AsyncStream)
     assert params.streaming is True
     assert 0 in client.streams
-    submit_meta, _prompt, block_hashes, media = fake_socket.send_multipart.call_args.args[0]
+    submit_meta, _prompt, block_hashes, media, offload = fake_socket.send_multipart.call_args.args[
+        0
+    ]
     # No hashes passed, so the frame says None and the coordinator hashes.
     assert msgpack.unpackb(block_hashes, raw=False) is None
-    # Text-only, but the media frame is still present: the count is fixed.
+    # Text-only and no offload params, but both frames are still present: the
+    # count is fixed.
     assert msgpack.unpackb(media, raw=False) is None
+    assert msgpack.unpackb(offload, raw=False) is None
     submit_payload = msgpack.unpackb(submit_meta, raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[2]["streaming"] is True
@@ -142,7 +146,7 @@ async def test_client_stop_terminates_open_streams():
     assert items == []
 
 
-async def test_stream_close_sends_abort_and_terminates_iterator():
+async def test_stream_close_sends_abort_and_reports_cancellation():
     """Closing a live stream sends ABORT_REQUEST and wakes its consumer."""
     client, fake_socket = _make_client()
     iterator = client.add_request_streaming("hi", SamplingParams())
@@ -153,7 +157,9 @@ async def test_stream_close_sends_abort_and_terminates_iterator():
     assert payload == [Headers.ABORT_REQUEST.value, iterator.request_id]
     assert iterator.request_id not in client.streams
     assert iterator.request_id not in client.request_submission_times
-    assert [item async for item in iterator] == []
+    with pytest.raises(InferenceRequestAborted) as error:
+        await anext(iterator)
+    assert not error.value.source_safe
 
 
 async def test_add_request_with_kv_handoff_streaming_returns_stream():

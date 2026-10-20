@@ -23,20 +23,34 @@ When enabled, Megatron applies the env vars and config overrides below via `mega
 
 ## Environment variables
 
-Each variable may be set by the launcher or left unset. If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC` and `CAUSAL_CONV1D_DETERMINISTIC`, which their kernels auto-detect from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
+Each variable may be set by the launcher or left unset. If set, the value must be one that has been validated as deterministic — anything else fails hard with an assertion. Except on Hopper GPUs, an empty `NCCL_ALGO` and a list that adds `NVLS` to `Ring`, such as `Ring,NVLS`, are accepted without that validation; see [Letting NCCL choose the algorithm](#letting-nccl-choose-the-algorithm). If unset, `apply_determinism_env` fills the canonical default (except `MAMBA_DETERMINISTIC` and `CAUSAL_CONV1D_DETERMINISTIC`, which the external `mamba_ssm` and `causal_conv1d` packages auto-detect from `torch.are_deterministic_algorithms_enabled()`). Must be set before the first cuBLAS / Transformer Engine call — `apply_determinism_to_args` runs early in `validate_args` to guarantee this.
 
 | Variable | Accepted values (or unset) | Default filled if unset | Reason |
 |---|---|---|---|
-| `NCCL_ALGO` | subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}` | `Ring` | Conservative default — `Ring`'s reduction order is fixed by topology, so it is bit-exact across runs on every supported NCCL version |
+| `NCCL_ALGO` | subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS, NVLS}`, where `NVLS` needs `Ring` and is not accepted on Hopper; or the empty string (not on Hopper) | `Ring` | Conservative default — `Ring`'s reduction order is fixed by topology, so it is bit-exact across runs on every supported NCCL version. The empty string lets NCCL choose, and `Ring,NVLS` lets it choose between `Ring` and NVLS — see [Letting NCCL choose the algorithm](#letting-nccl-choose-the-algorithm) |
 | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | `0` | `0` | Forces Transformer Engine to use deterministic algorithms |
 | `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` or `:16:8` | `:4096:8` | Deterministic cuBLAS workspace (both sizes are reproducible per NVIDIA docs; `:4096:8` is faster, `:16:8` uses less memory) |
-| `TRITON_CACHE_AUTOTUNING` | `0` or `1` | *(none — opt-in)* | Persists each Triton autotune winner so every rank reuses one choice instead of re-timing it. Left unset, deterministic mode instead pins the cheapest config, which needs no cache — see [Triton autotuning](#triton-autotuning) |
+| `TRITON_CACHE_AUTOTUNING` | `0` or `1` | *(none — opt-in)* | Persists Triton autotune winners for autotuners **outside** the pinned scope, so ranks reuse one choice instead of re-timing it. Kernels inside the scope are pinned without timing either way — see [Triton autotuning](#triton-autotuning) |
 | `TRITON_CACHE_DIR` | any shared-filesystem path | *(none — required only with `TRITON_CACHE_AUTOTUNING=1`)* | No safe default exists: unset, Triton uses a node-local directory and each node autotunes on its own. Required rather than filled in |
-| `TRITON_PRINT_AUTOTUNING` | `1` | *(none — recommended, not set)* | Logs the config each rank selected. Changes no numerics, so it is recommended rather than forced; when `TRITON_CACHE_AUTOTUNING=1` and this is unset, a startup line reminds you. See [Verifying kernel-config agreement](#verifying-kernel-config-agreement) |
-| `MAMBA_DETERMINISTIC` | any string starting with `'1'` | *(none — SSM auto-detects)* | Mamba SSM auto-follows `torch.are_deterministic_algorithms_enabled()` when unset; only an explicit non-deterministic override is rejected |
+| `TRITON_PRINT_AUTOTUNING` | `1` | *(none — not set)* | Logs the config Triton times, which only happens for autotuners outside the pinned scope. For pinned kernels use `--triton-autotune-enumerate-autotuners` and `--triton-autotune-verify-every` — see [Verifying kernel-config agreement](#verifying-kernel-config-agreement) |
+| `MAMBA_DETERMINISTIC` | any string starting with `'1'` | *(none — SSM auto-detects)* | Controls the external `mamba_ssm` package, which auto-follows `torch.are_deterministic_algorithms_enabled()` when unset; only an explicit non-deterministic override is rejected. Megatron's in-tree SSM kernels (`megatron.core.ssm.ops`) do not read it and follow `--deterministic-mode` instead |
 | `CAUSAL_CONV1D_DETERMINISTIC` | any string starting with `'1'` | *(none — the kernel auto-detects)* | causal_conv1d ≥ 1.6.0 auto-follows `torch.are_deterministic_algorithms_enabled()` when unset, reducing the conv weight/bias gradients through a workspace instead of `atomicAdd`; the Mamba and GDP mixers reject a deterministic run without it |
 
-If you override `NCCL_ALGO`, the value must be a subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}`. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file, so it cannot be vouched for as bit-exact across stacks. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for ensuring whatever NCCL falls back to is deterministic on their environment.
+If you override `NCCL_ALGO` with a non-empty value, the value must be a subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS, NVLS}`, and a value with `NVLS` must also contain `Ring`; on Hopper such a value is rejected. `Tree` is intentionally excluded: its intra-node chain reduction order is not user-controllable, and the inter-node tree topology can vary across runs without a pinned topology file, so it cannot be vouched for as bit-exact across stacks. `^NVLS` is accepted (banning NVLS is a legitimate user choice on hardware that exposes it); the user is responsible for ensuring whatever NCCL falls back to is deterministic on their environment.
+
+### Letting NCCL choose the algorithm
+
+Setting `NCCL_ALGO` to the empty string (`export NCCL_ALGO=`) asks NCCL to choose the algorithm for each collective; with NCCL 2.24 or later, NCCL then chooses as it does in a run without `--deterministic-mode`. `--deterministic-mode` keeps the empty value instead of filling in `Ring`, and rank 0 issues a warning at startup. On Hopper GPUs, `--deterministic-mode` rejects the empty value instead; the last paragraph of this section gives the reason.
+
+Leaving `NCCL_ALGO` unset cannot do this: `--deterministic-mode` fills in `Ring`. Without that default, PyTorch 2.8 and later would still exclude NVLS: with `torch.use_deterministic_algorithms(True)` on, it sets `NCCL_ALGO=^NVLS` in the process environment when it creates an NCCL process group and the variable is unset, logging "disabling NVLS algorithm in NCCL". PyTorch counts an empty `NCCL_ALGO` as set and leaves it alone. When Megatron initializes `torch.distributed`, it checks that `NCCL_ALGO` is still empty after creating the default process group, and stops the run if it is not.
+
+NCCL 2.24 and later read no algorithm from the empty string and so exclude none: NCCL's cost model chooses among every algorithm the hardware and the other NCCL settings allow, `Tree` and NVLS included. A tuner plugin, if one is loaded, is still called for every collective. NCCL 2.23 and earlier instead read the empty string as a list that enables no algorithm, then enable `Ring` and `Tree` again (only `Ring` when CollNet is available), so NVLS is not used. With `NCCL_DEBUG=INFO`, NCCL logs `NCCL_ALGO set by environment to` followed by the empty value; that line is expected.
+
+Bit-exact reproducibility then rests on the algorithms NCCL selects, which Megatron does not check. PyTorch 2.8 and later write `^NVLS` under the deterministic flag because NVLS reductions can be non-deterministic, so make sure the algorithms NCCL chooses on your hardware and NCCL version are deterministic. A value of only whitespace is rejected, because NCCL 2.24 and later fail to parse it. The discussion and measurements are in [issue #8138](https://github.com/NVIDIA/Megatron-LM/issues/8138).
+
+`NCCL_ALGO=Ring,NVLS` (in either order) narrows the choice that the empty value leaves to NCCL: NCCL chooses between `Ring` and NVLS for each collective and does not use `Tree`. Broadcast and reduce run only with `Ring` ([tuning.cc L255 at v2.27.7-1](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/graph/tuning.cc#L255)), so a list with `NVLS` but without `Ring` would leave them no algorithm and is rejected. NCCL uses NVLS only for a communicator with more than two GPUs in the node and, without CollNet, only for one that stays within a single node ([nvls.cc L160](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/transport/nvls.cc#L160), [tuning.cc L446-L448](https://github.com/NVIDIA/nccl/blob/v2.27.7-1/src/graph/tuning.cc#L446-L448)); the multi-node form is the separate `NVLSTree` algorithm, which is not accepted. A group that spans nodes, often the data-parallel group, therefore runs `Ring`, while a group within one node, such as a tensor-parallel group of eight GPUs, can use NVLS. PyTorch leaves the value alone because it is set, and rank 0 issues no warning for it. Whether NVLS reductions are bit-exact on your GPUs is not checked at run time; `tests/unit_tests/determinism/correctness/test_nccl_nvls_allreduce.py` checks that a bf16 AllReduce under `Ring,NVLS` gives the same bits after different communicator histories, and its docstring gives the command.
+
+Hopper GPUs (compute capability 9, such as H100, H200 and H800) are excluded because on them the result of an NVLS reduction can depend on the multicast objects allocated before it in the same process, such as those of communicators created earlier. The fix is in the kernel driver and Fabric Manager: 550.144.03 or later in the 550 branch, or 570 or later; the 560 branch has none ([NVIDIA/nccl#2360](https://github.com/NVIDIA/nccl/issues/2360)). The CUDA version, including that of the user-space `libcuda.so`, does not matter. NCCL 2.27 and later accumulate NVLS reductions in fp32, which mitigates the problem in many cases, depending on the values reduced, but does not fix it. Megatron does not check the driver or Fabric Manager version, so on every Hopper GPU it rejects an empty `NCCL_ALGO` and any list that includes `NVLS`, such as `Ring,NVLS` (`^NVLS` stays accepted); leave `NCCL_ALGO` unset on Hopper to use the `Ring` default.
 
 ## Config requirements
 
@@ -51,6 +65,13 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 | `torch.utils.deterministic.fill_uninitialized_memory` | Set to `False` — see below |
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html)).
+
+GDN and GDN2 use a torch-native query/key L2 normalization in deterministic mode,
+in addition to their native convolution and recurrence paths. FLA's normalization
+autotuner can select reduction layouts with different rounding between processes.
+The native path preserves additive epsilon, FP32 intermediate computation, and
+FLA's backward formula using the normalized output rounded to the input dtype.
+Training without deterministic mode continues to use the optimized FLA path.
 
 ## Uninitialized-memory fill
 
@@ -69,20 +90,17 @@ torch.utils.deterministic.fill_uninitialized_memory = True
 
 ## Triton autotuning
 
-Triton picks a kernel config by timing its candidates, so the winner depends on the machine at that instant and ranks can disagree. Deterministic mode offers two ways to remove that variance:
+Triton picks a kernel config by timing its candidates, so the winner depends on the machine at that instant and ranks can disagree. `--deterministic-mode` pins it: the `megatron.core.tuning` adapter selects one candidate per kernel and shape without timing anything, from a tuned table when one matches (tables ship for `sm100` and `sm103`, covering the `mamba_ssm` SSD kernels and the in-tree MLA RoPE and mHC kernels, or can be recorded with `--triton-autotune-mode record`), otherwise from the cheapest candidate by a pure function of the candidate list. Pinned kernels never consult Triton's autotune cache, so every rank computes the same answer by construction. The cheapest candidate is not necessarily the fastest one; a recorded table recovers the throughput.
 
-| Strategy | How to select it | Determinism rests on |
-|---|---|---|
-| **Pinned config** (default) | leave `TRITON_CACHE_AUTOTUNING` unset | Nothing external. `autotune_configs` picks the cheapest config by a pure function of the candidate list, so every rank computes the same answer without timing anything. Slower, since the pinned config is not necessarily the fastest one. |
-| **Cached autotuning** | `TRITON_CACHE_AUTOTUNING=1` **and** `TRITON_CACHE_DIR=<shared path>` | Every rank reading one warm cache. Autotuning still runs and still picks fast configs, but a rank that misses the cache re-times the selection on its own and can pick differently. |
+The default scope is `mamba_ssm`, `transformer_engine` and `megatron.core` (`--triton-autotune-modules`). Kernels whose outputs do not depend on the config — by default only pure data movement, Transformer Engine's MoE permutation kernels, listed in `AutotunePolicy.config_invariant` (`--triton-autotune-config-invariant`) — keep Triton's timed choice, since pinning them would only cost throughput. See `megatron/core/tuning/README.md` for recording tables, precedence rules and the full option list.
 
-Cached autotuning is opt-in because its determinism is conditional: the pinned default holds by construction, the cached path holds only while the shared cache does. Setting `TRITON_CACHE_AUTOTUNING=1` without `TRITON_CACHE_DIR` is rejected — unset, Triton falls back to a node-local directory, which is exactly the case the cache is meant to prevent.
+Autotuners outside the scope still time their candidates. `TRITON_CACHE_AUTOTUNING=1` with a shared `TRITON_CACHE_DIR` makes those ranks reuse one cached winner, but a rank that misses the cache re-times the selection on its own and can pick differently, so prefer adding their modules to `--triton-autotune-modules`. Setting `TRITON_CACHE_AUTOTUNING=1` without `TRITON_CACHE_DIR` is rejected — unset, Triton falls back to a node-local directory, which is exactly the case the cache is meant to prevent.
 
 ## Verifying kernel-config agreement
 
-Applies to cached autotuning; the pinned default has nothing to compare. `TRITON_PRINT_AUTOTUNING=1` makes each rank log the config it selects per kernel; group those lines by kernel and key across the per-rank logs, and every group should hold exactly one distinct config.
+`--triton-autotune-verify-every N` compares, every N training steps, the configs that ranks chose for the same kernel and shape, and logs any disagreement (`--triton-autotune-verify-strict` raises instead). Each check exchanges only the choices made since the previous one. `--triton-autotune-enumerate-autotuners` logs, per rank, every multi-config autotuner the run reaches and whether it is pinned, timed as config-invariant, or outside the scope.
 
-Note the limit: a rank only logs when it *tunes*, so a run where some ranks hit the cache and others miss cannot be compared this way — the hitting ranks log nothing.
+For autotuners outside the scope, `TRITON_PRINT_AUTOTUNING=1` makes each rank log the config Triton selects; a rank only logs when it tunes, so a run where some ranks hit the autotune cache and others miss cannot be compared this way.
 
 ## Verifying determinism
 

@@ -2,6 +2,7 @@
 
 import logging
 import warnings
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 import pytest
@@ -197,10 +198,26 @@ def test_explicit_rank_overrides_the_default_ranks(restore_default_log_ranks):
     logger.log.assert_not_called()
 
 
+@contextmanager
+def _pretend_rank(rank):
+    """Make ``warn_single_rank`` see ``rank``, whichever branch it takes.
+
+    It reads ``torch.distributed.get_rank`` directly once distributed is up, and falls back to
+    ``safe_get_rank`` only before that, so patching one alone leaves the test at the mercy of
+    whether the suite runs under a launcher.
+    """
+    with (
+        patch("megatron.core._rank_utils.torch.distributed.is_initialized", return_value=True),
+        patch("megatron.core._rank_utils.torch.distributed.get_rank", return_value=rank),
+        patch("megatron.core._rank_utils.safe_get_rank", return_value=rank),
+    ):
+        yield
+
+
 def test_warn_single_rank_warns_on_every_default_rank(restore_default_log_ranks):
     set_default_log_ranks([0, 64])
 
-    with patch("megatron.core._rank_utils.safe_get_rank", return_value=64):
+    with _pretend_rank(64):
         with pytest.warns(UserWarning, match="message"):
             warn_single_rank("message")
 
@@ -208,9 +225,35 @@ def test_warn_single_rank_warns_on_every_default_rank(restore_default_log_ranks)
 def test_warn_single_rank_stays_quiet_outside_the_default_ranks(restore_default_log_ranks):
     set_default_log_ranks([0, 64])
 
-    with patch("megatron.core._rank_utils.safe_get_rank", return_value=5):
+    with _pretend_rank(5):
         with warnings.catch_warnings(record=True) as raised:
             warnings.simplefilter("always")
             warn_single_rank("message")
 
     assert raised == []
+
+
+def _emit_unrelated_future_warning():
+    warnings.warn("unrelated", FutureWarning, stacklevel=2)
+
+
+def test_warn_single_rank_does_not_rearm_other_warnings():
+    """A suppressed call must not re-arm warnings that already printed.
+
+    ``warnings.catch_warnings`` bumps the global filter version on both enter and exit, and
+    ``warn_explicit`` clears a module's ``__warningregistry__`` whenever that version moves.
+    Entering it on every call therefore re-armed every other warning in the process, so a
+    once-per-bucket call site made torch's deprecation notices reprint on every bucket.
+    """
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("default")
+        with (
+            patch("megatron.core._rank_utils.torch.distributed.is_initialized", return_value=True),
+            patch("megatron.core._rank_utils.torch.distributed.get_rank", return_value=5),
+        ):
+            for _ in range(3):
+                _emit_unrelated_future_warning()
+                # Rank 5 is not a default log rank, so this call itself stays silent.
+                warn_single_rank("job-level message")
+
+    assert len([w for w in seen if w.category is FutureWarning]) == 1

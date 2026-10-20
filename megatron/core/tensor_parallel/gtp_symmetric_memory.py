@@ -133,9 +133,9 @@ class RegisteredLIFOPool:
     The wgrad reduce-scatter can only use symmetric collectives if its send buffer is
     window-registered, so the wgrad is written into a buffer from this cache. ``alloc``
     pops a free buffer (or allocates a new one through ``gtp_symm_pool_ctx``); ``free``
-    returns it once the reduce-scatter has finished reading it. Buffers are shared by
-    all weights of the same size, so memory stays at the peak number of in-flight
-    reduce-scatters instead of one buffer per weight.
+    returns it with a completion event if the reduce-scatter is still reading it.
+    Buffers are shared by all weights of the same size, keeping memory at the peak
+    number of in-flight reduce-scatters instead of one buffer per weight.
 
     CUDA graphs: the eager warmup iterations run the same reduce-scatter overlap as
     the captured steps and are expected to pre-populate the free lists, so that during
@@ -147,9 +147,8 @@ class RegisteredLIFOPool:
     untagged tensors, which lets callers pass mixed buffer lists to both this pool and
     the plain scratch pool and have each take only its own.
 
-    Why LIFO: ordering cannot affect correctness (buffers enter the free list only
-    after their reduce-scatter has been waited on), but LIFO keeps the same buffer
-    reused for the same operation at steady state even if a key ever over-allocates,
+    Why LIFO: allocation waits for the buffer's prior-use completion event. LIFO keeps
+    the same buffer reused for the same operation at steady state even if a key ever over-allocates,
     whereas FIFO would rotate the assignment every iteration -- LIFO keeps memory
     behavior deterministic and repeatable across iterations.
     """
@@ -174,6 +173,9 @@ class RegisteredLIFOPool:
         bucket = self._free[(numel, dtype, group.group_name)]
         if bucket:
             flat = bucket.pop()
+            ready_event = getattr(flat, "_gtp_wgrad_reuse_event", None)
+            if ready_event is not None:
+                torch.cuda.current_stream(device=device).wait_event(ready_event)
         else:
             if torch.cuda.is_current_stream_capturing():
                 mine = sum(len(v) for k, v in self._free.items() if k[2] == group.group_name)
@@ -210,12 +212,24 @@ class RegisteredLIFOPool:
         out._gtp_symm_group = group  # marks the buffer as pool-owned; free() keys on this
         return out
 
-    def free(self, buf: torch.Tensor) -> None:
-        """Return ``buf`` to its group's free list; no-op for untagged (foreign) buffers."""
+    def has_free(
+        self, shape: torch.Size | tuple[int, ...], dtype: torch.dtype, group: dist.ProcessGroup
+    ) -> bool:
+        """True when ``alloc`` would pop rather than allocate.
+
+        Lets a caller tell "recycling" from "growing the pool" and wait for one of its own
+        in-flight buffers instead of raising the high-water mark.
+        """
+        return bool(self._free.get((int(math.prod(shape)), dtype, group.group_name)))
+
+    def free(self, buf: torch.Tensor, ready_event: torch.cuda.Event | None = None) -> None:
+        """Return a tagged buffer with an optional, recorded prior-use completion event."""
         group = getattr(buf, "_gtp_symm_group", None)
         if group is None:
             return
-        self._free[(buf.numel(), buf.dtype, group.group_name)].append(buf.view(-1))
+        flat = buf.view(-1)
+        flat._gtp_wgrad_reuse_event = ready_event
+        self._free[(buf.numel(), buf.dtype, group.group_name)].append(flat)
 
     def clear(self) -> None:
         """Drop every cached buffer. Called at teardown, before the pools they alias go away."""

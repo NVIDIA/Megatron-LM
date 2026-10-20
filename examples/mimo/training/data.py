@@ -12,10 +12,11 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from examples.mimo.training.topology import HeteroTopology
+from examples.mimo.utils.hetero import get_data_lane_rank, get_language_batch_parallel_size
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.utils import get_pg_rank
+from megatron.training.global_vars import get_run_config
 
 _ENCODER_SEED_OFFSET = 10_000
 _LANGUAGE_SEED_OFFSET = 20_000
@@ -291,13 +292,13 @@ def build_train_valid_test_data_loaders(
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 
     encoder_name = _encoder_name(topology)
-    llm_data_parallel_size = args.mimo_llm_dp * args.gtp_weight_remat_size
+    llm_data_parallel_size = get_language_batch_parallel_size(args)
     if (
         encoder_name is not None
         and (args.micro_batch_size * llm_data_parallel_size) % args.mimo_encoder_dp
     ):
         raise ValueError(
-            "micro_batch_size * mimo_llm_dp * GTP must be divisible by mimo_encoder_dp"
+            "micro_batch_size * language sample lanes must be divisible by mimo_encoder_dp"
         )
 
     language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
@@ -346,8 +347,8 @@ def _build_split_loaders(
     encoder_name: Optional[str],
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
-    data_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp
-    base_seed = args.seed + module_seed_offset + get_pg_rank(data_group)
+    cfg = get_run_config()
+    base_seed = cfg.rng.seed + module_seed_offset + get_data_lane_rank(pg_collection)
     common = _mock_loader_kwargs(args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(
