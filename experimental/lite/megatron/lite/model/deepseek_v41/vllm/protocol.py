@@ -14,3 +14,11 @@ def build_model(model_cfg, *, impl_cfg):
     from .model import DeepseekV41Model
 
     return native.build_model(model_cfg, impl_cfg=impl_cfg, _model_class=DeepseekV41Model)
+
+
+def export_hf_weights(chunks, model_cfg, ps, **kwargs):
+    yield from native.export_hf_weights(chunks, model_cfg, ps, **kwargs)
+
+
+def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
+    return native.save_hf_weights(chunks, path, model_cfg, ps, **kwargs)
