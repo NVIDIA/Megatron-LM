@@ -78,6 +78,40 @@ class MultiChildModel(nn.Module):
         return x
 
 
+class TinySharedMTP(nn.Module):
+    """Two MTP depths with shifted token embeddings and one shared residual block."""
+
+    def __init__(self, width: int, vocab_size: int) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, width)
+        self.enorm = nn.LayerNorm(width, bias=False)
+        self.hnorm = nn.LayerNorm(width, bias=False)
+        self.eh_proj = nn.Linear(2 * width, width, bias=False)
+        self.shared_block = nn.Sequential(
+            nn.LayerNorm(width, bias=False),
+            nn.Linear(width, width, bias=False),
+            nn.GELU(),
+            nn.Linear(width, width, bias=False),
+        )
+        self.output = nn.Linear(width, vocab_size, bias=False)
+
+    def forward(self, token_ids: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Condition each depth on the previous depth and sum its next-token loss."""
+        seq_length = hidden_states.size(1)
+        losses = []
+        for depth in (1, 2):
+            # At position t, depth k consumes token t+k and predicts token t+k+1.
+            embeddings = self.embedding(token_ids[:, depth : depth + seq_length])
+            hidden_states = self.eh_proj(
+                torch.cat((self.enorm(embeddings), self.hnorm(hidden_states)), dim=-1)
+            )
+            hidden_states = hidden_states + self.shared_block(hidden_states)
+            logits = self.output(hidden_states)
+            targets = token_ids[:, depth + 1 : depth + 1 + seq_length]
+            losses.append(nn.functional.cross_entropy(logits.flatten(0, 1), targets.flatten()))
+        return torch.stack(losses).sum()
+
+
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
@@ -217,6 +251,51 @@ def test_fully_shard_sgd_losses_match_baseline(
         torch.stack(baseline_losses),
         msg="Sharded losses did not match baseline losses.",
     )
+
+
+def test_shared_mtp_backward_matches_baseline(distributed_setup):
+    """Shared-layer MTP should match unsharded training over multiple SGD steps."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    width = 2 * world_size
+    vocab_size = 4 * width
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(5678 + rank)
+    seq_length = 4
+    token_ids = torch.randint(vocab_size, (2, seq_length + 3), device=device)
+    hidden_states = torch.randn(2, seq_length, width, device=device)
+    inputs = (token_ids, hidden_states)
+
+    def train(model, optimizer, inputs, *, reduce_wgrad: bool) -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad()
+            loss = model(*inputs)
+            losses.append(loss.detach())
+            loss.backward()
+            if reduce_wgrad:
+                # The plain baseline has no DDP wrapper to average its gradients.
+                for parameter in model.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+            optimizer.step()
+        return losses
+
+    torch.manual_seed(1234)
+    baseline = TinySharedMTP(width, vocab_size).to(device)
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    baseline_losses = train(baseline, baseline_optimizer, inputs, reduce_wgrad=True)
+
+    torch.manual_seed(1234)
+    model = TinySharedMTP(width, vocab_size).to(device)
+    with fully_shard_context(device=device):
+        fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+    losses = train(model, optimizer, inputs, reduce_wgrad=False)
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
 
 
 def test_rejects_delayed_te_weight_gradient(distributed_setup):
@@ -609,7 +688,7 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     x = torch.full((1, 1), float(rank + 1), device=device)
     with microbatch(context, is_last=False):
         model(x).sum().backward()
-        model(x).sum().backward()
+    model(x).sum().backward()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()

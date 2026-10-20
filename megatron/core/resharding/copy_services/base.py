@@ -44,6 +44,9 @@ class CopyService(ABC):
     # Point-to-point transports tolerate ranks with no local operations. Collective
     # transports whose mesh must cover the whole process group can opt out.
     supports_idle_ranks = True
+    # A refit may switch between disjoint destination pools. Transports that
+    # bind one fixed receiver map for their lifetime must opt out.
+    supports_multiple_destination_pools = True
     # Multiple runs per plan are opt-in so existing third-party services retain
     # the historical model-wide run(). Supporting them requires run() to release
     # submitted tensor references and establish current-stream ordering for all
