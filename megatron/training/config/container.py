@@ -414,10 +414,6 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``InferenceSetupConfig.to_inference_config(model, ...)`` to build the runtime
     ``megatron.core.inference.config.InferenceConfig`` consumed by the engine."""
 
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    """Optimizer settings. Inference never builds an optimizer; this section carries the
-    optimizer-owned values (e.g. precision flags) that shared code reads from the run config."""
-
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
