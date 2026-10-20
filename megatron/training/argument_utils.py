@@ -393,7 +393,11 @@ def core_transformer_config_from_args(args, config_class=None):
     # Config class.
     config_class = config_class or TransformerConfig
 
-    if args.multi_latent_attention:
+    if getattr(args, 'dsv4_version', 'v4') == 'v4.1':
+        from megatron.core.models.deepseek_v41.config import DeepSeekV41Config
+
+        config_class = DeepSeekV41Config
+    elif args.multi_latent_attention:
         config_class = MLATransformerConfig
 
     if args.heterogeneous_layers_config_path is not None:
@@ -501,6 +505,10 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
     # Build config.
+    if getattr(args, 'dsv4_version', 'v4') == 'v4.1':
+        from megatron.training.models.deepseek_v41 import configure_v41_args
+
+        configure_v41_args(args, kw_args)
     config = config_class(**kw_args)
 
     _apply_yarn_config_from_args(config, args)
@@ -707,6 +715,13 @@ def hybrid_config_from_args(
     else:
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
+    if getattr(transformer_cfg, 'dsv4_version', 'v4') == 'v4.1':
+        from megatron.training.models.deepseek_v41 import DeepSeekV41ModelConfig
+
+        if model_config_cls is not HybridModelConfig:
+            raise ValueError("V4.1 uses its explicit model builder without ModelOpt composition")
+        model_config_cls = DeepSeekV41ModelConfig
+        kwargs["engram_token_map"] = args.engram_token_map
 
     kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if transformer_cfg.transformer_impl == "inference_optimized":

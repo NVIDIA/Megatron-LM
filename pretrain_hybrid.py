@@ -28,12 +28,13 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
 )
+from megatron.core.pipeline_parallel.pipeline_payload import PipelineDataIterator
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import (
@@ -62,12 +63,9 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
-)
 from model_provider import model_provider
 
 try:
@@ -331,7 +329,12 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = get_batch(data_iterator, vp_stage)
+        cp_batch = (next(data_iterator) if isinstance(data_iterator, PipelineDataIterator)
+                    else get_batch(data_iterator, vp_stage))
+        if getattr(get_args(), 'dsv4_version', 'v4') == 'v4.1':
+            from megatron.training.datasets.v41_pipeline import normalize_v41_batch
+
+            cp_batch = normalize_v41_batch(cp_batch)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -360,6 +363,22 @@ def forward_step(data_iterator, model: HybridModel):
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
+
+
+def _prepare_pipeline_inputs(iterator, model, num_microbatches, *, forward_only=False):
+    """Prepare typed V4.1 plans before the schedule posts receives."""
+    args = get_args()
+    if getattr(args, 'dsv4_version', 'v4') != 'v4.1':
+        return iterator
+    from megatron.training.datasets.v41_pipeline import prepare_v41_pipeline_inputs
+
+    return prepare_v41_pipeline_inputs(
+        iterator, model, num_microbatches, args=args, get_batch=get_batch,
+        forward_only=forward_only,
+    )
+
+
+forward_step.prepare_pipeline_inputs = _prepare_pipeline_inputs
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
