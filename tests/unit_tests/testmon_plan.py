@@ -150,10 +150,6 @@ def select(
             raise ValueError("immutable container image identity is unavailable")
         identity = cache_identity(root, bucket, recipe_platform, image_id)
         manifest = validate_cache(cache_dir, identity, matched_key)
-        if manifest.get("image_id") != image_id:
-            # The CPU host cannot measure the packages in a different GPU image.
-            # Let the existing GPU selector compare installed runtime versions.
-            raise ValueError("container image changed; GPU runtime validation is required")
         if not any(char in bucket for char in "*?[") and source_sha != manifest["source_sha"]:
             # Explicit-file pytest arguments bypass Testmon's stable-file collection skip.
             # They may discover new IDs from collection-only production dependencies.

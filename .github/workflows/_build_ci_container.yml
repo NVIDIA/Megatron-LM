@@ -420,8 +420,8 @@ jobs:
             ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
             ${{ matrix.registry }}/megatron-lm:${{ inputs.source-sha }}-${{ matrix.cloud }}
 
-      # The config digest is also docker image inspect's .Id. CPU Testmon
-      # selection can prove the GPU environment matches without pulling it.
+      # The config digest is also docker image inspect's .Id. The GPU runner
+      # verifies that it pulls the image named in this run's CPU selection plan.
       - name: Record unit-test image identity
         id: unit-test-image
         continue-on-error: true

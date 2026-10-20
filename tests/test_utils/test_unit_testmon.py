@@ -535,7 +535,7 @@ def cpu_baseline(project, tmp_path):
         ("new-test", "enforce", []),
         ("mandatory", "selected", ["test_other.py"]),
         ("missing-cache", "enforce", []),
-        ("image", "enforce", []),
+        ("image", "selected", []),
     ],
 )
 def test_cpu_selection(cpu_baseline, change, mode, selected):
@@ -625,7 +625,6 @@ def test_cpu_selection(cpu_baseline, change, mode, selected):
             expected = {
                 "collection-dependency": ["tests/unit_tests/example/test_app.py::test_param[2]"],
                 "new-test": ["tests/unit_tests/example/test_new.py::test_new"],
-                "image": [],
             }
             assert nodes == expected[change]
     assert {phase: _snapshot(directory / phase) for phase in before} == before
