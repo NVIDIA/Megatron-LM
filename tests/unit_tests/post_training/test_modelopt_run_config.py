@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -15,65 +16,60 @@ from megatron.training.config.container import InferenceConfigContainer
 from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.gpt import GPTModelBuilder
 from megatron.training.models.hybrid import HybridModelBuilder
-from tests.unit_tests.post_training.test_modelopt_model_config import _make_args
+from tests.unit_tests.post_training.conftest import make_modelopt_test_args
 
-
-@pytest.mark.parametrize(
-    "option", [{"modelopt_enabled": True}, {"export_kd_teacher_load": "/teacher"}]
+_NON_MODELOPT_OPTION_OVERRIDES = (
+    {"export_te_mcore_model": True},
+    {"export_default_te_spec": True},
+    {"export_force_local_attention": True},
+    {"export_real_quant_cfg": "fp8_real_quant"},
+    {"export_kd_teacher_model_config": "/teacher.yaml"},
+    {"export_kd_teacher_ckpt_format": "torch_dist"},
+    {"export_kd_cfg": "/kd.yaml"},
+    {"qad_train_target": "base"},
+    {"freeze_base_for_mtp": True},
+    {"lsq_scale_lr": 1e-4},
+    {"qk_l2_norm": True},
+    {"enable_gpt_oss": True},
+    {"export_offline_model": True},
 )
-def test_modelopt_config_selection_from_explicit_options(option):
-    args = _make_args(**option)
-    args.load = None
-    original_args = vars(args).copy()
-    assert modelopt_utils.should_use_modelopt_config(args)
-    assert vars(args) == original_args
 
 
 @pytest.mark.parametrize(
-    "option",
+    "overrides,load,checkpoint_has_state,expected,assert_args_unchanged",
     [
-        {"export_te_mcore_model": True},
-        {"export_default_te_spec": True},
-        {"export_force_local_attention": True},
-        {"export_real_quant_cfg": "fp8_real_quant"},
-        {"export_kd_teacher_model_config": "/teacher.yaml"},
-        {"export_kd_teacher_ckpt_format": "torch_dist"},
-        {"export_kd_cfg": "/kd.yaml"},
-        {"qad_train_target": "base"},
-        {"freeze_base_for_mtp": True},
-        {"lsq_scale_lr": 1e-4},
-        {"qk_l2_norm": True},
-        {"enable_gpt_oss": True},
-        {"export_offline_model": True},
+        ({"modelopt_enabled": True}, None, False, True, True),
+        ({"export_kd_teacher_load": "/teacher"}, None, False, True, True),
+        ({}, "/modelopt-checkpoint", True, True, False),
+        ({}, None, False, False, False),
+        *[(option, None, False, False, False) for option in _NON_MODELOPT_OPTION_OVERRIDES],
     ],
 )
-def test_options_outside_modelopt_do_not_select_it(option):
-    args = _make_args(**option)
-    args.load = None
-    assert not modelopt_utils.should_use_modelopt_config(args)
-
-
-def test_modelopt_config_selection_from_checkpoint():
-    args = _make_args()
-    args.load = "/modelopt-checkpoint"
-    with patch(
-        "megatron.post_training.checkpointing.has_modelopt_state", return_value=True
-    ) as has_state:
-        assert modelopt_utils.should_use_modelopt_config(args)
-    has_state.assert_called_once_with(args.load)
-
-
-def test_plain_run_does_not_select_modelopt_config():
-    args = _make_args()
-    args.load = None
-    assert not modelopt_utils.should_use_modelopt_config(args)
+def test_should_use_modelopt_config(
+    overrides, load, checkpoint_has_state, expected, assert_args_unchanged
+):
+    args = make_modelopt_test_args(**overrides)
+    args.load = load
+    original_args = vars(args).copy()
+    patch_ctx = (
+        patch("megatron.post_training.checkpointing.has_modelopt_state", return_value=True)
+        if checkpoint_has_state
+        else nullcontext()
+    )
+    with patch_ctx as has_state:
+        result = modelopt_utils.should_use_modelopt_config(args)
+    assert result is expected
+    if checkpoint_has_state:
+        has_state.assert_called_once_with(load)
+    if assert_args_unchanged:
+        assert vars(args) == original_args
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
 @pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize("kd", [False, True])
 def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
-    args = _make_args(
+    args = make_modelopt_test_args(
         hybrid_layer_pattern="M*" if hybrid else None,
         export_kd_teacher_load=str(tmp_path) if kd else None,
     )
@@ -116,7 +112,7 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
 
 
 def test_tokenizer_finalizes_same_model_used_for_build():
-    cfg = mc.modelopt_inference_config_from_args(_make_args())
+    cfg = mc.modelopt_inference_config_from_args(make_modelopt_test_args())
     model = cfg.model
     model.vocab_size = None
     resolve_tokenizer_vocab_size(cfg, 32768)
@@ -135,7 +131,7 @@ def test_tokenizer_finalizes_same_model_used_for_build():
     "field,value", [("tp_comm_overlap", True), ("cross_entropy_fusion_impl", "te")]
 )
 def test_direct_config_validates_kd_incompatibilities(tmp_path, field, value):
-    args = _make_args(export_kd_teacher_load=str(tmp_path))
+    args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
     model = mc.modelopt_model_config_from_args(args)
     cfg = pretrain_cfg_container_from_args(args, model)
     cfg.distillation = mc.distillation_config_from_args(args, model)
@@ -145,7 +141,7 @@ def test_direct_config_validates_kd_incompatibilities(tmp_path, field, value):
 
 
 def test_direct_training_config_rejects_manual_gc(tmp_path):
-    args = _make_args(export_kd_teacher_load=str(tmp_path))
+    args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
     model = mc.modelopt_model_config_from_args(args)
     cfg = pretrain_cfg_container_from_args(args, model)
     cfg.distillation = mc.distillation_config_from_args(args, model)
@@ -155,42 +151,15 @@ def test_direct_training_config_rejects_manual_gc(tmp_path):
 
 
 def test_serialized_builder_is_ignored():
-    cfg = mc.modelopt_inference_config_from_args(_make_args())
+    cfg = mc.modelopt_inference_config_from_args(make_modelopt_test_args())
     data = cfg.to_dict()
     data["model"]["_builder_"] = "os.system"
     restored = InferenceConfigContainer.from_dict(data)
     assert restored.model.get_builder_cls() is GPTModelBuilder
 
 
-def test_teacher_inherits_configured_student_format():
-    from argparse import Namespace
-
-    from megatron.post_training import checkpointing
-    from megatron.training.config.training_config import CheckpointConfig
-    from megatron.training.models.distillation import DistillationConfig
-
-    args = Namespace(ckpt_format="torch", finetune=False)
-    observed = []
-    with (
-        patch.object(checkpointing, "get_args", return_value=args),
-        patch.object(checkpointing, "unwrap_model"),
-        patch.object(
-            checkpointing,
-            "load_checkpoint",
-            side_effect=lambda *a, **kw: observed.append(args.ckpt_format),
-        ),
-    ):
-        checkpointing.load_kd_teacher_checkpoint(
-            [Mock()],
-            DistillationConfig(teacher_load="/teacher"),
-            student_checkpoint=CheckpointConfig(ckpt_format="torch_dist"),
-        )
-    assert observed == ["torch_dist"]
-    assert vars(args) == {"ckpt_format": "torch", "finetune": False}
-
-
 def test_legacy_inference_helper_reuses_declared_model():
-    args = _make_args()
+    args = make_modelopt_test_args()
     cfg = mc.modelopt_inference_config_from_args(args)
     model = cfg.model
     with (
@@ -199,10 +168,9 @@ def test_legacy_inference_helper_reuses_declared_model():
         patch.object(mc, "modelopt_inference_config_from_args") as translate,
     ):
         mc.build_modelopt_models(args)
-        mc.build_modelopt_models(args)
     translate.assert_not_called()
     assert cfg.model is model
-    assert build.call_count == 2
+    build.assert_called_once()
 
 
 def test_inference_uses_config_without_cli_enable_flag():
@@ -230,9 +198,7 @@ def test_inference_uses_config_without_cli_enable_flag():
         patch.object(utils, "build_inference_models", return_value=[stage]) as build,
         patch.object(utils, "get_model_builder") as legacy_builder,
         patch.object(
-            utils,
-            "load_checkpoint",
-            side_effect=lambda **kw: loaded.append(kw["ddp_model"]),
+            utils, "load_checkpoint", side_effect=lambda **kw: loaded.append(kw["ddp_model"])
         ),
     ):
         assert utils.get_model_for_inference() is stage

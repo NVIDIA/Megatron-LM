@@ -97,9 +97,7 @@ class TestModelConfigDefaults:
         assert cfg.post_wrap_hooks == []
 
     def test_invalid_real_quant_config_is_rejected(self):
-        cfg = DummyModelConfig(
-            transformations=ModelTransformConfig(real_quant_cfg="unsupported")
-        )
+        cfg = DummyModelConfig(transformations=ModelTransformConfig(real_quant_cfg="unsupported"))
         with pytest.raises(ValueError, match="Unsupported real_quant_cfg"):
             cfg.validate()
 

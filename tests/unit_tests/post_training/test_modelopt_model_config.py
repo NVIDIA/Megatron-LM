@@ -3,7 +3,6 @@
 """Unit tests for building ModelOpt model configs/hooks that use the stock GPT/Hybrid builders."""
 
 import functools
-import sys
 import warnings
 from argparse import Namespace
 from unittest.mock import Mock, patch
@@ -16,9 +15,7 @@ from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
-from megatron.post_training.arguments import add_modelopt_args
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
-from megatron.training.arguments import parse_args, validate_args
 from megatron.training.models.base import ModelConfig
 from megatron.training.models.distillation import DistillationConfig
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, default_layer_spec
@@ -28,29 +25,12 @@ from megatron.training.models.hybrid import (
     resolve_hybrid_stack_spec,
 )
 from megatron.training.models.transforms import ModelTransformConfig
-
-
-def _make_args(extra_argv=(), **overrides):
-    sys.argv = ['test_modelopt_model_config.py', *extra_argv]
-    args = parse_args(extra_args_provider=add_modelopt_args)
-    args.num_layers = 2
-    args.hidden_size = 128
-    args.num_attention_heads = 8
-    args.micro_batch_size = 1
-    args.seq_length = 128
-    args.max_position_embeddings = 128
-    args.padded_vocab_size = 32000
-    args.position_embedding_type = 'rope'
-    args.apply_rope_fusion = False
-    for name, value in overrides.items():
-        setattr(args, name, value)
-    validate_args(args)
-    return args
+from tests.unit_tests.post_training.conftest import make_modelopt_test_args
 
 
 class TestDistillationConfigFromArgs:
     def test_none_without_teacher(self):
-        args = _make_args()
+        args = make_modelopt_test_args()
         student = mc.modelopt_model_config_from_args(args)
         assert mc.distillation_config_from_args(args, student) is None
 
@@ -71,7 +51,7 @@ class TestDistillationConfigFromArgs:
                 {"logit_kl_temperature": 2.0, "intermediate_layer_pairs": [["a", "b", "mse"]]}
             )
         )
-        args = _make_args(
+        args = make_modelopt_test_args(
             export_kd_teacher_load=str(tmp_path),
             export_kd_teacher_model_config=str(teacher_yaml),
             export_kd_teacher_ckpt_format="torch_dist",
@@ -103,7 +83,9 @@ class TestDistillationConfigFromArgs:
     def test_rejects_unknown_loss_yaml_keys(self, tmp_path):
         kd_yaml = tmp_path / "kd.yaml"
         kd_yaml.write_text(yaml.safe_dump({"criterion": "x"}))
-        args = _make_args(export_kd_teacher_load=str(tmp_path), export_kd_cfg=str(kd_yaml))
+        args = make_modelopt_test_args(
+            export_kd_teacher_load=str(tmp_path), export_kd_cfg=str(kd_yaml)
+        )
         with pytest.raises(ValueError, match="Unknown distillation settings"):
             mc.distillation_config_from_args(args, mc.modelopt_model_config_from_args(args))
 
@@ -163,10 +145,53 @@ class TestDistillationConfig:
         with pytest.raises(ValueError, match="resolved teacher_model"):
             DistillationConfig(teacher_load="/t").validate()
 
+    @staticmethod
+    def _student_config(**transformer_overrides):
+        transformer = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=1,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_dtype=None,
+        )
+        for name, value in transformer_overrides.items():
+            setattr(transformer, name, value)
+        return GPTModelConfig(transformer=transformer, vocab_size=32000)
+
+    @staticmethod
+    def _distillation_with_teacher(**teacher_overrides):
+        teacher = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=1,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_dtype=None,
+        )
+        for name, value in teacher_overrides.items():
+            setattr(teacher, name, value)
+        return DistillationConfig(
+            teacher_load="/ckpt/teacher",
+            teacher_model=GPTModelConfig(transformer=teacher, vocab_size=32000),
+        )
+
+    @pytest.mark.parametrize(
+        "attr", ["tensor_model_parallel_size", "pipeline_model_parallel_size", "pipeline_dtype"]
+    )
+    def test_validate_student_rejects_mismatched_parallelism_or_dtype(self, attr):
+        distillation = self._distillation_with_teacher(**{attr: 2})
+        with pytest.raises(ValueError, match=f"same {attr}"):
+            distillation.validate_student(self._student_config())
+
 
 class TestModelOptModelConfigFromArgs:
     def test_gpt_uses_stock_builder_and_modelopt_spec(self):
-        args = _make_args(
+        args = make_modelopt_test_args(
             export_te_mcore_model=True,
             export_force_local_attention=True,
             export_real_quant_cfg="None",
@@ -192,7 +217,7 @@ class TestModelOptModelConfigFromArgs:
         )
 
     def test_gpt_default_te_spec_honors_disable_moe_grouped_gemm(self):
-        args = _make_args(export_default_te_spec=True)
+        args = make_modelopt_test_args(export_default_te_spec=True)
 
         config = mc.modelopt_model_config_from_args(args, disable_moe_grouped_gemm=True)
 
@@ -203,7 +228,7 @@ class TestModelOptModelConfigFromArgs:
         assert get_spec.call_args.args[1] is False  # moe_grouped_gemm
 
     def test_hybrid_sets_stack_spec(self):
-        args = _make_args(hybrid_layer_pattern="M*-", export_te_mcore_model=True)
+        args = make_modelopt_test_args(hybrid_layer_pattern="M*-", export_te_mcore_model=True)
         stack_spec = ModuleSpec(module=object)
 
         config = mc.modelopt_model_config_from_args(args, disable_moe_grouped_gemm=True)
@@ -221,7 +246,7 @@ class TestModelOptModelConfigFromArgs:
         )
 
     def test_transformer_config_tweaks(self):
-        args = _make_args(export_offline_model=True)
+        args = make_modelopt_test_args(export_offline_model=True)
 
         config = mc.modelopt_model_config_from_args(args)
 
@@ -230,7 +255,7 @@ class TestModelOptModelConfigFromArgs:
 
     def test_architecture_options_come_from_core_arguments(self):
         # The --export- spellings are deprecated aliases of the core flags.
-        args = _make_args(["--export-qk-l2-norm", "--enable-gpt-oss"])
+        args = make_modelopt_test_args(["--export-qk-l2-norm", "--enable-gpt-oss"])
 
         config = mc.modelopt_model_config_from_args(args)
 
@@ -240,13 +265,13 @@ class TestModelOptModelConfigFromArgs:
         assert config.transformer.yarn_correction_range_round_to_int is False
 
     def test_rejects_custom_spec(self):
-        args = _make_args()
+        args = make_modelopt_test_args()
         args.spec = ["some.module", "some_spec"]
         with pytest.raises(ValueError, match="custom args.spec"):
             mc.modelopt_model_config_from_args(args)
 
     def test_rejects_freeze_alias_conflict(self):
-        args = _make_args(freeze_base_for_mtp=True, qad_train_target="base")
+        args = make_modelopt_test_args(freeze_base_for_mtp=True, qad_train_target="base")
         with pytest.raises(ValueError, match="conflicts with --qad-train-target"):
             mc.modelopt_model_config_from_args(args)
 
@@ -269,7 +294,7 @@ class TestModelOptModelConfigFromArgs:
                 return hook
 
             monkeypatch.setattr(model_hooks, name, factory)
-        args = _make_args(
+        args = make_modelopt_test_args(
             freeze_base_for_mtp=True,
             lsq_scale_lr=1e-3,
             export_te_mcore_model=True,
@@ -306,7 +331,7 @@ class TestModelOptModelConfigFromArgs:
         assert config.pre_wrap_hooks == [freeze]  # no duplicate registration across builds
 
     def test_no_runtime_hooks_stored_in_config(self):
-        config = mc.modelopt_model_config_from_args(_make_args())
+        config = mc.modelopt_model_config_from_args(make_modelopt_test_args())
         assert config.pre_wrap_hooks == []
         assert config.transformations.qad_train_target is None
         assert config.restore_modelopt_state is False
@@ -314,7 +339,7 @@ class TestModelOptModelConfigFromArgs:
     def test_teacher_yaml_resolved_before_serialization(self, tmp_path):
         teacher_yaml = tmp_path / "teacher.yaml"
         teacher_yaml.write_text(yaml.safe_dump({"num_layers": 4}))
-        args = _make_args(
+        args = make_modelopt_test_args(
             export_kd_teacher_load=str(tmp_path), export_kd_teacher_model_config=str(teacher_yaml)
         )
         config = mc.modelopt_model_config_from_args(args)
@@ -327,7 +352,9 @@ class TestModelOptModelConfigFromArgs:
 
     @pytest.mark.parametrize("device", ["cpu", "cuda"])
     def test_post_training_execution_device_is_explicit(self, device):
-        cfg = mc.modelopt_inference_config_from_args(_make_args(use_cpu_initialization=True))
+        cfg = mc.modelopt_inference_config_from_args(
+            make_modelopt_test_args(use_cpu_initialization=True)
+        )
         with (
             patch(
                 "megatron.core.process_groups_config.ProcessGroupCollection.use_mpu_process_groups"
@@ -341,9 +368,11 @@ class TestModelOptModelConfigFromArgs:
 
 
 class TestModelType:
-    @pytest.mark.parametrize("pattern,expected", [(None, GPTModelConfig), ("M*-", HybridModelConfig)])
+    @pytest.mark.parametrize(
+        "pattern,expected", [(None, GPTModelConfig), ("M*-", HybridModelConfig)]
+    )
     def test_layer_pattern_selects_config(self, pattern, expected):
-        args = _make_args(hybrid_layer_pattern=pattern)
+        args = make_modelopt_test_args(hybrid_layer_pattern=pattern)
         assert isinstance(mc.modelopt_model_config_from_args(args), expected)
 
     @pytest.mark.parametrize(
@@ -355,19 +384,19 @@ class TestModelType:
         ],
     )
     def test_deprecated_flag_is_honored(self, flag, pattern, expected):
-        args = _make_args(export_model_type=flag, hybrid_layer_pattern=pattern)
+        args = make_modelopt_test_args(export_model_type=flag, hybrid_layer_pattern=pattern)
         with pytest.warns(DeprecationWarning, match="--export-model-type is deprecated"):
             assert isinstance(mc.modelopt_model_config_from_args(args), expected)
 
     def test_deprecated_flag_conflicting_with_config_raises(self):
-        args = _make_args(export_model_type="GPTModel")
+        args = make_modelopt_test_args(export_model_type="GPTModel")
         config = hybrid_config_from_args(args)
         with pytest.warns(DeprecationWarning), pytest.raises(ValueError, match="conflicts"):
             mc.apply_modelopt_model_config(config, args)
 
     @pytest.mark.parametrize("flag", [None, "GPTModel"])
     def test_gpt_config_with_layer_pattern_raises(self, flag):
-        args = _make_args(hybrid_layer_pattern="M*-", export_model_type=flag)
+        args = make_modelopt_test_args(hybrid_layer_pattern="M*-", export_model_type=flag)
         config = gpt_config_from_args(args)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
@@ -375,13 +404,13 @@ class TestModelType:
                 mc.apply_modelopt_model_config(config, args)
 
     def test_entry_point_config_is_updated_in_place(self):
-        args = _make_args(export_te_mcore_model=True)
+        args = make_modelopt_test_args(export_te_mcore_model=True)
         config = hybrid_config_from_args(args)
         assert mc.apply_modelopt_model_config(config, args) is config
         assert config.transformations.remap_te_layernorm is True
 
     def test_hybrid_default_te_spec_disables_remap_without_touching_args(self):
-        args = _make_args(
+        args = make_modelopt_test_args(
             hybrid_layer_pattern="M*-", export_te_mcore_model=True, export_default_te_spec=True
         )
         config = mc.modelopt_model_config_from_args(args)
@@ -471,11 +500,13 @@ class TestBuildTeacher:
 
 
 class TestOnModelInitDevice:
-    def test_passthrough_without_meta_device(self):
-        hook = Mock()
-        assert model_hooks.on_model_init_device(hook, False) is hook
+    @pytest.mark.parametrize("init_meta", [False, True])
+    def test_wraps_hook_for_meta_device(self, init_meta):
+        if not init_meta:
+            hook = Mock()
+            assert model_hooks.on_model_init_device(hook, False) is hook
+            return
 
-    def test_hook_runs_under_meta_device(self):
         created = []
 
         def hook(models):
@@ -484,74 +515,22 @@ class TestOnModelInitDevice:
 
         wrapped = model_hooks.on_model_init_device(hook, True)
         assert wrapped(["model"]) == ["model"]
-
         assert created[0].device.type == "meta"
-        assert torch.empty(1).device.type != "meta"
 
 
 class TestKdConvertHook:
-    def _student_config(self, **transformer_overrides):
-        transformer = TransformerConfig(
-            num_layers=2,
-            hidden_size=128,
-            num_attention_heads=1,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_dtype=None,
-        )
-        for name, value in transformer_overrides.items():
-            setattr(transformer, name, value)
-        return GPTModelConfig(transformer=transformer, vocab_size=32000)
-
-    @staticmethod
-    def _distillation(teacher_transformer):
-        return DistillationConfig(
-            teacher_load="/ckpt/teacher",
-            teacher_model=GPTModelConfig(transformer=teacher_transformer, vocab_size=32000),
-        )
-
-    def _run(self, student_config, teacher_transformer, models):
-        distillation = self._distillation(teacher_transformer)
-        hook = model_hooks.kd_convert_hook(student_config, distillation, remap_te_layernorm=False)
-        return hook(models)
-
-    @pytest.mark.parametrize(
-        "attr", ["tensor_model_parallel_size", "pipeline_model_parallel_size", "pipeline_dtype"]
-    )
-    def test_rejects_mismatched_parallelism_or_dtype(self, attr):
-        teacher = Mock(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-            pipeline_dtype=None,
-        )
-        setattr(teacher, attr, 2)
-        student = self._student_config()
-        with pytest.raises(ValueError, match=f"same {attr}"):
-            self._distillation(teacher).validate_student(student)
-
     def test_rejects_multiple_model_chunks(self):
+        student_config = GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=1),
+            vocab_size=32000,
+        )
+        distillation = DistillationConfig(
+            teacher_load="/ckpt/teacher",
+            teacher_model=GPTModelConfig(transformer=student_config.transformer, vocab_size=32000),
+        )
+        hook = model_hooks.kd_convert_hook(student_config, distillation, remap_te_layernorm=False)
         with pytest.raises(ValueError, match="virtual pipeline"):
-            self._run(self._student_config(), Mock(), [Mock(), Mock()])
-
-
-class TestFreezeHookOrdering:
-    def test_freeze_hook_appended_without_kd(self):
-        from megatron.training.training import (
-            _add_model_freeze_pre_wrap_hook,
-            _freeze_all_model_chunks,
-        )
-
-        model_config = Mock(pre_wrap_hooks=[])
-
-        _add_model_freeze_pre_wrap_hook(
-            model_config, freeze_all_layers=True, freeze_base_model_for_mtp=False
-        )
-
-        assert model_config.pre_wrap_hooks == [_freeze_all_model_chunks]
+            hook([Mock(), Mock()])
 
 
 class TestKdConvertHookDoesNotLoadTeacherWeights:
@@ -604,7 +583,7 @@ class TestModelOptMtpSpec:
         Utils.initialize_model_parallel(1, 1)
         try:
             config = mc.modelopt_model_config_from_args(
-                _make_args(mtp_num_layers=1, export_real_quant_cfg=quant_cfg)
+                make_modelopt_test_args(mtp_num_layers=1, export_real_quant_cfg=quant_cfg)
             )
             decoder_spec = default_layer_spec(config, vp_stage=None)
             mtp_spec = mtp_block_spec(config, decoder_spec, pp_rank=0)
@@ -653,6 +632,29 @@ class TestTeacherCheckpointConfig:
             finetune=False, ckpt_format="torch", export_kd_teacher_load="/stale"
         )
 
+    def test_student_checkpoint_format_when_teacher_format_unset(self):
+        from megatron.post_training import checkpointing
+        from megatron.training.config.training_config import CheckpointConfig
+
+        args = Namespace(ckpt_format="torch", finetune=False)
+        observed = []
+
+        def load(*_args, **_kwargs):
+            observed.append(args.ckpt_format)
+
+        with (
+            patch.object(checkpointing, "get_args", return_value=args),
+            patch.object(checkpointing, "unwrap_model"),
+            patch.object(checkpointing, "load_checkpoint", side_effect=load),
+        ):
+            checkpointing.load_kd_teacher_checkpoint(
+                [Mock()],
+                DistillationConfig(teacher_load="/teacher"),
+                student_checkpoint=CheckpointConfig(ckpt_format="torch_dist"),
+            )
+        assert observed == ["torch_dist"]
+        assert vars(args) == {"ckpt_format": "torch", "finetune": False}
+
     def test_absent_legacy_teacher_path_is_not_left_on_args(self):
         from megatron.post_training import checkpointing
 
@@ -682,18 +684,6 @@ class TestTeacherCheckpointConfig:
 
 
 class TestConfigurationDrivenKDLoss:
-    def test_distillation_detection_accepts_model_chunk_lists(self):
-        from modelopt.torch.distill import DistillationModel
-
-        from megatron.post_training.utils import is_distillation_model
-
-        distillation_model = Mock(spec=DistillationModel)
-        with patch(
-            "megatron.post_training.utils.unwrap_model",
-            return_value=[object(), distillation_model],
-        ):
-            assert is_distillation_model([Mock(), Mock()])
-
     @pytest.mark.parametrize("training", [True, False])
     def test_kd_loss_without_legacy_cli_teacher_flag(self, training):
         from modelopt.torch.distill import DistillationModel

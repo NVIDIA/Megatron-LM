@@ -7,11 +7,11 @@ from argparse import Namespace
 import pytest
 import torch
 
+import megatron.post_training.optimizer as modelopt_optimizer
 import megatron.training.training as training
 from megatron.core.optimizer import OptimizerConfig, _get_param_groups
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.post_training.model_hooks import _propagate_expert_allreduce_to_lsq_params
-import megatron.post_training.optimizer as modelopt_optimizer
 from megatron.post_training.optimizer import (
     get_lsq_config_overrides,
     install_lsq_optimizer_overrides,
@@ -86,9 +86,7 @@ def test_wrapped_config_adds_lsq_override(restore_optimizer_config_fn, monkeypat
         lambda: Namespace(model=_model_config(lsq_scale_lr=1e-4)),
     )
     install_lsq_optimizer_overrides()
-    config, overrides = training.get_megatron_optimizer_config(
-        Namespace(lr=3e-5, min_lr=0.0)
-    )
+    config, overrides = training.get_megatron_optimizer_config(Namespace(lr=3e-5, min_lr=0.0))
     assert config == base_config
     assert set(base_overrides).issubset(overrides)
     assert len(overrides) == len(base_overrides) + 1

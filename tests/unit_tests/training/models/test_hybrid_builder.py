@@ -230,17 +230,14 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.HybridModel")
     def test_transform_config_selects_modelopt_spec(self, mock_model, *_):
         self.config.transformations = ModelTransformConfig(
-            default_te_spec=True,
-            moe_grouped_gemm=False,
+            default_te_spec=True, moe_grouped_gemm=False
         )
         with patch(
             "megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec"
         ) as mock_modelopt:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
         mock_modelopt.assert_called_once_with(
-            remap_te_layernorm=False,
-            use_default_te_spec=True,
-            moe_grouped_gemm=False,
+            remap_te_layernorm=False, use_default_te_spec=True, moe_grouped_gemm=False
         )
         assert mock_model.call_args.kwargs["hybrid_stack_spec"] is mock_modelopt.return_value
 
