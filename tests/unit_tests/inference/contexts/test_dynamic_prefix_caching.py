@@ -3511,7 +3511,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             with monkeypatch.context() as staging:
                 socket = Mock()
                 staging.setattr(engine, "payload_stager", SimpleNamespace(stage=stage))
-                staging.setattr(engine, "socket_for_receiving_requests", socket)
+                staging.setattr(engine, "socket_for_receiving_requests", socket, raising=False)
                 asyncio.run(stage_finished_request())
                 socket.send_multipart.assert_called_once()
                 frames = socket.send_multipart.call_args.args[0]
