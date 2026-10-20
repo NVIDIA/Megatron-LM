@@ -773,13 +773,13 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
         {**environment, "RUNNER_TEMP": str(tmp_path)},
     )
     assert result.returncode == 0, result.stderr
-    restore = _step("_unit-tests.yml", "select", "baseline")
+    restore = _step("_unit-tests.yml", "select", "plan")
     assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
     workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
     assert all(
         "PATH" not in step.get("env", {})
         for step in workflow["jobs"]["select"]["steps"]
-        if step.get("id") != "baseline"
+        if step.get("id") != "plan"
     )
     probe = subprocess.run(
         ["zstd", "--quiet", "--version"],
@@ -796,24 +796,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     )
 
     bucket = "tests/unit_tests/test_example.py"
-    result, outputs = _run(
-        _step("_unit-tests.yml", "select", "result")["run"],
-        tmp_path,
-        {
-            "PLAN_MODE": "selected",
-            "HAS_TESTS": str(has_tests).lower(),
-            "PLAN_OUTCOME": "success",
-            "UPLOAD_OUTCOME": "success",
-            "PLAN_ARTIFACT": "plan",
-            "BUCKET": bucket,
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert outputs == {
-        "mode": "selected",
-        "has_tests": str(has_tests).lower(),
-        "plan_artifact": "plan",
-    }
+    outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["run"]["needs"] == "select"
     expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
@@ -824,33 +807,24 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     inputs = SimpleNamespace(unit_testmon_mode="enforce")
     context = {"needs": needs, "inputs": inputs}
     assert eval(expression, {"__builtins__": {}}, context) == has_tests
-    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
-    mode = mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
-    assert eval(mode, {"__builtins__": {}}, context) == "preselected"
+    assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
+        "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
+    )
+    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
+        "${{ matrix.mode || 'full' }}"
+    )
 
-    # Setup failures must fail on CPU rather than move selection onto the GPU.
+    # CPU failures stop GPU scheduling; full-suite requests bypass selection.
     needs.select.result = "failure"
     assert not eval(expression, {"__builtins__": {}}, context)
-    needs.select.result = "success"
-
-    # When CPU selection requires the full bucket, GPU execution receives full.
-    result, full = _run(
-        _step("_unit-tests.yml", "select", "result")["run"],
-        tmp_path,
-        {
-            "PLAN_MODE": "full",
-            "HAS_TESTS": "true",
-            "PLAN_OUTCOME": "success",
-            "UPLOAD_OUTCOME": "skipped",
-            "PLAN_ARTIFACT": "plan",
-            "BUCKET": bucket,
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert full == {"mode": "full", "has_tests": "true", "plan_artifact": ""}
-    needs.select.outputs = SimpleNamespace(**full)
+    needs.select.result = "skipped"
+    inputs.unit_testmon_mode = "full"
     assert eval(expression, {"__builtins__": {}}, context)
-    assert eval(mode, {"__builtins__": {}}, context) == "full"
+    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    for job in callers.values():
+        if job.get("uses") == "./.github/workflows/_unit-tests.yml":
+            assert "strategy" not in job
+            assert "buckets" in job["with"]
 
     for platform in ("dgx_h100", "dgx_gb200"):
         directory = tmp_path / f"unit-test-plan-{platform}"
@@ -880,3 +854,168 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     # Missing coverage is valid only when every bucket selected no tests.
     assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
     assert outputs == ({} if has_tests else {"has_coverage": "false"})
+
+
+@pytest.mark.parametrize(
+    "scenario", ["mixed", "empty", "cache-error", "selector-error", "upload-error"]
+)
+def test_grouped_cpu_selection(tmp_path: Path, scenario: str) -> None:
+    pytest.importorskip("testmon")
+    if shutil.which("node") is None:
+        pytest.skip("Grouped workflow validation requires Node.js")
+    buckets = [
+        {"bucket": f"tests/unit_tests/{name}/**/*.py", "timeout": 40}
+        for name in (["empty"] if scenario == "empty" else ["selected", "empty", "full"])
+    ]
+    unit_tests = tmp_path / "tests/unit_tests"
+    unit_tests.mkdir(parents=True)
+    for script in (
+        "testmon_cache.py",
+        "testmon_selector.py",
+        "testmon_plan.py",
+        "testmon_mandatory.py",
+        "find_test_cases.py",
+    ):
+        (unit_tests / script).symlink_to(ROOT / "tests/unit_tests" / script)
+    (unit_tests / "testmon_mandatory_tests.yaml").write_text("mappings: []\n")
+    dataset = tmp_path / "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text("")
+    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text(
+        json.dumps({"products": [{"test_case": [entry["bucket"] for entry in buckets]}]})
+    )
+    selected = unit_tests / "selected/test_case.py"
+    selected.parent.mkdir()
+    selected.write_text("def test_case(): pass\n")
+    pr_files = tmp_path / "pr-files"
+    pr_files.mkdir()
+    (pr_files / "changed-files").write_text("")
+    (pr_files / "metadata.json").write_text(
+        json.dumps({"tested_sha": "a" * 40, "changed_paths": 0})
+    )
+    environment = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+        "PYTHONPATH": str(unit_tests),
+        "BUCKETS": json.dumps(buckets),
+        "RECIPE_PLATFORM": "dgx_h100",
+        "SOURCE_SHA": "a" * 40,
+        "TARGET_BRANCH": "main",
+        "PR_FILES_DIR": str(pr_files),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "TEST_SCENARIO": scenario,
+        "TEST_HELPER": str(ROOT / ".github/scripts/select_unit_tests.js"),
+    }
+    # Empty recorded databases are sufficient: a new file is selected, and a
+    # bucket without files is skipped. Use real cache validation and selection.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json, os
+from pathlib import Path
+from testmon.db import DB
+from testmon_cache import PHASES, cache_identity, record_phase, finalize
+for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
+    if '/full/' in entry['bucket']:
+        continue
+    directory = Path('saved') / str(index)
+    for phase in PHASES:
+        database = directory / phase / '.testmondata'
+        database.parent.mkdir(parents=True)
+        DB(str(database)).con.close()
+        record_phase(directory, phase)
+    identity = cache_identity(Path.cwd(), entry['bucket'], 'dgx_h100')
+    finalize(directory, identity, 'b' * 40, '111-1')
+""",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            """
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const outputs = {}, uploads = [], warnings = [];
+const scenario = process.env.TEST_SCENARIO;
+let restores = 0;
+const core = {
+  info() {}, startGroup() {}, endGroup() {},
+  warning(message) { warnings.push(message); },
+  setOutput(name, value) { outputs[name] = value; },
+  summary: {addHeading() { return this; }, addTable() { return this; }, async write() {}},
+};
+const cache = {async restoreCache(paths, key, prefixes) {
+  assert.deepEqual(paths, ['assets_dir/testmon']);
+  assert.equal(key, `${prefixes[0]}lookup-123-2`);
+  assert(!fs.existsSync(paths[0]), 'previous bucket cache was not cleared');
+  const index = restores++;
+  if (scenario === 'selector-error' && index === 1)
+    fs.unlinkSync('tests/unit_tests/testmon_selector.py');
+  if (scenario === 'cache-error' && index === 0) throw new Error('cache unavailable');
+  if (!fs.existsSync(`saved/${index}`)) return undefined;
+  fs.cpSync(`saved/${index}`, paths[0], {recursive: true});
+  return `${prefixes[0]}111-1`;
+}};
+const artifact = {async uploadArtifact(name, files, root) {
+  if (scenario === 'upload-error') throw new Error('artifact unavailable');
+  assert.equal(root, 'assets_dir/testmon-plan');
+  assert.deepEqual(files, [`${root}/plan.json`]);
+  uploads.push({name, plan: JSON.parse(fs.readFileSync(files[0], 'utf8'))});
+}};
+function report(error) { console.log(JSON.stringify({outputs, uploads, warnings, restores, error})); }
+require(process.env.TEST_HELPER)({core, cache, artifact})
+  .then(() => report()).catch(error => { report(error.message); process.exitCode = 1; });
+""",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    report = json.loads(result.stdout)
+    if scenario in {"selector-error", "upload-error"}:
+        assert result.returncode != 0
+        assert report["outputs"] == {}
+        assert report["restores"] == (2 if scenario == "selector-error" else 1)
+        assert len(report["uploads"]) == (1 if scenario == "selector-error" else 0)
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert report["restores"] == len(buckets)
+    matrix = json.loads(report["outputs"]["matrix"])
+    assert report["outputs"]["has_tests"] == str(scenario != "empty").lower()
+    assert [entry["bucket"] for entry in matrix] == [
+        entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
+    ]
+    assert [entry["mode"] for entry in matrix] == (
+        []
+        if scenario == "empty"
+        else ["full" if scenario == "cache-error" else "preselected", "full"]
+    )
+    assert all(entry["timeout"] == 40 for entry in matrix)
+    assert bool(report["warnings"]) == (scenario == "cache-error")
+    for upload in report["uploads"]:
+        plan = upload["plan"]
+        assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])
+        expected = (
+            ["tests/unit_tests/selected/test_case.py"] if "/selected/" in plan["bucket"] else []
+        )
+        assert plan["phases"] == {"prod": expected, "experimental": expected}
+        assert plan["source_sha"] == "a" * 40
+        matches = [entry for entry in matrix if entry["bucket"] == plan["bucket"]]
+        assert bool(matches) == bool(expected)
+        if matches:
+            assert matches[0]["plan_artifact"] == upload["name"]
+    assert any("/empty/" in upload["plan"]["bucket"] for upload in report["uploads"])
+    assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
