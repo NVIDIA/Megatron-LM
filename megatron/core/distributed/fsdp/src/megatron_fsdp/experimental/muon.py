@@ -216,10 +216,10 @@ class FsdpMuon(Muon):
                         raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
             # EO's OrthogonalizedOptimizer.step implements momentum inline, without a helper.
             momentum.lerp_(grad, 1 - group["momentum"])
-            update: torch.Tensor = (
-                grad.lerp(momentum, group["momentum"]) if self.nesterov else momentum
-            )
-            local_input.copy_(update.reshape(local_input.shape))
+            if self.nesterov:
+                torch.lerp(grad, momentum, group["momentum"], out=local_input.view_as(momentum))
+            else:
+                local_input.copy_(momentum.reshape(local_input.shape))
         return momentum_inputs
 
     def _orthogonalize_updates(
