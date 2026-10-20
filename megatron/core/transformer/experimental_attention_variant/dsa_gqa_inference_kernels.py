@@ -53,7 +53,7 @@ if HAVE_TRITON:
     # Integers that change from step to step are not specialized (Triton otherwise compiles
     # separate variants for values equal to 1 or divisible by 16); only model constants are
     # constexpr, so a kernel compiles once per model.
-    @triton.jit(do_not_specialize=["stride_scores", "width"])
+    @triton.jit(do_not_specialize=["stride_scores", "width", "row_offset", "num_out_rows"])
     def _score_kernel(
         query,
         key_cache,
@@ -69,6 +69,8 @@ if HAVE_TRITON:
         stride_table,
         stride_scores,
         width,
+        row_offset,
+        num_out_rows,
         max_pages,
         num_pages,
         INDEX_DIM: tl.constexpr,
@@ -77,6 +79,7 @@ if HAVE_TRITON:
         ROW_BLOCK: tl.constexpr,
         BLOCK_T: tl.constexpr,
         FILL_INVALID: tl.constexpr,
+        WINDOWED: tl.constexpr,
     ):
         worker = tl.program_id(0)
         block = tl.program_id(1)
@@ -84,8 +87,14 @@ if HAVE_TRITON:
         num_rows = tl.load(block_rows + block)
         request = tl.load(block_requests + block).to(tl.int64)
         row_in_block = tl.arange(0, ROW_BLOCK)
-        row_valid = row_in_block < num_rows
         rows = (tl.load(block_starts + block) + row_in_block).to(tl.int64)
+        row_valid = row_in_block < num_rows
+        out_rows = rows
+        if WINDOWED:
+            # Only rows inside this call's window [row_offset, row_offset + num_out_rows) are
+            # scored, into out rows counted from row_offset.
+            row_valid = row_valid & (rows >= row_offset) & (rows < row_offset + num_out_rows)
+            out_rows = rows - row_offset
         lengths = tl.load(row_lengths + rows, mask=row_valid, other=0)
         lengths = tl.minimum(lengths, width)
         dims = tl.arange(0, INDEX_DIM_TILE)
@@ -98,7 +107,11 @@ if HAVE_TRITON:
         longest = tl.max(lengths, axis=0)
         # Positions below `limit` are written: whole rows when invalid positions are filled
         # with -inf, else only each row's keys. Empty (padding) blocks write nothing.
-        limit = tl.where(num_rows > 0, width, 0) if FILL_INVALID else longest
+        if WINDOWED:
+            num_valid = tl.sum(row_valid.to(tl.int32), axis=0)
+        else:
+            num_valid = num_rows
+        limit = tl.where(num_valid > 0, width, 0) if FILL_INVALID else longest
         for start in range(worker * BLOCK_T, limit, workers * BLOCK_T):
             positions = start + tl.arange(0, BLOCK_T)
             logical_page = positions // PAGE_SIZE
@@ -122,7 +135,9 @@ if HAVE_TRITON:
             store = row_valid[:, None] & (positions[None, :] < limit)
             if not FILL_INVALID:
                 store = store & in_row
-            tl.store(scores + rows[:, None] * stride_scores + positions[None, :], score, mask=store)
+            tl.store(
+                scores + out_rows[:, None] * stride_scores + positions[None, :], score, mask=store
+            )
 
     @triton.jit(do_not_specialize=["stride_topk", "topk", "slice_len", "num_slices"])
     def _partial_kernel(
@@ -374,6 +389,7 @@ def dsa_gqa_indexer_scores(
     *,
     out: torch.Tensor,
     fill_invalid: bool,
+    row_offset: int = 0,
 ) -> None:
     """Score each row's cached indexer keys against the row's indexer query.
 
@@ -384,12 +400,15 @@ def dsa_gqa_indexer_scores(
         row_lengths: Int32 ``[rows]``; row ``t`` scores keys ``[0, row_lengths[t])``.
         block_starts, block_rows, block_requests: Int32 score blocks (``build_row_metadata``);
             a block with 0 rows is skipped.
-        out: Caller-owned FP32 scores ``[rows,width]``; ``out[t, j]`` is the dot product of
-            query ``t`` with its request's key ``j`` for ``j < min(row_lengths[t], width)``.
+        out: Caller-owned FP32 scores ``[out_rows,width]`` for rows ``row_offset`` to
+            ``row_offset + out_rows - 1``: ``out[t - row_offset, j]`` is the dot product of query
+            ``t`` with its request's key ``j`` for ``j < min(row_lengths[t], width)``. Scoring a
+            step's rows in windows bounds the buffer at long context.
         fill_invalid: Write negative infinity at positions at or past each row's length.
             Without it those positions are left unwritten, for a top-k that reads only the
             first ``row_lengths[t]`` scores of row ``t``. Rows in no block (padding) are
             never written.
+        row_offset: First row of the window ``out`` covers.
     """
     if not HAVE_TRITON:
         raise RuntimeError("Triton is required for the DSA indexer kernel.")
@@ -416,18 +435,26 @@ def dsa_gqa_indexer_scores(
         ("block_requests", block_requests),
     ):
         _require_int32_vector(name, tensor, num_blocks)
-    if (
-        out.dtype != torch.float32
-        or out.dim() != 2
-        or out.size(0) != num_rows
-        or out.stride(-1) != 1
-    ):
-        raise TypeError("out must be FP32 [rows,width] with dense rows.")
+    if out.dtype != torch.float32 or out.dim() != 2 or out.stride(-1) != 1:
+        raise TypeError("out must be FP32 [out_rows,width] with dense rows.")
+    if row_offset < 0 or row_offset + out.size(0) > num_rows:
+        raise ValueError(
+            f"Score window [{row_offset}, {row_offset + out.size(0)}) exceeds {num_rows} rows."
+        )
     width = out.size(1)
     if num_blocks == 0 or width == 0:
         return
     tiles = triton.cdiv(width, SCORE_BLOCK_T)
-    workers = max(1, min(tiles, SCORE_PROGRAMS_PER_SM * _num_sms(query.device.index) // num_blocks))
+    # Size the per-block parallelism by the blocks that can overlap the window: all of them
+    # when it covers every row, else (windows split long prefill rows) about one per
+    # SCORE_ROW_BLOCK rows. Blocks outside the window exit at once.
+    if out.size(0) == num_rows:
+        active_blocks = num_blocks
+    else:
+        active_blocks = min(num_blocks, triton.cdiv(out.size(0), SCORE_ROW_BLOCK) + 1)
+    workers = max(
+        1, min(tiles, SCORE_PROGRAMS_PER_SM * _num_sms(query.device.index) // active_blocks)
+    )
     _score_kernel[(workers, num_blocks)](
         query,
         key_cache,
@@ -443,6 +470,8 @@ def dsa_gqa_indexer_scores(
         block_table.stride(0),
         out.stride(0),
         width,
+        row_offset,
+        out.size(0),
         block_table.size(1),
         key_cache.size(0),
         INDEX_DIM=index_dim,
@@ -451,6 +480,8 @@ def dsa_gqa_indexer_scores(
         ROW_BLOCK=SCORE_ROW_BLOCK,
         BLOCK_T=SCORE_BLOCK_T,
         FILL_INVALID=fill_invalid,
+        # A call that covers every row compiles without the window checks.
+        WINDOWED=out.size(0) != num_rows,
         num_warps=4,
         num_stages=2,
     )

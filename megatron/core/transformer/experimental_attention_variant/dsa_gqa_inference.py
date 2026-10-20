@@ -9,6 +9,7 @@ from functools import cache, partial
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core.inference.contexts import BaseInferenceContext
 
@@ -101,19 +102,30 @@ def _sparse_attention_rows(
         # columns; the indexer never writes past a row's length.
         alignment = deep_select.get_stride_requirement()[0] // torch.float32.itemsize
         width = -(-max(width, index_topk) // alignment) * alignment
-    scores = torch.empty((num_rows, width), dtype=torch.float32, device=query.device)
-    dsa_gqa_inference_kernels.dsa_gqa_indexer_scores(
-        index_query.contiguous(),
-        index_key_cache,
-        block_table,
-        row_lengths,
-        block_starts,
-        block_rows,
-        block_requests,
-        out=scores,
-        fill_invalid=not use_deep_select,
-    )
-    topk_indices = _select_topk(scores, row_lengths, index_topk, use_deep_select)
+    # Score and select in windows of rows so the score buffer stays bounded at long context;
+    # the window count depends only on the padded rows and the width (CUDA-graph safe).
+    window = max(1, min(num_rows, SCORE_BUFFER_BYTES // (width * torch.float32.itemsize)))
+    scores = torch.empty((window, width), dtype=torch.float32, device=query.device)
+    topk_indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device=query.device)
+    index_query = index_query.contiguous()
+    for start in range(0, num_rows, window):
+        stop = min(start + window, num_rows)
+        window_scores = scores[: stop - start]
+        dsa_gqa_inference_kernels.dsa_gqa_indexer_scores(
+            index_query,
+            index_key_cache,
+            block_table,
+            row_lengths,
+            block_starts,
+            block_rows,
+            block_requests,
+            out=window_scores,
+            fill_invalid=not use_deep_select,
+            row_offset=start,
+        )
+        topk_indices[start:stop] = _select_topk(
+            window_scores, row_lengths[start:stop], index_topk, use_deep_select
+        )
     output = query.new_empty((num_rows, num_query_heads, value_cache.size(-1)))
     dsa_gqa_inference_kernels.dsa_gqa_sparse_attention(
         query,
