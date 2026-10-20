@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Release export: owner routing, bounded native rows, precision and byte stability."""
 import hashlib
 import json
 from pathlib import Path
@@ -71,12 +70,8 @@ def _model(ps):
                 (3,) if name == 'bias' else ((24, 64) if name.endswith('weight') else (1,)),
                 torch.float32,
             )
-        table = ShardedFrozenTable(
-            5,
-            32,
-            ps.dp_cp_group or SimpleNamespace(size=lambda: 1, rank=lambda: 0),
-            initialize=False,
-        )
+        group = ps.dp_cp_group or SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+        table = ShardedFrozenTable(5, 32, group, initialize=False)
         start = table.embedding.lookup.boundaries[table.group.rank()]
         table.embedding.weight.copy_(
             torch.arange(start * 32, (start + table.embedding.weight.shape[0]) * 32)
@@ -117,30 +112,22 @@ def _owner_worker(rank, root, ep, pp):
                 )
     for target in ('bf16', 'release'):
         reference = _model(ParallelState())
-        save_hf_weights(
-            reference,
-            f'{root}/reference-{target}',
-            cfg,
-            ParallelState(),
-            target=target,
-            buffer_max_size_bytes=16384,
+        options = dict(target=target, buffer_max_size_bytes=16384)
+        output, refpath, again = (
+            f'{root}/{s}-{target}' for s in ('distributed', 'reference', 'again')
         )
-        output = f'{root}/distributed-{target}'
-        save_hf_weights(model, output, cfg, ps, target=target, buffer_max_size_bytes=16384)
-        actual, expected = _files(output), _files(f'{root}/reference-{target}')
+        save_hf_weights(reference, refpath, cfg, ParallelState(), **options)
+        save_hf_weights(model, output, cfg, ps, **options)
+        actual, expected = _files(output), _files(refpath)
         assert actual.keys() == expected.keys()
         assert all(
             a.shape == expected[k].shape and torch.equal(_bits(a), _bits(expected[k]))
             for k, a in actual.items()
         )
         load_hf_weights(model, output, cfg, ps)
-        save_hf_weights(
-            model, f'{root}/again-{target}', cfg, ps, target=target, buffer_max_size_bytes=16384
-        )
-        assert all(
-            torch.equal(_bits(v), _bits(_files(f'{root}/again-{target}')[k]))
-            for k, v in actual.items()
-        )
+        save_hf_weights(model, again, cfg, ps, **options)
+        reloaded = _files(again)
+        assert all(torch.equal(_bits(v), _bits(reloaded[k])) for k, v in actual.items())
     assert synced == [True] * 4  # direct saves also finish pending gathers
     dist.destroy_process_group()
 
@@ -179,11 +166,8 @@ def test_runtime_export_finishes_overlapped_parameter_gather():
         assert synced == [True]
         yield 'head.weight', torch.ones(1)
 
-    handle = SimpleNamespace(
-        _model=chunk,
-        _parallel_state=None,
-        _extras={'protocol': SimpleNamespace(export_hf_weights=export)},
-    )
+    protocol = SimpleNamespace(export_hf_weights=export)
+    handle = SimpleNamespace(_model=chunk, _parallel_state=None, _extras={'protocol': protocol})
     assert len(list(object.__new__(MegatronLiteRuntime).export_weights(handle))) == 1
 
 
