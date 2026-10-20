@@ -775,7 +775,12 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     assert result.returncode == 0, result.stderr
     restore = _step("_unit-tests.yml", "select", "baseline")
     assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
-    assert restore["if"] == "steps.cache-compression.outcome == 'success'"
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    assert all(
+        "PATH" not in step.get("env", {})
+        for step in workflow["jobs"]["select"]["steps"]
+        if step.get("id") != "baseline"
+    )
     probe = subprocess.run(
         ["zstd", "--quiet", "--version"],
         env={**environment, "PATH": compression["path"]},
@@ -809,7 +814,6 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
         "has_tests": str(has_tests).lower(),
         "plan_artifact": "plan",
     }
-    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["run"]["needs"] == "select"
     expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
@@ -817,30 +821,36 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     needs = SimpleNamespace(
         select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
     )
-    assert eval(expression, {"__builtins__": {}}, {"needs": needs}) == has_tests
+    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    context = {"needs": needs, "inputs": inputs}
+    assert eval(expression, {"__builtins__": {}}, context) == has_tests
+    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
+    mode = mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
+    assert eval(mode, {"__builtins__": {}}, context) == "preselected"
 
-    # CPU failures keep the existing GPU cache-selection path available.
-    result, fallback = _run(
+    # Setup failures must fail on CPU rather than move selection onto the GPU.
+    needs.select.result = "failure"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    needs.select.result = "success"
+
+    # When CPU selection requires the full bucket, GPU execution receives full.
+    result, full = _run(
         _step("_unit-tests.yml", "select", "result")["run"],
         tmp_path,
         {
-            "PLAN_MODE": "enforce" if has_tests else "selected",
-            "HAS_TESTS": str(has_tests).lower(),
+            "PLAN_MODE": "full",
+            "HAS_TESTS": "true",
             "PLAN_OUTCOME": "success",
-            "UPLOAD_OUTCOME": "skipped" if has_tests else "failure",
+            "UPLOAD_OUTCOME": "skipped",
             "PLAN_ARTIFACT": "plan",
             "BUCKET": bucket,
         },
     )
     assert result.returncode == 0, result.stderr
-    assert fallback == {"mode": "enforce", "has_tests": "true", "plan_artifact": ""}
-    needs.select.outputs = SimpleNamespace(**fallback)
-    assert eval(expression, {"__builtins__": {}}, {"needs": needs})
-    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
-    mode = mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
-    for requested in ("enforce", "full"):
-        inputs = SimpleNamespace(unit_testmon_mode=requested)
-        assert eval(mode, {"__builtins__": {}}, {"needs": needs, "inputs": inputs}) == requested
+    assert full == {"mode": "full", "has_tests": "true", "plan_artifact": ""}
+    needs.select.outputs = SimpleNamespace(**full)
+    assert eval(expression, {"__builtins__": {}}, context)
+    assert eval(mode, {"__builtins__": {}}, context) == "full"
 
     for platform in ("dgx_h100", "dgx_gb200"):
         directory = tmp_path / f"unit-test-plan-{platform}"

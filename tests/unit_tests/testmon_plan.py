@@ -5,34 +5,11 @@
 from __future__ import annotations
 
 import json
-import platform
-import re
 import sqlite3
-import subprocess
 from contextlib import closing
 from pathlib import Path
 
 from testmon_cache import PHASES, PLATFORMS, cache_identity, validate_cache
-
-
-def _collection_sources_unchanged(root: Path, source_sha: str, recipe_path: str) -> None:
-    """Defer source changes to GPU collection, which can discover new test IDs."""
-
-    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *args], cwd=root, capture_output=True, timeout=30, check=check
-        )
-
-    if git("cat-file", "-e", f"{source_sha}^{{commit}}", check=False).returncode:
-        # Actions uses a shallow checkout; fetch the baseline without moving HEAD.
-        git("fetch", "--no-tags", "--no-write-fetch-head", "--depth=1", "origin", source_sha)
-    # Runtime fingerprints do not cover imports used only to generate test IDs.
-    # Preserve the old selector's discovery of new parametrized tests.
-    paths = [":(glob)**/*.py", recipe_path]
-    changed = git("diff", "--name-only", source_sha, "--", *paths).stdout
-    added = git("ls-files", "--others", "--exclude-standard", "--", *paths).stdout
-    if changed or added:
-        raise ValueError("collection sources changed; using the existing GPU selector")
 
 
 def _changed_files(directory: Path, source_sha: str) -> list[str]:
@@ -44,11 +21,12 @@ def _changed_files(directory: Path, source_sha: str) -> list[str]:
     return paths
 
 
-def _mandatory_files(
+def _bucket_files(
     root: Path, bucket: str, recipe_platform: str, changed: list[str]
-) -> list[str]:
+) -> tuple[set[str], list[str]]:
     import yaml
     from find_test_cases import (
+        PLATFORM_EXCLUSIONS,
         PLATFORM_MARKERS,
         expand_pattern,
         file_has_marker,
@@ -64,7 +42,7 @@ def _mandatory_files(
         raise ValueError(f"invalid mandatory-test configuration: {error}") from error
     all_buckets = [case for product in recipe["products"] for case in product["test_case"]]
     bucket_files = set(expand_pattern(str(root / bucket)))
-    ignored = set()
+    ignored = {str(root / path) for path in PLATFORM_EXCLUSIONS.get(recipe_path.parent.name, ())}
     for test_case in all_buckets:
         if test_case != bucket and is_child_of_bucket(test_case, bucket):
             ignored.update(expand_pattern(str(root / test_case)))
@@ -76,35 +54,44 @@ def _mandatory_files(
             if Path(path).name.startswith("test_") and not file_has_marker(path, marker)
         )
     _, patterns = triggered_patterns(mappings, changed, recipe_platform)
-    return [
+    tests = {
+        str(Path(path).relative_to(root))
+        for path in bucket_files - ignored
+        if Path(path).name.startswith("test_")
+    }
+    mandatory = [
         str(Path(path).relative_to(root))
         for path in mandatory_files(
             [str(root / pattern) for pattern in patterns], str(root / bucket), ignored
         )
     ]
+    return tests, mandatory
 
 
-def _select_phase(root: Path, database: Path) -> list[str]:
+def _select_phase(root: Path, database: Path, test_files: set[str]) -> set[str]:
     from testmon.process_code import Module, blob_to_checksums, read_source_sha
 
     with closing(
         sqlite3.connect(database.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     ) as connection:
-        # Deselected placeholders have no duration. LEFT JOIN retains executed
-        # tests without fingerprints so they are always selected.
+        # Keep placeholders in the known-file inventory, but use only executed
+        # tests for dependency selection.
         fingerprints = connection.execute(
-            "SELECT te.test_name, te.failed, f.filename, f.fsha, f.method_checksums "
+            "SELECT te.test_name, te.duration, te.failed, f.filename, f.fsha, f.method_checksums "
             "FROM test_execution te "
             "LEFT JOIN test_execution_file_fp tf ON tf.test_execution_id = te.id "
             "LEFT JOIN file_fp f ON f.id = tf.fingerprint_id "
-            "WHERE te.duration IS NOT NULL"
         ).fetchall()
 
-    selected = set()
+    known_files = {row[0].split("::", 1)[0] for row in fingerprints}
+    selected = test_files - known_files
     sources = {}
-    for nodeid, failed, filename, recorded_sha, fingerprint in fingerprints:
+    for nodeid, duration, failed, filename, recorded_sha, fingerprint in fingerprints:
+        if duration is None:
+            continue
+        test_file = nodeid.split("::", 1)[0]
         if failed != 0 or filename is None:
-            selected.add(nodeid)
+            selected.add(test_file)
             continue
         if filename not in sources:
             path = root / filename
@@ -116,12 +103,15 @@ def _select_phase(root: Path, database: Path) -> list[str]:
             )
             sources[filename] = (source_sha, checksums)
         source_sha, checksums = sources[filename]
-        if source_sha is None or (
+        if filename == test_file and recorded_sha != source_sha:
+            # Recollect changed test files to discover new tests and parameter IDs.
+            selected.add(test_file)
+        elif source_sha is None or (
             recorded_sha != source_sha
             and (not checksums or not set(blob_to_checksums(fingerprint)) <= checksums)
         ):
-            selected.add(nodeid)
-    return sorted(selected)
+            selected.add(test_file)
+    return selected & test_files
 
 
 def select(
@@ -129,55 +119,33 @@ def select(
     cache_dir: Path,
     bucket: str,
     recipe_platform: str,
-    image_id: str,
     source_sha: str,
     matched_key: str,
     pr_files_dir: Path,
 ) -> dict:
-    """Return a CPU selection, or defer to the existing GPU selector when unavailable."""
+    """Decide on CPU whether to execute selected files or the full bucket."""
     plan = {
         "schema": 1,
         "source_sha": source_sha,
         "bucket": bucket,
         "platform": recipe_platform,
-        "image_id": image_id,
-        "mode": "enforce",
+        "mode": "full",
         "reason": "",
         "phases": {},
     }
     try:
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
-            raise ValueError("immutable container image identity is unavailable")
-        identity = cache_identity(root, bucket, recipe_platform, image_id)
-        manifest = validate_cache(cache_dir, identity, matched_key)
-        if not any(char in bucket for char in "*?[") and source_sha != manifest["source_sha"]:
-            # Explicit-file pytest arguments bypass Testmon's stable-file collection skip.
-            # They may discover new IDs from collection-only production dependencies.
-            raise ValueError(
-                "explicit test-file bucket requires GPU collection after source changes"
-            )
+        identity = cache_identity(root, bucket, recipe_platform)
+        validate_cache(cache_dir, identity, matched_key)
         changed_files = _changed_files(pr_files_dir, source_sha)
-        mandatory = _mandatory_files(root, bucket, recipe_platform, changed_files)
-        _collection_sources_unchanged(
-            root, manifest["source_sha"], PLATFORMS[recipe_platform]["recipe"]
-        )
-        for phase in PHASES:
-            runtime = json.loads((cache_dir / phase / "metadata.json").read_text())["runtime"]
-            if (
-                runtime["python"].split(".")[:2] != platform.python_version().split(".")[:2]
-                or runtime["implementation"] != platform.python_implementation()
-            ):
-                raise ValueError("CPU Python differs from the Testmon fingerprint interpreter")
-        phases = {
-            phase: _select_phase(root, cache_dir / phase / ".testmondata") for phase in PHASES
-        }
+        test_files, mandatory = _bucket_files(root, bucket, recipe_platform, changed_files)
         # Recollect affected files in both modes: production dependencies can change
         # parameter IDs or experimental markers without changing the test source.
-        affected_files = sorted(
-            {nodeid.split("::", 1)[0] for nodes in phases.values() for nodeid in nodes}
-            | set(mandatory)
-        )
-        phases = {phase: affected_files for phase in PHASES}
+        affected_files = set(mandatory) | (test_files & set(changed_files))
+        for phase in PHASES:
+            affected_files.update(
+                _select_phase(root, cache_dir / phase / ".testmondata", test_files)
+            )
+        phases = {phase: sorted(affected_files) for phase in PHASES}
         plan.update(
             mode="selected",
             reason="selected on CPU from the compatible main baseline",
@@ -192,20 +160,13 @@ def select(
         TypeError,
         KeyError,
         sqlite3.Error,
-        subprocess.SubprocessError,
     ) as error:
         plan["reason"] = str(error)
     return plan
 
 
 def prepare(
-    plan: dict,
-    cache_dir: Path,
-    bucket: str,
-    recipe_platform: str,
-    source_sha: str,
-    *,
-    image_id: str | None = None,
+    plan: dict, cache_dir: Path, bucket: str, recipe_platform: str, source_sha: str
 ) -> None:
     """Validate the plan identity and write the distributed runner's selection files."""
     if plan["schema"] != 1 or plan["mode"] != "selected":
@@ -216,8 +177,6 @@ def prepare(
         or plan["platform"] != recipe_platform
     ):
         raise ValueError("Testmon plan does not match this checkout and bucket")
-    if image_id is not None and plan["image_id"] != image_id:
-        raise ValueError("Testmon plan container image changed")
     for phase in PHASES:
         output = cache_dir / ".testmon-work" / phase / "selected-tests"
         output.parent.mkdir(parents=True, exist_ok=True)

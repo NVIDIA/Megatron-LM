@@ -155,7 +155,7 @@ runs:
 
     - name: Compute unit Testmon cache identity
       id: unit-testmon-identity
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode != 'full'
+      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'baseline')
       shell: bash -e -u -o pipefail {0}
       continue-on-error: true
       env:
@@ -174,9 +174,8 @@ runs:
 
     - name: Download CPU unit Testmon plan
       id: download-unit-testmon-plan
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'preselected' && inputs.unit_testmon_plan_artifact != '' && steps.unit-testmon-identity.outcome == 'success'
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'preselected' && inputs.unit_testmon_plan_artifact != ''
       uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-      continue-on-error: true
       with:
         name: ${{ inputs.unit_testmon_plan_artifact }}
         path: assets_dir/testmon
@@ -185,23 +184,20 @@ runs:
       id: validate-unit-testmon-plan
       if: steps.download-unit-testmon-plan.outcome == 'success'
       shell: bash -e -u -o pipefail {0}
-      continue-on-error: true
       env:
         BUCKET: ${{ inputs.test_case }}
         RECIPE_PLATFORM: ${{ inputs.platform }}
-        CONTAINER_IMAGE: ${{ inputs.container-image }}
       run: |
         python tests/unit_tests/testmon_selector.py prepare \
           --plan assets_dir/testmon/plan.json --cache-dir assets_dir/testmon \
           --bucket "$BUCKET" --platform "$RECIPE_PLATFORM" \
-          --source-sha "$(git rev-parse HEAD)" \
-          --image-id "$(docker image inspect --format '{{.Id}}' "$CONTAINER_IMAGE")"
+          --source-sha "$(git rev-parse HEAD)"
 
     # Only main publishes this namespace. Synthetic PR pushes can read caches
     # from the default branch; the sentinel primary key is never saved.
     - name: Restore unit Testmon baseline
       id: restore-unit-testmon
-      if: inputs.is_unit_test == 'true' && steps.unit-testmon-identity.outcome == 'success' && (inputs.unit_testmon_mode == 'enforce' || (inputs.unit_testmon_mode == 'preselected' && steps.validate-unit-testmon-plan.outcome != 'success'))
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success'
       uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       continue-on-error: true
       with:
@@ -211,7 +207,7 @@ runs:
 
     - name: Prepare PR file download
       id: unit-test-pr-files-directory
-      if: inputs.is_unit_test == 'true' && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != '' && steps.restore-unit-testmon.outcome == 'success' && steps.restore-unit-testmon.outputs.cache-matched-key != ''
       shell: bash -e -u -o pipefail {0}
       continue-on-error: true
       run: |
@@ -245,10 +241,6 @@ runs:
         PLAN_OUTCOME: ${{ steps.validate-unit-testmon-plan.outcome }}
       run: |
         FALLBACK_REASON=""
-        if [[ "$REQUESTED_MODE" == "preselected" && "${PLAN_OUTCOME:-}" != "success" ]]; then
-          REQUESTED_MODE=enforce
-          FALLBACK_REASON="CPU selection plan unavailable or invalid; selecting tests on GPU"
-        fi
         case "$REQUESTED_MODE" in
           full)
             EFFECTIVE_MODE=full
@@ -258,6 +250,7 @@ runs:
             EFFECTIVE_MODE=baseline
             ;;
           preselected)
+            [[ "${PLAN_OUTCOME:-}" == "success" ]]
             EFFECTIVE_MODE=preselected
             ;;
           enforce)

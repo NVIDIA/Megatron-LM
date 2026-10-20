@@ -338,14 +338,13 @@ run_enforced_tests() {
     local target prod_count experimental_count mandatory_count
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
     if [[ "${UNIT_TESTMON_MODE:-enforce}" == "preselected" ]]; then
-        # Use the CPU selection; the host has already checked the pulled image.
+        # Consume the CPU decision without running selection again on GPU.
         if ! uv run --no-sync python tests/unit_tests/testmon_selector.py prepare \
                 --plan "$UNIT_TESTMON_CACHE_DIR/plan.json" --cache-dir "$UNIT_TESTMON_CACHE_DIR" \
                 --bucket "$BUCKET" --platform "dgx_$PLATFORM" \
                 --source-sha "$(git rev-parse HEAD)"; then
-            write_testmon_summary "full fallback: CPU selection plan is unavailable or invalid"
-            run_full_tests
-            return
+            write_testmon_summary "CPU selection plan is unavailable or invalid"
+            return 1
         fi
     else
         rm -rf -- "$UNIT_TESTMON_CACHE_DIR/.testmon-work"

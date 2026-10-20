@@ -506,10 +506,7 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
             "PR_FILES_DIR": "" if restore == "empty-artifact-dir" else str(pr_files_dir),
             # The tested PR commit is deliberately independent of baseline b*40.
             "TESTED_SHA": "c" * 40,
-            "REQUESTED_MODE": (
-                "preselected" if restore in {"different-image", "missing-image"} else "enforce"
-            ),
-            "PLAN_OUTCOME": "failure",
+            "REQUESTED_MODE": "enforce",
             "IDENTITY_OUTCOME": "failure" if restore == "identity-error" else "success",
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
             "MATCHED_KEY": "" if restore == "miss" else identity["cache_prefix"] + "123-1",

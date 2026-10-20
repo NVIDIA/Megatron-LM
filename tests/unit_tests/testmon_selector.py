@@ -122,7 +122,7 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def _run_plan(argv: list[str]) -> int:
-    """Write a selection artifact and Actions outputs; uncertainty always schedules GPUs."""
+    """Write a CPU selection or full-run decision and prepare it for execution."""
     from testmon_plan import prepare, select
 
     parser = argparse.ArgumentParser(description="Select tests on CPU or prepare a saved plan.")
@@ -137,7 +137,6 @@ def _run_plan(argv: list[str]) -> int:
         child.add_argument("--cache-dir", type=Path, required=True)
         child.add_argument("--bucket", required=True)
         child.add_argument("--platform", required=True)
-        child.add_argument("--image-id", required=child is select_parser)
         child.add_argument("--source-sha", required=True)
     args = parser.parse_args(argv)
     if args.command == "prepare":
@@ -148,7 +147,6 @@ def _run_plan(argv: list[str]) -> int:
                 args.bucket,
                 args.platform,
                 args.source_sha,
-                image_id=args.image_id,
             )
         except (OSError, RuntimeError, ValueError, TypeError, KeyError) as error:
             print(f"Unit Testmon plan unavailable: {error}", file=sys.stderr)
@@ -159,7 +157,6 @@ def _run_plan(argv: list[str]) -> int:
         args.cache_dir,
         args.bucket,
         args.platform,
-        args.image_id,
         args.source_sha,
         args.matched_key,
         args.pr_files_dir,
