@@ -71,3 +71,11 @@ def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     validate_args(args)
     assert args.cuda_graph_impl == "none"
+
+
+def test_hybrid_builder_rejects_dynamic_context_parallel(monkeypatch):
+    from hybrid_builders import hybrid_builder
+
+    args = _hybrid_cp_args(monkeypatch)
+    with pytest.raises(NotImplementedError, match="not yet supported for HybridModel"):
+        hybrid_builder(args, pre_process=True, post_process=True)
