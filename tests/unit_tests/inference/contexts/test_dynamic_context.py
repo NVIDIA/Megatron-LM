@@ -2329,6 +2329,103 @@ class TestDynamicContext:
         finally:
             self._restore_model_parallel()
 
+    def _get_context_with_attention_free_stage(self):
+        """Build a PP=2 context for layout ``M*|M-``; stage 1 holds no attention layer."""
+        params_dtype = torch.float32
+        if parallel_state.get_pipeline_model_parallel_rank() == 0:
+            layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        else:
+            layer_type_list = [Symbols.MAMBA, Symbols.MLP]
+        return DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=4,
+                kv_channels=64,
+                num_attention_heads=8,
+                pipeline_model_parallel_size=2,
+                tensor_model_parallel_size=1,
+                pipeline_dtype=params_dtype,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=0.1,
+                block_size_tokens=128,
+                max_tokens=1024,
+                unified_memory_level=0,
+                mamba_inference_state_config=MambaInferenceStateConfig(
+                    layer_type_list, (544, 4), (8, 64, 16), params_dtype, params_dtype
+                ),
+            ),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pipeline_stage_without_attention_layers_allocates_no_kv_memory(self):
+        """A hybrid stage without attention layers initializes and stores no KV.
+
+        It keeps a block allocator mirroring the other stages', but its KV buffer has no
+        layers. The pipeline MIN of the block count is set by the stage holding attention.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            context = self._get_context_with_attention_free_stage()
+            rank = parallel_state.get_pipeline_model_parallel_rank()
+            if rank == 0:
+                assert context.num_attention_layers == 1
+                assert context.memory_buffer.shape[1] == 1
+            else:
+                assert context.num_attention_layers == 0
+                assert context.memory_buffer.numel() == 0
+            assert context.memory_buffer.shape[2] == context.kv_block_allocator.pool_size
+
+            capacities = torch.tensor(
+                [context.kv_block_allocator.pool_size, context.kv_block_allocator.paused_limit],
+                device="cuda",
+                dtype=torch.long,
+            )
+            gathered = [torch.zeros_like(capacities) for _ in range(2)]
+            torch.distributed.all_gather(
+                gathered, capacities, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            assert len({tuple(t.tolist()) for t in gathered}) == 1
+        finally:
+            self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pipeline_stage_without_attention_layers_mirrors_block_tables(self):
+        """Every stage assigns the same KV blocks to the same requests.
+
+        The attention-free stage stores no KV, but the other stages' attention reads blocks
+        from tables that all stages build alike, so admission and block ids must match.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            context = self._get_context_with_attention_free_stage()
+            for request_id, prompt_length in enumerate((144, 300, 17)):
+                context.add_request(
+                    DynamicInferenceRequest(
+                        request_id=request_id,
+                        prompt_tokens=torch.arange(prompt_length, dtype=torch.long, device="cpu"),
+                        sampling_params=SamplingParams(num_tokens_to_generate=8),
+                    )
+                )
+            local = torch.cat(
+                [
+                    context.request_to_kv_block_ids[:3].flatten().to(torch.long),
+                    context.request_kv_block_counts[:3].to(torch.long),
+                    torch.tensor([context.kv_block_allocator.pool_avail], dtype=torch.long),
+                ]
+            ).cuda()
+            gathered = [torch.zeros_like(local) for _ in range(2)]
+            torch.distributed.all_gather(
+                gathered, local, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            assert torch.equal(gathered[0], gathered[1])
+            assert context.request_kv_block_counts[:3].tolist() == [2, 3, 1]
+        finally:
+            self._restore_model_parallel()
+
     @pytest.mark.internal
     @rounder_override(64)
     def test_uneven_decoder_pp_layer_map_matches_get_num_layers_to_build(self):

@@ -43,6 +43,7 @@ from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_stack_spec_for,
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
+    DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
     reset_rounder,
     set_rounder,
@@ -292,6 +293,114 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             ), f"Request {request.request_id}: status={request.status}"
             num_expected = request.sampling_params.num_tokens_to_generate
             assert len(request.generated_tokens) <= num_expected
+
+    @staticmethod
+    def _generate(env):
+        """Add every request, step the engine to completion, return tokens and log probs."""
+        for request in env.requests:
+            env.engine._add_request(request)
+        outputs = {}
+        while True:
+            result = env.engine.step_modern()
+            for request in result["finished_requests"]:
+                assert request.status == Status.COMPLETED
+                outputs[request.request_id] = (
+                    list(request.generated_tokens),
+                    torch.tensor(request.generated_log_probs, dtype=torch.float32),
+                )
+            if not env.engine.has_unfinished_requests():
+                break
+        assert len(outputs) == len(env.requests)
+        return outputs
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("pp_pattern", ["M*-|M*-", "M*-|M-", "M-|M*-", "M-|M-"])
+    @torch.inference_mode()
+    def test_hybrid_pipeline_stage_without_attention_matches_pp1(self, pp_pattern):
+        """A hybrid model whose PP=2 split leaves a stage without attention layers.
+
+        Such a stage stores no KV but runs the same block bookkeeping as the other stage
+        (``M-|M-`` has no attention layer at all). With the same weights, the prefill step
+        (first generated token and its log prob) must match PP=1 bitwise. Decode log probs
+        at PP=2 differ from PP=1 by a few bf16 ulps even when both stages hold attention
+        (``M*-|M*-``, the control), which can flip a greedy near-tie later on. So the decode
+        steps are compared with a tolerance, up to the first token where the runs diverge.
+        """
+        Utils.initialize_distributed()
+        if torch.distributed.get_world_size() < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        config_kwargs = dict(
+            model_provider="hybrid",
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=24,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            top_k=1,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+        )
+
+        # PP=1 reference.
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                hybrid_layer_pattern=pp_pattern.replace("|", ""), **config_kwargs
+            )
+        )
+        model = env.engine.controller.inference_wrapped_model.model
+        reference_state = {
+            key: value.clone()
+            for key, value in model.state_dict().items()
+            if "_extra_state" not in key
+        }
+        expected = self._generate(env)
+        del env, model
+        self._release_ep_resources()
+        Utils.destroy_model_parallel()
+
+        # PP=2 with the PP=1 weights.
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                hybrid_layer_pattern=pp_pattern, pipeline_model_parallel_size=2, **config_kwargs
+            )
+        )
+        context = env.engine.context
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        stage_pattern = pp_pattern.split("|")[pp_rank]
+        if "*" not in stage_pattern:
+            assert context.num_attention_layers == 0
+            assert context.memory_buffer.numel() == 0
+        layer_offset = sum(len(segment) for segment in pp_pattern.split("|")[:pp_rank])
+        model = env.engine.controller.inference_wrapped_model.model
+        for key, value in model.state_dict().items():
+            if "_extra_state" in key:
+                continue
+            if key.startswith("decoder.layers."):
+                index, rest = key[len("decoder.layers.") :].split(".", 1)
+                key = f"decoder.layers.{int(index) + layer_offset}.{rest}"
+            value.copy_(reference_state[key])
+        actual = self._generate(env)
+
+        assert actual.keys() == expected.keys()
+        for request_id, (tokens, log_probs) in expected.items():
+            actual_tokens, actual_log_probs = actual[request_id]
+            assert actual_tokens[0] == tokens[0], f"request {request_id}"
+            assert torch.equal(actual_log_probs[0], log_probs[0]), f"request {request_id}"
+            # A request ends early when it samples the termination id, so the lengths may
+            # differ only after the runs diverge.
+            matching = next(
+                (i for i, (x, y) in enumerate(zip(actual_tokens, tokens)) if x != y),
+                min(len(actual_tokens), len(tokens)),
+            )
+            if matching == min(len(actual_tokens), len(tokens)):
+                assert len(actual_tokens) == len(tokens), f"request {request_id}"
+            torch.testing.assert_close(
+                actual_log_probs[:matching], log_probs[:matching], rtol=0, atol=2e-2
+            )
 
     # ---- MTP draft-KV cache under expert parallelism ---------------------- #
     #
