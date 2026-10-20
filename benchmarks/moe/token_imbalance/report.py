@@ -8,6 +8,7 @@ at a fixed configuration, plus the imbalance numbers that go with it.
 
 Reads <root>/<tree>/<config>/rank*.jsonl written by benchmark.py.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,14 +19,22 @@ from pathlib import Path
 # Kept in step with benchmark.WORKLOADS without importing it (this script needs no torch).
 EXPERIMENTS = {
     "trace_replay": [
-        "W0_balanced", "W1_hot_expert_set", "W3_spread_hot_experts", "W4_random_balanced",
-        "W5_zero_expert_rank", "W6_rotating_hotspot", "W7_burst",
+        "W0_balanced",
+        "W1_hot_expert_set",
+        "W3_spread_hot_experts",
+        "W4_random_balanced",
+        "W5_zero_expert_rank",
+        "W6_rotating_hotspot",
+        "W7_burst",
     ],
     "rank_target": ["R0_balanced", "R1_hot_rank_spread", "R2_hot_rank_concentrated"],
 }
 WORKLOAD_ORDER = [w for ws in EXPERIMENTS.values() for w in ws]
 RANK_LEVEL_FIELDS = (
-    "maxvio_max", "concentration_at_maxvio_max", "hot_rank_persistence", "rank_loads_per_step",
+    "maxvio_max",
+    "concentration_at_maxvio_max",
+    "hot_rank_persistence",
+    "rank_loads_per_step",
 )
 
 
@@ -84,9 +93,11 @@ def main() -> int:
 
     emit("## 1. Step time by workload, at fixed configuration (ms, worst rank)")
     emit()
-    emit("Only the routing changes along a row. The two experiments are separate tables: a "
-         "trace_replay row replays one logical trace, a rank_target row is built for its "
-         "layout.")
+    emit(
+        "Only the routing changes along a row. The two experiments are separate tables: a "
+        "trace_replay row replays one logical trace, a rank_target row is built for its "
+        "layout."
+    )
     for experiment, order in EXPERIMENTS.items():
         emit()
         emit(f"### {experiment}")
@@ -105,12 +116,16 @@ def main() -> int:
 
     emit("## 2. Imbalance that goes with each workload (group-global histogram)")
     emit()
-    emit("Rank loads count token-expert assignments per destination EP rank after top-k "
-         "expansion. maxvio = max/mean rank load (worst step); concentration = 1 - H(p)/log R "
-         "at that step; persistence = share of step transitions whose busiest rank stays.")
+    emit(
+        "Rank loads count token-expert assignments per destination EP rank after top-k "
+        "expansion. maxvio = max/mean rank load (worst step); concentration = 1 - H(p)/log R "
+        "at that step; persistence = share of step transitions whose busiest rank stays."
+    )
     emit()
-    emit("| configuration | workload | expert max/mean | expert CV (pop.) | rank loads (step 0) "
-         "| maxvio | concentration | persistence |")
+    emit(
+        "| configuration | workload | expert max/mean | expert CV (pop.) | rank loads (step 0) "
+        "| maxvio | concentration | persistence |"
+    )
     emit("|---|---|---|---|---|---|---|---|")
 
     def _f(v, digits=3):
@@ -122,10 +137,12 @@ def main() -> int:
             if not e:
                 continue
             loads = (e.get("rank_loads_per_step") or [None])[0]
-            emit(f"| {cfg} | {wl} | {_f(e.get('expert_imbalance'))} | {_f(e.get('expert_cv'))} "
-                 f"| {loads if loads is not None else 'n/a'} | {_f(e.get('maxvio_max'))} "
-                 f"| {_f(e.get('concentration_at_maxvio_max'))} "
-                 f"| {_f(e.get('hot_rank_persistence'), 2)} |")
+            emit(
+                f"| {cfg} | {wl} | {_f(e.get('expert_imbalance'))} | {_f(e.get('expert_cv'))} "
+                f"| {loads if loads is not None else 'n/a'} | {_f(e.get('maxvio_max'))} "
+                f"| {_f(e.get('concentration_at_maxvio_max'))} "
+                f"| {_f(e.get('hot_rank_persistence'), 2)} |"
+            )
     emit()
 
     emit("## 3. Correctness oracle")
@@ -139,15 +156,20 @@ def main() -> int:
     total_arms = total_bad = 0
     for cfg in sorted(data):
         n = len(data[cfg])
-        bad = [wl for wl, e in data[cfg].items()
-               if e["status"] != "OK" or not all(e["checks"].values())]
+        bad = [
+            wl
+            for wl, e in data[cfg].items()
+            if e["status"] != "OK" or not all(e["checks"].values())
+        ]
         total_arms += n
         total_bad += len(bad)
         mark = "**FAIL**" if bad else "yes"
         emit(f"| {cfg} | {n} | {mark} | {', '.join(bad) if bad else '-'} |")
     emit()
-    emit(f"**{total_arms - total_bad}/{total_arms} arms passed every oracle check.** "
-         f"Checked: {', '.join(sorted(keys))}")
+    emit(
+        f"**{total_arms - total_bad}/{total_arms} arms passed every oracle check.** "
+        f"Checked: {', '.join(sorted(keys))}"
+    )
     emit()
 
     if args.out:

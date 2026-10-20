@@ -9,11 +9,10 @@ directly rather than only through the end-to-end arms.
 
 from __future__ import annotations
 
-import pytest
-import torch
-
 import benchmark as B
+import pytest
 import rank_load as RL
+import torch
 
 NUM_EXPERTS = 8
 TOKENS = 128

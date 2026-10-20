@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import math
 
-import pytest
-import torch
-
 import benchmark as B
+import pytest
 import rank_load as RL
+import torch
 
 TOKENS = 128
 
@@ -95,8 +94,9 @@ def test_r1_and_r2_share_maxvio_and_differ_in_concentration(ep, hot_maxvio):
 def test_r1_and_r2_coincide_at_two_ranks():
     """With two ranks the hot rank's share fixes the other's; concentration has no freedom."""
     total = TOKENS * 2
-    assert RL.target_rank_loads("R1_hot_rank_spread", 2, total, 1.5) == \
-        RL.target_rank_loads("R2_hot_rank_concentrated", 2, total, 1.5)
+    assert RL.target_rank_loads("R1_hot_rank_spread", 2, total, 1.5) == RL.target_rank_loads(
+        "R2_hot_rank_concentrated", 2, total, 1.5
+    )
 
 
 def test_hot_maxvio_outside_the_feasible_range_is_rejected():
@@ -114,15 +114,17 @@ def test_schedules_only_move_loads_between_ranks(schedule):
     """Per-step load multiset is constant: time is varied without varying severity."""
     base = RL.target_rank_loads("R2_hot_rank_concentrated", 4, 256, 2.0)
     for step in range(8):
-        loads = B.target_loads_for_step("R2_hot_rank_concentrated", 4, 256, step, 9,
-                                        hot_maxvio=2.0, schedule=schedule, period=3)
+        loads = B.target_loads_for_step(
+            "R2_hot_rank_concentrated", 4, 256, step, 9, hot_maxvio=2.0, schedule=schedule, period=3
+        )
         assert sorted(loads) == sorted(base)
 
 
 def test_rotate_moves_the_hotspot_every_period():
     def hot(step):
-        loads = B.target_loads_for_step("R1_hot_rank_spread", 4, 256, step, 9, hot_maxvio=2.0,
-                                        schedule="rotate", period=3)
+        loads = B.target_loads_for_step(
+            "R1_hot_rank_spread", 4, 256, step, 9, hot_maxvio=2.0, schedule="rotate", period=3
+        )
         return loads.index(max(loads))
 
     assert [hot(s) for s in range(7)] == [0, 0, 0, 1, 1, 1, 2]
@@ -160,8 +162,7 @@ def test_unrealizable_counts_are_rejected():
 @pytest.mark.parametrize("ep, num_experts", [(1, 8), (2, 8), (4, 8), (4, 16), (8, 32)])
 @pytest.mark.parametrize("topk", [1, 2, 4])
 @pytest.mark.parametrize("schedule", RL.SCHEDULES)
-def test_rank_target_workloads_hit_their_target_exactly(workload, ep, num_experts, topk,
-                                                        schedule):
+def test_rank_target_workloads_hit_their_target_exactly(workload, ep, num_experts, topk, schedule):
     hot_maxvio = min(2.0, float(ep))
     kw = dict(hot_maxvio=hot_maxvio, schedule=schedule, period=2)
     for step in range(5):
@@ -180,9 +181,9 @@ def test_rank_target_workloads_depend_on_the_layout_by_design():
 
 def test_rank_level_summary_over_steps():
     counts = [
-        [6, 2, 2, 2],   # rank loads at EP=2: [8, 4]
-        [2, 2, 6, 2],   # [4, 8]: the hotspot moved
-        [2, 2, 6, 2],   # [4, 8]: it stayed
+        [6, 2, 2, 2],  # rank loads at EP=2: [8, 4]
+        [2, 2, 6, 2],  # [4, 8]: the hotspot moved
+        [2, 2, 6, 2],  # [4, 8]: it stayed
     ]
     s = B.rank_level_summary(counts, 2)
     assert s["rank_loads_per_step"] == [[8, 4], [4, 8], [4, 8]]
@@ -194,8 +195,10 @@ def test_rank_level_summary_over_steps():
 def test_fingerprint_covers_rank_target_parameters():
     base = dict(hot_maxvio=2.0, schedule="rotate", period=2)
     a = B.workload_fingerprint("R1_hot_rank_spread", 8, 2, TOKENS, 3, 1, 4, **base)
-    b = B.workload_fingerprint("R1_hot_rank_spread", 8, 2, TOKENS, 3, 1, 4,
-                               **{**base, "hot_maxvio": 3.0})
-    c = B.workload_fingerprint("R1_hot_rank_spread", 8, 2, TOKENS, 3, 1, 4,
-                               **{**base, "schedule": "random"})
+    b = B.workload_fingerprint(
+        "R1_hot_rank_spread", 8, 2, TOKENS, 3, 1, 4, **{**base, "hot_maxvio": 3.0}
+    )
+    c = B.workload_fingerprint(
+        "R1_hot_rank_spread", 8, 2, TOKENS, 3, 1, 4, **{**base, "schedule": "random"}
+    )
     assert len({a, b, c}) == 3

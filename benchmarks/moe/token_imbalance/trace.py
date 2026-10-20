@@ -21,6 +21,7 @@ Format (one directory per trace):
     tensors/source_rank.pt      [T]    int32     (which rank contributed the row)
     tensors/expert_ids.pt       [T, K] int64     (== token_ids for this harness)
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -137,9 +138,7 @@ def save_trace(
         workload_checksum=workload_checksum,
         tensors=manifest_tensors,
     )
-    (out_dir / "manifest.json").write_text(
-        json.dumps(man.as_json(), indent=2), encoding="utf-8"
-    )
+    (out_dir / "manifest.json").write_text(json.dumps(man.as_json(), indent=2), encoding="utf-8")
     return man
 
 
@@ -158,8 +157,15 @@ def load_trace(trace_dir: Path) -> tuple[TraceManifest, dict[str, torch.Tensor]]
         raise TraceValidationError(
             f"unsupported schema_version {raw.get('schema_version')!r}, expected {SCHEMA_VERSION}"
         )
-    for key in ("seed", "logical_num_tokens", "num_experts", "topk", "world_size",
-                "workload_checksum", "tensors"):
+    for key in (
+        "seed",
+        "logical_num_tokens",
+        "num_experts",
+        "topk",
+        "world_size",
+        "workload_checksum",
+        "tensors",
+    ):
         if key not in raw:
             raise TraceValidationError(f"manifest is missing required field {key!r}")
 
@@ -187,9 +193,7 @@ def load_trace(trace_dir: Path) -> tuple[TraceManifest, dict[str, torch.Tensor]]
         if not isinstance(t, torch.Tensor):
             raise TraceValidationError(f"{name} did not load as a plain tensor")
         if list(t.shape) != list(meta["shape"]):
-            raise TraceValidationError(
-                f"{name} shape {list(t.shape)} != manifest {meta['shape']}"
-            )
+            raise TraceValidationError(f"{name} shape {list(t.shape)} != manifest {meta['shape']}")
         if str(t.dtype).replace("torch.", "") != meta["dtype"]:
             raise TraceValidationError(f"{name} dtype {t.dtype} != manifest {meta['dtype']}")
         tensors[name] = t
@@ -212,7 +216,9 @@ def _validate_semantics(man: TraceManifest, tensors: dict[str, torch.Tensor]) ->
             f"manifest logical_num_tokens {man.logical_num_tokens} != expert_ids rows {T}"
         )
     if gates.shape != ids.shape:
-        raise TraceValidationError(f"gates shape {tuple(gates.shape)} != expert_ids {tuple(ids.shape)}")
+        raise TraceValidationError(
+            f"gates shape {tuple(gates.shape)} != expert_ids {tuple(ids.shape)}"
+        )
     if src.shape != (T,):
         raise TraceValidationError(f"source_rank shape {tuple(src.shape)} != ({T},)")
 
@@ -248,9 +254,7 @@ def _validate_semantics(man: TraceManifest, tensors: dict[str, torch.Tensor]) ->
         raise TraceValidationError(f"gate rows do not sum to 1 (max deviation {worst:.6g})")
 
     if int(src.min()) < 0 or int(src.max()) >= man.world_size:
-        raise TraceValidationError(
-            f"source_rank out of range for world_size {man.world_size}"
-        )
+        raise TraceValidationError(f"source_rank out of range for world_size {man.world_size}")
     counts = torch.bincount(src, minlength=man.world_size)
     if int(counts.sum()) != T:
         raise TraceValidationError("source_rank does not account for every token")

@@ -39,6 +39,7 @@ Correctness oracle (exact integer metadata + exact round trip), at every step:
 Usage:
     torchrun --standalone --nproc_per_node=N benchmark.py --mode dispatch_only --ep 2 ...
 """
+
 from __future__ import annotations
 
 import argparse
@@ -131,8 +132,17 @@ def _generator(*parts: Any) -> torch.Generator:
 
 
 def routing_for_step(
-    workload: str, num_experts: int, topk: int, tokens: int, step: int, seed: int, ep_size: int,
-    *, hot_maxvio: float = 2.0, schedule: str = "static", period: int = 3,
+    workload: str,
+    num_experts: int,
+    topk: int,
+    tokens: int,
+    step: int,
+    seed: int,
+    ep_size: int,
+    *,
+    hot_maxvio: float = 2.0,
+    schedule: str = "static",
+    period: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(expert_ids [tokens, topk] int64, gates [tokens, topk] float32), deterministic.
 
@@ -142,8 +152,9 @@ def routing_for_step(
     they depend on it by design.
     """
     if is_rank_target(workload):
-        return _rank_target_routing(workload, num_experts, topk, tokens, step, seed, ep_size,
-                                    hot_maxvio, schedule, period)
+        return _rank_target_routing(
+            workload, num_experts, topk, tokens, step, seed, ep_size, hot_maxvio, schedule, period
+        )
     if workload not in TRACE_WORKLOADS:
         raise ValueError(f"unknown workload {workload}")
 
@@ -189,8 +200,17 @@ def routing_for_step(
     return ids, _gates(tokens, topk, g)
 
 
-def target_loads_for_step(workload: str, ep_size: int, total: int, step: int, seed: int, *,
-                          hot_maxvio: float, schedule: str, period: int) -> list[int]:
+def target_loads_for_step(
+    workload: str,
+    ep_size: int,
+    total: int,
+    step: int,
+    seed: int,
+    *,
+    hot_maxvio: float,
+    schedule: str,
+    period: int,
+) -> list[int]:
     """Per-rank target load at `step` for a rank_target workload (sums to `total`)."""
     base = RL.target_rank_loads(workload, ep_size, total, hot_maxvio)
     perm = RL.schedule_permutation(schedule, period, ep_size, step, seed)
@@ -200,10 +220,19 @@ def target_loads_for_step(workload: str, ep_size: int, total: int, step: int, se
     return loads
 
 
-def _rank_target_routing(workload, num_experts, topk, tokens, step, seed, ep_size, hot_maxvio,
-                         schedule, period):
-    loads = target_loads_for_step(workload, ep_size, tokens * topk, step, seed,
-                                  hot_maxvio=hot_maxvio, schedule=schedule, period=period)
+def _rank_target_routing(
+    workload, num_experts, topk, tokens, step, seed, ep_size, hot_maxvio, schedule, period
+):
+    loads = target_loads_for_step(
+        workload,
+        ep_size,
+        tokens * topk,
+        step,
+        seed,
+        hot_maxvio=hot_maxvio,
+        schedule=schedule,
+        period=period,
+    )
     counts = RL.expert_counts_for_rank_loads(loads, num_experts, tokens, topk)
     g = _generator(workload, seed, step, ep_size, hot_maxvio, schedule, period)
     ids = RL.routing_from_expert_counts(counts, tokens, topk, g)
@@ -222,8 +251,9 @@ def _gates(tokens: int, topk: int, g: torch.Generator) -> torch.Tensor:
     return gates / gates.sum(dim=1, keepdim=True)
 
 
-def probs_matrix_from_gates(ids: torch.Tensor, gates: torch.Tensor, num_experts: int,
-                           dtype: torch.dtype) -> torch.Tensor:
+def probs_matrix_from_gates(
+    ids: torch.Tensor, gates: torch.Tensor, num_experts: int, dtype: torch.dtype
+) -> torch.Tensor:
     """[T, K] gates -> [T, E] masked probabilities; unrouted entries are exactly 0.
 
     This is the probability layout the all-to-all dispatcher consumes (`permute` indexes
@@ -241,16 +271,35 @@ def routing_map_from_ids(ids: torch.Tensor, num_experts: int) -> torch.Tensor:
 
 
 def workload_fingerprint(
-    workload: str, num_experts: int, topk: int, tokens: int, steps: int, seed: int, ep_size: int,
-    *, hot_maxvio: float = 2.0, schedule: str = "static", period: int = 3,
+    workload: str,
+    num_experts: int,
+    topk: int,
+    tokens: int,
+    steps: int,
+    seed: int,
+    ep_size: int,
+    *,
+    hot_maxvio: float = 2.0,
+    schedule: str = "static",
+    period: int = 3,
 ) -> str:
     h = hashlib.sha256()
     h.update(f"{workload}|{num_experts}|{topk}|{tokens}|{steps}|{seed}|{ep_size}".encode())
     if is_rank_target(workload):
         h.update(f"|{hot_maxvio}|{schedule}|{period}".encode())
     for step in range(steps):
-        ids, gates = routing_for_step(workload, num_experts, topk, tokens, step, seed, ep_size,
-                                      hot_maxvio=hot_maxvio, schedule=schedule, period=period)
+        ids, gates = routing_for_step(
+            workload,
+            num_experts,
+            topk,
+            tokens,
+            step,
+            seed,
+            ep_size,
+            hot_maxvio=hot_maxvio,
+            schedule=schedule,
+            period=period,
+        )
         h.update(ids.numpy().tobytes())
         h.update(gates.numpy().tobytes())
     return h.hexdigest()[:16]
@@ -259,6 +308,7 @@ def workload_fingerprint(
 # --------------------------------------------------------------------------------------
 # metrics
 # --------------------------------------------------------------------------------------
+
 
 def imbalance_metrics(counts: list[int]) -> dict[str, Any]:
     """max/mean and population CV; explicit null (never a fake epsilon) on zero load."""
@@ -270,8 +320,12 @@ def imbalance_metrics(counts: list[int]) -> dict[str, Any]:
         return {"max_over_mean": None, "cv": None, "reason": "zero_assignments"}
     mean = total / n
     pstd = math.sqrt(sum((c - mean) ** 2 for c in counts) / n)
-    return {"max_over_mean": max(counts) / mean, "cv": pstd / mean,
-            "std_definition": "population", "reason": None}
+    return {
+        "max_over_mean": max(counts) / mean,
+        "cv": pstd / mean,
+        "std_definition": "population",
+        "reason": None,
+    }
 
 
 def percentile(sorted_vals: list[float], p: float) -> float:
@@ -353,10 +407,12 @@ class ArmResult:
 
 # --------------------------------------------------------------------------------------
 
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("dispatch_only", "moe_fwd_bwd", "training_step"),
-                    default="dispatch_only")
+    ap.add_argument(
+        "--mode", choices=("dispatch_only", "moe_fwd_bwd", "training_step"), default="dispatch_only"
+    )
     ap.add_argument("--ep", type=int, default=1)
     ap.add_argument("--etp", type=int, default=1)
     ap.add_argument("--tp", type=int, default=1)
@@ -365,18 +421,38 @@ def main() -> int:
     ap.add_argument("--hidden-size", type=int, default=512)
     ap.add_argument("--ffn-hidden-size", type=int, default=1024)
     ap.add_argument("--tokens", type=int, default=128, help="per-rank source tokens")
-    ap.add_argument("--min-tokens", type=int, default=0,
-                    help="override the permute geometry precondition (default: topk)")
-    ap.add_argument("--steps", type=int, default=1,
-                    help="routing steps per measured iteration; per-step workloads and "
-                         "non-static schedules refuse a value too small to exercise them")
-    ap.add_argument("--hot-maxvio", type=float, default=2.0,
-                    help="R1/R2: busiest-rank load as a multiple of the mean rank load")
-    ap.add_argument("--schedule", choices=RL.SCHEDULES, default="static",
-                    help="R*: which rank carries the hot load at each step; the per-step load "
-                         "multiset is the same at every step")
-    ap.add_argument("--schedule-period", type=int, default=3,
-                    help="R* with --schedule rotate: steps between hotspot moves")
+    ap.add_argument(
+        "--min-tokens",
+        type=int,
+        default=0,
+        help="override the permute geometry precondition (default: topk)",
+    )
+    ap.add_argument(
+        "--steps",
+        type=int,
+        default=1,
+        help="routing steps per measured iteration; per-step workloads and "
+        "non-static schedules refuse a value too small to exercise them",
+    )
+    ap.add_argument(
+        "--hot-maxvio",
+        type=float,
+        default=2.0,
+        help="R1/R2: busiest-rank load as a multiple of the mean rank load",
+    )
+    ap.add_argument(
+        "--schedule",
+        choices=RL.SCHEDULES,
+        default="static",
+        help="R*: which rank carries the hot load at each step; the per-step load "
+        "multiset is the same at every step",
+    )
+    ap.add_argument(
+        "--schedule-period",
+        type=int,
+        default=3,
+        help="R* with --schedule rotate: steps between hotspot moves",
+    )
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--seed", type=int, default=1234)
@@ -384,21 +460,36 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--base-sha", default="UNKNOWN")
     ap.add_argument("--run-id", default="unknown")
-    ap.add_argument("--repo-root", default=None,
-                    help="Megatron-LM checkout to import (default: parent of this file)")
-    ap.add_argument("--write-trace", default=None,
-                    help="directory to persist a trace-v1 record per workload step into")
-    ap.add_argument("--instrument", choices=("none", "counters"), default="none",
-                    help="extra always-on instrumentation, to measure its overhead")
-    ap.add_argument("--capability-json", default=None,
-                    help="write the backend capability probe result to this path")
+    ap.add_argument(
+        "--repo-root",
+        default=None,
+        help="Megatron-LM checkout to import (default: parent of this file)",
+    )
+    ap.add_argument(
+        "--write-trace",
+        default=None,
+        help="directory to persist a trace-v1 record per workload step into",
+    )
+    ap.add_argument(
+        "--instrument",
+        choices=("none", "counters"),
+        default="none",
+        help="extra always-on instrumentation, to measure its overhead",
+    )
+    ap.add_argument(
+        "--capability-json",
+        default=None,
+        help="write the backend capability probe result to this path",
+    )
     args = ap.parse_args()
 
     geom_min = args.min_tokens or args.topk
     if args.tokens < geom_min:
-        print(f"ERROR: --tokens {args.tokens} < required geometry minimum {geom_min} "
-              f"(the argsort permute needs num_experts*num_tokens >= tokens*topk slots)",
-              file=sys.stderr)
+        print(
+            f"ERROR: --tokens {args.tokens} < required geometry minimum {geom_min} "
+            f"(the argsort permute needs num_experts*num_tokens >= tokens*topk slots)",
+            file=sys.stderr,
+        )
         return 2
     workloads = args.workloads.split(",")
     for workload in workloads:
@@ -407,9 +498,12 @@ def main() -> int:
             return 2
         need = min_steps(workload, args.schedule, args.schedule_period)
         if args.steps < need:
-            print(f"ERROR: {workload} (schedule {args.schedule}) needs --steps >= {need} to be "
-                  f"exercised; with --steps {args.steps} every iteration would replay only "
-                  f"the first {args.steps} step(s)", file=sys.stderr)
+            print(
+                f"ERROR: {workload} (schedule {args.schedule}) needs --steps >= {need} to be "
+                f"exercised; with --steps {args.steps} every iteration would replay only "
+                f"the first {args.steps} step(s)",
+                file=sys.stderr,
+            )
             return 2
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -420,13 +514,16 @@ def main() -> int:
 
     if args.ep * args.etp * args.tp != world:
         if rank == 0:
-            print(f"ERROR: ep {args.ep} * etp {args.etp} * tp {args.tp} != world {world}",
-                  file=sys.stderr)
+            print(
+                f"ERROR: ep {args.ep} * etp {args.etp} * tp {args.tp} != world {world}",
+                file=sys.stderr,
+            )
         torch.distributed.destroy_process_group()
         return 2
 
-    repo_root = Path(args.repo_root).resolve() if args.repo_root else \
-        Path(__file__).resolve().parents[3]
+    repo_root = (
+        Path(args.repo_root).resolve() if args.repo_root else Path(__file__).resolve().parents[3]
+    )
     sys.path.insert(0, str(repo_root))
 
     from backend_adapter import StandardAlltoAllAdapter, report_capability
@@ -507,10 +604,16 @@ def main() -> int:
     # `seed + rank` would silently change the model whenever the EP layout changes, which
     # would break the "same logical workload, different execution method" contract.
     torch.manual_seed(args.seed)
-    full_W1 = torch.randn(args.num_experts, args.hidden_size, 2 * args.ffn_hidden_size,
-                          dtype=torch.float32) * 0.02
-    full_W2 = torch.randn(args.num_experts, args.ffn_hidden_size, args.hidden_size,
-                          dtype=torch.float32) * 0.02
+    full_W1 = (
+        torch.randn(
+            args.num_experts, args.hidden_size, 2 * args.ffn_hidden_size, dtype=torch.float32
+        )
+        * 0.02
+    )
+    full_W2 = (
+        torch.randn(args.num_experts, args.ffn_hidden_size, args.hidden_size, dtype=torch.float32)
+        * 0.02
+    )
     lo, hi = local_expert_indices[0], local_expert_indices[-1] + 1
     assert local_expert_indices == list(range(lo, hi)), "local experts must be contiguous"
     W1 = full_W1[lo:hi].to(device=dev, dtype=torch.bfloat16).contiguous()
@@ -524,9 +627,9 @@ def main() -> int:
             n = int(counts[e].item())
             if n == 0:
                 continue
-            gu = x[offset:offset + n] @ W1[e]
+            gu = x[offset : offset + n] @ W1[e]
             gate, up = gu.chunk(2, dim=-1)
-            out[offset:offset + n] = (torch.nn.functional.silu(gate) * up) @ W2[e]
+            out[offset : offset + n] = (torch.nn.functional.silu(gate) * up) @ W2[e]
             offset += n
         return out
 
@@ -537,9 +640,7 @@ def main() -> int:
     def moe_layer():
         nonlocal _moe_layer
         if _moe_layer is None:
-            from megatron.core.models.gpt.gpt_layer_specs import (
-                get_gpt_layer_local_submodules,
-            )
+            from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
             from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
             from megatron.core.transformer.spec_utils import get_submodules
 
@@ -595,14 +696,23 @@ def main() -> int:
         if args.instrument == "counters":
             counters[key] += 1
 
-    route_kwargs = dict(hot_maxvio=args.hot_maxvio, schedule=args.schedule,
-                        period=args.schedule_period)
+    route_kwargs = dict(
+        hot_maxvio=args.hot_maxvio, schedule=args.schedule, period=args.schedule_period
+    )
 
     def run_arm(rec: ArmResult, workload: str, checksum: str) -> None:
         steps = args.steps
         per_step = [
-            routing_for_step(workload, args.num_experts, args.topk, args.tokens, s,
-                             args.seed, args.ep, **route_kwargs)
+            routing_for_step(
+                workload,
+                args.num_experts,
+                args.topk,
+                args.tokens,
+                s,
+                args.seed,
+                args.ep,
+                **route_kwargs,
+            )
             for s in range(steps)
         ]
         maps_cpu = [routing_map_from_ids(ids, args.num_experts) for ids, _ in per_step]
@@ -615,14 +725,23 @@ def main() -> int:
         if args.write_trace and rank == 0:
             try:
                 from trace import save_trace, trace_digest
+
                 digests = []
                 for s, (ids_s, gates_s) in enumerate(per_step):
                     tdir = Path(args.write_trace) / workload / f"step{s:04d}"
                     src = torch.zeros(ids_s.shape[0], dtype=torch.int32)
                     save_trace(
-                        tdir, ids_s, gates_s, src, num_experts=args.num_experts,
-                        topk=args.topk, hidden_size=args.hidden_size, world_size=world,
-                        seed=args.seed, workload_id=workload, workload_checksum=checksum,
+                        tdir,
+                        ids_s,
+                        gates_s,
+                        src,
+                        num_experts=args.num_experts,
+                        topk=args.topk,
+                        hidden_size=args.hidden_size,
+                        world_size=world,
+                        seed=args.seed,
+                        workload_id=workload,
+                        workload_checksum=checksum,
                         producer_commit=args.base_sha,
                     )
                     digests.append(trace_digest(tdir))
@@ -639,7 +758,8 @@ def main() -> int:
         # ---------------- correctness oracle (outside the timed window) ----------------
         corr["distinct_topk_ok"] = all(
             len(set(ids[t].tolist())) == args.topk
-            for ids, _ in per_step for t in range(args.tokens)
+            for ids, _ in per_step
+            for t in range(args.tokens)
         )
         corr["id_range_ok"] = all(
             bool(ids.min().item() >= 0 and ids.max().item() < args.num_experts)
@@ -664,10 +784,19 @@ def main() -> int:
             # Every source rank sends the same constructed block, so the global target is
             # world x the per-source target.
             targets = [
-                [world * c for c in target_loads_for_step(
-                    workload, args.ep, args.tokens * args.topk, s, args.seed,
-                    hot_maxvio=args.hot_maxvio, schedule=args.schedule,
-                    period=args.schedule_period)]
+                [
+                    world * c
+                    for c in target_loads_for_step(
+                        workload,
+                        args.ep,
+                        args.tokens * args.topk,
+                        s,
+                        args.seed,
+                        hot_maxvio=args.hot_maxvio,
+                        schedule=args.schedule,
+                        period=args.schedule_period,
+                    )
+                ]
                 for s in range(steps)
             ]
             rec.target_rank_loads_per_step = targets
@@ -686,12 +815,12 @@ def main() -> int:
         # (on the slow path, outside the timed window) and then required to be exact.
         assert (args.topk & (args.topk - 1)) == 0, "oracle prefers a power-of-two topk"
         ones_full = [
-            probs_matrix_from_gates(ids, torch.full_like(g, 1.0 / args.topk), args.num_experts,
-                                    torch.bfloat16).cuda()
+            probs_matrix_from_gates(
+                ids, torch.full_like(g, 1.0 / args.topk), args.num_experts, torch.bfloat16
+            ).cuda()
             for ids, g in per_step
         ]
-        probe_x = torch.full((args.tokens, args.hidden_size), 0.5, device=dev,
-                             dtype=torch.bfloat16)
+        probe_x = torch.full((args.tokens, args.hidden_size), 0.5, device=dev, dtype=torch.bfloat16)
         ph, _c, _p = token_permutation(probe_x, ones_full[0], maps[0])
         factor = float(token_unpermutation(ph)[0, 0].float().item()) / 0.5
         corr["combine_factor"] = factor
@@ -708,13 +837,13 @@ def main() -> int:
         h = args.hidden_size
         assert h % 2 == 0, "round-trip oracle needs an even hidden size"
         unit = 1024
-        target = k * unit                                    # integer row sum
-        amp = 42                                             # balanced +-amp sums to zero
+        target = k * unit  # integer row sum
+        amp = 42  # balanced +-amp sums to zero
         signs = torch.empty(h, dtype=torch.int64)
         signs[0::2] = amp
         signs[1::2] = -amp
         assert int(signs.sum().item()) == 0
-        signs = signs.roll(rank * 2)                          # rank-dependent permutation
+        signs = signs.roll(rank * 2)  # rank-dependent permutation
         lift = target // h
         assert lift * h == target, f"row sum {k} must divide evenly over {h} columns"
         ints = signs + lift
@@ -760,8 +889,9 @@ def main() -> int:
         # Real (non-sentinel) activations. No padding: the workload decides every row's
         # experts, and a padded row would silently drop assignments from it.
         g_in = torch.Generator(device="cpu").manual_seed(args.seed + 991 + rank)
-        real_input = torch.randn(args.tokens, args.hidden_size, generator=g_in,
-                                 dtype=torch.float32).to(device=dev, dtype=torch.bfloat16)
+        real_input = torch.randn(
+            args.tokens, args.hidden_size, generator=g_in, dtype=torch.float32
+        ).to(device=dev, dtype=torch.bfloat16)
         step_holder: dict[str, Any] = {}
 
         def model_step(s: int) -> None:
@@ -776,6 +906,7 @@ def main() -> int:
             else:
                 layer.zero_grad(set_to_none=True)
             from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+
             MoEAuxLossAutoScaler.main_loss_backward_scale = None
             out = layer(real_input.unsqueeze(1))
             hs = out[0] if isinstance(out, tuple) else out
@@ -858,24 +989,35 @@ def main() -> int:
                 last_loss is not None and math.isfinite(last_loss) and abs(last_loss) < 1e6
             )
             corr["model_step_loss"] = last_loss
-            gsum = sum(
-                float(p.grad.abs().sum()) for p in _moe_layer.parameters() if p.grad is not None
-            ) if _moe_layer is not None else 0.0
+            gsum = (
+                sum(
+                    float(p.grad.abs().sum()) for p in _moe_layer.parameters() if p.grad is not None
+                )
+                if _moe_layer is not None
+                else 0.0
+            )
             corr["model_step_grad_abs_sum"] = gsum
             corr["model_step_grads_flow"] = gsum > 0
         if args.instrument != "none":
             corr["instrumentation_counters"] = dict(counters)
         rec.correctness = corr
         hard_keys = [
-            "distinct_topk_ok", "id_range_ok", "assignments_match_T_times_k",
-            "global_histogram_exact", "roundtrip_exact", "counts_len_ok",
-            "local_counts_sum_ok", "combine_factor_is_topk",
+            "distinct_topk_ok",
+            "id_range_ok",
+            "assignments_match_T_times_k",
+            "global_histogram_exact",
+            "roundtrip_exact",
+            "counts_len_ok",
+            "local_counts_sum_ok",
+            "combine_factor_is_topk",
         ]
         if is_rank_target(workload):
             hard_keys.append("rank_target_exact")
         if model_mode:
             hard_keys += [
-                "replayed_routing_exact", "model_step_ran", "model_step_loss_finite",
+                "replayed_routing_exact",
+                "model_step_ran",
+                "model_step_loss_finite",
                 "model_step_grads_flow",
             ]
         hard_fail = not all(bool(corr[k]) for k in hard_keys)
@@ -886,16 +1028,36 @@ def main() -> int:
     results = []
     for workload in workloads:
         rank_target = is_rank_target(workload)
-        checksum = workload_fingerprint(workload, args.num_experts, args.topk, args.tokens,
-                                        args.steps, args.seed, args.ep, **route_kwargs)
+        checksum = workload_fingerprint(
+            workload,
+            args.num_experts,
+            args.topk,
+            args.tokens,
+            args.steps,
+            args.seed,
+            args.ep,
+            **route_kwargs,
+        )
         rec = ArmResult(
-            workload_id=workload, workload_checksum=checksum,
-            experiment="rank_target" if rank_target else "trace_replay", mode=args.mode,
-            backend="standard_alltoall", base_sha=args.base_sha, ep=args.ep, etp=args.etp,
-            tp=args.tp, world_size=world, rank=rank, num_experts=args.num_experts,
-            topk=args.topk, hidden_size=args.hidden_size, logical_tokens=args.tokens,
-            assignments=args.tokens * args.topk, steps=args.steps,
-            measured_iters=args.iters, warmup_iters=args.warmup,
+            workload_id=workload,
+            workload_checksum=checksum,
+            experiment="rank_target" if rank_target else "trace_replay",
+            mode=args.mode,
+            backend="standard_alltoall",
+            base_sha=args.base_sha,
+            ep=args.ep,
+            etp=args.etp,
+            tp=args.tp,
+            world_size=world,
+            rank=rank,
+            num_experts=args.num_experts,
+            topk=args.topk,
+            hidden_size=args.hidden_size,
+            logical_tokens=args.tokens,
+            assignments=args.tokens * args.topk,
+            steps=args.steps,
+            measured_iters=args.iters,
+            warmup_iters=args.warmup,
             hot_maxvio=args.hot_maxvio if rank_target else None,
             schedule=args.schedule if rank_target else None,
             schedule_period=args.schedule_period if rank_target else None,
@@ -906,6 +1068,7 @@ def main() -> int:
             rec.status = "FAILED"
             rec.error = f"{type(exc).__name__}: {exc}"
             import traceback
+
             traceback.print_exc()
         results.append(rec)
         emit(rec)
@@ -913,8 +1076,10 @@ def main() -> int:
     sync()
     if rank == 0:
         ok = sum(1 for r in results if r.status == "OK")
-        print(f"[B1] run_id={args.run_id} mode={args.mode} ep={args.ep} world={world} "
-              f"arms={len(results)} ok={ok} -> {out_dir}")
+        print(
+            f"[B1] run_id={args.run_id} mode={args.mode} ep={args.ep} world={world} "
+            f"arms={len(results)} ok={ok} -> {out_dir}"
+        )
     torch.distributed.destroy_process_group()
     return 0
 

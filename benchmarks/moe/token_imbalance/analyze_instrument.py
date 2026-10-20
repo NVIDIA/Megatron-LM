@@ -4,6 +4,7 @@
 Alternating order is used so a monotone drift does not land entirely on one side. With only
 four arms per side the result is a direction and a magnitude, not a significance claim.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,8 +42,10 @@ def main() -> int:
 
     print(f"# B1 instrumentation overhead — {args.run_dir}")
     print()
-    print("Per-workload comparison. Pooling workloads is invalid: their absolute step times "
-          "differ by more than the effect being measured.")
+    print(
+        "Per-workload comparison. Pooling workloads is invalid: their absolute step times "
+        "differ by more than the effect being measured."
+    )
     print()
     print("| workload | none median_ms (arms) | counters median_ms (arms) | delta |")
     print("|---|---|---|---|")
@@ -64,10 +67,13 @@ def main() -> int:
         lo = min(vals["none"][2], vals["counters"][2])
         hi = max(vals["none"][3], vals["counters"][3])
         spreads.append(100 * (hi / lo - 1))
-        print(f"| {wl} | {n:.4f} ({vals['none'][1]}) | {c:.4f} ({vals['counters'][1]}) | "
-              f"{d:+.3f}% |")
+        print(
+            f"| {wl} | {n:.4f} ({vals['none'][1]}) | {c:.4f} ({vals['counters'][1]}) | "
+            f"{d:+.3f}% |"
+        )
     print()
     if deltas:
+
         def median(v: list[float]) -> float:
             w = sorted(v)
             return w[len(w) // 2] if len(w) % 2 else (w[len(w) // 2 - 1] + w[len(w) // 2]) / 2
@@ -75,19 +81,25 @@ def main() -> int:
         med = median(deltas)
         mad = median([abs(d - med) for d in deltas])
         worst = max(abs(d) for d in deltas)
-        print(f"median delta across {len(deltas)} workloads: **{med:+.3f}%** "
-              f"(median absolute deviation {mad:.3f}%)")
+        print(
+            f"median delta across {len(deltas)} workloads: **{med:+.3f}%** "
+            f"(median absolute deviation {mad:.3f}%)"
+        )
         print(f"largest single-workload |delta|: {worst:.3f}%")
         print(f"per-workload arm spread: median {median(spreads):.2f}%, max {max(spreads):.2f}%")
         print()
-        print("A few workloads show large single-arm deltas. On this shared, drifting node "
-              "those are attributable to co-tenant load, not to the counters: the counters are "
-              "three dict increments per step, and the same setting appears both faster and "
-              "slower depending on the workload.")
+        print(
+            "A few workloads show large single-arm deltas. On this shared, drifting node "
+            "those are attributable to co-tenant load, not to the counters: the counters are "
+            "three dict increments per step, and the same setting appears both faster and "
+            "slower depending on the workload."
+        )
         print()
-        print(f"verdict: median overhead {med:+.3f}%, i.e. below the ~{median(spreads):.1f}% "
-              f"arm-to-arm resolution of this sample. The instrumentation is NOT measurably "
-              f"slower, and this experiment cannot bound it more tightly than that.")
+        print(
+            f"verdict: median overhead {med:+.3f}%, i.e. below the ~{median(spreads):.1f}% "
+            f"arm-to-arm resolution of this sample. The instrumentation is NOT measurably "
+            f"slower, and this experiment cannot bound it more tightly than that."
+        )
     return 0
 
 

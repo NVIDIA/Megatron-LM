@@ -20,6 +20,7 @@ Honesty rules applied here:
   * a configuration whose arms are not all valid is listed as INVALID and excluded from
     aggregation rather than silently dropped.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -82,16 +83,17 @@ def main() -> int:
     emit()
     emit(f"run: `{args.run_dir}`")
     emit(f"reference tree: `{args.reference}`")
-    emit("metric: worst-rank median step time (ms), geometric mean within a tree, "
-         "log ratio across trees")
+    emit(
+        "metric: worst-rank median step time (ms), geometric mean within a tree, "
+        "log ratio across trees"
+    )
     emit()
 
     all_effects: list[float] = []
     for cfg in sorted(blocks):
         emit(f"## {cfg}")
         emit()
-        emit("| workload | block APPA | block PAAP | mean step-time change | LOO | "
-             "verdict |")
+        emit("| workload | block APPA | block PAAP | mean step-time change | LOO | " "verdict |")
         emit("|---|---|---|---|---|---|")
         kinds = sorted(blocks[cfg])
         per_workload: dict[str, list[float]] = defaultdict(list)
@@ -125,26 +127,43 @@ def main() -> int:
             cells = [f"{100 * math.expm1(e):+.3f}%" for e in effects]
             while len(cells) < 2:
                 cells.append("n/a")
-            loo = [100 * math.expm1(sum(e for j, e in enumerate(effects) if j != i)
-                                    / max(1, len(effects) - 1))
-                   for i in range(len(effects))] if len(effects) > 1 else []
-            verdict = "flat (|Δ| < 1%)" if abs(change) < 1.0 else (
-                "patch faster" if change < 0 else "patch slower")
-            emit(f"| {wl} | {cells[0]} | {cells[1]} | {change:+.3f}% | "
-                 f"{', '.join(f'{v:+.3f}' for v in loo) or 'n/a'} | {verdict} |")
+            loo = (
+                [
+                    100
+                    * math.expm1(
+                        sum(e for j, e in enumerate(effects) if j != i) / max(1, len(effects) - 1)
+                    )
+                    for i in range(len(effects))
+                ]
+                if len(effects) > 1
+                else []
+            )
+            verdict = (
+                "flat (|Δ| < 1%)"
+                if abs(change) < 1.0
+                else ("patch faster" if change < 0 else "patch slower")
+            )
+            emit(
+                f"| {wl} | {cells[0]} | {cells[1]} | {change:+.3f}% | "
+                f"{', '.join(f'{v:+.3f}' for v in loo) or 'n/a'} | {verdict} |"
+            )
             all_effects.extend(effects)
         emit()
 
     if all_effects:
         geo_ratio = math.exp(sum(all_effects) / len(all_effects))
-        emit(f"Across {len(all_effects)} block-level effects: geometric mean "
-             f"patch/baseline step-time ratio **{geo_ratio:.6f}** "
-             f"({100 * (geo_ratio - 1):+.3f}%).")
+        emit(
+            f"Across {len(all_effects)} block-level effects: geometric mean "
+            f"patch/baseline step-time ratio **{geo_ratio:.6f}** "
+            f"({100 * (geo_ratio - 1):+.3f}%)."
+        )
         emit()
         abs_mean = statistics.fmean(abs(e) for e in all_effects)
-        emit(f"Mean absolute block effect: {100 * abs_mean:.3f}%. Compare this with the A/A "
-             f"noise floor measured on the same hardware before reading any single row as a "
-             f"real change.")
+        emit(
+            f"Mean absolute block effect: {100 * abs_mean:.3f}%. Compare this with the A/A "
+            f"noise floor measured on the same hardware before reading any single row as a "
+            f"real change."
+        )
     if args.out:
         args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"\nwrote {args.out}")

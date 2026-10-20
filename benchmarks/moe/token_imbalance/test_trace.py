@@ -19,12 +19,11 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-
-import pytest
-import torch
+from trace import TENSOR_FILES, TraceValidationError, load_trace, save_trace, trace_digest
 
 import benchmark as B
-from trace import TENSOR_FILES, TraceValidationError, load_trace, save_trace, trace_digest
+import pytest
+import torch
 
 NUM_EXPERTS = 8
 TOPK = 2
@@ -38,14 +37,24 @@ def _valid_ids_and_gates(tokens: int = TOKENS, seed: int = SEED, ep_size: int = 
     return B.routing_for_step(WORKLOAD, NUM_EXPERTS, TOPK, tokens, 0, seed, ep_size)
 
 
-def _save(root: Path, name: str, *, tokens: int = TOKENS, world_size: int = 2,
-          seed: int = SEED) -> Path:
+def _save(
+    root: Path, name: str, *, tokens: int = TOKENS, world_size: int = 2, seed: int = SEED
+) -> Path:
     ids, gates = _valid_ids_and_gates(tokens=tokens, seed=seed)
     src = (torch.arange(ids.shape[0]) % world_size).to(torch.int32)
     d = root / name
     save_trace(
-        d, ids, gates, src, num_experts=NUM_EXPERTS, topk=TOPK, hidden_size=HIDDEN,
-        world_size=world_size, seed=seed, workload_id=WORKLOAD, workload_checksum="deadbeef",
+        d,
+        ids,
+        gates,
+        src,
+        num_experts=NUM_EXPERTS,
+        topk=TOPK,
+        hidden_size=HIDDEN,
+        world_size=world_size,
+        seed=seed,
+        workload_id=WORKLOAD,
+        workload_checksum="deadbeef",
         producer_commit="test",
     )
     return d
@@ -61,6 +70,7 @@ def workdir():
 
 
 # --------------------------------------------------------------------------- determinism
+
 
 def test_same_seed_regenerates_identical_workload():
     i1, g1 = _valid_ids_and_gates()
@@ -94,6 +104,7 @@ def test_gates_are_normalized_and_slots_distinct():
 
 # --------------------------------------------------------------------------- round trip
 
+
 def test_valid_trace_round_trips(workdir):
     d = _save(workdir, "t")
     man, tensors = load_trace(d)
@@ -116,6 +127,7 @@ def test_refuses_to_overwrite_an_existing_trace(workdir):
 
 
 # --------------------------------------------------------------------------- rejections
+
 
 def _copy(workdir: Path, tag: str) -> Path:
     src = _save(workdir, f"src-{tag}")
@@ -197,8 +209,18 @@ def test_rejects_invalid_tensor_content(workdir, name, ids, gates, reason):
     d = workdir / f"bad-{name}"
     src = torch.zeros(ids.shape[0], dtype=torch.int32)
     save_trace(
-        d, ids, gates, src, num_experts=NUM_EXPERTS, topk=TOPK, hidden_size=HIDDEN,
-        world_size=1, seed=1, workload_id=name, workload_checksum="x", producer_commit="test",
+        d,
+        ids,
+        gates,
+        src,
+        num_experts=NUM_EXPERTS,
+        topk=TOPK,
+        hidden_size=HIDDEN,
+        world_size=1,
+        seed=1,
+        workload_id=name,
+        workload_checksum="x",
+        producer_commit="test",
     )
     with pytest.raises(TraceValidationError, match=reason):
         load_trace(d)
@@ -210,9 +232,18 @@ def test_rejects_out_of_range_expert_id(workdir):
     ids[:, 1] = 99
     gates = torch.full((8, 2), 0.5, dtype=torch.float32)
     save_trace(
-        d, ids, gates, torch.zeros(8, dtype=torch.int32), num_experts=NUM_EXPERTS, topk=TOPK,
-        hidden_size=HIDDEN, world_size=1, seed=1, workload_id="badid",
-        workload_checksum="x", producer_commit="test",
+        d,
+        ids,
+        gates,
+        torch.zeros(8, dtype=torch.int32),
+        num_experts=NUM_EXPERTS,
+        topk=TOPK,
+        hidden_size=HIDDEN,
+        world_size=1,
+        seed=1,
+        workload_id="badid",
+        workload_checksum="x",
+        producer_commit="test",
     )
     with pytest.raises(TraceValidationError, match="out of range"):
         load_trace(d)
@@ -223,9 +254,18 @@ def test_rejects_out_of_range_source_rank(workdir):
     ids = torch.stack([torch.arange(2, dtype=torch.int64) for _ in range(8)])
     gates = torch.full((8, 2), 0.5, dtype=torch.float32)
     save_trace(
-        d, ids, gates, torch.full((8,), 7, dtype=torch.int32), num_experts=NUM_EXPERTS,
-        topk=TOPK, hidden_size=HIDDEN, world_size=1, seed=1, workload_id="badsrc",
-        workload_checksum="x", producer_commit="test",
+        d,
+        ids,
+        gates,
+        torch.full((8,), 7, dtype=torch.int32),
+        num_experts=NUM_EXPERTS,
+        topk=TOPK,
+        hidden_size=HIDDEN,
+        world_size=1,
+        seed=1,
+        workload_id="badsrc",
+        workload_checksum="x",
+        producer_commit="test",
     )
     with pytest.raises(TraceValidationError, match="source_rank out of range"):
         load_trace(d)
@@ -234,10 +274,18 @@ def test_rejects_out_of_range_source_rank(workdir):
 def test_rejects_zero_token_trace(workdir):
     d = workdir / "empty"
     save_trace(
-        d, torch.zeros((0, 2), dtype=torch.int64), torch.zeros((0, 2), dtype=torch.float32),
-        torch.zeros(0, dtype=torch.int32), num_experts=NUM_EXPERTS, topk=TOPK,
-        hidden_size=HIDDEN, world_size=1, seed=1, workload_id="empty",
-        workload_checksum="x", producer_commit="test",
+        d,
+        torch.zeros((0, 2), dtype=torch.int64),
+        torch.zeros((0, 2), dtype=torch.float32),
+        torch.zeros(0, dtype=torch.int32),
+        num_experts=NUM_EXPERTS,
+        topk=TOPK,
+        hidden_size=HIDDEN,
+        world_size=1,
+        seed=1,
+        workload_id="empty",
+        workload_checksum="x",
+        producer_commit="test",
     )
     with pytest.raises(TraceValidationError, match="zero logical tokens"):
         load_trace(d)

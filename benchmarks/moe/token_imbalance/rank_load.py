@@ -45,7 +45,7 @@ def rank_loads(expert_counts: Sequence[int], ep_size: int) -> list[int]:
     if ep_size < 1 or num_experts % ep_size != 0:
         raise ValueError(f"{num_experts} experts cannot be placed evenly on {ep_size} ranks")
     per_rank = num_experts // ep_size
-    return [int(sum(expert_counts[r * per_rank:(r + 1) * per_rank])) for r in range(ep_size)]
+    return [int(sum(expert_counts[r * per_rank : (r + 1) * per_rank])) for r in range(ep_size)]
 
 
 def maxvio(loads: Sequence[int]) -> float | None:
@@ -91,11 +91,7 @@ def rank_load_summary(loads: Sequence[int]) -> dict[str, Any]:
 # rank-target workloads: constructed for a given layout
 # --------------------------------------------------------------------------------------
 
-RANK_TARGET_WORKLOADS = (
-    "R0_balanced",
-    "R1_hot_rank_spread",
-    "R2_hot_rank_concentrated",
-)
+RANK_TARGET_WORKLOADS = ("R0_balanced", "R1_hot_rank_spread", "R2_hot_rank_concentrated")
 
 RANK_TARGET_NOTES = {
     "R0_balanced": "every EP rank receives the same load (maxvio 1, concentration 0)",
@@ -145,8 +141,9 @@ def target_rank_loads(workload: str, ep_size: int, total: int, hot_maxvio: float
     raise ValueError(f"unknown rank-target workload {workload}")
 
 
-def schedule_permutation(schedule: str, period: int, ep_size: int, step: int,
-                         seed: int) -> list[int]:
+def schedule_permutation(
+    schedule: str, period: int, ep_size: int, step: int, seed: int
+) -> list[int]:
     """Which rank carries load slot `i` at `step`: loads[perm[i]] = target[i].
 
     Only the assignment of loads to ranks changes with the step; the per-step load multiset
@@ -178,8 +175,9 @@ def min_steps_for_schedule(schedule: str, period: int) -> int:
     return 2
 
 
-def expert_counts_for_rank_loads(loads: Sequence[int], num_experts: int, tokens: int,
-                                 topk: int) -> list[int]:
+def expert_counts_for_rank_loads(
+    loads: Sequence[int], num_experts: int, tokens: int, topk: int
+) -> list[int]:
     """Spread each rank's load evenly over its local experts; checks realizability.
 
     A row holds `topk` distinct experts, so one expert can take at most `tokens` assignments
@@ -203,8 +201,9 @@ def expert_counts_for_rank_loads(loads: Sequence[int], num_experts: int, tokens:
     return counts
 
 
-def routing_from_expert_counts(counts: Sequence[int], tokens: int, topk: int,
-                               g: torch.Generator) -> torch.Tensor:
+def routing_from_expert_counts(
+    counts: Sequence[int], tokens: int, topk: int, g: torch.Generator
+) -> torch.Tensor:
     """[tokens, topk] distinct expert ids whose per-expert histogram equals `counts` exactly.
 
     Slots are laid out expert-major and slot j goes to row j % tokens. Each expert's slots are

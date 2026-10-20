@@ -12,6 +12,7 @@ token-imbalance benchmark exists to expose.
 Usage:
     summarize_b1.py --results-root <dir> [--out table.md] [--reference base-main]
 """
+
 from __future__ import annotations
 
 import argparse
@@ -42,13 +43,22 @@ class Arm:
 
     @property
     def key(self) -> tuple:
-        return (self.mode, self.ep, self.topk, self.tokens, self.steps, self.hidden_size,
-                self.world)
+        return (
+            self.mode,
+            self.ep,
+            self.topk,
+            self.tokens,
+            self.steps,
+            self.hidden_size,
+            self.world,
+        )
 
     @property
     def config_label(self) -> str:
-        return (f"{self.mode} ep={self.ep} k={self.topk} T={self.tokens} "
-                f"steps={self.steps} H={self.hidden_size} w={self.world}")
+        return (
+            f"{self.mode} ep={self.ep} k={self.topk} T={self.tokens} "
+            f"steps={self.steps} H={self.hidden_size} w={self.world}"
+        )
 
     def worst(self, field_name: str) -> float | None:
         vals = [r[field_name] for r in self.ranks if r.get(field_name) is not None]
@@ -79,15 +89,30 @@ def load(root: Path, run_pattern: str | None = None) -> list[Arm]:
             if not line.strip():
                 continue
             r = json.loads(line)
-            k = (tree, r["workload_id"], r["mode"], r["ep"], r["topk"],
-                 r["logical_tokens"], r["steps"], r["hidden_size"], r["world_size"])
+            k = (
+                tree,
+                r["workload_id"],
+                r["mode"],
+                r["ep"],
+                r["topk"],
+                r["logical_tokens"],
+                r["steps"],
+                r["hidden_size"],
+                r["world_size"],
+            )
             if k not in arms:
                 arms[k] = Arm(
-                    tree=tree, run_id=r.get("run_id") or f.parent.name, mode=r["mode"],
-                    ep=r["ep"], topk=r["topk"], tokens=r["logical_tokens"],
+                    tree=tree,
+                    run_id=r.get("run_id") or f.parent.name,
+                    mode=r["mode"],
+                    ep=r["ep"],
+                    topk=r["topk"],
+                    tokens=r["logical_tokens"],
                     steps=r["steps"],
-                    hidden_size=r["hidden_size"], world=r["world_size"],
-                    workload_id=r["workload_id"], workload_checksum=r["workload_checksum"],
+                    hidden_size=r["hidden_size"],
+                    world=r["world_size"],
+                    workload_id=r["workload_id"],
+                    workload_checksum=r["workload_checksum"],
                     base_sha=r.get("base_sha", "?"),
                 )
                 arms[k].run_ids = getattr(arms[k], "run_ids", set()) | {f.parents[1].name}
@@ -100,8 +125,9 @@ def main() -> int:
     ap.add_argument("--results-root", type=Path, required=True)
     ap.add_argument("--reference", default="base-main")
     ap.add_argument("--out", type=Path, default=None)
-    ap.add_argument("--run-pattern", default=None,
-                    help="only aggregate runs whose path contains this substring")
+    ap.add_argument(
+        "--run-pattern", default=None, help="only aggregate runs whose path contains this substring"
+    )
     args = ap.parse_args()
 
     arms = load(args.results_root, args.run_pattern)
@@ -116,6 +142,7 @@ def main() -> int:
         buckets[a.key][a.workload_id][a.tree] = a
 
     lines: list[str] = []
+
     def emit(s: str = "") -> None:
         lines.append(s)
         print(s)
@@ -131,31 +158,40 @@ def main() -> int:
     # ---- 1. imbalance characterisation (config-independent view) -------------------
     emit("## 1. Workload imbalance (group-global expert histogram)")
     emit()
-    emit("| workload | expert max/mean | expert CV (pop.) | rank maxvio (worst step) | "
-         "rank concentration | assignments |")
+    emit(
+        "| workload | expert max/mean | expert CV (pop.) | rank maxvio (worst step) | "
+        "rank concentration | assignments |"
+    )
     emit("|---|---|---|---|---|---|")
     # one representative configuration per workload: the widest EP, then the most tokens,
     # so the imbalance numbers describe the configuration where imbalance actually bites.
     for wl in sorted({a.workload_id for a in arms}):
-        cands = [a for a in arms if a.workload_id == wl and a.tree == args.reference
-                 and a.status() == "OK"]
+        cands = [
+            a
+            for a in arms
+            if a.workload_id == wl and a.tree == args.reference and a.status() == "OK"
+        ]
         if not cands:
             emit(f"| {wl} | n/a | n/a | n/a | n/a | n/a |")
             continue
         a = max(cands, key=lambda x: (x.ep, x.tokens, x.topk))
         r0 = a.ranks[0]
         c = r0.get("correctness") or {}
-        emit(f"| {a.workload_id} | {_f(r0.get('expert_imbalance'))} | {_f(r0.get('expert_cv'))} "
-             f"| {_f(r0.get('maxvio_max'))} | {_f(r0.get('concentration_at_maxvio_max'))} "
-             f"| {(c.get('global_assignments_per_step') or [None])[0]} "
-             f"(ep={a.ep}, T={a.tokens}, k={a.topk}) |")
+        emit(
+            f"| {a.workload_id} | {_f(r0.get('expert_imbalance'))} | {_f(r0.get('expert_cv'))} "
+            f"| {_f(r0.get('maxvio_max'))} | {_f(r0.get('concentration_at_maxvio_max'))} "
+            f"| {(c.get('global_assignments_per_step') or [None])[0]} "
+            f"(ep={a.ep}, T={a.tokens}, k={a.topk}) |"
+        )
     emit()
 
     # ---- 2. speed table -----------------------------------------------------------
     emit("## 2. Speed comparison (baseline vs patch)")
     emit()
-    emit("| configuration | workload | baseline worst-rank ms | patch worst-rank ms | delta | "
-         "baseline tok/s | patch tok/s | throughput delta | peak alloc (B, worst rank) | status |")
+    emit(
+        "| configuration | workload | baseline worst-rank ms | patch worst-rank ms | delta | "
+        "baseline tok/s | patch tok/s | throughput delta | peak alloc (B, worst rank) | status |"
+    )
     emit("|---|---|---|---|---|---|---|---|---|---|")
 
     ratios: list[float] = []
@@ -180,25 +216,31 @@ def main() -> int:
                 delta = "n/a"
             btps = b.worst("logical_tokens_per_second")
             ptps = p.worst("logical_tokens_per_second")
-            tdelta = (f"{100 * (ptps / btps - 1):+.2f}%" if btps and ptps and btps > 0 else "n/a")
+            tdelta = f"{100 * (ptps / btps - 1):+.2f}%" if btps and ptps and btps > 0 else "n/a"
             st = f"{b.status()}/{p.status()}"
             if st != "OK/OK":
                 st = f"**{st}**"
-            emit(f"| {b.config_label} | {wl} | {_f(bms, 4)} | {_f(pms, 4)} | {delta} | "
-                 f"{_f(btps, 1)} | {_f(ptps, 1)} | {tdelta} | "
-                 f"{_f(max(b.worst('peak_allocated_bytes') or 0, p.worst('peak_allocated_bytes') or 0), 0)} "
-                 f"| {st} |")
+            emit(
+                f"| {b.config_label} | {wl} | {_f(bms, 4)} | {_f(pms, 4)} | {delta} | "
+                f"{_f(btps, 1)} | {_f(ptps, 1)} | {tdelta} | "
+                f"{_f(max(b.worst('peak_allocated_bytes') or 0, p.worst('peak_allocated_bytes') or 0), 0)} "
+                f"| {st} |"
+            )
     emit()
     if ratios:
         geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
-        emit(f"Geometric mean of patch/baseline median-time ratios across "
-             f"{len(ratios)} paired arms: **{geo:.6f}** "
-             f"({100 * (geo - 1):+.3f}% step time).")
+        emit(
+            f"Geometric mean of patch/baseline median-time ratios across "
+            f"{len(ratios)} paired arms: **{geo:.6f}** "
+            f"({100 * (geo - 1):+.3f}% step time)."
+        )
         emit()
-        emit("A ratio of 1.000 means the measured step time did not move. The A3 fix adds one "
-             "reduction over a [num_experts] tensor and removes nothing, so approximately 1.0 "
-             "is the expected value; a large apparent gain here would be evidence of a "
-             "confounded measurement, not of a speedup.")
+        emit(
+            "A ratio of 1.000 means the measured step time did not move. The A3 fix adds one "
+            "reduction over a [num_experts] tensor and removes nothing, so approximately 1.0 "
+            "is the expected value; a large apparent gain here would be evidence of a "
+            "confounded measurement, not of a speedup."
+        )
         emit()
 
     # ---- 3. correctness -----------------------------------------------------------
@@ -215,9 +257,11 @@ def main() -> int:
             for tree in sorted(wl_map[wl]):
                 arm = wl_map[wl][tree]
                 if arm.status() != "OK":
-                    emit(f"| {tree} {arm.config_label} | {wl} | " +
-                         " | ".join("NOT_EVALUATED" for _ in names) +
-                         f" | {arm.status()} |")
+                    emit(
+                        f"| {tree} {arm.config_label} | {wl} | "
+                        + " | ".join("NOT_EVALUATED" for _ in names)
+                        + f" | {arm.status()} |"
+                    )
                     continue
                 ch = arm.checks()
                 mark = " | ".join("PASS" if ch.get(n) else "**FAIL**" for n in sorted(names))
@@ -227,20 +271,30 @@ def main() -> int:
     # ---- 4. method notes ----------------------------------------------------------
     emit("## 4. Method notes and limits")
     emit()
-    emit("* `dispatch_only` times dispatcher preprocess/dispatch/postprocess, a stand-in local "
-         "expert computation, and combine. It does not represent GEMM cost or a training step.")
+    emit(
+        "* `dispatch_only` times dispatcher preprocess/dispatch/postprocess, a stand-in local "
+        "expert computation, and combine. It does not represent GEMM cost or a training step."
+    )
     emit("* `moe_fwd_bwd` runs the real MoELayer forward and backward, router included.")
-    emit("* Probs are applied inside the expert module upstream; this harness feeds raw expert "
-         "outputs to combine, and the round trip is checked against a calibration probe.")
-    emit("* Expert weights are indexed by global expert id and drawn from one fixed seed on "
-         "every rank, so changing the EP layout does not change the logical model.")
-    emit("* `transformer_engine` and `apex` are absent on this node, so the expert computation "
-         "is a per-expert loop rather than TE grouped GEMM. Absolute step times are therefore "
-         "not comparable with TE-enabled runs; the baseline/patch comparison remains valid "
-         "because both sides use the identical path.")
-    emit("* The node is shared: other tenants hold memory on the GPUs used here. Absolute "
-         "latencies carry that noise; the paired baseline/patch comparison is the defensible "
-         "quantity.")
+    emit(
+        "* Probs are applied inside the expert module upstream; this harness feeds raw expert "
+        "outputs to combine, and the round trip is checked against a calibration probe."
+    )
+    emit(
+        "* Expert weights are indexed by global expert id and drawn from one fixed seed on "
+        "every rank, so changing the EP layout does not change the logical model."
+    )
+    emit(
+        "* `transformer_engine` and `apex` are absent on this node, so the expert computation "
+        "is a per-expert loop rather than TE grouped GEMM. Absolute step times are therefore "
+        "not comparable with TE-enabled runs; the baseline/patch comparison remains valid "
+        "because both sides use the identical path."
+    )
+    emit(
+        "* The node is shared: other tenants hold memory on the GPUs used here. Absolute "
+        "latencies carry that noise; the paired baseline/patch comparison is the defensible "
+        "quantity."
+    )
     if args.out:
         args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"\nwrote {args.out}")

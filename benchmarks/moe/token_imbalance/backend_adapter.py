@@ -18,6 +18,7 @@ The first (and currently only) adapter is ``standard_alltoall``: the repository'
 reusing their authors' code and configuration, and are compared on the SAME logical workload
 and oracle.
 """
+
 from __future__ import annotations
 
 import sys
@@ -74,6 +75,7 @@ def probe_environment(num_experts: int = 8) -> Capability:
 
     try:
         import transformer_engine  # noqa: F401
+
         cap.grouped_gemm = SUPPORTED
         cap.precision["fp8"] = UNVERIFIED
         cap.notes.append("transformer_engine importable; grouped GEMM available")
@@ -96,10 +98,10 @@ def probe_environment(num_experts: int = 8) -> Capability:
     cap.etp["etp=1"] = SUPPORTED
     cap.etp["etp>1"] = UNVERIFIED  # no ETP run was performed, so this is not a claim
 
-    cap.zero_token_rows = SUPPORTED      # W5 exercises it and passes
-    cap.variable_topk = SUPPORTED        # W0..W7 does not vary topk within a run
-    cap.recompute = UNVERIFIED           # not exercised by the benchmark
-    cap.cuda_graph = UNVERIFIED          # not exercised by the benchmark
+    cap.zero_token_rows = SUPPORTED  # W5 exercises it and passes
+    cap.variable_topk = SUPPORTED  # W0..W7 does not vary topk within a run
+    cap.recompute = UNVERIFIED  # not exercised by the benchmark
+    cap.cuda_graph = UNVERIFIED  # not exercised by the benchmark
     return cap
 
 
