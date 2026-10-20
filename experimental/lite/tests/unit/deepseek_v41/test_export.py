@@ -192,11 +192,12 @@ def test_live_bf16_wo_a_keeps_updates_which_release_fp8_would_round(monkeypatch)
         yield key, weight
 
     monkeypatch.setattr(hf_weights, 'export_hf_weights', native)
-    online = dict(export_hf_weights([], None, None, target='vllm', include_frozen=False))
+    config = SimpleNamespace(vocab_size=32, n_routed_experts=1)
+    online = dict(export_hf_weights([], config, None, target='vllm', include_frozen=False))
     assert set(online) == {key}
     assert online[key].dtype == torch.bfloat16
     assert torch.equal(_bits(online[key]), _bits(weight))
-    offline = dict(export_hf_weights([], None, None, target='release', include_frozen=False))
+    offline = dict(export_hf_weights([], config, None, target='release', include_frozen=False))
     assert set(offline) == {key, 'layers.0.attn.wo_a.scale'}
     decoded = _dequantize_block_scaled_tensor(
         offline[key], offline['layers.0.attn.wo_a.scale'], weight.shape
