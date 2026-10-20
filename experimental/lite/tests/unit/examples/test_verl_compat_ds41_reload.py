@@ -14,6 +14,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'examples/verl'))
 from verl_mlite import compat
 
+pytestmark = pytest.mark.optional
+
 
 def test_headless_patch_does_not_require_optional_profile(monkeypatch):
     server = ModuleType(compat._VLLM_ASYNC_SERVER_MODULE)

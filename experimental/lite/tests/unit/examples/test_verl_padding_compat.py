@@ -9,6 +9,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'examples/verl'))
 from verl_mlite import compat
 
+pytestmark = pytest.mark.optional
+
 
 def _missing(name):
     def functions():
