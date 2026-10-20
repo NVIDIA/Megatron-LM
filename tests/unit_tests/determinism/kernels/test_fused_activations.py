@@ -217,14 +217,20 @@ def test_bias_dropout_add_fused_inference_replays_bit_exactly():
 
 
 class TestFusedCrossEntropy:
-    """``--cross-entropy-loss-fusion`` is rejected by ``--deterministic-mode``; this records
-    whether the compiled kernel itself replays bit-exactly (op catalog: non-deterministic)."""
+    """Native fused CE must replay under strict deterministic algorithms."""
 
     @pytest.fixture(autouse=True)
-    def parallel_group(self, tp_size, det_algos):
+    def parallel_group(self, tp_size, det_algos, request):
         """Exercise real TP groups and restore the caller's deterministic settings."""
         if Utils.world_size % tp_size:
             pytest.skip(f"TP={tp_size} requires a world size divisible by {tp_size}")
+        if not det_algos:
+            request.applymarker(
+                pytest.mark.xfail(
+                    strict=False,
+                    reason="default-mode compiler autotuning can change reduction order",
+                )
+            )
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
         previous = torch.are_deterministic_algorithms_enabled()
         previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -238,10 +244,6 @@ class TestFusedCrossEntropy:
     @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
     @pytest.mark.parametrize("det_algos", [False, True], ids=["default", "deterministic"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
-    @pytest.mark.xfail(
-        strict=False,
-        reason="op-catalog lists the fused cross entropy as non-deterministic; recorded, not gated",
-    )
     def test_fused_vocab_parallel_cross_entropy_replays(self, dtype, tp_size, det_algos):
         """Replay rank-distinct vocabulary shards under competing CUDA streams.
 
