@@ -649,6 +649,10 @@ def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
             "Dynamic context parallelism not supported with CUDA Graph",
         ),
         ({}, "Dynamic context parallelism must be used with calculate_per_token_loss"),
+        (
+            {"calculate_per_token_loss": True, "moe_z_loss_coeff": 1e-3},
+            "Dynamic context parallelism not supported with moe_z_loss_coeff",
+        ),
     ],
 )
 def test_dynamic_cp_rejects_unsupported_config(overrides, message):
