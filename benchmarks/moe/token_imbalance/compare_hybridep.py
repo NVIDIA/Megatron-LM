@@ -82,10 +82,15 @@ def main():
                         if initial is None:
                             initial = {
                                 name: value.detach().cpu().clone()
-                                for name, value in layer.state_dict().items()
+                                for name, value in layer.named_parameters()
                             }
                         else:
-                            layer.load_state_dict(initial, strict=True)
+                            parameters = dict(layer.named_parameters())
+                            if parameters.keys() != initial.keys():
+                                raise AssertionError("logical parameter names differ")
+                            with torch.no_grad():
+                                for name, parameter in parameters.items():
+                                    parameter.copy_(initial[name])
                         # Warmup has no updates; reset all accumulated gradients each call.
                         for iteration in range(-args.warmup, args.steps):
                             step = max(iteration, 0)
