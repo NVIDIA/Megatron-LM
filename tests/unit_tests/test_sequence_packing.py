@@ -866,3 +866,51 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     finally:
         Utils.destroy_model_parallel()
         unset_global_variables()
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_wrap_data_iterator_raises_stop_iteration_on_every_rank(tp):
+    '''
+    Only TP rank 0 reads data, and here only the last DP rank runs out. Every rank must
+    raise StopIteration instead of blocking in a collective, so evaluate() can stop.
+    '''
+    if Utils.world_size % tp != 0:
+        pytest.skip(f"world size is not divisible by tp={tp}")
+    Utils.initialize_model_parallel(tp, 1)
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        config = SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=64,
+            virtual_pipeline_model_parallel_size=None,
+            pipeline_model_parallel_layout=None,
+            mtp_num_layers=None,
+        )
+        num_microbatches = 2
+        data_iterator = None
+        if pg.tp.rank() == 0:
+            # The last DP rank holds one global batch plus a partial one.
+            num_batches = 2 if pg.dp.rank() < pg.dp.size() - 1 else 1
+            num_samples = num_batches * num_microbatches
+            if pg.dp.rank() == pg.dp.size() - 1:
+                num_samples += 1
+            device = torch.device("cuda", torch.cuda.current_device())
+            tokens = torch.arange(16, dtype=torch.int64, device=device)
+            sample = {
+                "tokens": tokens,
+                "labels": tokens + 1,
+                "loss_mask": torch.ones(16, dtype=torch.float32, device=device),
+                "position_ids": tokens,
+                "cu_seqlens": torch.tensor([0, 16], dtype=torch.int32, device=device),
+            }
+            data_iterator = RerunDataIterator(iter([dict(sample) for _ in range(num_samples)]))
+
+        _, num_micro_batches, _, _ = wrap_data_iterator(
+            data_iterator, config, num_microbatches, pg_collection=pg
+        )
+        assert num_micro_batches > 0
+        with pytest.raises(StopIteration):
+            wrap_data_iterator(data_iterator, config, num_microbatches, pg_collection=pg)
+    finally:
+        Utils.destroy_model_parallel()
+        unset_global_variables()
