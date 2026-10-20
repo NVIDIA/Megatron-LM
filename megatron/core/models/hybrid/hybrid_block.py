@@ -43,6 +43,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    SinglePassMHCState,
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
@@ -391,7 +392,12 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
+        if (
+            self.config.enable_mhc_connections
+            and not self.config.mhc_single_pass
+            and self.post_process
+            and not self.is_mtp_layer
+        ):
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
@@ -543,6 +549,7 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
+        mhc_state: SinglePassMHCState | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -596,6 +603,11 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        if self.config.mhc_single_pass and mhc_state is None:
+            if not self.pre_process:
+                raise ValueError("Single-pass mHC requires the incoming stage's explicit mix state")
+            mhc_state = SinglePassMHCState()
 
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
@@ -779,6 +791,8 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = input_ids
+                                if mhc_state is not None:
+                                    layer_kwargs["mhc_state"] = mhc_state
                                 hidden_states, _ = layer(**layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
@@ -830,14 +844,19 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if mhc_state is not None:
+                hidden_states = mhc_state.contract(
+                    hidden_states, self.config.mhc_num_residual_streams
+                )
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
