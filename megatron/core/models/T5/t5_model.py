@@ -10,6 +10,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import lm_head_can_emit
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -68,18 +69,26 @@ class T5LMHead(MegatronModule):
             tp_group=tp_group,
         )
 
-    def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
+    def forward(
+        self,
+        hidden_states: Tensor,
+        word_embeddings_weight: Tensor,
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
         """Forward pass.
 
         Args:
             hidden_states (Tensor): output hidden states from decoder
             word_embeddings_weight (Tensor): word embedding weight
+            output_dtype (torch.dtype, optional): logits dtype to ask of the output layer
 
         Returns:
             Tensor: logits tensor
         """
 
-        logits, _ = self.output_layer(hidden_states, weight=word_embeddings_weight)
+        logits, _ = self.output_layer(
+            hidden_states, weight=word_embeddings_weight, output_dtype=output_dtype
+        )
         return logits
 
 
@@ -288,6 +297,7 @@ class T5Model(LanguageModule):
         output_encoder_hidden_only: bool = False,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
+        logits_dtype: Optional[torch.dtype] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
@@ -301,6 +311,7 @@ class T5Model(LanguageModule):
             encoder_decoder_attn_mask (Tensor): cross-attention mask between encoder and decoder
             lm_labels (Tensor): labels for decoder output
             inference_context (BaseInferenceContext): relevant arguments for inferencing
+            logits_dtype (torch.dtype, optional): dtype to emit the logits in
 
         Returns:
             Tensor: loss tensor
@@ -426,7 +437,13 @@ class T5Model(LanguageModule):
             output_weight = None
             if self.share_embeddings_and_output_weights:
                 output_weight = self.shared_embedding_or_output_weight()
-            lm_logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
+            if logits_dtype is not None and not lm_head_can_emit(self.config, logits_dtype):
+                logits_dtype = None  # the head keeps its own dtype
+            lm_logits = self.lm_head(
+                decoder_hidden_states,
+                word_embeddings_weight=output_weight,
+                output_dtype=logits_dtype,
+            )
 
             if lm_labels is None:
                 # [s b h] => [b s h]
