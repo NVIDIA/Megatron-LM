@@ -12,8 +12,6 @@ from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.extensions.transformer_engine import te_general_gemm
-from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.quantization.utils import (
@@ -90,38 +88,16 @@ def get_model_builder(
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
-        model_config, builder_cls = gpt_config_from_args(args), GPTModelBuilder
-    elif provider in ("hybrid", "mamba"):
+        return GPTModelBuilder(gpt_config_from_args(args))
+    if provider in ("hybrid", "mamba"):
         if provider == "mamba":
             warnings.warn(
                 '"mamba" model provider is deprecated. Use "hybrid" instead.',
                 DeprecationWarning,
                 stacklevel=2,
             )
-        model_config, builder_cls = hybrid_config_from_args(args), HybridModelBuilder
-    else:
-        raise ValueError(f"Invalid model provider {provider}")
-    model_config.logit_dtype = default_inference_logit_dtype(model_config)
-    return builder_cls(model_config)
-
-
-def default_inference_logit_dtype(model_config) -> Optional[torch.dtype]:
-    """The LM head's output dtype for a model built for inference."""
-    transformer_config = model_config.transformer
-    if model_config.logit_dtype is not None:
-        return model_config.logit_dtype
-    if is_mxfp8_output_proj_active(transformer_config):
-        return None
-    if transformer_config.params_dtype != torch.float32 and te_general_gemm is None:
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "Inference keeps the logits in the model's compute dtype: "
-            "an fp32 result from a half-precision LM head needs Transformer Engine general_gemm, "
-            "which is unavailable. Pass --output-logit-dtype to choose explicitly.",
-        )
-        return None
-    return torch.float32
+        return HybridModelBuilder(hybrid_config_from_args(args))
+    raise ValueError(f"Invalid model provider {provider}")
 
 
 def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
