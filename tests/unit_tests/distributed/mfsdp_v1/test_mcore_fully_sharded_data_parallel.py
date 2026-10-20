@@ -25,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
@@ -1364,8 +1365,10 @@ class TestFsdpNonUnitBucketPreservation:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(
+                    hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
+                )
+                return self.mamba_layer(hidden_states=h, aux_inputs=LayerAuxInputs())
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
@@ -1470,8 +1473,10 @@ class TestFsdpMambaConvParamGather:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(
+                    hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
+                )
+                return self.mamba_layer(hidden_states=h, aux_inputs=LayerAuxInputs())
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
@@ -1572,8 +1577,10 @@ class TestFsdpHybridModelDoubleBuffer:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
-                return self.mamba_layer(hidden_states=h)
+                h, _ = self.attn_layer(
+                    hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
+                )
+                return self.mamba_layer(hidden_states=h, aux_inputs=LayerAuxInputs())
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)

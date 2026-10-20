@@ -33,6 +33,7 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -597,7 +598,7 @@ def test_thd_format(tc: TestCase):
     # --- SBHD forward/backward ---
     local_sbhd = shard_sbhd(full_sbhd, cp_rank, cp_size, tp_rank, tp_size, sp)
     input_sbhd = local_sbhd.detach().clone().requires_grad_(True)
-    out_sbhd, _ = layer(hidden_states=input_sbhd)
+    out_sbhd, _ = layer(hidden_states=input_sbhd, aux_inputs=LayerAuxInputs())
     gathered_sbhd = gather_sbhd(out_sbhd, cp_size, tp_size, sp)
     gathered_sbhd.backward(grad_sbhd)
     sbhd_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
@@ -607,7 +608,9 @@ def test_thd_format(tc: TestCase):
     local_thd = shard_thd(seq_data, seqlens, cp_rank, cp_size, tp_rank, tp_size, sp, H, pad_to_max)
     packed_seq_params = make_packed_seq_params(seqlens, cp_size, tp_size, sp, pad_to_max)
     input_thd = local_thd.detach().clone().requires_grad_(True)
-    out_thd, _ = layer(hidden_states=input_thd, packed_seq_params=packed_seq_params)
+    out_thd, _ = layer(
+        hidden_states=input_thd, aux_inputs=LayerAuxInputs(packed_seq_params=packed_seq_params)
+    )
     gathered_thd = gather_thd(out_thd, seqlens, cp_size, tp_size, sp, H, pad_to_max)
     gathered_thd.backward(grad_thd)
     thd_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}

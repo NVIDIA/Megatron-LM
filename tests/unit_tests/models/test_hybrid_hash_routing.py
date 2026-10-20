@@ -31,7 +31,6 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.typed_torch import copy_signature
 
 
 class RecordingTransformerLayer(TransformerLayer):
@@ -50,14 +49,14 @@ class RecordingTransformerLayer(TransformerLayer):
             self.cuda_graphs = [object()]
 
     @bind_layer_interface
-    @copy_signature(TransformerLayer.forward)
-    def forward(self, hidden_states, **kwargs):
-        self.calls.append(kwargs)
+    def forward(self, hidden_states, aux_inputs):
+        self.calls.append(vars(aux_inputs))
         return hidden_states, LayerAuxOutputs()
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         self.used_cuda_graph = True
-        return self.forward(*args, **kwargs)
+        hidden_states = kwargs.pop("hidden_states") if not args else args[0]
+        return self.forward(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(**kwargs))
 
     def _run_local_cuda_graph(self, module, args, kwargs):
         assert module is self
@@ -198,7 +197,9 @@ def make_stack(layers, **config_overrides):
 def run_stack(stack, input_ids):
     hidden_states = torch.randn(4, 2, 8, requires_grad=True)
     output = HybridStack.forward(
-        stack, hidden_states=hidden_states, attention_mask=None, input_ids=input_ids
+        stack,
+        hidden_states=hidden_states,
+        aux_inputs=LayerAuxInputs(attention_mask=None, input_ids=input_ids),
     )
     assert output.shape == hidden_states.shape
     return output

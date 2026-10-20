@@ -28,6 +28,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
@@ -154,7 +155,7 @@ def _run_one_backward(ddp_model, rank, calculate_per_token_loss=False):
     x = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
     out = x
     for layer in ddp_model.module.children():
-        out, _ = layer(out, attention_mask=None)
+        out, _ = layer(hidden_states=out, aux_inputs=LayerAuxInputs(attention_mask=None))
     loss = out.float().mean()
     loss.backward()
     # Sync ONCE: finish_grad_sync() triggers the (single) grad reduction for
@@ -215,7 +216,12 @@ def _run_wide_backward(
 
     out = x
     for layer, replay_context in zip(layers, replay_contexts):
-        out, _ = layer(out, attention_mask=None, residual_stream_recompute_context=replay_context)
+        out, _ = layer(
+            hidden_states=out,
+            aux_inputs=LayerAuxInputs(
+                attention_mask=None, residual_stream_recompute_context=replay_context
+            ),
+        )
         if replay_context is not None:
             replay_context.finalize(out)
     out.float().square().mean().backward()
@@ -523,7 +529,7 @@ def _run_step_distopt(ddp_model, optim, rank):
     x = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
     out = x
     for layer in ddp_model.module.children():
-        out, _ = layer(out, attention_mask=None)
+        out, _ = layer(hidden_states=out, aux_inputs=LayerAuxInputs(attention_mask=None))
     loss = out.float().mean()
     loss.backward()
     # Production order (finalize_model_grads): reduce across DP first, THEN the gtp_remat

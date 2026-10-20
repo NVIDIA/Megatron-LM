@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
@@ -34,7 +34,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.layer_interface import LayerAuxInputs
+from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -42,6 +42,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
+    deprecate_inference_params,
     get_pg_rank,
     get_pg_size,
     is_torch_min_version,
@@ -50,7 +51,6 @@ from megatron.core.utils import (
 )
 
 if TYPE_CHECKING:
-    from megatron.core.context_parallel import CPLayout, THDCPLayoutPlan
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 
@@ -1873,7 +1873,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             "sequence_len_offset",
         )
         # Capture metadata only; replay must use the tensors restored by checkpoint.
-        static_aux_inputs = replace(aux_inputs, **dict.fromkeys(checkpoint_fields))
+        static_aux_inputs = replace(
+            aux_inputs, decoder_input=None, **dict.fromkeys(checkpoint_fields)
+        )
         checkpoint_args = (
             hidden_states,
             decoder_input,
@@ -1882,7 +1884,9 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         def custom_forward(hidden_states, decoder_input, *tensors):
             replay_aux_inputs = replace(
-                static_aux_inputs, **dict(zip(checkpoint_fields, tensors, strict=True))
+                static_aux_inputs,
+                decoder_input=decoder_input,
+                **dict(zip(checkpoint_fields, tensors, strict=True)),
             )
             return self._proj_and_transformer_layer(
                 hidden_states, replay_aux_inputs, decoder_input=decoder_input
@@ -1953,94 +1957,11 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         return outputs
 
-    def forward(
-        self,
-        input_ids: Optional[Tensor],
-        position_ids: Optional[Tensor],
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        padding_mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-        embedding=None,
-        decoder_input: Optional[Tensor] = None,
-        mtp_input_mask: Optional[Tensor] = None,
-        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
-        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
-    ):
-        """
-        Execute the forward pass through the Multi-Token Prediction (MTP) layer.
-
-        Args:
-            input_ids (Tensor): Input token IDs .
-            position_ids (Tensor): Positional IDs of the input tokens.
-            hidden_states (Tensor): Hidden states tensor of shape [s, b, h] where s is the
-                sequence length, b is the batch size, and h is the hidden size.
-            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
-                self-attention.
-            context (Tensor, optional): Context tensor for cross-attention, if applicable.
-            context_mask (Tensor, optional): Mask for cross-attention context, if applicable.
-            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
-            rotary_pos_cos (Tensor, optional): Cosine component of rotary positional embeddings.
-            rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
-            sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
-            embedding (Callable): The embedding module from gpt model to compute the decoder input.
-            mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
-
-        Returns:
-            Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
-            [s, b, h], and optionally the updated context tensor if cross-attention is used.
-        """
-        assert context is None, "multi token prediction + cross attention is not yet supported."
-        if decoder_input is None:
-            assert input_ids is not None and position_ids is not None
-            (
-                input_ids,
-                position_ids,
-                padding_mask,
-                mtp_input_mask,
-                decoder_input,
-                hidden_states,
-            ) = self._get_embeddings(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                padding_mask=padding_mask,
-                embedding=embedding,
-                hidden_states=hidden_states,
-                packed_seq_params=packed_seq_params,
-                mtp_input_mask=mtp_input_mask,
-            )
-        else:
-            decoder_input, hidden_states = self._get_precomputed_embeddings(
-                decoder_input=decoder_input, hidden_states=hidden_states
-            )
-
-        aux_inputs = LayerAuxInputs(
-            attention_mask=attention_mask,
-            padding_mask=padding_mask,
-            context=context,
-            context_mask=context_mask,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            attention_bias=attention_bias,
-            inference_context=inference_params,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            packed_seq_params_by_layout=packed_seq_params_by_layout,
-            cp_layout_plan=cp_layout_plan,
-        )
-
-        # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
-        # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
-        # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
+    @bind_layer_interface
+    def forward(self, hidden_states: Tensor, aux_inputs: LayerAuxInputs):
+        """Apply one MTP depth to embeddings prepared by the owning block."""
+        decoder_input = aux_inputs.decoder_input
+        # Hybrid MTP delegates full recompute to its nested stack.
         use_outer_recompute = (
             self.config.recompute_granularity == 'full'
             and self.training
@@ -2054,8 +1975,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = self._proj_and_transformer_layer(
                 hidden_states, aux_inputs, decoder_input=decoder_input
             )
-
-        return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
+        return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -2446,45 +2366,33 @@ class MultiTokenPredictionBlock(MegatronModule):
                 ]
             )
 
+    @bind_layer_interface
     def forward(
         self,
-        input_ids: Optional[Tensor],
-        position_ids: Optional[Tensor],
         hidden_states: Tensor,
-        attention_mask: Tensor,
-        padding_mask: Optional[Tensor] = None,
-        context: Optional[Tensor] = None,
-        context_mask: Optional[Tensor] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        rotary_pos_cos: Optional[Tensor] = None,
-        rotary_pos_sin: Optional[Tensor] = None,
-        attention_bias: Optional[Tensor] = None,
-        inference_params: Optional[InferenceParams] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        sequence_len_offset: Optional[Tensor] = None,
-        extra_block_kwargs: Optional[dict] = None,
-        embedding=None,
-        decoder_input: Optional[Tensor] = None,
-        mtp_input_mask: Optional[Tensor] = None,
-        mhc_multistream: Optional[Tensor] = None,
-        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
-        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        aux_inputs: LayerAuxInputs | None = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        **model_inputs,
     ) -> Tensor:
-        """
-        Perform the forward pass through all of the MTP modules.
+        """Concatenate the main hidden states and each MTP depth's predictions.
 
-        Args:
-            hidden_states (Tensor): Hidden states for input token with the shape [s, b, h]
-                where s is the sequence length, b is the batch size, and h is the hidden size.
-            mhc_multistream (Tensor, optional): Pre-contraction decoder output [s, b, n*h]
-                used as the input to MTP depths when hyper connections are enabled.
-            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
-                self-attention.
-            mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
-
-        Returns:
-            (Tensor): The mtp loss tensor of shape [b, s].
+        GPT passes model-facing keywords, packed once at this block boundary.
+        Hybrid callers supply their existing auxiliary inputs directly.
+        The block advances conditioning tokens or embeddings before each depth.
+        The optional mHC stream supplies the uncontracted states used by the depths.
         """
+        if aux_inputs is None:
+            model_inputs["inference_context"] = deprecate_inference_params(
+                model_inputs.get("inference_context"), inference_params
+            )
+            aux_inputs = LayerAuxInputs(**model_inputs)
+        assert (
+            aux_inputs.context is None
+        ), "multi token prediction + cross attention is not yet supported."
+        packed_seq_params = aux_inputs.packed_seq_params
+        mhc_multistream = aux_inputs.mhc_multistream
+
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage, pp_rank=self.pp_rank)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
@@ -2503,17 +2411,6 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-
-            if decoder_input is not None:
-                decoder_input, _ = roll_tensor_precomputed_embeddings(
-                    decoder_input,
-                    shifts=-1,
-                    dims=0,
-                    sp_group=self.tp_group if self.sequence_parallel else None,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
-                    return_sum=False,
-                )
 
             # Older HSM entries predict earlier targets than the newest entry. Roll
             # them once per depth so all candidates correspond to the same target.
@@ -2579,26 +2476,49 @@ class MultiTokenPredictionBlock(MegatronModule):
             else:
                 hidden_states_input = hidden_states
 
-            hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask = self.layers[
-                layer_idx
-            ](
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-                sequence_len_offset=sequence_len_offset,
-                embedding=embedding,
-                decoder_input=decoder_input,
-                mtp_input_mask=mtp_input_mask,
-                **(extra_block_kwargs or {}),
+            layer = self.layers[layer_idx]
+            if aux_inputs.decoder_input is None:
+                assert aux_inputs.input_ids is not None and aux_inputs.position_ids is not None
+                (
+                    input_ids,
+                    position_ids,
+                    padding_mask,
+                    mtp_input_mask,
+                    decoder_input,
+                    hidden_states_input,
+                ) = layer._get_embeddings(
+                    hidden_states=hidden_states_input,
+                    input_ids=aux_inputs.input_ids,
+                    position_ids=aux_inputs.position_ids,
+                    padding_mask=aux_inputs.padding_mask,
+                    mtp_input_mask=aux_inputs.mtp_input_mask,
+                    embedding=aux_inputs.embedding,
+                    packed_seq_params=packed_seq_params,
+                )
+                aux_inputs = aux_inputs.update(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    padding_mask=padding_mask,
+                    mtp_input_mask=mtp_input_mask,
+                )
+            else:
+                decoder_input, _ = roll_tensor_precomputed_embeddings(
+                    aux_inputs.decoder_input,
+                    shifts=-1,
+                    dims=0,
+                    sp_group=self.tp_group if self.sequence_parallel else None,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                    return_sum=False,
+                )
+                aux_inputs = aux_inputs.update(decoder_input=decoder_input)
+                # Padding fill is local to the depth; advance the unfilled embeddings next time.
+                decoder_input, hidden_states_input = layer._get_precomputed_embeddings(
+                    decoder_input=decoder_input, hidden_states=hidden_states_input
+                )
+            # Keep the embedding module in block state for later depths, outside layer graphs.
+            hidden_states, _ = layer(
+                hidden_states_input, aux_inputs.update(decoder_input=decoder_input, embedding=None)
             )
 
             if hidden_state_mixing_enabled:

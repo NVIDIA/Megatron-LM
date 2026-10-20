@@ -260,38 +260,14 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         return args, bound
 
     @bind_layer_interface
-    def forward(
-        self,
-        hidden_states: Tensor,
-        inference_context: Optional[BaseInferenceContext] = None,
-        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
-    ):
-        """
-        Perform a forward pass through the Mamba layer.
-
-        This method implements the core computation of a Mamba layer, including
-        the convolution and the selective SSM/SSD.
-
-        Args:
-            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
-                b is batch size, and h is hidden size.
-            inference_context (BaseInferenceContext, optional): Parameters for inference-time
-                optimizations.
-            packed_sequence_cp_metadata (PackedSequenceCPMetadata, optional): Rank-local
-                packed-sequence metadata for chunkwise CP.
-            residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
-                Call-local ordered replay state for a configured residual connection.
-
-        Returns:
-            output (Tensor): Transformed hidden states of shape [s, b, h].
-        """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
+    def forward(self, hidden_states: Tensor, aux_inputs: LayerAuxInputs):
+        """Run the mixer and residual update, carrying shared invocation inputs."""
+        residual_stream_recompute_context = aux_inputs.residual_stream_recompute_context
+        mixer_inputs = (
+            aux_inputs
+            if getattr(self.mixer, "chunkwise_context_parallel", False)
+            else aux_inputs.update(packed_sequence_cp_metadata=None)
+        )
         # Whole-layer + mixer lens spans, mirroring transformer_layer.py so the hybrid
         # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
         # ~34s of uninstrumented first-iteration warmup). No-op unless the 'layer' span
@@ -310,18 +286,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             # transformer layer's self_attention/mlp (this is where the SSD kernel autotune
             # lands on the first pass).
             with _otel_managed_span('layer', 'megatron.layer.mamba'):
-                mixer_output, aux_outputs = self.mixer(
-                    hidden_states,
-                    LayerAuxInputs(
-                        inference_context=inference_context,
-                        packed_seq_params=packed_seq_params,
-                        packed_sequence_cp_metadata=(
-                            packed_sequence_cp_metadata
-                            if getattr(self.mixer, "chunkwise_context_parallel", False)
-                            else None
-                        ),
-                    ),
-                )
+                mixer_output, aux_outputs = self.mixer(hidden_states, mixer_inputs)
 
             hidden_states = self._apply_mixer_update(
                 (mixer_output, aux_outputs.bias),
@@ -372,19 +337,22 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         """
         Check if we should call the local cudagraph path.
         """
+        inputs = kwargs.get("aux_inputs")
+        context = (
+            inputs.inference_context if inputs is not None else kwargs.get("inference_context")
+        )
         # Training and validation mode CUDA graphs.
         if (
             hasattr(self, 'cudagraph_manager')
-            and kwargs.get('inference_context') is None
+            and context is None
             and not torch.is_inference_mode_enabled()  # for inference eager dummy_forward
         ):
             return True
         elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
-            and kwargs.get('inference_context') is not None
+            and context is not None
             and not self.config.cuda_graph_modules  # empty-list = per-layer CUDA graphs
         ):
-            context = kwargs['inference_context']
             using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
                 not context.is_static_batching() and context.using_cuda_graph_this_step()
             )

@@ -36,7 +36,7 @@ class _ResidualObservationLayer(torch.nn.Module, BaseTransformerLayer):
         self.layer_number = layer_number
 
     def forward(self, hidden_states, aux_inputs):
-        return hidden_states + 1, LayerAuxOutputs(context=aux_inputs.context)
+        return hidden_states + 1, LayerAuxOutputs()
 
 
 class TestParallelTransformerBlock:

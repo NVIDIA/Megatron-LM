@@ -747,8 +747,11 @@ class TestMimoModel:
                     return hidden_states if hidden_states is not None else self.input_tensor
 
             class _IdentityMTPLayer(torch.nn.Module):
-                def forward(self, hidden_states, **kwargs):
-                    return hidden_states, None
+
+                def forward(self, hidden_states, aux_inputs):
+                    from megatron.core.transformer.layer_interface import LayerAuxOutputs
+
+                    return hidden_states, LayerAuxOutputs()
 
             model.language_model.decoder = _IdentityDecoder()
             for mtp_layer in model.language_model.mtp.layers:
@@ -867,8 +870,11 @@ class TestMimoModel:
                     return hidden_states if hidden_states is not None else self.input_tensor
 
             class _IdentityMTPLayer(torch.nn.Module):
-                def forward(self, hidden_states, **kwargs):
-                    return hidden_states, None
+
+                def forward(self, hidden_states, aux_inputs):
+                    from megatron.core.transformer.layer_interface import LayerAuxOutputs
+
+                    return hidden_states, LayerAuxOutputs()
 
             model.language_model.decoder = _IdentityDecoder()
             for mtp_layer in model.language_model.mtp.layers:

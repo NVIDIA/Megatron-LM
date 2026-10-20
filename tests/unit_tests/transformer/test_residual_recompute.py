@@ -27,7 +27,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import bind_layer_interface
+from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -635,8 +635,9 @@ class TestResidualStreamRecomputeIntegration:
         context = build_residual_stream_recompute_plan(1, 1)[0]
         output, _ = layer(
             hidden_states=hidden_states,
-            attention_mask=None,
-            residual_stream_recompute_context=context,
+            aux_inputs=LayerAuxInputs(
+                attention_mask=None, residual_stream_recompute_context=context
+            ),
         )
         context.finalize(output)
         output.square().mean().backward()
@@ -895,8 +896,9 @@ class TestResidualStreamRecomputeIntegration:
         hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
         output = stack(
             hidden_states=hidden_states,
-            attention_mask=None,
-            packed_seq_params=boundary_packed_seq_params,
+            aux_inputs=LayerAuxInputs(
+                attention_mask=None, packed_seq_params=boundary_packed_seq_params
+            ),
         )
 
         assert events == [
@@ -924,7 +926,7 @@ class TestResidualStreamRecomputeIntegration:
         ).cuda()
         hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states=hidden_states, attention_mask=None)
+        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
         output.square().mean().backward()
 
         assert output.shape == hidden_states.shape

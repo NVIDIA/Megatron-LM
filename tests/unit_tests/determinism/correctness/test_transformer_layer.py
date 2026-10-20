@@ -29,6 +29,7 @@ import torch
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.configs import GPT_CONFIGS, gpt_base, parallelism_configs
@@ -145,7 +146,7 @@ RUNNER = BitExactRunner(
 # Helpers reused by the specialty (perf/racing/jitter) sub-tests below.
 # ---------------------------------------------------------------------------
 def _fwd_bwd(layer, hidden, mask):
-    out = layer(hidden_states=hidden, attention_mask=mask)
+    out = layer(hidden_states=hidden, aux_inputs=LayerAuxInputs(attention_mask=mask))
     # TransformerBlock returns a tensor; some layer types return a tuple.
     out = out[0] if isinstance(out, tuple) else out
     loss = out.float().pow(2).mean()

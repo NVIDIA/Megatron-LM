@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
@@ -121,7 +122,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     def run_step(layers, x):
         with fp8_autocast(enabled=False):
             for layer in layers:
-                x = layer(x)
+                x = layer(hidden_states=x, aux_inputs=LayerAuxInputs())
         return x.mean()
 
     # -------------------------------------------------------------------------
@@ -294,7 +295,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
         with fp8_autocast(enabled=True, fp8_recipe=recipe):
             y = x
             for layer in layers_fp8:
-                y = layer(y)
+                y = layer(hidden_states=y, aux_inputs=LayerAuxInputs())
         loss = y.mean()
         if rank == 0:
             fp8_losses.append(loss.item())

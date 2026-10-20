@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
@@ -102,9 +103,11 @@ def test_branchwise_wide_moe_keeps_all_moe_paths_at_backbone_width():
             16, 2, wide_hidden_size, device=torch.cuda.current_device(), requires_grad=True
         )
 
-        output, aux_outputs = layer(hidden_states=residual_stream, attention_mask=None)
+        output, context = layer(
+            hidden_states=residual_stream, aux_inputs=LayerAuxInputs(attention_mask=None)
+        )
 
-        assert aux_outputs.context is None
+        assert context is None
         assert output.shape == residual_stream.shape
         _assert_branchwise_geometry(layer, config)
         output.float().square().mean().backward()
@@ -148,9 +151,11 @@ def test_branchwise_wide_moe_runs_with_tensor_and_expert_parallelism():
             16, 2, wide_hidden_size, device=torch.cuda.current_device(), requires_grad=True
         )
 
-        output, aux_outputs = layer(hidden_states=residual_stream, attention_mask=None)
+        output, context = layer(
+            hidden_states=residual_stream, aux_inputs=LayerAuxInputs(attention_mask=None)
+        )
 
-        assert aux_outputs.context is None
+        assert context is None
         assert output.shape == residual_stream.shape
         _assert_branchwise_geometry(layer, config)
         output.float().square().mean().backward()

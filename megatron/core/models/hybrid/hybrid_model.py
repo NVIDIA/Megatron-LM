@@ -694,20 +694,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if self.config.freeze_base_model_for_mtp and self.training
             else nullcontext()
         )
+        aux_inputs = LayerAuxInputs(
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
+            input_ids=hash_input_ids,
+        )
         with backbone_context:
-            hidden_states, aux_outputs = self.decoder(
-                decoder_input,
-                LayerAuxInputs(
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                    packed_seq_params_by_layout=packed_seq_params_by_layout,
-                    cp_layout_plan=cp_layout_plan,
-                    input_ids=hash_input_ids,
-                ),
-            )
+            hidden_states, aux_outputs = self.decoder(decoder_input, aux_inputs)
         assert aux_outputs.bias is None, "HybridModel requires a complete residual decoder"
         mhc_multistream = aux_outputs.mhc_multistream
 
@@ -748,20 +746,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "MTP requires both input_ids and position_ids when precomputed "
                     "decoder_input embeddings are not provided."
                 )
-            mtp_hidden_states = self.mtp(
-                input_ids=mtp_inputs.input_ids,
-                position_ids=mtp_inputs.position_ids,
-                hidden_states=mtp_inputs.hidden_states,
-                mhc_multistream=mtp_inputs.mhc_multistream,
-                attention_mask=attention_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=mtp_inputs.packed_seq_params,
-                embedding=self.embedding,
-                decoder_input=mtp_inputs.decoder_input,
-                mtp_input_mask=mtp_inputs.mtp_input_mask,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
+            mtp_hidden_states, _ = self.mtp(
+                mtp_inputs.hidden_states,
+                aux_inputs.update(
+                    input_ids=mtp_inputs.input_ids,
+                    position_ids=mtp_inputs.position_ids,
+                    mhc_multistream=mtp_inputs.mhc_multistream,
+                    packed_seq_params=mtp_inputs.packed_seq_params,
+                    packed_sequence_cp_metadata=None,
+                    inference_context=None,
+                    embedding=self.embedding,
+                    decoder_input=mtp_inputs.decoder_input,
+                    mtp_input_mask=mtp_inputs.mtp_input_mask,
+                ),
             )
 
         if not self.post_process:

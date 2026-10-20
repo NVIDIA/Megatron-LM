@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import replace
 from typing import Optional, Tuple
 
 from torch import Tensor
@@ -9,11 +8,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import (
-    LayerAuxInputs,
-    _normalize_layer_output,
-    bind_layer_interface,
-)
+from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
@@ -103,18 +98,19 @@ class HyperConnectionHybridLayer(MegatronModule):
                 "HyperConnectionHybridLayer does not support residual_stream recomputation; "
                 "select 'mhc' in recompute_modules and configure mhc_recompute_layer_num instead."
             )
-        return super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
-
-    def bind_layer_outputs(self, result):
-        """Expose the wrapper's natural context output as named auxiliary state."""
-        return _normalize_layer_output(result, output_field="context")
+        args, bound = super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
+        bound["inner_inputs"] = aux_inputs.update(mhc_recompute_manager=None)
+        return args, bound
 
     @bind_layer_interface
     def forward(
-        self, hidden_states: Tensor, aux_inputs: LayerAuxInputs
-    ) -> Tuple[Tensor, Optional[Tensor]]:
+        self,
+        hidden_states: Tensor,
+        aux_inputs: LayerAuxInputs,
+        mhc_recompute_manager=None,
+        inner_inputs=None,
+    ) -> Tensor:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
-        mhc_recompute_manager = aux_inputs.mhc_recompute_manager
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
         )
@@ -123,18 +119,15 @@ class HyperConnectionHybridLayer(MegatronModule):
         )
 
         if fast_path_result is None:
-            layer_output, aux_outputs = self.inner_layer(
-                aggregated, replace(aux_inputs, mhc_recompute_manager=None)
-            )
+            layer_output, aux_outputs = self.inner_layer(aggregated, inner_inputs)
             assert aux_outputs.bias is None, "mHC requires a complete residual layer"
-            context = aux_outputs.context
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)
             layer_output_with_bias = (layer_output - aggregated, None)
             dropout_prob = 0.0
             bias_dropout_fusion = False
         else:
-            layer_output_with_bias, context, dropout_prob, bias_dropout_fusion = fast_path_result
+            layer_output_with_bias, _, dropout_prob, bias_dropout_fusion = fast_path_result
 
         layer_output = layer_output_with_bias[0]
         if layer_output.shape != aggregated.shape:
@@ -165,4 +158,4 @@ class HyperConnectionHybridLayer(MegatronModule):
             and hidden_states.dtype != self.config.params_dtype
         ):
             hidden_states = hidden_states.to(self.config.params_dtype)
-        return hidden_states, context
+        return hidden_states

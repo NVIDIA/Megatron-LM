@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import List, Optional, Set, Union, cast
 
 import torch
@@ -489,26 +489,23 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.input_tensor = input_tensor
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
-        """
-        Check if we should call the local cudagraph path.
-        """
+        """Select block-scope inference graphs from model-facing arguments."""
+
+        inference_context = kwargs.get("inference_context")
+        if inference_context is None:
+            inference_context = kwargs.get("inference_params")
         if (
             InferenceMode.is_active()
-            and hasattr(self, 'cudagraph_manager')
-            and kwargs['attention_mask'] is None
-            and (
-                kwargs.get('inference_context') is not None
-                or kwargs.get('inference_params') is not None
-            )
+            and hasattr(self, "cudagraph_manager")
+            and kwargs.get("attention_mask") is None
+            and inference_context is not None
             and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         ):
-            if kwargs['inference_context'].is_static_batching():
-                using_cuda_graph = kwargs['inference_context'].is_decode_only()
-            else:
-                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
-
-            if using_cuda_graph:
-                return True
+            return (
+                inference_context.is_decode_only()
+                if inference_context.is_static_batching()
+                else inference_context.using_cuda_graph_this_step()
+            )
         return False
 
     def __call__(self, *args, **kwargs):
@@ -524,7 +521,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
-        attention_mask: Optional[Tensor],
+        attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -540,9 +537,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        input_ids: Optional[Tensor] = None,
     ):
         """
         Perform the forward pass through the transformer block.
+
+        Model-facing arguments are packed once here for the shared layer interface.
 
         This method handles the core computation of the transformer, including
         self-attention, optional cross-attention, and feed-forward operations.
@@ -589,10 +589,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        # Remove 'dynamic_inference_decode_only' from kwargs if present
-        # this is only used to uniquely identify decode and non-decode cuda graph
-        # runners in the cuda graph manager
-
         # Initialize feature collection (consistent with FastGen's Wan implementation)
         if extract_layer_indices is None:
             extract_layer_indices = set()
@@ -683,43 +679,34 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_mhc_recompute=use_mhc_recompute,
         )
 
-        base_aux_inputs = LayerAuxInputs(
+        aux_inputs = LayerAuxInputs(
             attention_mask=attention_mask,
             context=context,
             context_mask=context_mask,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
+            inference_context=inference_context,
             packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
             padding_mask=padding_mask,
+            input_ids=input_ids,
         )
 
         with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
-                checkpointed_result = checkpointed_forward(
+                hidden_states, intermediate_hidden_states = checkpointed_forward(
                     self,
                     hidden_states,
-                    base_aux_inputs,
+                    aux_inputs,
                     use_inner_quantization_context=use_inner_quantization_context,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
                 )
-                # Handle return value from _checkpointed_forward
-                if len(extract_layer_indices) > 0:
-                    # (hidden_states, intermediate_hidden_states) tuple
-                    hidden_states, intermediate_hidden_states = checkpointed_result
-                else:
-                    # No intermediate_hidden_states requested: just hidden_states
-                    hidden_states = checkpointed_result
             else:
-                base_aux_inputs = replace(
-                    base_aux_inputs,
-                    inference_context=inference_context,
-                    rotary_pos_cos=rotary_pos_cos,
-                    rotary_pos_sin=rotary_pos_sin,
-                    rotary_pos_cos_sin=rotary_pos_cos_sin,
-                    sequence_len_offset=sequence_len_offset,
-                )
                 for l_no, layer in enumerate(self.layers):
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
@@ -744,12 +731,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         )
 
                     with self.offload_context, inner_quantization_context:
-                        aux_inputs = replace(
-                            base_aux_inputs, context=context, mhc_recompute_manager=mhc_manager
-                        )
+                        aux_inputs = aux_inputs.update(mhc_recompute_manager=mhc_manager)
                         hidden_states, aux_outputs = layer(hidden_states, aux_inputs)
                         assert aux_outputs.bias is None, "TransformerBlock requires complete layers"
-                        context = aux_outputs.context
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,

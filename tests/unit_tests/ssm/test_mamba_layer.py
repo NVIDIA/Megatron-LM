@@ -153,7 +153,7 @@ class TestMambaLayer:
         dtype = torch.float32 if fp32_residual else torch.bfloat16
         hidden_states = torch.randn(16, 2, 3 * config.hidden_size, device="cuda", dtype=dtype)
         atomic_input = hidden_states.detach().clone().requires_grad_(True)
-        atomic_output = layer(atomic_input)
+        atomic_output = layer(hidden_states=atomic_input, aux_inputs=LayerAuxInputs())
         atomic_output.float().square().mean().backward()
         atomic_grads = {
             name: param.grad.clone()

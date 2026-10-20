@@ -1,9 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from contextlib import nullcontext
-from dataclasses import replace
-from typing import List, Optional, Set, Tuple, Union
+from typing import List, Optional, Set
 
 from torch import Tensor
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel import ContextParallelLayoutState
@@ -29,7 +29,7 @@ def checkpointed_forward(
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
-) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+) -> tuple[Tensor, list[Tensor]]:
     """Forward method with activation checkpointing.
 
     Args:
@@ -44,57 +44,28 @@ def checkpointed_forward(
             and token IDs. Checkpointed tensors are restored into this container on replay.
 
     Returns:
-        If extract_layer_indices is empty: hidden_states tensor
-        If extract_layer_indices is non-empty: (hidden_states, intermediate_hidden_states) tuple
+        Hidden states and extracted intermediate tensors.
     """
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+    if isinstance(aux_inputs.rotary_pos_emb, (tuple, list)):
+        assert len(aux_inputs.rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
 
-    context = aux_inputs.context
-    rotary_pos_emb = aux_inputs.rotary_pos_emb
-    # Keep checkpointed activations out of the metadata captured by the closure.
-    static_aux_inputs = replace(
-        aux_inputs,
-        attention_mask=None,
-        context=None,
-        context_mask=None,
-        rotary_pos_emb=None,
-        padding_mask=None,
-        input_ids=None,
-    )
+    def custom(start: int, end: int, chunk_inputs: LayerAuxInputs):
+        # Checkpoint functions accept only tensors. Keep non-tensor metadata in
+        # the closure, and reconstruct immutable input snapshots for each replay.
+        leaves, input_spec = tree_flatten(vars(chunk_inputs))
+        tensor_indices = [i for i, value in enumerate(leaves) if isinstance(value, Tensor)]
+        tensor_inputs = tuple(leaves[i] for i in tensor_indices)
+        for i in tensor_indices:
+            leaves[i] = None
 
-    # Wrap non-dual RoPE to tuple to unify custom_forward interface.
-    is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
-    assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
-    rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
-
-    def custom(start: int, end: int):
-        def custom_forward(
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            rotary_pos_emb_local,
-            rotary_pos_emb_global,
-            padding_mask=None,
-            input_ids=None,
-        ):
-            rotary_pos_emb = (
-                (rotary_pos_emb_local, rotary_pos_emb_global)
-                if is_dual_rope
-                else rotary_pos_emb_global
-            )
-
-            aux_inputs = replace(
-                static_aux_inputs,
-                attention_mask=attention_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                padding_mask=padding_mask,
-                input_ids=input_ids,
-            )
+        def custom_forward(hidden_states, *input_tensors):
+            restored = list(leaves)
+            for i, tensor in zip(tensor_indices, input_tensors):
+                restored[i] = tensor
+            aux_inputs = LayerAuxInputs(**tree_unflatten(restored, input_spec))
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
@@ -103,7 +74,7 @@ def checkpointed_forward(
                     hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                         index, hidden_states
                     )
-                    aux_inputs = replace(aux_inputs, packed_seq_params=layer_packed_seq_params)
+                    aux_inputs = aux_inputs.update(packed_seq_params=layer_packed_seq_params)
                 # Keep both residuals in the layer's layout, inside the CP conversions.
                 residual_accumulator = hidden_states
 
@@ -126,34 +97,23 @@ def checkpointed_forward(
                 with inner_quantization_context:
                     hidden_states, aux_outputs = layer(hidden_states, aux_inputs)
                     assert aux_outputs.bias is None, "Recompute requires complete residual layers"
-                    context = aux_outputs.context
-                    aux_inputs = replace(aux_inputs, context=context)
 
                 observe_layer_residuals(layer, residual_accumulator, hidden_states)
                 if cp_layout_state is not None:
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
-            return hidden_states, context
+            return hidden_states
 
-        return custom_forward
+        return custom_forward, tensor_inputs
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
-        nonlocal hidden_states, context
-        cf = custom(start, end)
-        # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (
-            hidden_states,
-            aux_inputs.attention_mask,
-            context,
-            aux_inputs.context_mask,
-            *rotary_pos_emb,
-            aux_inputs.padding_mask,
-            aux_inputs.input_ids,
-        )
+        nonlocal hidden_states
+        cf, tensor_inputs = custom(start, end, aux_inputs)
+        args = (hidden_states, *tensor_inputs)
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
             if self.config.fp8 or self.config.fp4:
-                hidden_states, context = te_checkpoint(
+                hidden_states = te_checkpoint(
                     cf,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
@@ -161,13 +121,11 @@ def checkpointed_forward(
                     *args,
                 )
             else:
-                hidden_states, context = tensor_parallel.checkpoint(
+                hidden_states = tensor_parallel.checkpoint(
                     cf, self.config.distribute_saved_activations, *args
                 )
         else:
-            # Note: original block-branch no-checkpoint path omitted padding_mask
-            # (relied on its default=None); restored here for consistency.
-            hidden_states, context = cf(*args)
+            hidden_states = cf(*args)
 
         if self.config.recompute_method == "uniform":
             if (end - 1 + layer_offset) in extract_layer_indices:
@@ -204,8 +162,4 @@ def checkpointed_forward(
     else:
         raise ValueError("Invalid activation recompute method.")
 
-    # Return intermediate hidden states if feature extraction was requested
-    if len(extract_layer_indices) > 0:
-        return hidden_states, intermediate_hidden_states
-
-    return hidden_states
+    return hidden_states, intermediate_hidden_states

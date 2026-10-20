@@ -214,7 +214,10 @@ class TestLayerAuxInputsEquivalence:
                 )
                 assert aux_outputs.bias is None
             else:
-                output = layer(value, residual_stream_recompute_context=context)
+                output = layer(
+                    hidden_states=value,
+                    aux_inputs=LayerAuxInputs(residual_stream_recompute_context=context),
+                )
                 if symbol != "M":
                     output = output[0]
             context.finalize(output)
@@ -277,7 +280,10 @@ class TestLayerAuxInputsEquivalence:
                         assert aux_outputs.bias is None
                     else:
                         kwargs = {"sequence_len_offset": sequence_offset} if symbol == "*" else {}
-                        output = layer(x, inference_context=context, **kwargs)
+                        output = layer(
+                            hidden_states=x,
+                            aux_inputs=LayerAuxInputs(inference_context=context, **kwargs),
+                        )
                         if symbol != "M":
                             output = output[0]
                     outputs.append(output.detach().clone())
@@ -309,11 +315,12 @@ def check_equivalence(symbol, test_core, *, stack_spec=hybrid_stack_spec, **conf
     mask = torch.ones(2, 1, 64, 64, device="cuda", dtype=torch.bool).triu(1)
 
     def legacy(value):
-        output = (
-            module(value)
-            if symbol == "M" or (test_core and symbol in ("-", "E"))
-            else module(value, attention_mask=mask)
-        )
+        if test_core:
+            output = (
+                module(value) if symbol in ("M", "-", "E") else module(value, attention_mask=mask)
+            )
+        else:
+            output = module(hidden_states=value, aux_inputs=LayerAuxInputs(attention_mask=mask))
         if test_core:
             result, bias = output
             return result if bias is None else result + bias
@@ -358,18 +365,18 @@ class TestLayerAuxInputsCudaGraphs:
         for param in graphed.parameters():
             param.main_grad = torch.zeros_like(param)
         x = torch.randn(32, 2, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        expected = eager(x, attention_mask=None)
+        expected = eager(hidden_states=x, aux_inputs=LayerAuxInputs())
         expected_value = expected.detach().clone()
         expected.float().sum().backward()
         expected_grad = x.grad.detach().clone()
         x.grad = None
-        recorded = graphed(x, attention_mask=None)
+        recorded = graphed(hidden_states=x, aux_inputs=LayerAuxInputs())
         assert_bit_exact(expected_value, {}, recorded, {})
         recorded.float().sum().backward()
         create_cudagraphs()
         for _ in range(2):
             x.grad = None
-            replayed = graphed(x, attention_mask=None)
+            replayed = graphed(hidden_states=x, aux_inputs=LayerAuxInputs())
             # Backward replay can reuse forward graph buffers; snapshot the value first.
             replayed_value = replayed.detach().clone()
             replayed.float().sum().backward()

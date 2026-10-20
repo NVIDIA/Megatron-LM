@@ -194,7 +194,7 @@ class TestHybridStackMHC:
         stack = _get_stack(config, num_local_layers=3).cuda()
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states, attention_mask=None)
+        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
 
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
@@ -233,7 +233,10 @@ class TestHybridStackMHC:
             record_input_ids,
         )
 
-        output = stack(hidden_states, attention_mask=None, input_ids=input_ids)
+        output = stack(
+            hidden_states=hidden_states,
+            aux_inputs=LayerAuxInputs(attention_mask=None, input_ids=input_ids),
+        )
         output.float().sum().backward()
 
         assert len(seen_input_ids) == 2
@@ -248,7 +251,7 @@ class TestHybridStackMHC:
             8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
 
-        output = stack(hidden_states, attention_mask=None)
+        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
 
         assert output.shape == hidden_states.shape
         assert output.dtype == torch.bfloat16
@@ -271,7 +274,7 @@ class TestHybridStackMHC:
         ).cuda()
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states, attention_mask=None)
+        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
 
         assert output.shape == hidden_states.shape
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in stack.layers)
@@ -303,7 +306,7 @@ class TestHybridStackMHC:
         ).cuda()
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states, attention_mask=None)
+        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
 
         wrapped_layer = stack.layers[0]
         assert isinstance(wrapped_layer, HyperConnectionHybridLayer)

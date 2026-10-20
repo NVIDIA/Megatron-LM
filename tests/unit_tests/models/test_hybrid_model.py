@@ -395,10 +395,11 @@ class TestHybridModel:
             def prepare_cp_layout(self, **kwargs):
                 return SimpleNamespace(**kwargs)
 
-            def forward(self, **kwargs):
-                self.mtp_input_mask = kwargs["mtp_input_mask"]
-                hidden_states = kwargs["hidden_states"]
-                return torch.cat((hidden_states, hidden_states), dim=0)
+            def forward(self, hidden_states, aux_inputs):
+                from megatron.core.transformer.layer_interface import LayerAuxOutputs
+
+                self.mtp_input_mask = aux_inputs.mtp_input_mask
+                return (torch.cat((hidden_states, hidden_states), dim=0), LayerAuxOutputs())
 
         self.model.config.mtp_num_layers = 1
         self.model.mtp_process = True

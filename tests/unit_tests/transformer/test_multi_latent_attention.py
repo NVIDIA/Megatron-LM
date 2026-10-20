@@ -23,6 +23,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttention,
@@ -1753,7 +1754,9 @@ class TestFusedMLAPreMLPResidualNorm:
         results = []
         for layer in (reference, fused):
             layer_input = hidden_states.clone().requires_grad_(True)
-            output, _ = layer(hidden_states=layer_input, attention_mask=attention_mask)
+            output, _ = layer(
+                hidden_states=layer_input, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
+            )
             output.backward(output_grad)
             grads = {
                 name: param.grad

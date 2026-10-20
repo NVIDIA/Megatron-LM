@@ -2070,9 +2070,14 @@ class CudaGraphManager(torch.nn.Module):
             cache_key: Optional hashable key for O(1) runner lookup.
                 If `inference_context` is provided, this gets set to the correct value.
         """
-        is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        aux_inputs = kwargs.get("aux_inputs")
+        inference_context = (
+            aux_inputs.inference_context
+            if aux_inputs is not None
+            else kwargs.get("inference_context")
+        )
+        is_inference_mode = inference_context is not None
         if cache_key is None and is_inference_mode:
-            inference_context = kwargs['inference_context']
             if inference_context.is_static_batching():
                 batch_size = kwargs['hidden_states'].shape[0]
                 cache_key = (batch_size, inference_context.is_decode_only())

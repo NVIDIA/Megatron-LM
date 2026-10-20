@@ -33,6 +33,7 @@ from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.layer_interface import LayerAuxInputs, LayerAuxOutputs
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
@@ -425,18 +426,30 @@ class TestMultiTokenPredictionLayer:
         seen_masks = []
 
         class _IncrementLayer:
-            def __call__(
+
+            def _get_embeddings(
                 self,
+                *,
                 hidden_states,
                 input_ids,
                 position_ids,
                 padding_mask,
-                mtp_input_mask=None,
+                mtp_input_mask,
                 **kwargs,
             ):
+                return (
+                    input_ids,
+                    position_ids,
+                    padding_mask,
+                    mtp_input_mask,
+                    hidden_states,
+                    hidden_states,
+                )
+
+            def __call__(self, hidden_states, aux_inputs):
                 seen_inputs.append(hidden_states.clone())
-                seen_masks.append(mtp_input_mask)
-                return hidden_states + 1, input_ids, position_ids, padding_mask, mtp_input_mask
+                seen_masks.append(aux_inputs.mtp_input_mask)
+                return hidden_states + 1, LayerAuxOutputs()
 
         block = types.SimpleNamespace(
             config=config,
@@ -463,11 +476,13 @@ class TestMultiTokenPredictionLayer:
         mtp_input_mask = torch.tensor([[True, False]])
         MultiTokenPredictionBlock.forward(
             block,
-            input_ids=torch.zeros(1, 2, dtype=torch.long),
-            position_ids=torch.zeros(1, 2, dtype=torch.long),
             hidden_states=hidden_states,
-            attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
-            mtp_input_mask=mtp_input_mask,
+            aux_inputs=LayerAuxInputs(
+                input_ids=torch.zeros(1, 2, dtype=torch.long),
+                position_ids=torch.zeros(1, 2, dtype=torch.long),
+                attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
+                mtp_input_mask=mtp_input_mask,
+            ),
         )
 
         torch.testing.assert_close(seen_inputs[0], hidden_states)
@@ -484,12 +499,22 @@ class TestMultiTokenPredictionLayer:
         )
         seen_embeddings = []
 
-        class _CaptureLayer:
-            def __call__(
-                self, hidden_states, input_ids, position_ids, padding_mask, decoder_input, **kwargs
-            ):
-                seen_embeddings.append(decoder_input.clone())
-                return hidden_states, input_ids, position_ids, padding_mask, None
+        layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+        torch.nn.Module.__init__(layer)
+        layer.config = config
+        layer.cp_group = layer.tp_group = None
+        layer.mtp_layer_pattern = None
+
+        def capture_precomputed(decoder_input, hidden_states):
+            seen_embeddings.append(decoder_input.clone())
+            return MultiTokenPredictionLayer._get_precomputed_embeddings(
+                layer, decoder_input, hidden_states
+            )
+
+        layer._get_precomputed_embeddings = capture_precomputed
+        layer._proj_and_transformer_layer = (
+            lambda hidden_states, aux_inputs, **kwargs: hidden_states
+        )
 
         block = types.SimpleNamespace(
             config=config,
@@ -501,17 +526,16 @@ class TestMultiTokenPredictionLayer:
             tp_group=None,
             hidden_state_mixing_rng_tracker_name=None,
             sequence_parallel=False,
-            layers=[_CaptureLayer(), _CaptureLayer()],
+            layers=[layer, layer],
         )
         decoder_input = torch.arange(4, dtype=torch.float32).view(4, 1, 1)
 
         MultiTokenPredictionBlock.forward(
             block,
-            input_ids=None,
-            position_ids=None,
             hidden_states=torch.ones_like(decoder_input),
-            decoder_input=decoder_input,
-            attention_mask=None,
+            aux_inputs=LayerAuxInputs(
+                input_ids=None, position_ids=None, decoder_input=decoder_input, attention_mask=None
+            ),
         )
 
         torch.testing.assert_close(
@@ -530,15 +554,29 @@ class TestMultiTokenPredictionLayer:
         seen_inputs = []
 
         class _IncrementLayer:
-            def __call__(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
-                seen_inputs.append(hidden_states.clone())
+
+            def _get_embeddings(
+                self,
+                *,
+                hidden_states,
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+                **kwargs,
+            ):
                 return (
-                    hidden_states + 10,
                     input_ids,
                     position_ids,
                     padding_mask,
-                    kwargs.get("mtp_input_mask"),
+                    mtp_input_mask,
+                    hidden_states,
+                    hidden_states,
                 )
+
+            def __call__(self, hidden_states, aux_inputs):
+                seen_inputs.append(hidden_states.clone())
+                return hidden_states + 10, LayerAuxOutputs()
 
         block = types.SimpleNamespace(
             config=config,
@@ -575,11 +613,13 @@ class TestMultiTokenPredictionLayer:
         hidden_states = torch.arange(5, dtype=torch.float32).view(5, 1, 1)
         MultiTokenPredictionBlock.forward(
             block,
-            input_ids=torch.zeros(1, 5, dtype=torch.long),
-            position_ids=torch.zeros(1, 5, dtype=torch.long),
             hidden_states=hidden_states,
-            attention_mask=torch.ones(1, 1, 5, 5, dtype=torch.bool),
-            packed_seq_params=packed_seq_params,
+            aux_inputs=LayerAuxInputs(
+                input_ids=torch.zeros(1, 5, dtype=torch.long),
+                position_ids=torch.zeros(1, 5, dtype=torch.long),
+                attention_mask=torch.ones(1, 1, 5, 5, dtype=torch.bool),
+                packed_seq_params=packed_seq_params,
+            ),
         )
 
         expected_once = [1, 2, 12, 4, 14] if packed else [1, 2, 3, 4, 14]
@@ -840,7 +880,6 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
-        mtp_layer = mtp.layers[0]
 
         seq_len = 4
         batch_size = 2
@@ -849,33 +888,38 @@ class TestMultiTokenPredictionLayer:
         padding_mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
         hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
         attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
-        seen = {}
+        seen = []
 
         def fake_embedding(input_ids, position_ids):
             return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
 
         def fake_proj_and_transformer_layer(self, hidden_states, aux_inputs, *, decoder_input):
-            seen["padding_mask"] = aux_inputs.padding_mask
+            seen.append(aux_inputs.padding_mask)
             return hidden_states
 
-        monkeypatch.setattr(
-            mtp_layer,
-            "_proj_and_transformer_layer",
-            types.MethodType(fake_proj_and_transformer_layer, mtp_layer),
-        )
+        for layer in mtp.layers:
+            monkeypatch.setattr(
+                layer,
+                "_proj_and_transformer_layer",
+                types.MethodType(fake_proj_and_transformer_layer, layer),
+            )
 
-        _, _, _, returned_padding_mask, _ = mtp_layer.forward(
+        inputs = LayerAuxInputs(
             input_ids=input_ids,
             position_ids=position_ids,
-            hidden_states=hidden_states,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
             embedding=fake_embedding,
         )
+        mtp(hidden_states, inputs)
+        assert inputs.padding_mask is padding_mask
+        assert inputs.decoder_input is None
 
-        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
-        assert torch.equal(seen["padding_mask"], expected_padding_mask)
-        assert torch.equal(returned_padding_mask, expected_padding_mask)
+        expected_padding_mask = padding_mask
+        assert len(seen) == config.mtp_num_layers
+        for actual_padding_mask in seen:
+            expected_padding_mask, _ = roll_tensor(expected_padding_mask, shifts=-1, dims=-1)
+            assert torch.equal(actual_padding_mask, expected_padding_mask)
 
     def test_get_embeddings_detaches_decoder_input(self):
         """With mtp_detach_heads=True, _get_embeddings detaches decoder_input (severing
@@ -987,8 +1031,9 @@ class TestMultiTokenPredictionLayer:
         # gradient flow to the detach logic (not the attention kernels). Must be an
         # nn.Module since it is assigned as a child module of the layer.
         class _IdentityMTPLayer(torch.nn.Module):
-            def forward(self, hidden_states, **kwargs):
-                return hidden_states, None
+
+            def forward(self, hidden_states, aux_inputs):
+                return hidden_states, LayerAuxOutputs()
 
         for layer in mtp.layers:
             monkeypatch.setattr(layer, "mtp_model_layer", _IdentityMTPLayer())
@@ -1008,12 +1053,14 @@ class TestMultiTokenPredictionLayer:
         def fake_embedding(input_ids, position_ids):
             return emb_weight.clone()
 
-        output = mtp.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            embedding=fake_embedding,
+        output, _ = mtp.forward(
+            hidden_states,
+            LayerAuxInputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                embedding=fake_embedding,
+            ),
         )
 
         # forward concatenates [main_hidden_states, mtp_out_0, mtp_out_1] along dim 0;
@@ -1089,13 +1136,15 @@ class TestMultiTokenPredictionLayer:
             input_ids.size(1), 1, config.hidden_size, device="cuda", requires_grad=True
         )
 
-        output = mtp(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attention_mask=None,
-            embedding=embedding,
-            mtp_input_mask=mtp_input_mask,
+        output, _ = mtp(
+            hidden_states,
+            LayerAuxInputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                embedding=embedding,
+                mtp_input_mask=mtp_input_mask,
+            ),
         )
 
         # Each MTP output at position 4 can causally attend to every invalid
@@ -1517,15 +1566,28 @@ class TestMTPHiddenStateRollUnderParallelism:
         class _TokenCountingLayer:
             """Stands in for an MTP layer: advances the state by exactly one token."""
 
-            def __call__(self, hidden_states, input_ids, position_ids, padding_mask=None, **kwargs):
-                layer_inputs.append(hidden_states.detach().clone())
+            def _get_embeddings(
+                self,
+                *,
+                hidden_states,
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask,
+                **kwargs,
+            ):
                 return (
-                    hidden_states + 1,
                     input_ids,
                     position_ids,
                     padding_mask,
-                    kwargs.get("mtp_input_mask"),
+                    mtp_input_mask,
+                    hidden_states,
+                    hidden_states,
                 )
+
+            def __call__(self, hidden_states, aux_inputs):
+                layer_inputs.append(hidden_states.detach().clone())
+                return hidden_states + 1, LayerAuxOutputs()
 
         rolled_history = []
         mixed_states = []
@@ -1582,11 +1644,13 @@ class TestMTPHiddenStateRollUnderParallelism:
         token_ids = torch.zeros(batch_size, local_seq_length, dtype=torch.int64, device="cuda")
         output = MultiTokenPredictionBlock.forward(
             block,
-            input_ids=token_ids,
-            position_ids=token_ids.clone(),
             hidden_states=hidden_states,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
+            aux_inputs=LayerAuxInputs(
+                input_ids=token_ids,
+                position_ids=token_ids.clone(),
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+            ),
         )
         return rolled_history, mixed_states, layer_inputs, output
 
@@ -3326,23 +3390,13 @@ class TestMultiTokenPredictionHybrid:
         input_ids = torch.arange(4).reshape(1, 4)
         position_ids = torch.arange(4).reshape(1, 4)
         padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
         decoder_input = torch.randn(4, 1, 8)
         hidden_states = torch.randn(4, 1, 8)
         calls = {"inner": 0, "outer": 0}
 
-        def get_embeddings(_self, **_kwargs):
-            return (
-                input_ids,
-                position_ids,
-                padding_mask,
-                mtp_input_mask,
-                decoder_input,
-                hidden_states,
-            )
-
         def inner_forward(_self, states, aux_inputs, *, decoder_input):
             calls["inner"] += 1
+            assert decoder_input is aux_inputs.decoder_input
             assert states is hidden_states
             assert aux_inputs.padding_mask is padding_mask
             return hidden_states + 1
@@ -3351,17 +3405,17 @@ class TestMultiTokenPredictionHybrid:
             calls["outer"] += 1
             raise AssertionError("Hybrid MTP must not use the outer checkpoint")
 
-        layer._get_embeddings = types.MethodType(get_embeddings, layer)
         layer._proj_and_transformer_layer = types.MethodType(inner_forward, layer)
         layer._checkpointed_forward = types.MethodType(outer_forward, layer)
 
-        output, *_ = layer(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attention_mask=None,
-            padding_mask=padding_mask,
-            embedding=object(),
+        output, _ = layer(
+            hidden_states,
+            LayerAuxInputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+                decoder_input=decoder_input,
+            ),
         )
 
         assert calls == {"inner": 1, "outer": 0}
@@ -3581,8 +3635,11 @@ class TestMultiTokenPredictionHybrid:
                     packed_seq_params=kwargs["packed_seq_params"],
                 )
 
-            def __call__(self, **kwargs):
-                return self.forward_impl(**kwargs)
+            def __call__(self, hidden_states, aux_inputs=None, **kwargs):
+                if aux_inputs is None:
+                    return self.forward_impl(hidden_states=hidden_states, **kwargs)
+                output = self.forward_impl(hidden_states=hidden_states, **vars(aux_inputs))
+                return output, LayerAuxOutputs()
 
         def output_layer(output, **kwargs):
             return output, None

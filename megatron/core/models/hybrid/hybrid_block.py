@@ -7,20 +7,19 @@
 
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
 
-from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout, THDCPLayoutPlan
+from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
@@ -32,7 +31,6 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
@@ -67,8 +65,7 @@ from megatron.core.transformer.wide_residual_layer import (
     expand_wide_residual_stream,
 )
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
-
+from megatron.core.utils import WrappedTensor, make_viewless_tensor
 
 @dataclass
 class HybridStackSubmodules:
@@ -538,43 +535,19 @@ class HybridStack(MegatronModule):
         if manager is not None and is_block_end:
             manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
+    def bind_layer_outputs(self, result):
+        """Expose the optional pre-contraction MTP stream as an auxiliary output."""
+        if isinstance(result, Tensor):
+            return super().bind_layer_outputs(result)
+        hidden_states, mhc_multistream = result
+        return hidden_states, LayerAuxOutputs(mhc_multistream=mhc_multistream)
+
     @bind_layer_interface
-    def forward(
-        self,
-        hidden_states: Union[Tensor, WrappedTensor],
-        attention_mask: Tensor,
-        inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        padding_mask=None,
-        packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
-        cp_layout_plan: THDCPLayoutPlan | None = None,
-        input_ids: Optional[Tensor] = None,
-    ):
-        """
-        Forward function of the HybridStack class.
-
-        It either returns the Loss values if labels are given or the
-            final hidden units
-
-        Args:
-            hidden_states (Union[Tensor, WrappedTensor]): the input tensor.
-                Can be passed as a WrappedTensor during inference to avoid an obsolete
-                reference in the calling function.
-            attention_mask (Tensor): the attention mask.
-            inference_context (BaseInferenceContext): the inference parameters.
-            rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
-                Defaults to None.
-            input_ids (Tensor, optional): Token IDs forwarded to hash-routed
-                TransformerLayer instances. Defaults to None.
-        Returns:
-            Tensor: the output tensor.
-        """
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
+    def forward(self, hidden_states: Union[Tensor, WrappedTensor], aux_inputs: LayerAuxInputs):
+        """Execute the stack, deriving only layer-local scheduling inputs."""
+        inference_context = aux_inputs.inference_context
+        packed_seq_params = aux_inputs.packed_seq_params
+        padding_mask = aux_inputs.padding_mask
         if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
             raise NotImplementedError(
                 "Hybrid chunkwise context parallelism does not support padding masks."
@@ -584,8 +557,8 @@ class HybridStack(MegatronModule):
         if self._cp_layout_manager is not None:
             cp_layout_state = self._cp_layout_manager.build_forward_state(
                 packed_seq_params,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                thd_plan=cp_layout_plan,
+                packed_seq_params_by_layout=aux_inputs.packed_seq_params_by_layout,
+                thd_plan=aux_inputs.cp_layout_plan,
             )
 
         packed_sequence_cp_metadata = None
@@ -682,33 +655,34 @@ class HybridStack(MegatronModule):
             if use_residual_stream_recompute
             else [None] * self.num_layers_per_pipeline_rank
         )
-        execution_context = LayerExecutionContext(
-            quant_context_factory=get_inner_quant_context,
-            cp_layout_state=cp_layout_state,
-            residual_stream_recompute_plan=residual_stream_recompute_plan,
+        execution_context = (
+            LayerExecutionContext(
+                quant_context_factory=get_inner_quant_context,
+                cp_layout_state=cp_layout_state,
+                residual_stream_recompute_plan=residual_stream_recompute_plan,
+            )
+            if self._residual_stream_atomic_layer_pairs
+            else None
         )
 
-        base_aux_inputs = LayerAuxInputs(
-            attention_mask=attention_mask,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-            input_ids=input_ids,
+        # Layout planning belongs to this stack, outside individual layer graphs.
+        aux_inputs = aux_inputs.update(
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            packed_seq_params_by_layout=None,
+            cp_layout_plan=None,
         )
 
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
-                hidden_states = checkpointed_forward(
+                hidden_states, _ = checkpointed_forward(
                     self,
                     hidden_states,
-                    base_aux_inputs,
+                    aux_inputs,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                 )
             else:
-                base_aux_inputs = replace(
-                    base_aux_inputs,
+                aux_inputs = aux_inputs.update(
                     inference_context=inference_context,
                     sequence_len_offset=sequence_len_offset,
                     execution_context=execution_context,
@@ -721,7 +695,7 @@ class HybridStack(MegatronModule):
                         strict=True,
                     )
                 ):
-                    layer_packed_seq_params = packed_seq_params
+                    layer_packed_seq_params = aux_inputs.packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx
                     ]
@@ -753,8 +727,7 @@ class HybridStack(MegatronModule):
                     # Observe ordinary layers inside their CP layout conversions.
                     residual_accumulator = hidden_states
                     with inner_quant_context:
-                        aux_inputs = replace(
-                            base_aux_inputs,
+                        aux_inputs = aux_inputs.update(
                             packed_seq_params=layer_packed_seq_params,
                             residual_stream_recompute_context=residual_stream_recompute_context,
                             mhc_recompute_manager=mhc_manager,
@@ -806,7 +779,7 @@ class HybridStack(MegatronModule):
         )
 
         if mhc_multistream is not None:
-            return hidden_states, LayerAuxOutputs(mhc_multistream=mhc_multistream)
+            return hidden_states, mhc_multistream
         return hidden_states
 
     def sharded_state_dict(

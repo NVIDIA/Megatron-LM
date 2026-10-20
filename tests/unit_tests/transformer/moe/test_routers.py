@@ -20,6 +20,7 @@ from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import capture_tensor_observations
+from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
@@ -1923,7 +1924,10 @@ class TestHashRouting:
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
         input_ids = torch.randint(0, config.hash_moe_vocab_size, (2, 8), device="cuda")
 
-        output, _ = layer(hidden_states=hidden_states, attention_mask=None, input_ids=input_ids)
+        output, _ = layer(
+            hidden_states=hidden_states,
+            aux_inputs=LayerAuxInputs(attention_mask=None, input_ids=input_ids),
+        )
 
         assert layer.mlp.router.is_hash_layer
         assert output.shape == hidden_states.shape

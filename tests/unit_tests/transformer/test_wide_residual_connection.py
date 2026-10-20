@@ -10,7 +10,7 @@ from torch import nn
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import bind_layer_interface
+from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
@@ -768,9 +768,11 @@ class TestWideResidualLayerIntegration:
         )
         hidden_states = torch.randn(2, 3, config.hidden_size, requires_grad=True)
 
-        output, aux_outputs = layer(hidden_states=hidden_states, attention_mask=None)
+        output, context = layer(
+            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
+        )
 
-        assert aux_outputs.context is None
+        assert context is None
         assert type(layer) is TransformerLayer
         assert not hasattr(layer, "residual_connection_self_attn")
         assert not hasattr(layer, "residual_connection_mlp")
@@ -855,10 +857,12 @@ class TestWideResidualLayerIntegration:
         base = torch.randn(2, 3, config.hidden_size, requires_grad=True)
         residual_stream = expand_wide_residual_stream(base, 3)
 
-        output, aux_outputs = layer(hidden_states=residual_stream, attention_mask=None)
+        output, context = layer(
+            hidden_states=residual_stream, aux_inputs=LayerAuxInputs(attention_mask=None)
+        )
 
         expected = expand_wide_residual_stream(12.0 * base + 4.0, 3)
-        assert aux_outputs.context is None
+        assert context is None
         assert output.shape[-1] == 3 * config.hidden_size
         assert torch.allclose(output, expected)
         assert layer.self_attention.last_hidden_size == config.hidden_size
@@ -927,7 +931,10 @@ class TestWideResidualLayerIntegration:
         layer.residual_connection_mlp.register_forward_pre_hook(record_operation, with_kwargs=True)
         base = torch.randn(2, 3, config.hidden_size)
 
-        layer(hidden_states=expand_wide_residual_stream(base, 3), attention_mask=None)
+        layer(
+            hidden_states=expand_wide_residual_stream(base, 3),
+            aux_inputs=LayerAuxInputs(attention_mask=None),
+        )
 
         assert operations == [
             ("self_attention", "read"),

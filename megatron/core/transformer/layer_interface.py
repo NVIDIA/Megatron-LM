@@ -1,14 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Auxiliary invocation inputs and outputs for hybrid layers.
 
-Legacy forwards remain supported during migration. The private adapter dispatches
-only on the input container, never on the kind of layer or core.
+Computational cores keep their natural forward arguments; composition layers carry
+the input container. Binding dispatches on that container, never on the kind of layer.
 """
 
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -54,6 +54,11 @@ class LayerAuxInputs:
     packed_seq_params: PackedSeqParams | None = None
     padding_mask: Tensor | None = None
     input_ids: Tensor | None = None
+    position_ids: Tensor | None = None
+    mtp_input_mask: Tensor | None = None
+    decoder_input: Tensor | None = None
+    embedding: Callable | None = None
+    mhc_multistream: Tensor | None = None
     sequence_len_offset: Tensor | int | None = None
     packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None
     rotary_pos_cos: Tensor | None = None
@@ -68,23 +73,28 @@ class LayerAuxInputs:
     mhc_recompute_manager: Any = None
     execution_context: LayerExecutionContext | None = None
 
+    def update(self, **updates) -> LayerAuxInputs:
+        """Reuse this snapshot unless a field changes; never mutate earlier inputs."""
+        if all(getattr(self, name) is value for name, value in updates.items()):
+            return self
+        return replace(self, **updates)
+
 
 @experimental_api
 @dataclass(frozen=True)
 class LayerAuxOutputs:
     """Named outputs accompanying hidden states.
 
-    Only ``bias`` is an additive contribution. ``context`` carries cross-attention
-    state; ``mhc_multistream`` preserves the decoder stream consumed by MTP.
+    ``bias`` is an additive contribution; ``mhc_multistream`` preserves the
+    decoder stream consumed by MTP. Layers do not return or advance their invocation inputs.
     """
 
     bias: Tensor | None = None
-    context: Tensor | None = None
     mhc_multistream: Tensor | None = None
 
 
-def _flatten_layer_aux_outputs(aux_outputs):
-    """Expose only present tensors to graph and autograd tree utilities."""
+def _flatten_layer_aux(aux_outputs):
+    """Expose present fields to graph and autograd tree utilities."""
     names = tuple(
         field.name for field in fields(aux_outputs) if getattr(aux_outputs, field.name) is not None
     )
@@ -93,22 +103,31 @@ def _flatten_layer_aux_outputs(aux_outputs):
 
 register_pytree_node(
     LayerAuxOutputs,
-    _flatten_layer_aux_outputs,
+    _flatten_layer_aux,
     lambda values, names: LayerAuxOutputs(**dict(zip(names, values))),
+)
+register_pytree_node(
+    LayerAuxInputs,
+    _flatten_layer_aux,
+    lambda values, names: LayerAuxInputs(**dict(zip(names, values))),
 )
 
 
 LayerOutput = tuple[Tensor, LayerAuxOutputs]
 
 
-def _normalize_layer_output(result, *, output_field="bias") -> LayerOutput:
-    """Name a raw auxiliary output, preserving already-bound outputs."""
+def _normalize_layer_output(result) -> LayerOutput:
+    """Bind natural tensors or bias pairs to hidden states and named outputs."""
     if isinstance(result, Tensor):
         return result, LayerAuxOutputs()
     hidden_states, aux_outputs = result
     if not isinstance(aux_outputs, LayerAuxOutputs):
-        return hidden_states, LayerAuxOutputs(**{output_field: aux_outputs})
-    return result
+        if aux_outputs is not None and not isinstance(aux_outputs, Tensor):
+            raise TypeError(
+                "Layer outputs must contain auxiliary outputs or a tensor bias, not inputs"
+            )
+        aux_outputs = LayerAuxOutputs(bias=aux_outputs)
+    return hidden_states, aux_outputs
 
 
 @experimental_api
@@ -129,7 +148,8 @@ class LayerInterface(Protocol):
 
     Implement ``forward(x, aux_inputs) -> LayerOutput`` directly, or use
     ``@bind_layer_interface`` on an explicit-argument forward. Customize binding
-    only through ``bind_layer_inputs`` and ``bind_layer_outputs``.
+    only through ``bind_layer_inputs`` and ``bind_layer_outputs``. Inputs are immutable;
+    layers process them without returning a replacement for the next layer.
     """
 
     def bind_layer_inputs(self, hidden_states, aux_inputs: LayerAuxInputs, *, forward=None):
