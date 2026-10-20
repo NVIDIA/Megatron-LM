@@ -22,7 +22,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -36,6 +35,13 @@ from megatron.core.ssm.mamba_mixer import (
     causal_conv1d_fn,
     mamba_chunk_scan_combined,
 )
+
+# einops is optional for megatron-core; mamba-ssm, which the shared-prefix paths require,
+# depends on it.
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
 
 
 def _mamba_state_dtype_kwargs(mixer: MambaMixer) -> dict:

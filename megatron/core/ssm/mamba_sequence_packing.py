@@ -6,7 +6,6 @@ from functools import lru_cache
 from itertools import accumulate
 
 import torch
-from einops import rearrange
 
 from megatron.core.ssm.mamba_mixer import (
     MAMBA_HAS_STATE_DTYPE,
@@ -14,6 +13,13 @@ from megatron.core.ssm.mamba_mixer import (
     causal_conv1d_fn,
     mamba_chunk_scan_combined,
 )
+
+# einops is optional for megatron-core; mamba-ssm, which the shared-prefix paths require,
+# depends on it.
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
 
 
 @lru_cache(maxsize=32)
