@@ -150,7 +150,7 @@ class InferenceSetupConfig:
     offset_sampling_seed_by_dp_rank: bool = True
     """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
     generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
-    --deterministic-mode is enabled."""
+    deterministic mode is enabled (the default)."""
 
     inference_dynamic_batching_async_sched_mode: Literal["async", "legacy"] = "async"
     """Async scheduling mode for dynamic batching. "async" (default) overlaps asynchronous
