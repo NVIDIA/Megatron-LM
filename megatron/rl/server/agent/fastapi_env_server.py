@@ -68,6 +68,9 @@ class FastAPIEnvServer(EnvironmentServer):
             return JSONResponse(status_code=500, content={"detail": repr(exc)})
 
         if isinstance(env, RewardOnlyAgent):
+            bos_policies = {None: policy, getattr(policy, "add_bos", None): policy}
+            for add_bos in (False, True):
+                bos_policies.setdefault(add_bos, policy.model_copy(update={"add_bos": add_bos}))
 
             @app.post("/prompts/")
             async def sample_prompt(request: RemotePromptRequest) -> RemotePrompt:
@@ -79,7 +82,7 @@ class FastAPIEnvServer(EnvironmentServer):
                 group_request = GroupedRolloutRequest(
                     num_groups=1,
                     rollouts_per_group=1,
-                    inference_interface=policy,
+                    inference_interface=bos_policies[request.add_bos],
                     generation_args=request.generation_args,
                     validation=request.validation,
                 )
@@ -158,11 +161,15 @@ class FastAPIEnvServer(EnvironmentServer):
             golden=sampled.golden,
             generation_args=request.generation_args,
             validation=request.validation,
+            add_bos=getattr(request.inference_interface, "add_bos", None),
         )
 
         async def run_episode() -> Rollout | TokenRollout:
             # The env server scores the episode itself, so the episode is already the rollout.
-            return _ROLLOUT.validate_python(await self._post("/episodes/", episode_request))
+            rollout = _ROLLOUT.validate_python(await self._post("/episodes/", episode_request))
+            if env_id := getattr(self, "env_id", None):
+                rollout.env_id = env_id
+            return rollout
 
         async def build_rollout(rollout: Rollout | TokenRollout) -> Rollout | TokenRollout:
             return rollout
@@ -216,7 +223,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--add-bos",
         action="store_true",
-        help="Prepend BOS to prompts; set it when the trainer runs without --rl-skip-bos-token.",
+        help="Prepend BOS for episode requests that do not state a convention."
     )
     args = parser.parse_args()
     with open(args.env_config, 'r') as f:

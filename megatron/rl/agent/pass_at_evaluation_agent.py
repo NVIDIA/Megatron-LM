@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from ..__init__ import GenericGenerationArgs
+from .. import GenericGenerationArgs
 from ..inference import LLMChatMessage
 from .api import EvaluationAgent, EvaluationRequest, EvaluationResponse, RewardEvaluationResult
 

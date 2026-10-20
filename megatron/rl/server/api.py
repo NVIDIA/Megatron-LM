@@ -5,9 +5,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 from typing_extensions import Self, Type
 
-from .. import TypeLookupable
-
-from ..__init__ import Request
+from .. import Request, TypeLookupable
 from ..agent.api import EvaluationRequest, RolloutRequest
 from ..inference import InferenceInterface, LLMChatMessage
 
@@ -63,6 +61,7 @@ class RemoteEpisodeRequest(Request):
     prompt: str | list[LLMChatMessage]
     golden: Any = None
     validation: bool = False
+    add_bos: bool | None = None  # None: use the env server's launch-time default.
     inference_interface: None = None
 
 

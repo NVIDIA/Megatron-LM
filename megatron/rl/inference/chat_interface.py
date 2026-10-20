@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from openai import AsyncOpenAI
+import httpx
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pydantic import PrivateAttr
 
 from .api import InferenceRequest, InferenceResponse, LLMChatMessage
@@ -18,7 +19,14 @@ class MegatronChatInterface(ReturnsTokens, ReturnsRaw):
     def openai_client(self) -> AsyncOpenAI:
         """The shared client, created on first use unless one was installed."""
         if self._openai_client is None:
-            self._openai_client = AsyncOpenAI(base_url=self.base_url, api_key="NONE", timeout=None)
+            self._openai_client = AsyncOpenAI(
+                base_url=self.base_url,
+                api_key="NONE",
+                http_client=DefaultAsyncHttpxClient(
+                    timeout=None,
+                    limits=httpx.Limits(max_connections=None, max_keepalive_connections=None),
+                ),
+            )
         return self._openai_client
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
