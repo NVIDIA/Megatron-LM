@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   select:
-    name: Select tests on CPU
+    name: unit tests selection
     if: inputs.unit_testmon_mode == 'enforce'
     runs-on: ubuntu-latest
     permissions:
@@ -107,10 +107,24 @@ jobs:
           PATH: ${{ steps.cache-compression.outputs.path }}
         with:
           script: |
-            const select = require('./.github/scripts/select_unit_tests.js');
-            const cache = require(`${process.env.RUNNER_TEMP}/testmon/node_modules/@actions/cache`);
-            const {DefaultArtifactClient} = require(`${process.env.RUNNER_TEMP}/testmon/node_modules/@actions/artifact`);
-            await select({core, cache, artifact: new DefaultArtifactClient()});
+            // Only SDK transport lives here; Python owns selection and the matrix.
+            const client = `
+              (async () => {
+                const [operation, ...args] = process.argv.slice(1);
+                const modules = process.env.RUNNER_TEMP + '/testmon/node_modules/';
+                if (operation === 'restore') {
+                  const key = await require(modules + '@actions/cache').restoreCache(
+                    [args[0]], args[1], [args[2]]);
+                  require('node:fs').writeFileSync(args[3], key || '');
+                } else {
+                  const {DefaultArtifactClient} = require(modules + '@actions/artifact');
+                  await new DefaultArtifactClient().uploadArtifact(args[0], [args[1]], args[2]);
+                }
+              })().catch(error => { console.error(error); process.exitCode = 1; });
+            `;
+            await exec.exec('python', ['.github/scripts/select_unit_tests.py'], {
+              env: {...process.env, TESTMON_NODE: process.execPath, TESTMON_ACTIONS: client},
+            });
 
   run:
     name: ${{ matrix.bucket }}

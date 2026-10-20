@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib.util
 import json
 import os
 import re
@@ -798,6 +799,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     bucket = "tests/unit_tests/test_example.py"
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
+    assert workflow["jobs"]["select"]["name"] == "unit tests selection"
     assert workflow["jobs"]["run"]["needs"] == "select"
     expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
     expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
@@ -859,10 +861,10 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
 @pytest.mark.parametrize(
     "scenario", ["mixed", "empty", "cache-error", "selector-error", "upload-error"]
 )
-def test_grouped_cpu_selection(tmp_path: Path, scenario: str) -> None:
+def test_grouped_cpu_selection(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     pytest.importorskip("testmon")
-    if shutil.which("node") is None:
-        pytest.skip("Grouped workflow validation requires Node.js")
     buckets = [
         {"bucket": f"tests/unit_tests/{name}/**/*.py", "timeout": 40}
         for name in (["empty"] if scenario == "empty" else ["selected", "empty", "full"])
@@ -907,8 +909,8 @@ def test_grouped_cpu_selection(tmp_path: Path, scenario: str) -> None:
         "RUNNER_TEMP": str(tmp_path),
         "GITHUB_RUN_ID": "123",
         "GITHUB_RUN_ATTEMPT": "2",
-        "TEST_SCENARIO": scenario,
-        "TEST_HELPER": str(ROOT / ".github/scripts/select_unit_tests.js"),
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
     }
     # Empty recorded databases are sufficient: a new file is selected, and a
     # bucket without files is skipped. Use real cache validation and selection.
@@ -940,61 +942,57 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         capture_output=True,
         text=True,
     )
-    result = subprocess.run(
-        [
-            "node",
-            "-e",
-            """
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const outputs = {}, uploads = [], warnings = [];
-const scenario = process.env.TEST_SCENARIO;
-let restores = 0;
-const core = {
-  info() {}, startGroup() {}, endGroup() {},
-  warning(message) { warnings.push(message); },
-  setOutput(name, value) { outputs[name] = value; },
-  summary: {addHeading() { return this; }, addTable() { return this; }, async write() {}},
-};
-const cache = {async restoreCache(paths, key, prefixes) {
-  assert.deepEqual(paths, ['assets_dir/testmon']);
-  assert.equal(key, `${prefixes[0]}lookup-123-2`);
-  assert(!fs.existsSync(paths[0]), 'previous bucket cache was not cleared');
-  const index = restores++;
-  if (scenario === 'selector-error' && index === 1)
-    fs.unlinkSync('tests/unit_tests/testmon_selector.py');
-  if (scenario === 'cache-error' && index === 0) throw new Error('cache unavailable');
-  if (!fs.existsSync(`saved/${index}`)) return undefined;
-  fs.cpSync(`saved/${index}`, paths[0], {recursive: true});
-  return `${prefixes[0]}111-1`;
-}};
-const artifact = {async uploadArtifact(name, files, root) {
-  if (scenario === 'upload-error') throw new Error('artifact unavailable');
-  assert.equal(root, 'assets_dir/testmon-plan');
-  assert.deepEqual(files, [`${root}/plan.json`]);
-  uploads.push({name, plan: JSON.parse(fs.readFileSync(files[0], 'utf8'))});
-}};
-function report(error) { console.log(JSON.stringify({outputs, uploads, warnings, restores, error})); }
-require(process.env.TEST_HELPER)({core, cache, artifact})
-  .then(() => report()).catch(error => { report(error.message); process.exitCode = 1; });
-""",
-        ],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
+    spec = importlib.util.spec_from_file_location(
+        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
     )
-    report = json.loads(result.stdout)
+    assert spec is not None and spec.loader is not None
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    monkeypatch.chdir(tmp_path)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    uploads = []
+    restores = 0
+
+    def actions(operation, *args):
+        nonlocal restores
+        if operation == "restore":
+            path, key, prefix, key_file = args
+            assert path == "assets_dir/testmon"
+            assert key == f"{prefix}lookup-123-2"
+            assert not Path(path).exists(), "previous bucket cache was not cleared"
+            index = restores
+            restores += 1
+            if scenario == "selector-error" and index == 1:
+                (unit_tests / "testmon_selector.py").unlink()
+            if scenario == "cache-error" and index == 0:
+                raise subprocess.CalledProcessError(1, [operation])
+            saved = tmp_path / "saved" / str(index)
+            if saved.exists():
+                shutil.copytree(saved, path)
+            Path(key_file).write_text(f"{prefix}111-1" if saved.exists() else "")
+        else:
+            assert operation == "upload"
+            if scenario == "upload-error":
+                raise subprocess.CalledProcessError(1, [operation])
+            name, plan, root = args
+            assert root == "assets_dir/testmon-plan"
+            assert plan == f"{root}/plan.json"
+            uploads.append({"name": name, "plan": json.loads(Path(plan).read_text())})
+
+    monkeypatch.setattr(selector, "_actions", actions)
     if scenario in {"selector-error", "upload-error"}:
-        assert result.returncode != 0
-        assert report["outputs"] == {}
-        assert report["restores"] == (2 if scenario == "selector-error" else 1)
-        assert len(report["uploads"]) == (1 if scenario == "selector-error" else 0)
+        with pytest.raises(subprocess.CalledProcessError):
+            selector.main()
+        assert not (tmp_path / "outputs").exists()
+        assert restores == (2 if scenario == "selector-error" else 1)
+        assert len(uploads) == (1 if scenario == "selector-error" else 0)
         return
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert report["restores"] == len(buckets)
-    matrix = json.loads(report["outputs"]["matrix"])
-    assert report["outputs"]["has_tests"] == str(scenario != "empty").lower()
+    selector.main()
+    assert restores == len(buckets)
+    outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
+    matrix = json.loads(outputs["matrix"])
+    assert outputs["has_tests"] == str(scenario != "empty").lower()
     assert [entry["bucket"] for entry in matrix] == [
         entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
     ]
@@ -1004,8 +1002,8 @@ require(process.env.TEST_HELPER)({core, cache, artifact})
         else ["full" if scenario == "cache-error" else "preselected", "full"]
     )
     assert all(entry["timeout"] == 40 for entry in matrix)
-    assert bool(report["warnings"]) == (scenario == "cache-error")
-    for upload in report["uploads"]:
+    assert bool(caplog.records) == (scenario == "cache-error")
+    for upload in uploads:
         plan = upload["plan"]
         assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])
         expected = (
@@ -1017,5 +1015,5 @@ require(process.env.TEST_HELPER)({core, cache, artifact})
         assert bool(matches) == bool(expected)
         if matches:
             assert matches[0]["plan_artifact"] == upload["name"]
-    assert any("/empty/" in upload["plan"]["bucket"] for upload in report["uploads"])
+    assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
     assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")
