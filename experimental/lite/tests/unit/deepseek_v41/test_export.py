@@ -123,10 +123,10 @@ def _owner_worker(rank, root, ep, pp):
             cfg,
             ParallelState(),
             target=target,
-            buffer_max_size_bytes=128,
+            buffer_max_size_bytes=16384,
         )
         output = f'{root}/distributed-{target}'
-        save_hf_weights(model, output, cfg, ps, target=target, buffer_max_size_bytes=128)
+        save_hf_weights(model, output, cfg, ps, target=target, buffer_max_size_bytes=16384)
         actual, expected = _files(output), _files(f'{root}/reference-{target}')
         assert actual.keys() == expected.keys()
         assert all(
@@ -135,7 +135,7 @@ def _owner_worker(rank, root, ep, pp):
         )
         load_hf_weights(model, output, cfg, ps)
         save_hf_weights(
-            model, f'{root}/again-{target}', cfg, ps, target=target, buffer_max_size_bytes=128
+            model, f'{root}/again-{target}', cfg, ps, target=target, buffer_max_size_bytes=16384
         )
         assert all(
             torch.equal(_bits(v), _bits(_files(f'{root}/again-{target}')[k]))
@@ -185,3 +185,12 @@ def test_runtime_export_finishes_overlapped_parameter_gather():
         _extras={'protocol': SimpleNamespace(export_hf_weights=export)},
     )
     assert len(list(object.__new__(MegatronLiteRuntime).export_weights(handle))) == 1
+
+
+def test_row_fragments_are_bounded_and_preserve_order():
+    from megatron.lite.primitive.ckpt.row_export import iter_row_shards
+
+    value = torch.arange(160, dtype=torch.uint8).reshape(5, 32)
+    parts = [p for _, p in iter_row_shards([("rows", value, 0, 5)], max_bytes=64)]
+    assert [p.start for p in parts] == [0, 2, 4] and all(p.tensor.numel() <= 64 for p in parts)
+    assert torch.equal(torch.cat([p.tensor for p in parts]), value)
