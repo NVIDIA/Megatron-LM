@@ -475,7 +475,7 @@ scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
 
 
 def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
+    data_iterator, config, num_microbatches, pg_collection: ProcessGroupCollection
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -487,8 +487,6 @@ def wrap_data_iterator(
         pg_collection: Caller-owned process groups; must define dp_cp, dp, tp, and pp.
     """
 
-    if pg_collection is None:
-        raise ValueError("pg_collection is required for sequence packing")
     dp_cp_group = pg_collection.dp_cp
     dp_group = pg_collection.dp
     tp_group = pg_collection.tp
