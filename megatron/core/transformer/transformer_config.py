@@ -3640,6 +3640,16 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
+        if self.dynamic_context_parallel:
+            # Captured graphs bake in static communicators, so they cannot follow the
+            # per-microbatch CP group that dynamic context parallelism selects at runtime.
+            assert (
+                self.cuda_graph_impl == "none"
+            ), "Dynamic context parallelism not supported with CUDA Graph"
+            assert (
+                self.calculate_per_token_loss
+            ), "Dynamic context parallelism must be used with calculate_per_token_loss"
+
         if self.cuda_graph_scope is not None:
             assert self.cuda_graph_modules in (
                 "full",

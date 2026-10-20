@@ -1303,10 +1303,8 @@ def validate_args(args, defaults={}):
         args.hybrid_context_parallel = False
 
     if args.dynamic_context_parallel:
-        assert args.cuda_graph_impl == "none", 'Dynamic context parallelism not supported with CUDA Graph'
         assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
         assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
-        assert args.calculate_per_token_loss, 'Dynamic context parallelism must be used with --calculate-per-token-loss'
         if args.sequence_packing_scheduler is None:
             args.sequence_packing_scheduler = 'default_dynamic_cp'
         if args.sequence_packing_scheduler != 'default_dynamic_cp':

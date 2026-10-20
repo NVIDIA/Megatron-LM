@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""validate_args must reject CUDA graphs with dynamic context parallelism.
+"""The config built from args must reject CUDA graphs with dynamic context parallelism.
 
 A captured graph bakes in static communicators, so it cannot follow the per-microbatch
 context-parallel group that dynamic context parallelism selects at runtime.
@@ -10,7 +10,8 @@ import sys
 
 import pytest
 
-from megatron.training.arguments import parse_args, validate_args
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 
 _GUARD = "Dynamic context parallelism not supported with CUDA Graph"
 
@@ -54,23 +55,26 @@ def test_hybrid_context_parallel_rejects_cuda_graph_impl(
     monkeypatch, cuda_graph_impl, prerequisites
 ):
     args = _hybrid_cp_args(monkeypatch, cuda_graph_impl=cuda_graph_impl, **prerequisites)
+    validate_args(args)
     with pytest.raises(AssertionError, match=_GUARD):
-        validate_args(args)
+        core_transformer_config_from_args(args, TransformerConfig)
 
 
 @pytest.mark.parametrize("deprecated_flag", ["enable_cuda_graph", "external_cuda_graph"])
 def test_hybrid_context_parallel_rejects_deprecated_cuda_graph_flags(monkeypatch, deprecated_flag):
     # validate_args translates these into cuda_graph_impl and deletes them before the
-    # hybrid-CP checks run, so the guard must read cuda_graph_impl.
+    # config is built, so the guard must read cuda_graph_impl.
     args = _hybrid_cp_args(monkeypatch, **{deprecated_flag: True})
+    validate_args(args)
     with pytest.raises(AssertionError, match=_GUARD):
-        validate_args(args)
+        core_transformer_config_from_args(args, TransformerConfig)
 
 
 def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
     args = _hybrid_cp_args(monkeypatch)
     validate_args(args)
     assert args.cuda_graph_impl == "none"
+    assert core_transformer_config_from_args(args, TransformerConfig).dynamic_context_parallel
 
 
 def test_hybrid_builder_rejects_dynamic_context_parallel(monkeypatch):

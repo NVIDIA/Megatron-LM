@@ -531,6 +531,7 @@ def test_sequence_packing_dense_config_passes():
 def test_dynamic_cp_accepts_contiguous_linear_layout():
     config = _make_packing_config(
         dynamic_context_parallel=True,
+        calculate_per_token_loss=True,
         sequence_packing_scheduler="default_dynamic_cp",
         context_parallel_size=2,
         linear_cp_layout="contiguous",
@@ -633,3 +634,27 @@ def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
     TransformerConfig(offload_modules=["expert_fc1", "moe_act"], **common)
     with pytest.raises(ValueError, match="cannot be combined with expert_fc1 or moe_act"):
         TransformerConfig(offload_modules=["fused_group_mlp", "moe_act"], **common)
+
+
+@requires_te_2_9
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (
+            {"calculate_per_token_loss": True, "cuda_graph_impl": "local"},
+            "Dynamic context parallelism not supported with CUDA Graph",
+        ),
+        (
+            {"calculate_per_token_loss": True, "enable_cuda_graph": True},
+            "Dynamic context parallelism not supported with CUDA Graph",
+        ),
+        ({}, "Dynamic context parallelism must be used with calculate_per_token_loss"),
+    ],
+)
+def test_dynamic_cp_rejects_unsupported_config(overrides, message):
+    with pytest.raises(AssertionError, match=message):
+        _make_packing_config(
+            dynamic_context_parallel=True,
+            sequence_packing_scheduler="default_dynamic_cp",
+            **overrides,
+        )
