@@ -29,14 +29,17 @@ def test_post_backward_promotes_query_key_before_making_leaves(rows, master_dtyp
     for got in actual[2:4]:
         assert got.dtype == torch.float32
         if rows:
-            assert not torch.equal(got, got.bfloat16().float()), 'BF16-leaf negative control'
+            assert not torch.equal(
+                got, got.bfloat16().float()
+            ), 'BF16-leaf negative control'
 
 
 def test_fp4_negative_zero_survives_decode_and_requantization():
     values = torch.tensor(_FP4_E2M1_TABLE).repeat(2).reshape(1, 32)
     assert values[0, 8].signbit()
     codes, _ = quantize_mxfp4(values)
-    unpacked = torch.stack((codes & 15, codes >> 4), dim=-1).flatten(-2)
+    unsigned = codes.to(torch.int16) & 255
+    unpacked = torch.stack((unsigned & 15, unsigned >> 4), dim=-1).flatten(-2)
     assert unpacked.tolist() == [list(range(16)) * 2]
 
 
@@ -57,7 +60,9 @@ def test_modular_forward_consults_readiness_between_updates(monkeypatch, publish
         model.child.weight.data.copy_(master.detach())
 
     setattr(model.child.weight, PARAM_READY_CALLBACK_ATTR, ready)
-    monkeypatch.setattr(module.NativeModel, 'forward', lambda self, x, **kw: x @ self.child.weight)
+    monkeypatch.setattr(
+        module.NativeModel, 'forward', lambda self, x, **kw: x @ self.child.weight
+    )
     if not publish:
         monkeypatch.setattr(module, 'ensure_params_ready', lambda params: None)
     for _ in range(2):
