@@ -500,7 +500,8 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     wrap_data_iterator.assert_called_once_with(original_iterator, config, 1)
     assert forwarded_iterators == [packed_iterator, packed_iterator]
     assert captured["num_microbatches"] == 3
-    assert result[-3:] == (3, 12.0, 34.0)
+    assert len(result) == 12
+    assert result[8:] == (3, 12.0, 34.0, None)
 
 
 @pytest.mark.parametrize(
