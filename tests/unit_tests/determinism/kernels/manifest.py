@@ -347,7 +347,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels. Fused aux loss uses TE's "
-        "fixed-order reduction when explicitly requested or torch deterministic algorithms is enabled; "
+        "fixed-order reduction when explicitly requested, with torch deterministic algorithms on or off; "
         "the default atomic branch is a negative control.",
     ),
     KernelEntry(

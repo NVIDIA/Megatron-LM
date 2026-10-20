@@ -127,8 +127,7 @@ def switch_load_balancing_loss_func(
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
                                                False for padding tokens. Defaults to None.
-        deterministic (bool): Require deterministic fused loss execution. PyTorch's global
-                              deterministic-algorithms setting also enables this requirement.
+        deterministic (bool): Require deterministic fused loss execution.
 
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
@@ -150,7 +149,6 @@ def switch_load_balancing_loss_func(
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
-        deterministic = deterministic or torch.are_deterministic_algorithms_enabled()
         supports_deterministic = te_supports_deterministic_moe_aux_loss()
         if deterministic and not supports_deterministic:
             raise ValueError(
