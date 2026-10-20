@@ -310,7 +310,6 @@ def test_flashinfer_row_kernels_replay(kernel):
     assert_replays_bit_exact(fn, args, backward=False, what=kernel)
 
 
-
 @pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
 def test_mxfp8_quantize_rows_replays():
     """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows."""
