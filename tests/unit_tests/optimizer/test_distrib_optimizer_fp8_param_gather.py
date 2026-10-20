@@ -192,53 +192,95 @@ def test_precision_aware_optimizer_requires_distributed_optimizer(model_parallel
         _get_optimizer(model, use_distributed_optimizer=False)
 
 
-# (format saved with, format loaded with, whether the checkpoint records its format). The
-# unrecorded ones stand for checkpoints written before the format was recorded, which hold
-# MCore-managed FP32 main params for this configuration, so only those are left unrecorded.
+# (FP8 recipe, main params dtype, format saved with, format loaded with, whether the checkpoint
+# records its format). The unrecorded ones stand for checkpoints written before the format was
+# recorded, so they are saved the way those versions saved them: MCore-managed FP32 main params
+# with a non-delayed recipe, param remainders without FP8 where TE owned FP32 master weights, and
+# FP32 master values with FP16 main params, where TE stores no remainders.
+_FP32, _FP16 = torch.float32, torch.float16
 _CHECKPOINT_COMPATIBILITY_CASES = [
-    (None, None, True),
-    (True, True, True),
-    (None, True, True),
-    (True, None, True),
-    (None, None, False),
-    (None, True, False),
+    ("tensorwise", _FP32, None, None, True),
+    ("tensorwise", _FP32, True, True, True),
+    ("tensorwise", _FP32, None, True, True),
+    ("tensorwise", _FP32, True, None, True),
+    ("tensorwise", _FP32, None, None, False),
+    ("tensorwise", _FP32, None, True, False),
+    (None, _FP32, None, None, True),
+    (None, _FP32, False, False, True),
+    (None, _FP32, None, False, True),
+    (None, _FP32, None, None, False),
+    # An explicit --no-store-param-remainders must not hide the remainders of an old checkpoint.
+    (None, _FP32, None, False, False),
+    # TE ignores store_param_remainders for FP16 master weights, so it changes nothing here.
+    (None, _FP16, None, None, True),
+    (None, _FP16, None, None, False),
+    (None, _FP16, True, False, False),
 ]
 
 
 @pytest.mark.parametrize(
-    ("save_remainders", "load_remainders", "record_format"), _CHECKPOINT_COMPATIBILITY_CASES
+    ("fp8_recipe", "main_params_dtype", "save_remainders", "load_remainders", "record_format"),
+    _CHECKPOINT_COMPATIBILITY_CASES,
 )
 def test_param_remainders_checkpoint_compatibility(
-    model_parallel, tmp_path_dist_ckpt, save_remainders, load_remainders, record_format
+    model_parallel,
+    tmp_path_dist_ckpt,
+    fp8_recipe,
+    main_params_dtype,
+    save_remainders,
+    load_remainders,
+    record_format,
 ):
     """dist-checkpointing would load int16 param remainders as FP32 master params, or the
     reverse, with a silent value cast that corrupts the master weights, so a format mismatch must
     raise, and matching formats must load the exact master weights."""
     metadata = {"distrib_optim_sharding_type": "dp_reshardable", "checkpoint_version": 3.1}
-    name = f"remainders_{save_remainders}_{load_remainders}_{record_format}"
+    name = (
+        f"remainders_{fp8_recipe}_{main_params_dtype}_{save_remainders}_{load_remainders}_"
+        f"{record_format}"
+    )
     with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
         model = _ddp_model()
-        _, optimizer = _get_optimizer(model, store_param_remainders=save_remainders)
+        _, optimizer = _get_optimizer(
+            model,
+            fp8_recipe,
+            main_params_dtype=main_params_dtype,
+            store_param_remainders=save_remainders,
+        )
         _train_step(model, optimizer)
         (saving,) = optimizer.chained_optimizers
+        saved_remainders = saving._stores_param_remainders()
+        if main_params_dtype != torch.float32:
+            # The checkpoint format must match what TE holds: FP16 masters, never remainders.
+            assert not saved_remainders
+            assert all(master.dtype == torch.float16 for master in _master_params(optimizer))
         sharded_state_dict = saving.sharded_state_dict({}, metadata=metadata)
-        assert sharded_state_dict["param_state_param_remainders"] == bool(save_remainders)
+        assert sharded_state_dict["param_state_param_remainders"] == saved_remainders
         if not record_format:
             del sharded_state_dict["param_state_param_remainders"]
         save({"optimizer": sharded_state_dict}, ckpt_dir)
         saved_shard = saving.get_main_param_shard(model.module.weight)
 
-        _, optimizer = _get_optimizer(model, store_param_remainders=load_remainders)
+        _, optimizer = _get_optimizer(
+            model,
+            fp8_recipe,
+            main_params_dtype=main_params_dtype,
+            store_param_remainders=load_remainders,
+        )
         (loading,) = optimizer.chained_optimizers
         loaded = load(
             {"optimizer": loading.sharded_state_dict({}, metadata=metadata, is_loading=True)},
             ckpt_dir,
         )
-        if bool(save_remainders) != bool(load_remainders):
+        if saved_remainders != loading._stores_param_remainders():
             with pytest.raises(RuntimeError, match="silently corrupt"):
                 loading.load_state_dict(loaded["optimizer"])
             return
         loading.load_state_dict(loaded["optimizer"])
         loaded_shard = loading.get_main_param_shard(model.module.weight)
         if saved_shard is not None:
-            assert torch.equal(loaded_shard, saved_shard)
+            if main_params_dtype == torch.float32:
+                assert torch.equal(loaded_shard, saved_shard)
+            else:
+                # TE rescales FP16 master weights from their absmax when setting them.
+                torch.testing.assert_close(loaded_shard, saved_shard, rtol=2**-10, atol=0)

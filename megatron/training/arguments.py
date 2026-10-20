@@ -3624,13 +3624,13 @@ def _add_experimental_args(parser):
     group.add_argument('--store-param-remainders', action=argparse.BooleanOptionalAction,
                        default=None,
                        help='With --use-precision-aware-optimizer, BF16 params and FP32 main '
-                       'params, store only the 16 low bits of the FP32 master weights that the '
-                       'BF16 params do not hold. This saves memory, and the optimizer checkpoint '
-                       'then holds these int16 remainders instead of FP32 master weights. Enabled '
-                       'by default, except with a non-delayed --fp8-recipe and no '
-                       '--fp8-param-gather, where it is off so that optimizer checkpoints hold '
-                       'FP32 master weights, like the checkpoints of that configuration written by '
-                       'Megatron Core versions that did not record the format. Disabled with '
+                       'params, store only the low 16 bits of each FP32 master weight (the BF16 '
+                       'param holds the high 16 bits). This saves memory, and the optimizer '
+                       'checkpoint then holds int16 remainders instead of FP32 master weights. '
+                       'On by default, except with a non-delayed --fp8-recipe, FP32 main params '
+                       'and no --optimizer-cpu-offload: there it is off by default, to stay '
+                       'compatible with existing checkpoints of that configuration, which hold '
+                       'FP32 master weights. No effect with --fp8-param-gather. Disabled with '
                        '--optimizer-cuda-graph. Ignored by Megatron-FSDP.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
                        help='Dtype of main grads when enabling precision-aware-optimizer.')

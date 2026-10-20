@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional
 
-from megatron.core.utils import is_te_min_version, log_single_rank
+from megatron.core.utils import log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -1765,7 +1765,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return bool(
             self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
             and self.config.resolved_store_param_remainders
-            and self.config.bf16
         )
 
     def _check_loaded_param_remainders(self, state_dict: dict) -> None:
@@ -1801,13 +1800,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Backward compatibility: infer whether a checkpoint written before the format was recorded
         holds param remainders.
         """
-        # Such checkpoints never combined param remainders with --optimizer-cuda-graph (TE
-        # rejected it), so this run's --optimizer-cuda-graph is ignored.
+        # Such a checkpoint holds param remainders exactly when TE owned the master weights of
+        # BF16 params. That does not depend on this run's store_param_remainders or
+        # optimizer_cuda_graph, so both are ignored: an explicit store_param_remainders=False must
+        # still be detected as a mismatch, not load the remainders as FP32 master weights.
         return bool(
             self.config._te_master_weights_in_checkpoint_without_format()
-            and self.config.bf16
-            and self.config.store_param_remainders is not False
-            and is_te_min_version("2.1.0")
+            and self.config._param_remainders_supported()
         )
 
     def _param_groups_to_param2group_meta(

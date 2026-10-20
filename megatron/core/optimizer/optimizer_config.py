@@ -205,12 +205,17 @@ class OptimizerConfig:
         int16 remainder of the 16 bits the BF16 parameter holds. This lowers GPU memory usage, and
         the optimizer checkpoint then holds int16 remainders instead of FP32 master weights.
 
-        None (default) resolves to True, except with FP32 main params and a non-delayed FP8 recipe,
-        where the precision-aware optimizer owns the master weights only because the params are
-        BF16. There it resolves to False, so that checkpoints hold FP32 master weights like the
-        checkpoints of this configuration written by Megatron Core versions that did not record
-        the master weight format, which hold MCore-managed FP32 main params. Setting it to True
-        there saves memory, but makes the optimizer checkpoints incompatible with those.
+        None (default) resolves to True, except when:
+            - FP32 main params and
+            - a non-delayed FP8 recipe and
+            - no optimizer_cpu_offload.
+        Otherwise, resolves to False. 
+        This is for backwards-compatibility for checkpoints written  in this case 
+        by Megatron Core versions that did not record the master weight format, which hold
+        MCore-managed FP32 main params. Setting it to True saves memory, but makes
+        old optimizer checkpoints incompatible.
+        Only takes effect with BF16 params and FP32 main params: TE FusedAdam stores no remainders
+        for FP16 main params.
         The value in effect is the resolved_store_param_remainders property.
     """
 
@@ -474,9 +479,16 @@ class OptimizerConfig:
     def _te_master_weights_in_checkpoint_without_format(self) -> bool:
         """Backward compatibility: whether this configuration's optimizer checkpoints written before
         the master weight format was recorded hold TE-owned master weights (else MCore-managed main
-        params). Megatron Core then let TE own the master weights only where it does so even for
-        FP8 params."""
+        params). Those versions did not distinguish BF16 from FP8 params: they let TE own the master
+        weights only in the configurations where it owns them for FP8 params, which is what
+        fp8_param_gather=True reproduces."""
         return self._te_owns_master_weights(fp8_param_gather=True)
+
+    def _param_remainders_supported(self) -> bool:
+        """Whether TE FusedAdam stores param remainders when asked to, wherever it owns the master
+        weights. It needs BF16 params, whose 16 bits the remainders complete, and FP32 master
+        weights: with FP16 master weights it silently ignores store_param_remainders."""
+        return self.bf16 and self.main_params_dtype == torch.float32 and is_te_min_version("2.1.0")
 
     @property
     def resolved_store_param_remainders(self) -> bool:
@@ -488,7 +500,7 @@ class OptimizerConfig:
             # main params, so that the checkpoints of this configuration keep that format.
             requested = self._te_master_weights_in_checkpoint_without_format()
         # TE FusedAdam's capturable (CUDA graph) mode cannot store param remainders.
-        return requested and is_te_min_version("2.1.0") and not self.optimizer_cuda_graph
+        return requested and self._param_remainders_supported() and not self.optimizer_cuda_graph
 
     def resolve_fp8_param_gather(self, ddp_fp8_param_gather: bool) -> "OptimizerConfig":
         """Return a copy of this config with fp8_param_gather taken from the model's DDP config.
