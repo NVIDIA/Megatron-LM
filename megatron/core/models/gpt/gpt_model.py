@@ -453,9 +453,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
-                packed_seq = (
-                    packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-                )
+                packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
                 cp_group = packed_seq_params.cp_group if packed_seq_params is not None else None
                 rotary_pos_emb = self.rotary_pos_emb(
                     rotary_seq_len, packed_seq=packed_seq, cp_group=cp_group
