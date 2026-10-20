@@ -28,7 +28,15 @@ MCore's ``fp8_utils`` is deliberately not imported, since this package must not 
 
 import torch
 from torch import nn
-from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+
+from ..utils import HAVE_TE
+
+if HAVE_TE:
+    from transformer_engine.pytorch import tensor as te_tensor
+
+    GroupedTensor = getattr(te_tensor, "GroupedTensor", ())
+else:
+    GroupedTensor = ()
 
 
 def get_values(tensor: torch.Tensor) -> torch.Tensor:
@@ -39,6 +47,8 @@ def get_values(tensor: torch.Tensor) -> torch.Tensor:
     """
     if not isinstance(tensor, GroupedTensor):
         return tensor
+    if tensor.quantizer is not None:
+        raise NotImplementedError("Quantized GroupedTensor storage requires a separate path.")
     return tensor.rowwise_data.view(tensor.shape)
 
 
@@ -49,9 +59,10 @@ def install_storage(parameter: nn.Parameter, storage: torch.Tensor) -> None:
     remap there is nothing worth preserving from the previous allocation.
 
     Only high-precision grouped storage is supported. Quantized grouped storage keeps ``uint8``
-    bytes plus its own scale and amax buffers, none of which FSDP shards, so it is rejected by
-    the dtype check below rather than silently remapped.
+    bytes plus its own scale and amax buffers, so it requires a separate sharding path.
     """
+    if parameter.quantizer is not None:
+        raise NotImplementedError("Quantized GroupedTensor storage requires a separate path.")
     flat_storage = storage.view(-1)
     old_rowwise_data = parameter.rowwise_data
     if flat_storage.numel() != old_rowwise_data.numel():

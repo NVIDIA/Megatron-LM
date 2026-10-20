@@ -472,11 +472,15 @@ class FsdpParameterGroup:
                 )
 
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = (
+            unsharded_tensor = (
                 unsharded_model_weight.get_tensor_view(index)
                 if isinstance(unsharded_model_weight, DBuffer)
                 else unsharded_model_weight.get_tensor(index)
             )
+            if isinstance(fsdp_parameter.unsharded, GroupedTensor):
+                install_storage(fsdp_parameter.unsharded, unsharded_tensor)
+            else:
+                fsdp_parameter.unsharded.data = unsharded_tensor
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:

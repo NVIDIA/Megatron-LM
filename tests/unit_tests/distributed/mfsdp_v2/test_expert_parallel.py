@@ -2,7 +2,7 @@
 
 """Megatron-FSDP v2 composed with expert parallelism through a real MCore HybridModel.
 
-Checks that an ``EP=4`` transformer-MoE ``HybridModel`` (an attention layer + a MoE layer)
+Checks that an ``EP=4`` transformer-MoE ``HybridModel`` (``EP=2`` on four ranks)
 sharded with mFSDP v2 (experts over the expert-DP sub-mesh, dense params over the full DP
 mesh), consuming its ``1/dp`` shard of a global batch, reproduces a single **full-batch
 ``EP=1`` reference**.
@@ -301,13 +301,19 @@ def _train(
 )
 @pytest.mark.parametrize("single_grouped_weight", _WEIGHT_LAYOUTS)
 def test_ep_fsdp_matches_fullbatch_reference(
-    distributed_setup, dense_placements, moe_placements, single_grouped_weight, te_single_grouped_env
+    distributed_setup,
+    dense_placements,
+    moe_placements,
+    single_grouped_weight,
+    te_single_grouped_env,
 ):
     """All dense/MoE ZeRO combinations reproduce sequential no-shard training."""
     device = distributed_setup.device
     world_size, rank = distributed_setup.world_size, distributed_setup.rank
 
-    num_experts, ep_size = 8, 4
+    if world_size < 4:
+        pytest.skip("Requires at least four ranks to compose EP with expert-DP sharding.")
+    num_experts, ep_size = 8, min(4, world_size // 2)
     # hidden=64 with 4 heads -> head_dim=16, large enough for the attention backend.
     hidden, ffn_hidden, vocab, seq, b_local = 64, 128, 128, 8, 2
     # HybridModel builds one layer per pattern symbol, so "*E" is a two-layer stack: "*" a
@@ -444,5 +450,5 @@ def test_ep_fsdp_matches_fullbatch_reference(
         torch.stack(reference_losses),
         rtol=5e-3,
         atol=5e-3,
-        msg="EP=4 mFSDP model did not reproduce full-batch EP=1 training.",
+        msg=f"EP={ep_size} mFSDP model did not reproduce full-batch EP=1 training.",
     )
