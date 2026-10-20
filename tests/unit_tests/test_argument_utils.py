@@ -81,6 +81,27 @@ def _minimal_training_args(monkeypatch):
     return args
 
 
+@pytest.mark.parametrize(
+    "flags, expected",
+    [
+        ([], True),
+        (["--deterministic-mode"], True),
+        (["--disable-deterministic-mode"], False),
+        (["--deterministic-mode", "--disable-deterministic-mode"], False),
+        (["--disable-deterministic-mode", "--deterministic-mode"], False),
+    ],
+)
+def test_cli_determinism_reaches_transformer_config(flags, expected):
+    parser = add_megatron_arguments(ArgumentParser())
+    args = parser.parse_args(flags)
+    args.params_dtype = torch.float32
+    config = core_transformer_config_from_args(
+        args, config_class=CapturingTransformerConfig
+    )
+    assert args.disable_deterministic_mode == (not expected)
+    assert config.deterministic_mode is expected
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()
