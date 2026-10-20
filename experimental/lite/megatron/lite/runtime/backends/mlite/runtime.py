@@ -420,6 +420,13 @@ class MegatronLiteRuntime(RuntimeBase):
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
+        # Complete overlapped DistOpt gathers before publishing updated weights.
+        wrapped = handle._model if isinstance(handle._model, (list, tuple)) else [handle._model]
+        for chunk in {id(c): c for c in [*model_chunks, *wrapped]}.values():
+            sync = getattr(chunk, "start_param_sync", None)
+            if callable(sync):
+                sync(force_sync=True)
+
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
         else:
