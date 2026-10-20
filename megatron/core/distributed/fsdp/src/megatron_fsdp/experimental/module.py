@@ -32,7 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .indexed_order import IndexedOrder
+from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -199,11 +199,17 @@ class FsdpModule:
         """
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
-            module.register_full_backward_hook(
-                lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
-                    cast(FsdpModule, hooked_module)
-                )
-            )
+
+            def grad_checking_post_backward_hook(module, grad_input, _grad_output):
+                if all(grad is None for grad in grad_input):
+                    # With no input gradients, this hook runs before internal backward.
+                    module.context._delayed_post_backward_callbacks.append(
+                        (module, post_backward_hook)
+                    )
+                else:
+                    post_backward_hook(module)
+
+            module.register_full_backward_hook(grad_checking_post_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
@@ -320,21 +326,25 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder[nn.Module], prefetch_size: int | None
+        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        next_module = order.next_item(cast(nn.Module, self))
+        module = cast(nn.Module, self)
+        order.advance(module)
+        next_module = order.next_item()
         if prefetch_size is None:
             if next_module is not None:
                 cast(FsdpModule, next_module)._unshard_parameter_groups()
             return
 
         prefetched_size = 0
+        offset = 1
         while next_module is not None and prefetched_size < prefetch_size:
             fsdp_module = cast(FsdpModule, next_module)
             fsdp_module._unshard_parameter_groups()
             prefetched_size += fsdp_module.num_parameter_elements
-            next_module = order.next_item(next_module)
+            offset += 1
+            next_module = order.next_item(offset)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.

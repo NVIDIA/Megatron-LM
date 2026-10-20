@@ -148,11 +148,11 @@ class ArgumentGroupFactory:
             return {"type": config_type}
 
         if origin in [types.UnionType, typing.Union]:
-            # Handle Optional and Union
-            if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
-                return self._extract_type(type_tuple[0])
-            else:
-                raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
+            # Optional may place None anywhere; multiple value types need CLI metadata.
+            value_types = [value_type for value_type in type_tuple if value_type is not type(None)]
+            if len(value_types) == 1:
+                return self._extract_type(value_types[0])
+            raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
 
         elif origin is list:
             if len(type_tuple) == 1:
@@ -216,15 +216,15 @@ class ArgumentGroupFactory:
                 if argparse_kwargs["action"] == "store_false":
                     argparse_kwargs["arg_names"] = [self._format_arg_name(name, prefix="no"), self._format_arg_name(name, prefix="disable")] 
         except TypeInferenceError as e:
-            if attr_argparse_meta is not None:
+            if attr_argparse_meta is None:
+                raise e
+            if "type" not in attr_argparse_meta:
                 print(
                     f"WARNING: Inferring the appropriate argparse argument type from {self.src_cfg_class} "
                     f"failed for {attribute.name}: {attribute.type}.\n"
                     "Deferring to attribute metadata. If the metadata is incomplete, 'parser.add_argument()' may fail.\n"
                     f"Original failure: {e}"
                 )
-            else:
-                raise e
 
         # metadata provided by field takes precedence 
         if attr_argparse_meta is not None:
@@ -563,11 +563,13 @@ def _default_config_from_args(
         return kwargs
 
 
-def resolve_tokenizer_vocab_size(cfg: PretrainConfigContainer, padded_vocab_size: int | None) -> None:
+def resolve_tokenizer_vocab_size(
+    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
+) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
 
     Args:
-        cfg: Previously constructed training configuration. Explicit model
+        cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
         padded_vocab_size: Final size resolved by tokenizer initialization,
             including any CLI/checkpoint override. None is valid only when the

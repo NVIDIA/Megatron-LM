@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.training import arguments, global_vars, initialize
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 @pytest.mark.parametrize("load_checkpoint", [False, True])
@@ -42,7 +43,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     calls = {}
     for name in (
         "set_run_config",
-        "initialize_runtime_services",
         "initialize_megatron",
         "load_checkpoint",
         "generate_and_write_samples_conditional",
@@ -55,7 +55,6 @@ def test_generate_samples_uses_inference_startup(monkeypatch, load_checkpoint, c
     script.main()
 
     calls["set_run_config"].assert_called_once_with(cfg)
-    calls["initialize_runtime_services"].assert_called_once_with(args)
     calls["initialize_megatron"].assert_called_once_with()
     if load_checkpoint:
         calls["load_checkpoint"].assert_called_once_with([model], None, None)
@@ -78,6 +77,8 @@ def test_resume_updates_microbatches_before_setup_validation(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.skip_train = True  # Evaluation-only setup must also restore the calculator.
+    run_config.validation.skip_train = True
+    run_config.train.micro_batch_size = 1
     args.load = "checkpoint"
     args.data_parallel_size = 1
     args.micro_batch_size = 1
@@ -205,7 +206,10 @@ def test_inference_distributed_initialization_without_training_fields(
         "result_rejected_tracker_filename",
     ):
         delattr(args, name)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
+    monkeypatch.setattr(initialize, "initialize_runtime_services", Mock())
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize, "set_default_log_ranks", Mock())
@@ -230,7 +234,10 @@ def test_inference_distributed_initialization_without_training_fields(
 
 
 def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch, run_config):
-    monkeypatch.setattr(initialize, "get_args", lambda: Namespace(tp_comm_overlap=True))
+    args = Namespace(tp_comm_overlap=True)
+    cfg = inference_cfg_container_from_args(args, build_model_config=False)
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(initialize, "get_args", lambda: args)
     distributed = Mock()
     monkeypatch.setattr(initialize, "_initialize_distributed", distributed)
     with pytest.raises(ValueError, match="fixed training user buffers"):
@@ -260,6 +267,8 @@ def test_distributed_training_services_require_explicit_opt_in(
     args.seq_length, args.decoder_seq_length = 64, 96
     args.decoder_tp_comm_overlap = decoder_overlap
     args.micro_batch_size = 7  # Deliberately stale; cfg.train owns the input.
+    args.batch_parallel_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     run_config.train.micro_batch_size = 3
     if native_model:
         run_config.model = GPTModelConfig(
@@ -282,6 +291,7 @@ def test_distributed_training_services_require_explicit_opt_in(
 
     monkeypatch.setattr(run_config, "finalize", finalize_config)
     for name in (
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
@@ -300,6 +310,7 @@ def test_distributed_training_services_require_explicit_opt_in(
 
     assert events == [
         "finalize_config",
+        "initialize_runtime_services",
         "init_persistent_async_worker",
         "initialize_rerun_state_machine",
         "_initialize_distributed",

@@ -112,9 +112,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    eval_iters: int | None = 100
+    eval_iters: int | list[int | None] | None = field(
+        default=100, metadata={"argparse_meta": {"type": int}}
+    )
     """Number of iterations to run for evaluation. Used for both validation and test. If not set,
-    evaluation will not run."""
+    evaluation will not run. Full/multiple validation resolves this to per-dataset counts."""
 
     eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
@@ -140,9 +142,6 @@ class ValidationConfig:
 
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
-
-    test_mode: bool = False
-    """Run all real-time test alongside the experiment."""
 
     full_validation: bool = False
     """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""
