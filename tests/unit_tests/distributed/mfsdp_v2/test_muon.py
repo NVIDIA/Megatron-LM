@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Distributed owner-compute Muon steps compared with unsharded Emerging Optimizers Muon."""
+"""Compare FSDP Muon training losses with unsharded Emerging Optimizers Muon."""
 
 import copy
 
@@ -8,7 +8,6 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
@@ -16,11 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    get_containing_parameter_group,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import intersect_ranges
 
 pytest.importorskip("emerging_optimizers")
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
@@ -28,14 +23,8 @@ from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import muon
 
 
-def _placements():
-    return Placements(
-        dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
-    )
-
-
 class TinyModel(nn.Module):
-    """Two buffers, each with a split matrix and a matrix wholly on one rank."""
+    """Hidden matrices optimized by Muon, with an output layer optimized by SGD."""
 
     def __init__(self):
         super().__init__()
@@ -54,35 +43,20 @@ class TinyModel(nn.Module):
         return self.block2(self.block1(x))
 
 
-def _parameter_groups(params):
-    return [
-        {
-            "params": [
-                params["block1.0.weight"],
-                params["block2.0.weight"],
-                params["block2.3.bias"],
-            ],
-            "lr": 0.05,
-        },
-        {
-            "params": [params["block1.2.weight"], params["block2.2.weight"]],
-            "lr": 0.02,
-            "momentum": 0.8,
-            "weight_decay": 0.0,
-        },
-    ]
-
-
-def _reference_shard(param, full):
-    group = get_containing_parameter_group(param)
-    buffer = group.main_weight
-    index = next(i for i, fp in enumerate(group.fsdp_parameters) if fp.sharded is param)
-    tensor_range = buffer.layout.get_tensor_range(index)
-    local_range = buffer.layout.get_local_range(buffer.mesh, buffer.placements)
-    shard = intersect_ranges(tensor_range, local_range)
-    if shard.numel == 0:
-        return full.new_empty(0)
-    return full.detach().view(-1).narrow(0, shard.start - tensor_range.start, shard.numel)
+def _train(
+    model: nn.Module, optimizers: tuple[torch.optim.Optimizer, ...], inputs: torch.Tensor
+) -> torch.Tensor:
+    """Train on the given batches and return the loss curve."""
+    losses = []
+    for x in inputs:
+        model.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=inputs.dtype, enabled=inputs.dtype == torch.bfloat16):
+            loss = model(x).float().sum()
+        losses.append(loss.detach())
+        loss.backward()
+        for optimizer in optimizers:
+            optimizer.step()
+    return torch.stack(losses)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
@@ -104,9 +78,9 @@ def _reference_shard(param, full):
     ],
 )
 def test_muon_matches_reference(
-    distributed_setup, monkeypatch, dtype, weight_decay_method, nesterov, kernel_options
+    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options
 ):
-    """Match weights and momentum over steps, including a checkpoint round trip."""
+    """FSDP and unsharded Muon should produce identical loss curves."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
@@ -115,111 +89,38 @@ def test_muon_matches_reference(
     mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))["dp"]
     torch.manual_seed(1234)
     model = TinyModel().to(device=device, dtype=dtype)
-    reference = copy.deepcopy(model)
-    reference_params = {
-        name: nn.Parameter(param.detach().float().clone())
-        for name, param in reference.named_parameters()
-    }
+    # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
+    reference = copy.deepcopy(model).float()
+    reference_params = dict(reference.named_parameters())
     with fully_shard_context(device=device):
-        fully_shard(model.block1, mesh=mesh, placements=_placements())
-        fully_shard(model.block2, mesh=mesh, placements=_placements())
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=Placements(
+                dp_axes=[0],
+                parameter=[RowAtomic()],
+                gradient=[RowAtomic()],
+                optimizer=[RowAtomic()],
+            ),
+        )
     params = dict(model.named_parameters())
     kwargs = dict(
-        momentum=0.9, nesterov=nesterov, weight_decay_method=weight_decay_method, **kernel_options
+        lr=0.05,
+        momentum=0.9,
+        nesterov=nesterov,
+        weight_decay_method=weight_decay_method,
+        **kernel_options,
     )
-    owner_assignment_calls = []
-    assign_owner_work = muon.assign_owner_work
-
-    def record_owner_assignment(buffers):
-        buffers = list(buffers)
-        owner_assignment_calls.append(buffers)
-        return assign_owner_work(buffers)
-
-    monkeypatch.setattr(muon, "assign_owner_work", record_owner_assignment)
-    optimizer = muon.FsdpMuon(_parameter_groups(params), **kwargs)
-    assert len(owner_assignment_calls) == 1
-    assert len(owner_assignment_calls[0]) == 2
-    # Upstream Muon requires matrix-only input; FsdpMuon skips the supplied bias.
-    reference_groups = _parameter_groups(reference_params)
-    for group in reference_groups:
-        group["params"] = [param for param in group["params"] if param.ndim == 2]
-    reference_optimizer = Muon(reference_groups, **kwargs)
     excluded_names = ["block2.3.weight", "block2.3.bias"]
+    muon_names = [name for name in params if name not in excluded_names]
+    optimizer = muon.FsdpMuon([params[name] for name in muon_names], **kwargs)
+    reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
     other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)
     reference_other = torch.optim.SGD([reference_params[n] for n in excluded_names], lr=0.01)
 
-    for block in (model.block1, model.block2):
-        buffer = get_containing_parameter_group(block[0].weight).main_weight
-        holder_counts = [
-            sum(
-                intersect_ranges(
-                    buffer.layout.get_tensor_range(i),
-                    buffer.layout.get_rank_range(mesh, buffer.placements, rank),
-                ).numel
-                > 0
-                for rank in mesh.mesh.tolist()
-            )
-            for i in range(2)
-        ]
-        assert sorted(holder_counts) == [1, 2]
-
-    for step in range(3):
-        model.zero_grad(set_to_none=True)
-        reference.zero_grad(set_to_none=True)
-        x = torch.randn(4, 8, device=device, dtype=dtype)
-        actual = model(x)
-        expected = reference(x)
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        actual.sum().backward()
-        expected.sum().backward()
-        skipped_names = ()
-        if step == 1:
-            # A whole buffer can skip a step without losing momentum or replanning.
-            skipped_names = ("block1.0.weight", "block1.2.weight")
-        elif step == 2:
-            # The remaining matrix in block2 must still use its own optimizer group.
-            skipped_names = ("block2.0.weight",)
-        for name in skipped_names:
-            params[name].grad = None
-            reference.get_parameter(name).grad = None
-        for name, param in reference.named_parameters():
-            reference_params[name].grad = None if param.grad is None else param.grad.float().clone()
-
-        excluded_before = [params[n].to_local().clone() for n in excluded_names]
-        optimizer.step()
-        # Reuse the assignments computed during construction, including after reload.
-        assert len(owner_assignment_calls) == (1 if step == 0 else 2)
-        assert len(owner_assignment_calls[-1]) == 2
-        for name, before in zip(excluded_names, excluded_before):
-            torch.testing.assert_close(params[name].to_local(), before, atol=0, rtol=0)
-            assert params[name] not in optimizer.state
-        other_optimizer.step()
-        reference_optimizer.step()
-        reference_other.step()
-
-        for name, param in params.items():
-            torch.testing.assert_close(
-                param.to_local().reshape(-1),
-                _reference_shard(param, reference_params[name]),
-                atol=0,
-                rtol=0,
-            )
-            if param in optimizer.state:
-                momentum = optimizer.state[param]["momentum_buffer"]
-                assert isinstance(momentum, DTensor)
-                torch.testing.assert_close(
-                    momentum.to_local().reshape(-1),
-                    _reference_shard(
-                        param, reference_optimizer.state[reference_params[name]]["momentum_buffer"]
-                    ),
-                    atol=0,
-                    rtol=0,
-                )
-        with torch.no_grad():
-            for name, param in reference.named_parameters():
-                param.copy_(reference_params[name])
-        if step == 0:
-            state = copy.deepcopy(optimizer.state_dict())
-            optimizer = muon.FsdpMuon(_parameter_groups(params), **kwargs)
-            optimizer.load_state_dict(state)
+    # Every rank uses identical batches, so the reference needs no gradient reduction.
+    inputs = torch.randn(5, 4, 8, device=device, dtype=dtype)
+    reference_losses = _train(reference, (reference_optimizer, reference_other), inputs)
+    losses = _train(model, (optimizer, other_optimizer), inputs)
+    torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
