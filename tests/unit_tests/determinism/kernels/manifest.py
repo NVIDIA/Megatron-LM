@@ -841,6 +841,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
+    KernelEntry(
+        name="mfsdp_muon_dispatch",
+        sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/muon.py",),
+        tests=("tests/unit_tests/distributed/mfsdp_v2/test_muon.py",),
+        kind="dispatch",
+        notes="FsdpMuon calls Emerging Optimizers Muon on matrices gathered to their owners. "
+        "test_muon_matches_reference checks weights, momentum, and forward outputs bitwise "
+        "against unsharded Muon across multiple steps, including an optimizer-state reload. "
+        "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
+    ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
         name="csa_teacher_lse",
