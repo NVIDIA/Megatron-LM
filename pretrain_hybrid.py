@@ -30,11 +30,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_dynamic_data_context_parallel_groups,
-    get_dynamic_tensor_data_context_parallel_group,
-)
+from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -141,7 +137,8 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.dynamic_context_parallel
+    # Dynamic CP always uses the sequence-packing path above.
+    assert not args.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -169,7 +166,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
-        is_hybrid_cp=is_hybrid_cp,
+        is_hybrid_cp=False,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
@@ -198,21 +195,14 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     return get_batches_on_this_cp_rank(
         batch,
         boundary_layout=config.linear_cp_layout,
-        is_hybrid_cp=is_hybrid_cp,
+        is_hybrid_cp=False,
         cp_group=get_context_parallel_group(),
         additional_layouts=additional_layouts,
-        hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
         sequence_parallel=config.sequence_parallel,
         tp_group=mpu.get_tensor_model_parallel_group(),
         tp_cp_group=(
-            (
-                get_dynamic_tensor_data_context_parallel_group(
-                    group_size=int(batch['local_cp_size'].item())
-                )
-                if is_hybrid_cp
-                else mpu.get_tensor_and_context_parallel_group()
-            )
+            mpu.get_tensor_and_context_parallel_group()
             if config.sequence_parallel and config.tensor_model_parallel_size > 1
             else None
         ),
