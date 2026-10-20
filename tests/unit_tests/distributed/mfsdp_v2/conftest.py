@@ -11,6 +11,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor.debug import _clear_sharding_prop_cache
 
+from megatron.core.utils import is_torch_min_version
+
 
 @dataclasses.dataclass(frozen=True)
 class DistributedSetup:
@@ -23,10 +25,10 @@ class DistributedSetup:
 
 def _release_symmetric_memory_pools() -> None:
     """Drop the cached symmetric-memory pools so the next test starts from an empty pool."""
-    pools = getattr(symm_mem, "_symm_mem_pools", None)
-    if pools:
+    # symm_mem.get_mem_pool() and its process-wide pool cache are new in PyTorch 2.10.
+    if is_torch_min_version("2.10.0a0"):
         # Drops the pools' last references, freeing their segments and rendezvous state.
-        pools.clear()
+        symm_mem._symm_mem_pools.clear()
 
 
 @pytest.fixture(scope="function")
