@@ -3508,7 +3508,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if cfg.optimizer.overlap_param_gather:
+    if cfg.optimizer.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
