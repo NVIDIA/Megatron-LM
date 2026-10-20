@@ -4,13 +4,14 @@
 
 from argparse import ArgumentParser
 from dataclasses import asdict, fields
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from megatron.training import arguments, training
+from megatron.training import arguments, global_vars, training
 from megatron.training.argument_utils import _default_config_from_args
-from megatron.training.config import SchedulerConfig, TrainingConfig
+from megatron.training.config import SchedulerConfig, TrainingConfig, container
 
 
 def cli_config(*options):
@@ -74,20 +75,19 @@ def test_deprecated_no_weight_decay_cond_type_is_not_a_cli_argument():
 
 @pytest.fixture
 def build_scheduler(monkeypatch, run_config):
-    """Run the real get_optimizer_param_scheduler, capturing what it hands to the scheduler."""
+    """Resolve the scheduler steps at finalize, then run the real get_optimizer_param_scheduler."""
     scheduler_cls = Mock()
     monkeypatch.setattr(training, "OptimizerParamScheduler", scheduler_cls)
-    monkeypatch.setattr(training, "update_train_iters", Mock())
+    monkeypatch.setattr(container, "update_train_iters", Mock())
 
-    def build(config, **run_args):
+    def build(config, **train):
         args, _ = cli_config()
         # Everything the scheduler reads from SchedulerConfig must come from the config owner.
         remove_scheduler_args(args)
-        args.lr, args.min_lr, args.global_batch_size = 1e-3, 1e-5, 4
-        args.train_iters = args.train_samples = None
-        for name, value in run_args.items():
-            setattr(args, name, value)
+        args.lr, args.min_lr = 1e-3, 1e-5
+        run_config.train = TrainingConfig(global_batch_size=4, **train)
         run_config.scheduler = config
+        run_config._resolve_scheduler_step_fields()
         monkeypatch.setattr(training, "get_args", lambda: args)
         training.get_optimizer_param_scheduler(Mock())
         return scheduler_cls.call_args.kwargs
@@ -241,6 +241,7 @@ def validate_at_pretrain(monkeypatch, run_config):
 
 
 def test_pretrain_validates_scheduler_before_initialization(validate_at_pretrain, run_config):
+    run_config.optimizer.weight_decay = 0.0
     scheduler = SchedulerConfig(start_weight_decay=0.0, end_weight_decay=0.0)
     validate_at_pretrain(scheduler, train_iters=10)
     run_config.scheduler = SchedulerConfig(
@@ -252,7 +253,14 @@ def test_pretrain_validates_scheduler_before_initialization(validate_at_pretrain
         training.pretrain(run_config, Mock(), None, Mock())
 
 
-def test_constant_weight_decay_is_derived_from_optimizer_at_finalize(run_config):
+@pytest.fixture
+def finalizable(monkeypatch, run_config):
+    """Provide the args and micro batch size that finalization still needs."""
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    run_config.train.micro_batch_size = 1
+
+
+def test_constant_weight_decay_is_derived_from_optimizer_at_finalize(finalizable, run_config):
     run_config.optimizer.weight_decay = 0.05
     run_config.scheduler = SchedulerConfig(weight_decay_incr_style="constant")
     assert run_config.scheduler.start_weight_decay is None
@@ -265,9 +273,9 @@ def test_constant_weight_decay_is_derived_from_optimizer_at_finalize(run_config)
     assert run_config.scheduler.end_weight_decay == 0.05
 
 
-def test_validation_is_repeatable_after_finalize(run_config):
+def test_validation_is_repeatable_after_finalize(finalizable, run_config):
     run_config.optimizer.weight_decay = 0.05
-    run_config.train = TrainingConfig(train_iters=10)
+    run_config.train = TrainingConfig(train_iters=10, micro_batch_size=1)
     run_config.scheduler = SchedulerConfig(weight_decay_incr_style="constant")
     run_config.finalize()
     # An in-process restart re-enters pretrain, which validates the finalized config again.
@@ -296,7 +304,7 @@ def test_scheduled_weight_decay_requires_both_bounds(run_config, style, missing)
 
 
 @pytest.mark.parametrize("style", ["linear", "cosine"])
-def test_scheduled_weight_decay_is_not_overwritten_at_finalize(run_config, style):
+def test_scheduled_weight_decay_is_not_overwritten_at_finalize(finalizable, run_config, style):
     run_config.optimizer.weight_decay = 0.05
     run_config.scheduler = SchedulerConfig(
         weight_decay_incr_style=style, start_weight_decay=0.0, end_weight_decay=0.1

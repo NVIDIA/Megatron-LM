@@ -15,6 +15,10 @@ except ImportError:
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
+from megatron.core.num_microbatches_calculator import (
+    get_current_global_batch_size,
+    update_num_microbatches,
+)
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -344,7 +348,10 @@ class PretrainConfigContainer(ConfigContainerBase):
     def _resolve_scheduler_step_fields(self):
         """Calculate user-unspecified scheduler configuration arguments from configurable fields."""
 
-        assert (self.train.train_iters is not None or self.train.train_samples is not None), 'either train-iters or train-samples should be provided.'
+        # Without a training horizon there is nothing to resolve; building the optimizer param
+        # scheduler (get_optimizer_param_scheduler) is what requires one.
+        if self.train.train_iters is None and self.train.train_samples is None:
+            return
         # Iteration-based training.
         if self.train.train_iters:
             if self.scheduler.lr_decay_iters is None:
@@ -355,7 +362,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             if self.scheduler.lr_wsd_decay_iters is not None:
                 self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * lr_decay_steps
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
         # Sample-based training.
@@ -370,7 +377,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.scheduler.wd_incr_steps = self.train.train_samples
             self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * lr_decay_steps
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
@@ -424,6 +431,9 @@ class PretrainConfigContainer(ConfigContainerBase):
 
 def update_train_iters(train: TrainingConfig) -> None:
     """Resolve the sample-based training horizon on the supplied training config."""
+    # Imported lazily: megatron.training.utils imports megatron.training.config.
+    from megatron.training.utils import print_rank_0
+
     # For iteration-based training, we don't need to do anything
     if train.train_iters:
         return

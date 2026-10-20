@@ -2700,6 +2700,9 @@ def get_optimizer_param_scheduler(optimizer):
     cfg = get_run_config()
     args = get_args()
 
+    if cfg.train.train_iters is None and cfg.train.train_samples is None:
+        raise Exception('either train-iters or train-samples should be provided.')
+
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
         init_lr=cfg.scheduler.lr_warmup_init,
