@@ -392,8 +392,8 @@ Custom layer classes placed in a `HybridStack` must accept
 The binding decorators have three roles:
 
 - `@bind_layer_interface` binds inputs and normalizes outputs for a complete layer.
-- `@bind_layer_inputs` binds inputs for a split stage, preserving its intermediate output.
-- `@bind_layer_outputs` normalizes a completion stage's output, preserving its arguments.
+- `@bind_layer_input_stage` binds inputs for a split stage, preserving its intermediate output.
+- `@bind_layer_output_stage` normalizes a completion stage's output, preserving its arguments.
 
 A `MegatronModule` can keep an ordinary explicit-argument `forward` and opt into
 the shared interface:
@@ -430,60 +430,68 @@ def forward(self, hidden_states, aux_inputs: LayerAuxInputs):
 ```
 
 The binder passes that object unchanged as a keyword argument, so hooks and the
-`layer_aux_inputs_forward` override run once. Shortcut and the hybrid mHC wrapper use
+`bind_layer_inputs` and `bind_layer_outputs` hooks run once. Shortcut and the hybrid mHC wrapper use
 this form; their public calls take `(hidden_states, aux_inputs)` rather than individual
 execution keywords. Shortcut replaces its child CP/recompute state, while mHC
 clears its wrapper-owned manager before invoking a complete inner layer.
 
-Layers customize shared invocation by overriding `MegatronModule.layer_aux_inputs_forward`:
+`LayerInterface` defines two overridable binding methods, inherited through
+`MegatronModule`:
+
+- `bind_layer_inputs(hidden_states, aux_inputs, **kwargs)` returns `(args, kwargs)`
+  for the ordinary forward. It owns validation, normalization, argument renaming,
+  and omission, but does not execute the layer.
+- `bind_layer_outputs(result)` returns `(hidden_states, LayerAuxOutputs)` and owns
+  interpretation of the layer's natural output.
+
+The common execution path is:
 
 ```python
-def layer_aux_inputs_forward(self, hidden_states, aux_inputs, **kwargs):
+args, kwargs = self.bind_layer_inputs(hidden_states, aux_inputs)
+result = self._call_with_bound_args(*args, **kwargs)
+return self.bind_layer_outputs(result)
+```
+
+`_call_with_bound_args` retains normal PyTorch hooks and CUDA-graph dispatch. Direct
+`.forward(...)` calls use the same binding hooks around the raw implementation,
+retaining PyTorch's usual bypass of module hooks and graph dispatch. Layers do not
+receive execution callbacks. Explicit legacy calls bypass the two binding hooks.
+
+For example, input adaptation can delegate to the default signature-based binding:
+
+```python
+def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
     if aux_inputs.residual_stream_recompute_context is not None:
-        raise TypeError("mHC does not support residual-stream recomputation.")
-    return super().layer_aux_inputs_forward(hidden_states, aux_inputs, **kwargs)
+        raise TypeError("This layer does not support residual-stream recomputation.")
+    args, bound = super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
+    if bound.get("context") is None:
+        bound.pop("context", None)
+    return args, bound
 ```
 
-This method runs before argument binding, hooks, and CUDA-graph dispatch, so
-validation also runs during replay. Forward `**kwargs` to preserve direct
-`forward(..., LayerAuxInputs)` calls, which supply a private execution callback to
-bypass hooks and graph dispatch. Ordinary explicit-argument calls bypass the
-override. The binding decorator is named `bind_layer_interface`; it no longer
-accepts `reject=`, `exclude=`, or `omit_none=` policies.
-
-Layer-specific argument omission can also live in this override. Wrap the execution callback to
-remove bound keywords before hooks or graph dispatch, while preserving the direct
-`forward` path:
+Forward `**kwargs` when delegating: the optional `forward` argument selects the
+method signature for a direct call or split stage. Normal module calls bind against
+`self.forward`. The default output hook accepts a tensor, a tensor/bias pair, or an
+already normalized result. A layer returning a natural context pair can instead use:
 
 ```python
-def layer_aux_inputs_forward(self, hidden_states, aux_inputs, *, _call=None):
-    call = self._call_with_bound_args if _call is None else _call
-
-    def call_with_selected_args(*args, **kwargs):
-        kwargs.pop("unused_argument", None)  # Always exclude this argument.
-        if kwargs.get("context") is None:
-            kwargs.pop("context", None)  # Keep forward's default when context is absent.
-        return call(*args, **kwargs)
-
-    return super().layer_aux_inputs_forward(hidden_states, aux_inputs, _call=call_with_selected_args)
+def bind_layer_outputs(self, result):
+    hidden_states, context = result
+    return hidden_states, LayerAuxOutputs(context=context)
 ```
 
-Mamba uses this pattern for its layer-specific optional arguments. TransformerLayer
-inherits the shared binding directly and keeps optional `None` values during ordinary
-execution and local CUDA graphs. Its TE replay-argument preparation omits unused
-optional keywords to preserve the captured input signature, and drops `input_ids` for layers without
-hash routing even when IDs are supplied. The decorator only maps
-declared fields, applies aliases, and normalizes the result;
-it no longer owns omission policies.
+Mamba omits absent optional state in its input hook. TransformerLayer uses the
+default input hook and keeps optional `None` values during ordinary execution and
+local CUDA graphs. Its TE replay-argument preparation omits unused optional keywords
+and non-hash token IDs to preserve the captured input signature.
 
-The container and layer forwards both use `packed_sequence_cp_metadata`, so
-this field binds directly by name. For differently named legacy parameters,
-`aliases` maps forward parameter names to container field names. A forwarding method
-with `*args, **kwargs` must expose a concrete signature, for example by placing
-`@copy_signature(the_forwarded_method)` beneath `@bind_layer_interface`.
-Subclasses inherit the binding when they inherit `forward`; an overridden
-`forward` should declare its own binding. Native `forward(x, aux_inputs)` methods
-continue to work without a decorator and must return the output pair themselves.
+The container and layer forwards both use `packed_sequence_cp_metadata`, so this
+field binds directly by name. A forwarding method with `*args, **kwargs` must expose
+a concrete signature, for example by placing `@copy_signature(the_forwarded_method)`
+beneath `@bind_layer_interface`. Subclasses inherit the binding when they inherit
+`forward`; an overridden `forward` should declare its own binding. Native
+`forward(x, aux_inputs)` methods continue to work without a decorator and must return
+the output pair themselves.
 
 All shared calls use `LayerOutput = tuple[Tensor, LayerAuxOutputs]`:
 
@@ -503,12 +511,13 @@ context = aux_outputs.context
 Complete Transformer layers return `LayerAuxOutputs(context=context)` even for
 explicit-argument calls; callers formerly unpacking `(output, context)` must read
 `.context`. The mHC implementation returns `(output, context)`; its
-`layer_aux_inputs_forward` override wraps that context in `LayerAuxOutputs` for shared calls.
+`bind_layer_outputs` override wraps that context in `LayerAuxOutputs` for shared calls.
 HybridStack returns its optional MTP stream in
 `LayerAuxOutputs(mhc_multistream=...)`. Output-selection adapters are no longer needed.
 
-CrossAttention accepts shared inputs: `context` binds to `key_value_states`, and
-`context_mask` binds to `attention_mask`. Its projection bias occupies `aux_outputs.bias`.
+CrossAttention's `bind_layer_inputs` override maps `context` to
+`key_value_states` and `context_mask` to `attention_mask` before hooks and execution.
+It inherits the ordinary attention forward and its shared binding. Its projection bias occupies `aux_outputs.bias`.
 
 Residual `write` operations still consume the internal projection pair
 `(output, bias)`; they do not consume auxiliary state. A shared layer result can
@@ -524,10 +533,10 @@ Shortcut scheduling arguments are supplied only through this context. Its
 implementation returns a tensor; the shared helper supplies an empty auxiliary-output container.
 
 Transformer and Mamba pre-core stages accept `(hidden_states, aux_inputs)` through
-`@bind_layer_inputs`. Calls go through the overridable
-`layer_aux_inputs_forward_pre_attn_and_core_attn` method, whose default implementation
-selects declared arguments. It leaves the intermediate state opaque: pass the entire
-result to `forward_post_core_attn`.
+`@bind_layer_input_stage`. It calls the same `bind_layer_inputs` hook, selecting the
+stage's signature through the `forward` argument. Intermediate state stays opaque:
+pass the entire result to `forward_post_core_attn`. No separate stage-specific binding
+hook is needed.
 
 Unused attention/rotary/padding arguments have been removed from Mamba's pre-core
 signature; shared callers can continue supplying them in `LayerAuxInputs`, and the
@@ -539,8 +548,9 @@ mixer has `chunkwise_context_parallel` enabled; otherwise the mixer receives `No
 This selection is independent of input binding and applies to explicit calls too.
 
 Completed Transformer and Mamba split stages return `(hidden_states, aux_outputs)`.
-Their `forward_post_core_attn` methods use `@bind_layer_outputs` to normalize the
-implementation's natural output; Transformer declares `output_field="context"`.
+Their `forward_post_core_attn` methods use `@bind_layer_output_stage`, which calls the
+same `bind_layer_outputs` hook. Transformer's output hook names its natural context
+output; it preserves an already normalized output unchanged.
 Shortcut uses the same input container for atomic and split-stage execution and
 consumes the completed output pair directly. Core projection stages retain their
 internal `(output, bias)` contract for residual fusion.
@@ -578,7 +588,8 @@ Checkpoint and residual-fusion boundaries extract `aux_outputs.bias` and retain 
 outputs. TE partial MoE capture keeps its existing flat intermediate-output contract.
 
 `MoESubmodules.pre_norm` is available for core input normalization and defaults
-to `IdentityOp`; the MoE binding applies it only for shared calls, including ordinary
+to `IdentityOp`; MoELayer's `bind_layer_inputs` override applies it only for
+shared calls, including ordinary
 Transformer MLP execution and each MLP chunk.
 
 `MegatronModule` binds shared inputs before module hooks and CUDA-graph selection.

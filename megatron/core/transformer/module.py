@@ -11,7 +11,11 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.transformer.layer_interface import LayerAuxInputs, _parse_layer_aux_inputs
+from megatron.core.transformer.layer_interface import (
+    LayerInterface,
+    _call_layer_interface,
+    _parse_layer_aux_inputs,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -30,13 +34,6 @@ class TwoStageAttentionLayer:
     def supports_two_stage_attention(self) -> bool:
         """Return whether this module instance supports two-stage execution."""
         return True
-
-    def layer_aux_inputs_forward_pre_attn_and_core_attn(
-        self, hidden_states, aux_inputs: LayerAuxInputs
-    ):
-        """Bind stage inputs without interpreting the state saved for the post-core stage."""
-        stage = self.forward_pre_attn_and_core_attn
-        return stage._layer_aux_input_binding(self, stage, hidden_states, aux_inputs)
 
     def forward_pre_attn_and_core_attn(self, *args: Any, **kwargs: Any) -> Any:
         """Run the pre-attention and core-attention stage."""
@@ -69,7 +66,7 @@ def is_first_microbatch_tracked(config) -> bool:
     )
 
 
-class MegatronModule(torch.nn.Module):
+class MegatronModule(torch.nn.Module, LayerInterface):
     """Base Megatron module inhertied by all Models.
 
     Megatron specific extensions of torch Module with support
@@ -91,26 +88,11 @@ class MegatronModule(torch.nn.Module):
     def __call__(self, *args, **kwargs):
         # Bind once, before graph selection or PyTorch hooks, and convert the
         # result only after the normal module execution path has completed.
-        if getattr(self.forward, "_layer_aux_input_binding", None) is not None:
+        if getattr(self.forward, "_layer_input_schema", None) is not None:
             shared_inputs = _parse_layer_aux_inputs(args, kwargs)
             if shared_inputs is not None:
-                return self.layer_aux_inputs_forward(*shared_inputs)
+                return _call_layer_interface(self, self._call_with_bound_args, *shared_inputs)
         return self._call_with_bound_args(*args, **kwargs)
-
-    def layer_aux_inputs_forward(self, hidden_states, aux_inputs: LayerAuxInputs, *, _call=None):
-        """Bind shared inputs, execute the layer, and normalize its output.
-
-        Override this method for layer-owned validation or shared-call behavior,
-        then delegate to super. Forward ``**kwargs`` so direct ``forward`` calls
-        preserve their private execution callback and bypass hooks/graph dispatch.
-        """
-        return self.forward._layer_aux_input_binding(
-            self,
-            self._call_with_bound_args if _call is None else _call,
-            hidden_states,
-            aux_inputs,
-            hidden_as_keyword=self._layer_aux_input_hidden_as_keyword,
-        )
 
     def _call_with_bound_args(self, *args, **kwargs):
         """Execute an ordinary forward call through PyTorch's hook/compile machinery."""

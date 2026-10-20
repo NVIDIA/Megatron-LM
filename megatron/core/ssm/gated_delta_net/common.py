@@ -351,13 +351,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer, LayerInterface):
                 ).uniform_(*self.A_init_range)
                 self.A_log.data.copy_(torch.log(A))
 
-    def layer_aux_inputs_forward(self, hidden_states, aux_inputs, **kwargs):
+    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
         """Reject unsupported chunkwise CP metadata before executing a GDN core."""
         if aux_inputs.packed_sequence_cp_metadata is not None:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support packed-sequence chunkwise CP metadata."
             )
-        return super().layer_aux_inputs_forward(hidden_states, aux_inputs, **kwargs)
+        return super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
 
     @bind_layer_interface
     def forward(

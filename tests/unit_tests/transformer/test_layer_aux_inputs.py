@@ -42,7 +42,9 @@ from megatron.core.transformer.layer_interface import (
     LayerAuxInputs,
     LayerAuxOutputs,
     LayerInterface,
+    bind_layer_input_stage,
     bind_layer_interface,
+    bind_layer_output_stage,
 )
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
@@ -439,7 +441,10 @@ def test_mlp_shared_binding_preserves_bias_and_checkpoint_tensor_boundary(
             self.bias = nn.Parameter(torch.ones(4))
             self.calls = []
 
-        @bind_layer_interface(input_transform=lambda module, x: x * 2)
+        def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+            return super().bind_layer_inputs(hidden_states * 2, aux_inputs, **kwargs)
+
+        @bind_layer_interface
         def forward(self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None):
             self.calls.append((hidden_states.shape, padding_mask, input_ids, packed_seq_params))
             return hidden_states.square(), self.bias
@@ -763,6 +768,9 @@ def test_moe_forward_backward_combined_output_and_pre_norm():
                 x = torch.randn(3, 2, 4)
                 expected = module(module.pre_norm(x))[0]
                 assert_bit_exact(apply_output_bias(module(x, LayerAuxInputs())), {}, expected, {})
+                assert_bit_exact(
+                    apply_output_bias(module.forward(x, LayerAuxInputs())), {}, expected, {}
+                )
 
 
 def test_flex_dispatcher_combines_shared_output_and_preserves_gradients():
@@ -868,14 +876,18 @@ def test_mhc_fast_path_leaves_routing_input_selection_to_the_core(hash_routing):
 
 
 @pytest.mark.parametrize("updates_context", [False, True])
-def test_cross_attention_binds_context_and_preserves_bias(updates_context):
+@pytest.mark.parametrize("direct", [False, True])
+def test_cross_attention_binds_context_and_preserves_bias(updates_context, direct):
     from megatron.core.transformer.attention import CrossAttention
 
     module = bare(CrossAttention)
     x, context, mask, bias = (torch.randn(2, 4) for _ in range(4))
     module.forward_pre_attn_and_core_attn = Mock(return_value=x)
     module.forward_post_core_attn = Mock(return_value=(x, bias))
-    output, aux_outputs = module(x, LayerAuxInputs(context=context, context_mask=mask))
+    call = module.forward if direct else module
+    output, aux_outputs = call(
+        x, LayerAuxInputs(context=context, context_mask=mask, attention_mask=torch.zeros_like(mask))
+    )
     assert output is x and aux_outputs.bias is bias
     kwargs = module.forward_pre_attn_and_core_attn.call_args.kwargs
     assert kwargs["key_value_states"] is context
@@ -933,9 +945,13 @@ class ExplicitSignatureLayer(MegatronModule):
 def test_signature_binding_preserves_hooks_gradients_and_legacy_calls(call_style):
     class CustomLayer(ExplicitSignatureLayer):
 
-        def layer_aux_inputs_forward(self, hidden_states, aux_inputs, **kwargs):
+        def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
             events.append("shared")
-            return super().layer_aux_inputs_forward(hidden_states, aux_inputs, **kwargs)
+            return super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
+
+        def bind_layer_outputs(self, result):
+            events.append("outputs")
+            return super().bind_layer_outputs(result)
 
     module = bare(CustomLayer)
     x = torch.randn(2, 4, requires_grad=True)
@@ -974,7 +990,11 @@ def test_signature_binding_preserves_hooks_gradients_and_legacy_calls(call_style
     assert module.seen == (mask, metadata, {})
     expected = x.sin() if call_style == "forward" else (x * 2).sin() * 3
     assert_bit_exact(result[0], {}, expected, {})
-    assert events == (["shared"] if call_style == "forward" else ["shared", "before", "after"])
+    assert events == (
+        ["shared", "outputs"]
+        if call_style == "forward"
+        else ["shared", "before", "after", "outputs"]
+    )
     expected_grad = torch.autograd.grad(expected.sum(), x)[0]
     result[0].sum().backward()
     assert_bit_exact(x.grad, {}, expected_grad, {})
@@ -1017,12 +1037,8 @@ def test_shared_call_rejects_ambiguous_arguments_before_execution(args, kwargs):
 def test_adapter_validates_declarations_and_requires_a_forwarding_schema():
     with pytest.raises(TypeError, match="explicit hidden-state"):
         bind_layer_interface(lambda self, *args, **kwargs: None)
-    with pytest.raises(ValueError, match="alias"):
-        bind_layer_interface(lambda self, x: x, aliases={"typo": "attention_mask"})
     with pytest.raises(ValueError, match="Required parameter"):
         bind_layer_interface(lambda self, x, required: x)
-    with pytest.raises(ValueError, match="alias"):
-        bind_layer_interface(lambda self, x, **kwargs: x, aliases={"x": "attention_mask"})
 
 
 @pytest.mark.parametrize("mode", ["eager", "local", "te_capture", "te_replay"])
@@ -1032,10 +1048,10 @@ def test_shared_binding_surrounds_graph_dispatch_without_recursion(mode, output_
 
     class Layer(GraphableMegatronModule):
 
-        def layer_aux_inputs_forward(self, hidden_states, aux_inputs, **kwargs):
+        def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
             if aux_inputs.context is not None:
                 raise ValueError("Unsupported context")
-            return super().layer_aux_inputs_forward(hidden_states, aux_inputs, **kwargs)
+            return super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
 
         @bind_layer_interface
         def forward(self, hidden_states, attention_mask=None):
@@ -1137,9 +1153,9 @@ def test_binding_passes_whole_container_without_reentering_override(call_style):
 
     class Wrapper(MegatronModule):
 
-        def layer_aux_inputs_forward(self, hidden_states, aux_inputs, **kwargs):
+        def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
             events.append(aux_inputs)
-            return super().layer_aux_inputs_forward(hidden_states, aux_inputs, **kwargs)
+            return super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
 
         @bind_layer_interface
         def forward(self, hidden_states, aux_inputs: LayerAuxInputs):
@@ -1163,6 +1179,80 @@ def test_binding_passes_whole_container_without_reentering_override(call_style):
     assert aux_outputs.bias is None
     output.sum().backward()
     assert_bit_exact(x.grad, {}, x.detach().cos(), {})
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_two_binding_hooks_own_input_and_output_adaptation(direct):
+    class Layer(MegatronModule):
+        def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+            events.append("bind_inputs")
+            return super().bind_layer_inputs(hidden_states * 2, aux_inputs, **kwargs)
+
+        def bind_layer_outputs(self, result):
+            events.append("bind_outputs")
+            output, context = result
+            return output, LayerAuxOutputs(context=context)
+
+        @bind_layer_interface
+        def forward(self, hidden_states, context=None):
+            events.append("forward")
+            return hidden_states.sin(), context
+
+    events = []
+    module = bare(Layer)
+    x = torch.randn(2, 4, requires_grad=True)
+    context = torch.randn(2, 4, requires_grad=True)
+    module.register_forward_pre_hook(lambda *args: events.append("pre_hook"))
+    module.register_forward_hook(lambda *args: events.append("post_hook"))
+    call = module.forward if direct else module
+    output, aux_outputs = call(x, LayerAuxInputs(context=context))
+    assert events == (
+        ["bind_inputs", "forward", "bind_outputs"]
+        if direct
+        else ["bind_inputs", "pre_hook", "forward", "post_hook", "bind_outputs"]
+    )
+    assert aux_outputs.context is context and aux_outputs.bias is None
+    (output.sum() + aux_outputs.context.sum()).backward()
+    assert_bit_exact(x.grad, {}, 2 * (2 * x.detach()).cos(), {})
+    assert_bit_exact(context.grad, {}, torch.ones_like(context), {})
+
+
+def test_split_stages_use_the_same_two_binding_hooks():
+    class Layer(MegatronModule):
+        def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+            events.append("bind_inputs")
+            return super().bind_layer_inputs(hidden_states * 2, aux_inputs, **kwargs)
+
+        def bind_layer_outputs(self, result):
+            events.append("bind_outputs")
+            output, context = result
+            return output, LayerAuxOutputs(context=context)
+
+        @bind_layer_interface
+        def forward(self, hidden_states, context=None):
+            raise AssertionError("Split execution must select the stage signature")
+
+        @bind_layer_input_stage
+        def forward_pre_attn_and_core_attn(self, hidden_states, attention_mask=None):
+            return hidden_states, hidden_states.sin(), attention_mask
+
+        @bind_layer_output_stage
+        def forward_post_core_attn(self, hidden_states, residual, context):
+            return hidden_states + residual, context
+
+    events = []
+    module = bare(Layer)
+    x = torch.randn(2, 4)
+    mask = object()
+    state = module.forward_pre_attn_and_core_attn(
+        x, LayerAuxInputs(attention_mask=mask, context=object())
+    )
+    assert len(state) == 3 and state[2] is mask
+    assert events == ["bind_inputs"]
+    output, aux_outputs = module.forward_post_core_attn(*state)
+    assert events == ["bind_inputs", "bind_outputs"]
+    assert_bit_exact(output, {}, 2 * x + (2 * x).sin(), {})
+    assert aux_outputs.context is mask and aux_outputs.bias is None
 
 
 def test_inherited_adapter_and_override_keep_distinct_signatures():
@@ -1245,14 +1335,20 @@ def test_mhc_per_call_setup_runs_before_graph_dispatch():
     assert module(x, LayerAuxInputs()) == (x, LayerAuxOutputs())
     assert seen == [manager, manager, None]
 
-    def direct_forward(*args, **kwargs):
+    def attention(*args, **kwargs):
         assert module._mhc_recompute_manager is manager
         assert "mhc_recompute_manager" not in kwargs
-        return x, LayerAuxOutputs()
+        return x, None
 
-    module.layer_aux_inputs_forward(
-        x, LayerAuxInputs(mhc_recompute_manager=manager), _call=direct_forward
+    module.layer_number = 1
+    module._forward_attention = Mock(side_effect=attention)
+    module._forward_mlp = Mock(return_value=x)
+    assert module.forward(x, LayerAuxInputs(mhc_recompute_manager=manager)) == (
+        x,
+        LayerAuxOutputs(),
     )
+    module._forward_attention.assert_called_once()
+    module._forward_mlp.assert_called_once()
     assert seen == [manager, manager, None]
 
 

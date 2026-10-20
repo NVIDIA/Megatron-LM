@@ -112,41 +112,47 @@ def _normalize_layer_output(result, *, output_field="bias") -> LayerOutput:
 
 
 @experimental_api
-def bind_layer_outputs(forward=None, *, output_field="bias"):
-    """Normalize a completed split-stage layer's natural return value.
+def bind_layer_output_stage(stage):
+    """Apply the layer's output hook to a completed split stage."""
 
-    Unlike ``bind_layer_interface``, this decorator preserves the method's arguments
-    and always binds its output. Use ``output_field="context"`` for a stage that returns
-    hidden states and cross-attention context. Tensor-only stages need no options.
-    """
+    @wraps(stage)
+    def forward(self, *args, **kwargs):
+        return self.bind_layer_outputs(stage(self, *args, **kwargs))
 
-    if output_field not in {field.name for field in fields(LayerAuxOutputs)}:
-        raise ValueError(f"Unknown layer output field: {output_field}")
-    if forward is None:
-        return lambda method: bind_layer_outputs(method, output_field=output_field)
-
-    @wraps(forward)
-    def bound(*args, **kwargs):
-        return _normalize_layer_output(forward(*args, **kwargs), output_field=output_field)
-
-    return bound
+    return forward
 
 
 @experimental_api
 @runtime_checkable
 class LayerInterface(Protocol):
-    """A layer returns hidden states and named auxiliary outputs.
+    """A layer accepts auxiliary inputs and returns hidden states and named outputs.
 
-    Compute cores leave output bias separate for dropout/residual fusion. Complete
-    residual layers return their updated hidden states with ``aux_outputs.bias=None``.
-    Shared expert contributions are combined inside MoE. Attention context and
-    the mHC stream have their own fields and are never treated as additive bias.
-
-    Implement ``forward(x, aux_inputs) -> LayerOutput`` directly, or decorate an
-    explicit-argument forward with ``bind_layer_interface``. Decorated forwards
-    may return a tensor when no auxiliary outputs remain; the helper supplies an empty container.
-    Legacy ``(hidden_states, bias)`` core outputs are adapted only for shared calls.
+    Implement ``forward(x, aux_inputs) -> LayerOutput`` directly, or use
+    ``@bind_layer_interface`` on an explicit-argument forward. Customize binding
+    only through ``bind_layer_inputs`` and ``bind_layer_outputs``.
     """
+
+    def bind_layer_inputs(self, hidden_states, aux_inputs: LayerAuxInputs, *, forward=None):
+        """Return ``(args, kwargs)`` for execution, without running the layer.
+
+        Override for validation, normalization, or argument adaptation. ``forward``
+        selects the decorated method for direct calls and split stages; forward it
+        to super when delegating. Normal module calls use ``self.forward``.
+        """
+        method = self.forward if forward is None else forward
+        hidden_name, field_names = method._layer_input_schema
+        kwargs = {
+            name: aux_inputs if name == "aux_inputs" else getattr(aux_inputs, name)
+            for name in field_names
+        }
+        if hidden_name is not None and getattr(self, "_layer_aux_input_hidden_as_keyword", False):
+            kwargs[hidden_name] = hidden_states
+            return (), kwargs
+        return (hidden_states,), kwargs
+
+    def bind_layer_outputs(self, result) -> LayerOutput:
+        """Normalize a natural result to hidden states and named auxiliary outputs."""
+        return _normalize_layer_output(result)
 
     def forward(self, x: Tensor, aux_inputs: LayerAuxInputs) -> LayerOutput:
         """Return ``(hidden_states, aux_outputs)`` without applying deferred bias."""
@@ -172,130 +178,69 @@ def _parse_layer_aux_inputs(args, kwargs):
     raise TypeError("Use layer(hidden_states, aux_inputs) without legacy arguments")
 
 
+def _call_layer_interface(
+    module, call, hidden_states, aux_inputs, *, forward=None, bind_outputs=True
+):
+    """Bind around execution; input-only stages leave their intermediate result intact."""
+    args, kwargs = module.bind_layer_inputs(hidden_states, aux_inputs, forward=forward)
+    result = call(*args, **kwargs)
+    return module.bind_layer_outputs(result) if bind_outputs else result
+
+
 @experimental_api
-def bind_layer_interface(legacy_forward=None, *, aliases=None, input_transform=None):
-    """Bind shared inputs and normalize a complete layer's output.
+def bind_layer_interface(forward):
+    """Bind inputs and outputs through the layer's two hooks.
 
-    Accept ``(hidden_states, LayerAuxInputs)`` through an ordinary forward signature
-    and return ``(hidden_states, LayerAuxOutputs)`` for shared calls.
-
-    Binding is prepared at decoration time. Only named parameters matching input
-    fields are selected; ``**kwargs`` never opts a layer into every field. Use
-    ``copy_signature`` beneath this decorator for forwarding-only methods.
-    A parameter named ``aux_inputs`` receives the original container unchanged,
-    allowing orchestration layers to pass it on without unpacking and rebuilding it.
-
-    ``aliases`` maps forward parameter names to input field names, including
-    explicitly forwarded kwargs. Layers that omit arguments customize
-    ``layer_aux_inputs_forward``.
-    ``input_transform(module, hidden_states)`` expresses shared-call-only normalization.
-    Implementations may return a tensor or ``(hidden_states, LayerAuxOutputs)``.
-    Tensor results receive an empty auxiliary-output container. Existing core ``(hidden_states, bias)``
-    results receive ``LayerAuxOutputs(bias=bias)``. Named auxiliary outputs pass through unchanged.
-
-    MegatronModule routes shared calls through its overridable
-    ``layer_aux_inputs_forward`` method, which applies the binder before hooks and
-    graph dispatch and normalizes the result after execution. Direct ``forward``
-    calls use the same override but bypass hooks and graph dispatch. Legacy calls
-    bypass shared-call policies. The compatibility keyword ``inputs=`` is reserved
-    for the container and cannot be mixed with legacy arguments.
+    Module calls bind around PyTorch hooks and graph dispatch; direct forward calls
+    bind around forward execution. Explicit-argument calls bypass both hooks.
+    Use ``copy_signature`` beneath this decorator for forwarding-only methods.
     """
-
-    if legacy_forward is None:
-        return lambda forward: bind_layer_interface(
-            forward, aliases=aliases, input_transform=input_transform
-        )
-
-    bind = _make_layer_aux_input_binding(
-        legacy_forward, aliases=aliases, input_transform=input_transform
-    )
-
-    def invoke(module, call, hidden_states, aux_inputs, *, hidden_as_keyword=False):
-        return _normalize_layer_output(
-            bind(module, call, hidden_states, aux_inputs, hidden_as_keyword=hidden_as_keyword)
-        )
-
-    @wraps(legacy_forward)
-    def forward(self, *args, **kwargs):
-        shared_inputs = _parse_layer_aux_inputs(args, kwargs)
-        if shared_inputs is None:
-            return legacy_forward(self, *args, **kwargs)
-        return self.layer_aux_inputs_forward(
-            *shared_inputs, _call=lambda *a, **kw: legacy_forward(self, *a, **kw)
-        )
-
-    forward._layer_aux_input_binding = invoke
-    return forward
+    return _bind_layer_method(forward, bind_outputs=True)
 
 
-def _make_layer_aux_input_binding(legacy_forward, *, aliases=None, input_transform=None):
-    """Prepare argument selection once for a full forward or an opaque split stage."""
-    parameters = list(inspect.signature(legacy_forward).parameters.values())[1:]
+@experimental_api
+def bind_layer_input_stage(stage):
+    """Bind a split stage's inputs, preserving its opaque intermediate output."""
+    return _bind_layer_method(stage, bind_outputs=False)
+
+
+def _bind_layer_method(method, *, bind_outputs):
+    """Cache signature fields and dispatch shared calls through the binding hooks."""
+    parameters = list(inspect.signature(method).parameters.values())[1:]
     if not parameters or parameters[0].kind not in (
         inspect.Parameter.POSITIONAL_ONLY,
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
     ):
         raise TypeError("A LayerAuxInputs forward needs an explicit hidden-state parameter")
     hidden_parameter = parameters[0]
-    field_names = {field.name for field in fields(LayerAuxInputs)}
-    aliases = dict(aliases or {})
-    named = {
-        parameter.name: parameter
-        for parameter in parameters[1:]
-        if parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
-    }
-    has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters)
-    if "inputs" in named:
-        raise TypeError("A decorated forward must use explicit fields, not an inputs parameter")
-    for name, source in aliases.items():
-        if (
-            name in {hidden_parameter.name, "inputs", "aux_inputs"}
-            or source not in field_names
-            or (name not in named and not has_kwargs)
-        ):
-            raise ValueError(f"Invalid LayerAuxInputs alias: {name} <- {source}")
-    mapping = {
-        name: aliases.get(name, name)
-        for name in dict.fromkeys((*named, *aliases))
-        if name == "aux_inputs" or aliases.get(name, name) in field_names
-    }
-    for name, parameter in named.items():
-        if name in mapping and parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
-            raise TypeError("LayerAuxInputs fields must be keyword-capable parameters")
-        if parameter.default is inspect.Parameter.empty and name not in mapping:
+    field_names = {field.name for field in fields(LayerAuxInputs)} | {"aux_inputs"}
+    binding = []
+    for parameter in parameters[1:]:
+        if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            continue
+        name = parameter.name
+        if name == "inputs":
+            raise TypeError("A decorated forward must use explicit fields, not an inputs parameter")
+        if name in field_names:
+            if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
+                raise TypeError("LayerAuxInputs fields must be keyword-capable parameters")
+            binding.append(name)
+        elif parameter.default is inspect.Parameter.empty:
             raise ValueError(f"Required parameter {name} has no LayerAuxInputs binding")
-    binding = tuple(mapping.items())
 
-    def invoke(module, call, hidden_states, aux_inputs, *, hidden_as_keyword=False):
-        bound = {}
-        for name, source in binding:
-            value = aux_inputs if source == "aux_inputs" else getattr(aux_inputs, source)
-            bound[name] = value
-        if input_transform is not None:
-            hidden_states = input_transform(module, hidden_states)
-        if hidden_as_keyword and hidden_parameter.kind != inspect.Parameter.POSITIONAL_ONLY:
-            bound[hidden_parameter.name] = hidden_states
-            result = call(**bound)
-        else:
-            result = call(hidden_states, **bound)
-        return result
-
-    return invoke
-
-
-@experimental_api
-def bind_layer_inputs(stage=None):
-    """Bind shared inputs to a pre-core stage while preserving its opaque return state."""
-    if stage is None:
-        return lambda method: bind_layer_inputs(method)
-    bind = _make_layer_aux_input_binding(stage)
-
-    @wraps(stage)
+    @wraps(method)
     def forward(self, *args, **kwargs):
         shared_inputs = _parse_layer_aux_inputs(args, kwargs)
         if shared_inputs is None:
-            return stage(self, *args, **kwargs)
-        return self.layer_aux_inputs_forward_pre_attn_and_core_attn(*shared_inputs)
+            return method(self, *args, **kwargs)
+        return _call_layer_interface(
+            self, method.__get__(self), *shared_inputs, forward=forward, bind_outputs=bind_outputs
+        )
 
-    forward._layer_aux_input_binding = bind
+    hidden_name = (
+        None
+        if hidden_parameter.kind == inspect.Parameter.POSITIONAL_ONLY
+        else hidden_parameter.name
+    )
+    forward._layer_input_schema = hidden_name, tuple(binding)
     return forward

@@ -698,7 +698,11 @@ class MoELayer(BaseMoELayer, LayerInterface):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    @bind_layer_interface(input_transform=lambda module, x: module.pre_norm(x))
+    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+        """Apply the configured core input norm only for shared-interface calls."""
+        return super().bind_layer_inputs(self.pre_norm(hidden_states), aux_inputs, **kwargs)
+
+    @bind_layer_interface
     def forward(
         self,
         hidden_states: torch.Tensor,

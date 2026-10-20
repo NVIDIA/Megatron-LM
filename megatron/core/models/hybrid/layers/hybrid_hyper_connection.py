@@ -11,7 +11,7 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
     LayerAuxInputs,
-    LayerAuxOutputs,
+    _normalize_layer_output,
     bind_layer_interface,
 )
 from megatron.core.transformer.module import (
@@ -96,22 +96,18 @@ class HyperConnectionHybridLayer(MegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
-    def layer_aux_inputs_forward(self, hidden_states, aux_inputs, *, _call=None):
-        """Validate shared inputs and expose the raw context as named auxiliary outputs."""
+    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+        """Reject unsupported residual replay before executing the wrapped layer."""
         if aux_inputs.residual_stream_recompute_context is not None:
             raise TypeError(
                 "HyperConnectionHybridLayer does not support residual_stream recomputation; "
                 "select 'mhc' in recompute_modules and configure mhc_recompute_layer_num instead."
             )
-        call = self._call_with_bound_args if _call is None else _call
+        return super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
 
-        def call_with_aux_outputs(*args, **kwargs):
-            output, context = call(*args, **kwargs)
-            return output, LayerAuxOutputs(context=context)
-
-        return super().layer_aux_inputs_forward(
-            hidden_states, aux_inputs, _call=call_with_aux_outputs
-        )
+    def bind_layer_outputs(self, result):
+        """Expose the wrapper's natural context output as named auxiliary state."""
+        return _normalize_layer_output(result, output_field="context")
 
     @bind_layer_interface
     def forward(

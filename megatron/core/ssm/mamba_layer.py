@@ -27,9 +27,9 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.layer_interface import (
     LayerAuxInputs,
-    bind_layer_inputs,
+    bind_layer_input_stage,
     bind_layer_interface,
-    bind_layer_outputs,
+    bind_layer_output_stage,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -188,7 +188,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
-    @bind_layer_inputs
+    @bind_layer_input_stage
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -232,7 +232,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
             return ssm_output, residual
         return ssm_output, residual, connection_state
 
-    @bind_layer_outputs
+    @bind_layer_output_stage
     def forward_post_core_attn(
         self,
         ssm_output: Tensor,
@@ -251,19 +251,13 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
 
         return None
 
-    def layer_aux_inputs_forward(self, hidden_states, aux_inputs, *, _call=None):
-        """Omit absent optional state before hooks and graph dispatch."""
-        call = self._call_with_bound_args if _call is None else _call
-
-        def call_with_optional_state(*args, **kwargs):
-            for name in ("packed_sequence_cp_metadata", "residual_stream_recompute_context"):
-                if kwargs.get(name) is None:
-                    kwargs.pop(name, None)
-            return call(*args, **kwargs)
-
-        return super().layer_aux_inputs_forward(
-            hidden_states, aux_inputs, _call=call_with_optional_state
-        )
+    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+        """Omit absent optional state from the mixer's execution arguments."""
+        args, bound = super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
+        for name in ("packed_sequence_cp_metadata", "residual_stream_recompute_context"):
+            if bound.get(name) is None:
+                bound.pop(name, None)
+        return args, bound
 
     @bind_layer_interface
     def forward(

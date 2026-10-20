@@ -18,7 +18,7 @@ from megatron.core.transformer.layer_interface import (
     LayerAuxInputs,
     LayerAuxOutputs,
     LayerExecutionContext,
-    bind_layer_inputs,
+    bind_layer_input_stage,
 )
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
@@ -247,7 +247,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             calls.append(("finalize", layer_idx))
             return hidden_states + layer_idx
 
-    @bind_layer_inputs
+    @bind_layer_input_stage
     def attn_forward(
         self,
         hidden_states,

@@ -2159,10 +2159,12 @@ class CrossAttention(Attention):
     [s, b, h] and returns output of the same size.
     """
 
-    forward = bind_layer_interface(
-        Attention.forward.__wrapped__,
-        aliases={"key_value_states": "context", "attention_mask": "context_mask"},
-    )
+    def bind_layer_inputs(self, hidden_states, aux_inputs, **kwargs):
+        """Map shared context fields to the attention core's key/value inputs."""
+        args, bound = super().bind_layer_inputs(hidden_states, aux_inputs, **kwargs)
+        bound["key_value_states"] = aux_inputs.context
+        bound["attention_mask"] = aux_inputs.context_mask
+        return args, bound
 
     def __init__(
         self,

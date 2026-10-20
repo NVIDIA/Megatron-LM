@@ -34,9 +34,10 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.layer_interface import (
     LayerAuxInputs,
     LayerAuxOutputs,
-    bind_layer_inputs,
+    _normalize_layer_output,
+    bind_layer_input_stage,
     bind_layer_interface,
-    bind_layer_outputs,
+    bind_layer_output_stage,
 )
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
@@ -846,7 +847,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         output, aux_outputs = self.self_attention(hidden_states, aux_inputs)
         return output, aux_outputs.bias
 
-    @bind_layer_inputs
+    @bind_layer_input_stage
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -877,7 +878,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return attention_intermediate, residual, context, attn_state
 
-    @bind_layer_outputs(output_field="context")
+    @bind_layer_output_stage
     def forward_post_core_attn(
         self,
         attention_intermediate: Tensor,
@@ -1103,6 +1104,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
 
         return hidden_states, context
+
+    def bind_layer_outputs(self, result):
+        """Name the context returned by a completed transformer layer or stage."""
+        return _normalize_layer_output(result, output_field="context")
 
     @bind_layer_interface
     @copy_signature(_forward_attention)
@@ -2356,18 +2361,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
-    def layer_aux_inputs_forward(self, hidden_states, aux_inputs, *, _call=None):
-        """Bind the mHC manager outside the tensor-only execution arguments."""
-        call = self._call_with_bound_args if _call is None else _call
-
-        def call_with_manager(*args, **kwargs):
-            if _call is None:
-                kwargs["mhc_recompute_manager"] = aux_inputs.mhc_recompute_manager
-            else:
-                self._mhc_recompute_manager = aux_inputs.mhc_recompute_manager
-            return call(*args, **kwargs)
-
-        return super().layer_aux_inputs_forward(hidden_states, aux_inputs, _call=call_with_manager)
+    def bind_layer_inputs(self, hidden_states, aux_inputs, *, forward=None):
+        """Set per-call mHC state without passing its manager into the graph."""
+        args, bound = super().bind_layer_inputs(hidden_states, aux_inputs, forward=forward)
+        self._mhc_recompute_manager = aux_inputs.mhc_recompute_manager
+        if forward is None:
+            # The normal module boundary also handles explicit legacy manager arguments.
+            bound["mhc_recompute_manager"] = aux_inputs.mhc_recompute_manager
+        return args, bound
 
     def _call_with_bound_args(self, *args, **kwargs):
         # Pull the manager off kwargs before the graph dispatch hands them to the
