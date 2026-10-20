@@ -27,6 +27,7 @@ from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
+    SinglePassMHCState,
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
 )
@@ -279,6 +280,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         vp_stage: Optional[int] = None,
         name: str | None = None,
     ):
+        if config.mhc_single_pass and config.recompute_granularity == 'full':
+            raise ValueError("Single-pass full recompute requires the explicit HybridStack adapter")
         super().__init__(config=config)
 
         if pg_collection is None:
@@ -539,6 +542,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        mhc_state: SinglePassMHCState | None = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -641,6 +645,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
+
+        shared_state_kwargs = {}
+        if self.config.mhc_single_pass and mhc_state is None:
+            if not self.pre_process:
+                raise ValueError("Single-pass mHC requires the incoming stage's explicit mix state")
+            mhc_state = SinglePassMHCState()
+        if mhc_state is not None:
+            shared_state_kwargs["mhc_state"] = mhc_state
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -759,6 +771,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
+                            **shared_state_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     finalize_mhc_recompute_layer(
@@ -780,8 +793,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Only contract if the final layer norm is in this stage
         if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.mhc_num_residual_streams
+            hidden_states = (
+                mhc_state.contract(hidden_states, self.mhc_num_residual_streams)
+                if mhc_state is not None
+                else HyperConnectionModule.output_contract(
+                    hidden_states, self.mhc_num_residual_streams
+                )
             )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
