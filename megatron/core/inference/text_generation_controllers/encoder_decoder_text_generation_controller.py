@@ -18,10 +18,6 @@ class EncoderDecoderTextGenerationController(TextGenerationController):
 
     """
 
-    # T5InferenceWrapper runs the model without its inference context,
-    # so the LM head cannot read the requested logits dtype and keeps its own.
-    _model_reads_logits_dtype = False
-
     def prep_inference_input(
         self,
         prompts_tokens: torch.Tensor,
