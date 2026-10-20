@@ -192,10 +192,10 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     """
     cfg = get_run_config()
     args = get_args()
-    train_samples = getattr(args, 'train_samples', None)
+    train_samples = cfg.train.train_samples
     if train_samples is None:
-        train_iters = getattr(args, 'train_iters', None)
-        global_batch_size = getattr(args, 'global_batch_size', None)
+        train_iters = cfg.train.train_iters
+        global_batch_size = cfg.train.global_batch_size
         if train_iters is not None and global_batch_size is not None:
             train_samples = int(train_iters) * int(global_batch_size)
 
