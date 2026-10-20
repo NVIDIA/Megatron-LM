@@ -1334,14 +1334,10 @@ class TestMegatronMixedPrecisionArguments:
         args = self._parser().parse_args([])
         assert args.logit_dtype is None
 
-    @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+    @pytest.mark.parametrize("dtype", ["bf16", "fp16", "fp32"])
     def test_logit_dtype_accepts_supported_choices(self, dtype):
         args = self._parser().parse_args(["--output-logit-dtype", dtype])
         assert args.logit_dtype == dtype
-
-    def test_logit_dtype_rejects_fp16(self):
-        with pytest.raises(ArgumentError, match="invalid choice"):
-            self._parser().parse_args(["--output-logit-dtype", "fp16"])
 
 
 # ---------------------------------------------------------------------------
