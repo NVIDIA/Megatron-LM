@@ -180,16 +180,16 @@ def get_model_for_inference(
     declared_modelopt = (
         cfg is not None and cfg.model is not None and cfg.model.transformations is not None
     )
-    requested_modelopt = pg_collection is not None and getattr(args, "modelopt_enabled", False)
-    if declared_modelopt or requested_modelopt:
+    use_modelopt = declared_modelopt or (
+        HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args)
+    )
+    if use_modelopt:
         # The ModelOpt model config is translated with the global parallel sizes.
         if pg_collection is not None:
             raise ValueError(
                 "Custom inference process groups are not supported by the ModelOpt builder"
             )
-        model = build_inference_models(cfg)
-    elif pg_collection is None and HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args):
-        model = build_modelopt_models(args)
+        model = build_inference_models(cfg) if declared_modelopt else build_modelopt_models(args)
     else:
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()

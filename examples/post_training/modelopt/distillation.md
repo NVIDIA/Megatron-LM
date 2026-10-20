@@ -111,6 +111,11 @@ GPT/Hybrid model config. Rebuilding a deserialized config reconstructs setup hoo
 automatically; it does not need to reread the teacher architecture YAML or retain the
 original argparse namespace.
 
+`DistillationConfig.teacher_model_config` (argparse-name overrides of the student's
+architecture) exists only to carry `--export-kd-teacher-model-config` into
+`teacher_model`. A YAML run config should instead give the teacher directly as
+`teacher_model`, a full `ModelConfig` of its own.
+
 Setup runs in this order: restore ModelOpt state, apply QAD freezing and LSQ
 setup, register checkpoint key remapping, run user pre-wrap hooks (including
 training freezes), then convert for KD. The training loop passes the run's

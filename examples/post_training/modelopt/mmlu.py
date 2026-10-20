@@ -106,11 +106,8 @@ if __name__ == "__main__":
     model = build_inference_models(cfg)
     report_current_memory_info()
 
-    # Materialize the model from meta device to gpu before loading the checkpoint.
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
-    unwrapped_model.to_empty(device="cuda")
-    report_current_memory_info()
 
     tokenizer = get_hf_tokenizer()
 

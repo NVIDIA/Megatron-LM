@@ -56,7 +56,15 @@ class TestDistillationConfigFromArgs:
 
     def test_maps_kd_arguments_and_reads_loss_yaml(self, tmp_path):
         teacher_yaml = tmp_path / "teacher.yaml"
-        teacher_yaml.write_text(yaml.safe_dump({"num_layers": 4}))
+        teacher_yaml.write_text(
+            yaml.safe_dump(
+                {
+                    "num_layers": 4,
+                    "untie_embeddings_and_output_weights": True,
+                    "rotary_base": 500000,
+                }
+            )
+        )
         kd_yaml = tmp_path / "kd.yaml"
         kd_yaml.write_text(
             yaml.safe_dump(
@@ -80,6 +88,9 @@ class TestDistillationConfigFromArgs:
         assert distillation.logit_kl_temperature == 2.0
         assert distillation.intermediate_layer_pairs == [("a", "b", "mse")]
         assert distillation.teacher_model.transformer.num_layers == 4
+        assert distillation.teacher_model.share_embeddings_and_output_weights is False
+        assert distillation.teacher_model.rotary_base == 500000
+        assert student.share_embeddings_and_output_weights is True
         assert distillation.teacher_model.transformations is not student.transformations
         assert distillation.teacher_model.transformations.qad_train_target is None
         assert distillation.teacher_model.transformations.lsq_scale_lr is None

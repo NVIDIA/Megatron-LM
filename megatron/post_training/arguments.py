@@ -71,7 +71,9 @@ def add_modelopt_args(parser):
         '--export-kd-teacher-model-config',
         type=str,
         default=None,
-        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+        help='Path to teacher model config for distillation, with argparse field names overriding '
+        'the student\'s. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml. '
+        'CLI only: YAML run configs give the teacher as DistillationConfig.teacher_model.',
     )
     group.add_argument(
         '--export-kd-teacher-ckpt-format',

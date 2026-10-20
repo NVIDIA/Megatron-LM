@@ -28,3 +28,10 @@ class ModelTransformConfig:
 
     te_mcore_model: bool = False
     """Remap Transformer Engine checkpoint layernorm keys on load."""
+
+    def validate(self) -> None:
+        """Validate transformation settings before allocating models or loading checkpoints."""
+        if self.qad_train_target not in (None, "mtp", "base", "both"):
+            raise ValueError(f"Unsupported qad_train_target: {self.qad_train_target}")
+        if self.real_quant_cfg not in ("None", "fp8_real_quant", "fp8_blockwise_real_quant"):
+            raise ValueError(f"Unsupported real_quant_cfg: {self.real_quant_cfg}")

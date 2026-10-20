@@ -133,12 +133,7 @@ class ModelConfig:
     def validate(self) -> None:
         """Validate transformations before allocating models or loading checkpoints."""
         if self.transformations is not None:
-            target = self.transformations.qad_train_target
-            if target not in (None, "mtp", "base", "both"):
-                raise ValueError(f"Unsupported qad_train_target: {target}")
-            real_quant_cfg = self.transformations.real_quant_cfg
-            if real_quant_cfg not in ("None", "fp8_real_quant", "fp8_blockwise_real_quant"):
-                raise ValueError(f"Unsupported real_quant_cfg: {real_quant_cfg}")
+            self.transformations.validate()
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.
@@ -316,6 +311,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         use_layer_wise_param_layout: bool = True,
         device: Any | None = None,
         checkpoint: Any | None = None,
+        distillation: Any | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -334,6 +330,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
                 controls whether to compute and supply a shard-aligned param layout to DDP.
             device: Explicit model placement requested by the run configuration.
             checkpoint: Run-owned checkpoint configuration available to pre-wrap hooks.
+            distillation: Run-owned distillation configuration available to pre-wrap hooks.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,

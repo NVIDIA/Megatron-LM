@@ -19,7 +19,7 @@ from megatron.post_training.model_config import (
     build_inference_models,
     modelopt_inference_config_from_args,
 )
-from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
+from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint

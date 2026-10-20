@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -53,7 +53,11 @@ class DistillationConfig:
 
     teacher_model_config: str | None = None
     """YAML overriding the student's architecture settings for the teacher. Field names
-    follow the argparse names (e.g. ``num_layers``), not ``TransformerConfig``."""
+    follow the argparse names (e.g. ``num_layers``), not ``TransformerConfig``.
+
+    Only for ``--export-kd-teacher-model-config``: it is resolved into ``teacher_model`` at
+    CLI translation time. YAML run configs should give the teacher as ``teacher_model``, a
+    ``ModelConfig`` of its own, rather than as argparse-name overrides."""
 
     teacher_ckpt_format: str | None = None
     """Checkpoint format of the teacher, if different from the student's."""
@@ -89,9 +93,8 @@ class DistillationConfig:
                 DeprecationWarning,
                 stacklevel=3,
             )
-            defaults = DistillationConfig(teacher_load="")
             for name, value in load_distillation_loss_yaml(self.kd_cfg).items():
-                if getattr(self, name) != getattr(defaults, name):
+                if getattr(self, name) != _LOSS_DEFAULTS[name]:
                     raise ValueError(f"{name} is set both directly and in kd_cfg ({self.kd_cfg}).")
                 setattr(self, name, value)
             self.kd_cfg = None
@@ -101,11 +104,10 @@ class DistillationConfig:
 
     def loss_kwargs(self) -> dict[str, Any]:
         """Non-default loss settings, as keyword arguments for ModelOpt's ``DistillationConfig``."""
-        defaults = DistillationConfig(teacher_load="")
         return {
             name: getattr(self, name)
             for name in _LOSS_FIELDS
-            if getattr(self, name) != getattr(defaults, name)
+            if getattr(self, name) != _LOSS_DEFAULTS[name]
         }
 
     def validate(self) -> None:
@@ -143,3 +145,10 @@ class DistillationConfig:
                     f"Student and teacher must have the same {attr}, got "
                     f"{student_value} (student) and {teacher_value} (teacher)."
                 )
+
+
+_LOSS_DEFAULTS: dict[str, Any] = {
+    f.name: f.default_factory() if f.default_factory is not MISSING else f.default
+    for f in fields(DistillationConfig)
+    if f.name in _LOSS_FIELDS
+}

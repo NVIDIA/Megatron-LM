@@ -239,3 +239,18 @@ def test_inference_uses_config_without_cli_enable_flag():
     legacy_builder.assert_not_called()
     build.assert_called_once_with(cfg)
     assert loaded == [[stage]]
+
+
+def test_inference_rejects_custom_pg_collection_for_checkpoint_detected_modelopt():
+    from argparse import Namespace
+
+    from megatron.inference import utils
+
+    args = Namespace(load="/modelopt-ckpt", modelopt_enabled=False)
+    with (
+        patch.object(utils, "get_args", return_value=args),
+        patch("megatron.training.global_vars.is_run_config_initialized", return_value=False),
+        patch.object(utils, "should_use_modelopt_config", return_value=True),
+        pytest.raises(ValueError, match="Custom inference process groups are not supported"),
+    ):
+        utils.get_model_for_inference(pg_collection=Mock())

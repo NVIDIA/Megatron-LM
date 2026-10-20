@@ -18,7 +18,6 @@ from argparse import Namespace
 import yaml
 
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
-from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.distillation import DistillationConfig, load_distillation_loss_yaml
 from megatron.training.models.gpt import GPTModelConfig
 from megatron.training.models.hybrid import HybridModelConfig
@@ -52,9 +51,6 @@ def distillation_config_from_args(
         **loss,
     )
     teacher_args = _load_teacher_model_config(distillation, args)
-    overrides = {}
-    if isinstance(student_model_config, HybridModelConfig):
-        overrides["hybrid_layer_pattern"] = teacher_args.hybrid_layer_pattern
     teacher_transformations = student_model_config.transformations
     if teacher_transformations is not None:
         teacher_transformations = dataclasses.replace(
@@ -62,14 +58,17 @@ def distillation_config_from_args(
             qad_train_target=None,
             lsq_scale_lr=None,
         )
-    distillation.teacher_model = dataclasses.replace(
-        student_model_config,
-        transformer=core_transformer_config_from_args(teacher_args),
-        transformations=teacher_transformations,
-        pre_wrap_hooks=[],
-        post_wrap_hooks=[],
-        **overrides,
-    )
+    if isinstance(student_model_config, HybridModelConfig):
+        teacher_model = hybrid_config_from_args(teacher_args)
+        teacher_model.hybrid_stack_spec = student_model_config.hybrid_stack_spec
+    else:
+        teacher_model = gpt_config_from_args(teacher_args)
+        teacher_model.transformer_layer_spec = student_model_config.transformer_layer_spec
+        teacher_model.mtp_layer_spec = student_model_config.mtp_layer_spec
+    teacher_model.vocab_size = student_model_config.vocab_size
+    teacher_model.should_pad_vocab = student_model_config.should_pad_vocab
+    teacher_model.transformations = teacher_transformations
+    distillation.teacher_model = teacher_model
     return distillation
 
 
@@ -97,7 +96,7 @@ def _load_teacher_model_config(distillation: DistillationConfig, args: Namespace
 
     if config_path is not None:
         with open(config_path) as f:
-            config = yaml.safe_load(f)
+            config = yaml.safe_load(f) or {}
 
         del args_dict["kv_channels"]  # not recalculated if present
         # Setting teacher Flextron fields to false if training with Flextron, can be overridden
