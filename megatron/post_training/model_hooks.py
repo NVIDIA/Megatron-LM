@@ -207,7 +207,6 @@ def _build_teacher(student_model_config, distillation, model):
         teacher_model_config,
         vocab_size=student_model_config.vocab_size,
         should_pad_vocab=student_model_config.should_pad_vocab,
-        transformations=None,
         pre_wrap_hooks=[],
         post_wrap_hooks=[],
     )

@@ -21,8 +21,13 @@ from megatron.training.argument_utils import gpt_config_from_args, hybrid_config
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.models.base import ModelConfig
 from megatron.training.models.distillation import DistillationConfig
-from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
-from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, default_layer_spec
+from megatron.training.models.hybrid import (
+    HybridModelBuilder,
+    HybridModelConfig,
+    resolve_hybrid_stack_spec,
+)
+from megatron.training.models.transforms import ModelTransformConfig
 
 
 def _make_args(extra_argv=(), **overrides):
@@ -75,7 +80,13 @@ class TestDistillationConfigFromArgs:
         assert distillation.logit_kl_temperature == 2.0
         assert distillation.intermediate_layer_pairs == [("a", "b", "mse")]
         assert distillation.teacher_model.transformer.num_layers == 4
-        assert distillation.teacher_model.transformations is None
+        assert distillation.teacher_model.transformations is not student.transformations
+        assert distillation.teacher_model.transformations.qad_train_target is None
+        assert distillation.teacher_model.transformations.lsq_scale_lr is None
+        assert (
+            distillation.teacher_model.transformations.real_quant_cfg
+            == student.transformations.real_quant_cfg
+        )
         assert student.transformer.num_layers == 2  # the student config is untouched
 
     def test_rejects_unknown_loss_yaml_keys(self, tmp_path):
@@ -154,9 +165,13 @@ class TestModelOptModelConfigFromArgs:
 
         assert isinstance(config, GPTModelConfig)
         assert config.get_builder_cls() is GPTModelBuilder
+        assert config.transformer_layer_spec is None
+        assert config.mtp_layer_spec is None
         spec = object()
-        with patch.object(mc, "get_gpt_modelopt_spec", return_value=spec) as get_spec:
-            assert config.transformer_layer_spec(config) is spec
+        with patch(
+            "megatron.training.models.gpt.get_gpt_modelopt_spec", return_value=spec
+        ) as get_spec:
+            assert default_layer_spec(config, vp_stage=None) is spec
         get_spec.assert_called_once_with(
             config=config.transformer,
             local_core_attention=True,
@@ -170,22 +185,26 @@ class TestModelOptModelConfigFromArgs:
 
         config = mc.modelopt_model_config_from_args(args, disable_moe_grouped_gemm=True)
 
-        with patch.object(mc, "get_gpt_layer_with_transformer_engine_spec") as get_spec:
-            config.transformer_layer_spec(config)
+        with patch(
+            "megatron.training.models.gpt.get_gpt_layer_with_transformer_engine_spec"
+        ) as get_spec:
+            default_layer_spec(config, vp_stage=None)
         assert get_spec.call_args.args[1] is False  # moe_grouped_gemm
 
     def test_hybrid_sets_stack_spec(self):
         args = _make_args(hybrid_layer_pattern="M*-", export_te_mcore_model=True)
         stack_spec = ModuleSpec(module=object)
 
-        with patch.object(
-            mc, "get_hybrid_stack_modelopt_spec", return_value=stack_spec
+        config = mc.modelopt_model_config_from_args(args, disable_moe_grouped_gemm=True)
+        with patch(
+            "megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec",
+            return_value=stack_spec,
         ) as get_spec:
-            config = mc.modelopt_model_config_from_args(args, disable_moe_grouped_gemm=True)
+            assert resolve_hybrid_stack_spec(config) is stack_spec
 
         assert isinstance(config, HybridModelConfig)
         assert config.get_builder_cls() is HybridModelBuilder
-        assert config.hybrid_stack_spec is stack_spec
+        assert config.hybrid_stack_spec is None
         get_spec.assert_called_once_with(
             remap_te_layernorm=True, use_default_te_spec=False, moe_grouped_gemm=False
         )
@@ -247,10 +266,8 @@ class TestModelOptModelConfigFromArgs:
             hybrid_layer_pattern="M*" if builder_cls is HybridModelBuilder else None,
         )
         args.load = "/ckpt/student"
-        # Use a serializable spec without requiring the optional hybrid spec backends.
-        with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None):
-            original = mc.modelopt_model_config_from_args(args)
-            distillation = mc.distillation_config_from_args(args, original)
+        original = mc.modelopt_model_config_from_args(args)
+        distillation = mc.distillation_config_from_args(args, original)
         config = ModelConfig.from_dict(original.as_dict())
         assert config.pre_wrap_hooks == []
         assert config.transformations == original.transformations
@@ -313,8 +330,7 @@ class TestModelType:
     @pytest.mark.parametrize("pattern,expected", [(None, GPTModelConfig), ("M*-", HybridModelConfig)])
     def test_layer_pattern_selects_config(self, pattern, expected):
         args = _make_args(hybrid_layer_pattern=pattern)
-        with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None):
-            assert isinstance(mc.modelopt_model_config_from_args(args), expected)
+        assert isinstance(mc.modelopt_model_config_from_args(args), expected)
 
     @pytest.mark.parametrize(
         "flag,pattern,expected",
@@ -326,10 +342,7 @@ class TestModelType:
     )
     def test_deprecated_flag_is_honored(self, flag, pattern, expected):
         args = _make_args(export_model_type=flag, hybrid_layer_pattern=pattern)
-        with (
-            patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None),
-            pytest.warns(DeprecationWarning, match="--export-model-type is deprecated"),
-        ):
+        with pytest.warns(DeprecationWarning, match="--export-model-type is deprecated"):
             assert isinstance(mc.modelopt_model_config_from_args(args), expected)
 
     def test_deprecated_flag_conflicting_with_config_raises(self):
@@ -350,18 +363,16 @@ class TestModelType:
     def test_entry_point_config_is_updated_in_place(self):
         args = _make_args(export_te_mcore_model=True)
         config = hybrid_config_from_args(args)
-        with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None):
-            assert mc.apply_modelopt_model_config(config, args) is config
+        assert mc.apply_modelopt_model_config(config, args) is config
         assert config.transformations.te_mcore_model is True
 
     def test_hybrid_default_te_spec_disables_remap_without_touching_args(self):
         args = _make_args(
             hybrid_layer_pattern="M*-", export_te_mcore_model=True, export_default_te_spec=True
         )
-        with patch.object(mc, "get_hybrid_stack_modelopt_spec", return_value=None) as get_spec:
-            config = mc.modelopt_model_config_from_args(args)
-        assert get_spec.call_args.kwargs["remap_te_layernorm"] is False
+        config = mc.modelopt_model_config_from_args(args)
         assert config.transformations.te_mcore_model is False
+        assert config.transformations.default_te_spec is True
         assert args.export_te_mcore_model is True
 
 
@@ -411,12 +422,14 @@ class TestBuildTeacher:
         teacher_transformer = TransformerConfig(
             num_layers=2, hidden_size=128, num_attention_heads=1
         )
+        teacher_transformations = ModelTransformConfig(force_local_attention=True)
         distillation = DistillationConfig(
             teacher_load="/ckpt/teacher",
             teacher_model=GPTModelConfig(
                 transformer=teacher_transformer,
                 vocab_size=None,
                 transformer_layer_spec=student_spec,
+                transformations=teacher_transformations,
             ),
         )
         student_stage = Mock(pre_process=True, post_process=False, vp_stage=None)
@@ -430,7 +443,7 @@ class TestBuildTeacher:
         assert teacher_config.transformer is teacher_transformer
         assert teacher_config.transformer_layer_spec is student_spec
         assert teacher_config.vocab_size == 32000
-        assert teacher_config.transformations is None
+        assert teacher_config.transformations is teacher_transformations
         assert teacher_config.pre_wrap_hooks == []
         assert build_model.call_args.args[1] is student_stage.pg_collection
         assert build_model.call_args.kwargs == {
@@ -579,10 +592,12 @@ class TestModelOptMtpSpec:
             config = mc.modelopt_model_config_from_args(
                 _make_args(mtp_num_layers=1, export_real_quant_cfg=quant_cfg)
             )
-            decoder_spec = config.transformer_layer_spec(config)
+            decoder_spec = default_layer_spec(config, vp_stage=None)
             mtp_spec = mtp_block_spec(config, decoder_spec, pp_rank=0)
             layer = mtp_spec.layer_specs[0].submodules.mtp_model_layer
-            expected = mc.modelopt_mtp_layer_spec(config)
+            from megatron.training.models.gpt import _modelopt_mtp_layer_spec
+
+            expected = _modelopt_mtp_layer_spec(config)
             assert layer.module is TransformerLayer
             assert layer.submodules == expected.submodules
             if quant_cfg != "None":

@@ -85,7 +85,7 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
         export_kd_teacher_load=str(tmp_path) if kd else None,
     )
     args.load = "/student"
-    # Build the real specs: a whole-container test must include their nested callables.
+    # The transform config must preserve every setting needed to rebuild the specs.
     model = mc.modelopt_model_config_from_args(args)
     if training:
         cfg = pretrain_cfg_container_from_args(args, model)
@@ -94,6 +94,8 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
         cfg = mc.modelopt_inference_config_from_args(args, device="cpu")
     path = tmp_path / "run.yaml"
     cfg.to_yaml(str(path))
+    assert "modelopt_gpt_layer_spec" not in path.read_text()
+    assert "modelopt_mtp_layer_spec" not in path.read_text()
     restored = type(cfg).from_yaml(str(path), mode=InstantiationMode.STRICT)
     restored.validate()
     assert restored.model.get_builder_cls() is (HybridModelBuilder if hybrid else GPTModelBuilder)

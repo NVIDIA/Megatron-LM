@@ -122,6 +122,13 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""
     if model_config.hybrid_stack_spec is not None:
         return model_config.hybrid_stack_spec
+    if model_config.transformations is not None:
+        options = model_config.transformations
+        return get_hybrid_stack_modelopt_spec(
+            remap_te_layernorm=options.te_mcore_model,
+            use_default_te_spec=options.default_te_spec,
+            moe_grouped_gemm=options.moe_grouped_gemm,
+        )
     use_wide_residual = model_config.transformer.wide_residual is not None
     if model_config.transformer.transformer_impl == "inference_optimized":
         return (
@@ -129,13 +136,6 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
             if use_wide_residual
             else hybrid_inference_stack_spec
         )
-    if model_config.restore_modelopt_state:
-        if use_wide_residual:
-            raise NotImplementedError(
-                "wide_residual does not support ModelOpt HybridStack specs because they "
-                "do not statically construct wide-residual layer classes."
-            )
-        return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
     return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
 
 

@@ -3,13 +3,13 @@
 """Derive stock GPT/Hybrid model configs for ModelOpt workflows from the CLI arguments.
 
 ModelOpt runs use the regular ``GPTModelBuilder`` / ``HybridModelBuilder``. What is specific to
-ModelOpt (layer specs from the ``--export-*`` flags, the offline speculative-decoding tweak, and
-the transformations that select the pre-wrap hooks in ``megatron.post_training.model_hooks``) is
-applied to a stock config by ``apply_modelopt_model_config``.
+ModelOpt (layer-spec settings from the ``--export-*`` flags, the offline speculative-decoding
+tweak, and the transformations that select the pre-wrap hooks in
+``megatron.post_training.model_hooks``) is applied to a stock config by
+``apply_modelopt_model_config``.
 """
 
 import dataclasses
-import functools
 import logging
 import os
 import warnings
@@ -17,13 +17,6 @@ from argparse import Namespace
 
 import yaml
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
-    get_gpt_heterogeneous_layer_spec,
-)
-from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
-from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
-from megatron.training import print_rank_0
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.models.distillation import DistillationConfig, load_distillation_loss_yaml
@@ -62,10 +55,17 @@ def distillation_config_from_args(
     overrides = {}
     if isinstance(student_model_config, HybridModelConfig):
         overrides["hybrid_layer_pattern"] = teacher_args.hybrid_layer_pattern
+    teacher_transformations = student_model_config.transformations
+    if teacher_transformations is not None:
+        teacher_transformations = dataclasses.replace(
+            teacher_transformations,
+            qad_train_target=None,
+            lsq_scale_lr=None,
+        )
     distillation.teacher_model = dataclasses.replace(
         student_model_config,
         transformer=core_transformer_config_from_args(teacher_args),
-        transformations=None,
+        transformations=teacher_transformations,
         pre_wrap_hooks=[],
         post_wrap_hooks=[],
         **overrides,
@@ -118,62 +118,6 @@ def _load_teacher_model_config(distillation: DistillationConfig, args: Namespace
         args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
 
     return Namespace(**args_dict)
-
-
-def modelopt_mtp_layer_spec(model_config: GPTModelConfig):
-    """Keep MTP on the standard decoder spec, independently of ModelOpt decoder quantization."""
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
-
-    config = model_config.transformer
-    return get_gpt_decoder_layer_specs(
-        config, use_transformer_engine=config.transformer_impl == "transformer_engine"
-    )[-1]
-
-
-def modelopt_gpt_layer_spec(
-    model_config: GPTModelConfig,
-    *,
-    default_te_spec: bool,
-    force_local_attention: bool,
-    remap_te_layernorm: bool,
-    real_quant_cfg: str,
-    disable_moe_grouped_gemm: bool,
-):
-    """GPT layer spec for ModelOpt workflows.
-
-    Used as ``GPTModelConfig.transformer_layer_spec``, so it is evaluated by the builder against
-    the config it is building (e.g. the teacher's, whose layer count differs from the student's).
-    """
-    config = model_config.transformer
-    if config.heterogeneous_block_specs:
-        return get_gpt_heterogeneous_layer_spec(
-            config=config, use_te=config.transformer_impl == "transformer_engine"
-        )
-    if default_te_spec:
-        # Use the canonical full Transformer Engine spec instead of the modelopt-customized
-        # spec. Required by pruning, which operates on the un-customized layer graph.
-        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so mtp.prune
-        # can act on individual expert linears.
-        return get_gpt_layer_with_transformer_engine_spec(
-            config.num_moe_experts,
-            not disable_moe_grouped_gemm,
-            config.qk_layernorm,
-            config.multi_latent_attention,
-            config.experimental_attention_variant,
-            qk_l2_norm=config.qk_l2_norm,
-        )
-    if config.context_parallel_size > 1:
-        print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
-        local_core_attention = False
-    else:
-        local_core_attention = force_local_attention
-    return get_gpt_modelopt_spec(
-        config=config,
-        local_core_attention=local_core_attention,
-        remap_te_layernorm=remap_te_layernorm,
-        real_quant_cfg=real_quant_cfg,
-        use_arbitrary_attention_mask=False,
-    )
 
 
 # Values of the deprecated ``--export-model-type`` flag.
@@ -243,7 +187,7 @@ def apply_modelopt_model_config(
     *,
     disable_moe_grouped_gemm: bool = False,
 ) -> GPTModelConfig | HybridModelConfig:
-    """Set the ModelOpt layer spec and transformations on a stock GPT or Hybrid model config.
+    """Set declarative ModelOpt construction and transformation options on a stock model config.
 
     Args:
         model_config: A config from ``gpt_config_from_args`` / ``hybrid_config_from_args``,
@@ -272,15 +216,6 @@ def apply_modelopt_model_config(
                 "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
             )
             te_mcore_model = False
-        # Default to grouped MLP for the export spec (matches the pre-modernization
-        # behavior of get_hybrid_stack_modelopt_spec — its factory default is True).
-        # ``disable_moe_grouped_gemm`` (set by prune.py) forces SequentialMLP so
-        # mtp.prune can act on individual expert linears.
-        model_config.hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-            remap_te_layernorm=te_mcore_model,
-            use_default_te_spec=args.export_default_te_spec,
-            moe_grouped_gemm=not disable_moe_grouped_gemm,
-        )
     else:
         if args.export_offline_model:
             transformer_config = model_config.transformer
@@ -291,16 +226,6 @@ def apply_modelopt_model_config(
             # SP is not used for offline
             # TODO: DSR1 MTP may require SP
             transformer_config.sequence_parallel = False
-        model_config.mtp_layer_spec = modelopt_mtp_layer_spec
-        model_config.transformer_layer_spec = functools.partial(
-            modelopt_gpt_layer_spec,
-            default_te_spec=args.export_default_te_spec,
-            force_local_attention=args.export_force_local_attention,
-            remap_te_layernorm=te_mcore_model,
-            real_quant_cfg=args.export_real_quant_cfg,
-            disable_moe_grouped_gemm=disable_moe_grouped_gemm,
-        )
-
     qad_train_target = getattr(args, 'qad_train_target', None)
     if args.freeze_base_for_mtp:
         if qad_train_target not in (None, 'mtp'):
@@ -310,6 +235,10 @@ def apply_modelopt_model_config(
             )
         qad_train_target = 'mtp'
     model_config.transformations = ModelTransformConfig(
+        default_te_spec=args.export_default_te_spec,
+        force_local_attention=args.export_force_local_attention,
+        real_quant_cfg=args.export_real_quant_cfg,
+        moe_grouped_gemm=not disable_moe_grouped_gemm,
         qad_train_target=qad_train_target,
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
         te_mcore_model=te_mcore_model,

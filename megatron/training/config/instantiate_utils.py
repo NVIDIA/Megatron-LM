@@ -96,8 +96,6 @@ _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
 _DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset(
     {
         "functools.partial",
-        "megatron.post_training.model_config.modelopt_gpt_layer_spec",
-        "megatron.post_training.model_config.modelopt_mtp_layer_spec",
     }
 )
 

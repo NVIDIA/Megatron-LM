@@ -4,6 +4,7 @@ import abc
 import functools
 import importlib
 import inspect
+import warnings
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
@@ -109,10 +110,10 @@ class ModelConfig:
 
     # === ModelOpt ===
     restore_modelopt_state: bool = False
-    """Restore ModelOpt quantization/sparsity state."""
+    """Deprecated compatibility field; ignored by Megatron-LM model builders."""
 
     transformations: ModelTransformConfig | None = None
-    """Declarative ModelOpt setup, reconstructed as hooks by GPT/Hybrid builders."""
+    """Declarative ModelOpt layer-spec and hook setup used by GPT/Hybrid builders."""
 
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
@@ -132,10 +133,20 @@ class ModelConfig:
 
     def validate(self) -> None:
         """Validate transformations before allocating models or loading checkpoints."""
+        if self.restore_modelopt_state:
+            warnings.warn(
+                "ModelConfig.restore_modelopt_state is deprecated and ignored by "
+                "Megatron-LM model builders; configure ModelOpt through transformations instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if self.transformations is not None:
             target = self.transformations.qad_train_target
             if target not in (None, "mtp", "base", "both"):
                 raise ValueError(f"Unsupported qad_train_target: {target}")
+            real_quant_cfg = self.transformations.real_quant_cfg
+            if real_quant_cfg not in ("None", "fp8_real_quant", "fp8_blockwise_real_quant"):
+                raise ValueError(f"Unsupported real_quant_cfg: {real_quant_cfg}")
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.

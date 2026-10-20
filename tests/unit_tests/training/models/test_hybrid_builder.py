@@ -9,6 +9,7 @@ from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.models.transforms import ModelTransformConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -216,12 +217,32 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_none_uses_default_te_spec(self, mock_model, *_):
-        # Default config: hybrid_stack_spec=None, restore_modelopt_state=False,
-        # transformer_impl != "inference_optimized" → falls through to default TE spec.
+        # Default config: hybrid_stack_spec=None and transformer_impl !=
+        # "inference_optimized" → falls through to the default TE spec.
         with patch("megatron.training.models.hybrid.default_hybrid_stack_spec") as mock_default:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is mock_default
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_transform_config_selects_modelopt_spec(self, mock_model, *_):
+        self.config.transformations = ModelTransformConfig(
+            default_te_spec=True,
+            moe_grouped_gemm=False,
+        )
+        with patch(
+            "megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec"
+        ) as mock_modelopt:
+            self.builder.build_model(self.pg, pre_process=True, post_process=True)
+        mock_modelopt.assert_called_once_with(
+            remap_te_layernorm=False,
+            use_default_te_spec=True,
+            moe_grouped_gemm=False,
+        )
+        assert mock_model.call_args.kwargs["hybrid_stack_spec"] is mock_modelopt.return_value
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
@@ -249,45 +270,35 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_spec_none_with_restore_modelopt_state_uses_modelopt_spec(self, mock_model, *_):
+    def test_restore_modelopt_state_does_not_change_selected_spec(self, mock_model, *_):
         self.config.restore_modelopt_state = True
-        modelopt_spec = ModuleSpec(module=object)
-        with patch(
-            "megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec",
-            return_value=modelopt_spec,
-        ) as mock_fn:
+        with patch("megatron.training.models.hybrid.default_hybrid_stack_spec") as mock_default:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
-        mock_fn.assert_called_once_with(local_core_attention=False, remap_te_layernorm=False)
         call_kwargs = mock_model.call_args.kwargs
-        assert call_kwargs["hybrid_stack_spec"] is modelopt_spec
+        assert call_kwargs["hybrid_stack_spec"] is mock_default
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_wide_residual_rejects_modelopt_spec_generation(self, _mock_model, *_):
+    def test_restore_modelopt_state_does_not_reject_wide_residual(self, mock_model, *_):
         self.config.transformer.wide_residual = WideResidualConfig(num_streams=2)
         self.config.restore_modelopt_state = True
-        with pytest.raises(NotImplementedError, match="ModelOpt HybridStack"):
+        with patch("megatron.training.models.hybrid.wide_residual_hybrid_stack_spec") as mock_wide:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
+        assert mock_model.call_args.kwargs["hybrid_stack_spec"] is mock_wide
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_spec_none_inference_optimized_takes_precedence_over_modelopt(self, mock_model, *_):
+    def test_restore_modelopt_state_does_not_change_inference_spec(self, mock_model, *_):
         self.config.transformer.transformer_impl = "inference_optimized"
         self.config.restore_modelopt_state = True
-        with (
-            patch("megatron.training.models.hybrid.hybrid_inference_stack_spec") as mock_inf,
-            patch(
-                "megatron.training.models.hybrid.get_hybrid_stack_modelopt_spec"
-            ) as mock_modelopt,
-        ):
+        with patch("megatron.training.models.hybrid.hybrid_inference_stack_spec") as mock_inf:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is mock_inf
-        mock_modelopt.assert_not_called()
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)

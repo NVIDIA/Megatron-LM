@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
+from megatron.training.models.transforms import ModelTransformConfig
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +95,18 @@ class TestModelConfigDefaults:
         assert cfg.extra_checkpoint_metadata is None
         assert cfg.pre_wrap_hooks == []
         assert cfg.post_wrap_hooks == []
+
+    def test_restore_modelopt_state_is_deprecated(self):
+        cfg = DummyModelConfig(restore_modelopt_state=True)
+        with pytest.warns(DeprecationWarning, match="deprecated and ignored"):
+            cfg.validate()
+
+    def test_invalid_real_quant_config_is_rejected(self):
+        cfg = DummyModelConfig(
+            transformations=ModelTransformConfig(real_quant_cfg="unsupported")
+        )
+        with pytest.raises(ValueError, match="Unsupported real_quant_cfg"):
+            cfg.validate()
 
     def test_custom_fields_stored(self):
         hook1 = Mock()
