@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.training import arguments, checkpointing, global_vars, initialize
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.config.common_config import RNGConfig
 
 
@@ -27,8 +28,10 @@ def _args_without_rng():
 @pytest.fixture
 def initialization_mocks(monkeypatch):
     args = _args_without_rng()
-    monkeypatch.setattr(initialize, "get_args", lambda: args)
+    args.batch_parallel_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     for name in (
+        "initialize_runtime_services",
         "setup_logging",
         "initialize_rerun_state_machine",
         "_initialize_distributed",
@@ -101,6 +104,8 @@ def test_initialization_applies_tracker_policy(
     )
     cfg.model = model
     cfg.rng = RNGConfig(te_rng_tracker=te_tracker, inference_rng_tracker=inference_tracker)
+    if not inference:
+        cfg.train.micro_batch_size = 1
     before = asdict(cfg.rng)
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     initialize.initialize_megatron(
@@ -127,7 +132,6 @@ def test_native_cuda_graph_requirement_is_resolved_before_seeding(
     from megatron.training.models import GPTModelConfig, HybridModelConfig
 
     args, seed = initialization_mocks
-    args.lazy_mpu_init = lazy
     transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
     transformer.cuda_graph_impl = "transformer_engine"
     model_cls = GPTModelConfig if model_kind == "gpt" else HybridModelConfig
@@ -141,6 +145,9 @@ def test_native_cuda_graph_requirement_is_resolved_before_seeding(
     )
     cfg.model = model
     cfg.rng = RNGConfig(inference_rng_tracker=not training)
+    cfg.dist.lazy_mpu_init = lazy
+    if training:
+        cfg.train.micro_batch_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
 
     def check_seed(*seed_args, **seed_kwargs):
@@ -213,23 +220,39 @@ def test_shared_config_factories_use_run_rng_after_bootstrap(
 @pytest.mark.parametrize("skip", [False, True])
 @pytest.mark.parametrize("training", [False, True])
 def test_initialization_uses_owner_and_preserves_deferred_seeding(
-    lazy, skip, te_tracker, inference_tracker, run_config, initialization_mocks, training
+    monkeypatch,
+    lazy,
+    skip,
+    te_tracker,
+    inference_tracker,
+    run_config,
+    initialization_mocks,
+    training,
 ):
     args, seed = initialization_mocks
-    args.lazy_mpu_init = lazy
+    cfg = (
+        run_config
+        if training
+        else inference_cfg_container_from_args(args, build_model_config=False)
+    )
+    if training:
+        cfg.train.micro_batch_size = 1
+    cfg.dist.lazy_mpu_init = lazy
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     rng = RNGConfig(
         seed=919,
         data_parallel_random_init=True,
         te_rng_tracker=te_tracker,
         inference_rng_tracker=inference_tracker,
     )
-    run_config.rng = rng
+    cfg.rng = rng
     finish = initialize.initialize_megatron(
         allow_no_cuda=True,
         skip_random_seed=skip,
         skip_dependency_compilation=True,
         training=training,
     )
+    assert cfg._finalized
     if lazy:
         seed.assert_not_called()
         finish()
@@ -323,6 +346,7 @@ def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, r
     from megatron.training.distillation import utils_logits
 
     args = Namespace(seed=999, seq_length=32, train_samples=16)
+    run_config.train.train_samples = 16
     monkeypatch.setattr(utils_logits, "get_args", lambda: args)
     monkeypatch.setattr(utils_logits, "_blend_identifiers", lambda args: {"mock": True})
     run_config.rng.seed = 123

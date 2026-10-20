@@ -45,6 +45,7 @@ TRAIN_STATE_KEYS = {
     "do_train",
     "do_valid",
     "do_test",
+    "release",
 }
 
 
@@ -346,8 +347,10 @@ def test_save_checkpoint_release_writes_release_tracker_and_train_state(
 
         state_dict = torch.load(global_train_state_path, weights_only=True)
         assert set(state_dict.keys()) == TRAIN_STATE_KEYS
+        assert state_dict["release"].item() is True
         assert state_dict["step"].item() == populated_train_state.iteration
         assert state_dict["floating_point_operations_so_far"].item() == num_fp_ops
 
         loaded_state = read_train_state(str(global_train_state_path))
+        assert loaded_state.release is True
         assert loaded_state.consumed_train_samples == populated_train_state.consumed_train_samples

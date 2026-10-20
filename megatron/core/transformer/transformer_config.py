@@ -360,7 +360,10 @@ class TransformerConfig(ModelParallelConfig):
     """Layer offset for DSA cross-layer top-k sharing."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+    """Coefficient for the DSA indexer KL divergence loss.
+    Set to 0 to disable indexer loss; in that mode the non-differentiable indexer projections are
+    frozen and excluded from gradient/optimizer bookkeeping.
+    """
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
@@ -381,6 +384,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 
+    dsa_indexer_qk_proj_use_quantization: bool = True
+    """Whether indexer query/key projections use the enclosing FP8/FP4 context.
+    When disabled, these projections use the configured unquantized dtype (e.g. BF16).
+    This does not control ``linear_weights_proj`` or index-score quantization.
+    """
+
     dsa_indexer_k_norm_epsilon: Optional[float] = None
     """Optional epsilon override for the DSA indexer key LayerNorm."""
 
@@ -396,6 +405,23 @@ class TransformerConfig(ModelParallelConfig):
     """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
     path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
     backend. The final index scores remain FP32 independently of this option."""
+
+    dsa_indexer_kpool: int = 1
+    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection.
+    When greater than one, ``dsa_indexer_topk`` must be divisible by this value.
+    """
+
+    dsa_indexer_kpool_use_quantization: bool = False
+    """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
+    rotation. This does not change projection parameter or GEMM precision.
+    """
+
+    dsa_indexer_kpool_always_select_tail: bool = True
+    """Append each query's incomplete causal pool after selected history pools.
+    This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
+    Set to False for fixed-width pool-only selection. Only applies when
+    ``dsa_indexer_kpool > 1``.
+    """
 
     ####################
     # Compressed sparse attention
@@ -807,6 +833,7 @@ class TransformerConfig(ModelParallelConfig):
     """When set, GLU activations in the shared expert MLP will use a block
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
+    Requires BF16 or FP16 model parameters when GLU is enabled.
     """
     moe_shortcut_connection: bool = False
     """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
@@ -1008,6 +1035,9 @@ class TransformerConfig(ModelParallelConfig):
     backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via
     TransformerEngine's transformer_engine.pytorch.ep API."""
 
+    moe_virtual_expert_load_balance: bool = False
+    """Balance MoE routes by materializing virtual experts over HybridEP."""
+
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
@@ -1140,7 +1170,7 @@ class TransformerConfig(ModelParallelConfig):
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
-    advanced fused kernels."""
+    advanced fused kernels. Requires BF16 or FP16 model parameters when GLU is enabled."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
     """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
@@ -1665,9 +1695,20 @@ class TransformerConfig(ModelParallelConfig):
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
-            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+            if (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            ) and not (
+                self.cuda_graph_impl == "local"
+                and not self.enable_cuda_graph
+                and not self.external_cuda_graph
+                and normalize_inference_cuda_graph_scope(
+                    self.inference_cuda_graph_scope, self.cuda_graph_impl
+                )
+                == InferenceCudaGraphScope.block
+            ):
                 raise NotImplementedError(
-                    "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
+                    "wide_residual supports CUDA graphs only with cuda_graph_impl='local' "
+                    "and inference_cuda_graph_scope='block'."
                 )
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
@@ -1796,11 +1837,13 @@ class TransformerConfig(ModelParallelConfig):
         if (
             self.dsa_indexer_weights_proj_output_dtype == "fp32"
             and self.dsa_kernel_backend == "cudnn"
+            and self.dsa_indexer_kpool <= 1
         ):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
-                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
-                "Use dsa_kernel_backend='tilelang' or 'none'."
+                "dsa_kernel_backend='cudnn' for per-token DSA, which requires a BF16 indexer "
+                "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
+                "dsa_kernel_backend='tilelang'/'none'."
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
@@ -1864,6 +1907,31 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            if self.dsa_indexer_kpool < 1:
+                raise ValueError(
+                    f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
+                )
+            if self.dsa_indexer_kpool > 1:
+                if self.dsa_indexer_topk is None:
+                    raise ValueError(
+                        "dsa_indexer_topk must be set when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk < 1:
+                    raise ValueError(
+                        "dsa_indexer_topk must be positive"
+                        " when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk % self.dsa_indexer_kpool != 0:
+                    raise ValueError(
+                        "dsa_indexer_topk must be divisible"
+                        " by dsa_indexer_kpool for pool selection; "
+                        f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
+                    )
+            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                raise ValueError(
+                    "DSA indexer loss is not supported with kpool selection; set "
+                    "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
@@ -2288,6 +2356,90 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.num_moe_experts is not None and self.num_moe_experts > 0
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
+
+        if self.moe_virtual_expert_load_balance:
+            MAX_VIRTUAL_EXPERT_EP_SIZE = 64
+
+            def require(condition: bool, message: str) -> None:
+                if not condition:
+                    raise ValueError(f"Virtual-expert load balancing requires {message}.")
+
+            required_values = {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_routing_map_mode": "indices",
+                "bf16": True,
+                "params_dtype": torch.bfloat16,
+                "fp4": None,
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "moe_expert_rank_capacity_factor": None,
+                "moe_paged_stash": False,
+                "moe_use_grouped_tensor": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "moe_router_enable_expert_bias": False,
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_hybridep_pad_uneven_dispatch_inputs": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            for name, value in required_values.items():
+                require(getattr(self, name) == value, f"{name}={value!r}")
+            require(
+                2 <= self.expert_model_parallel_size <= MAX_VIRTUAL_EXPERT_EP_SIZE,
+                f"2<=expert_model_parallel_size<={MAX_VIRTUAL_EXPERT_EP_SIZE}",
+            )
+            require(
+                self.num_moe_experts is not None and self.num_moe_experts <= 8192,
+                "1<=num_moe_experts<=8192",
+            )
+            require(
+                self.num_moe_experts % self.expert_model_parallel_size == 0,
+                "num_moe_experts divisible by expert_model_parallel_size",
+            )
+            require(
+                1 <= self.moe_router_topk <= min(32, self.num_moe_experts),
+                "1<=moe_router_topk<=min(32, num_moe_experts)",
+            )
+            routing = self.moe_router_load_balancing_type
+            require(
+                "sinkhorn" not in ((routing,) if isinstance(routing, str) else routing),
+                "no sinkhorn routing",
+            )
+            require(
+                (self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu))
+                or (
+                    not self.gated_linear_unit
+                    and self.activation_func == squared_relu
+                    and self.use_fused_weighted_squared_relu
+                ),
+                "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation",
+            )
+            require(
+                (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                "moe_latent_size (or hidden_size) divisible by 128",
+            )
+            require(self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128")
+            mxfp8 = self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            require(
+                not self.fp8 or mxfp8,
+                "fp8=None for BF16, or fp8='e4m3' with fp8_recipe='mxfp8' " "and fp8_param=True",
+            )
+            require(
+                not self.moe_router_padding_for_quantization or mxfp8,
+                "moe_router_padding_for_quantization=False unless using native MXFP8",
+            )
+            require(
+                self.moe_flex_dispatcher_num_sms is None or self.moe_flex_dispatcher_num_sms > 0,
+                "moe_flex_dispatcher_num_sms>0",
+            )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
@@ -2945,6 +3097,29 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
+        has_glu_interleave = self.moe_mlp_glu_interleave_size is not None or (
+            self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        )
+        if self.gated_linear_unit and has_glu_interleave and self.params_dtype == torch.float32:
+            raise ValueError(
+                "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
+            )
+        if self.gated_linear_unit and self.moe_mlp_glu_interleave_size is not None:
+            assert self.expert_gtp_weight_remat_size == 1, (
+                "Routed expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable routed expert GLU interleave or expert GTP weight sharding."
+            )
+        if (
+            self.gated_linear_unit
+            and self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        ):
+            assert self.gtp_weight_remat_size == 1, (
+                "Shared expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable shared expert GLU interleave or GTP weight sharding."
+            )
+
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
                 raise ValueError(
@@ -3401,8 +3576,16 @@ class TransformerConfig(ModelParallelConfig):
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
         assert not (
-            self.moe_shortcut_connection and self.cuda_graph_impl != "none"
-        ), "CUDA graphs are not supported with moe_shortcut_connection."
+            self.moe_shortcut_connection
+            and self.cuda_graph_impl != "none"
+            and not (
+                self.cuda_graph_impl == "local"
+                and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            )
+        ), (
+            "moe_shortcut_connection supports CUDA graphs only with "
+            "cuda_graph_impl='local' and inference_cuda_graph_scope='block'."
+        )
 
         if self.cuda_graph_impl != "none":
 
@@ -3444,7 +3627,17 @@ class TransformerConfig(ModelParallelConfig):
                             'mlp cuda graph is only supported for dense layers, '
                             'but not found in the model.'
                         )
-                    if (
+                    if self.moe_virtual_expert_load_balance:
+                        # The virtual-expert planner keeps its routing metadata private to one
+                        # forward, which only the whole-layer moe scope preserves.
+                        assert not {
+                            CudaGraphModule.moe_router,
+                            CudaGraphModule.moe_preprocess,
+                        } & set(self.cuda_graph_modules), (
+                            'virtual-expert load balancing supports the moe CUDA graph scope only; '
+                            'moe_router and moe_preprocess are not supported.'
+                        )
+                    elif (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
@@ -3991,6 +4184,12 @@ class MLATransformerConfig(TransformerConfig):
 
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
+
+    mla_proj_use_quantization: bool = True
+    """Whether absorbed-MLA projections use the enclosing FP8/FP4 context.
+    When disabled, they use the configured unquantized dtype (e.g. BF16). Core-attention
+    precision is unchanged.
+    """
 
     use_fused_mla_q_uproj: bool = False
     """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).

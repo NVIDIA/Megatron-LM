@@ -37,3 +37,12 @@ class Countdown:
         if completed:
             self._value = self._initial_value
         return completed
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether the cycle is untouched or has automatically re-armed.
+
+        This reports total-count state; it cannot detect missing callbacks before
+        a cycle starts or surplus callbacks that complete another whole cycle.
+        """
+        return self._value == self._initial_value
