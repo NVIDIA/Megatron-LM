@@ -17,6 +17,7 @@ Guides for Megatron Core training and inference features.
 cuda_graph
 cross_layer_state
 fine_grained_activation_offloading
+low_precision_training
 moe
 megatron_fsdp
 dist_optimizer

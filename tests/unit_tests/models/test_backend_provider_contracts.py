@@ -91,8 +91,8 @@ class TestCrossEntropyFollowsTheConfig:
         ).vocab_parallel_cross_entropy()
         assert target is fused_vocab_parallel_cross_entropy
 
-    def test_an_explicit_te_request_is_not_silently_ignored(self):
-        """megatron/training/arguments.py rejects this, but a config built directly can ask."""
+    def test_explicit_te_request_is_not_silently_ignored(self):
+        """An explicit TE request selects the TE cross-entropy implementation."""
         target = get_backend_from_config(
             _config(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te")
         ).vocab_parallel_cross_entropy()

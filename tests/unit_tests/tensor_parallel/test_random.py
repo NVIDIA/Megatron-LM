@@ -9,6 +9,7 @@ from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
+    cudagraph_needs_generator_registration,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -85,6 +86,29 @@ def test_double_fork_cuda_rng_states_tracker(use_cudagraphable_rng):
     assert torch.equal(randn_double_fork_2[1], randn_single_fork_2[1])
     assert torch.equal(double_fork_state1, single_fork_state1)
     assert torch.equal(double_fork_state2, single_fork_state2)
+
+
+def test_cudagraph_generator_registration_matches_capture_behavior():
+    """Capturing a tracker fork must work when registration follows the detected requirement.
+
+    Regression test for PyTorch 2.14.0a0 builds without lazy generator registration, which
+    the version check alone treated as not needing registration.
+    """
+    rng_tracker = CudaRNGStatesTracker(use_cudagraphable_rng=True)
+    rng_tracker.add("state1", 1234)
+    needs_registration = cudagraph_needs_generator_registration()
+    assert cudagraph_needs_generator_registration() is needs_registration
+
+    graph = torch.cuda.CUDAGraph()
+    if needs_registration:
+        for state in rng_tracker.get_states().values():
+            graph.register_generator_state(state)
+    with torch.cuda.graph(graph):
+        with rng_tracker.fork("state1"):
+            out = torch.rand(16, device="cuda")
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all((out >= 0) & (out < 1))
 
 
 def test_convert_cuda_rng_state():

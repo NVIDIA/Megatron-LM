@@ -22,11 +22,11 @@ REQUEST_FIELD_POLICY = {
     "sampling_params": "checkpoint:copy-and-reduce-budget / merge:first",
     "inference_parameters": "checkpoint:drop-deprecated-alias / merge:drop",
     "prompt_tokens": "checkpoint:append-output / merge:first / wire:opt-in",
-    "compact_prompt_tokens": "checkpoint:preserve / merge:first / wire:opt-in",
     "media_tensors": "checkpoint:preserve / merge:first / wire:drop",
     "prompt_length": "checkpoint:reset / merge:reset / wire:derive",
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",
+    "finish_reason": "checkpoint:reset / merge:last",
     "encoder_prompt": "checkpoint:drop / merge:drop",
     "generated_text": "checkpoint:reset / merge:reset / finalize:decode-concatenated-tokens",
     "segments": "checkpoint:drop / merge:drop-unsupported",
@@ -65,6 +65,7 @@ REQUEST_FIELD_POLICY = {
 }
 
 SAMPLING_FIELD_POLICY = {
+    "seed": "preserve",
     "temperature": "preserve",
     "top_k": "preserve",
     "top_p": "preserve",
@@ -78,6 +79,7 @@ SAMPLING_FIELD_POLICY = {
     "return_prompt_top_n_logprobs": "preserve-derived-policy",
     "add_BOS": "preserve",
     "stop_words": "deep-copy-preserve",
+    "stop_token_ids": "deep-copy-preserve",
     "detokenize_stop_sequence": "preserve",
     "detokenize_generations": "preserve",
     "return_prompt_tokens": "preserve",

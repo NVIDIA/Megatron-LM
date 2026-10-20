@@ -236,7 +236,7 @@ def test_dense_batch_and_head_layout_parity(
 
 def test_pre_fusion_rejects_deterministic_mode(model_parallel):
     with pytest.raises(ValueError, match="Pre-GDR fusion is non-deterministic"):
-        _model(True, deterministic_mode=True)
+        _model(True, deterministic_mode=True, gdn_kernel_backend='torch')
 
 
 @pytest.mark.parametrize("value_heads", [16, 64])
@@ -250,7 +250,7 @@ def test_post_fusion_distributed_layout(
     tp, cp, sequence_parallel, batch, packed, pre_fusion, recompute, value_heads
 ):
     """Enable the post fusion through CP redistribution and the complete backward."""
-    if torch.distributed.get_world_size() < tp * cp:
+    if Utils.world_size < tp * cp:
         pytest.skip("This layout requires four distributed GPU ranks")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp

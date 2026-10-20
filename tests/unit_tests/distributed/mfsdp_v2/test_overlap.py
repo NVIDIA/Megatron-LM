@@ -10,7 +10,6 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
-from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
@@ -163,7 +162,7 @@ def test_overlaps_communication_and_compute(
     train_one_step()
     torch.cuda.synchronize(device)
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with torch.profiler.profile() as prof:
         train_one_step()
         # Synchronize inside the profiler context so in-flight device kernels
         # complete and get recorded before the profiler stops on __exit__.
@@ -250,9 +249,6 @@ def test_overlaps_communication_and_compute(
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_groups)}."
     )
 
-    # Release the dedicated communicator so it does not leak into the shared session.
-    dist.destroy_process_group(dp_group)
-
 
 def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     """Zero per-module prefetch budgets should launch all-gathers before compute."""
@@ -293,7 +289,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
 
     train_one_step()
     torch.cuda.synchronize(device)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    with torch.profiler.profile() as prof:
         train_one_step()
         torch.cuda.synchronize(device)
 

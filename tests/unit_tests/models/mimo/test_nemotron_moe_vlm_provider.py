@@ -407,7 +407,9 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
         moe_shortcut_post_norm=True,
         is_hybrid_model=True,
         use_fused_weighted_squared_relu=True,
-        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm"],
+        wide_residual=object(),
+        residual_stream_recompute_num_layers=4,
+        recompute_modules=["moe_act", "shortcut_pre_mlp_layernorm", "residual_stream"],
         offload_modules=["core_attn", "shortcut_post_norm"],
     )
 
@@ -430,6 +432,8 @@ def test_make_dense_non_hybrid_drops_language_only_settings():
     assert config.moe_shortcut_post_norm is False
     assert config.is_hybrid_model is False
     assert config.use_fused_weighted_squared_relu is False
+    assert config.wide_residual is None
+    assert config.residual_stream_recompute_num_layers is None
     assert config.recompute_modules == ["moe_act"]
     assert config.offload_modules == ["core_attn"]
 
@@ -470,6 +474,7 @@ def test_modality_configs_do_not_inherit_language_fp32_residuals():
 def test_language_model_spec_builds_mamba():
     """language_model_spec returns a MambaModel spec carrying the preset config."""
     from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import mamba_stack_spec
     from megatron.core.models.mamba.mamba_model import MambaModel
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
@@ -483,6 +488,19 @@ def test_language_model_spec_builds_mamba():
     assert spec.params["config"].expert_tensor_parallel_size == 2
     assert spec.params["max_sequence_length"] == args.seq_length
     assert spec.params["logit_dtype"] is None
+    assert spec.params["mamba_stack_spec"] is mamba_stack_spec
+
+
+def test_language_model_spec_selects_static_wide_residual_stack():
+    """Wide-residual language configs select the matching static HybridStack spec."""
+    from examples.mimo.model_providers.nemotron_moe_vlm import language_model_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
+
+    args = _parse_validate(_build_argv(*_PRESET_20L) + ["--wide-residual", "3"])
+    spec = language_model_spec(args, pg_collection=None, llm_grid=None)
+
+    assert spec.params["config"].wide_residual.num_streams == 3
+    assert spec.params["mamba_stack_spec"] is wide_residual_hybrid_stack_spec
 
 
 @pytest.mark.parametrize(
@@ -591,12 +609,14 @@ def test_language_rank_placement_uses_language_parallelism():
     language_config = nemotron_language_config(
         args, tp_size=2, pp_size=1, ep_size=1, expt_tp_size=1
     )
+    assert language_config.gtp_remat_num_sequence_shards == 1
     language_spec = ModuleSpec(module=object, params={"config": language_config})
     projection = language_input_projection_spec(args, None, None, language_spec)
 
     assert projection.params["input_size"] == 5120
     assert projection.params["config"].tensor_model_parallel_size == 2
     assert projection.params["config"].gtp_weight_remat_size == 2
+    assert projection.params["config"].gtp_remat_num_sequence_shards == 1
     provider = resolve_provider(args)
     assert provider.language_input_projection_specs[RADIO_ENCODER_MODULE_NAME] is (
         language_input_projection_spec
@@ -609,7 +629,8 @@ def test_language_rank_placement_uses_language_parallelism():
 
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("use_groups", [False, True])
-def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
+@pytest.mark.parametrize("sequence_shards", [1, 2])
+def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, sequence_shards):
     from types import SimpleNamespace
 
     from examples.mimo.model_providers import nemotron_moe_vlm as provider
@@ -618,6 +639,8 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
     args = SimpleNamespace(
         mimo_llm_ep=1,
         mimo_llm_expt_tp=1,
+        tensor_parallel_num_weight_shards=sequence_shards,
+        tensor_parallel_num_sequence_shards=sequence_shards,
         vocab_size=64,
         seq_length=32,
         hybrid_layer_pattern="*",
@@ -626,9 +649,17 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups):
     monkeypatch.setattr(
         provider,
         "_base_config",
-        lambda args: SimpleNamespace(context_parallel_size=8, calculate_per_token_loss=True),
+        lambda args: SimpleNamespace(
+            context_parallel_size=8,
+            calculate_per_token_loss=True,
+            gtp_remat_num_sequence_shards=sequence_shards,
+        ),
     )
     grid = SimpleNamespace(shape=[1, cp_size, 1], dim_names=["tp", "cp", "pp"])
+    if sequence_shards > 1:
+        grid.shape.append(sequence_shards)
+        grid.dim_names.append("gtp_remat_sequence_shards")
+    cp_size *= sequence_shards
     groups = None
     if use_groups:
         groups = SimpleNamespace(
@@ -649,7 +680,39 @@ def test_encoder_and_projection_do_not_inherit_language_cp():
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
     args.context_parallel_size = 2
+    args.tensor_parallel_num_weight_shards = 2
+    args.tensor_parallel_num_sequence_shards = 2
     vision = radio_vision_config(args, tp_size=1, pp_size=1)
     projection = nemotron_projection_config(args, tp_size=1, projection_input_size=5120)
     assert vision.context_parallel_size == 1
     assert projection.context_parallel_size == 1
+    assert vision.gtp_remat_num_sequence_shards == 1
+    assert projection.gtp_remat_num_sequence_shards == 1
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("sequence_shards", [1, 4])
+def test_language_sequence_shards_are_excluded_from_projection(tp, sequence_shards):
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        nemotron_language_config,
+        nemotron_projection_config,
+    )
+
+    args = _parse_validate(_build_argv(*_PRESET_20L))
+    args.tensor_model_parallel_size = tp
+    args.sequence_parallel = tp > 1
+    args.tensor_parallel_num_weight_shards = 8
+    args.tensor_parallel_num_sequence_shards = tp * sequence_shards
+    args.context_parallel_size = 2 * sequence_shards
+
+    language = nemotron_language_config(
+        args, tp, pp_size=1, ep_size=1, expt_tp_size=1, cp_size=args.context_parallel_size
+    )
+    assert language.gtp_remat_num_sequence_shards == sequence_shards
+    assert language.context_parallel_size == 2 * sequence_shards
+    projection = nemotron_projection_config(
+        args, tp, projection_input_size=5120, base_config=language
+    )
+    assert projection.gtp_remat_num_sequence_shards == 1
+    assert projection.context_parallel_size == 1
+    assert projection.gtp_weight_remat_size == language.gtp_weight_remat_size

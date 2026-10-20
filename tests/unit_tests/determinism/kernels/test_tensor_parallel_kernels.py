@@ -4,7 +4,8 @@
 
 * ``VocabParallelEmbedding``: the deterministic branch (``weight[ids]``) and the default
   ``F.embedding`` path, with heavily duplicated ids so the backward accumulates thousands of
-  rows into the same embedding row.
+  rows into the same embedding row; with ``gradient_accumulation_fusion`` the weight gradient
+  goes straight into ``main_grad`` (``fused_embedding_wgrad``).
 * ``vocab_parallel_cross_entropy``: the unfused path deterministic mode relies on.
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
   with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
@@ -22,6 +23,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fusions import fused_layer_norm
+from megatron.core.fusions.fused_embedding_wgrad import accumulate_embedding_wgrad
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import (
@@ -90,6 +92,45 @@ class TestTensorParallelLayers:
                 replays=4,
                 what=f"VocabParallelEmbedding[det={deterministic_branch}]",
             )
+
+    def test_vocab_parallel_embedding_wgrad_fusion_replays(self):
+        """gradient_accumulation_fusion: 64 distinct ids over 4096 positions accumulate into
+        main_grad through the sorted partial sums of ``fused_embedding_wgrad``."""
+        seeded()
+        config = _config(deterministic_mode=False, gradient_accumulation_fusion=True)
+        module = VocabParallelEmbedding(
+            8192, 1024, init_method=init_method_normal(0.02), config=config
+        ).cuda()
+        module.weight.main_grad = torch.zeros_like(module.weight, dtype=torch.float32)
+        module.weight.grad_added_to_main_grad = False
+        ids = torch.randint(0, 64, (1, 4096), device="cuda") * 100
+        assert_module_replays_bit_exact(
+            module,
+            (ids,),
+            replays=4,
+            contention=True,
+            what="VocabParallelEmbedding[gradient_accumulation_fusion]",
+        )
+        assert module.weight.grad_added_to_main_grad
+
+    def test_accumulate_embedding_wgrad_replays(self):
+        seeded()
+        ids = torch.randint(0, 64, (1, 4096), device="cuda") * 100
+        grad = torch.randn(1, 4096, 1024, device="cuda", dtype=torch.bfloat16)
+        main_grad = torch.randn(8192, 1024, device="cuda")
+
+        def accumulate(ids, grad, main_grad):
+            accumulate_embedding_wgrad(ids, grad, main_grad)
+            return main_grad
+
+        assert_replays_bit_exact(
+            accumulate,
+            (ids, grad, main_grad),
+            replays=3,
+            backward=False,
+            contention=True,
+            what="accumulate_embedding_wgrad",
+        )
 
     @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
     def test_vocab_parallel_cross_entropy_replays(self, label_smoothing):
@@ -261,4 +302,38 @@ def test_sliding_window_softmax_torch_path_replays(with_caller_mask):
         (scores,),
         replays=3,
         what=f"FusedScaleMaskSoftmax[torch, swa{'+padding' if with_caller_mask else ''}]",
+    )
+
+
+@pytest.mark.skipif(not HAVE_SCALED_SOFTMAX_EXT, reason="apex scaled softmax extensions missing")
+@pytest.mark.parametrize("with_caller_mask", [False, True], ids=["swa", "swa+padding"])
+def test_windowed_config_with_fusion_uses_torch_path_replays(with_caller_mask):
+    """A windowed config must not route to the apex fused kernels (issue #7847).
+
+    The fused kernels have no window parameter, so selecting them for a
+    windowed config silently computes full-causal attention. Windowed configs
+    must therefore fall through to ``forward_torch_softmax`` even when every
+    shape/dtype gate would admit the kernel; this covers that routed path for
+    both fwd and bwd, with and without a composed caller mask.
+    """
+    seeded()
+    module = FusedScaleMaskSoftmax(
+        input_in_fp16=False,
+        input_in_bf16=True,
+        attn_mask_type=AttnMaskType.causal,
+        scaled_masked_softmax_fusion=True,
+        mask_func=attention_mask_func,
+        softmax_in_fp32=True,
+        scale=None,
+        window_size=(128, 0),
+    )
+    b, np_, sq, sk = 2, 8, 512, 512
+    scores = torch.randn(b, np_, sq, sk, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    mask = (torch.rand(b, 1, sq, sk, device="cuda") < 0.2) if with_caller_mask else None
+    assert not module.is_kernel_available(mask, b, np_, sq, sk), "windowed config took fused path"
+    assert_replays_bit_exact(
+        lambda s: module(s, mask),
+        (scores,),
+        replays=3,
+        what=f"FusedScaleMaskSoftmax[torch, swa-fusion{'+padding' if with_caller_mask else ''}]",
     )
