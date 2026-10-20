@@ -93,11 +93,7 @@ _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
     "signal.",
 )
 
-_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset(
-    {
-        "functools.partial",
-    }
-)
+_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset({"functools.partial"})
 
 
 class TargetAllowlist:
@@ -364,8 +360,7 @@ def instantiate_node(
             assert callable(_target_)
             # Drop unexpected kwargs in lenient mode or raise in strict mode
             kwargs = _filter_kwargs_for_target(_target_, kwargs, full_key, mode)
-            result = _call_target(_target_, partial, args, kwargs, full_key)
-            return result
+            return _call_target(_target_, partial, args, kwargs, full_key)
         else:
             dict_items = {}
             for key, value in node.items():
