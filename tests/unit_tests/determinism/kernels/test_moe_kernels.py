@@ -852,15 +852,15 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing,sigmoid_input_scaling",
+        "balancing,score,expert_bias,hash_routing,sigmoid_input_scaling_factor",
         [
-            ("aux_loss", "softmax", False, False, False),
-            ("seq_aux_loss", "sigmoid", True, False, False),
-            ("sinkhorn", "softmax", False, False, False),
-            ("none", "sigmoid", False, True, False),
-            ("none", "softmax", False, True, False),
-            ("seq_aux_loss", "sigmoid", True, False, True),
-            ("none", "sigmoid", False, True, True),
+            ("aux_loss", "softmax", False, False, 1.0),
+            ("seq_aux_loss", "sigmoid", True, False, 1.0),
+            ("sinkhorn", "softmax", False, False, 1.0),
+            ("none", "sigmoid", False, True, 1.0),
+            ("none", "softmax", False, True, 1.0),
+            ("seq_aux_loss", "sigmoid", True, False, 0.612),
+            ("none", "sigmoid", False, True, 1.5),
         ],
         ids=[
             "aux_loss",
@@ -873,7 +873,7 @@ class TestMoEModules:
         ],
     )
     def test_topk_router_replays(
-        self, balancing, score, expert_bias, hash_routing, sigmoid_input_scaling
+        self, balancing, score, expert_bias, hash_routing, sigmoid_input_scaling_factor
     ):
         self._init()
         seeded()
@@ -882,7 +882,7 @@ class TestMoEModules:
             moe_router_topk=8 if balancing != "sinkhorn" else 1,
             moe_router_load_balancing_type=balancing,
             moe_router_score_function=score,
-            moe_router_sigmoid_input_scaling=sigmoid_input_scaling,
+            moe_router_sigmoid_input_scaling_factor=sigmoid_input_scaling_factor,
             moe_router_enable_expert_bias=expert_bias,
             moe_router_pre_softmax=balancing == "sinkhorn",
             moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
@@ -912,7 +912,7 @@ class TestMoEModules:
             replays=3,
             grad_output=grad_output,
             contention=hash_routing,
-            what=f"TopKRouter[{balancing}, hash={hash_routing}, scaled_sigmoid={sigmoid_input_scaling}]",
+            what=f"TopKRouter[{balancing}, hash={hash_routing}, scaled_sigmoid={sigmoid_input_scaling_factor}]",
         )
 
     def test_topk_router_per_token_loss_replays_and_captures(self):

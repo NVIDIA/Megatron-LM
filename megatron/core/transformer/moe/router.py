@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import math
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -97,11 +96,6 @@ class Router(ABC, MegatronModule):
         self.weight = torch.nn.Parameter(
             torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
         )
-        self.sigmoid_input_scale = (
-            math.sqrt(self.weight.shape[0] / self.weight.shape[1])
-            if self.config.moe_router_sigmoid_input_scaling
-            else 1.0
-        )
         if self.config.add_bias_linear:
             self.bias = torch.nn.Parameter(
                 torch.empty((self.config.num_moe_experts), dtype=torch.float32)
@@ -151,11 +145,21 @@ class Router(ABC, MegatronModule):
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
-        if self.config.moe_router_sigmoid_input_scaling:
+        if self.config.moe_router_sigmoid_input_scaling_factor != 1.0:
+            # Calibrate the positive gain a using representative random-init inputs and
+            # fixed router weights: sweep a, select s = sigmoid(a * logits)[topk], form
+            # b = s / ||s||_2, and maximize the empirical mean of ||db/dinput||_F^2.
+            # Validate on held-out inputs and independent router initializations. This
+            # measures local gate-direction sensitivity for an RMS-normalized mixture
+            # of independent experts; it excludes top-k boundary changes and does not
+            # establish full-network criticality. See the MoE README for the procedure.
+            # With zero gate bias and std(W) = c_init / sqrt(hidden_size), use
+            # a = c_target / c_init; c_target = 0.55 with c_init = 0.9 gives a ~ 0.611.
+            # The gain is model-dependent, not derived from the expert count.
             # Share effective logits across routing, auxiliary losses, and inference.
             if logits.dtype in (torch.float16, torch.bfloat16):
                 logits = logits.float()
-            logits = logits * self.sigmoid_input_scale
+            logits = logits * self.config.moe_router_sigmoid_input_scaling_factor
         return logits
 
     @abstractmethod

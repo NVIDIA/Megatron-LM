@@ -930,12 +930,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
     """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
-    moe_router_sigmoid_input_scaling: bool = False
-    """Scale sigmoid router logits by ``sqrt(num_moe_experts / hidden_size)`` before
-    scoring and z-loss. For 256 experts and hidden size 8192, the multiplier is about
-    0.1768. This fixed scale is separate from ``moe_router_topk_scaling_factor``, which
-    scales selected output probabilities. Requires sigmoid scoring without Sinkhorn
-    balancing. Disabled by default and adds no checkpoint tensors."""
+    moe_router_sigmoid_input_scaling_factor: float = 1.0
+    """Fixed positive, finite multiplier for sigmoid router logits before scoring and
+    z-loss. Calibrate on representative random-init activations; see the MoE README.
+    The value is not derived from the expert count or hidden size. Separate from
+    ``moe_router_topk_scaling_factor``, which scales selected output probabilities.
+    Non-identity values require sigmoid MoE routing without Sinkhorn balancing.
+    Defaults to 1.0 (unchanged behavior) and adds no checkpoint tensors."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -3371,13 +3372,21 @@ class TransformerConfig(ModelParallelConfig):
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
 
-        if self.moe_router_sigmoid_input_scaling:
+        if (
+            not math.isfinite(self.moe_router_sigmoid_input_scaling_factor)
+            or self.moe_router_sigmoid_input_scaling_factor <= 0
+        ):
+            raise ValueError("moe_router_sigmoid_input_scaling_factor must be positive and finite.")
+        if self.moe_router_sigmoid_input_scaling_factor != 1.0:
             if not self.num_moe_experts or self.moe_router_score_function != "sigmoid":
                 raise ValueError(
-                    "moe_router_sigmoid_input_scaling requires a MoE model with sigmoid scoring."
+                    "moe_router_sigmoid_input_scaling_factor requires a MoE model with sigmoid "
+                    "scoring."
                 )
             if self.moe_router_load_balancing_type == "sinkhorn":
-                raise ValueError("moe_router_sigmoid_input_scaling does not support Sinkhorn.")
+                raise ValueError(
+                    "moe_router_sigmoid_input_scaling_factor does not support Sinkhorn."
+                )
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
             "sigmoid",

@@ -357,7 +357,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch.compile",
         notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
-        "Fixed sigmoid input scaling replays with sequence auxiliary loss, expert bias and hash routing.",
+        "Explicit sigmoid input gains replay with sequence auxiliary loss, expert bias and hash routing.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
