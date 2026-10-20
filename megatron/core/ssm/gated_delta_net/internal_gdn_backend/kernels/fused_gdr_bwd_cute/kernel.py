@@ -27,15 +27,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from .._cute_compat import _wrap_tma
 from . import tcgen05_ws
 from .layouts import BackwardLayoutPlan, TmaDescriptorBundle, build_backward_layout_plan
 from .storage import (
     TMEM_ALLOCATION_COLUMNS,
-    TMEM_COLUMNS,
-    TMEM_RANGES,
-    LayoutBudget,
     SharedStorage,
-    get_layout_budget,
     make_shared_views,
     make_tmem_views,
 )
@@ -46,44 +43,6 @@ except ImportError:
     _cute_iket = getattr(cute, "iket", None)
 except NotImplementedError:
     _cute_iket = getattr(cute, "iket", None)
-
-
-try:
-    from cutlass.cute.nvgpu.cpasync import TmaInfo
-except ImportError:
-    from cutlass.base_dsl import extract_mlir_attributes as _ema
-    from cutlass.base_dsl import extract_mlir_values as _emv
-    from cutlass.base_dsl import get_mlir_types as _gmt
-    from cutlass.base_dsl import new_from_mlir_values as _nfmv
-
-    class TmaInfo:
-        """MLIR-value shim for CuTeDSL releases returning an atom/tensor pair."""
-
-        def __init__(self, atom, tma_tensor):
-            self.atom = atom
-            self.tma_tensor = tma_tensor
-
-        def __extract_mlir_values__(self):
-            return _emv(self.atom) + _emv(self.tma_tensor)
-
-        def __extract_mlir_attributes__(self):
-            return _ema(self.atom) + _ema(self.tma_tensor)
-
-        def __new_from_mlir_values__(self, values):
-            atom_values = len(_gmt(self.atom))
-            return TmaInfo(
-                _nfmv(self.atom, values[:atom_values]),
-                _nfmv(self.tma_tensor, values[atom_values:]),
-            )
-
-        def __getitem__(self, index):
-            return (self.atom, self.tma_tensor)[index]
-
-
-def _wrap_tma(value):
-    if isinstance(value, TmaInfo):
-        return value
-    return TmaInfo(value[0], value[1])
 
 
 @dsl_user_op
@@ -461,102 +420,6 @@ class _CompletionOnlyTmaAsyncPipeline(pipeline.PipelineTmaAsync):
         _ = state, loc, ip
 
 
-@dataclass(frozen=True)
-class StaticTensorContract:
-    """Trace-time rank plus static shape/inner-stride requirements."""
-
-    name: str
-    rank: int
-    shape_modes: tuple[tuple[int, str], ...]
-    stride_modes: tuple[tuple[int, str], ...]
-
-
-STATIC_TENSOR_CONTRACTS = (
-    StaticTensorContract(
-        "q", 4, ((0, "one"), (2, "grouped_heads"), (3, "dk")),
-        ((1, "grouped_token_stride"), (2, "dk"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "k", 4, ((0, "one"), (2, "grouped_heads"), (3, "dk")),
-        ((1, "grouped_token_stride"), (2, "dk"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "v", 4, ((0, "one"), (2, "heads"), (3, "dv")),
-        ((1, "value_token_stride"), (2, "dv"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "a", 4, ((0, "one"), (2, "heads"), (3, "bt")),
-        ((1, "a_token_stride"), (2, "bt"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "g", 3, ((0, "one"), (2, "heads")),
-        ((1, "heads"), (2, "one")),
-    ),
-    StaticTensorContract(
-        "beta", 3, ((0, "one"), (2, "heads")),
-        ((1, "heads"), (2, "one")),
-    ),
-    StaticTensorContract(
-        "do", 4, ((0, "one"), (2, "heads"), (3, "dv")),
-        ((1, "value_token_stride"), (2, "dv"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "dht",
-        4,
-        ((0, "num_sequences"), (1, "heads"), (2, "dk"), (3, "dv")),
-        (
-            (0, "state_batch_stride"),
-            (1, "state_head_stride"),
-            (2, "dv"),
-            (3, "one"),
-        ),
-    ),
-    StaticTensorContract(
-        "h",
-        5,
-        ((0, "one"), (2, "heads"), (3, "dk"), (4, "dv")),
-        ((2, "state_head_stride"), (3, "dv"), (4, "one")),
-    ),
-    StaticTensorContract(
-        "cu_seqlens", 1, ((0, "metadata_size"),), ((0, "one"),)
-    ),
-    StaticTensorContract(
-        "chunk_offsets", 1, ((0, "metadata_size"),), ((0, "one"),)
-    ),
-    StaticTensorContract(
-        "dq", 4, ((0, "one"), (2, "grouped_heads"), (3, "dk")),
-        ((1, "grouped_token_stride"), (2, "dk"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "dk", 4, ((0, "one"), (2, "grouped_heads"), (3, "dk")),
-        ((1, "grouped_token_stride"), (2, "dk"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "dv", 4, ((0, "one"), (2, "heads"), (3, "dv")),
-        ((1, "value_token_stride"), (2, "dv"), (3, "one")),
-    ),
-    StaticTensorContract(
-        "dg", 3, ((0, "one"), (2, "heads")),
-        ((1, "heads"), (2, "one")),
-    ),
-    StaticTensorContract(
-        "db", 3, ((0, "one"), (2, "heads")),
-        ((1, "heads"), (2, "one")),
-    ),
-    StaticTensorContract(
-        "dh0",
-        4,
-        ((0, "num_sequences"), (1, "heads"), (2, "dk"), (3, "dv")),
-        (
-            (0, "state_batch_stride"),
-            (1, "state_head_stride"),
-            (2, "dv"),
-            (3, "one"),
-        ),
-    ),
-)
-
-
 class FusedGdrBwdKernel:
     """SM100 role, memory, MMA, TMA, and launch structure."""
 
@@ -578,28 +441,7 @@ class FusedGdrBwdKernel:
     bt = _BT
     dk = _DK
     dv = _DV
-    tmem_columns = TMEM_COLUMNS
     tmem_allocation_columns = TMEM_ALLOCATION_COLUMNS
-
-    mm_64_64_128_tile = (64, 64, 128)
-    mm_64_128_64_tile = (64, 128, 64)
-    mm_128_64_64_tile = (128, 64, 64)
-    mm_128_64_128_tile = (128, 64, 128)
-    mm_64_64_64_tile = (64, 64, 64)
-
-    p_tmem_offset = 0
-    dk_tmem_offset = 0
-    dv_tmem_offset = 64
-    da_tmem_offset = 128
-    u_tmem_offset = 192
-    vprime_tmem_offset = 416
-    dog_tmem_offset = 416
-    dq_tmem_offset = 192
-    a_tmem_offset = 160
-    dp_tmem_offset = 160
-    dh_left_tmem_offset = 256
-    dh_right_tmem_offset = 320
-    mask_tmem_offset = 384
 
     shared_storage = SharedStorage
 
@@ -609,7 +451,6 @@ class FusedGdrBwdKernel:
         acc_dtype=cutlass.Float32,
         *,
         heads: int = 64,
-        grouped_heads: int = 64,
         num_sequences: int,
         use_dht: bool = True,
         state_v_first: bool = False,
@@ -629,10 +470,6 @@ class FusedGdrBwdKernel:
             raise ValueError(
                 "heads must be divisible by four for g/beta TMA loads"
             )
-        if grouped_heads != heads:
-            raise ValueError(
-                "grouped_heads must equal heads; GQA head mapping is unsupported"
-            )
         if num_sequences <= 0:
             raise ValueError("num_sequences must be positive")
         if uniform_sequence_length < 0:
@@ -641,14 +478,12 @@ class FusedGdrBwdKernel:
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
         self.heads = heads
-        self.grouped_heads = grouped_heads
         self.num_sequences = num_sequences
         self.use_dht = use_dht
         self.state_v_first = state_v_first
         self.uniform_sequence_length = uniform_sequence_length
         self.enable_varlen_tail = enable_varlen_tail
         self.enable_iket = enable_iket
-        self.cta_group = tcgen05.CtaGroup.ONE
         self.tmem_free_barrier = pipeline.NamedBarrier(
             barrier_id=1,
             num_threads=self.threads_per_cta,
@@ -687,142 +522,25 @@ class FusedGdrBwdKernel:
         )
 
     def _build_mma_layouts(self) -> BackwardLayoutPlan:
-        """Build named trace-time layout bindings and validate TMEM placement."""
+        """Build the named trace-time layout bindings."""
 
-        plan = build_backward_layout_plan(self.io_dtype, self.acc_dtype)
-        self._validate_tmem_layout_plan(plan)
-        return plan
-
-    def _validate_tmem_layout_plan(self, plan: BackwardLayoutPlan) -> None:
-        """Keep the physical TMEM reservations pinned to the baseline layout."""
-
-        range_by_name = {
-            name: (begin, end) for name, begin, end, _, _ in TMEM_RANGES
-        }
-        bindings = (
-            ("p", self.p_tmem_offset, "mm_64_64_128_k_k"),
-            ("dk", self.dk_tmem_offset, "mm_64_128_64_mn_mn"),
-            ("dv", self.dv_tmem_offset, "mm_64_128_64_mn_mn"),
-            ("da", self.da_tmem_offset, "mm_64_64_128_k_k"),
-            ("u", self.u_tmem_offset, "mm_64_128_64_mn_mn"),
-            ("vprime", self.vprime_tmem_offset, "mm_64_128_64_mn_mn"),
-            ("dog", self.dog_tmem_offset, "mm_64_128_64_mn_mn"),
-            ("dq", self.dq_tmem_offset, "mm_64_128_64_mn_mn"),
-            ("a", self.a_tmem_offset, "mm_64_64_128_k_k"),
-            ("dp", self.dp_tmem_offset, "mm_64_64_128_k_k"),
-            ("at", self.a_tmem_offset, "mm_64_64_128_k_k"),
-            ("dh_left", self.dh_left_tmem_offset, "mm_128_64_64_mn_mn"),
-            ("dh_right", self.dh_right_tmem_offset, "mm_128_64_64_mn_mn"),
-        )
-        assert {binding[0] for binding in bindings} == set(range_by_name) - {
-            "mask"
-        }
-        assert range_by_name["mask"] == (
-            self.mask_tmem_offset,
-            self.mask_tmem_offset + 32,
-        )
-        for name, offset, variant_name in bindings:
-            begin, end = range_by_name[name]
-            assert begin == offset
-            logical_columns = plan.physical_columns_by_variant[variant_name]
-            reservation_columns = (
-                logical_columns // 2
-                if logical_columns == 64
-                and variant_name.startswith("mm_64_64_")
-                else logical_columns
-            )
-            assert end - begin == reservation_columns, (
-                f"{name}: TMEM range span {end - begin} does not match "
-                f"{variant_name} physical reservation {reservation_columns}"
-            )
+        return build_backward_layout_plan(self.io_dtype, self.acc_dtype)
 
     @cute.jit
-    def _check_static_tensor_contracts(
-        self,
-        q,
-        k,
-        v,
-        a,
-        g,
-        beta,
-        do,
-        dht,
-        h,
-        cu_seqlens,
-        chunk_offsets,
-        dq,
-        dk,
-        dv,
-        dg,
-        db,
-        dh0,
-    ):
-        tensors = {
-            "q": q,
-            "k": k,
-            "v": v,
-            "a": a,
-            "g": g,
-            "beta": beta,
-            "do": do,
-            "dht": dht,
-            "h": h,
-            "cu_seqlens": cu_seqlens,
-            "chunk_offsets": chunk_offsets,
-            "dq": dq,
-            "dk": dk,
-            "dv": dv,
-            "dg": dg,
-            "db": db,
-            "dh0": dh0,
-        }
-        expected = {
-            "one": 1,
-            "num_sequences": self.num_sequences,
-            "metadata_size": self.num_sequences + 1,
-            "heads": self.heads,
-            "grouped_heads": self.grouped_heads,
-            "bt": self.bt,
-            "dk": self.dk,
-            "dv": self.dv,
-            "grouped_token_stride": self.grouped_heads * self.dk,
-            "value_token_stride": self.heads * self.dv,
-            "a_token_stride": self.heads * self.bt,
-            "state_head_stride": self.dk * self.dv,
-            "state_batch_stride": self.heads * self.dk * self.dv,
-        }
-        for spec in STATIC_TENSOR_CONTRACTS:
-            tensor = tensors[spec.name]
-            if cutlass.const_expr(len(tensor.shape) != spec.rank):
-                raise ValueError(
-                    f"{spec.name} must have rank {spec.rank}"
-                )
-            for mode, key in spec.shape_modes:
-                if cutlass.const_expr(
-                    not cute.is_static(tensor.shape[mode])
-                ):
-                    raise ValueError(
-                        f"{spec.name}.shape[{mode}] must be static"
-                    )
-                if cutlass.const_expr(
-                    tensor.shape[mode] != expected[key]
-                ):
-                    raise ValueError(
-                        f"{spec.name}.shape[{mode}] has wrong extent"
-                    )
-            for mode, key in spec.stride_modes:
-                if cutlass.const_expr(
-                    not cute.is_static(tensor.stride[mode])
-                ):
-                    raise ValueError(
-                        f"{spec.name}.stride[{mode}] must be static"
-                    )
-                if cutlass.const_expr(
-                    tensor.stride[mode] != expected[key]
-                ):
-                    raise ValueError(
-                        f"{spec.name}.stride[{mode}] has wrong value"
-                    )
+    def _check_static_shapes(self, q, h, dht):
+        """Require static head/state modes; the launcher marks only tokens dynamic."""
+
+        checks = (
+            ("q", q, ((2, self.heads), (3, self.dk))),
+            ("h", h, ((2, self.heads), (3, self.dk), (4, self.dv))),
+            ("dht", dht, ((0, self.num_sequences), (1, self.heads), (2, self.dk), (3, self.dv))),
+        )
+        for name, tensor, modes in checks:
+            for mode, extent in modes:
+                if cutlass.const_expr(not cute.is_static(tensor.shape[mode])):
+                    raise ValueError(f"{name}.shape[{mode}] must be static")
+                if cutlass.const_expr(tensor.shape[mode] != extent):
+                    raise ValueError(f"{name}.shape[{mode}] has wrong extent")
 
     @staticmethod
     def _token_matrix_view(tensor):
@@ -985,18 +703,6 @@ class FusedGdrBwdKernel:
         )
 
     @cute.jit
-    def layout_probe(self, stream: cuda.CUstream):
-        self._build_mma_layouts()
-        self._layout_probe_kernel().launch(
-            grid=(1, 1, 1),
-            block=(self.threads_per_cta, 1, 1),
-            cluster=(1, 1, 1),
-            smem=self.shared_storage.size_in_bytes(),
-            stream=stream,
-            min_blocks_per_mp=1,
-        )
-
-    @cute.jit
     def _allocate_tmem(self, tmem_holding_ptr, warp_idx):
         if warp_idx == self.state_warp_ids[0]:
             for allocation_index in cutlass.range_constexpr(
@@ -1031,16 +737,6 @@ class FusedGdrBwdKernel:
                     tmem_holding_ptr + allocation_index,
                     self.tmem_allocation_columns[allocation_index],
                 )
-
-    @cute.kernel
-    def _layout_probe_kernel(self):
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(self.shared_storage)
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-
-        tmem_holding_ptr = storage.tmem_holding_buf.data_ptr()
-        self._allocate_tmem(tmem_holding_ptr, warp_idx)
-        self._release_tmem(tmem_holding_ptr, warp_idx)
 
     @cute.jit
     def _make_role_pipelines(self, storage):
@@ -2436,7 +2132,6 @@ class FusedGdrBwdKernel:
             dvprime_state_inputs_ready_handle = self._producer_at(
                 mma_input_ready_pipelines[_INPUT_DVPRIME_STATE_READY], chunk_iteration
             ).acquire()
-            state_tidx = tidx
             g_last = s_exp_g[_BT - 1]
             self._seed_state_half(
                 dh_left_acc,
@@ -2445,7 +2140,7 @@ class FusedGdrBwdKernel:
                 s_tmp41,
                 sequence,
                 head,
-                state_tidx,
+                tidx,
                 g_last,
                 chunk_iteration == 0,
                 loaded_h_stage,
@@ -2459,7 +2154,7 @@ class FusedGdrBwdKernel:
                 s_tmp41,
                 sequence,
                 head,
-                state_tidx,
+                tidx,
                 g_last,
                 chunk_iteration == 0,
                 loaded_h_stage,
@@ -2483,7 +2178,7 @@ class FusedGdrBwdKernel:
                 s_tmp41,
                 sequence,
                 head,
-                state_tidx,
+                tidx,
                 g_last,
                 False,
                 loaded_h_stage,
@@ -2497,7 +2192,7 @@ class FusedGdrBwdKernel:
                 s_tmp41,
                 sequence,
                 head,
-                state_tidx,
+                tidx,
                 g_last,
                 False,
                 loaded_h_stage,
@@ -2533,7 +2228,6 @@ class FusedGdrBwdKernel:
                 dv,
                 dv_acc,
                 s_exp_g,
-                head,
                 load_tensor_pipelines,
                 mma_done_pipelines,
                 smem_reuse_pipelines,
@@ -2711,7 +2405,6 @@ class FusedGdrBwdKernel:
         dv,
         dv_acc,
         s_exp_g,
-        head,
         load_tensor_pipelines,
         mma_done_pipelines,
         smem_reuse_pipelines,
@@ -3201,7 +2894,6 @@ class FusedGdrBwdKernel:
         self.kv_reduction_barrier.arrive_and_wait()
         self._iket_pop_stage(block_idx, chunk_iteration)
         dk_state_handle.release()
-        return u_handle
 
     @cute.jit
     def run_kv_consumer_late(
@@ -3301,21 +2993,16 @@ class FusedGdrBwdKernel:
     def run_aq_consumer(
         self,
         block_idx,
-        a_copy_acc,
-        da_copy_acc,
         db,
         dg,
-        dp_copy_acc,
         dq_acc,
         dv_acc,
         head,
         load_tensor_pipelines,
-        mask_acc,
         mask_tmem_ptr,
         mma_done_pipelines,
         smem_reuse_pipelines,
         tmp21_reuse_pipeline,
-        p_copy_acc,
         primary_tmem_ptr,
         da_tmem_ptr,
         dg_rmw_done_pipeline,
@@ -3339,7 +3026,6 @@ class FusedGdrBwdKernel:
         s_tmp21,
         s_tmp22,
         s_tmp22_padded,
-        s_tmp41_padded,
         s_v,
         scale,
         sequence_chunks,
@@ -3430,53 +3116,6 @@ class FusedGdrBwdKernel:
             loaded_g_stage = g_handle.index
             aq_row0 = (aq_tidx // 32) * 16 + (aq_tidx % 32) // 4
             aq_row1 = aq_row0 + 8
-            c_p_base = cute.make_identity_tensor((_BT, _BT))
-            c_p = cute.make_tensor(
-                c_p_base.iterator,
-                cute.make_layout(
-                    ((16, 4), (32, 2)),
-                    stride=(
-                        (cute.E(0), 16 * cute.E(0)),
-                        (cute.E(1), 32 * cute.E(1)),
-                    ),
-                ),
-            )
-            atom_p_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-                self.acc_dtype,
-            )
-            tiled_p_t2r = tcgen05.make_tmem_copy(
-                atom_p_t2r, p_copy_acc
-            )
-            thr_p_t2r = tiled_p_t2r.get_slice(aq_tidx)
-            t_tr_p = thr_p_t2r.partition_S(p_copy_acc)
-            t_tr_cp = thr_p_t2r.partition_D(c_p)
-            t_tr_cp_flat = cute.group_modes(t_tr_cp, 0, cute.rank(t_tr_cp))
-
-            c_mask = c_p
-            atom_mask_r2t = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
-                self.acc_dtype,
-            )
-            atom_mask_t2r = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-                self.acc_dtype,
-            )
-            tiled_mask_r2t = tcgen05.make_tmem_copy(
-                atom_mask_r2t, mask_acc
-            )
-            tiled_mask_t2r = tcgen05.make_tmem_copy(
-                atom_mask_t2r, mask_acc
-            )
-            thr_mask_r2t = tiled_mask_r2t.get_slice(aq_tidx)
-            thr_mask_t2r = tiled_mask_t2r.get_slice(aq_tidx)
-            t_rt_mask = thr_mask_r2t.partition_D(mask_acc)
-            t_rt_cmask = thr_mask_r2t.partition_S(c_mask)
-            t_rt_cmask_flat = cute.group_modes(
-                t_rt_cmask, 0, cute.rank(t_rt_cmask)
-            )
-            t_tr_mask = thr_mask_t2r.partition_S(mask_acc)
-            t_tr_cmask = thr_mask_t2r.partition_D(c_mask)
             r_mask = cute.make_rmem_tensor((32,), self.acc_dtype)
             mask_row = aq_tidx % _BT
             mask_column_base = (aq_tidx // _BT) * (_BT // 2)
@@ -3852,17 +3491,6 @@ class FusedGdrBwdKernel:
             cute.arch.fence_view_async_shared()
             vprime_handle.release()
 
-            t_tr_a_acc = thr_p_t2r.partition_S(a_copy_acc)
-            t_tr_da_acc = thr_p_t2r.partition_S(da_copy_acc)
-            atom_da_acc_r2t = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
-                self.acc_dtype,
-            )
-            tiled_da_acc_r2t = tcgen05.make_tmem_copy(
-                atom_da_acc_r2t, da_copy_acc
-            )
-            thr_da_acc_r2t = tiled_da_acc_r2t.get_slice(aq_tidx)
-            t_rt_da_acc = thr_da_acc_r2t.partition_D(da_copy_acc)
             r_mask_phase6 = cute.make_rmem_tensor((32,), self.acc_dtype)
             _direct_tmem_load32(mask_tmem_ptr, r_mask_phase6)
             _direct_tmem_load32(
@@ -3894,7 +3522,6 @@ class FusedGdrBwdKernel:
                 ),
                 square_layout.outer,
             )
-            t_tr_dp = thr_p_t2r.partition_S(dp_copy_acc)
             r_p = cute.make_rmem_tensor_like(r_pg, self.acc_dtype)
             r_mask_phase7 = cute.make_rmem_tensor((32,), self.acc_dtype)
             _direct_tmem_load32(mask_tmem_ptr, r_mask_phase7)
@@ -5352,26 +4979,15 @@ class FusedGdrBwdKernel:
     @cute.kernel
     def _fused_bwd_kernel(
         self,
-        q,
-        k,
-        v,
-        a,
-        g,
-        beta,
-        do,
-        dht,
         dht_matrix,
         dh0_matrix,
-        h,
         cu_seqlens,
         chunk_offsets,
         dq,
-        dk,
         dv,
         dk_matrix,
         dg,
         db,
-        dh0,
         tma_q,
         tma_k,
         tma_v,
@@ -5483,7 +5099,6 @@ class FusedGdrBwdKernel:
             canonical_views.tmp23_right_square_transposed
         )
         s_tmp41 = canonical_views.tmp41
-        s_tmp41_padded = canonical_views.tmp41_padded
 
         packed_views = shared_views.packed
         s_tmp11_p1 = packed_views.tmp11_p1
@@ -5576,11 +5191,7 @@ class FusedGdrBwdKernel:
             mma_dh_k,
         )
         primary_tmem_ptr = tmem_views.primary_ptr
-        secondary_tmem_ptr = tmem_views.secondary_ptr
         mask_tmem_ptr = tmem_views.mask_ptr
-        vprime_tmem_ptr = tmem_views.vprime_ptr
-        dog_tmem_ptr = tmem_views.dog_ptr
-        dq_tmem_ptr = tmem_views.dq_ptr
         da_tmem_ptr = tmem_views.da_ptr
         square_tmem_ptr = tmem_views.square_ptr
         u_acc = tmem_views.u_acc
@@ -5591,11 +5202,6 @@ class FusedGdrBwdKernel:
         dv_acc = tmem_views.dv_acc
         dh_left_acc = tmem_views.dh_left_acc
         dh_right_acc = tmem_views.dh_right_acc
-        p_copy_acc = tmem_views.p_copy_acc
-        dp_copy_acc = tmem_views.dp_copy_acc
-        a_copy_acc = tmem_views.a_copy_acc
-        da_copy_acc = tmem_views.da_copy_acc
-        mask_acc = tmem_views.mask_acc
         block_idx, _, _ = cute.arch.block_idx()
         sequence = block_idx // self.heads
         head = block_idx % self.heads
@@ -5728,21 +5334,16 @@ class FusedGdrBwdKernel:
                     _cute_iket.range_push("WG1_AQ")
             self.run_aq_consumer(
                 block_idx,
-                a_copy_acc,
-                da_copy_acc,
                 db,
                 dg,
-                dp_copy_acc,
                 dq_acc,
                 dv_acc,
                 head,
                 load_tensor_pipelines,
-                mask_acc,
                 mask_tmem_ptr,
                 mma_done_pipelines,
                 smem_reuse_pipelines,
                 tmp21_reuse_pipeline,
-                p_copy_acc,
                 primary_tmem_ptr,
                 da_tmem_ptr,
                 dg_rmw_done_pipeline,
@@ -5766,7 +5367,6 @@ class FusedGdrBwdKernel:
                 s_tmp21,
                 s_tmp22,
                 s_tmp22_padded,
-                s_tmp41_padded,
                 s_v,
                 scale,
                 sequence_chunks,
@@ -5896,25 +5496,7 @@ class FusedGdrBwdKernel:
         scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
-        self._check_static_tensor_contracts(
-            q,
-            k,
-            v,
-            a,
-            g,
-            beta,
-            do,
-            dht,
-            h,
-            cu_seqlens,
-            chunk_offsets,
-            dq,
-            dk,
-            dv,
-            dg,
-            db,
-            dh0,
-        )
+        self._check_static_shapes(q, h, dht)
         dht_matrix = self._state_matrix_view(dht)
         dh0_matrix = self._state_matrix_view(dh0)
         dk_matrix = self._token_matrix_view(dk)
@@ -5933,26 +5515,15 @@ class FusedGdrBwdKernel:
             dq,
         )
         self._fused_bwd_kernel(
-            q,
-            k,
-            v,
-            a,
-            g,
-            beta,
-            do,
-            dht,
             dht_matrix,
             dh0_matrix,
-            h,
             cu_seqlens,
             chunk_offsets,
             dq,
-            dk,
             dv,
             dk_matrix,
             dg,
             db,
-            dh0,
             tma.q,
             tma.k,
             tma.v,
@@ -6014,7 +5585,5 @@ class FusedGdrBwdKernel:
 
 __all__ = [
     "FusedGdrBwdKernel",
-    "LayoutBudget",
     "SharedStorage",
-    "get_layout_budget",
 ]

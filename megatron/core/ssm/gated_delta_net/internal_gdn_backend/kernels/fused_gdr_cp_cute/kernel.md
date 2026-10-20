@@ -15,19 +15,44 @@ The internal backend tries this package before FLA's CP preprocessing. Set
   for unsupported operands.
 - `0`: disable this package and use FLA CP preprocessing.
 
-`FLA_CP_CUTEDSL` is accepted as a compatibility alias when the Megatron
-variable is unset.
-
 ## Supported fast path
 
-- NVIDIA SM100 B200/GB200 with an NCCL CP group of size 2 through 8.
+- NVIDIA Blackwell data-center GPUs (SM100 B200/GB200, SM103 GB300) with an NCCL
+  CP group of size 2 through 8.
 - Packed THD input with validated CPU sequence offsets attached to the CP
   context. Call `finalize_packed_seq_params()` after padding and before the
   model forward so the existing `cp_partition_route` owns that snapshot.
-- BF16 operands, scalar `g` gate, chunk size 64.
-- Equal key/value dimensions of 64 or 128.
-- A local sequence length of at least 64 that is not divisible by 64 is handled
-  inside the kernels; inputs are not padded or copied.
+- BF16 operands, chunk size 64, and exactly one gate: GDN's scalar `g`
+  (`[1,T,HV]`, fp32 or bf16) or KDA's per-key `gk` (`[1,T,HV,K]` fp32, FLA's
+  chunk-local log2 cumsum). The kernels read only the chunk-last row of `gk`
+  and apply no per-token gating in that mode, so the `k` / `q` operands must
+  arrive pre-gated as FLA's `kg` / `qg` -- the same contract as FLA's own
+  Triton CP pre-process. `HV % 4 == 0` is required in both modes (only the
+  `g` TMA box needs it; the dispatcher keeps one head-geometry contract).
+- Equal key/value dimensions of 128.
+- Any local window length that is not a multiple of 64 is handled inside the
+  kernels (the TMA descriptors carry the logical `T`, so a ragged tail is
+  zero-filled by the hardware); inputs are not padded or copied. Windows
+  shorter than one chunk (`T < 64`) rely on the same zero-fill and are
+  covered by the `cp_tiny_window` GDR harness case.
+
+## Modules
+
+Only the warp-specialized (tcgen05) engines remain:
+
+| Module | Role |
+| --- | --- |
+| `backend.py` | dispatcher: predicates, chain classification, emit flags, wrapper cache and rendezvous, launch counters, fallback reasons |
+| `protocol.py` | `CPProtocolMixin`: protocol geometry (`NV`, `NK`, `NSTRIPS`, `STRIP`, gate mode), sys-scope flag/ack spins and signals, `hm_sym` strip offsets, the cp.async staging + bf16 hi/lo warp-MMA fold both merge roles run, and the tcgen05 gemm issue helper |
+| `fused_ws.py` | `PreProcessFwdFusedWS` (forward compute + merge roles) and its host wrapper `CuteDSLFusedCPPreProcessWS` |
+| `bwd_ws.py` | `PreProcessBwdFusedWS` (reverse compute + suffix fold) and its host wrapper `CuteDSLFusedCPBwdPreProcessWS` |
+| `_host.py` | host helpers shared by the wrappers: pointer / CUstream memoization, gate normalization |
+| `symm.py` | `CPSymmBuffers`: the symmetric `hm_sym` / `flags` / `acks` tensors and peer pointer tables |
+
+Each wrapper compiles exactly one program. The forward's aligned and ragged specializations are the same program under scalar `g` (`need_lam` is on either way) and the per-key `gk` wrapper is built as the ragged specialization; the backward wrapper runs the ragged (tail-masked) specialization for every `T` in every gate mode. Keying the backward on `T % 64 == 0` used to compile the ragged program lazily on only the ranks that own an unaligned boundary window, several minutes into a packed run while their peers spun, and mixed two programs across ranks; the single program costs the lambda table and the dV tail mask on aligned calls. The wrapper cache key and the
+handshake signature carry the gate mode, so a GDN and a KDA layer of the same
+head geometry never share a wrapper. The forward engine's K = 64 `gk` pairing
+is unverified and unreachable: the dispatcher admits only K = V = 128.
 
 The production `GatedDeltaNet.forward` path preserves MCore's established
 chunkwise-CP contract: dense SBHD input with `B > 1` is rejected. Use packed THD
@@ -89,3 +114,11 @@ with no CuTeDSL fallback. The GB200 test
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` checks the forward and
 backward launch-counter deltas and requires the fallback-reason map to remain
 empty, in addition to comparing the output and five gradients with pure FLA.
+The same file covers the per-key (`gk`) gate mode through the KDA adapter at
+the Kimi head geometry (K == V == 128) under CP2 and CP4 in strict `cute`
+mode: one launch per direction, no fallback, output and all seven gradients
+against FLA's own CP path; a companion test pins down that head dims outside
+the kernels' envelope raise in `cute` mode and are recorded as fallbacks in
+`auto` mode instead of passing silently. The tests skip unless the pytest
+process group has exactly `cp_size` ranks (run them under `torchrun
+--nproc_per_node=2` and `=4`).

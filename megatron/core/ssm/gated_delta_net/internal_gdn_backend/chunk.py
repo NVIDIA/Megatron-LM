@@ -20,7 +20,7 @@ def _load_internal_chunk_gated_delta_rule() -> (
     except ImportError as exc:
         raise RuntimeError(
             "The internal GDR backend requires the flash-linear-attention dependency "
-            "from the Megatron Core development environment."
+            f"from the Megatron Core development environment (import failed: {exc})."
         ) from exc
     return chunk_gated_delta_rule
 
@@ -35,9 +35,22 @@ def _load_internal_prepare_validated_chunk_metadata() -> (
     except ImportError as exc:
         raise RuntimeError(
             "The internal GDR backend requires the flash-linear-attention dependency "
-            "from the Megatron Core development environment."
+            f"from the Megatron Core development environment (import failed: {exc})."
         ) from exc
     return prepare_validated_chunk_metadata
+
+
+@lru_cache(maxsize=1)
+def _load_internal_chunk_kda() -> Callable[..., tuple[torch.Tensor, torch.Tensor | None]]:
+    """Load FLA and the in-tree KDA orchestration only when this backend is used."""
+    try:
+        from .kda import chunk_kda
+    except ImportError as exc:
+        raise RuntimeError(
+            "The internal GDR backend requires the flash-linear-attention dependency "
+            f"from the Megatron Core development environment (import failed: {exc})."
+        ) from exc
+    return chunk_kda
 
 
 def _gdn_is_cuda_graphed(config) -> bool:
@@ -141,6 +154,33 @@ def prepare_validated_chunk_metadata(
     return helper(cu_seqlens, include_chunk_indices=include_chunk_indices)
 
 
+def _validate_public_options(
+    *,
+    use_beta_sigmoid_in_kernel: bool,
+    allow_neg_eigval: bool,
+    state_v_first: bool,
+    kwargs: dict,
+) -> bool:
+    """Reject unsupported FLA options and fold the deprecated ``transpose_state_layout``.
+
+    Shared by the FLA-free public entry point below and by the dispatcher in
+    ``implementation.py`` (which the e2e tests call directly). ``kwargs`` is mutated:
+    ``transpose_state_layout`` is popped once it is folded into the returned
+    ``state_v_first``.
+    """
+    if use_beta_sigmoid_in_kernel:
+        raise ValueError("The internal GDR backend does not support in-kernel beta sigmoid.")
+    if allow_neg_eigval:
+        raise ValueError("The internal GDR backend does not support negative eigenvalues.")
+
+    transpose_state_layout = kwargs.pop("transpose_state_layout", None)
+    if transpose_state_layout is not None:
+        if state_v_first and not bool(transpose_state_layout):
+            raise ValueError("state_v_first conflicts with transpose_state_layout=False.")
+        state_v_first = bool(transpose_state_layout)
+    return state_v_first
+
+
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -162,16 +202,12 @@ def chunk_gated_delta_rule(
     **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the in-tree CuTe DSL GDR path with FLA fallback."""
-    if use_beta_sigmoid_in_kernel:
-        raise ValueError("The internal GDR backend does not support in-kernel beta sigmoid.")
-    if allow_neg_eigval:
-        raise ValueError("The internal GDR backend does not support negative eigenvalues.")
-
-    transpose_state_layout = kwargs.pop("transpose_state_layout", None)
-    if transpose_state_layout is not None:
-        if state_v_first and not bool(transpose_state_layout):
-            raise ValueError("state_v_first conflicts with transpose_state_layout=False.")
-        state_v_first = bool(transpose_state_layout)
+    state_v_first = _validate_public_options(
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        state_v_first=state_v_first,
+        kwargs=kwargs,
+    )
 
     implementation = _load_internal_chunk_gated_delta_rule()
     return implementation(
@@ -192,5 +228,63 @@ def chunk_gated_delta_rule(
         validated_chunk_offsets=validated_chunk_offsets,
         cp_context=cp_context,
         recompute_h=recompute_h,
+        **kwargs,
+    )
+
+
+@torch.compiler.disable
+def chunk_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    safe_gate: bool = False,
+    lower_bound: float | None = None,
+    disable_recompute: bool = False,
+    return_intermediate_states: bool = False,
+    state_v_first: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    validated_chunk_indices: torch.LongTensor | None = None,
+    cp_context: object | None = None,
+    **kwargs: object,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run FLA's KDA kernels with the in-tree CuTe DSL CP pre-processing (FLA fallback).
+
+    Same keyword surface as ``fla.ops.kda.chunk_kda`` (``A_log`` / ``dt_bias`` /
+    ``chunk_size`` travel in ``kwargs``), plus ``validated_chunk_indices`` for
+    caller-prepared packed chunk metadata.
+    """
+    implementation = _load_internal_chunk_kda()
+    return implementation(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        disable_recompute=disable_recompute,
+        return_intermediate_states=return_intermediate_states,
+        state_v_first=state_v_first,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        validated_chunk_indices=validated_chunk_indices,
+        cp_context=cp_context,
         **kwargs,
     )

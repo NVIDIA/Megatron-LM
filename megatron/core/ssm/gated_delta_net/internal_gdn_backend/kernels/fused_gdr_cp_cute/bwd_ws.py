@@ -5,11 +5,11 @@
 
 """Warp-specialized tcgen05 (Blackwell) fused CP backward ``dhu`` pre-process.
 
-Reverse-direction sibling of :mod:`fused_gdr_cp_cute.fused_ws`.  The shipped
-non-warp-specialized backward (:mod:`fused_gdr_cp_cute.bwd_fused`) inherits the
-SM80 warp-MMA engine; on the current stack it measures 1027.70 us against
-1020.94 us for exact FLA at the canonical CP2 shape -- i.e. no speedup at all.
-The forward received the Blackwell rewrite; the backward never did.
+Reverse-direction sibling of :mod:`fused_gdr_cp_cute.fused_ws`; the wire
+protocol and the SM80 hi/lo bf16 fold come from
+:mod:`fused_gdr_cp_cute.protocol`.  The non-warp-specialized SM80 backward it
+replaced measured 1027.70 us against 1020.94 us for exact FLA at the canonical
+CP2 shape -- i.e. no speedup at all.
 
 Design provenance
 -----------------
@@ -89,7 +89,8 @@ one warp (tcgen05 issue and tcgen05.commit are elect-one-per-warp; multi-warp
 issue duplicates MMAs and over-arrives the 1-count producer mbarriers).
 
 Restrictions: sm_100a, K == V == 128, B = 1, BT = 64, gate modes
-none/g/gk, no DPLR.  Other shapes fall back to the non-WS backward.
+none/g/gk, no DPLR.  Other shapes are refused by the dispatcher
+(`backend.py`) and fall back to FLA.
 """
 
 from __future__ import annotations
@@ -104,14 +105,8 @@ import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .bwd_fused import _FLA_WRAPPER_CACHE  # noqa: F401
-from .bwd_fused import BT, CuteDSLFusedCPBwdPreProcess, PreProcessBwdFused
-from .bwd_fused import chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl_fused as _bwd_entry
-from .fused_ws import PreProcessFwdFusedWS, tmem_alloc_ptr
-
-# _FLA_WRAPPER_CACHE is re-exported, not used here: benchmark harnesses find
-# the live wrapper through `candidate.__module__` to inspect the published
-# [Htilde|P] wire payload.
+from ._host import CPHostCaches, _normalize_gate
+from .protocol import BT, CPProtocolMixin, tmem_alloc_ptr
 
 NS = 64                # strip width
 VGS = 2                # front dV/gate pipeline stages
@@ -125,17 +120,25 @@ NB_TMEM_ALLOC = 4
 NB_ITEM = 5            # item boundaries (all threads)
 
 
-class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
+class PreProcessBwdFusedWS(CPProtocolMixin):
     """Warp-specialized reverse producer with peer push and suffix fold."""
 
     def __init__(self, H, HV, K, V, gate_mode, R, rank, n_sm=None,
                  full_chunks=False):
-        # Backward protocol/geometry first (peer counts, NSTRIPS, NB, ...).
-        PreProcessBwdFused.__init__(self, H, HV, K, V, gate_mode, R, rank)
+        # Protocol geometry first (NSTRIPS, NB, STRIP, ...).
+        CPProtocolMixin.__init__(self, H, HV, K, V, gate_mode, R, rank)
         assert K == V == 128, "WS backward is specialized for K == V == 128"
-        assert gate_mode in ("none", "g", "gk"), gate_mode
         if self.use_g:
             assert HV % 4 == 0, "WS g-mode needs HV % 4 == 0 (TMA box)"
+        # The chain is always the whole group.  It used to be configurable
+        # (`pre_count` / `post_count`), which let a caller build an engine whose
+        # pushes covered fewer ranks than the emit rules in `backend.py` assume
+        # they cover -- those rules truncate a consumer's fold by zeroing a
+        # transition, which only bounds the sum correctly if every earlier rank
+        # is in it.  A shortened chain would drop terms twice.  It is fixed
+        # here so that cannot be expressed.
+        self.consumer_lo = 0
+        self.source_hi = R - 1
 
         self.NG = self.NSTRIPS               # 4
         self.SPP = max(self.NSTRIPS // 2, 1)  # 2 strips per MMA pair
@@ -181,8 +184,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         self.n_items = self.n_citems + self.n_mitems
         # A rank whose local sequence neither enters nor leaves this CP shard
         # still participates in symmetric-buffer init; one idle CTA keeps the
-        # launch legal (both role blocks compile away).  Mirrors
-        # PreProcessBwdFused.n_grid = max(n_work, 1).
+        # launch legal (both role blocks compile away).
         self.n_ctas = max(min(n_sm, self.n_items), 1)
         nwork = max(1, self.n_citems)
         eff0 = max(1, min(self.n_ctas, nwork))
@@ -199,7 +201,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         pDV: cute.Pointer,     # [1,T,HV,V] bf16
         pG: cute.Pointer,      # [1,T,HV] fp32 or dummy
         pGK: cute.Pointer,     # [1,T,HV,K] fp32 or dummy
-        pHMloc: cute.Pointer,  # local symmetric [2,R,1,HV,NG,K,64] fp32
+        pHMloc: cute.Pointer,  # local symmetric [2,R,HV,NG,K,64] fp32
         pPtrs: cute.Pointer,   # int64 [3,R] rows hm/flags/acks
         pDHT: cute.Pointer,    # [HV,K,V] fp32 canonical output
         scale: cutlass.Float32,
@@ -711,23 +713,6 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
     def _rev(self, tq, nc):
         """Reverse-scan chunk index: the scan runs NT-1 .. 0."""
         return nc - 1 - tq
-
-    # ------------------------------------------------------------- gemm util
-    @cute.jit
-    def _exec_gemm(self, tiled_mma, tAcc, tCrA, tCrB, a_stage, b_stage,
-                   acc_init: cutlass.Constexpr = False,
-                   kp_lo: cutlass.Constexpr = 0,
-                   kp_hi: cutlass.Constexpr = -1):
-        n_kp = cute.size(tCrB, mode=[2])
-        hi = n_kp if kp_hi < 0 else kp_hi
-        for kpi in cutlass.range(hi - kp_lo, unroll_full=True):
-            kp = kp_lo + kpi
-            tiled_mma.set(tcgen05.Field.ACCUMULATE,
-                          cutlass.Boolean(acc_init or kp != 0))
-            cute.gemm(tiled_mma, tAcc,
-                      tCrA[None, None, kp, a_stage],
-                      tCrB[None, None, kp, b_stage], tAcc)
-        return tiled_mma
 
     # ----------------------------------------------------------- front TMA
     @cute.jit
@@ -1471,73 +1456,247 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
 
 
 # ---------------------------------------------------------------------- host
-class CuteDSLFusedCPBwdPreProcessWS(CuteDSLFusedCPBwdPreProcess):
-    """Same host wrapper, warp-specialized reverse compute engine.
+class CuteDSLFusedCPBwdPreProcessWS(CPHostCaches):
+    """Persistent host wrapper for the warp-specialized reverse engine.
 
     Aligned calls (``T % BT == 0``) compile the ragged-tail machinery away,
-    so chunk alignment joins the compile-cache key.  Both specializations
+    so chunk alignment is the compile-cache key.  Both specializations
     coexist in the cache; a workload that alternates lengths pays one extra
-    compile, not one per call.
+    compile, not one per call.  Under per-key ``gk`` the ragged
+    specialization serves every ``T`` instead (see ``_launch``).
+
+    The chain shape is deliberately NOT part of the key.  The engine is always
+    built on the full chain -- rank r pushes to ``r-1 .. 0`` and folds
+    ``r+1 .. R-1`` -- and a packed batch is expressed by suppressing halves
+    of the pushed summary at runtime (``emit_h`` / ``emit_m``) rather than
+    by shortening the chain.  Keying on ``(pre_count, post_count)`` used to
+    mean a fresh multi-second `cute.compile` for every chain shape the
+    packing produced, at a random mid-training step, with every peer rank
+    spinning for the duration -- and under THD the shape changes every step.
     """
 
-    OP_CLASS = PreProcessBwdFusedWS
+    def __init__(
+        self,
+        group,
+        H: int,
+        HV: int,
+        DK: int,
+        DV: int,
+        gate_mode: str = "g",
+        device=None,
+    ):
+        import torch.distributed as dist
 
-    def _op_key(self, T):
-        return (int(T) % BT == 0,)
+        from .symm import CPSymmBuffers
 
-    def _make_op(self, key):
-        (full_chunks,) = key
-        return PreProcessBwdFusedWS(
-            self.H, self.HV, self.DK, self.DV, self.gate_mode,
-            self.R, self.rank, full_chunks=full_chunks,
+        assert DK == DV == 128, "WS backward is specialized for K == V == 128"
+        assert gate_mode in ("none", "g", "gk")
+        self.group = group
+        self.R = dist.get_world_size(group)
+        self.rank = dist.get_rank(group)
+        assert self.R >= 2
+        self.H, self.HV, self.DK, self.DV = H, HV, DK, DV
+        self.gate_mode = gate_mode
+        self.device = device or torch.device(
+            "cuda", torch.cuda.current_device()
+        )
+        self.bufs = CPSymmBuffers(group, HV, DK, DV, self.device)
+        self.ptrs = torch.stack(
+            [
+                self.bufs.hm_ptrs,
+                self.bufs.fl_ptrs,
+                self.bufs.ak_ptrs,
+            ]
+        ).contiguous()
+        self.step = 0
+        self._ops: dict[tuple, PreProcessBwdFusedWS] = {}
+        self._compiled: dict[tuple, object] = {}
+        self._init_host_caches()
+        self._last_zero = None
+        self._dummy_g = torch.zeros(
+            1, 1, 1, dtype=torch.float32, device=self.device
+        )
+        self._dummy_gk = torch.zeros(
+            1, 1, 1, 1, dtype=torch.float32, device=self.device
         )
 
+    @torch.no_grad()
+    def launch_validated(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        w: torch.Tensor,
+        do: torch.Tensor,
+        dv: torch.Tensor,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        scale: float | None = None,
+        dht_out: torch.Tensor | None = None,
+        emit_h: bool = True,
+        emit_m: bool = True,
+        _stream_handle=None,
+    ) -> torch.Tensor:
+        """``__call__`` without the argument assertions.
 
-def ws_supported(K: int, V: int, gate_mode: str) -> bool:
-    """Shape gate for the warp-specialized backward.
+        Backward twin of the forward wrapper's `launch_validated`; see there.
+        The contract is the assertion block of ``__call__``: `q`/`k`/`w`/`do`/
+        `dv` contiguous bf16 with `B == 1`, `T >= 1`, the wrapper's own
+        `(H, HV, K, V)`, a gate matching `self.gate_mode`, and `dht_out` (when
+        given) a contiguous fp32 `[HV,K,V]` tensor.
 
-    Everything outside this envelope keeps the non-WS backward, which
-    supports K in {64,128}, any 64-multiple V and bounded CP neighborhoods.
-    """
-    return K == V == 128 and gate_mode in ("none", "g", "gk")
+        ``emit_h`` / ``emit_m`` are the mirror of the forward's: the reverse
+        chain is always the full ``rank-1 .. 0`` push and ``rank+1 .. R-1``
+        fold, and a packed batch suppresses halves of the pushed
+        ``dh_out = P . dh_in + Htilde`` instead of shortening it.  The caller
+        sets them from the CP context (see ``backend.py``):
 
+            emit_h = pre_num_ranks > 0
+            emit_m = emit_h and post_num_ranks > 0 and one local sequence
+        """
+        return self._launch(
+            q, k, w, do, dv, g, gk, scale, dht_out, emit_h, emit_m, _stream_handle
+        )
 
-@torch.no_grad()
-def chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl_ws(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    w: torch.Tensor,
-    do: torch.Tensor,
-    dv: torch.Tensor,
-    g: torch.Tensor | None = None,
-    gk: torch.Tensor | None = None,
-    bg: torch.Tensor | None = None,
-    scale: float | None = None,
-    state_v_first: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    dht: torch.Tensor | None = None,
-    initial_state: torch.Tensor | None = None,
-    context=None,
-    chunk_size: int = BT,
-):
-    """FLA-signature adapter selecting the warp-specialized engine.
+    @torch.no_grad()
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        w: torch.Tensor,
+        do: torch.Tensor,
+        dv: torch.Tensor,
+        g: torch.Tensor | None = None,
+        gk: torch.Tensor | None = None,
+        scale: float | None = None,
+        dht_out: torch.Tensor | None = None,
+        emit_h: bool = True,
+        emit_m: bool = True,
+    ) -> torch.Tensor:
+        B, T, H, K = q.shape
+        HV, V = do.shape[2], do.shape[-1]
+        assert B == 1 and T >= 1
+        assert (H, HV, K, V) == (
+            self.H,
+            self.HV,
+            self.DK,
+            self.DV,
+        )
+        assert q.shape == k.shape
+        assert w.shape == (B, T, HV, K)
+        assert do.shape == dv.shape == (B, T, HV, V)
+        assert HV % H == 0
+        assert not (g is not None and gk is not None)
+        assert all(
+            tensor.dtype == torch.bfloat16
+            for tensor in (q, k, w, do, dv)
+        )
+        assert all(
+            tensor.is_contiguous()
+            for tensor in (q, k, w, do, dv)
+        )
+        mode = (
+            "g"
+            if g is not None
+            else ("gk" if gk is not None else "none")
+        )
+        assert mode == self.gate_mode
+        return self._launch(q, k, w, do, dv, g, gk, scale, dht_out,
+                            emit_h, emit_m)
 
-    Shapes outside :func:`ws_supported` fall back to the non-WS backward
-    rather than failing, so this entry point is a drop-in replacement.
-    """
-    K = q.shape[-1]
-    V = do.shape[-1]
-    mode = "g" if g is not None else ("gk" if gk is not None else "none")
-    cls = (CuteDSLFusedCPBwdPreProcessWS if ws_supported(K, V, mode)
-           else None)
-    return _bwd_entry(
-        q, k, w, do, dv, g=g, gk=gk, bg=bg, scale=scale,
-        state_v_first=state_v_first, cu_seqlens=cu_seqlens, dht=dht,
-        initial_state=initial_state, context=context, chunk_size=chunk_size,
-        wrapper_cls=cls,
-    )
+    def _launch(
+        self,
+        q,
+        k,
+        w,
+        do,
+        dv,
+        g,
+        gk,
+        scale,
+        dht_out,
+        emit_h=True,
+        emit_m=True,
+        _stream_handle=None,
+    ) -> torch.Tensor:
+        T, K = q.shape[1], q.shape[3]
+        HV, V = do.shape[2], do.shape[-1]
+        scale = K ** -0.5 if scale is None else float(scale)
 
+        # No host padding for T < BT: the TMA descriptors are built from the
+        # logical `T` (see `PreProcessBwdFusedWS.__call__`), so rows >= T are
+        # out of bounds and zero-filled by the hardware, exactly as in the
+        # forward wrapper.
+        g = _normalize_gate(g, self._dummy_g)
+        gk = _normalize_gate(gk, self._dummy_gk)
 
-chunk_gated_delta_rule_bwd_dhu_pre_process = (
-    chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl_ws
-)
+        if dht_out is None:
+            # Only the top rank has no source to fold, so only it leaves the
+            # output untouched.  (This used to key on `post_count == 0`; with
+            # the full chain every other rank runs the merge, and a rank whose
+            # sources contribute nothing gets zeros through their emit masks.)
+            if self.rank == self.R - 1:
+                if self._last_zero is None:
+                    self._last_zero = torch.zeros(
+                        HV,
+                        K,
+                        V,
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                dht_out = self._last_zero
+            else:
+                dht_out = torch.empty(
+                    HV,
+                    K,
+                    V,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+        else:
+            assert dht_out.shape == (HV, K, V)
+            assert dht_out.dtype == torch.float32
+            assert dht_out.is_contiguous()
+
+        self.step += 1
+        args = (
+            self._p(q, cutlass.BFloat16),
+            self._p(k, cutlass.BFloat16),
+            self._p(w, cutlass.BFloat16),
+            self._p(do, cutlass.BFloat16),
+            self._p(dv, cutlass.BFloat16),
+            self._p(g, cutlass.Float32),
+            self._p(gk, cutlass.Float32),
+            self._p(self.bufs.hm_sym, cutlass.Float32),
+            self._p(self.ptrs, cutlass.Int64),
+            self._p(dht_out, cutlass.Float32),
+            cutlass.Float32(scale),
+            cutlass.Int32(T),
+            cutlass.Int32(self.step),
+            cutlass.Int32((1 if emit_h else 0) | (2 if emit_m else 0)),
+            self._cu_stream(_stream_handle),
+        )
+        # One backward program per wrapper: the ragged (tail-masked)
+        # specialization serves every `T`, in every gate mode.  Keying the
+        # compile cache on `T % 64 == 0` meant that, in a packed layout where
+        # only some ranks own an unaligned boundary window, those ranks paid a
+        # multi-minute `cute.compile` at the first such window while their
+        # peers spun in the symmetric-memory handshake, and the two programs
+        # then ran side by side across ranks; the g-mode ragged case of the
+        # GB300 harness never completed that way.  One compile per wrapper, at
+        # the first launch; the cost on aligned calls is the lambda table and
+        # the dV tail mask (see `fused_ws.PreProcessFwdFusedWS.build_key`).
+        full_chunks = False
+        geometry = (full_chunks,)
+        op = self._ops.get(geometry)
+        if op is None:
+            op = PreProcessBwdFusedWS(
+                self.H, self.HV, self.DK, self.DV, self.gate_mode,
+                self.R, self.rank, full_chunks=full_chunks,
+            )
+            self._ops[geometry] = op
+        compiled = self._compiled.get(geometry)
+        if compiled is None:
+            compiled = cute.compile(op, *args)
+            self._compiled[geometry] = compiled
+        compiled(*args)
+        return dht_out

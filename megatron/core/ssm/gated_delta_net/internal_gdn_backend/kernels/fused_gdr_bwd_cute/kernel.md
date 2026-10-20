@@ -25,9 +25,9 @@ Runtime dispatch is controlled by `MCORE_GDN_INTERNAL_BACKEND`:
 The production backward call path is:
 
 ```text
-implementation.InternalChunkGatedDeltaRuleFunction.backward
-  -> implementation._cutedsl_backward
-  -> implementation._call_fused_gdr_bwd_cute
+gdn.InternalChunkGatedDeltaRuleFunction.backward
+  -> gdn._cutedsl_backward
+  -> gdn._call_fused_gdr_bwd_cute
   -> fused_bwd.fused_gdr_bwd
   -> launcher.launch_fused_gdr_bwd
   -> kernel.FusedGdrBwdKernel
@@ -77,17 +77,18 @@ asserts that both CuTe DSL forward and backward kernels run.
 
 ## Package structure
 
-- `fused_bwd.py` validates the public kernel contract, packs dense batches,
-  creates variable-length metadata, allocates outputs, and restores output
-  shapes and dtypes.
+- `fused_bwd.py` validates the public kernel contract and the packed
+  variable-length metadata, then allocates the outputs. Dense-batch packing
+  and output reshaping happen in the adapter before and after this interface.
 - `launcher.py` owns DLPack descriptors, dynamic token-mode annotations,
-  specialization keys, thread-safe compilation caching, and stream-bound
-  launch preparation.
+  specialization keys, thread-safe compilation caching, and the launch on the
+  caller's current stream.
 - `layouts.py` owns the ten oriented MMA variants, nineteen logical
   operation bindings, canonical and packed SMEM layouts, accumulator-layout
   checks, and the trace-local TMA descriptor bundle.
-- `storage.py` owns the decorated shared-memory struct, TMEM live-range
-  contract, resource budget, and named SMEM/TMEM view builders.
+- `storage.py` owns the decorated shared-memory struct, the TMEM live-range
+  contract that also fixes every accumulator's column offset, and the named
+  SMEM/TMEM view builders.
 - `kernel.py` contains the role schedule, pipeline ordering, tensor-bound TMA
   descriptor construction, allocation/free ordering, and the
   `FusedGdrBwdKernel` entry point.
@@ -114,8 +115,9 @@ asserts that both CuTe DSL forward and backward kernels run.
 
 The physical leading dimension of token tensors is always one because the
 wrapper uses packed THD storage. `B` is the logical sequence count encoded by
-`cu_seqlens`; it is not restricted to two. Dense BTHD inputs with any positive
-batch size are flattened and receive generated offsets before this interface.
+`cu_seqlens`; it is not restricted to two. The adapter flattens dense BTHD
+inputs with any positive batch size and generates their `cu_seqlens` and
+`chunk_offsets` before calling this interface.
 
 The result is `(dq, dk, dv, dg, dbeta, dh0)`. Token gradients match their
 corresponding input shapes; `dh0` is FP32 `[B, 64, 128, 128]`.
@@ -155,9 +157,10 @@ The 384-thread CTA has these specialized roles:
 
 The implementation allocates 480 TMEM columns in four legal power-of-two
 blocks and phase-aliases accumulator ranges only when their live intervals do
-not overlap. Shared storage is checked at import time against the SM100 opt-in
-limit. `get_layout_budget()` exposes the actual shared-memory, TMEM-column, and
-thread budgets for tests and diagnostics.
+not overlap. `storage.TMEM_RANGES` is the single source of every range's
+columns and live phases; the accumulator views derive their offsets from it at
+import time. Shared storage is checked at import time against the SM100 opt-in
+limit.
 
 Layout metadata is resolved by logical operation name at trace time and
 flattened into explicit arguments before the `@cute.kernel` boundary. The
@@ -170,28 +173,31 @@ linear regrouping.
 
 The token mode is marked dynamic, so one specialization can launch different
 packed token counts when the remaining static contract matches. Dtypes, head
-counts, logical sequence count, uniform sequence length, device capability,
-and IKET instrumentation are compilation-key fields. Consequently:
+count, logical sequence count, uniform sequence length, the partial-chunk tail
+specialization, device index and capability, and IKET instrumentation are
+compilation-key fields. Consequently:
 
 - The first call for a new key includes CuTe DSL JIT compilation.
 - Steady-state benchmarks must warm the key before timing.
 - Each distinct logical batch size or uniform sequence length can add a cache
   entry for the process lifetime.
-- Prepared launches bind tensor descriptors and the caller's current CUDA
-  stream; tensors are retained until replay completes.
+- Each launch replays the compiled specialization on the caller's current
+  CUDA stream; the wrapper's operands stay referenced until the replay has
+  been enqueued.
 
 ## CI coverage
 
 CPU unit tests in `tests/unit_tests/ssm/test_internal_gdn_backend.py` keep a
 small representative matrix for BF16 support, dtype rejection, dense packing,
-the arbitrary packed-batch contract, and the named layout/storage structure.
-They do not duplicate a large shape sweep.
+and the arbitrary packed-batch contract. They do not duplicate a large shape
+sweep.
 
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` is marked
 `launch_on_gb200`. It calls the internal GDR backend directly for non-CP and CP4
-with `B=2`, `T=8192`, `H=64`, `D=128`, and BF16. The CP4 parameter manually
-builds a single-sequence CP context; it validates FLA CP forward plus fused CuTe
-backward, but it does not exercise dense `GatedDeltaNet.forward`. The test
+with `B=1`, `H=64`, `D=128`, BF16, aligned and ragged packings. The CP4
+parameter builds the CP context from global `cu_seqlens`; it validates the CuTe
+CP preprocessing plus the fused CuTe forward and backward, but it does not
+exercise dense `GatedDeltaNet.forward`. The test
 compares output and all five input gradients with FLA and records CUDA-event
 timing after two warmups and five samples, with a 10% regression allowance.
 JIT time is excluded.
@@ -205,17 +211,20 @@ The production packed-THD CP4 aligned/tail validation is recorded in
   restores their gradient dtypes afterward.
 - When no final-state gradient is supplied, the adapter reuses a stream-scoped
   zero-`dht` tensor. This LRU cache is bounded to 256 MiB.
-- Uniform dense-batch offsets are cached by device, batch size, and local
-  sequence length. Packed variable-length metadata retains the identity/version
-  cache described below.
-- Metadata is cached by `cu_seqlens` identity and tensor version; in-place
-  mutation invalidates the cached entry. Standard packed-batch construction
-  supplies a trusted CPU mirror once, which GatedDeltaNet validates and reuses
-  across layers. Q/KV validation and equality checks therefore do not observe
-  CUDA results in Python. Chunk offsets are generated lazily only by the
-  internal path and reuse the identity/version cache. Device-only offsets are
-  not treated as validated metadata; direct calls without a CPU mirror fall
-  back in `auto` mode and fail in `cute` mode.
+- Chunk metadata is owned and cached by the adapter: uniform dense-batch
+  offsets by device, batch size, and local sequence length; packed
+  `chunk_offsets` by `cu_seqlens` identity and tensor version. The adapter
+  always hands the wrapper device `cu_seqlens` plus validated `chunk_offsets`
+  with `trusted_chunk_offsets=True`, so the wrapper only re-checks their dtype,
+  device, and shape and derives the two O(1) specialization flags
+  (`uniform_sequence_length`, `has_partial_chunks`) without a device sync. The
+  wrapper keeps no cache of its own.
+- Standard packed-batch construction supplies a trusted CPU mirror once, which
+  GatedDeltaNet validates and reuses across layers. Q/KV validation and
+  equality checks therefore do not observe CUDA results in Python. Device-only
+  offsets are not treated as validated metadata; direct calls without a CPU
+  mirror fall back in `auto` mode and fail in `cute` mode. Direct wrapper calls
+  with CPU `cu_seqlens` still get the full per-sequence prefix check.
 - Unsupported shapes and dtypes fall back only in `auto` mode. `cute` mode is
   useful in CI and debugging because it turns accidental fallback into an
   explicit failure.
@@ -223,8 +232,8 @@ The production packed-THD CP4 aligned/tail validation is recorded in
   commit, GPU, CUDA/CuTe DSL versions, shape, warmup count, sample count, and
   whether JIT time is included.
 
-For layout-only development, run the CPU contract test first, then compile the
-SM100 probe and both uniform and packed-variable specializations on GB200.
+For layout-only development, compile both the uniform and the packed-variable
+specialization on GB200.
 Correctness must compare the full fused forward/backward result against FLA.
 Performance comparisons for a structural refactor use at least 20 interleaved
 baseline/candidate samples after warmup; cold JIT time is reported separately.

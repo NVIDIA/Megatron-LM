@@ -62,9 +62,36 @@ def _reject(reason: str) -> None:
     return None
 
 
-def _wrapper_cache_key(group, device, H, HV, K, V) -> tuple:
+# The rank-consistent handshake all-gathers an int64 signature, so the gate
+# mode travels as a small code rather than a string.  Only the two modes this
+# dispatcher admits have a code: scalar `g` (GDN) and per-key `gk` (KDA).
+_GATE_MODE_CODE = {"g": 1, "gk": 2}
+
+
+def _gate_mode(g: torch.Tensor | None) -> str:
+    """``"g"`` (GDN, scalar per-head decay) or ``"gk"`` (KDA, per-key decay).
+
+    Derived from which gate the caller supplied, after `_is_supported` /
+    `_is_supported_bwd` has established that exactly one of them is.
+    """
+    return "g" if g is not None else "gk"
+
+
+def _wrapper_cache_key(group, device, H, HV, K, V, gate_mode: str) -> tuple:
     """Return the rank-stable ownership key for a mutable CP wrapper."""
-    return (id(group), device.index, H, HV, K, V, "g")
+    return (id(group), device.index, H, HV, K, V, gate_mode)
+
+
+def _wrapper_signature(direction: int, H, HV, K, V, gate_mode: str) -> tuple[int, ...]:
+    """The shape signature :func:`_rank_consistent_wrapper_init` all-gathers.
+
+    ``direction`` is 0 for the forward wrapper and 1 for the backward one.  The
+    gate mode is part of it because a `g` and a `gk` wrapper of the same
+    ``(H, HV, K, V)`` are different programs with different operand contracts:
+    without it a GDN-vs-KDA first-use order mismatch across ranks would pass
+    the handshake and rendezvous mismatched symmetric buffers.
+    """
+    return (direction, H, HV, K, V, _GATE_MODE_CODE[gate_mode])
 
 
 class _SerializedWrapper:
@@ -108,10 +135,10 @@ class _SerializedWrapper:
 
             self._input_ready.record(caller_stream)
             self._owner_stream.wait_event(self._input_ready)
-            # The wrappers perform ATen preprocessing (padding, gate conversion,
-            # and descriptor updates) before the compiled launch. Run the whole
-            # call on the owner stream so the ready event orders those operations
-            # together with the kernel that consumes their results.
+            # The wrappers perform ATen preprocessing (gate normalisation) before
+            # the compiled launch. Run the whole call on the owner stream so the
+            # ready event orders that operation together with the kernel that
+            # consumes its result.
             with torch.cuda.stream(self._owner_stream):
                 result = self._wrapper.launch_validated(*args, **kwargs)
             self._completion.record(self._owner_stream)
@@ -169,7 +196,7 @@ def _cuda_graphs_enabled(context: FLACPContext) -> bool:
 
 
 def _backend_mode() -> str:
-    value = os.environ.get("MCORE_GDN_CP_CUTEDSL", os.environ.get("FLA_CP_CUTEDSL", "auto")).lower()
+    value = os.environ.get("MCORE_GDN_CP_CUTEDSL", "auto").lower()
     if value in {"0", "false", "no", "off"}:
         return "disabled"
     if value in {"1", "true", "yes", "on"}:
@@ -389,8 +416,8 @@ def _emit_flags(context: FLACPContext, *, forward: bool) -> tuple[bool, bool]:
     if context.pre_num_ranks is None or context.post_num_ranks is None:
         # A context built without chain metadata can only be the whole-group
         # single-sequence case, which suppresses nothing.  `_classify_chain`
-        # never produces one -- it cross-checks both fields -- but the
-        # standalone harness entry in `bwd_fused.py` does not go through it.
+        # never produces one -- it cross-checks both fields -- so this is a
+        # guard for direct callers only.
         return True, True
     pre = int(context.pre_num_ranks)
     post = int(context.post_num_ranks)
@@ -495,7 +522,7 @@ def _runtime_supported(*, device: torch.device, group) -> bool:
             and _has_module("cuda.bindings.driver")
             and _has_module("torch.distributed._symmetric_memory")
             and device.type == "cuda"
-            and torch.cuda.get_device_capability(device) == (10, 0)
+            and torch.cuda.get_device_capability(device)[0] == 10
             and str(dist.get_backend(group)).lower().endswith("nccl")
             and 2 <= dist.get_world_size(group) <= 8
         )
@@ -518,6 +545,11 @@ def _is_supported(
 ) -> str | None:
     """Return the chain mode to run, or ``None`` to fall back to Triton.
 
+    Two gate modes are admitted, selected by which gate the caller supplies:
+    GDN's scalar ``g`` (``[B,T,HV]``, fp32 or bf16) and KDA's per-key ``gk``
+    (``[B,T,HV,K]`` fp32: FLA's chunk-local log2 cumsum, of which the kernels
+    read only the chunk-last row; ``k`` arrives pre-gated as FLA's ``kg``).
+
     Every refusal is attributed through :func:`_reject`; see
     :func:`get_cutedsl_fallback_reasons`.
     """
@@ -527,11 +559,14 @@ def _is_supported(
         return _reject("no CP context or group")
     if chunk_size != 64:
         return _reject(f"chunk_size={chunk_size} (only 64)")
-    if g is None or gk is not None or bg is not None:
-        return _reject("gate is not scalar g (gk/bg/none unsupported)")
+    if bg is not None:
+        return _reject("DPLR bg gate unsupported")
+    if (g is None) == (gk is None):
+        return _reject("gate must be exactly one of g or gk")
     if v is not None:
         return _reject("separate v operand (DPLR-style) unsupported")
-    if k.ndim != 4 or u.ndim != 4 or w.ndim != 4 or g.ndim != 3:
+    gate = g if g is not None else gk
+    if k.ndim != 4 or u.ndim != 4 or w.ndim != 4 or gate.ndim != (3 if g is not None else 4):
         return _reject("operand rank mismatch")
 
     B, T, H, K = k.shape
@@ -540,25 +575,43 @@ def _is_supported(
         return _reject(f"B={B} (only 1)")
     if T < 1:
         return _reject("empty local shard")
-    if K != V or K not in {64, 128}:
-        return _reject(f"K={K},V={V} (need K==V in 64,128)")
+    if K != V or K != 128:
+        return _reject(f"K={K},V={V} (need K==V==128)")
+    # `HV % 4 == 0` is a g-mode kernel requirement (the g TMA box covers four
+    # heads).  The gk kernels do not need it, but the dispatcher keeps one head
+    # geometry contract for both modes: the gk branches share everything else
+    # (merge roles, walk descriptors, the pair mapping) with the g-mode program
+    # that was validated at these geometries, every KDA production shard
+    # (96/48/24/12 heads) satisfies it, and a refusal is visible in
+    # `get_cutedsl_fallback_reasons` rather than silent.
     if H < 1 or HV % H != 0 or HV % 4 != 0:
         return _reject(f"head geometry H={H},HV={HV}")
-    if u.shape != (B, T, HV, V) or w.shape != (B, T, HV, K) or g.shape != (B, T, HV):
+    if u.shape != (B, T, HV, V) or w.shape != (B, T, HV, K):
         return _reject("operand shape mismatch")
+    if g is not None:
+        if g.shape != (B, T, HV):
+            return _reject("operand shape mismatch")
+    elif gk.shape != (B, T, HV, K):
+        return _reject("gk shape mismatch")
     if k.dtype != torch.bfloat16 or u.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
         return _reject(f"dtype {k.dtype} (only bfloat16)")
-    if g.dtype not in {torch.bfloat16, torch.float32}:
-        return _reject(f"gate dtype {g.dtype}")
-    # `g` joins the contiguity check that used to cover only k/u/w. The window
-    # slice below no longer calls `.contiguous()`, so a non-contiguous operand
-    # must be refused here rather than silently repacked; production `g` comes
-    # from `chunk_local_cumsum` and is always contiguous, so this refuses
-    # nothing real and a refusal is a correct Triton call either way.
-    if not (k.is_contiguous() and u.is_contiguous() and w.is_contiguous() and g.is_contiguous()):
+    if g is not None:
+        if g.dtype not in {torch.bfloat16, torch.float32}:
+            return _reject(f"gate dtype {g.dtype}")
+    elif gk.dtype != torch.float32:
+        # FLA's `kda_gate_chunk_cumsum` emits fp32.  The wrapper would accept
+        # bf16, but only by allocating a fresh fp32 [T,HV,K] copy per launch.
+        return _reject(f"gk dtype {gk.dtype} (only float32)")
+    # The gate joins the contiguity check that used to cover only k/u/w. The
+    # window slice below no longer calls `.contiguous()`, so a non-contiguous
+    # operand must be refused here rather than silently repacked; production
+    # gates come from `chunk_local_cumsum` / `kda_gate_chunk_cumsum` and are
+    # always contiguous, so this refuses nothing real and a refusal is a
+    # correct Triton call either way.
+    if not (k.is_contiguous() and u.is_contiguous() and w.is_contiguous() and gate.is_contiguous()):
         return _reject("non-contiguous operand")
     device = k.device
-    if u.device != device or w.device != device or g.device != device:
+    if u.device != device or w.device != device or gate.device != device:
         return _reject("operands on different devices")
 
     world_size, rank = _group_topology(context.group)
@@ -668,7 +721,8 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
             initial_state = initial_state.transpose(-1, -2).contiguous()
         return initial_state
 
-    key = _wrapper_cache_key(context.group, k.device, H, HV, K, V)
+    gate_mode = _gate_mode(g)
+    key = _wrapper_cache_key(context.group, k.device, H, HV, K, V, gate_mode)
     fused = _WRAPPER_CACHE.get(key)
     if fused is None:
         # Wrapper construction performs a symmetric-memory rendezvous; the
@@ -680,13 +734,13 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
             key,
             lambda: _SerializedWrapper(
                 CuteDSLFusedCPPreProcessWS(
-                    context.group, H, HV, K, V, gate_mode="g", device=k.device, split=1
+                    context.group, H, HV, K, V, gate_mode=gate_mode, device=k.device
                 ),
                 k.device,
             ),
             group=context.group,
             device=k.device,
-            signature=(0, H, HV, K, V),
+            signature=_wrapper_signature(0, H, HV, K, V, gate_mode),
         )
 
     # The kernel scans one contiguous window. For a packed batch that window is
@@ -704,12 +758,14 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
     # `_is_supported` above, and `h0_out` is a contiguous fp32 [HV,K,V] view of
     # a buffer this function allocated. Re-deriving them costs ~15 us of host
     # time per call, which under THD is a real fraction of the pre-process.
+    # `_window(None, ...)` is `None`, so the inactive gate stays `None`.
     emit_h, emit_m = _emit_flags(context, forward=True)
     fused.launch_validated(
         _window(k, bos, eos),
         _window(u, bos, eos),
         _window(w, bos, eos),
         g=_window(g, bos, eos),
+        gk=_window(gk, bos, eos),
         h0_out=initial_state[0],
         emit_h=emit_h,
         emit_m=emit_m,
@@ -755,13 +811,18 @@ def _is_supported_bwd(
         return _reject("bwd: no CP context or group")
     if chunk_size != 64:
         return _reject(f"bwd: chunk_size={chunk_size} (only 64)")
-    if g is None or gk is not None or bg is not None:
-        return _reject("bwd: gate is not scalar g (gk/bg/none unsupported)")
+    if bg is not None:
+        return _reject("bwd: DPLR bg gate unsupported")
+    if (g is None) == (gk is None):
+        return _reject("bwd: gate must be exactly one of g or gk")
     if dht is not None:
         return _reject("bwd: caller supplied dht")
     if q.ndim != 4 or k.ndim != 4 or w.ndim != 4 or do.ndim != 4 or dv.ndim != 4:
         return _reject("bwd: operand rank mismatch")
-    if g.ndim != 3:
+    # See the forward twin for the two gate modes.  In gk mode the kernel never
+    # gates `q` (src == scale), so `q` must arrive pre-gated as FLA's `qg`.
+    gate = g if g is not None else gk
+    if gate.ndim != (3 if g is not None else 4):
         return _reject("bwd: operand rank mismatch")
 
     B, T, H, K = q.shape
@@ -770,16 +831,20 @@ def _is_supported_bwd(
         return _reject(f"bwd: B={B} (only 1)")
     if T < 1:
         return _reject("bwd: empty local shard")
-    if K != V or K not in {64, 128}:
-        return _reject(f"bwd: K={K},V={V} (need K==V in 64,128)")
+    if K != V or K != 128:
+        return _reject(f"bwd: K={K},V={V} (need K==V==128)")
+    # `HV % 4 == 0` kept for both modes; see the forward twin.
     if H < 1 or HV % H != 0 or HV % 4 != 0:
         return _reject(f"bwd: head geometry H={H},HV={HV}")
     if k.shape != (B, T, H, K) or w.shape != (B, T, HV, K):
         return _reject("bwd: operand shape mismatch")
     if do.shape != (B, T, HV, V) or dv.shape != (B, T, HV, V):
         return _reject("bwd: operand shape mismatch")
-    if g.shape != (B, T, HV):
-        return _reject("bwd: operand shape mismatch")
+    if g is not None:
+        if g.shape != (B, T, HV):
+            return _reject("bwd: operand shape mismatch")
+    elif gk.shape != (B, T, HV, K):
+        return _reject("bwd: gk shape mismatch")
     if (
         q.dtype != torch.bfloat16
         or k.dtype != torch.bfloat16
@@ -788,17 +853,20 @@ def _is_supported_bwd(
         or dv.dtype != torch.bfloat16
     ):
         return _reject(f"bwd: dtype {q.dtype} (only bfloat16)")
-    if g.dtype not in {torch.bfloat16, torch.float32}:
-        return _reject(f"bwd: gate dtype {g.dtype}")
-    # See the forward twin: `g` joins the contiguity check now that the window
-    # slice is a pure view.
+    if g is not None:
+        if g.dtype not in {torch.bfloat16, torch.float32}:
+            return _reject(f"bwd: gate dtype {g.dtype}")
+    elif gk.dtype != torch.float32:
+        return _reject(f"bwd: gk dtype {gk.dtype} (only float32)")
+    # See the forward twin: the gate joins the contiguity check now that the
+    # window slice is a pure view.
     if not (
         q.is_contiguous()
         and k.is_contiguous()
         and w.is_contiguous()
         and do.is_contiguous()
         and dv.is_contiguous()
-        and g.is_contiguous()
+        and gate.is_contiguous()
     ):
         return _reject("bwd: non-contiguous operand")
     device = q.device
@@ -807,7 +875,7 @@ def _is_supported_bwd(
         or w.device != device
         or do.device != device
         or dv.device != device
-        or g.device != device
+        or gate.device != device
     ):
         return _reject("bwd: operands on different devices")
 
@@ -886,31 +954,27 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
             dht_out = dht_out.transpose(-1, -2).contiguous()
         return dht_out
 
-    # Keyed on the same tuple the wrapper class is chosen from, so the class
-    # itself is only imported and selected on a cache miss (see the forward).
-    key = _wrapper_cache_key(context.group, q.device, H, HV, K, V)
+    gate_mode = _gate_mode(g)
+    key = _wrapper_cache_key(context.group, q.device, H, HV, K, V, gate_mode)
     fused = _BWD_WRAPPER_CACHE.get(key)
     if fused is None:
-        from .bwd_fused import CuteDSLFusedCPBwdPreProcess
-        from .bwd_ws import CuteDSLFusedCPBwdPreProcessWS, ws_supported
-
+        # The wrapper module is only imported on a cache miss (see the forward).
         # The warp-specialized Blackwell engine is 2.7x exact FLA at the
-        # canonical shape versus 0.99x for the SM80 engine it replaces. Other
-        # shapes keep the non-WS engine.
-        wrapper_cls = (
-            CuteDSLFusedCPBwdPreProcessWS
-            if ws_supported(K, V, "g")
-            else CuteDSLFusedCPBwdPreProcess
-        )
+        # canonical shape; `_is_supported_bwd` admits only its K == V == 128.
+        from .bwd_ws import CuteDSLFusedCPBwdPreProcessWS
+
         fused = _get_or_create_wrapper(
             _BWD_WRAPPER_CACHE,
             key,
             lambda: _SerializedWrapper(
-                wrapper_cls(context.group, H, HV, K, V, gate_mode="g", device=q.device), q.device
+                CuteDSLFusedCPBwdPreProcessWS(
+                    context.group, H, HV, K, V, gate_mode=gate_mode, device=q.device
+                ),
+                q.device,
             ),
             group=context.group,
             device=q.device,
-            signature=(1, H, HV, K, V),
+            signature=_wrapper_signature(1, H, HV, K, V, gate_mode),
         )
 
     # The reverse scan runs over the first local sequence -- the only one that
@@ -931,6 +995,7 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
         _window(do, bos, eos),
         _window(dv, bos, eos),
         g=_window(g, bos, eos),
+        gk=_window(gk, bos, eos),
         scale=K**-0.5 if scale is None else float(scale),
         dht_out=dht_out[-1],
         emit_h=emit_h,

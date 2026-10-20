@@ -35,8 +35,7 @@ Each tile = one (batch, head) pair. The assigned CTA loops over all
 chunks for that tile sequentially, which is required because the
 recurrent state S must be propagated chunk-by-chunk.
 
-Persistent grid shape:     (min(B * H, max_active_clusters), 1, 1)
-Non-persistent grid shape: (B, H, 1)  - one CTA per tile, 2D grid
+Persistent grid shape: (min(B * H, max_active_clusters), 1, 1)
 """
 
 from typing import Optional, Tuple
@@ -62,7 +61,6 @@ class GDNTileSchedulerParams:
         num_q_heads: cutlass.Int32,
         num_v_heads: cutlass.Int32,
         is_GQA: bool,
-        is_persistent: bool = True,
         total_tiles: Optional[cutlass.Int32] = None,
         num_seqs_fdd: cute.FastDivmodDivisor = None,
         num_heads_fdd: cute.FastDivmodDivisor = None,
@@ -74,7 +72,6 @@ class GDNTileSchedulerParams:
         self.num_q_heads = num_q_heads
         self.num_v_heads = num_v_heads
         self.is_GQA = is_GQA
-        self.is_persistent = is_persistent
         # num_o_heads: HQ for GQA (grouped-query), HV for GVA/MHA
         self.num_o_heads = num_q_heads if is_GQA else num_v_heads
         if total_tiles is None:
@@ -100,7 +97,6 @@ class GDNTileSchedulerParams:
             self.num_q_heads,
             self.num_v_heads,
             self.is_GQA,
-            self.is_persistent,
             self.total_tiles,
             self.num_seqs_fdd,
             self.num_heads_fdd,
@@ -118,7 +114,6 @@ class GDNTileSchedulerParams:
                 self.num_q_heads,
                 self.num_v_heads,
                 self.is_GQA,
-                self.is_persistent,
                 self.total_tiles,
                 self.num_seqs_fdd,
                 self.num_heads_fdd,
@@ -135,21 +130,15 @@ class GDNTileSchedulerParams:
     def get_grid_shape(
         self, max_active_clusters: Int32, *, loc=None, ip=None
     ) -> Tuple[Integer, Integer, Integer]:
-        if cutlass.const_expr(self.is_persistent):
-            return (min(self.total_tiles, max_active_clusters), 1, 1)
-        else:
-            return (self.num_seqs, self.num_o_heads, 1)
+        return (min(self.total_tiles, max_active_clusters), 1, 1)
 
 
 class GDNTileScheduler:
     """
-    Tile scheduler supporting both persistent and non-persistent modes.
+    Persistent tile scheduler.
 
-    Persistent:     CTAs are assigned (batch, head) tiles in round-robin order
-                    and loop over multiple tiles, processing all chunks per tile
-                    before moving on.
-    Non-persistent: Each CTA handles exactly one (batch, head) tile; the 2D
-                    grid maps blockIdx.x -> batch, blockIdx.y -> head.
+    CTAs are assigned (batch, head) tiles in round-robin order and loop over
+    multiple tiles, processing all chunks per tile before moving on.
     """
 
     def __init__(
@@ -230,7 +219,7 @@ class GDNTileScheduler:
     def _get_current_work_for_linear_idx(
         self, linear_idx: Int32, *, loc=None, ip=None
     ) -> WorkTileInfo:
-        # Used only in persistent mode: decode flat tile index -> (batch, head).
+        # Decode flat tile index -> (batch, head).
         # Tile ordering: head-major, i.e. linear_idx = batch * num_o_heads + head.
         is_valid = linear_idx < cute.size(self.params.total_tiles, loc=loc, ip=ip)
         remain_work_idx, head_idx = divmod(linear_idx, self.params.num_heads_fdd)
@@ -240,14 +229,8 @@ class GDNTileScheduler:
 
     @dsl_user_op
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        if self.params.is_persistent:
-            return self._get_current_work_for_linear_idx(
-                self._current_work_linear_idx, loc=loc, ip=ip
-            )
-        # Non-persistent: 2D grid -> blockIdx.x = batch, blockIdx.y = head.
-        batch_idx, head_idx, _ = self.block_idx
-        return WorkTileInfo(
-            (batch_idx, head_idx, self.block_idx[2]), cutlass.Boolean(self.is_valid)
+        return self._get_current_work_for_linear_idx(
+            self._current_work_linear_idx, loc=loc, ip=ip
         )
 
     @dsl_user_op
@@ -256,10 +239,6 @@ class GDNTileScheduler:
 
     @dsl_user_op
     def advance_to_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
-        if self.params.is_persistent:
-            self._current_work_linear_idx += Int32(advance_count) * Int32(
-                self.num_persistent_ctas
-            )
-        else:
-            # Non-persistent: each CTA handles exactly one tile; mark exhausted.
-            self.is_valid = False
+        self._current_work_linear_idx += Int32(advance_count) * Int32(
+            self.num_persistent_ctas
+        )

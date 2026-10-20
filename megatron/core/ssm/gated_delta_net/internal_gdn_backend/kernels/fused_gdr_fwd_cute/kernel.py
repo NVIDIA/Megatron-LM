@@ -39,7 +39,7 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
     cumsumlog[t]     = sum_{l=0}^{t} log(gate_l)              cumulative log of gates
     cumprod[t]       = exp(cumsumlog[t])                       cumulative product of gates
     T_pairwise[i,j]  = cumprod[i] / cumprod[j]  (i>=j)       inter-token transfer weights
-    (stored in registers; 128 regs/thread)
+    (stored in registers; 32 regs/thread for BT = 64)
 
   GEMM 1 - kk   : W_kk[BT,BT]  = K  @ K^T       (lower-triangular intra scores)
   GEMM 2 - qk   : W_qk[BT,BT]  = Q  @ K^T       (output attention scores)
@@ -56,24 +56,30 @@ Algorithm overview (per chunk c, tokens [cC, (c+1)C)):
     O[BT,DV]  = O_intra + T_col * QS             (combine intra + inter)
     S_next    = cumprod[BT-1] * S_prev + dS        (update state in TMEM)
 
-SMEM layout (225.5 KB total):
-  Buffer                           Size (B)  Stages
-  q                                32768     1
-  k                                32768     2      <-- double-buffered (prefetch next chunk)
-  v                                32768     1
-  A_inverse / new_v                32768     1      <-- A_inv result, then overwritten with fp16 NV
-  QK output / O store              32768     1      <-- W_qk scores, then O epilogue staging
-  state / decay_v                  32768     1      <-- state GMEM<->TMEM staging, shared with decay_v ALU
-  cumsumlog                          512     1      <-- BT x fp32 scalars
-  cumprod                            512     1
-  cumprod_scale                      512     1
+  Optional training side outputs: the unscaled A_inverse tile (output_A), the
+  chunk-local cumulative log2 gate (output_g) and every chunk's input state h
+  (output_h; staged through a 32 KiB SMEM tile and stored by TMA when both the
+  io and state dtypes are BF16, otherwise written from registers to GMEM).
 
-TMEM layout (256 KB total):
-  Buffer                  Size (B)  Stages
-  state (S)               65536     1      <-- DKxDV fp32 = 128x128x4B
-  q*state acc             65536     1      <-- BTxDV fp32 accumulator
-  qk/kk/new_v/k*state/    65536     2      <-- shared accumulator for all other GEMMs
-    kv/qkv acc
+SMEM layout (computed from the layout definitions in __call__; BT = 64, DK = DV = 128):
+  Buffer                           Size (B)  Stages
+  q                                16384     1
+  k                                32768     2      <-- double-buffered (prefetch next chunk)
+  v                                16384     1
+  A_inverse                         8192     1      <-- A_inv result (B operand of GEMM 5)
+  QK output                         8192     1      <-- W_qk scores (B operand of GEMM 6)
+  O store                          16384     1      <-- O epilogue staging for the TMA store
+  h store                          32768     1      <-- BF16 h TMA staging (bf16-state specialization only)
+  cumsumlog / cumprod / beta         256     1      <-- BT x fp32 scalars each
+  Every buffer is 1 KiB aligned: ~130 KB total with the h staging tile, ~98 KB without.
+
+TMEM layout (512 columns, 32B per column; offsets in _setup_attributes):
+  Buffer                  Columns  Stages
+  state (S)               128      1      <-- DKxDV fp32 accumulator of GEMM 7
+  q*state acc             64       1      <-- BTxDV fp32 accumulator of GEMMs 4 and 6
+  state input             64       1      <-- S_prev (io dtype) as A operand of GEMMs 3 and 4
+  shared acc              64       2      <-- kk/qk/k*state/new_v fp32 accumulators
+  shared input            64       2      <-- V-KS / NV / delta (io dtype) as A operands of GEMMs 5-7
 
 Warp assignments (12 warps = 384 threads):
   warps 0-3     : compute group 0 - T-pairwise, kk_epi, qk_epi, inverse
@@ -81,8 +87,8 @@ Warp assignments (12 warps = 384 threads):
                                     new_v_epi, kv_update_epi, qkv_epilogue
   warp  8       : MMA warp       - issues all 7 GEMMs
   warp  9       : TMA load warp  - loads q, k (double-buf), v
-  warp  10      : TMA gate warp  - loads gate, beta
-  warp  11      : epilogue warp   - store O to global memory
+  warp  10      : gate/beta warp - ldg + cp.async loads of gate and beta (and the output_g store)
+  warp  11      : epilogue warp  - TMA stores of O (and of the BF16 h staging tile)
 """
 
 import math
@@ -91,93 +97,14 @@ from typing import Optional, Tuple, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 
-# ---------------------------------------------------------------------------
-# cutlass-dsl 4.4.2 compatibility: TmaInfo was removed; make_tiled_tma_atom_*
-# now returns a plain (CopyAtom, Tensor) tuple instead of TmaInfo.
-# ---------------------------------------------------------------------------
-try:
-    from cutlass.cute.nvgpu.cpasync import TmaInfo
-except ImportError:
-    from cutlass.base_dsl import extract_mlir_attributes as _ema
-    from cutlass.base_dsl import extract_mlir_values as _emv
-    from cutlass.base_dsl import get_mlir_types as _gmt
-    from cutlass.base_dsl import new_from_mlir_values as _nfmv
-
-    class TmaInfo:  # type: ignore[no-redef]
-        """Compatibility shim replacing cpasync.TmaInfo for cutlass-dsl >= 4.4.2."""
-
-        def __init__(self, atom, tma_tensor, smem_layout=None):
-            self._atom = atom
-            self._tma_tensor = tma_tensor
-
-        @property
-        def atom(self):
-            return self._atom
-
-        @property
-        def tma_tensor(self):
-            return self._tma_tensor
-
-        def __extract_mlir_values__(self):
-            return _emv(self._atom) + _emv(self._tma_tensor)
-
-        def __extract_mlir_attributes__(self):
-            return _ema(self._atom) + _ema(self._tma_tensor)
-
-        def __new_from_mlir_values__(self, values):
-            n = len(_gmt(self._atom))
-            return TmaInfo(
-                _nfmv(self._atom, values[:n]),
-                _nfmv(self._tma_tensor, values[n:]),
-            )
-
-        def __iter__(self):
-            yield self._atom
-            yield self._tma_tensor
-
-        def __getitem__(self, i):
-            return (self._atom, self._tma_tensor)[i]
-
-        def __len__(self):
-            return 2
-
-
-@dsl_user_op
-def _gdn_timeline_clock64(*, loc=None, ip=None):
-    """Device timestamp helper for Python CuTeDSL debug instrumentation."""
-    return cutlass.Int64(
-        llvm.inline_asm(
-            T.i64(),
-            [],
-            "mov.u64 $0, %globaltimer;",
-            "=l",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-def _wrap_tma(ret):
-    """Wrap make_tiled_tma_atom_* return value in TmaInfo if not already."""
-    if isinstance(ret, TmaInfo):
-        return ret
-    # 4.4.2: returns (CopyAtom, Tensor) tuple
-    return TmaInfo(ret[0], ret[1])
-
-
+from .._cute_compat import TmaInfo, _wrap_tma
 from .tile_scheduler import GDNTileScheduler, GDNTileSchedulerParams
 
 # ---------------------------------------------------------------------------
@@ -205,7 +132,8 @@ class GatedDeltaNetChunkedKernel:
 
     # TMA descriptor size in bytes
     bytes_per_tensormap = 128
-    num_tensormaps = 9
+    # Slots: Q=0, K=1, V=2, O=3, H_OUT=4.
+    num_tensormaps = 5
 
     def __init__(
         self,
@@ -220,21 +148,9 @@ class GatedDeltaNetChunkedKernel:
         num_sm: int,
         is_GQA: bool,
         use_initial_state: bool,
-        store_final_state: bool = True,
-        enable_checkpoints: bool = False,
-        input_A: bool = False,
         store_A: bool = False,
         store_g: bool = False,
-        store_v_new: bool = False,
-        store_w: bool = False,
         store_h: bool = False,
-        w_rhs_precomputed: bool = False,
-        training_side_outputs_only: bool = False,
-        gate_is_log_cumsum: bool = False,
-        gate_is_log_decay: bool = False,
-        is_persistent: bool = True,
-        enable_timeline: bool = False,
-        enable_varlen_tail: bool = False,
     ):
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
@@ -247,35 +163,16 @@ class GatedDeltaNetChunkedKernel:
         self.num_sm = num_sm
         self.is_GQA = is_GQA
         self.use_initial_state = use_initial_state
-        self.store_final_state = store_final_state
-        self.enable_checkpoints = enable_checkpoints
-        if gate_is_log_cumsum and gate_is_log_decay:
-            raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
-        self.use_input_A = input_A
         self.store_A = store_A
         self.store_g = store_g
-        self.store_v_new = store_v_new
-        self.store_w = store_w
         self.store_h = store_h
+        # The gate is always raw Megatron log-decay, converted to a chunk-local
+        # cumulative log2 gate in registers by the gate warp.
         self.use_bf16_h_tma = (
             self.store_h
             and self.io_dtype == cutlass.BFloat16
             and self.state_dtype == cutlass.BFloat16
         )
-        assert not w_rhs_precomputed, (
-            "w_rhs_precomputed=True is not supported; pass w_rhs=None"
-        )
-        self.w_rhs_precomputed = w_rhs_precomputed
-        # Keep the broad training-only branch disabled; it skips too many
-        # pipeline tokens at once.  This flag enables verified drop-output
-        # compute skips while preserving the full forward synchronization shape.
-        self.drop_output_store_only = training_side_outputs_only
-        self.training_side_outputs_only = False
-        self.gate_is_log_cumsum = gate_is_log_cumsum
-        self.gate_is_log_decay = gate_is_log_decay
-        self.enable_varlen_tail = enable_varlen_tail
-        self.is_persistent = is_persistent
-        self.enable_timeline = enable_timeline
 
         # ------------------------------------------------------------------
         # Warp assignments  (12 warps total)
@@ -312,7 +209,6 @@ class GatedDeltaNetChunkedKernel:
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
-        self.occupancy = 1
         self.threads_per_warp = 32
 
         # ------------------------------------------------------------------
@@ -351,13 +247,9 @@ class GatedDeltaNetChunkedKernel:
         self.smem_q_stages = 1
         self.smem_k_stages = 2
         self.smem_v_stages = 1
-        # Dedicated 2 x 16 KiB W-RHS staging buffer. Keeping this separate
-        # from sV lets the TMA warp prefetch W without extending sV's lifetime.
-        self.smem_w_stages = 2
         self.smem_ainv_stages = 1
         self.smem_qk_stages = 1
         self.smem_o_stages = 1
-        self.smem_side_output_stages = 2
         self.smem_group_order_stages = 1
         # Cumulative gate buffers - placed last in SMEM
         self.smem_gate_stages = 1
@@ -388,67 +280,6 @@ class GatedDeltaNetChunkedKernel:
 
         self.buffer_align_bytes = 1024
 
-    @cute.jit
-    def _timeline_tag(
-        self,
-        debug_timing: Optional[cute.Tensor],
-        lane: cutlass.Int32,
-        chunk_idx: cutlass.Int32,
-        tag: cutlass.Int32,
-        batch_idx: cutlass.Int32,
-        head_idx: cutlass.Int32,
-        tidx: cutlass.Int32,
-        record_tidx: cutlass.Int32,
-    ):
-        if cutlass.const_expr(self.enable_timeline):
-            assert debug_timing is not None, "debug_timing must be provided when timeline is enabled"
-            if batch_idx == 0 and head_idx == 0 and chunk_idx < 2 and tidx == record_tidx:
-                debug_timing[lane, chunk_idx, tag] = _gdn_timeline_clock64()
-
-    @cute.jit
-    def _timeline_tag_from_args(self, timeline_args: tuple, tag: cutlass.Int32):
-        debug_timing, lane, chunk_idx, batch_idx, head_idx, tidx, record_tidx = timeline_args
-        self._timeline_tag(debug_timing, lane, chunk_idx, tag, batch_idx, head_idx, tidx, record_tidx)
-
-    # -----------------------------------------------------------------------
-    # Capability check
-    # -----------------------------------------------------------------------
-
-    @staticmethod
-    def can_implement(
-        io_dtype,
-        acc_dtype,
-        mma_tiler_qk,
-        mma_tiler_qs,
-        mma_tiler_qkv,
-        mma_tiler_kv,
-    ):
-        """Raise CantImplementError if this configuration is not supported."""
-        if io_dtype not in [cutlass.Float16, cutlass.BFloat16]:
-            raise testing.CantImplementError(
-                f"io_dtype={io_dtype} not supported; only Float16 and BFloat16 are supported"
-            )
-        if acc_dtype != cutlass.Float32:
-            raise testing.CantImplementError(
-                f"acc_dtype={acc_dtype} not supported; only Float32 is supported"
-            )
-        if mma_tiler_qk != (64, 64, 128):
-            raise testing.CantImplementError(
-                f"mma_tiler_qk={mma_tiler_qk} not supported; only (64, 64, 128) is supported"
-            )
-        if mma_tiler_qs != (128, 64, 128):
-            raise testing.CantImplementError(
-                f"mma_tiler_qs={mma_tiler_qs} not supported; only (128, 64, 128) is supported"
-            )
-        if mma_tiler_qkv != (128, 64, 64):
-            raise testing.CantImplementError(
-                f"mma_tiler_qkv={mma_tiler_qkv} not supported; only (128, 64, 64) is supported"
-            )
-        if mma_tiler_kv != (128, 128, 64):
-            raise testing.CantImplementError(
-                f"mma_tiler_kv={mma_tiler_kv} not supported; only (128, 128, 64) is supported"
-            )
-
     # -----------------------------------------------------------------------
     # Host entry point
     # -----------------------------------------------------------------------
@@ -459,25 +290,17 @@ class GatedDeltaNetChunkedKernel:
         q: cute.Tensor,
         k: cute.Tensor,
         v: cute.Tensor,
-        w_rhs: Optional[cute.Tensor],
         gate: cute.Tensor,
         beta: cute.Tensor,
         output_g: Optional[cute.Tensor],
         o: cute.Tensor,
-        input_A: Optional[cute.Tensor],
         output_A: Optional[cute.Tensor],
-        output_v_new: Optional[cute.Tensor],
-        output_w: Optional[cute.Tensor],
         output_h: Optional[cute.Tensor],
         cu_seqlens: cute.Tensor,
         s_in: Optional[cute.Tensor],
-        s_out: Optional[cute.Tensor],
-        s_checkpoints: Optional[cute.Tensor],
         cu_checkpoints: Optional[cute.Tensor],
-        checkpoint_every_n_tokens: cutlass.Int32,
         scale: cutlass.Float32,
         tensormap_workspace: cute.Tensor,
-        debug_timing: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         # chunk size
@@ -485,7 +308,6 @@ class GatedDeltaNetChunkedKernel:
         h_q = q.shape[1]
         h_v = v.shape[1]
         batch_size = cu_seqlens.shape[0] - 1
-        raw_k = k
 
         self._setup_attributes()
 
@@ -538,54 +360,6 @@ class GatedDeltaNetChunkedKernel:
                 ),
             )
 
-        if cutlass.const_expr(self.store_w):
-            if cutlass.const_expr(self.w_rhs_precomputed):
-                assert w_rhs is not None, "w_rhs must be provided when w_rhs_precomputed is True"
-                if cutlass.const_expr(self.is_GQA):
-                    w_rhs = cute.make_tensor(
-                        w_rhs.iterator,
-                        cute.make_layout(
-                            (w_rhs.shape[2], w_rhs.shape[0], (h_r, h_v)),
-                            stride=(w_rhs.stride[2], w_rhs.stride[0], (0, w_rhs.stride[1])),
-                        ),
-                    )
-                else:
-                    w_rhs = cute.make_tensor(
-                        w_rhs.iterator,
-                        cute.make_layout(
-                            (w_rhs.shape[2], w_rhs.shape[0], (h_r, h_q)),
-                            stride=(
-                                w_rhs.stride[2],
-                                w_rhs.stride[0],
-                                (w_rhs.stride[1], h_r * w_rhs.stride[1]),
-                            ),
-                        ),
-                    )
-            else:
-                assert w_rhs is None, "w_rhs must be None when generated inside the kernel"
-                if cutlass.const_expr(self.is_GQA):
-                    w_rhs = cute.make_tensor(
-                        raw_k.iterator,
-                        cute.make_layout(
-                            (raw_k.shape[2], raw_k.shape[0], (h_r, h_v)),
-                            stride=(raw_k.stride[2], raw_k.stride[0], (0, raw_k.stride[1])),
-                        ),
-                    )
-                else:
-                    w_rhs = cute.make_tensor(
-                        raw_k.iterator,
-                        cute.make_layout(
-                            (raw_k.shape[2], raw_k.shape[0], (h_r, h_q)),
-                            stride=(
-                                raw_k.stride[2],
-                                raw_k.stride[0],
-                                (raw_k.stride[1], h_r * raw_k.stride[1]),
-                            ),
-                        ),
-                    )
-        else:
-            assert w_rhs is None, "w_rhs must be None when store_w is False"
-
         gate = cute.make_tensor(
             gate.iterator,
             cute.make_layout(
@@ -621,21 +395,6 @@ class GatedDeltaNetChunkedKernel:
                 stride=(o.stride[2], o.stride[0], (o.stride[1], h_r * o.stride[1])),
             ),
         )
-        if cutlass.const_expr(self.use_input_A):
-            assert input_A is not None, "input_A must be provided when use_input_A is True"
-            input_A = cute.make_tensor(
-                input_A.iterator,
-                cute.make_layout(
-                    (input_A.shape[0], input_A.shape[2], (h_r, h_qv)),
-                    stride=(
-                        input_A.stride[0],
-                        input_A.stride[2],
-                        (input_A.stride[1], h_r * input_A.stride[1]),
-                    ),
-                ),
-            )
-        else:
-            assert input_A is None, "input_A must be None when use_input_A is False"
         if cutlass.const_expr(self.store_A):
             assert output_A is not None, "output_A must be provided when store_A is True"
             output_A = cute.make_tensor(
@@ -651,36 +410,6 @@ class GatedDeltaNetChunkedKernel:
             )
         else:
             assert output_A is None, "output_A must be None when store_A is False"
-        if cutlass.const_expr(self.store_v_new):
-            assert output_v_new is not None, "output_v_new must be provided when store_v_new is True"
-            output_v_new = cute.make_tensor(
-                output_v_new.iterator,
-                cute.make_layout(
-                    (output_v_new.shape[2], output_v_new.shape[0], (h_r, h_qv)),
-                    stride=(
-                        output_v_new.stride[2],
-                        output_v_new.stride[0],
-                        (output_v_new.stride[1], h_r * output_v_new.stride[1]),
-                    ),
-                ),
-            )
-        else:
-            assert output_v_new is None, "output_v_new must be None when store_v_new is False"
-        if cutlass.const_expr(self.store_w):
-            assert output_w is not None, "output_w must be provided when store_w is True"
-            output_w = cute.make_tensor(
-                output_w.iterator,
-                cute.make_layout(
-                    (output_w.shape[2], output_w.shape[0], (h_r, h_qv)),
-                    stride=(
-                        output_w.stride[2],
-                        output_w.stride[0],
-                        (output_w.stride[1], h_r * output_w.stride[1]),
-                    ),
-                ),
-            )
-        else:
-            assert output_w is None, "output_w must be None when store_w is False"
         if cutlass.const_expr(self.store_h):
             assert output_h is not None, "output_h must be provided when store_h is True"
             if cutlass.const_expr(self.use_bf16_h_tma):
@@ -724,46 +453,20 @@ class GatedDeltaNetChunkedKernel:
             assert output_h is None, "output_h must be None when store_h is False"
             h_tma_output = None
         if cutlass.const_expr(s_in is not None):
+            # The recurrent state lives in TMEM as S^T ([DV, DK], the A operand of GEMMs 3 and
+            # 4) and _load_initial_state copies GMEM rows straight into TMEM rows, while the
+            # caller hands the state in FLA's [N, H, DK, DV] layout. Present it transposed
+            # (modes (DV, DK)) so TMEM row v receives S[:, v]; the strided element loads run
+            # once per (sequence, head) tile.
             s_in = cute.make_tensor(
                 s_in.iterator,
                 cute.make_layout(
-                    (s_in.shape[2], s_in.shape[3], (h_r, h_qv), s_in.shape[0]),
+                    (s_in.shape[3], s_in.shape[2], (h_r, h_qv), s_in.shape[0]),
                     stride=(
-                        s_in.stride[2],
                         s_in.stride[3],
+                        s_in.stride[2],
                         (s_in.stride[1], h_r * s_in.stride[1]),
                         s_in.stride[0],
-                    ),
-                ),
-            )
-        if cutlass.const_expr(s_out is not None):
-            s_out = cute.make_tensor(
-                s_out.iterator,
-                cute.make_layout(
-                    (s_out.shape[2], s_out.shape[3], (h_r, h_qv), s_out.shape[0]),
-                    stride=(
-                        s_out.stride[2],
-                        s_out.stride[3],
-                        (s_out.stride[1], h_r * s_out.stride[1]),
-                        s_out.stride[0],
-                    ),
-                ),
-            )
-        if cutlass.const_expr(self.enable_checkpoints):
-            s_checkpoints = cute.make_tensor(
-                s_checkpoints.iterator,
-                cute.make_layout(
-                    (
-                        s_checkpoints.shape[2],
-                        s_checkpoints.shape[3],
-                        (h_r, h_qv),
-                        s_checkpoints.shape[0],
-                    ),
-                    stride=(
-                        s_checkpoints.stride[2],
-                        s_checkpoints.stride[3],
-                        (s_checkpoints.stride[1], h_r * s_checkpoints.stride[1]),
-                        s_checkpoints.stride[0],
                     ),
                 ),
             )
@@ -855,9 +558,6 @@ class GatedDeltaNetChunkedKernel:
         v_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma_qkv_ss, self.mma_tiler_qkv, self.io_dtype, self.smem_v_stages
         )
-        w_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            tiled_mma_qkv_ss, self.mma_tiler_qkv, self.io_dtype, self.smem_w_stages
-        )
         # A_inv is B operand for tiled_mma_qkv (GEMM 5: new_v: V @ A_inv);
         ainv_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma_qkv, self.mma_tiler_qkv, self.io_dtype, self.smem_ainv_stages
@@ -873,12 +573,6 @@ class GatedDeltaNetChunkedKernel:
             self.mma_tiler_qkv[:2],
             self.smem_o_stages,
         )
-        side_output_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-            self.io_dtype,
-            utils.LayoutEnum.from_tensor(o),
-            self.mma_tiler_qkv[:2],
-            self.smem_side_output_stages,
-        )
         if cutlass.const_expr(self.use_bf16_h_tma):
             assert output_h is not None
             h_smem_layout_staged = sm100_utils.make_smem_layout_epi(
@@ -889,16 +583,13 @@ class GatedDeltaNetChunkedKernel:
             )
             assert cute.size_in_bytes(self.io_dtype, h_smem_layout_staged) == 32768
         else:
-            h_smem_layout_staged = side_output_smem_layout_staged
+            # Type placeholder only: sH aliases sO and is never touched in this specialization.
+            h_smem_layout_staged = o_smem_layout_staged
         # Gate scalar arrays (1D Float32, flat layout - no swizzle needed)
         cumsumlog_smem_layout_staged = cute.make_layout(
             (self.b_t, 1, self.smem_gate_stages)
         )
         beta_smem_layout_staged = cute.make_layout((self.b_t, 1, self.smem_beta_stages))
-        ainput_smem_layout_staged = cute.make_layout(
-            (self.b_t, self.b_t, self.smem_ainv_stages),
-            stride=(self.b_t, 1, self.b_t * self.b_t),
-        )
 
         # ------------------------------------------------------------------
         # Shared memory struct  (defined here to capture layout cosizes)
@@ -912,12 +603,6 @@ class GatedDeltaNetChunkedKernel:
             load_q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.smem_q_stages * 2]
             # TMA load warp -> MMA warp
             load_v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.smem_v_stages * 2]
-            # TMA load warp -> CG1 (dedicated double-buffered W RHS)
-            load_w_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.smem_w_stages * 2]
-            # TMA load warp -> CG0 (saved A into sAinv)
-            load_A_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.smem_ainv_stages * 2
-            ]
             # TMA gate warp -> CG0/CG1
             load_gate_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.smem_gate_stages * 2
@@ -957,8 +642,8 @@ class GatedDeltaNetChunkedKernel:
             o_store_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.smem_o_stages * 2
             ]
-            # CG1 -> epilogue warp: VNew/W side-output staging readiness
-            side_output_store_mbar_ptr: cute.struct.MemRange[
+            # CG1 -> epilogue warp: BF16 h staging tile readiness (sH)
+            h_store_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, 2
             ]
             # CG0 -> CG1 (group order)
@@ -981,24 +666,10 @@ class GatedDeltaNetChunkedKernel:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(v_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
-            sW: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.io_dtype,
-                    cute.cosize(w_smem_layout_staged) if self.store_w else 1,
-                ],
-                self.buffer_align_bytes,
-            ]
-            # A_inv result, then overwritten with fp16 NV
+            # A_inv result (B operand of GEMM 5)
             sAinv: cute.struct.Align[
                 cute.struct.MemRange[
                     self.io_dtype, cute.cosize(ainv_smem_layout_staged)
-                ],
-                self.buffer_align_bytes,
-            ]
-            # Row-major saved-A TMA staging. CG0 converts this into sAinv layout.
-            sAinput: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.io_dtype, cute.cosize(ainput_smem_layout_staged)
                 ],
                 self.buffer_align_bytes,
             ]
@@ -1011,16 +682,7 @@ class GatedDeltaNetChunkedKernel:
                 cute.struct.MemRange[self.io_dtype, cute.cosize(o_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
-            # Dedicated VNew/W staging: two 128x64 BF16 tiles, never aliased with sO.
-            sSideOutput: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.io_dtype,
-                    cute.cosize(side_output_smem_layout_staged)
-                    if self.store_v_new or self.store_w else 1,
-                ],
-                self.buffer_align_bytes,
-            ]
-            # Dedicated 128x128 BF16 H staging (32 KiB), never aliased with VNew/W.
+            # Dedicated 128x128 BF16 H staging (32 KiB), never aliased with sO.
             sH: cute.struct.Align[
                 cute.struct.MemRange[
                     self.io_dtype,
@@ -1047,9 +709,6 @@ class GatedDeltaNetChunkedKernel:
         q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
         k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
         v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
-        w_smem_layout = cute.select(w_smem_layout_staged, mode=[0, 1, 2])
-        ainv_smem_layout = cute.select(ainv_smem_layout_staged, mode=[0, 1, 2])
-        ainput_smem_layout = cute.select(ainput_smem_layout_staged, mode=[0, 1])
 
         tma_q = _wrap_tma(
             cute.nvgpu.make_tiled_tma_atom_A(
@@ -1081,36 +740,8 @@ class GatedDeltaNetChunkedKernel:
                 self.cluster_layout_vmnk.shape,
             )
         )
-        if cutlass.const_expr(self.store_w):
-            assert w_rhs is not None, "w_rhs must be provided when store_w is True"
-            tma_w = _wrap_tma(
-                cute.nvgpu.make_tiled_tma_atom_A(
-                    tma_load_op,
-                    w_rhs,
-                    w_smem_layout,
-                    self.mma_tiler_qkv,
-                    tiled_mma_qkv_ss,
-                    self.cluster_layout_vmnk.shape,
-                )
-            )
-        else:
-            tma_w = tma_v
-        if cutlass.const_expr(self.use_input_A):
-            tma_A = _wrap_tma(
-                cpasync.make_tiled_tma_atom(
-                    tma_load_op,
-                    input_A,
-                    ainput_smem_layout,
-                    (self.b_t, self.b_t),
-                )
-            )
-        else:
-            tma_A = tma_k
-        cumsumlog_smem_layout = cute.select(cumsumlog_smem_layout_staged, mode=[0])  # noqa: F841
-        beta_smem_layout = cute.select(beta_smem_layout_staged, mode=[0])  # noqa: F841
 
         o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
-        side_output_smem_layout = cute.select(side_output_smem_layout_staged, mode=[0, 1])
         h_smem_layout = cute.select(h_smem_layout_staged, mode=[0, 1])
         tma_o = _wrap_tma(
             cpasync.make_tiled_tma_atom(
@@ -1120,30 +751,6 @@ class GatedDeltaNetChunkedKernel:
                 self.mma_tiler_qkv[:2],
             )
         )
-        if cutlass.const_expr(self.store_v_new):
-            assert output_v_new is not None, "output_v_new must be provided when store_v_new is True"
-            tma_v_new_out = _wrap_tma(
-                cpasync.make_tiled_tma_atom(
-                    tma_store_op,
-                    output_v_new,
-                    side_output_smem_layout,
-                    self.mma_tiler_qkv[:2],
-                )
-            )
-        else:
-            tma_v_new_out = tma_o
-        if cutlass.const_expr(self.store_w):
-            assert output_w is not None, "output_w must be provided when store_w is True"
-            tma_w_out = _wrap_tma(
-                cpasync.make_tiled_tma_atom(
-                    tma_store_op,
-                    output_w,
-                    side_output_smem_layout,
-                    self.mma_tiler_qkv[:2],
-                )
-            )
-        else:
-            tma_w_out = tma_o
         if cutlass.const_expr(self.use_bf16_h_tma):
             assert h_tma_output is not None
             tma_h_out = _wrap_tma(
@@ -1160,8 +767,6 @@ class GatedDeltaNetChunkedKernel:
         self.tma_q_bytes = cute.size_in_bytes(self.io_dtype, q_smem_layout)
         self.tma_k_bytes = cute.size_in_bytes(self.io_dtype, k_smem_layout)
         self.tma_v_bytes = cute.size_in_bytes(self.io_dtype, v_smem_layout)
-        self.tma_w_bytes = cute.size_in_bytes(self.io_dtype, w_smem_layout)
-        self.tma_A_bytes = cute.size_in_bytes(self.io_dtype, ainput_smem_layout)
         self.tma_o_bytes = cute.size_in_bytes(self.io_dtype, o_smem_layout)
 
         # ------------------------------------------------------------------
@@ -1172,7 +777,6 @@ class GatedDeltaNetChunkedKernel:
             num_q_heads=h_q,
             num_v_heads=h_v,
             is_GQA=self.is_GQA,
-            is_persistent=self.is_persistent,
         )
         grid_shape = GDNTileScheduler.get_grid_shape(
             scheduler_params, self.max_active_clusters
@@ -1187,49 +791,34 @@ class GatedDeltaNetChunkedKernel:
             tma_q,
             tma_k,
             tma_v,
-            tma_w,
-            tma_A,
             gate,
             beta,
             output_g,
             tma_o,
-            tma_v_new_out,
-            tma_w_out,
             tma_h_out,
-            input_A,
             output_A,
-            output_v_new,
-            output_w,
             output_h,
             h_tma_output,
             cu_seqlens,
             s_in,
-            s_out,
-            s_checkpoints,
             cu_checkpoints,
-            checkpoint_every_n_tokens,
             scale,
             q_smem_layout_staged,
             k_smem_layout_staged,
             k_trans_smem_layout_staged,
             v_smem_layout_staged,
-            w_smem_layout_staged,
             cumsumlog_smem_layout_staged,
             beta_smem_layout_staged,
-            ainput_smem_layout_staged,
             ainv_smem_layout_staged,
             qk_smem_layout_staged,
             o_smem_layout_staged,
-            side_output_smem_layout_staged,
             h_smem_layout_staged,
             scheduler_params,
             q,
             k,
             v,
-            w_rhs,
             o,
             tensormap_workspace,
-            debug_timing,
         ).launch(
             grid=grid_shape,
             block=(self.threads_per_cta, 1, 1),
@@ -1261,59 +850,43 @@ class GatedDeltaNetChunkedKernel:
         tma_q: TmaInfo,
         tma_k: TmaInfo,
         tma_v: TmaInfo,
-        tma_w: TmaInfo,
-        tma_A: TmaInfo,
         mGate: cute.Tensor,
         mBeta: cute.Tensor,
         mGateOut: Optional[cute.Tensor],
         tma_o: TmaInfo,
-        tma_v_new_out: TmaInfo,
-        tma_w_out: TmaInfo,
         tma_h_out: TmaInfo,
-        mA_in: Optional[cute.Tensor],
         mA_out: Optional[cute.Tensor],
-        mVNew_out: Optional[cute.Tensor],
-        mW_out: Optional[cute.Tensor],
         mH_out: Optional[cute.Tensor],
         mH_tma_out: Optional[cute.Tensor],
         # (B+1,)  int32  cumulative seq lengths
         cu_seqlens: cute.Tensor,
         # initial state (fp32) from GMEM; None if not used
         mS_init: Optional[cute.Tensor],
-        # final state output (fp32) to GMEM; None if not stored
-        mS_out: Optional[cute.Tensor],
-        mS_checkpoints: Optional[cute.Tensor],
+        # (B+1,) int32 per-sequence chunk prefix (output_h slot base); None if not stored
         cu_checkpoints: Optional[cute.Tensor],
-        checkpoint_every_n_tokens: cutlass.Int32,
         scale: cutlass.Float32,
         # SMEM staged layouts (needed to view shared_storage tensor buffers)
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
         k_trans_smem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
-        w_smem_layout_staged: cute.ComposedLayout,
         cumsumlog_smem_layout_staged: cute.Layout,
         beta_smem_layout_staged: cute.Layout,
-        ainput_smem_layout_staged: cute.Layout,
         ainv_smem_layout_staged: cute.ComposedLayout,
         qk_smem_layout_staged: cute.ComposedLayout,
         o_smem_layout_staged: cute.ComposedLayout,
-        side_output_smem_layout_staged: cute.ComposedLayout,
         h_smem_layout_staged: cute.ComposedLayout,
         # Scheduler
         scheduler_params: GDNTileSchedulerParams,
-        # TMA descriptor workspace in GMEM (one set of 9 slots per CTA).
-        # Slots: Q=0, K=1, V=2, O=3, A=4, W_RHS=5, VNEW_OUT=6, W_OUT=7, H_OUT=8.
+        # TMA descriptor workspace in GMEM (one set of 5 slots per CTA).
+        # Slots: Q=0, K=1, V=2, O=3, H_OUT=4.
         mQ,
         mK,
         mV,
-        mW: Optional[cute.Tensor],
         # used for TMA descriptor update
         mO,
-        # (num_ctas, 3+smem_k_stages, 16) Int64
+        # (num_ctas, num_tensormaps, bytes_per_tensormap) Int8
         tensormap_workspace: cute.Tensor,
-        # Optional debug timeline tensor: [lane, chunk(0..1), tag] int64 globaltimer stamps.
-        debug_timing: Optional[cute.Tensor],
     ):
         """
         Main GDN chunked kernel.
@@ -1333,24 +906,6 @@ class GatedDeltaNetChunkedKernel:
             )
         else:
             assert mS_init is None, "mS_init must be None if use_initial_state is False"
-        if cutlass.const_expr(self.store_final_state):
-            assert mS_out is not None, (
-                "mS_out must be provided if store_final_state is True"
-            )
-        else:
-            assert mS_out is None, "mS_out must be None if store_final_state is False"
-        if cutlass.const_expr(self.store_v_new):
-            assert mVNew_out is not None, (
-                "mVNew_out must be provided if store_v_new is True"
-            )
-        else:
-            assert mVNew_out is None, "mVNew_out must be None if store_v_new is False"
-        if cutlass.const_expr(self.store_w):
-            assert mW_out is not None, "mW_out must be provided if store_w is True"
-            assert mW is not None, "mW must be provided if store_w is True"
-        else:
-            assert mW_out is None, "mW_out must be None if store_w is False"
-            assert mW is None, "mW must be None if store_w is False"
         if cutlass.const_expr(self.store_h):
             assert mH_out is not None, "mH_out must be provided if store_h is True"
             if cutlass.const_expr(self.use_bf16_h_tma):
@@ -1362,8 +917,8 @@ class GatedDeltaNetChunkedKernel:
             assert mH_tma_out is None
 
         # ------------------------------------------------------------------
-        # TMA descriptor GMEM workspace - one set of 9 ptrs per CTA.
-        # Slots: Q=0, K=1, V=2, O=3, A=4, W_RHS=5, VNEW_OUT=6, W_OUT=7, H_OUT=8.
+        # TMA descriptor GMEM workspace - one set of 5 ptrs per CTA.
+        # Slots: Q=0, K=1, V=2, O=3, H_OUT=4.
         # ------------------------------------------------------------------
         cta_linear_idx = bidz * grid_dim[1] * grid_dim[0] + bidy * grid_dim[0] + bidx
 
@@ -1384,20 +939,8 @@ class GatedDeltaNetChunkedKernel:
         tensormap_o_ptr = tensormap_manager.get_tensormap_ptr(
             tensormap_workspace[(cta_linear_idx, 3, None)].iterator
         )
-        tensormap_A_ptr = tensormap_manager.get_tensormap_ptr(
-            tensormap_workspace[(cta_linear_idx, 4, None)].iterator
-        )
-        tensormap_w_ptr = tensormap_manager.get_tensormap_ptr(
-            tensormap_workspace[(cta_linear_idx, 5, None)].iterator
-        )
-        tensormap_v_new_out_ptr = tensormap_manager.get_tensormap_ptr(
-            tensormap_workspace[(cta_linear_idx, 6, None)].iterator
-        )
-        tensormap_w_out_ptr = tensormap_manager.get_tensormap_ptr(
-            tensormap_workspace[(cta_linear_idx, 7, None)].iterator
-        )
         tensormap_h_out_ptr = tensormap_manager.get_tensormap_ptr(
-            tensormap_workspace[(cta_linear_idx, 8, None)].iterator
+            tensormap_workspace[(cta_linear_idx, 4, None)].iterator
         )
 
         # ------------------------------------------------------------------
@@ -1418,31 +961,17 @@ class GatedDeltaNetChunkedKernel:
         sV = storage.sV.get_tensor(
             v_smem_layout_staged.outer, swizzle=v_smem_layout_staged.inner
         )
-        if cutlass.const_expr(self.store_w):
-            sW = storage.sW.get_tensor(
-                w_smem_layout_staged.outer, swizzle=w_smem_layout_staged.inner
-            )
-        else:
-            sW = sV
-        # A_inverse / new_v  (A_inv written first, then overwritten with fp16 NV)
+        # A_inverse (B operand of GEMM 5)
         sAinv = storage.sAinv.get_tensor(
             ainv_smem_layout_staged.outer, swizzle=ainv_smem_layout_staged.inner
         )
-        sAinput = storage.sAinput.get_tensor(ainput_smem_layout_staged)
-        # QK output / O store  (W_qk first, then O epilogue staging)
+        # QK output (B operand of GEMM 6)
         sQk = storage.sQk.get_tensor(
             qk_smem_layout_staged.outer, swizzle=qk_smem_layout_staged.inner
         )
         sO = storage.sO.get_tensor(
             o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
         )
-        if cutlass.const_expr(self.store_v_new or self.store_w):
-            sSideOutput = storage.sSideOutput.get_tensor(
-                side_output_smem_layout_staged.outer,
-                swizzle=side_output_smem_layout_staged.inner,
-            )
-        else:
-            sSideOutput = sO
         if cutlass.const_expr(self.use_bf16_h_tma):
             h_smem_layout = cute.select(h_smem_layout_staged, mode=[0, 1])
             sH = storage.sH.get_tensor(
@@ -1450,27 +979,18 @@ class GatedDeltaNetChunkedKernel:
                 swizzle=h_smem_layout.inner,
             )
         else:
-            sH = sSideOutput
+            # Type placeholder only; never read or written in this specialization.
+            sH = sO
         # Gate scalar arrays (1D Float32, flat - no swizzle)
         sCumsumlog = storage.cumsumlog.get_tensor(cumsumlog_smem_layout_staged)
         sCumprod = storage.cumprod.get_tensor(cumsumlog_smem_layout_staged)
         sBeta = storage.beta.get_tensor(beta_smem_layout_staged)
 
         if warp_idx == self.mma_warp_id:
-            if cutlass.const_expr(not self.drop_output_store_only):
-                cpasync.prefetch_descriptor(tma_q.atom)
+            cpasync.prefetch_descriptor(tma_q.atom)
             cpasync.prefetch_descriptor(tma_k.atom)
             cpasync.prefetch_descriptor(tma_v.atom)
-            if cutlass.const_expr(self.store_w):
-                cpasync.prefetch_descriptor(tma_w.atom)
-            if cutlass.const_expr(self.use_input_A):
-                cpasync.prefetch_descriptor(tma_A.atom)
-            if cutlass.const_expr(not self.drop_output_store_only):
-                cpasync.prefetch_descriptor(tma_o.atom)
-            if cutlass.const_expr(self.store_v_new):
-                cpasync.prefetch_descriptor(tma_v_new_out.atom)
-            if cutlass.const_expr(self.store_w):
-                cpasync.prefetch_descriptor(tma_w_out.atom)
+            cpasync.prefetch_descriptor(tma_o.atom)
             if cutlass.const_expr(self.use_bf16_h_tma):
                 cpasync.prefetch_descriptor(tma_h_out.atom)
 
@@ -1498,11 +1018,9 @@ class GatedDeltaNetChunkedKernel:
         cg_mma = _cg(len([self.mma_warp_id]))
         # 128 threads (CG0)
         cg_cg0 = _cg(self.threads_per_warp * len(self.compute_group_0_warp_ids))
-        # One participating thread per CG0 warp for TMA async waits.
-        cg_cg0_tma = _cg(len(self.compute_group_0_warp_ids))
         # 128 threads (CG1)
         cg_cg1 = _cg(self.threads_per_warp * len(self.compute_group_1_warp_ids))
-        # 4 threads (one per CG1 warp, used for V/W load signaling)
+        # 4 threads (one per CG1 warp, used for V load signaling)
         cg_cg1_v = _cg(len(self.compute_group_1_warp_ids))
         # 256 threads (CG0 + CG1)
         cg_both = _cg(
@@ -1512,7 +1030,7 @@ class GatedDeltaNetChunkedKernel:
         # 32 threads (epilogue warp)
         cg_epi = _cg(self.threads_per_warp * len([self.epilogue_warp_id]))
 
-        # TMA load -> consumers: K (double-buffered), Q, V, and W.
+        # TMA load -> consumers: K (double-buffered), Q, and V.
         load_k_producer, load_k_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.smem_k_stages,
             producer_group=cg_tma,
@@ -1536,22 +1054,6 @@ class GatedDeltaNetChunkedKernel:
             consumer_group=cg_cg1_v,
             tx_count=self.tma_v_bytes,
             barrier_storage=storage.load_v_mbar_ptr.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-        load_w_producer, load_w_consumer = pipeline.PipelineTmaAsync.create(
-            num_stages=self.smem_w_stages,
-            producer_group=cg_tma,
-            consumer_group=cg_cg1_v,
-            tx_count=self.tma_w_bytes,
-            barrier_storage=storage.load_w_mbar_ptr.data_ptr(),
-            defer_sync=True,
-        ).make_participants()
-        load_A_producer, load_A_consumer = pipeline.PipelineTmaAsync.create(
-            num_stages=self.smem_ainv_stages,
-            producer_group=cg_tma,
-            consumer_group=cg_cg0_tma,
-            tx_count=self.tma_A_bytes,
-            barrier_storage=storage.load_A_mbar_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
         # Gate warp (warp 10) -> CG0 / CG1:  gate/beta (PipelineAsync, software-signaled)
@@ -1647,12 +1149,14 @@ class GatedDeltaNetChunkedKernel:
             barrier_storage=storage.o_store_mbar_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
-        side_output_store_producer, side_output_store_consumer = (
+        # CG1 -> epilogue warp:  BF16 h staging tile ready in sH (bf16 TMA h path only;
+        # created unconditionally so the barrier layout does not depend on the specialization)
+        h_store_producer, h_store_consumer = (
             pipeline.PipelineAsync.create(
                 num_stages=1,
                 producer_group=cg_cg1,
                 consumer_group=cg_epi,
-                barrier_storage=storage.side_output_store_mbar_ptr.data_ptr(),
+                barrier_storage=storage.h_store_mbar_ptr.data_ptr(),
                 defer_sync=True,
             ).make_participants()
         )
@@ -1701,14 +1205,9 @@ class GatedDeltaNetChunkedKernel:
                 # First chunk: no previous state (S_prev = 0), skip GEMMs 3/4
                 for chunk_idx in cutlass.range(num_chunks_b):
                     chunk_offset = batch_start + chunk_idx * self.b_t
-                    self._timeline_tag(
-                        debug_timing, 0, chunk_idx, 0, batch_idx, head_idx, tidx,
-                        self.compute_group_0_warp_ids[0] * self.threads_per_warp,
-                    )
                     (
                         load_gate_consumer,
                         load_beta_consumer,
-                        load_A_consumer,
                         shared_acc_consumer,
                         a_inv_ready_producer,
                         qk_ready_producer,
@@ -1718,43 +1217,32 @@ class GatedDeltaNetChunkedKernel:
                         tmem_ptr,
                         scale,
                         (tiled_mma_qk,),
-                        (sCumsumlog, sBeta, sAinv, sAinput, sQk_pisl),
+                        (sCumsumlog, sBeta, sAinv, sQk_pisl),
                         (
                             load_gate_consumer,
                             load_beta_consumer,
-                            load_A_consumer,
                             shared_acc_consumer,
                             a_inv_ready_producer,
                             qk_ready_producer,
                             group_order_producer,
                         ),
                         (
-                            mA_in,
                             mA_out,
                             head_idx,
                             chunk_offset,
                             chunk_idx == 0,
                             batch_end,
                         ),
-                        (
-                            debug_timing,
-                            cutlass.Int32(0),
-                            chunk_idx,
-                            batch_idx,
-                            head_idx,
-                            tidx,
-                            self.compute_group_0_warp_ids[0] * self.threads_per_warp,
-                        ),
-                    )
-                    self._timeline_tag(
-                        debug_timing, 0, chunk_idx, 1, batch_idx, head_idx, tidx,
-                        self.compute_group_0_warp_ids[0] * self.threads_per_warp,
                     )
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
+            # Only the pipelines this group produces on. The O-store pipeline is produced by
+            # compute group 1 (which tails it); a tail here would wait on its empty barrier with
+            # a fresh producer state, which passes only while the epilogue has released an even
+            # number of O tiles and therefore stalls odd-chunk-count tiles whenever these warps
+            # reach it after the epilogue's last release.
             a_inv_ready_producer.tail()
             qk_ready_producer.tail()
-            o_store_producer.tail()
             group_order_producer.tail()
 
         # ==============================================================
@@ -1765,7 +1253,8 @@ class GatedDeltaNetChunkedKernel:
             and warp_idx <= self.compute_group_1_warp_ids[-1]
         ):
             cute.arch.setmaxregister_increase(self.num_regs_compute_group_1)
-            # Total TMEM columns: state(128) + q_state_acc(128) + shared_acc(128x2) = 512
+            # Total TMEM columns: state(128) + q_state_acc(64) + state_inp(64)
+            # + shared_acc(64x2) + shared_inp(64x2) = 512 (see _setup_attributes)
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1779,68 +1268,29 @@ class GatedDeltaNetChunkedKernel:
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
-                checkpoint_offset = 0
-                if cutlass.const_expr(self.enable_checkpoints or self.store_h):
-                    checkpoint_offset = cu_checkpoints[batch_idx]
-                if cutlass.const_expr(self.use_initial_state):
-                    kv_acc_producer = self._load_initial_state(
-                        tidx,
-                        mS_init,
-                        head_idx,
-                        batch_idx,
-                        tmem_ptr,
-                        tiled_mma_kv,
-                        kv_acc_producer,
+                # Skip zero-length packed sequences (no chunk, no pipeline traffic).
+                if num_chunks_b > 0:
+                    checkpoint_offset = 0
+                    if cutlass.const_expr(self.store_h):
+                        checkpoint_offset = cu_checkpoints[batch_idx]
+                    if cutlass.const_expr(self.use_initial_state):
+                        kv_acc_producer = self._load_initial_state(
+                            tidx,
+                            mS_init,
+                            head_idx,
+                            batch_idx,
+                            tmem_ptr,
+                            tiled_mma_kv,
+                            kv_acc_producer,
+                        )
+                    sV_pisl = self._transform_to_position_independent_layout(
+                        sV, v_smem_layout_staged.inner
                     )
-                sV_pisl = self._transform_to_position_independent_layout(
-                    sV, v_smem_layout_staged.inner
-                )
-                if cutlass.const_expr(self.store_w):
-                    sW_pisl = self._transform_to_position_independent_layout(
-                        sW, w_smem_layout_staged.inner
+                    sO_pisl = self._transform_to_position_independent_layout(
+                        sO, o_smem_layout_staged.inner
                     )
-                else:
-                    sW_pisl = sV_pisl
-                sO_pisl = self._transform_to_position_independent_layout(
-                    sO, o_smem_layout_staged.inner
-                )
-                self._timeline_tag(
-                    debug_timing, 1, 0, 0, batch_idx, head_idx, tidx,
-                    self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                )
-                (
-                    load_v_consumer,
-                    load_w_consumer,
-                    load_gate_consumer,
-                    shared_acc_consumer,
-                    kv_acc_consumer,
-                    q_state_acc_consumer,
-                    group_order_consumer,
-                    kv_acc_producer,
-                    state_inp_ready_producer,
-                    shared_inp_ready_producer,
-                    o_store_producer,
-                    side_output_store_producer,
-                    checkpoint_idx,
-                ) = self.compute_group_1(
-                    tidx,
-                    tmem_ptr,
-                    scale,
-                    (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
-                    (
-                        sV_pisl,
-                        sW_pisl,
-                        sCumsumlog,
-                        sCumprod,
-                        sBeta,
-                        sO_pisl,
-                        sSideOutput,
-                        sH,
-                    ),
-                    (mS_checkpoints, checkpoint_offset, checkpoint_every_n_tokens),
                     (
                         load_v_consumer,
-                        load_w_consumer,
                         load_gate_consumer,
                         shared_acc_consumer,
                         kv_acc_consumer,
@@ -1850,43 +1300,8 @@ class GatedDeltaNetChunkedKernel:
                         state_inp_ready_producer,
                         shared_inp_ready_producer,
                         o_store_producer,
-                        side_output_store_producer,
-                    ),
-                    (mVNew_out, mW_out, mH_out, True, 0, head_idx, batch_start),
-                    (
-                        debug_timing,
-                        cutlass.Int32(1),
-                        cutlass.Int32(0),
-                        batch_idx,
-                        head_idx,
-                        tidx,
-                        self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                    ),
-                )
-                self._timeline_tag(
-                    debug_timing, 1, 0, 1, batch_idx, head_idx, tidx,
-                    self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                )
-                for chunk_idx in cutlass.range(1, num_chunks_b):
-                    chunk_offset = batch_start + chunk_idx * self.b_t
-                    self._timeline_tag(
-                        debug_timing, 1, chunk_idx, 0, batch_idx, head_idx, tidx,
-                        self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                    )
-                    (
-                        load_v_consumer,
-                        load_w_consumer,
-                        load_gate_consumer,
-                        shared_acc_consumer,
-                        kv_acc_consumer,
-                        q_state_acc_consumer,
-                        group_order_consumer,
-                        kv_acc_producer,
-                        state_inp_ready_producer,
-                        shared_inp_ready_producer,
-                        o_store_producer,
-                        side_output_store_producer,
-                        checkpoint_offset,
+                        h_store_producer,
+                        checkpoint_idx,
                     ) = self.compute_group_1(
                         tidx,
                         tmem_ptr,
@@ -1894,18 +1309,15 @@ class GatedDeltaNetChunkedKernel:
                         (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
                         (
                             sV_pisl,
-                            sW_pisl,
                             sCumsumlog,
                             sCumprod,
                             sBeta,
                             sO_pisl,
-                            sSideOutput,
                             sH,
                         ),
-                        (mS_checkpoints, checkpoint_offset, checkpoint_every_n_tokens),
+                        (checkpoint_offset,),
                         (
                             load_v_consumer,
-                            load_w_consumer,
                             load_gate_consumer,
                             shared_acc_consumer,
                             kv_acc_consumer,
@@ -1915,40 +1327,55 @@ class GatedDeltaNetChunkedKernel:
                             state_inp_ready_producer,
                             shared_inp_ready_producer,
                             o_store_producer,
-                            side_output_store_producer,
+                            h_store_producer,
                         ),
-                        (mVNew_out, mW_out, mH_out, False, chunk_idx, head_idx, chunk_offset),
+                        (mH_out, True, 0, head_idx, batch_start),
+                    )
+                    for chunk_idx in cutlass.range(1, num_chunks_b):
+                        chunk_offset = batch_start + chunk_idx * self.b_t
                         (
-                            debug_timing,
-                            cutlass.Int32(1),
-                            chunk_idx,
-                            batch_idx,
-                            head_idx,
+                            load_v_consumer,
+                            load_gate_consumer,
+                            shared_acc_consumer,
+                            kv_acc_consumer,
+                            q_state_acc_consumer,
+                            group_order_consumer,
+                            kv_acc_producer,
+                            state_inp_ready_producer,
+                            shared_inp_ready_producer,
+                            o_store_producer,
+                            h_store_producer,
+                            checkpoint_offset,
+                        ) = self.compute_group_1(
                             tidx,
-                            self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                        ),
-                    )
-                    self._timeline_tag(
-                        debug_timing, 1, chunk_idx, 1, batch_idx, head_idx, tidx,
-                        self.compute_group_1_warp_ids[0] * self.threads_per_warp,
-                    )
-                if cutlass.const_expr(
-                    self.store_final_state or self.enable_checkpoints
-                ):
-                    kv_acc_consumer = self._store_final_state(
-                        tidx,
-                        mS_out,
-                        head_idx,
-                        batch_idx,
-                        tmem_ptr,
-                        tiled_mma_kv,
-                        kv_acc_consumer,
-                        seqlen_b,
-                        mS_checkpoints,
-                        checkpoint_offset,
-                        checkpoint_every_n_tokens,
-                    )
-                else:
+                            tmem_ptr,
+                            scale,
+                            (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
+                            (
+                                sV_pisl,
+                                sCumsumlog,
+                                sCumprod,
+                                sBeta,
+                                sO_pisl,
+                                sH,
+                            ),
+                            (checkpoint_offset,),
+                            (
+                                load_v_consumer,
+                                load_gate_consumer,
+                                shared_acc_consumer,
+                                kv_acc_consumer,
+                                q_state_acc_consumer,
+                                group_order_consumer,
+                                kv_acc_producer,
+                                state_inp_ready_producer,
+                                shared_inp_ready_producer,
+                                o_store_producer,
+                                h_store_producer,
+                            ),
+                            (mH_out, False, chunk_idx, head_idx, chunk_offset),
+                        )
+                    # Consume the last GEMM 7 token of the sequence (the final state stays in TMEM).
                     kv_acc_handle = kv_acc_consumer.wait_and_advance()
                     kv_acc_handle.release()
 
@@ -1960,7 +1387,7 @@ class GatedDeltaNetChunkedKernel:
 
             shared_inp_ready_producer.tail()
             o_store_producer.tail()
-            side_output_store_producer.tail()
+            h_store_producer.tail()
             state_inp_ready_producer.tail()
 
         # ==============================================================
@@ -1980,67 +1407,10 @@ class GatedDeltaNetChunkedKernel:
                 batch_start = cu_seqlens[batch_idx]
                 seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
-                # First chunk: no previous state (S_prev = 0), skip GEMMs 3/4.
-                chunk_offset = batch_start
-                self._timeline_tag(
-                    debug_timing, 2, 0, 0, batch_idx, head_idx, tidx,
-                    self.mma_warp_id * self.threads_per_warp,
-                )
-                (
-                    shared_acc_producer,
-                    q_state_acc_producer,
-                    kv_acc_producer,
-                    load_k_consumer,
-                    load_q_consumer,
-                    load_v_consumer,
-                    a_inv_ready_consumer,
-                    qk_ready_consumer,
-                    state_inp_ready_consumer,
-                    shared_inp_ready_consumer,
-                ) = self.mma_warp(
-                    tmem_ptr,
-                    (
-                        tiled_mma_qk,
-                        tiled_mma_qs,
-                        tiled_mma_qkv,
-                        tiled_mma_qkv_ss,
-                        tiled_mma_kv,
-                    ),
-                    (sQ, sK, sK_trans, sV, sAinv, sQk),
-                    (
-                        shared_acc_producer,
-                        q_state_acc_producer,
-                        kv_acc_producer,
-                        load_k_consumer,
-                        load_q_consumer,
-                        load_v_consumer,
-                        a_inv_ready_consumer,
-                        qk_ready_consumer,
-                        state_inp_ready_consumer,
-                        shared_inp_ready_consumer,
-                    ),
-                    (True,),
-                    (
-                        debug_timing,
-                        cutlass.Int32(2),
-                        cutlass.Int32(0),
-                        batch_idx,
-                        head_idx,
-                        tidx,
-                        self.mma_warp_id * self.threads_per_warp,
-                    ),
-                )
-                self._timeline_tag(
-                    debug_timing, 2, 0, 1, batch_idx, head_idx, tidx,
-                    self.mma_warp_id * self.threads_per_warp,
-                )
-
-                # Main loop: chunks 1..num_chunks_b-1 with previous state.
-                for chunk_idx in cutlass.range(1, num_chunks_b):  # noqa: B007
-                    self._timeline_tag(
-                        debug_timing, 2, chunk_idx, 0, batch_idx, head_idx, tidx,
-                        self.mma_warp_id * self.threads_per_warp,
-                    )
+                # Skip zero-length packed sequences (no chunk, no pipeline traffic).
+                if num_chunks_b > 0:
+                    # First chunk: no previous state (S_prev = 0), skip GEMMs 3/4.
+                    chunk_offset = batch_start
                     (
                         shared_acc_producer,
                         q_state_acc_producer,
@@ -2074,21 +1444,46 @@ class GatedDeltaNetChunkedKernel:
                             state_inp_ready_consumer,
                             shared_inp_ready_consumer,
                         ),
-                        (False,),
+                        (True,),
+                    )
+
+                    # Main loop: chunks 1..num_chunks_b-1 with previous state.
+                    for chunk_idx in cutlass.range(1, num_chunks_b):  # noqa: B007
                         (
-                            debug_timing,
-                            cutlass.Int32(2),
-                            chunk_idx,
-                            batch_idx,
-                            head_idx,
-                            tidx,
-                            self.mma_warp_id * self.threads_per_warp,
-                        ),
-                    )
-                    self._timeline_tag(
-                        debug_timing, 2, chunk_idx, 1, batch_idx, head_idx, tidx,
-                        self.mma_warp_id * self.threads_per_warp,
-                    )
+                            shared_acc_producer,
+                            q_state_acc_producer,
+                            kv_acc_producer,
+                            load_k_consumer,
+                            load_q_consumer,
+                            load_v_consumer,
+                            a_inv_ready_consumer,
+                            qk_ready_consumer,
+                            state_inp_ready_consumer,
+                            shared_inp_ready_consumer,
+                        ) = self.mma_warp(
+                            tmem_ptr,
+                            (
+                                tiled_mma_qk,
+                                tiled_mma_qs,
+                                tiled_mma_qkv,
+                                tiled_mma_qkv_ss,
+                                tiled_mma_kv,
+                            ),
+                            (sQ, sK, sK_trans, sV, sAinv, sQk),
+                            (
+                                shared_acc_producer,
+                                q_state_acc_producer,
+                                kv_acc_producer,
+                                load_k_consumer,
+                                load_q_consumer,
+                                load_v_consumer,
+                                a_inv_ready_consumer,
+                                qk_ready_consumer,
+                                state_inp_ready_consumer,
+                                shared_inp_ready_consumer,
+                            ),
+                            (False,),
+                        )
 
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
@@ -2118,14 +1513,6 @@ class GatedDeltaNetChunkedKernel:
                 tensormap_manager.init_tensormap_from_atom(
                     tma_v.atom, tensormap_v_ptr, self.tma_qkv_warp_id
                 )
-                if cutlass.const_expr(self.store_w):
-                    tensormap_manager.init_tensormap_from_atom(
-                        tma_w.atom, tensormap_w_ptr, self.tma_qkv_warp_id
-                    )
-                if cutlass.const_expr(self.use_input_A):
-                    tensormap_manager.init_tensormap_from_atom(
-                        tma_A.atom, tensormap_A_ptr, self.tma_qkv_warp_id
-                    )
                 tensormap_manager.fence_tensormap_initialization()
 
             while work.is_valid_tile:
@@ -2165,62 +1552,22 @@ class GatedDeltaNetChunkedKernel:
                     self.tma_qkv_warp_id,
                     (None, None, None),
                 )
-                if cutlass.const_expr(self.store_w):
-                    assert mW is not None, "mW must be provided when store_w is True"
-                    bounded_w = cute.make_tensor(
-                        mW.iterator,
-                        cute.make_layout(
-                            (mW.shape[0], batch_end, mW.shape[2]),
-                            stride=(mW.stride[0], mW.stride[1], mW.stride[2]),
-                        ),
-                    )
-                    tensormap_manager.update_tensormap(
-                        (bounded_w,),
-                        (tma_w.atom,),
-                        (tensormap_w_ptr,),
-                        self.tma_qkv_warp_id,
-                        (None,),
-                    )
-                if cutlass.const_expr(self.use_input_A):
-                    assert mA_in is not None, "mA_in must be provided when use_input_A is True"
-                    bounded_A = cute.make_tensor(
-                        mA_in.iterator,
-                        cute.make_layout(
-                            (batch_end, mA_in.shape[1], mA_in.shape[2]),
-                            stride=(mA_in.stride[0], mA_in.stride[1], mA_in.stride[2]),
-                        ),
-                    )
-                    tensormap_manager.update_tensormap(
-                        (bounded_A,),
-                        (tma_A.atom,),
-                        (tensormap_A_ptr,),
-                        self.tma_qkv_warp_id,
-                        (None,),
-                    )
 
                 for chunk_idx in cutlass.range(num_chunks_b):
                     chunk_offset = batch_start + chunk_idx * self.b_t
-                    self._timeline_tag(
-                        debug_timing, 3, chunk_idx, 0, batch_idx, head_idx, tidx,
-                        self.tma_qkv_warp_id * self.threads_per_warp,
-                    )
                     (
                         load_q_producer,
                         load_k_producer,
                         load_v_producer,
-                        load_w_producer,
-                        load_A_producer,
                     ) = (
                         self.tma_qkv_warp(
-                            (tiled_mma_qk, tiled_mma_qkv, tiled_mma_qkv_ss, tiled_mma_kv),
-                            (tma_q, tma_k, tma_v, tma_w, tma_A),
-                            (sQ, sK, sV, sW, sAinput),
+                            (tiled_mma_qk, tiled_mma_qkv_ss),
+                            (tma_q, tma_k, tma_v),
+                            (sQ, sK, sV),
                             (
                                 load_q_producer,
                                 load_k_producer,
                                 load_v_producer,
-                                load_w_producer,
-                                load_A_producer,
                             ),
                             (chunk_offset, chunk_idx, batch_idx, head_idx),
                             (
@@ -2228,23 +1575,8 @@ class GatedDeltaNetChunkedKernel:
                                 tensormap_q_ptr,
                                 tensormap_k_ptr,
                                 tensormap_v_ptr,
-                                tensormap_w_ptr,
-                                tensormap_A_ptr,
-                            ),
-                            (
-                                debug_timing,
-                                cutlass.Int32(3),
-                                chunk_idx,
-                                batch_idx,
-                                head_idx,
-                                tidx,
-                                self.tma_qkv_warp_id * self.threads_per_warp,
                             ),
                         )
-                    )
-                    self._timeline_tag(
-                        debug_timing, 3, chunk_idx, 1, batch_idx, head_idx, tidx,
-                        self.tma_qkv_warp_id * self.threads_per_warp,
                     )
 
                 scheduler.advance_to_next_work()
@@ -2253,10 +1585,6 @@ class GatedDeltaNetChunkedKernel:
             load_q_producer.tail()
             load_k_producer.tail()
             load_v_producer.tail()
-            if cutlass.const_expr(self.store_w):
-                load_w_producer.tail()
-            if cutlass.const_expr(self.use_input_A):
-                load_A_producer.tail()
 
         # ==============================================================
         # GATE/BETA LOAD WARP (warp 10)
@@ -2273,64 +1601,32 @@ class GatedDeltaNetChunkedKernel:
                 seqlen_b = cu_seqlens[batch_idx + 1] - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
                 batch_end = batch_start + seqlen_b
-                # Full tiles (all but the last): unconditional loads
-                for chunk_idx in cutlass.range(num_chunks_b - 1):
-                    chunk_offset = batch_start + chunk_idx * self.b_t
-                    self._timeline_tag(
-                        debug_timing, 4, chunk_idx, 0, batch_idx, head_idx, tidx,
-                        self.load_gate_beta_warp_id * self.threads_per_warp,
-                    )
+                # Zero-length packed sequences (trailing fixed-capacity cu_seqlens entries) own no
+                # chunk; every warp role must skip them consistently to keep the pipelines aligned.
+                if num_chunks_b > 0:
+                    # Full tiles (all but the last): unconditional loads
+                    for chunk_idx in cutlass.range(num_chunks_b - 1):
+                        chunk_offset = batch_start + chunk_idx * self.b_t
+                        load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
+                            tidx,
+                            (mGate, mBeta, mGateOut),
+                            (sCumsumlog, sCumprod, sBeta),
+                            (load_gate_producer, load_beta_producer),
+                            (chunk_offset, head_idx, False, batch_end),
+                        )
+                    # Last tile: is_last_tile=True, the valid-token predicate is derived inside
                     load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
                         tidx,
                         (mGate, mBeta, mGateOut),
                         (sCumsumlog, sCumprod, sBeta),
                         (load_gate_producer, load_beta_producer),
-                        (chunk_offset, head_idx, False, batch_end),
                         (
-                            debug_timing,
-                            cutlass.Int32(4),
-                            chunk_idx,
-                            batch_idx,
+                            batch_start + (num_chunks_b - 1) * self.b_t,
                             head_idx,
-                            tidx,
-                            self.load_gate_beta_warp_id * self.threads_per_warp,
+                            True,
+                            batch_end,
                         ),
                     )
-                    self._timeline_tag(
-                        debug_timing, 4, chunk_idx, 1, batch_idx, head_idx, tidx,
-                        self.load_gate_beta_warp_id * self.threads_per_warp,
-                    )
-                # Last tile: is_last_tile=True, valid_tokens derived inside
-                chunk_idx = num_chunks_b - 1
-                self._timeline_tag(
-                    debug_timing, 4, chunk_idx, 0, batch_idx, head_idx, tidx,
-                    self.load_gate_beta_warp_id * self.threads_per_warp,
-                )
-                load_gate_producer, load_beta_producer = self.load_gate_beta_warp(
-                    tidx,
-                    (mGate, mBeta, mGateOut),
-                    (sCumsumlog, sCumprod, sBeta),
-                    (load_gate_producer, load_beta_producer),
-                    (
-                        batch_start + (num_chunks_b - 1) * self.b_t,
-                        head_idx,
-                        True,
-                        batch_end,
-                    ),
-                    (
-                        debug_timing,
-                        cutlass.Int32(4),
-                        chunk_idx,
-                        batch_idx,
-                        head_idx,
-                        tidx,
-                        self.load_gate_beta_warp_id * self.threads_per_warp,
-                    ),
-                )
-                self._timeline_tag(
-                    debug_timing, 4, chunk_idx, 1, batch_idx, head_idx, tidx,
-                    self.load_gate_beta_warp_id * self.threads_per_warp,
-                )
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
             load_gate_producer.tail()
@@ -2347,30 +1643,16 @@ class GatedDeltaNetChunkedKernel:
 
             # All epilogue descriptors are updated per packed-varlen work tile.
             if work.is_valid_tile:
-                if cutlass.const_expr(not self.drop_output_store_only):
-                    tensormap_manager.init_tensormap_from_atom(
-                        tma_o.atom, tensormap_o_ptr, self.epilogue_warp_id
-                    )
-                if cutlass.const_expr(self.store_v_new):
-                    tensormap_manager.init_tensormap_from_atom(
-                        tma_v_new_out.atom,
-                        tensormap_v_new_out_ptr,
-                        self.epilogue_warp_id,
-                    )
-                if cutlass.const_expr(self.store_w):
-                    tensormap_manager.init_tensormap_from_atom(
-                        tma_w_out.atom, tensormap_w_out_ptr, self.epilogue_warp_id
-                    )
+                tensormap_manager.init_tensormap_from_atom(
+                    tma_o.atom, tensormap_o_ptr, self.epilogue_warp_id
+                )
                 if cutlass.const_expr(self.use_bf16_h_tma):
                     tensormap_manager.init_tensormap_from_atom(
                         tma_h_out.atom,
                         tensormap_h_out_ptr,
                         self.epilogue_warp_id,
                     )
-                if cutlass.const_expr(
-                    not self.drop_output_store_only or self.store_v_new or self.store_w or self.use_bf16_h_tma
-                ):
-                    tensormap_manager.fence_tensormap_initialization()
+                tensormap_manager.fence_tensormap_initialization()
 
             while work.is_valid_tile:
                 batch_idx, head_idx, _ = work.tile_idx
@@ -2379,73 +1661,25 @@ class GatedDeltaNetChunkedKernel:
                 seqlen_b = batch_end - batch_start
                 num_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
 
-                if cutlass.const_expr(not self.drop_output_store_only):
-                    # Build bounded O tensor: token dim capped to batch_end
-                    bounded_o = cute.make_tensor(
-                        mO.iterator,
-                        cute.make_layout(
-                            (mO.shape[0], batch_end, mO.shape[2]),
-                            stride=(mO.stride[0], mO.stride[1], mO.stride[2]),
-                        ),
-                    )
+                # Build bounded O tensor: token dim capped to batch_end
+                bounded_o = cute.make_tensor(
+                    mO.iterator,
+                    cute.make_layout(
+                        (mO.shape[0], batch_end, mO.shape[2]),
+                        stride=(mO.stride[0], mO.stride[1], mO.stride[2]),
+                    ),
+                )
 
-                    # Update O descriptor independently
-                    tensormap_manager.update_tensormap(
-                        (bounded_o,),
-                        (tma_o.atom,),
-                        (tensormap_o_ptr,),
-                        self.epilogue_warp_id,
-                        (None,),
-                    )
-                    tensormap_manager.fence_tensormap_update(tensormap_o_ptr)
+                # Update O descriptor independently
+                tensormap_manager.update_tensormap(
+                    (bounded_o,),
+                    (tma_o.atom,),
+                    (tensormap_o_ptr,),
+                    self.epilogue_warp_id,
+                    (None,),
+                )
+                tensormap_manager.fence_tensormap_update(tensormap_o_ptr)
 
-                if cutlass.const_expr(self.store_v_new):
-                    assert mVNew_out is not None
-                    bounded_v_new_out = cute.make_tensor(
-                        mVNew_out.iterator,
-                        cute.make_layout(
-                            (
-                                mVNew_out.shape[0],
-                                batch_end,
-                                mVNew_out.shape[2],
-                            ),
-                            stride=(
-                                mVNew_out.stride[0],
-                                mVNew_out.stride[1],
-                                mVNew_out.stride[2],
-                            ),
-                        ),
-                    )
-                    tensormap_manager.update_tensormap(
-                        (bounded_v_new_out,),
-                        (tma_v_new_out.atom,),
-                        (tensormap_v_new_out_ptr,),
-                        self.epilogue_warp_id,
-                        (None,),
-                    )
-                    tensormap_manager.fence_tensormap_update(tensormap_v_new_out_ptr)
-
-                if cutlass.const_expr(self.store_w):
-                    assert mW_out is not None
-                    bounded_w_out = cute.make_tensor(
-                        mW_out.iterator,
-                        cute.make_layout(
-                            (mW_out.shape[0], batch_end, mW_out.shape[2]),
-                            stride=(
-                                mW_out.stride[0],
-                                mW_out.stride[1],
-                                mW_out.stride[2],
-                            ),
-                        ),
-                    )
-                    tensormap_manager.update_tensormap(
-                        (bounded_w_out,),
-                        (tma_w_out.atom,),
-                        (tensormap_w_out_ptr,),
-                        self.epilogue_warp_id,
-                        (None,),
-                    )
-                    tensormap_manager.fence_tensormap_update(tensormap_w_out_ptr)
                 if cutlass.const_expr(self.use_bf16_h_tma):
                     assert mH_tma_out is not None
                     tensormap_manager.update_tensormap(
@@ -2459,71 +1693,26 @@ class GatedDeltaNetChunkedKernel:
 
                 for chunk_idx in cutlass.range(num_chunks_b):
                     chunk_offset = batch_start + chunk_idx * self.b_t
-                    self._timeline_tag(
-                        debug_timing, 5, chunk_idx, 0, batch_idx, head_idx, tidx,
-                        self.epilogue_warp_id * self.threads_per_warp,
-                    )
                     if cutlass.const_expr(self.use_bf16_h_tma):
-                        h_checkpoint_idx = (
-                            cu_checkpoints[batch_idx]
-                            + (chunk_idx * self.b_t) // checkpoint_every_n_tokens
-                        )
-                        side_output_store_consumer = self.output_h_tma_warp(
+                        # One saved h slot per 64-token chunk (output_h requires
+                        # checkpoint_every_n_tokens == b_t, enforced by the wrapper).
+                        h_checkpoint_idx = cu_checkpoints[batch_idx] + chunk_idx
+                        h_store_consumer = self.output_h_tma_warp(
                             (sH,),
                             (tma_h_out,),
-                            (side_output_store_consumer,),
+                            (h_store_consumer,),
                             (head_idx, h_checkpoint_idx),
                             (
                                 tensormap_manager,
                                 tensormap_h_out_ptr,
                             ),
-                            (),
                         )
-                    if cutlass.const_expr(self.store_v_new or self.store_w):
-                        side_output_store_consumer = self.side_output_tma_warp(
-                            (sSideOutput,),
-                            (tma_v_new_out, tma_w_out),
-                            (side_output_store_consumer,),
-                            (head_idx, chunk_offset),
-                            (
-                                tensormap_manager,
-                                tensormap_v_new_out_ptr,
-                                tensormap_w_out_ptr,
-                            ),
-                            (),
-                        )
-                    if cutlass.const_expr(not self.drop_output_store_only):
-                        o_store_consumer = self.epilogue_warp(
-                            (sO,),
-                            (tma_o,),
-                            (o_store_consumer,),
-                            (head_idx, chunk_offset),
-                            (tensormap_manager, tensormap_o_ptr),
-                            (
-                                debug_timing,
-                                cutlass.Int32(5),
-                                chunk_idx,
-                                batch_idx,
-                                head_idx,
-                                tidx,
-                                self.epilogue_warp_id * self.threads_per_warp,
-                            ),
-                        )
-                    else:
-                        # Consume O readiness without materializing the forward output.
-                        self._timeline_tag(
-                            debug_timing, 5, chunk_idx, 2, batch_idx, head_idx, tidx,
-                            self.epilogue_warp_id * self.threads_per_warp,
-                        )
-                        o_handle = o_store_consumer.wait_and_advance()
-                        self._timeline_tag(
-                            debug_timing, 5, chunk_idx, 3, batch_idx, head_idx, tidx,
-                            self.epilogue_warp_id * self.threads_per_warp,
-                        )
-                        o_handle.release()
-                    self._timeline_tag(
-                        debug_timing, 5, chunk_idx, 1, batch_idx, head_idx, tidx,
-                        self.epilogue_warp_id * self.threads_per_warp,
+                    o_store_consumer = self.epilogue_warp(
+                        (sO,),
+                        (tma_o,),
+                        (o_store_consumer,),
+                        (head_idx, chunk_offset),
+                        (tensormap_manager, tensormap_o_ptr),
                     )
                 scheduler.advance_to_next_work()
                 work = scheduler.get_current_work()
@@ -2540,15 +1729,12 @@ class GatedDeltaNetChunkedKernel:
         pipeline_args: tuple,
         work_args: tuple,
         tensormap_args: tuple,
-        timeline_args: tuple,
     ) -> tuple[
         pipeline.PipelineProducer,
         pipeline.PipelineProducer,
         pipeline.PipelineProducer,
-        pipeline.PipelineProducer,
-        pipeline.PipelineProducer,
     ]:
-        """Warp 9: load Q, K, V, and the optional W RHS for the current chunk.
+        """Warp 9: load Q, K, and V for the current chunk.
 
         Pattern (following fmha.py / dense_gemm_persistent.py):
           1. domain_offset the TMA tensor to (chunk_offset, head_idx, 0) so that
@@ -2562,15 +1748,13 @@ class GatedDeltaNetChunkedKernel:
         For the hierarchical head layout (h_r, h_qv) with h_r having stride 0
         (broadcast), the flat index maps correctly as long as head_idx < h_qv.
         """
-        tiled_mma_qk, tiled_mma_qkv, tiled_mma_qkv_ss, tiled_mma_kv = mma_args
-        tma_q, tma_k, tma_v, tma_w, tma_A = tma_args
-        sQ, sK, sV, sW, sAinput = smem_args
+        tiled_mma_qk, tiled_mma_qkv_ss = mma_args
+        tma_q, tma_k, tma_v = tma_args
+        sQ, sK, sV = smem_args
         (
             load_q_producer,
             load_k_producer,
             load_v_producer,
-            load_w_producer,
-            load_A_producer,
         ) = pipeline_args
         chunk_offset, chunk_idx, batch_idx, head_idx = work_args
         (
@@ -2578,8 +1762,6 @@ class GatedDeltaNetChunkedKernel:
             tensormap_q_ptr,
             tensormap_k_ptr,
             tensormap_v_ptr,
-            tensormap_w_ptr,
-            tensormap_A_ptr,
         ) = tensormap_args
 
         # Single-CTA mode: no multicast, cta_v = 0.
@@ -2587,9 +1769,7 @@ class GatedDeltaNetChunkedKernel:
 
         # Per-thread MMA slices (cta_v=0 for ONE-CTA mode).
         thr_mma_qk = tiled_mma_qk.get_slice(0)
-        thr_mma_qkv = tiled_mma_qkv.get_slice(0)
         thr_mma_qkv_ss = tiled_mma_qkv_ss.get_slice(0)
-        thr_mma_kv = tiled_mma_kv.get_slice(0)  # noqa: F841
 
         # Tile shapes from the MMA tiler (128, 128, 128):
         #   mode[0,2] = (BT, DK) - M,K tile for A (Q) and for B (K) of tiled_mma_qk
@@ -2598,8 +1778,6 @@ class GatedDeltaNetChunkedKernel:
         qk_tile = cute.select(self.mma_tiler_qk, mode=[0, 2])
         # (DV, BT)
         v_tile = cute.select(self.mma_tiler_qkv, mode=[0, 2])
-        # (BT, BT)
-        ainv_tile = (self.b_t, self.b_t)
 
         # ------------------------------------------------------------------
         # K  (B operand of GEMM-kk / GEMM-qk, double-buffered)
@@ -2621,7 +1799,6 @@ class GatedDeltaNetChunkedKernel:
         )
 
         # Load K for the current chunk into the next available pipeline stage.
-        self._timeline_tag_from_args(timeline_args, 2)
         k_handle = load_k_producer.acquire_and_advance()
         if chunk_idx == 0:
             tensormap_manager.fence_tensormap_update(tensormap_k_ptr)
@@ -2636,68 +1813,34 @@ class GatedDeltaNetChunkedKernel:
             ),
         )
 
-        self._timeline_tag_from_args(timeline_args, 3)
+        # --------------------------------------------------------------
+        # Q  (A operand of GEMM-qk/O path, single-buffered)
+        # --------------------------------------------------------------
+        mQ = cute.domain_offset(
+            (chunk_offset, cutlass.Int32(0)), tma_q.tma_tensor[None, None, head_idx]
+        )
+        gQ = cute.flat_divide(mQ, qk_tile)
+        tCgQ = thr_mma_qk.partition_A(gQ)
+        tQsQ, tQgQ = cpasync.tma_partition(
+            tma_q.atom,
+            0,
+            cta_layout,
+            cute.group_modes(sQ, 0, 3),
+            cute.group_modes(tCgQ, 0, 3),
+        )
 
-        if cutlass.const_expr(self.use_input_A):
-            self._timeline_tag_from_args(timeline_args, 4)
-            mA = cute.domain_offset(
-                (chunk_offset, cutlass.Int32(0)), tma_A.tma_tensor[None, None, head_idx]
-            )
-            gA = cute.flat_divide(mA, ainv_tile)
-            tAsA, tAgA = cpasync.tma_partition(
-                tma_A.atom,
-                0,
-                cta_layout,
-                cute.group_modes(sAinput, 0, 2),
-                cute.group_modes(gA, 0, 2),
-            )
-            a_handle = load_A_producer.acquire_and_advance()
-            if chunk_idx == 0:
-                tensormap_manager.fence_tensormap_update(tensormap_A_ptr)
-            cute.copy(
-                tma_A.atom,
-                tAgA[(None, 0, 0)],
-                tAsA[(None, a_handle.index)],
-                tma_bar_ptr=a_handle.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_A_ptr, cute.AddressSpace.generic
-                ),
-            )
-
-            self._timeline_tag_from_args(timeline_args, 5)
-
-        if cutlass.const_expr(not self.drop_output_store_only):
-            # --------------------------------------------------------------
-            # Q  (A operand of GEMM-qk/O path, single-buffered)
-            # --------------------------------------------------------------
-            mQ = cute.domain_offset(
-                (chunk_offset, cutlass.Int32(0)), tma_q.tma_tensor[None, None, head_idx]
-            )
-            gQ = cute.flat_divide(mQ, qk_tile)
-            tCgQ = thr_mma_qk.partition_A(gQ)
-            tQsQ, tQgQ = cpasync.tma_partition(
-                tma_q.atom,
-                0,
-                cta_layout,
-                cute.group_modes(sQ, 0, 3),
-                cute.group_modes(tCgQ, 0, 3),
-            )
-
-            self._timeline_tag_from_args(timeline_args, 6)
-            q_handle = load_q_producer.acquire_and_advance()
-            if chunk_idx == 0:
-                tensormap_manager.fence_tensormap_update(tensormap_q_ptr)
-            cute.copy(
-                tma_q.atom,
-                tQgQ[(None, 0, 0)],
-                tQsQ[(None, q_handle.index)],
-                tma_bar_ptr=q_handle.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_q_ptr, cute.AddressSpace.generic
-                ),
-            )
-
-            self._timeline_tag_from_args(timeline_args, 7)
+        q_handle = load_q_producer.acquire_and_advance()
+        if chunk_idx == 0:
+            tensormap_manager.fence_tensormap_update(tensormap_q_ptr)
+        cute.copy(
+            tma_q.atom,
+            tQgQ[(None, 0, 0)],
+            tQsQ[(None, q_handle.index)],
+            tma_bar_ptr=q_handle.barrier,
+            tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
+                tensormap_q_ptr, cute.AddressSpace.generic
+            ),
+        )
 
         # ------------------------------------------------------------------
         # V  (B operand of GEMM-new_v / GEMM-qkv, single-buffered)
@@ -2715,7 +1858,6 @@ class GatedDeltaNetChunkedKernel:
             cute.group_modes(tCgV, 0, 3),
         )
 
-        self._timeline_tag_from_args(timeline_args, 8)
         v_handle = load_v_producer.acquire_and_advance()
         if chunk_idx == 0:
             tensormap_manager.fence_tensormap_update(tensormap_v_ptr)
@@ -2729,41 +1871,10 @@ class GatedDeltaNetChunkedKernel:
             ),
         )
 
-        self._timeline_tag_from_args(timeline_args, 9)
-
-        if cutlass.const_expr(self.store_w):
-            mW = cute.domain_offset(
-                (cutlass.Int32(0), chunk_offset),
-                tma_w.tma_tensor[None, None, head_idx],
-            )
-            gW = cute.flat_divide(mW, v_tile)
-            tCgW = thr_mma_qkv_ss.partition_A(gW)
-            tWsW, tWgW = cpasync.tma_partition(
-                tma_w.atom,
-                0,
-                cta_layout,
-                cute.group_modes(sW, 0, 3),
-                cute.group_modes(tCgW, 0, 3),
-            )
-            w_handle = load_w_producer.acquire_and_advance()
-            if chunk_idx == 0:
-                tensormap_manager.fence_tensormap_update(tensormap_w_ptr)
-            cute.copy(
-                tma_w.atom,
-                tWgW[(None, 0, 0)],
-                tWsW[(None, w_handle.index)],
-                tma_bar_ptr=w_handle.barrier,
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_w_ptr, cute.AddressSpace.generic
-                ),
-            )
-
         return (
             load_q_producer,
             load_k_producer,
             load_v_producer,
-            load_w_producer,
-            load_A_producer,
         )
 
     @cute.jit
@@ -2774,19 +1885,17 @@ class GatedDeltaNetChunkedKernel:
         smem_args: tuple,
         pipeline_args: tuple,
         work_args: tuple,
-        timeline_args: tuple,
     ) -> tuple[pipeline.PipelineProducer, pipeline.PipelineProducer]:
         """Warp 10: load gate[BT] and beta[BT] for the current chunk.
 
-        Gate is loaded via ldg (sync G->R), converted to chunk-local cumulative
-        log2 in registers, then stored to sCumsumlog SMEM (stride-32 layout
-        matching compute_group_0 reads). If gate_is_log_cumsum=True, gate is
-        already chunk-local cumulative log2 and the conversion is skipped.
+        Gate is loaded via ldg (sync G->R) as raw Megatron log-decay, converted
+        to chunk-local cumulative log2 in registers, then stored to sCumsumlog
+        SMEM (stride-32 layout matching compute_group_0 reads).
 
         Beta is loaded via ldgsts (async G->S, cp.async) into sBeta SMEM.
 
-        The last tile uses predicated copies: elements with linear index >= valid_tokens
-        are out-of-bounds and receive neutral values (gate=1 -> ln=0, beta=0).
+        The last tile uses predicated copies: elements at token index >= batch_end
+        are out-of-bounds and receive neutral values (log-decay gate = 0, beta = 0).
 
         Thread tidx (lane 0..31) owns positions tidx, tidx+32, tidx+64, tidx+96.
         """
@@ -2856,7 +1965,6 @@ class GatedDeltaNetChunkedKernel:
         tBgBeta = thr_copy_beta_g2s.partition_S(gBeta)
         tBsBeta = thr_copy_beta_g2s.partition_D(sBeta)
 
-        self._timeline_tag_from_args(timeline_args, 2)
         gate_handle = load_gate_producer.acquire_and_advance()
 
         rGate = cute.make_rmem_tensor_like(tGgGate, self.acc_dtype)
@@ -2866,7 +1974,6 @@ class GatedDeltaNetChunkedKernel:
 
         # --- Predicate (last tile only): compute once, reuse for gate and beta ---
         if cutlass.const_expr(is_last_tile):
-            valid_tokens = batch_end  # noqa: F841
             tGcGate = thr_copy_gate_g2r.partition_S(cGate)
             tGpGate = cute.make_rmem_tensor(
                 ((tGcGate.shape[0][1],), tGcGate.shape[1]), cutlass.Boolean
@@ -2876,46 +1983,30 @@ class GatedDeltaNetChunkedKernel:
 
         # --- Gate load ---
         if cutlass.const_expr(is_last_tile):
-            if cutlass.const_expr(self.gate_is_log_cumsum):
-                if cutlass.const_expr(self.enable_varlen_tail):
-                    # Extend the last valid cumulative value across padded rows.
-                    tGrGate.fill(mGateHead[batch_end - 1])
-                else:
-                    tGrGate.fill(0.0)
-            else:
-                if cutlass.const_expr(self.gate_is_log_decay):
-                    # OOB neutral for raw Megatron log-decay: 0.0 contributes no decay.
-                    tGrGate.fill(0.0)
-                else:
-                    # OOB neutral: 1.0 -> log2 ~= 0.0 (no decay contribution).
-                    tGrGate.fill(1.0)
+            # OOB neutral for raw Megatron log-decay: 0.0 contributes no decay.
+            tGrGate.fill(0.0)
             cute.copy(tiled_copy_gate_g2r, tGgGate, tGrGate, pred=tGpGate)
         else:
             cute.copy(tiled_copy_gate_g2r, tGgGate, tGrGate)
 
-        # --- Convert gate to chunk-local cumulative log2 if needed ---
-        if not cutlass.const_expr(self.gate_is_log_cumsum):
-            for i in range(cute.size(tGrGate)):
-                if cutlass.const_expr(self.gate_is_log_decay):
-                    tGrGate[i] = tGrGate[i] * 1.4426950408889634
-                else:
-                    tGrGate[i] = cute.math.log2(tGrGate[i] + 1e-10, fastmath=True)
-            for offset in [1, 2, 4, 8, 16]:
-                for col in range(cute.size(tGrGate)):
-                    n = cute.arch.shuffle_sync_up(
-                        tGrGate[col], offset, mask=0xFFFFFFFF, mask_and_clamp=0
-                    )
-                    if lidx >= offset:
-                        tGrGate[col] = tGrGate[col] + n
-            sum_v = 0.0  # noqa: F841
-            for col in range(1, cute.size(tGrGate)):
-                last_v = cute.arch.shuffle_sync(
-                    tGrGate[col - 1],
-                    self.threads_per_warp - 1,
-                    mask=0xFFFFFFFF,
-                    mask_and_clamp=self.threads_per_warp - 1,
+        # --- Convert the raw log-decay gate to chunk-local cumulative log2 ---
+        for i in range(cute.size(tGrGate)):
+            tGrGate[i] = tGrGate[i] * 1.4426950408889634
+        for offset in [1, 2, 4, 8, 16]:
+            for col in range(cute.size(tGrGate)):
+                n = cute.arch.shuffle_sync_up(
+                    tGrGate[col], offset, mask=0xFFFFFFFF, mask_and_clamp=0
                 )
-                tGrGate[col] += last_v
+                if lidx >= offset:
+                    tGrGate[col] = tGrGate[col] + n
+        for col in range(1, cute.size(tGrGate)):
+            last_v = cute.arch.shuffle_sync(
+                tGrGate[col - 1],
+                self.threads_per_warp - 1,
+                mask=0xFFFFFFFF,
+                mask_and_clamp=self.threads_per_warp - 1,
+            )
+            tGrGate[col] += last_v
         if cutlass.const_expr(self.store_g):
             assert tGgGateOut is not None, "tGgGateOut must be available when store_g is True"
             if cutlass.const_expr(is_last_tile):
@@ -2934,10 +2025,8 @@ class GatedDeltaNetChunkedKernel:
         )
 
         gate_handle.commit()
-        self._timeline_tag_from_args(timeline_args, 3)
 
         # --- Beta load ---
-        self._timeline_tag_from_args(timeline_args, 4)
         beta_handle = load_beta_producer.acquire_and_advance()
         if cutlass.const_expr(is_last_tile):
             # clear OOB slots before predicated cp.async
@@ -2953,7 +2042,6 @@ class GatedDeltaNetChunkedKernel:
                 tiled_copy_beta_g2s, tBgBeta, tBsBeta[None, None, 0, beta_handle.index]
             )
         beta_handle.commit()
-        self._timeline_tag_from_args(timeline_args, 5)
 
         return load_gate_producer, load_beta_producer
 
@@ -2965,7 +2053,6 @@ class GatedDeltaNetChunkedKernel:
         smem_args: tuple,
         pipeline_args: tuple,
         work_args: tuple,
-        timeline_args: tuple,
     ) -> tuple[
         pipeline.PipelineProducer,
         pipeline.PipelineProducer,
@@ -3098,58 +2185,45 @@ class GatedDeltaNetChunkedKernel:
 
         # ---- GEMM 1: kk  (K @ K^T -> shared acc) ----------------------------
         # Both A and B are K; valid because tiled_mma_qk has K-major for both operands.
-        self._timeline_tag_from_args(timeline_args, 2)
         k_handle = load_k_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 3)
         kk_handle = shared_acc_producer.acquire_and_advance()
 
         num_kphases = cute.size(tCrK_A, mode=[2])
-        if cutlass.const_expr(not self.use_input_A):
-            for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qk,
-                    tCtShared[None, None, None, kk_handle.index],
-                    tCrK_A[None, None, kphase_idx, k_handle.index],
-                    tCrK_B[None, None, kphase_idx, k_handle.index],
-                    tCtShared[None, None, None, kk_handle.index],
-                )
+        for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
+            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
+            cute.gemm(
+                tiled_mma_qk,
+                tCtShared[None, None, None, kk_handle.index],
+                tCrK_A[None, None, kphase_idx, k_handle.index],
+                tCrK_B[None, None, kphase_idx, k_handle.index],
+                tCtShared[None, None, None, kk_handle.index],
+            )
 
-        # Signal W_kk ready -> CG0 kk_epi, or a dummy token when saved A is used.
+        # Signal W_kk ready -> CG0 kk_epi.
         kk_handle.commit()
 
-        # In drop-output mode Q no longer feeds qk/GEMM4 math. Skip qk compute
-        # and the Q TMA producer/consumer path while preserving shared_acc order.
-        if cutlass.const_expr(not self.drop_output_store_only):
-            self._timeline_tag_from_args(timeline_args, 4)
-            q_handle = load_q_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 5)
-            qk_handle = shared_acc_producer.acquire_and_advance()
+        # ---- GEMM 2: qk  (Q @ K^T -> shared acc) ----------------------------
+        q_handle = load_q_consumer.wait_and_advance()
+        qk_handle = shared_acc_producer.acquire_and_advance()
 
-            for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qk,
-                    tCtShared[None, None, None, qk_handle.index],
-                    tCrQ_A[None, None, kphase_idx, q_handle.index],
-                    tCrK_B[None, None, kphase_idx, k_handle.index],
-                    tCtShared[None, None, None, qk_handle.index],
-                )
+        for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
+            tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
+            cute.gemm(
+                tiled_mma_qk,
+                tCtShared[None, None, None, qk_handle.index],
+                tCrQ_A[None, None, kphase_idx, q_handle.index],
+                tCrK_B[None, None, kphase_idx, k_handle.index],
+                tCtShared[None, None, None, qk_handle.index],
+            )
 
-            # Signal W_qk ready -> CG0 qk_epi
-            qk_handle.commit()
-        else:
-            # Keep the shared_acc barrier token that GEMM 2 used in the full forward path.
-            qk_handle = shared_acc_producer.acquire_and_advance()
-            qk_handle.commit()
+        # Signal W_qk ready -> CG0 qk_epi
+        qk_handle.commit()
 
         # ---- GEMM 3: k*state  (K @ S_prev -> shared acc) --------------------
         # ---- GEMM 4: q*state  (Q @ S_prev -> tmem_q_state) ------------------
         # Skipped on the first chunk when use_initial_state is False (S_prev = 0, outputs are zero).
         if valid_state:
-            self._timeline_tag_from_args(timeline_args, 6)
             s_handle = state_inp_ready_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 7)
             ks_handle = shared_acc_producer.acquire_and_advance()
 
             num_kphases_qs = cute.size(tCrS_A, mode=[2])
@@ -3164,39 +2238,28 @@ class GatedDeltaNetChunkedKernel:
                 )
             ks_handle.commit()
 
-            if cutlass.const_expr(not self.drop_output_store_only):
-                q_state_acc_handle = q_state_acc_producer.acquire_and_advance()
-                # S_prev still loaded (same s_handle.index as GEMM 3).
-                num_kphases_qs = cute.size(tCrS_A, mode=[2])
-                for kphase_idx in cutlass.range(num_kphases_qs, unroll_full=True):
-                    tiled_mma_qs.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                    cute.gemm(
-                        tiled_mma_qs,
-                        tCtQState[None, None, None, q_state_acc_handle.index],
-                        tCrS_A[None, None, kphase_idx, s_handle.index],
-                        tCrQ_B_qs[None, None, kphase_idx, q_handle.index],
-                        tCtQState[None, None, None, q_state_acc_handle.index],
-                    )
-                q_state_acc_handle.commit()
-            else:
-                # Preserve the q_state_acc barrier token that GEMM 4 used in full forward.
-                q_state_acc_handle = q_state_acc_producer.acquire_and_advance()
-                q_state_acc_handle.commit()
-            # Release state SMEM (S_prev fully consumed by training path GEMM 3;
-            # full forward additionally consumed it in GEMM 4 above).
+            q_state_acc_handle = q_state_acc_producer.acquire_and_advance()
+            # S_prev still loaded (same s_handle.index as GEMM 3).
+            num_kphases_qs = cute.size(tCrS_A, mode=[2])
+            for kphase_idx in cutlass.range(num_kphases_qs, unroll_full=True):
+                tiled_mma_qs.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
+                cute.gemm(
+                    tiled_mma_qs,
+                    tCtQState[None, None, None, q_state_acc_handle.index],
+                    tCrS_A[None, None, kphase_idx, s_handle.index],
+                    tCrQ_B_qs[None, None, kphase_idx, q_handle.index],
+                    tCtQState[None, None, None, q_state_acc_handle.index],
+                )
+            q_state_acc_handle.commit()
+            # Release the S_prev input slot (fully consumed by GEMMs 3 and 4 above).
             s_handle.release()
 
-        if cutlass.const_expr(not self.drop_output_store_only):
-            q_handle.release()
+        q_handle.release()
 
         # ---- GEMM 5: new_v  (A_inv @ (V-KS) -> shared acc) ------------------
         # A_inv from CG0 (a_inv_ready); V-KS from CG1 (v_ks_ready, stored in sV).
-        self._timeline_tag_from_args(timeline_args, 8)
         vks_handle = shared_inp_ready_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 9)
-        self._timeline_tag_from_args(timeline_args, 10)
         ainv_handle = a_inv_ready_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 11)
         nv_handle = shared_acc_producer.acquire_and_advance()
 
         num_kphases_qkv = cute.size(tCrAinv_B, mode=[2])
@@ -3214,60 +2277,30 @@ class GatedDeltaNetChunkedKernel:
         nv_handle.commit()
         vks_handle.release()
 
-        # Optional training side output: W = A_beta @ (K * cumprod).
-        # CG1 stages K*cumprod in the shared-input TMEM pipeline. Reuse the same
-        # A_beta SMEM tile before releasing it to avoid a second forward replay.
-        if cutlass.const_expr(self.store_w):
-            self._timeline_tag_from_args(timeline_args, 12)
-            wks_handle = shared_inp_ready_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 13)
-            w_handle = shared_acc_producer.acquire_and_advance()
-            for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
-                tiled_mma_qkv.set(tcgen05.Field.ACCUMULATE, kphase_idx != 0)
-                cute.gemm(
-                    tiled_mma_qkv,
-                    tCtShared[None, None, None, w_handle.index],
-                    tCrQkv_A[None, None, kphase_idx, wks_handle.index],
-                    tCrAinv_B[None, None, kphase_idx, ainv_handle.index],
-                    tCtShared[None, None, None, w_handle.index],
-                )
-            w_handle.commit()
-            wks_handle.release()
-
         ainv_handle.release()
 
-        if cutlass.const_expr(not self.training_side_outputs_only):
-            # ---- GEMM 6: qkv  (W_qkv @ NV -> q * state acc) ------------------
-            # W_qkv from CG0 (qk_ready, stored in sQk); NV from CG1 (new_v_ready, stored in sNv).
-            self._timeline_tag_from_args(timeline_args, 14)
-            qkv_qk_handle = qk_ready_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 15)
-            self._timeline_tag_from_args(timeline_args, 16)
-            qkv_nv_handle = shared_inp_ready_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 17)
-            q_state_acc_handle = q_state_acc_producer.acquire_and_advance()
+        # ---- GEMM 6: qkv  (W_qkv @ NV -> q * state acc) ------------------
+        # W_qkv from CG0 (qk_ready, stored in sQk); NV from CG1 (new_v_ready, stored in sNv).
+        qkv_qk_handle = qk_ready_consumer.wait_and_advance()
+        qkv_nv_handle = shared_inp_ready_consumer.wait_and_advance()
+        q_state_acc_handle = q_state_acc_producer.acquire_and_advance()
 
-            if cutlass.const_expr(not self.drop_output_store_only):
-                num_kphases_qkv = cute.size(tCrQkv_A, mode=[2])
-                for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
-                    tiled_mma_qkv.set(
-                        tcgen05.Field.ACCUMULATE, valid_state or (kphase_idx != 0)
-                    )
-                    cute.gemm(
-                        tiled_mma_qkv,
-                        tCtQState[None, None, None, q_state_acc_handle.index],
-                        tCrQkv_A[None, None, kphase_idx, qkv_nv_handle.index],
-                        tCrNv_B[None, None, kphase_idx, qkv_qk_handle.index],
-                        tCtQState[None, None, None, q_state_acc_handle.index],
-                    )
+        num_kphases_qkv = cute.size(tCrQkv_A, mode=[2])
+        for kphase_idx in cutlass.range(num_kphases_qkv, unroll_full=True):
+            tiled_mma_qkv.set(
+                tcgen05.Field.ACCUMULATE, valid_state or (kphase_idx != 0)
+            )
+            cute.gemm(
+                tiled_mma_qkv,
+                tCtQState[None, None, None, q_state_acc_handle.index],
+                tCrQkv_A[None, None, kphase_idx, qkv_nv_handle.index],
+                tCrNv_B[None, None, kphase_idx, qkv_qk_handle.index],
+                tCtQState[None, None, None, q_state_acc_handle.index],
+            )
 
-            qkv_qk_handle.release()
-            qkv_nv_handle.release()
-            q_state_acc_handle.commit()
-        else:
-            # Preserve the q_state_acc/shared_inp slots that GEMM 6 used in full forward.
-            q_state_acc_producer.advance()
-            shared_inp_ready_consumer.advance()
+        qkv_qk_handle.release()
+        qkv_nv_handle.release()
+        q_state_acc_handle.commit()
 
         # ---- GEMM 7: kv_update  (K^T @ delta -> state TMEM) ---------------------
         # delta from CG1 (decay_v_ready, stored in sDecayV); K^T reuses k_handle slot.
@@ -3275,9 +2308,7 @@ class GatedDeltaNetChunkedKernel:
         if cutlass.const_expr(self.use_initial_state and is_first_chunk):
             kv_acc_producer.advance()
         kv_acc_handle = kv_acc_producer.acquire_and_advance()
-        self._timeline_tag_from_args(timeline_args, 18)
         dv_handle = shared_inp_ready_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 19)
 
         num_kphases_kv = cute.size(tCrKt_B, mode=[2])
         for kphase_idx in cutlass.range(num_kphases_kv, unroll_full=True):
@@ -3317,9 +2348,7 @@ class GatedDeltaNetChunkedKernel:
         smem_args: tuple,
         pipeline_args: tuple,
         work_args: tuple,
-        timeline_args: tuple,
     ) -> tuple[
-        pipeline.PipelineConsumer,
         pipeline.PipelineConsumer,
         pipeline.PipelineConsumer,
         pipeline.PipelineConsumer,
@@ -3329,19 +2358,16 @@ class GatedDeltaNetChunkedKernel:
     ]:
         """Warps 0-3: T-pairwise, kk_epi, inverse, qk_epi."""
         (tiled_mma_qk,) = mma_args
-        sCumsumlog, sBeta, sAinv, sAinput, sQk = smem_args
+        sCumsumlog, sBeta, sAinv, sQk = smem_args
         (
             load_gate_consumer,
             load_beta_consumer,
-            load_A_consumer,
             shared_acc_consumer,
             a_inv_ready_producer,
             qk_ready_producer,
             group_order_producer,
         ) = pipeline_args
-        (mA_in, mA_out, head_idx, chunk_offset, is_first_chunk, batch_end) = (
-            work_args
-        )
+        (mA_out, head_idx, chunk_offset, is_first_chunk, batch_end) = work_args
 
         # ------------------------------------------------------------------
         # Preamble: per-thread ID within CG0 and TMEM copy setup
@@ -3421,45 +2447,40 @@ class GatedDeltaNetChunkedKernel:
         #   sCumsumlog before committing the gate pipeline handle, so CG0 can read
         #   the final cumsumlog values immediately after wait_and_advance().
         # ------------------------------------------------------------------
-        self._timeline_tag_from_args(timeline_args, 2)
         gate_handle = load_gate_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 3)
 
         # Pre-compute T[i,*] for all columns into registers BEFORE waiting for TMEM.
-        # This overlaps the 128 exp2f calls with the MMA warp's GEMMs so that
-        # kk_epi and qk_epi only need a register multiply - no SMEM reads in the
-        # hot loop.  Register cost: BT fp32 = 128 regs (live until after qk_epi).
+        # This overlaps the 32 exp2f calls per thread with the MMA warp's GEMMs so
+        # that kk_epi and qk_epi only need a register multiply - no SMEM reads in
+        # the hot loop.  Register cost: 32 fp32 regs (the (2, 16) tensor below,
+        # live until after qk_epi).
         #   tGrT[j] = exp2(cumsumlog[i] - cumsumlog[j])  for i >= j, else 0.0
         #   where i = cg0_tidx (this thread's row), j = k (col, compile-time).
-        if cutlass.const_expr(not self.use_input_A or not self.drop_output_store_only):
-            rCumsumlog = cute.make_rmem_tensor((2, 16), self.acc_dtype)
-            tGrCumsumlog = thr_shared_t2r.partition_D(rCumsumlog)
-            for k in cutlass.range_constexpr(cute.size(tTR_tScS)):
-                coord = tTR_tScS[k]
-                tGrCumsumlog[k] = (
-                    cute.math.exp2(
-                        sCumsumlog[coord[0]] - sCumsumlog[coord[1]], fastmath=True
-                    )
-                    if coord[0] >= coord[1]
-                    else 0.0
+        rCumsumlog = cute.make_rmem_tensor((2, 16), self.acc_dtype)
+        tGrCumsumlog = thr_shared_t2r.partition_D(rCumsumlog)
+        for k in cutlass.range_constexpr(cute.size(tTR_tScS)):
+            coord = tTR_tScS[k]
+            tGrCumsumlog[k] = (
+                cute.math.exp2(
+                    sCumsumlog[coord[0]] - sCumsumlog[coord[1]], fastmath=True
                 )
+                if coord[0] >= coord[1]
+                else 0.0
+            )
         gate_handle.release()
 
         # Wait for beta ready (used in both kk_epi and qk_epi scaling)
-        self._timeline_tag_from_args(timeline_args, 4)
         beta_handle = load_beta_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 5)
 
-        if cutlass.const_expr(not self.use_input_A):
-            rBeta = cute.make_rmem_tensor((2,), self.acc_dtype)
-            rBeta = cute.make_tensor(
-                rBeta.iterator,
-                cute.flat_product(rBeta.layout, cute.make_layout((16,), stride=(0,))),
-            )
-            tGrBeta = thr_shared_t2r.partition_D(rBeta)
-            for k in cutlass.range_constexpr(cute.size(tTR_tScS)):
-                coord = tTR_tScS[k]
-                tGrBeta[k] = sBeta[coord[0], 0, beta_handle.index]
+        rBeta = cute.make_rmem_tensor((2,), self.acc_dtype)
+        rBeta = cute.make_tensor(
+            rBeta.iterator,
+            cute.flat_product(rBeta.layout, cute.make_layout((16,), stride=(0,))),
+        )
+        tGrBeta = thr_shared_t2r.partition_D(rBeta)
+        for k in cutlass.range_constexpr(cute.size(tTR_tScS)):
+            coord = tTR_tScS[k]
+            tGrBeta[k] = sBeta[coord[0], 0, beta_handle.index]
 
         # ------------------------------------------------------------------
         # Step 2: kk_epi - load W_kk (GEMM 1 result from TMEM), scale -> M_kk
@@ -3469,13 +2490,10 @@ class GatedDeltaNetChunkedKernel:
         # ------------------------------------------------------------------
         # Acquire sAinvNv slot, fence, signal
         ainv_handle = a_inv_ready_producer.acquire_and_advance()
-        if cutlass.const_expr(not self.training_side_outputs_only):
-            # Full forward only: acquire sQkOstore slot, write W_qkv (fp16), fence, signal.
-            qk_ready_handle = qk_ready_producer.acquire_and_advance()
-            group_order_handle = group_order_producer.acquire_and_advance()
-        self._timeline_tag_from_args(timeline_args, 6)
+        # Acquire sQkOstore slot, write W_qkv (fp16), fence, signal.
+        qk_ready_handle = qk_ready_producer.acquire_and_advance()
+        group_order_handle = group_order_producer.acquire_and_advance()
         kk_handle = shared_acc_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 7)
 
         # tStS_for_t2r = tStS_staged[(None, None), 0, 0, kk_handle.index]
         # tTR_tStS = thr_shared_t2r.partition_S(tStS_for_t2r)
@@ -3485,82 +2503,67 @@ class GatedDeltaNetChunkedKernel:
         tKKrKK = cute.make_rmem_tensor_like(tTR_tScS, self.acc_dtype)
 
         tKKrKK_out = cute.make_rmem_tensor_like(tKKrKK, self.io_dtype)
-        if cutlass.const_expr(not self.use_input_A):
-            tCrAI = tiled_ainv_r2s.retile(tKKrKK_out)
-            for sub in cutlass.range(tKKrKK.shape[2]):
-                cute.copy(
-                    tiled_shared_t2r,
-                    tTR_tStS[None, 0, sub, kk_handle.index],
-                    tKKrKK[None, 0, sub],
+        tCrAI = tiled_ainv_r2s.retile(tKKrKK_out)
+        for sub in cutlass.range(tKKrKK.shape[2]):
+            cute.copy(
+                tiled_shared_t2r,
+                tTR_tStS[None, 0, sub, kk_handle.index],
+                tKKrKK[None, 0, sub],
+            )
+            for k in cutlass.range(sub_tile_size):
+                tKKrKK[k, 0, sub] = (
+                    tKKrKK[k, 0, sub] * tGrCumsumlog[k, 0, sub] * tGrBeta[k, 0, sub]
                 )
-                for k in cutlass.range(sub_tile_size):
-                    tKKrKK[k, 0, sub] = (
-                        tKKrKK[k, 0, sub] * tGrCumsumlog[k, 0, sub] * tGrBeta[k, 0, sub]
-                    )
-                tKKrKK_out[None, 0, sub].store(
-                    tKKrKK[None, 0, sub].load().to(self.io_dtype)
-                )
-                cute.copy(
-                    tiled_ainv_r2s,
-                    tCrAI[None, 0, sub],
-                    tCsAI[None, 0, sub, ainv_handle.index],
-                )
+            tKKrKK_out[None, 0, sub].store(
+                tKKrKK[None, 0, sub].load().to(self.io_dtype)
+            )
+            cute.copy(
+                tiled_ainv_r2s,
+                tCrAI[None, 0, sub],
+                tCsAI[None, 0, sub, ainv_handle.index],
+            )
         # Release shared_acc stage 0 (CG1 also releases its side - collective barrier)
         kk_handle.release()
 
-        if cutlass.const_expr(not self.drop_output_store_only):
-            # ------------------------------------------------------------------
-            # Step 3: qk_epi - load W_qk (GEMM 2 result from TMEM), scale -> W_qkv
-            #   Depends on: shared_acc stage 1 (MMA warp GEMM 2 qk done)
-            #   W_qk[i,j] *= T[i,j] * scale  where T[i,j] = exp2(cumsumlog[i]-cumsumlog[j])
-            #   Same subtile structure as kk_epi (num_kk_subs / kk_sub_size reused).
-            #   Done before inverse so that qk_ready signals GEMM 6 early, letting the
-            #   MMA warp run GEMM 6 in parallel with the inverse computation below.
-            # ------------------------------------------------------------------
-            self._timeline_tag_from_args(timeline_args, 8)
-            qk_handle = shared_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 9)
+        # ------------------------------------------------------------------
+        # Step 3: qk_epi - load W_qk (GEMM 2 result from TMEM), scale -> W_qkv
+        #   Depends on: shared_acc stage 1 (MMA warp GEMM 2 qk done)
+        #   W_qk[i,j] *= T[i,j] * scale  where T[i,j] = exp2(cumsumlog[i]-cumsumlog[j])
+        #   Same subtile structure as kk_epi (num_kk_subs / kk_sub_size reused).
+        #   Done before inverse so that qk_ready signals GEMM 6 early, letting the
+        #   MMA warp run GEMM 6 in parallel with the inverse computation below.
+        # ------------------------------------------------------------------
+        qk_handle = shared_acc_consumer.wait_and_advance()
 
-            tStS_for_t2r = tStS_staged[(None, None), 0, 0, qk_handle.index]
-            # tTR_tStS = thr_shared_t2r.partition_S(tStS_for_t2r)
+        tStS_for_t2r = tStS_staged[(None, None), 0, 0, qk_handle.index]
+        # tTR_tStS = thr_shared_t2r.partition_S(tStS_for_t2r)
 
-            # tQKrQK: full-size register buffer for W_qkv (SMEM write), filled subtile by subtile.
-            tQKrQK = cute.make_rmem_tensor_like(tTR_tScS, self.acc_dtype)
+        # tQKrQK: full-size register buffer for W_qkv (SMEM write), filled subtile by subtile.
+        tQKrQK = cute.make_rmem_tensor_like(tTR_tScS, self.acc_dtype)
 
-            # Convert fp32 tQKrQK -> fp16 and store to sQk, one subtile at a time.
-            tQKrQK_out = cute.make_rmem_tensor_like(tQKrQK, self.io_dtype)
-            tCrQK = tiled_qk_r2s.retile(tQKrQK_out)
-            for sub in cutlass.range(tQKrQK.shape[2]):
-                cute.copy(
-                    tiled_shared_t2r,
-                    tTR_tStS[None, 0, sub, qk_handle.index],
-                    tQKrQK[None, 0, sub],
-                )
-                for k in cutlass.range(sub_tile_size):
-                    tQKrQK[k, 0, sub] = tQKrQK[k, 0, sub] * tGrCumsumlog[k, 0, sub] * scale
-                tQKrQK_out[None, 0, sub].store(
-                    tQKrQK[None, 0, sub].load().to(self.io_dtype)
-                )
-                cute.copy(
-                    tiled_qk_r2s, tCrQK[None, 0, sub], tCsQK[None, 0, sub, qk_handle.index]
-                )
-            cute.arch.fence_view_async_shared()
-            # Release shared_acc stage 1
-            qk_handle.release()
-            group_order_handle.commit()
+        # Convert fp32 tQKrQK -> fp16 and store to sQk, one subtile at a time.
+        tQKrQK_out = cute.make_rmem_tensor_like(tQKrQK, self.io_dtype)
+        tCrQK = tiled_qk_r2s.retile(tQKrQK_out)
+        for sub in cutlass.range(tQKrQK.shape[2]):
+            cute.copy(
+                tiled_shared_t2r,
+                tTR_tStS[None, 0, sub, qk_handle.index],
+                tQKrQK[None, 0, sub],
+            )
+            for k in cutlass.range(sub_tile_size):
+                tQKrQK[k, 0, sub] = tQKrQK[k, 0, sub] * tGrCumsumlog[k, 0, sub] * scale
+            tQKrQK_out[None, 0, sub].store(
+                tQKrQK[None, 0, sub].load().to(self.io_dtype)
+            )
+            cute.copy(
+                tiled_qk_r2s, tCrQK[None, 0, sub], tCsQK[None, 0, sub, qk_handle.index]
+            )
+        cute.arch.fence_view_async_shared()
+        # Release shared_acc stage 1
+        qk_handle.release()
+        group_order_handle.commit()
 
-            qk_ready_handle.commit()
-        else:
-            # Match the dummy shared_acc producer token that replaces GEMM 2.
-            self._timeline_tag_from_args(timeline_args, 8)
-            qk_handle = shared_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 9)
-            qk_handle.release()
-            if cutlass.const_expr(not self.training_side_outputs_only):
-                # GEMM 6 and qkv_epilogue still consume these barriers in the
-                # conservative drop-output path, but their data is discarded.
-                group_order_handle.commit()
-                qk_ready_handle.commit()
+        qk_ready_handle.commit()
 
         # Advance past shared_acc stages used by GEMMs 3/4 (K*State, Q*State).
         # These stages form a collective barrier with CG1; CG0 must advance
@@ -3571,8 +2574,6 @@ class GatedDeltaNetChunkedKernel:
         valid_state = not is_first_chunk or self.use_initial_state
         if valid_state:
             shared_acc_consumer.advance()
-        if cutlass.const_expr(self.store_w):
-            shared_acc_consumer.advance()
 
         # ------------------------------------------------------------------
         # Step 4: inverse - compute A_inv = (I + M_kk)^{-1}, write to sAinvNv
@@ -3580,52 +2581,51 @@ class GatedDeltaNetChunkedKernel:
         #   (qkv) running in the MMA warp.
         # ------------------------------------------------------------------
 
-        if cutlass.const_expr(not self.use_input_A):
-            # -- Hierarchical blockwise inverse: A_inv = (I + M_kk)^{-1} ----------
-            # Thread cg0_tidx owns row cg0_tidx of the BTxBT matrix.
-            # sAinv is reinterpreted as row-major (BTxBT) fp16 for the algorithm;
-            # the MMA-ready A-operand layout is written back via tiled_store_ainv after.
-            # NOTE: assumes io_dtype == Float16 (algorithm uses fp16 SMEM + fp32 accumulators).
-            warp_id = cg0_tidx // 32
-            lane_id = cg0_tidx % 32
+        # -- Hierarchical blockwise inverse: A_inv = (I + M_kk)^{-1} ----------
+        # Thread cg0_tidx owns row cg0_tidx of the BTxBT matrix.
+        # sAinv is reinterpreted as row-major (BTxBT) io_dtype for the algorithm;
+        # the MMA-ready A-operand layout is written back via tiled_store_ainv after.
+        # NOTE: the algorithm uses io_dtype (fp16 or bf16) SMEM with fp32 accumulators.
+        warp_id = cg0_tidx // 32
+        lane_id = cg0_tidx % 32
 
-            sA = sAinv_mn_view[None, None, ainv_handle.index]
-            # Stage 1: Gauss-Jordan inversion of BT//8 = 16 diagonal 8x8 blocks.
-            sM_8x8 = cute.flat_divide(sA, (8, 8))
-            self.inverse_barrier.arrive_and_wait()
-            if warp_id < 2:
-                self._invert_diagonal_NxN(
-                    sM_8x8[None, None, cg0_tidx // 8, cg0_tidx // 8], cg0_tidx, 8
-                )
-            self.inverse_barrier.arrive_and_wait()
-
-            # Stage 2: off-diagonal correction 8x8 -> 16x16.
-            # 8 diagonal 16x16 tiles; each warp handles 2 tiles sequentially.
-            sM_16x16 = cute.flat_divide(sA, (16, 16))
-            self._blockwise_diagonal_8x8_to_16x16(
-                sM_16x16[None, None, warp_id, warp_id], lane_id
+        sA = sAinv_mn_view[None, None, ainv_handle.index]
+        # Stage 1: Gauss-Jordan inversion of BT//8 = 8 diagonal 8x8 blocks (warps 0-1, one row per thread).
+        sM_8x8 = cute.flat_divide(sA, (8, 8))
+        self.inverse_barrier.arrive_and_wait()
+        if warp_id < 2:
+            self._invert_diagonal_NxN(
+                sM_8x8[None, None, cg0_tidx // 8, cg0_tidx // 8], cg0_tidx, 8
             )
-            self.inverse_barrier.arrive_and_wait()
+        self.inverse_barrier.arrive_and_wait()
 
-            # Stage 3: off-diagonal correction 16x16 -> 32x32.
-            # 4 diagonal 32x32 tiles; one tile per warp.
-            sM_32x32 = cute.flat_divide(sA, (32, 32))
-            if warp_id < 2:
-                self._blockwise_diagonal_16x16_to_32x32(
-                    sM_32x32[None, None, warp_id, warp_id], lane_id
-                )
-            self.inverse_barrier.arrive_and_wait()
+        # Stage 2: off-diagonal correction 8x8 -> 16x16.
+        # 4 diagonal 16x16 tiles; one tile per warp.
+        sM_16x16 = cute.flat_divide(sA, (16, 16))
+        self._blockwise_diagonal_8x8_to_16x16(
+            sM_16x16[None, None, warp_id, warp_id], lane_id
+        )
+        self.inverse_barrier.arrive_and_wait()
 
-            # Stage 4: off-diagonal correction 32x32 -> 64x64.
-            # 2 diagonal 64x64 tiles; warps 0,1 on tile 0, warps 2,3 on tile 1.
-            sM_64x64 = cute.flat_divide(sA, (64, 64))
-            if warp_id < 2:
-                self._blockwise_diagonal_32x32_to_64x64(
-                    sM_64x64[None, None, warp_id // 2, warp_id // 2], warp_id, lane_id
-                )
-            self.inverse_barrier.arrive_and_wait()
+        # Stage 3: off-diagonal correction 16x16 -> 32x32.
+        # 2 diagonal 32x32 tiles; one tile per warp on warps 0-1.
+        sM_32x32 = cute.flat_divide(sA, (32, 32))
+        if warp_id < 2:
+            self._blockwise_diagonal_16x16_to_32x32(
+                sM_32x32[None, None, warp_id, warp_id], lane_id
+            )
+        self.inverse_barrier.arrive_and_wait()
 
-        # tCrAI receives unscaled A_inv either from saved input_A or freshly inverted M_kk.
+        # Stage 4: off-diagonal correction 32x32 -> 64x64.
+        # 1 diagonal 64x64 tile (the whole BTxBT matrix); warps 0,1 collaborate on it.
+        sM_64x64 = cute.flat_divide(sA, (64, 64))
+        if warp_id < 2:
+            self._blockwise_diagonal_32x32_to_64x64(
+                sM_64x64[None, None, warp_id // 2, warp_id // 2], warp_id, lane_id
+            )
+        self.inverse_barrier.arrive_and_wait()
+
+        # tCrAI receives the unscaled A_inv of the freshly inverted M_kk.
         # Apply beta column-scaling: A_inv[i,j] *= beta[j]  (equivalent to A_inv @ diag(beta))
         tCsAI = thr_ainv_s2r.partition_S(sAinv_mn_view)
         tCsAI = tCsAI[None, None, None, ainv_handle.index]
@@ -3640,21 +2640,11 @@ class GatedDeltaNetChunkedKernel:
         for k in cutlass.range_constexpr(cute.size(tTR_tScS)):
             coord = tTR_tScS[k]
             tKKrBeta[k] = sBeta[coord[1], 0, beta_handle.index]
-        if cutlass.const_expr(self.use_input_A):
-            self._timeline_tag_from_args(timeline_args, 10)
-            a_load_handle = load_A_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 11)
-            tCsAinput = thr_ainv_s2r.partition_D(
-                sAinput[None, None, a_load_handle.index]
-            )
-            cute.autovec_copy(tCsAinput, tCrAI)
-            a_load_handle.release()
-        else:
-            cute.copy(
-                tiled_ainv_s2r,
-                tCsAI,
-                tCrAI,
-            )
+        cute.copy(
+            tiled_ainv_s2r,
+            tCsAI,
+            tCrAI,
+        )
         if cutlass.const_expr(self.store_A):
             assert mA_out is not None, "mA_out must be provided when store_A is True"
             gA_out = cute.domain_offset(
@@ -3662,24 +2652,20 @@ class GatedDeltaNetChunkedKernel:
             )
             gA_tile = cute.flat_divide(gA_out, (self.b_t, self.b_t))[None, None, 0, 0]
             tCgAI = thr_ainv_s2r.partition_D(gA_tile)
-            if cutlass.const_expr(not self.enable_varlen_tail):
+            # Full chunks use the vectorized store; a partial final chunk predicates
+            # every element on the logical sequence end so the store never spills into
+            # the next packed sequence (or past the allocation).
+            if chunk_offset + self.b_t <= batch_end:
                 cute.autovec_copy(
                     tCrAI,
                     tCgAI,
                     l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                 )
             else:
-                if chunk_offset + self.b_t <= batch_end:
-                    cute.autovec_copy(
-                        tCrAI,
-                        tCgAI,
-                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                    )
-                else:
-                    for k in cutlass.range_constexpr(cute.size(tCrAI)):
-                        coord = tTR_tScS[k]
-                        if chunk_offset + coord[0] < batch_end:
-                            tCgAI[k] = tCrAI[k]
+                for k in cutlass.range_constexpr(cute.size(tCrAI)):
+                    coord = tTR_tScS[k]
+                    if chunk_offset + coord[0] < batch_end:
+                        tCgAI[k] = tCrAI[k]
 
         tCrAI_acc.store(tCrAI.load().to(self.acc_dtype))
         for k in cutlass.range(cute.size(tCrAI)):
@@ -3702,7 +2688,6 @@ class GatedDeltaNetChunkedKernel:
         return (  # type: ignore[return-value]
             load_gate_consumer,
             load_beta_consumer,
-            load_A_consumer,
             shared_acc_consumer,
             a_inv_ready_producer,
             qk_ready_producer,
@@ -3711,13 +2696,12 @@ class GatedDeltaNetChunkedKernel:
 
     # ------------------------------------------------------------------
     # Hierarchical blockwise inverse helpers (ported from gdn_inverse_verify.py)
-    # Compute X = (I + M)^{-1} for a 128x128 unit lower-triangular matrix in-place
-    # on a row-major fp16 SMEM buffer.  5-stage algorithm:
-    #   Stage 1: Gauss-Jordan inversion of 16 diagonal 8x8 blocks (warp shuffle)
+    # Compute X = (I + M)^{-1} for a BTxBT = 64x64 unit lower-triangular matrix
+    # in-place on a row-major io_dtype SMEM buffer.  4-stage algorithm:
+    #   Stage 1: Gauss-Jordan inversion of 8 diagonal 8x8 blocks (warp shuffle)
     #   Stage 2: 8x8 -> 16x16 via warp MMA  (SM80_16x8x8)
     #   Stage 3: 16x16 -> 32x32 via warp MMA (SM80_16x8x16)
-    #   Stage 4: 32x32 -> 64x64 via warp MMA, 2 warps per 64x64 tile
-    #   Stage 5: 64x64 -> 128x128 via warp MMA, 4 warps on full matrix
+    #   Stage 4: 32x32 -> 64x64 via warp MMA, 2 warps on the full matrix
     # ------------------------------------------------------------------
 
     def _make_acc_tensor_into_a_view(self, acc: cute.Tensor) -> cute.Tensor:
@@ -4145,104 +3129,6 @@ class GatedDeltaNetChunkedKernel:
         return kv_acc_producer
 
     @cute.jit
-    def _store_final_state(
-        self,
-        tidx,
-        # full output-state GMEM tensor (DK, DV, (h_r, h_qv), B) fp32
-        mS_out,
-        head_idx,
-        batch_idx,
-        tmem_ptr,
-        tiled_mma_kv,
-        # MMA -> CG1 consumer; waited+released inside this method
-        kv_acc_consumer,
-        seqlen_b,
-        mS_checkpoints,
-        checkpoint_offset,
-        checkpoint_every_n_tokens,
-    ):
-        """Store final recurrent state from TMEM (fp32) to GMEM mS_out.
-
-        Waits for the last GEMM-7 (kv_acc) to complete, reads state TMEM -> registers,
-        writes registers -> GMEM fp32, then releases the consumer handle.
-        """
-        num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
-        cg1_tidx = tidx % num_threads_cg1
-
-        # Build state TMEM layout (mirrors compute_group_1 setup)
-        state_acc_shape = tiled_mma_kv.partition_shape_C(
-            (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
-        )
-        tCtState_fake = tiled_mma_kv.make_fragment_C(
-            cute.append(state_acc_shape, self.tmem_kv_acc_stages)
-        )
-        tCtState = cute.make_tensor(
-            tmem_ptr + self.tmem_state_offset, tCtState_fake.layout
-        )
-        tCtState_mn_view = self.transform_partitioned_tensor_layout(tCtState)
-        tCcState = cute.make_identity_tensor(
-            (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
-        )
-
-        # TMEM -> registers  (Ld32x32b)
-        atom_state_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
-        tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
-        thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
-        tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
-        tTR_tCcState = thr_state_t2r.partition_D(tCcState)
-        tTR_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.acc_dtype)
-        tRG_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.state_dtype)
-
-        # Wait for last GEMM-7 to finish
-        kv_acc_handle = kv_acc_consumer.wait_and_advance()
-
-        for sub in cutlass.range(tTR_rState.shape[2]):
-            # Read state TMEM -> fp32 registers
-            cute.copy(
-                tiled_state_t2r,
-                tTR_tCtState[None, 0, sub, kv_acc_handle.index],
-                tTR_rState[None, 0, sub],
-            )
-            if cutlass.const_expr(self.state_dtype != self.acc_dtype):
-                tRG_rState[None, 0, sub].store(
-                    tTR_rState[None, 0, sub].load().to(self.state_dtype)
-                )
-            else:
-                tRG_rState = tTR_rState
-            if cutlass.const_expr(self.enable_checkpoints):
-                if seqlen_b % checkpoint_every_n_tokens == 0:
-                    gS_checkpoints = cute.make_tensor(
-                        mS_checkpoints[
-                            None, None, head_idx, checkpoint_offset
-                        ].iterator,
-                        cute.make_ordered_layout(
-                            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]), order=(1, 0)
-                        ),
-                    )
-                    tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
-                    cute.autovec_copy(
-                        tRG_rState[None, 0, sub],
-                        tSgCheckpoints[None, 0, sub],
-                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                    )
-            if cutlass.const_expr(self.store_final_state):
-                gS_out = cute.flat_divide(
-                    mS_out[None, None, head_idx, batch_idx],
-                    (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                )[None, None, 0, 0]
-                tRG_tCgState = thr_state_t2r.partition_D(gS_out)
-                cute.autovec_copy(
-                    tRG_rState,
-                    tRG_tCgState,
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                )
-        kv_acc_handle.release()
-        return kv_acc_consumer
-
-    @cute.jit
     def compute_group_1(
         self,
         tidx: cutlass.Int32,
@@ -4253,7 +3139,6 @@ class GatedDeltaNetChunkedKernel:
         checkpoint_args: tuple,
         pipeline_args: tuple,
         work_args: tuple,
-        timeline_args: tuple,
     ) -> tuple[
         pipeline.PipelineConsumer,
         pipeline.PipelineConsumer,
@@ -4267,14 +3152,12 @@ class GatedDeltaNetChunkedKernel:
         pipeline.PipelineProducer,
         pipeline.PipelineProducer,
         pipeline.PipelineProducer,
-        pipeline.PipelineProducer,
     ]:
         """Warps 4-7: kv_decay_v, v-k*state, state*q_epi, new_v_epi, qkv_epilogue, kv_update_epi."""
-        sV, sW, sCumsumlog, sCumprod, sBeta, sO, sSideOutput, sH = smem_args
-        mS_checkpoints, checkpoint_offset, checkpoint_every_n_tokens = checkpoint_args
+        sV, sCumsumlog, sCumprod, sBeta, sO, sH = smem_args
+        (checkpoint_offset,) = checkpoint_args
         (
             load_v_consumer,
-            load_w_consumer,
             load_gate_consumer,
             shared_acc_consumer,
             kv_acc_consumer,
@@ -4284,10 +3167,10 @@ class GatedDeltaNetChunkedKernel:
             state_inp_ready_producer,
             shared_inp_ready_producer,
             o_store_producer,
-            side_output_store_producer,
+            h_store_producer,
         ) = pipeline_args
         tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv = mma_args
-        (mVNew_out, mW_out, mH_out, is_first_chunk, chunk_idx, head_idx, chunk_offset) = work_args
+        (mH_out, is_first_chunk, chunk_idx, head_idx, chunk_offset) = work_args
 
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
         cg1_tidx = tidx % num_threads_cg1
@@ -4403,7 +3286,6 @@ class GatedDeltaNetChunkedKernel:
         thr_shared_inp_r2t = tiled_shared_inp_r2t.get_slice(cg1_tidx)
         tRT_tCcShared_inp = thr_shared_inp_r2t.partition_S(tCcShared_inp)
         tRT_tCtShared_inp = thr_shared_inp_r2t.partition_D(tCtShared_inp_mn_view)
-        tRT_rShared_inp = cute.make_rmem_tensor_like(tRT_tCcShared_inp, self.io_dtype)  # noqa: F841
 
         # -- Q-state TMEM tensor (BTxDV, layout from tiled_mma_qs) --------------
         # Used by state*q_epi (scale Q*S result) and qkv_epilogue (read final O).
@@ -4442,7 +3324,6 @@ class GatedDeltaNetChunkedKernel:
         # Beta scaling: sBeta[cg1_tidx] - one scalar per thread.
 
         tRT_tCcV = thr_shared_inp_r2t.partition_S(tCcShared_inp)
-        tRT_tCtV = thr_shared_inp_r2t.partition_D(tCtShared_inp_mn_view)  # noqa: F841
         atom_v_s2r = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(num_matrices=4, transpose=True),
             self.io_dtype,
@@ -4469,20 +3350,10 @@ class GatedDeltaNetChunkedKernel:
         tiled_o_r2s = cute.make_tiled_copy_D(atom_o_r2s, tiled_o_t2r)
         thr_o_r2s = tiled_o_r2s.get_slice(cg1_tidx)
         tCsO = thr_o_r2s.partition_D(sO)
-        atom_side_output_r2s = cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(num_matrices=4, transpose=True),
-            self.io_dtype,
-        )
-        tiled_side_output_r2s = cute.make_tiled_copy_D(
-            atom_side_output_r2s, tiled_shared_t2r
-        )
-        tCsSideOutput = tiled_side_output_r2s.get_slice(cg1_tidx).partition_D(sSideOutput)
 
         sub_tile_size = 32
 
-        self._timeline_tag_from_args(timeline_args, 2)
         gate_handle = load_gate_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 3)
 
         cumprod_total = sCumprod[sCumprod.shape[0] - 1, 0, gate_handle.index]
 
@@ -4492,43 +3363,18 @@ class GatedDeltaNetChunkedKernel:
                 kv_acc_producer.advance()
             # Wait for previous chunk's GEMM 7 to finish writing dS.
             # This also serialises the TMEM read-modify-write vs GEMM 7.
-            self._timeline_tag_from_args(timeline_args, 4)
             kv_handle = kv_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 5)
 
             state_inp_ready_handle = state_inp_ready_producer.acquire_and_advance()
             if cutlass.const_expr(self.use_bf16_h_tma):
                 tCsH = thr_state_t2r.partition_D(sH)
-                h_side_output_store_handle = side_output_store_producer.acquire_and_advance()
+                h_store_handle = h_store_producer.acquire_and_advance()
             for sub in cutlass.range(tRT_rState_inp.shape[2]):
                 cute.copy(
                     tiled_state_t2r,
                     tTR_tCtState[None, 0, sub, kv_handle.index],
                     tTR_rState[None, 0, sub],
                 )
-                if cutlass.const_expr(self.enable_checkpoints and not is_first_chunk):
-                    if (self.b_t * chunk_idx) % checkpoint_every_n_tokens == 0:
-                        gS_checkpoints = cute.make_tensor(
-                            mS_checkpoints[
-                                None, None, head_idx, checkpoint_offset
-                            ].iterator,
-                            cute.make_ordered_layout(
-                                (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                                order=(1, 0),
-                            ),
-                        )
-                        tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
-                        if cutlass.const_expr(self.state_dtype != self.acc_dtype):
-                            tRG_rState[None, 0, sub].store(
-                                tTR_rState[None, 0, sub].load().to(self.state_dtype)
-                            )
-                        else:
-                            tRG_rState = tTR_rState
-                        cute.autovec_copy(
-                            tRG_rState[None, 0, sub],
-                            tSgCheckpoints[None, 0, sub],
-                            l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                        )
                 if cutlass.const_expr(self.store_h):
                     assert mH_out is not None, "mH_out must be provided when store_h is True"
                     if cutlass.const_expr(self.io_dtype != self.acc_dtype):
@@ -4571,7 +3417,7 @@ class GatedDeltaNetChunkedKernel:
                 )
             if cutlass.const_expr(self.use_bf16_h_tma):
                 cute.arch.fence_view_async_shared()
-                h_side_output_store_handle.commit()
+                h_store_handle.commit()
             cute.arch.fence_view_async_tmem_store()
             state_inp_ready_handle.commit()
 
@@ -4584,9 +3430,10 @@ class GatedDeltaNetChunkedKernel:
                     tTR_rState[None, 0, sub],
                     tRT_tCtState[None, 0, sub, kv_handle.index],
                 )
-            if cutlass.const_expr((self.enable_checkpoints or self.store_h) and not is_first_chunk):
-                if (self.b_t * chunk_idx) % checkpoint_every_n_tokens == 0:
-                    checkpoint_offset += 1
+            if cutlass.const_expr(self.store_h and not is_first_chunk):
+                # One saved h slot per 64-token chunk (output_h requires
+                # checkpoint_every_n_tokens == b_t, enforced by the wrapper).
+                checkpoint_offset += 1
             cute.arch.fence_view_async_tmem_store()
 
             # Release slot - MMA can now acquire it for this chunk's GEMM 7
@@ -4596,7 +3443,7 @@ class GatedDeltaNetChunkedKernel:
         elif cutlass.const_expr(self.use_bf16_h_tma):
             tCsH = thr_state_t2r.partition_D(sH)
             tRG_rState.fill(0.0)
-            h_side_output_store_handle = side_output_store_producer.acquire_and_advance()
+            h_store_handle = h_store_producer.acquire_and_advance()
             for sub in cutlass.range(tRG_rState.shape[2]):
                 cute.autovec_copy(
                     tRG_rState[None, 0, sub],
@@ -4604,7 +3451,7 @@ class GatedDeltaNetChunkedKernel:
                     l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                 )
             cute.arch.fence_view_async_shared()
-            h_side_output_store_handle.commit()
+            h_store_handle.commit()
 
         # Wait for kk and the qk/dummy-qk shared_acc slots to finish.
         shared_acc_consumer.advance()
@@ -4633,9 +3480,7 @@ class GatedDeltaNetChunkedKernel:
         # Thread cg1_tidx owns all DV elements for token bt=cg1_tidx.
         # Write fp16 delta to sV (GEMM 5 via v_ks_ready) and sStateDv (GEMM 7 via decay_v_ready).
         vks_handle = shared_inp_ready_producer.acquire_and_advance()
-        self._timeline_tag_from_args(timeline_args, 6)
         v_handle = load_v_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 7)
 
         if cutlass.const_expr(valid_state):
             # Load V[*, cg1_tidx] from sV SMEM into registers
@@ -4647,14 +3492,9 @@ class GatedDeltaNetChunkedKernel:
             tRT_rV = cute.make_rmem_tensor_like(tRT_tCcV, self.io_dtype)
             tCrV = tiled_v_s2r.retile(tRT_rV)
             cute.copy(tiled_v_s2r, tCsV[None, None, None, v_handle.index], tCrV)
-            if cutlass.const_expr(not self.training_side_outputs_only):
-                self._timeline_tag_from_args(timeline_args, 8)
-                group_order_handle = group_order_consumer.wait_and_advance()
-                self._timeline_tag_from_args(timeline_args, 9)
+            group_order_handle = group_order_consumer.wait_and_advance()
             # Wait for GEMM 3 (K*S) result in shared_acc
-            self._timeline_tag_from_args(timeline_args, 10)
             ks_acc_handle = shared_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 11)
             cute.copy(
                 tiled_shared_t2r,
                 tTR_tCtShared[None, None, None, ks_acc_handle.index],
@@ -4672,47 +3512,15 @@ class GatedDeltaNetChunkedKernel:
             )
             cute.arch.fence_view_async_tmem_store()
         else:
-            if cutlass.const_expr(not self.training_side_outputs_only):
-                self._timeline_tag_from_args(timeline_args, 8)
-                group_order_handle = group_order_consumer.wait_and_advance()
-                self._timeline_tag_from_args(timeline_args, 9)
+            group_order_handle = group_order_consumer.wait_and_advance()
         vks_handle.commit()
-
-        # Move the optional W RHS from its dedicated TMA buffer into TMEM.
-        if cutlass.const_expr(self.store_w):
-            wks_handle = shared_inp_ready_producer.acquire_and_advance()
-            w_load_handle = load_w_consumer.wait_and_advance()
-            sW_vt_view = self.transform_partitioned_tensor_layout(sW)
-            tCsW = thr_v_s2r.partition_S(sW_vt_view)
-            tRT_rWIn = cute.make_rmem_tensor_like(tRT_tCcV, self.io_dtype)
-            tCrWIn = tiled_v_s2r.retile(tRT_rWIn)
-            cute.copy(
-                tiled_v_s2r,
-                tCsW[None, None, None, w_load_handle.index],
-                tCrWIn,
-            )
-            w_load_handle.release()
-            if cutlass.const_expr(not self.w_rhs_precomputed):
-                for k in cutlass.range(cute.size(tRT_rWIn), vectorize=True):
-                    tRT_rWIn[k] = (
-                        tRT_rWIn[k].to(self.acc_dtype) * tGrCumprod[k]
-                    ).to(self.io_dtype)
-            cute.copy(
-                tiled_shared_inp_r2t,
-                tRT_rWIn,
-                tRT_tCtShared_inp[None, None, None, wks_handle.index],
-            )
-            cute.arch.fence_view_async_tmem_store()
-            wks_handle.commit()
 
         # ---- state*q_epi (ALU) ------------------------------------------------
         # Scale Q*S_prev cross-chunk contribution: QS[bt, *] *= cumprod[bt]
         # Thread cg1_tidx owns token bt=cg1_tidx -> scalar multiply by cur_cumprod.
         # Write scaled result back to same q_state TMEM slot so GEMM 6 accumulates on top.
-        if cutlass.const_expr(valid_state and not self.drop_output_store_only):
-            self._timeline_tag_from_args(timeline_args, 12)
+        if cutlass.const_expr(valid_state):
             qs_handle = q_state_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 13)
             for sub in cutlass.range(tTR_rQS.shape[1]):
                 cute.copy(
                     tiled_qs_t2r,
@@ -4731,25 +3539,14 @@ class GatedDeltaNetChunkedKernel:
             cute.arch.fence_view_async_tmem_store()
 
             qs_handle.release()
-        elif cutlass.const_expr(valid_state):
-            # Match the dummy q_state_acc producer token for skipped GEMM 4.
-            self._timeline_tag_from_args(timeline_args, 12)
-            qs_handle = q_state_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 13)
-            qs_handle.release()
 
         # ---- new_v_epi --------------------------------------------------------
         # NV = A_inv @ delta (GEMM 5 result) in shared_acc TMEM; fp32 -> fp16 -> sAinvNv.
-        self._timeline_tag_from_args(timeline_args, 14)
         nv_handle = shared_acc_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 15)
         sV_vt_view = self.transform_partitioned_tensor_layout(sV)
         v_handle.release()
-        if cutlass.const_expr(self.store_v_new or self.store_w):
-            side_output_store_handle = side_output_store_producer.acquire_and_advance()
 
-        if cutlass.const_expr(not self.training_side_outputs_only):
-            nv_ready_handle = shared_inp_ready_producer.acquire_and_advance()
+        nv_ready_handle = shared_inp_ready_producer.acquire_and_advance()
 
         tTR_rNv = cute.make_rmem_tensor_like(tTR_tCcShared, self.acc_dtype)
         tTR_rNv_inp = cute.make_rmem_tensor_like(tTR_rNv, self.io_dtype)
@@ -4762,51 +3559,14 @@ class GatedDeltaNetChunkedKernel:
             tTR_rNv_inp[None, sub, 0].store(
                 tTR_rNv[None, sub, 0].load().to(self.io_dtype)
             )
-            if cutlass.const_expr(not self.drop_output_store_only):
-                cute.copy(
-                    tiled_shared_inp_r2t,
-                    tTR_rNv_inp[None, sub, 0],
-                    tRT_tCtShared_inp[None, sub, 0, nv_ready_handle.index],
-                )
-        if cutlass.const_expr(self.store_v_new):
-            tRSNv = tiled_side_output_r2s.retile(tTR_rNv_inp)
             cute.copy(
-                tiled_side_output_r2s, tRSNv, tCsSideOutput[None, None, None, 0]
+                tiled_shared_inp_r2t,
+                tTR_rNv_inp[None, sub, 0],
+                tRT_tCtShared_inp[None, sub, 0, nv_ready_handle.index],
             )
-        if cutlass.const_expr(not self.drop_output_store_only):
-            cute.arch.fence_view_async_tmem_store()
+        cute.arch.fence_view_async_tmem_store()
         nv_handle.release()
-        if cutlass.const_expr(not self.training_side_outputs_only):
-            nv_ready_handle.commit()
-        else:
-            # Keep the shared_inp_ready slot that GEMM 6 consumed in full forward.
-            shared_inp_ready_producer.advance()
-
-        if cutlass.const_expr(self.store_w):
-            assert mW_out is not None, "mW_out must be provided when store_w is True"
-            self._timeline_tag_from_args(timeline_args, 16)
-            w_handle = shared_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 17)
-            tTR_rW = cute.make_rmem_tensor_like(tTR_tCcShared, self.acc_dtype)
-            tTR_rW_out = cute.make_rmem_tensor_like(tTR_rW, self.io_dtype)
-            for sub in cutlass.range(tTR_rW.shape[1]):
-                cute.copy(
-                    tiled_shared_t2r,
-                    tTR_tCtShared[None, sub, 0, w_handle.index],
-                    tTR_rW[None, sub, 0],
-                )
-                tTR_rW_out[None, sub, 0].store(
-                    tTR_rW[None, sub, 0].load().to(self.io_dtype)
-                )
-            tRSW = tiled_side_output_r2s.retile(tTR_rW_out)
-            cute.copy(
-                tiled_side_output_r2s, tRSW, tCsSideOutput[None, None, None, 1]
-            )
-            w_handle.release()
-
-        if cutlass.const_expr(self.store_v_new or self.store_w):
-            cute.arch.fence_view_async_shared()
-            side_output_store_handle.commit()
+        nv_ready_handle.commit()
 
         # Write decay_scale * delta to sStateDv -> GEMM 7 B-operand
         # -- kv_decay_v: S_prev *= Phi = exp(cumsumlog[BT-1]) ------------------
@@ -4828,42 +3588,33 @@ class GatedDeltaNetChunkedKernel:
         cute.arch.fence_view_async_tmem_store()
         decay_v_handle.commit()
 
-        if cutlass.const_expr(not self.training_side_outputs_only):
-            # ---- qkv_epilogue -----------------------------------------------------
-            # GEMM 6 accumulated W_qkv@NV into q_state TMEM on top of the scaled Q*S.
-            # q_state_acc second wait (same 1-stage pipeline, wraps back to stage 0).
-            o_handle = o_store_producer.acquire_and_advance()
-            self._timeline_tag_from_args(timeline_args, 18)
-            qs_handle2 = q_state_acc_consumer.wait_and_advance()
-            self._timeline_tag_from_args(timeline_args, 19)
+        # ---- qkv_epilogue -----------------------------------------------------
+        # GEMM 6 accumulated W_qkv@NV into q_state TMEM on top of the scaled Q*S.
+        # q_state_acc second wait (same 1-stage pipeline, wraps back to stage 0).
+        o_handle = o_store_producer.acquire_and_advance()
+        qs_handle2 = q_state_acc_consumer.wait_and_advance()
 
-            if cutlass.const_expr(not self.drop_output_store_only):
-                tTR_tOrO = cute.make_rmem_tensor_like(tTR_tOcO, self.acc_dtype)
-                tTR_rO_out = cute.make_rmem_tensor_like(tTR_tOrO, self.io_dtype)
-                tRS_tOrO = tiled_o_r2s.retile(tTR_rO_out)
-                cute.copy(
-                    tiled_o_t2r,
-                    tTR_tOtO[None, None, None, qs_handle2.index],
-                    tTR_tOrO,
-                )
-                tTR_rO_out.store(tTR_tOrO.load().to(self.io_dtype))
-                cute.copy(tiled_o_r2s, tRS_tOrO, tCsO[None, None, None, o_handle.index])
-                cute.arch.fence_view_async_shared()
-            group_order_handle.release()
-            qs_handle2.release()
+        tTR_tOrO = cute.make_rmem_tensor_like(tTR_tOcO, self.acc_dtype)
+        tTR_rO_out = cute.make_rmem_tensor_like(tTR_tOrO, self.io_dtype)
+        tRS_tOrO = tiled_o_r2s.retile(tTR_rO_out)
+        cute.copy(
+            tiled_o_t2r,
+            tTR_tOtO[None, None, None, qs_handle2.index],
+            tTR_tOrO,
+        )
+        tTR_rO_out.store(tTR_tOrO.load().to(self.io_dtype))
+        cute.copy(tiled_o_r2s, tRS_tOrO, tCsO[None, None, None, o_handle.index])
+        cute.arch.fence_view_async_shared()
+        group_order_handle.release()
+        qs_handle2.release()
 
-            # O in sQkOstore ready for epilogue warp TMA store, or a dummy token when O is dropped.
-            o_handle.commit()
-        else:
-            # Match the dummy q_state_acc/o_store producer slots for skipped GEMM 6/O store.
-            q_state_acc_consumer.advance()
-            o_store_producer.advance()
+        # O in sQkOstore ready for epilogue warp TMA store.
+        o_handle.commit()
 
         # ---- kv_update_epi ----------------------------------------------------
         # None, do state update at the beginning of the next chunk.
         return (  # type: ignore[return-value]
             load_v_consumer,
-            load_w_consumer,
             load_gate_consumer,
             shared_acc_consumer,
             kv_acc_consumer,
@@ -4873,83 +3624,10 @@ class GatedDeltaNetChunkedKernel:
             state_inp_ready_producer,
             shared_inp_ready_producer,
             o_store_producer,
-            side_output_store_producer,
+            h_store_producer,
             checkpoint_offset,
         )
 
-    @cute.jit
-    def side_output_tma_warp(
-        self,
-        smem_args,
-        tma_args,
-        pipeline_args,
-        work_args,
-        tensormap_args,
-        timeline_args,
-    ) -> pipeline.PipelineConsumer:
-        """Warp 11: bulk-store VNew/W staging tiles from SMEM to GMEM via TMA."""
-        (sSideOutput,) = smem_args
-        (tma_v_new_out, tma_w_out) = tma_args
-        (side_output_store_consumer,) = pipeline_args
-        head_idx, chunk_offset = work_args
-        (
-            tensormap_manager,
-            tensormap_v_new_out_ptr,
-            tensormap_w_out_ptr,
-        ) = tensormap_args
-
-        side_output_store_handle = side_output_store_consumer.wait_and_advance()
-        cta_layout = cute.make_layout(1)
-        side_output_tile = cute.select(self.mma_tiler_qkv, mode=[0, 1])
-
-        if cutlass.const_expr(self.store_v_new):
-            mVNew = cute.domain_offset(
-                (cutlass.Int32(0), chunk_offset),
-                tma_v_new_out.tma_tensor[None, None, head_idx],
-            )
-            gVNew = cute.flat_divide(mVNew, side_output_tile)
-            tVsVNew, tVgVNew = cpasync.tma_partition(
-                tma_v_new_out.atom,
-                0,
-                cta_layout,
-                cute.group_modes(sSideOutput, 0, 2),
-                cute.group_modes(gVNew, 0, 2),
-            )
-            cute.copy(
-                tma_v_new_out.atom,
-                tVsVNew[(None, 0)],
-                tVgVNew[(None, 0, 0)],
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_v_new_out_ptr, cute.AddressSpace.generic
-                ),
-            )
-
-        if cutlass.const_expr(self.store_w):
-            mW = cute.domain_offset(
-                (cutlass.Int32(0), chunk_offset),
-                tma_w_out.tma_tensor[None, None, head_idx],
-            )
-            gW = cute.flat_divide(mW, side_output_tile)
-            tWsW, tWgW = cpasync.tma_partition(
-                tma_w_out.atom,
-                0,
-                cta_layout,
-                cute.group_modes(sSideOutput, 0, 2),
-                cute.group_modes(gW, 0, 2),
-            )
-            cute.copy(
-                tma_w_out.atom,
-                tWsW[(None, 1)],
-                tWgW[(None, 0, 0)],
-                tma_desc_ptr=tensormap_manager.get_tensormap_ptr(
-                    tensormap_w_out_ptr, cute.AddressSpace.generic
-                ),
-            )
-
-        cute.arch.cp_async_bulk_commit_group()
-        cute.arch.cp_async_bulk_wait_group(0)
-        side_output_store_handle.release()
-        return side_output_store_consumer
     @cute.jit
     def output_h_tma_warp(
         self,
@@ -4958,19 +3636,18 @@ class GatedDeltaNetChunkedKernel:
         pipeline_args,
         work_args,
         tensormap_args,
-        timeline_args,
     ) -> pipeline.PipelineConsumer:
         """Warp 11: bulk-store the BF16 recurrent-state side output via TMA."""
         (sH,) = smem_args
         (tma_h_out,) = tma_args
-        (side_output_store_consumer,) = pipeline_args
+        (h_store_consumer,) = pipeline_args
         head_idx, h_checkpoint_idx = work_args
         (
             tensormap_manager,
             tensormap_h_out_ptr,
         ) = tensormap_args
 
-        h_side_output_store_handle = side_output_store_consumer.wait_and_advance()
+        h_store_handle = h_store_consumer.wait_and_advance()
         cta_layout = cute.make_layout(1)
         h_tile = cute.select(self.mma_tiler_kv, mode=[0, 1])
         mH = cute.domain_offset(
@@ -4995,8 +3672,8 @@ class GatedDeltaNetChunkedKernel:
         )
         cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0)
-        h_side_output_store_handle.release()
-        return side_output_store_consumer
+        h_store_handle.release()
+        return h_store_consumer
 
     @cute.jit
     def epilogue_warp(
@@ -5006,7 +3683,6 @@ class GatedDeltaNetChunkedKernel:
         pipeline_args,
         work_args,
         tensormap_args,
-        timeline_args,
     ) -> pipeline.PipelineConsumer:
         """Warp 11: TMA bulk-store O from SMEM staging buffer to global memory.
 
@@ -5024,9 +3700,7 @@ class GatedDeltaNetChunkedKernel:
         head_idx, chunk_offset = work_args
         tensormap_manager, tensormap_o_ptr = tensormap_args
 
-        self._timeline_tag_from_args(timeline_args, 2)
         o_handle = o_store_consumer.wait_and_advance()
-        self._timeline_tag_from_args(timeline_args, 3)
 
         cta_layout = cute.make_layout(1)
         # (BT, DV)
@@ -5050,7 +3724,6 @@ class GatedDeltaNetChunkedKernel:
         )
 
         # TMA bulk store SMEM -> GMEM using the descriptor updated per work tile
-        self._timeline_tag_from_args(timeline_args, 4)
         cute.copy(
             tma_o.atom,
             tOsO[(None, o_handle.index)],
@@ -5063,7 +3736,6 @@ class GatedDeltaNetChunkedKernel:
         # Wait for the store to complete before releasing the SMEM slot
         cute.arch.cp_async_bulk_commit_group()
         cute.arch.cp_async_bulk_wait_group(0)
-        self._timeline_tag_from_args(timeline_args, 5)
 
         o_handle.release()
 
@@ -5121,19 +3793,12 @@ class GatedDeltaNetChunkedKernel:
         return cute.make_tensor(wo_swizzle_iter, tensor_pisl)
 
     @staticmethod
-    def get_workspace_size(num_sm: int, B: int, HQ: int, HV: int, is_persistent: bool):
-        # q, k, v, o, A, w
-        if is_persistent:
-            return (
-                GatedDeltaNetChunkedKernel.bytes_per_tensormap
-                * GatedDeltaNetChunkedKernel.num_tensormaps
-                * num_sm
-            )
-        HO = HQ if HQ >= HV else HV
+    def get_workspace_size(num_sm: int):
+        # One set of num_tensormaps descriptors (Q, K, V, O, H_OUT) per persistent CTA.
         return (
             GatedDeltaNetChunkedKernel.bytes_per_tensormap
             * GatedDeltaNetChunkedKernel.num_tensormaps
-            * (B * HO)
+            * num_sm
         )
 
     @cute.jit

@@ -23,10 +23,7 @@ class _CompileCacheKey:
     input_dtypes: tuple[str, ...]
     output_dtypes: tuple[str, ...]
     heads: int
-    grouped_heads: int
     num_sequences: int
-    use_dht: bool
-    state_v_first: bool
     device_index: int
     capability: tuple[int, int]
     uniform_sequence_length: int = 0
@@ -42,19 +39,6 @@ class _CompiledKernelArtifacts:
     kernel: FusedGdrBwdKernel
 
 
-@dataclass(frozen=True, slots=True)
-class _PreparedFusedGdrBwdLaunch:
-    """Immutable strong owner for one fixed-stream compiled replay."""
-
-    artifacts: _CompiledKernelArtifacts
-    launch_args: tuple[Any, ...]
-    torch_stream: Any
-    tensor_refs: tuple[Any, ...]
-
-    def __call__(self) -> None:
-        self.artifacts.compiled(*self.launch_args)
-
-
 @dataclass
 class _CompileCacheEntry:
     """One independently synchronized specialization slot."""
@@ -65,13 +49,6 @@ class _CompileCacheEntry:
 
 _COMPILE_CACHE_LOCK = threading.Lock()
 _COMPILE_CACHE: dict[_CompileCacheKey, _CompileCacheEntry] = {}
-
-
-def _clear_compile_cache_for_test() -> None:
-    """Drop published and in-flight entries between isolated tests."""
-
-    with _COMPILE_CACHE_LOCK:
-        _COMPILE_CACHE.clear()
 
 
 def _get_or_compile(
@@ -192,7 +169,6 @@ def _make_compile_key(
     output_tensors,
     *,
     heads: int,
-    grouped_heads: int,
     num_sequences: int,
     uniform_sequence_length: int,
     device_index: int,
@@ -204,10 +180,7 @@ def _make_compile_key(
         input_dtypes=tuple(str(tensor.dtype) for tensor in input_tensors),
         output_dtypes=tuple(str(tensor.dtype) for tensor in output_tensors),
         heads=heads,
-        grouped_heads=grouped_heads,
         num_sequences=num_sequences,
-        use_dht=True,
-        state_v_first=False,
         uniform_sequence_length=uniform_sequence_length,
         device_index=device_index,
         capability=capability,
@@ -223,7 +196,6 @@ def _compile_artifacts(
     scale: float,
     driver_stream,
     heads: int,
-    grouped_heads: int,
     num_sequences: int,
     uniform_sequence_length: int,
     enable_varlen_tail: bool,
@@ -234,10 +206,7 @@ def _compile_artifacts(
         io_dtype=_cutlass_dtype(q.dtype),
         acc_dtype=_cutlass_dtype(dht.dtype),
         heads=heads,
-        grouped_heads=grouped_heads,
         num_sequences=num_sequences,
-        use_dht=True,
-        state_v_first=False,
         uniform_sequence_length=uniform_sequence_length,
         enable_varlen_tail=enable_varlen_tail,
         enable_iket=enable_iket,
@@ -256,19 +225,13 @@ def _compile_artifacts(
     return _CompiledKernelArtifacts(compiled=compiled, kernel=kernel)
 
 
-def prepare_fused_gdr_bwd_launch(
-    *, q, k, v, a, g, beta, do, dht, h, scale, metadata, outputs, torch_stream
-) -> _PreparedFusedGdrBwdLaunch:
-    """Bind one compiled CuTe DSL replay to tensors and a fixed torch stream."""
+def launch_fused_gdr_bwd(*, q, k, v, a, g, beta, do, dht, h, scale, metadata, outputs) -> None:
+    """Compile once per specialization and replay on the caller's current torch stream."""
 
     dq, dk, dv, dg, db, dh0 = outputs
     cu_seqlens = metadata.cu_seqlens
     chunk_offsets = metadata.chunk_offsets
     heads = v.shape[2]
-    grouped_heads = q.shape[2]
-    if grouped_heads != heads:
-        raise ValueError("grouped_heads must equal heads; GQA head mapping is unsupported")
-
     uniform_sequence_length = getattr(metadata, "uniform_sequence_length", 0)
     enable_varlen_tail = getattr(metadata, "has_partial_chunks", False)
     num_sequences = metadata.num_sequences
@@ -276,6 +239,7 @@ def prepare_fused_gdr_bwd_launch(
     input_tensors = (q, k, v, a, g, beta, do, dht, h, cu_seqlens, chunk_offsets)
     output_tensors = (dq, dk, dv, dg, db, dh0)
     tensor_refs = input_tensors + output_tensors
+    torch_stream = torch.cuda.current_stream(device=q.device)
     device_index = _validate_launch_devices(tensor_refs, torch_stream)
     capability = tuple(torch.cuda.get_device_capability(q.device))
     driver_stream = cuda.CUstream(torch_stream.cuda_stream)
@@ -283,7 +247,6 @@ def prepare_fused_gdr_bwd_launch(
         input_tensors,
         output_tensors,
         heads=heads,
-        grouped_heads=grouped_heads,
         num_sequences=num_sequences,
         uniform_sequence_length=uniform_sequence_length,
         device_index=device_index,
@@ -299,7 +262,6 @@ def prepare_fused_gdr_bwd_launch(
             scale=scale,
             driver_stream=driver_stream,
             heads=heads,
-            grouped_heads=grouped_heads,
             num_sequences=num_sequences,
             uniform_sequence_length=uniform_sequence_length,
             enable_varlen_tail=enable_varlen_tail,
@@ -311,33 +273,8 @@ def prepare_fused_gdr_bwd_launch(
     finally:
         del build
 
-    return _PreparedFusedGdrBwdLaunch(
-        artifacts=artifacts,
-        launch_args=tensor_refs + (scale, driver_stream),
-        torch_stream=torch_stream,
-        tensor_refs=tensor_refs,
-    )
+    # tensor_refs keeps every operand alive until the replay has been enqueued.
+    artifacts.compiled(*tensor_refs, scale, driver_stream)
 
 
-def launch_fused_gdr_bwd(*, q, k, v, a, g, beta, do, dht, h, scale, metadata, outputs) -> None:
-    """Prepare and immediately replay on the caller's current torch stream."""
-
-    prepared = prepare_fused_gdr_bwd_launch(
-        q=q,
-        k=k,
-        v=v,
-        a=a,
-        g=g,
-        beta=beta,
-        do=do,
-        dht=dht,
-        h=h,
-        scale=scale,
-        metadata=metadata,
-        outputs=outputs,
-        torch_stream=torch.cuda.current_stream(device=q.device),
-    )
-    prepared()
-
-
-__all__ = ["launch_fused_gdr_bwd", "prepare_fused_gdr_bwd_launch"]
+__all__ = ["launch_fused_gdr_bwd"]

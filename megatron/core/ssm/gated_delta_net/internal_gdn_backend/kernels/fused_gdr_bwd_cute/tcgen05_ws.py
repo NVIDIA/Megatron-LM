@@ -6,9 +6,8 @@ is distributed under the MIT License; attribution is recorded in ``kernel.py``.
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 
 
 def _ir(value, loc=None, ip=None):
@@ -59,56 +58,6 @@ def tmem_deallocate(tmem_buffer_ptr: cute.Pointer, num_columns: int):
         )
 
     _do_deallocate(cutlass.Int32(tmem_address), cutlass.Int32(num_columns))
-
-
-@cute.jit
-def load_f32x2(shared_address, dst_ptr):
-    """Load two contiguous FP32 values with one 64-bit shared instruction."""
-
-    i32_type = ir.IntegerType.get_signless(32)
-    result_type = llvm.StructType.get_literal([i32_type, i32_type])
-    result = llvm.inline_asm(
-        result_type,
-        [cutlass.Int32(shared_address).ir_value()],
-        "ld.shared.v2.b32 {$0, $1}, [$2];",
-        "=r,=r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    packed = cute.make_rmem_tensor((2,), cutlass.Int32)
-    for index in cutlass.range_constexpr(2):
-        packed[index] = cutlass.Int32(
-            llvm.extractvalue(i32_type, result, [index])
-        )
-    values = cute.make_tensor(
-        cute.recast_ptr(packed.iterator, dtype=cutlass.Float32), (2,)
-    )
-    dst = cute.make_tensor(dst_ptr, (2,))
-    for index in cutlass.range_constexpr(2):
-        dst[index] = values[index]
-
-
-@cute.jit
-def copy_bf16x8_s2g(shared_address, global_address):
-    """Copy one aligned 128-bit BF16 vector from shared to global memory."""
-
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(shared_address).ir_value(),
-            cutlass.Int64(global_address).ir_value(),
-        ],
-        """{
-.reg .b32 p0, p1, p2, p3;
-ld.shared.v4.b32 {p0, p1, p2, p3}, [$0];
-st.global.v4.b32 [$1], {p0, p1, p2, p3};
-}""",
-        "r,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
 
 
 @cute.jit

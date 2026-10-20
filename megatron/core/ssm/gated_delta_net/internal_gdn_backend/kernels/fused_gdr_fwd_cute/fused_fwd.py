@@ -13,7 +13,7 @@ to import FlashInfer.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional
 
 import torch
 
@@ -30,7 +30,9 @@ def _check_cuda_sm100(tensor: torch.Tensor) -> None:
     if _cuda_major() < 13:
         raise NotImplementedError("Megatron GDN prefill CuTe kernel requires CUDA 13+")
     if torch.cuda.get_device_capability(tensor.device)[0] != 10:
-        raise NotImplementedError("Megatron GDN prefill CuTe kernel is SM100/B200 only")
+        raise NotImplementedError(
+            "Megatron GDN prefill CuTe kernel requires a Blackwell data-center GPU (SM10x)"
+        )
 
 
 def _require_contiguous(name: str, tensor: torch.Tensor) -> torch.Tensor:
@@ -47,11 +49,11 @@ def _validate_cu_seqlens(cu_seqlens: torch.Tensor, total_tokens: int) -> torch.T
             "cu_seqlens final value must match total tokens: "
             f"{int(cu_seqlens[-1].item())} != {total_tokens}"
         )
+    if int(cu_seqlens[0].item()) != 0:
+        raise ValueError("cu_seqlens must start at 0")
     lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    if not bool((lengths % _BT == 0).all().item()):
-        raise NotImplementedError(
-            "Megatron GDN prefill CuTe kernel requires every sequence length to be a 64 multiple"
-        )
+    if bool((lengths < 0).any().item()):
+        raise ValueError("cu_seqlens must be non-decreasing")
     return cu_seqlens.to(device=cu_seqlens.device, dtype=torch.int32).contiguous()
 
 
@@ -77,28 +79,31 @@ def chunk_gated_delta_rule_prefill_cute(
     beta: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
-    output_final_state: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     output_A: Optional[torch.Tensor] = None,
     output_g: Optional[torch.Tensor] = None,
-    output_state: Optional[torch.Tensor] = None,
-    state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     output_h: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     assume_valid_cu_seqlens: bool = False,
-    gate_is_log_cumsum: bool = False,
     gate_is_log_decay: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+) -> torch.Tensor:
     """Run the local SM100 GDN prefill kernel.
 
     The accepted signature mirrors the FlashInfer API used by Megatron, but the
     implementation is local to Megatron Core and only supports the SM100 path.
+    The kernel implements only the raw Megatron log-decay gate, so
+    ``gate_is_log_decay`` must be True. ``checkpoint_every_n_tokens`` is validated
+    (``output_h`` stores one state per 64-token chunk and therefore requires 64)
+    but not forwarded: the kernel's chunk size fixes the checkpoint stride.
     """
-    if gate_is_log_cumsum and gate_is_log_decay:
-        raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
+    if not gate_is_log_decay:
+        raise NotImplementedError(
+            "Megatron GDN prefill CuTe kernel only implements raw log-decay gates; "
+            "pass gate_is_log_decay=True"
+        )
     if use_qk_l2norm_in_kernel:
         raise NotImplementedError("QK L2 norm inside the GDN prefill kernel is not supported")
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -171,10 +176,13 @@ def chunk_gated_delta_rule_prefill_cute(
         output_g = _require_contiguous("output_g", output_g)
 
     if output_h is not None:
-        expected_h_shape = (total_tokens // _BT, num_o_heads, head_size, head_size)
-        if tuple(output_h.shape) != expected_h_shape:
+        # The chunk count is sum(ceil(len_i / 64)) over the packed sequences, which the
+        # caller supplies as ``checkpoint_cu_starts[-1]``; only the per-chunk dims are
+        # checked here so the hot path does not synchronize with the device.
+        if output_h.ndim != 4 or tuple(output_h.shape[1:]) != (num_o_heads, head_size, head_size):
             raise ValueError(
-                f"output_h shape mismatch: expected {expected_h_shape}, got {tuple(output_h.shape)}"
+                "output_h shape mismatch: expected "
+                f"(num_chunks, {num_o_heads}, {head_size}, {head_size}), got {tuple(output_h.shape)}"
             )
         if output_h.dtype != q.dtype:
             raise ValueError("output_h dtype must match q dtype")
@@ -191,24 +199,31 @@ def chunk_gated_delta_rule_prefill_cute(
             raise ValueError("checkpoint_every_n_tokens must be a multiple of 64")
         if checkpoint_cu_starts is None:
             raise ValueError("checkpoint_cu_starts is required when checkpointing is enabled")
-        if state_checkpoints is None and output_h is None:
+        if checkpoint_cu_starts.ndim != 1 or checkpoint_cu_starts.numel() != cu_i32.numel():
             raise ValueError(
-                "state_checkpoints or output_h is required when checkpointing is enabled"
+                "checkpoint_cu_starts must be the per-sequence chunk prefix with the same "
+                f"length as cu_seqlens ({cu_i32.numel()}), got {tuple(checkpoint_cu_starts.shape)}"
             )
-    elif state_checkpoints is not None or checkpoint_cu_starts is not None or output_h is not None:
+        if output_h is None:
+            raise ValueError("output_h is required when checkpointing is enabled")
+    elif checkpoint_cu_starts is not None or output_h is not None:
         raise ValueError("checkpoint tensors must be None when checkpoint_every_n_tokens is 0")
 
+    if output_h is not None and not assume_valid_cu_seqlens:
+        expected_chunks = int(checkpoint_cu_starts[-1].item())
+        if output_h.shape[0] != expected_chunks:
+            raise ValueError(
+                f"output_h must hold {expected_chunks} chunk states, got {output_h.shape[0]}"
+            )
     if output_h is not None and output_h.dtype != torch.bfloat16:
-        output_h.index_fill_(0, (cu_i32[:-1] // _BT).to(torch.long), 0)
-
-    if output_final_state and output_state is None:
-        output_state = torch.empty(
-            (cu_i32.numel() - 1, num_o_heads, head_size, head_size),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    if not output_final_state:
-        output_state = None
+        # Non-bf16 states are initialized by the wrapper: zero the first chunk slot of
+        # every sequence (the bf16 TMA path does this in-kernel). A zero-length sequence
+        # owns no slot and its start offset equals the next sequence's (or the total), so
+        # redirect it to slot 0, which is a legitimate first slot that is zeroed anyway.
+        starts = checkpoint_cu_starts.to(device=output_h.device, dtype=torch.long)
+        owns_chunks = (starts[1:] - starts[:-1]) > 0
+        first_chunk_slots = torch.where(owns_chunks, starts[:-1], torch.zeros_like(starts[:-1]))
+        output_h.index_fill_(0, first_chunk_slots, 0)
 
     gate = (
         g
@@ -245,15 +260,11 @@ def chunk_gated_delta_rule_prefill_cute(
         output=output,
         cu_seqlens=cu_i32,
         initial_state=initial_state,
-        output_state=output_state,
         scale=kernel_scale,
-        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         cu_checkpoints=cu_checkpoints,
-        output_checkpoints=state_checkpoints,
         output_A=output_A,
         output_g=output_g,
         output_h=output_h,
-        gate_is_log_cumsum=gate_is_log_cumsum,
         gate_is_log_decay=gate_is_log_decay,
     )
-    return (output, output_state) if output_final_state else output
+    return output

@@ -29,7 +29,11 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
+)
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     prepare_cp_context_metadata as prepare_internal_gdr_cp_context_metadata,
+)
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     prepare_validated_chunk_metadata as prepare_internal_gdr_chunk_metadata,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
@@ -216,7 +220,6 @@ class GatedDeltaNet(_GDNBase):
                 "conversion must be handled before calling GatedDeltaNet."
             )
 
-        internal_gdr_global_num_sequences = None
         internal_gdr_global_cu_seqlens = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
@@ -297,7 +300,6 @@ class GatedDeltaNet(_GDNBase):
                 prepare_internal_gdr_cp_context_metadata(
                     chunkwise_cp_context,
                     config=self.config,
-                    global_num_sequences=internal_gdr_global_num_sequences,
                     global_cu_seqlens=internal_gdr_global_cu_seqlens,
                 )
         else:
@@ -436,12 +438,9 @@ class GatedDeltaNet(_GDNBase):
             include_chunk_indices = True
             if chunkwise_cp_context is not None:
                 metadata_cu_seqlens = getattr(chunkwise_cp_context, "cu_seqlens", None)
-                # [REMOVE BEFORE MERGE] Current CP experiments rely on the temporary
-                # 64-token-chunk internal backend contract. For the single-local-sequence
-                # CP layout, FLA's local chunk primitives can run dense and only fused
-                # backward needs device chunk offsets prepared before the profiled GDR
-                # scope. Drop this shape-only shortcut when the internal backend grows
-                # full tail/layout support.
+                # Single-local-sequence CP layout: FLA's local chunk primitives run dense
+                # (any sequence length) and only the fused backward needs device chunk
+                # offsets prepared before the profiled GDR scope.
                 include_chunk_indices = not (
                     metadata_cu_seqlens is not None and metadata_cu_seqlens.numel() == 2
                 )

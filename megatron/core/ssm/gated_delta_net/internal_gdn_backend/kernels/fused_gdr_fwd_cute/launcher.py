@@ -61,20 +61,9 @@ def _get_compiled_cache(
     HV: int,
     is_GQA: bool,
     use_initial_state: bool,
-    store_final_state: bool,
-    enable_checkpoints: bool,
-    input_A: bool,
     store_A: bool,
     store_g: bool,
-    store_v_new: bool,
-    store_w: bool,
     store_h: bool,
-    w_rhs_precomputed: bool,
-    training_side_outputs_only: bool,
-    gate_is_log_cumsum: bool,
-    gate_is_log_decay: bool,
-    enable_varlen_tail: bool,
-    enable_timeline: bool,
 ):
     """Return a mutable dict that lazily stores the compiled kernel."""
     return {}
@@ -116,23 +105,12 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
     output: torch.Tensor,
     cu_seqlens: torch.Tensor,
     initial_state: Optional[torch.Tensor],
-    output_state: Optional[torch.Tensor],
     scale: float,
-    checkpoint_every_n_tokens: int = 0,
     cu_checkpoints: Optional[torch.Tensor] = None,
-    output_checkpoints: Optional[torch.Tensor] = None,
-    input_A: Optional[torch.Tensor] = None,
     output_A: Optional[torch.Tensor] = None,
     output_g: Optional[torch.Tensor] = None,
-    output_v_new: Optional[torch.Tensor] = None,
-    output_w: Optional[torch.Tensor] = None,
     output_h: Optional[torch.Tensor] = None,
-    w_rhs: Optional[torch.Tensor] = None,
-    training_side_outputs_only: bool = False,
-    gate_is_log_cumsum: bool = False,
     gate_is_log_decay: bool = False,
-    debug_timing: Optional[torch.Tensor] = None,
-    enable_varlen_tail: bool = False,
 ) -> None:
     """Execute the Blackwell chunked GDN forward kernel derived from FlashInfer prefill.
 
@@ -142,78 +120,56 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         q: ``(total_tokens, HQ, DK)`` float16/bfloat16
         k: ``(total_tokens, HK, DK)`` float16/bfloat16
         v: ``(total_tokens, HV, DK)`` float16/bfloat16
-        gate: ``(total_tokens, HO)`` float32, forget gate
+        gate: ``(total_tokens, HO)`` float32, raw Megatron log-decay forget gate
         beta: ``(total_tokens, HO)`` float32, update gate
         output: ``(total_tokens, HO, DK)`` float16/bfloat16, pre-allocated
         cu_seqlens: ``(num_seqs + 1,)`` int32
         initial_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
-        output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16, or None
         scale: attention scale factor (must not be 0)
-        checkpoint_every_n_tokens: store intermediate state every N tokens (0 = disabled)
-        cu_checkpoints: ``(num_seqs + 1,)`` int32, cumulative checkpoint counts
-        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16, or None
-        input_A: optional saved unscaled ``A`` side input, shape ``(total_tokens, HO, 64)``
+        cu_checkpoints: ``(num_seqs + 1,)`` int32 per-sequence chunk prefix
+            (``sum(ceil(len_i / 64))``); required with ``output_h``
         output_A: optional ``(total_tokens, HO, 64)`` float16/bfloat16 side output
         output_g: optional ``(total_tokens, HO)`` float32 transformed-g side output
-        output_v_new: optional ``(total_tokens, HO, DK)`` float16/bfloat16 side output
-        output_w: optional ``(total_tokens, HO, DK)`` float16/bfloat16 side output
-        output_h: optional ``(total_chunks, HO, DK, DK)`` float16/bfloat16 FLA-layout h side output
-        w_rhs: optional ``(total_tokens, HO, DK)`` float16/bfloat16 precomputed
-            RHS used to compute output_w; if omitted, the kernel computes it
-            from k and gate cumprod
-        training_side_outputs_only: when True, skip the forward-only Q/O path and materialize only training side outputs
-        gate_is_log_cumsum: when True, gate is already chunk-local cumulative log2 ``g``
-        gate_is_log_decay: when True, gate is raw Megatron log-decay and must be
-            prefix-summed with the base-2 conversion in-kernel
-        debug_timing: optional ``(6, 2, 32)`` int64 tensor for debug globaltimer tags
-        enable_varlen_tail: compile native partial-tile handling for packed lengths
+        output_h: optional ``(total_chunks, HO, DK, DK)`` float16/bfloat16 FLA-layout
+            per-chunk input-state side output (one slot per 64-token chunk)
+        gate_is_log_decay: must be True; the kernel only implements the raw
+            Megatron log-decay gate, which it prefix-sums with the base-2
+            conversion in-kernel
+
+    Sequence lengths do not need to be multiples of 64: the kernel bounds every
+    per-sequence TMA descriptor at the logical sequence end, neutralizes the
+    gate/beta rows of a partial final chunk, and predicates the side-output
+    stores of that chunk. Zero-length sequences (trailing fixed-capacity
+    ``cu_seqlens`` entries) are skipped.
     """
     HQ = q.size(1)
     HV = v.size(1)
     DK = q.size(2)
     is_GQA = HQ >= HV
     use_initial_state = initial_state is not None
-    store_final_state = output_state is not None
-    enable_checkpoints = checkpoint_every_n_tokens > 0 and output_checkpoints is not None
-    use_input_A = input_A is not None
-    if gate_is_log_cumsum and gate_is_log_decay:
-        raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
+    if not gate_is_log_decay:
+        raise NotImplementedError(
+            "the fused GDR forward kernel only implements raw log-decay gates; "
+            "pass gate_is_log_decay=True"
+        )
     store_A = output_A is not None
     store_g = output_g is not None
-    store_v_new = output_v_new is not None
-    store_w = output_w is not None
     store_h = output_h is not None
-    w_rhs_precomputed = w_rhs is not None
-    enable_timeline = debug_timing is not None
-    if enable_timeline:
-        if tuple(debug_timing.shape) != (6, 2, 32):
-            raise ValueError(f"debug_timing shape mismatch: expected (6, 2, 32), got {tuple(debug_timing.shape)}")
-        if debug_timing.dtype != torch.int64:
-            raise ValueError("debug_timing must be torch.int64")
-        if not debug_timing.is_cuda or not debug_timing.is_contiguous():
-            raise ValueError("debug_timing must be a contiguous CUDA tensor")
-    if (enable_checkpoints or store_h) and cu_checkpoints is None:
-        raise ValueError("cu_checkpoints must be provided when checkpoints or output_h are requested")
-    if store_h and checkpoint_every_n_tokens <= 0:
-        raise ValueError("checkpoint_every_n_tokens must be positive when output_h is requested")
+    if store_h and cu_checkpoints is None:
+        raise ValueError("cu_checkpoints must be provided when output_h is requested")
     io_dtype = _cutlass_io_dtype(q.dtype)
 
     # Auto-detect state dtype from initial_state, default to float32
     if initial_state is not None:
         state_torch_dtype = initial_state.dtype
-    elif output_state is not None:
-        state_torch_dtype = output_state.dtype
     elif output_h is not None:
         state_torch_dtype = output_h.dtype
-    elif output_checkpoints is not None:
-        state_torch_dtype = output_checkpoints.dtype
     else:
         state_torch_dtype = torch.float32
     state_dtype = _cutlass_state_dtype(state_torch_dtype)
 
     _initial_state = initial_state if use_initial_state else None
-    B = cu_seqlens.size(0) - 1
-    _output_state = output_state if store_final_state else None
+    _cu_checkpoints = cu_checkpoints if store_h else None
 
     cache = _get_compiled_cache(
         str(q.dtype),
@@ -222,20 +178,9 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         HV,
         is_GQA,
         use_initial_state,
-        store_final_state,
-        enable_checkpoints,
-        use_input_A,
         store_A,
         store_g,
-        store_v_new,
-        store_w,
         store_h,
-        w_rhs_precomputed,
-        training_side_outputs_only,
-        gate_is_log_cumsum,
-        gate_is_log_decay,
-        enable_varlen_tail,
-        enable_timeline,
     )
 
     if "compiled" not in cache:
@@ -255,21 +200,9 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
             num_sm=num_sm,
             is_GQA=is_GQA,
             use_initial_state=use_initial_state,
-            store_final_state=store_final_state,
-            enable_checkpoints=enable_checkpoints,
-            input_A=use_input_A,
             store_A=store_A,
             store_g=store_g,
-            store_v_new=store_v_new,
-            store_w=store_w,
             store_h=store_h,
-            w_rhs_precomputed=w_rhs_precomputed,
-            training_side_outputs_only=training_side_outputs_only,
-            gate_is_log_cumsum=gate_is_log_cumsum,
-            gate_is_log_decay=gate_is_log_decay,
-            enable_varlen_tail=enable_varlen_tail,
-            is_persistent=True,
-            enable_timeline=enable_timeline,
         )
 
         # Convert PyTorch tensors to CuTe tensors for compilation.
@@ -287,12 +220,6 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         v_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1, 2), divisibility=1
         )
-        w_rhs_cute = None
-        if w_rhs_precomputed:
-            w_rhs_cute = from_dlpack(w_rhs, assumed_align=16)
-            w_rhs_cute.mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2), divisibility=1
-            )
         gate_cute = from_dlpack(gate, assumed_align=16)
         gate_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1), divisibility=1
@@ -311,28 +238,10 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         o_cute.mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1, 2), divisibility=1
         )
-        input_A_cute = None
-        if use_input_A:
-            input_A_cute = from_dlpack(input_A, assumed_align=16)
-            input_A_cute.mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2), divisibility=1
-            )
         A_cute = None
         if store_A:
             A_cute = from_dlpack(output_A, assumed_align=16)
             A_cute.mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2), divisibility=1
-            )
-        v_new_cute = None
-        if store_v_new:
-            v_new_cute = from_dlpack(output_v_new, assumed_align=16)
-            v_new_cute.mark_compact_shape_dynamic(
-                mode=0, stride_order=(0, 1, 2), divisibility=1
-            )
-        w_cute = None
-        if store_w:
-            w_cute = from_dlpack(output_w, assumed_align=16)
-            w_cute.mark_compact_shape_dynamic(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )
         h_cute = None
@@ -342,9 +251,6 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
                 mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
             )
         cu_seqlens_cute = from_dlpack(cu_seqlens, assumed_align=4).mark_layout_dynamic()
-        debug_timing_cute = None
-        if enable_timeline:
-            debug_timing_cute = from_dlpack(debug_timing, assumed_align=8).mark_layout_dynamic()
 
         s_in_cute = None
         if use_initial_state:
@@ -353,28 +259,13 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
                 mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
             )
 
-        s_out_cute = None
-        if store_final_state:
-            s_out_cute = from_dlpack(_output_state, assumed_align=16)
-            s_out_cute.mark_layout_dynamic().mark_compact_shape_dynamic(
-                mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
-            )
-
-        s_checkpoints_cute = None
         cu_checkpoints_cute = None
-        if enable_checkpoints:
-            s_checkpoints_cute = from_dlpack(output_checkpoints, assumed_align=16)
-            s_checkpoints_cute.mark_layout_dynamic().mark_compact_shape_dynamic(
-                mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
-            )
-        if enable_checkpoints or store_h:
+        if store_h:
             cu_checkpoints_cute = from_dlpack(
-                cu_checkpoints, assumed_align=4
+                _cu_checkpoints, assumed_align=4
             ).mark_layout_dynamic()
 
-        workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
-            num_sm, B, HQ, HV, True
-        )
+        workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(num_sm)
         workspace = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
         workspace_cute = from_dlpack(workspace, assumed_align=16)
 
@@ -385,25 +276,17 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
             q_cute,
             k_cute,
             v_cute,
-            w_rhs_cute,
             gate_cute,
             beta_cute,
             gate_out_cute,
             o_cute,
-            input_A_cute,
             A_cute,
-            v_new_cute,
-            w_cute,
             h_cute,
             cu_seqlens_cute,
             s_in_cute,
-            s_out_cute,
-            s_checkpoints_cute,
             cu_checkpoints_cute,
-            checkpoint_every_n_tokens,
             scale,
             workspace_cute,
-            debug_timing_cute,
             stream,
             options="--enable-tvm-ffi --opt-level 2",
         )
@@ -415,9 +298,7 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
     compiled = cache["compiled"]
     num_sm = cache["num_sm"]
 
-    workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
-        num_sm, B, HQ, HV, True
-    )
+    workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(num_sm)
     ws_key = f"workspace_{q.device.index}"
     if ws_key not in cache or cache[ws_key].size(0) < workspace_size:
         cache[ws_key] = torch.empty(workspace_size, dtype=torch.int8, device=q.device)
@@ -428,24 +309,16 @@ def cutedsl_fused_chunk_gdn_fwd_sm100(
         q,
         k,
         v,
-        w_rhs if w_rhs_precomputed else None,
         gate,
         beta,
         output_g if store_g else None,
         output,
-        input_A if use_input_A else None,
         output_A if store_A else None,
-        output_v_new if store_v_new else None,
-        output_w if store_w else None,
         output_h if store_h else None,
         cu_seqlens,
         _initial_state,
-        _output_state,
-        output_checkpoints,
-        cu_checkpoints,
-        checkpoint_every_n_tokens,
+        _cu_checkpoints,
         scale,
         workspace,
-        debug_timing if enable_timeline else None,
         stream,
     )
