@@ -297,12 +297,27 @@ class DpBalancedScheduler(BasePackingScheduler):
                     ):
                         vpp_needs_data[vp_stage] = True
 
+        # Only TP rank 0 reads data, so a rank that runs out must tell the others
+        # before any collective; otherwise they block in the broadcasts and gathers below.
+        # Reducing over TP, then DPxCP, then PP reaches every rank of the grid.
+        batch_list = None
+        exhausted = torch.zeros(1, dtype=torch.int32, device=dev)
+        if data_iterator is not None:
+            try:
+                batch_list = [next(data_iterator) for _ in range(num_microbatches)]
+            except StopIteration:
+                exhausted.fill_(1)
+        for group in (tp_group, dp_cp_group, pp_group):
+            torch.distributed.all_reduce(exhausted, op=torch.distributed.ReduceOp.MAX, group=group)
+        if exhausted.item():
+            raise StopIteration
+
         if data_iterator is not None:
             assert tp_group.rank() == 0, "Only TP rank 0 should have a packed data iterator"
 
-            # Step 1: Fetch batches and gather global sequence lengths
+            # Step 1: Gather global sequence lengths for the fetched batches
             batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
-                get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
+                get_batch_and_global_seqlens(iter(batch_list), num_microbatches, dp_group)
             )
 
             # Step 2: Check required sample keys
