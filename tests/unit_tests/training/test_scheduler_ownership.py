@@ -191,6 +191,7 @@ def test_consistent_options_are_accepted(run_config, train, scheduler):
     run_config.scheduler = SchedulerConfig(
         start_weight_decay=0.0, end_weight_decay=0.0, **scheduler
     )
+    run_config.optimizer.weight_decay = 0.0
     run_config.validate()
 
 
@@ -200,6 +201,7 @@ def test_skip_train_bypasses_lr_validation(run_config):
     run_config.scheduler = SchedulerConfig(
         lr_decay_samples=10, start_weight_decay=0.0, end_weight_decay=0.0
     )
+    run_config.optimizer.weight_decay = 0.0
     run_config.validate()
 
 
@@ -244,6 +246,7 @@ def test_pretrain_validates_scheduler_before_initialization(validate_at_pretrain
     run_config.scheduler = SchedulerConfig(
         lr_decay_samples=1, start_weight_decay=0.0, end_weight_decay=0.0
     )
+    run_config.optimizer.weight_decay = 0.0
     run_config.train = TrainingConfig(train_iters=10)
     with pytest.raises(AssertionError):
         training.pretrain(run_config, Mock(), None, Mock())
