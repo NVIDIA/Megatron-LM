@@ -8841,26 +8841,33 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 return RequestPromptPreparationResult(prompt=prompt, offload_params=offload_params)
 
             engine.prompt_preparer = types.SimpleNamespace(prepare_prompt=prepare_prompt)
-            futures = {}
-            for r in env.requests:
-                params = SamplingParams.deserialize(r.sampling_params.serialize())
-                message = _submit_request_message(
-                    r.request_id,
-                    params.serialize(),
-                    prompts[r.request_id],
-                    {"call_id": call_ids[r.request_id]},
-                )
-                prepared = engine._prepare_submit_request_message(message)
-                futures[r.request_id] = engine.add_request(
-                    r.request_id,
-                    msgpack.unpackb(prepared[1], raw=False),
-                    params,
-                    offload_params=msgpack.unpackb(prepared[3], raw=False),
-                )
-            return futures
+
+            async def submit():  # on the engine loop, where the coordinator path admits
+                futures = {}
+                for r in env.requests:
+                    params = SamplingParams.deserialize(r.sampling_params.serialize())
+                    message = _submit_request_message(
+                        r.request_id,
+                        params.serialize(),
+                        prompts[r.request_id],
+                        {"call_id": call_ids[r.request_id]},
+                    )
+                    prepared = engine._prepare_submit_request_message(message)
+                    futures[r.request_id] = engine.add_request(
+                        r.request_id,
+                        msgpack.unpackb(prepared[1], raw=False),
+                        params,
+                        offload_params=msgpack.unpackb(prepared[3], raw=False),
+                    )
+                return futures
+
+            return engine._loop.run_until_complete(submit())
 
         def snapshot(engine):
             return engine._loop.run_until_complete(engine.snapshot_live_requests())
+
+        def drain(engine):  # the stager's writes return, as shutdown waits for them
+            engine._loop.run_until_complete(engine._drain_staging_tasks())
 
         engine = env.engine
         wire_and_submit(engine, epoch=3, resumes={})
@@ -8872,6 +8879,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         # THE KILL. What survives: the stager's finished payloads and the framework's snapshot of
         # the live calls; together they cover every call exactly once.
+        drain(engine)
         snapshots = snapshot(engine)
         banked = {
             params["call_id"]: (payload, telemetry, True)
@@ -8913,6 +8921,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert future.done() is truth[call_ids[request_id]][2]  # served iff it had finished
         while engine.has_unfinished_requests():
             self._run_step(restarted)
+        drain(engine)
         assert snapshot(engine) == []
 
         by_call = {
