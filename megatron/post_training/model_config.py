@@ -207,14 +207,14 @@ def apply_modelopt_model_config(
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
     _check_model_type(model_config, args)
 
-    te_mcore_model = args.export_te_mcore_model
+    remap_te_layernorm = args.export_te_mcore_model
     if isinstance(model_config, HybridModelConfig):
-        if args.export_default_te_spec and te_mcore_model:
+        if args.export_default_te_spec and remap_te_layernorm:
             logger.warning(
                 "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
                 "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
             )
-            te_mcore_model = False
+            remap_te_layernorm = False
     else:
         if args.export_offline_model:
             transformer_config = model_config.transformer
@@ -240,7 +240,7 @@ def apply_modelopt_model_config(
         moe_grouped_gemm=not disable_moe_grouped_gemm,
         qad_train_target=qad_train_target,
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
-        te_mcore_model=te_mcore_model,
+        remap_te_layernorm=remap_te_layernorm,
     )
     return model_config
 

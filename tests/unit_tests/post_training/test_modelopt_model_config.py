@@ -378,14 +378,14 @@ class TestModelType:
         args = _make_args(export_te_mcore_model=True)
         config = hybrid_config_from_args(args)
         assert mc.apply_modelopt_model_config(config, args) is config
-        assert config.transformations.te_mcore_model is True
+        assert config.transformations.remap_te_layernorm is True
 
     def test_hybrid_default_te_spec_disables_remap_without_touching_args(self):
         args = _make_args(
             hybrid_layer_pattern="M*-", export_te_mcore_model=True, export_default_te_spec=True
         )
         config = mc.modelopt_model_config_from_args(args)
-        assert config.transformations.te_mcore_model is False
+        assert config.transformations.remap_te_layernorm is False
         assert config.transformations.default_te_spec is True
         assert args.export_te_mcore_model is True
 
@@ -514,7 +514,7 @@ class TestKdConvertHook:
 
     def _run(self, student_config, teacher_transformer, models):
         distillation = self._distillation(teacher_transformer)
-        hook = model_hooks.kd_convert_hook(student_config, distillation, te_mcore_model=False)
+        hook = model_hooks.kd_convert_hook(student_config, distillation, remap_te_layernorm=False)
         return hook(models)
 
     @pytest.mark.parametrize(
@@ -574,7 +574,7 @@ class TestKdConvertHookDoesNotLoadTeacherWeights:
             teacher_load="/ckpt/teacher",
             teacher_model=GPTModelConfig(transformer=student_config.transformer, vocab_size=32000),
         )
-        hook = model_hooks.kd_convert_hook(student_config, distillation, te_mcore_model=False)
+        hook = model_hooks.kd_convert_hook(student_config, distillation, remap_te_layernorm=False)
         student_stage = Mock()
 
         with (

@@ -78,10 +78,19 @@ def check_arguments(args=None):
         print_rank_0("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
 
-    if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
-        if not getattr(args, 'export_default_te_spec', False):
-            print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
-            args.moe_grouped_gemm = False
+
+def configure_moe_grouped_gemm(args, cfg):
+    """Disable grouped MoE GEMMs when the selected model spec does not support them."""
+    transformations = cfg.model.transformations
+    if (
+        getattr(args, "moe_grouped_gemm", False)
+        and transformations is not None
+        and not transformations.default_te_spec
+    ):
+        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
+        args.moe_grouped_gemm = False
+        cfg.model.transformer.moe_grouped_gemm = False
+        transformations.moe_grouped_gemm = False
 
 
 if __name__ == "__main__":
@@ -94,6 +103,7 @@ if __name__ == "__main__":
     # migrated settings use config; remaining settings still use legacy args.
     check_arguments(args)
     cfg = modelopt_inference_config_from_args(args)
+    configure_moe_grouped_gemm(args, cfg)
     set_run_config(cfg)
     initialize_megatron(training=True)
 

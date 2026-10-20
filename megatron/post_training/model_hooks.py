@@ -222,7 +222,7 @@ def _build_teacher(student_model_config, distillation, model):
     )
 
 
-def kd_convert_hook(student_model_config, distillation, te_mcore_model: bool) -> PreWrapHook:
+def kd_convert_hook(student_model_config, distillation, remap_te_layernorm: bool) -> PreWrapHook:
     """Convert each model stage into a ModelOpt ``DistillationModel`` with its teacher stage.
 
     The teacher is built by the same ``ModelBuilder`` class as the student, from the student's
@@ -236,7 +236,8 @@ def kd_convert_hook(student_model_config, distillation, te_mcore_model: bool) ->
     Args:
         student_model_config: The student ``ModelConfig``.
         distillation: The run's ``DistillationConfig`` (teacher and distillation loss).
-        te_mcore_model: Whether to register the TE state_dict key-remapping hook on the teacher.
+        remap_te_layernorm: Whether to register the TE layernorm key-remapping load hook on
+            the teacher.
     """
     def hook(models: list[MegatronModule]) -> list[MegatronModule]:
         print_rank_0("Distillation: Enabled.")
@@ -253,7 +254,7 @@ def kd_convert_hook(student_model_config, distillation, te_mcore_model: bool) ->
                 teacher_cfg=teacher_transformer,
             )
             teacher = _build_teacher(student_model_config, distillation, model)
-            if te_mcore_model:
+            if remap_te_layernorm:
                 teacher._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
 
             kd_config = {
@@ -291,11 +292,11 @@ def modelopt_pre_wrap_hook(model_config, checkpoint=None, distillation=None) -> 
         if options.qad_train_target is not None:
             register(qad_freeze_hook(options.qad_train_target))
         register(lsq_hook(options.lsq_scale_lr))
-        if options.te_mcore_model:
+        if options.remap_te_layernorm:
             register(te_load_state_dict_hook())
 
     hooks.extend(model_config.pre_wrap_hooks)
     if distillation is not None:
-        te_mcore_model = options.te_mcore_model if options else False
-        register(kd_convert_hook(model_config, distillation, te_mcore_model))
+        remap_te_layernorm = options.remap_te_layernorm if options else False
+        register(kd_convert_hook(model_config, distillation, remap_te_layernorm))
     return compose_hooks(hooks)

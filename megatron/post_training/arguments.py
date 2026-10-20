@@ -16,11 +16,6 @@ def add_modelopt_args(parser):
         "(hybrid iff set). Only needed for a hybrid model without a layer pattern.",
     )
     group.add_argument(
-        "--export-legacy-megatron",
-        action="store_true",
-        help="Export a legacy megatron-lm checkpoint.",
-    )
-    group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
         help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "

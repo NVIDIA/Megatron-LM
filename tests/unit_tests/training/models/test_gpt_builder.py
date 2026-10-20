@@ -91,7 +91,7 @@ class TestDefaultLayerSpecDispatch:
         config.transformations = ModelTransformConfig(
             force_local_attention=True,
             real_quant_cfg="fp8_real_quant",
-            te_mcore_model=True,
+            remap_te_layernorm=True,
         )
 
         result = default_layer_spec(config, vp_stage=None)
