@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Gated table masking and the host FP8 row-sharded table: decode and checkpoint bytes."""
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,3 +64,24 @@ def _worker(rank, root):
 @pytest.mark.gpus(2, min_architecture="blackwell")
 def test_host_fp8_table_matches_the_official_decode_and_checkpoints_its_bytes(tmp_path):
     torch.multiprocessing.spawn(_worker, args=(str(tmp_path),), nprocs=2)
+
+
+def _ragged_cpu(rank, root):
+    options = dict(rank=rank, world_size=2, timeout=timedelta(seconds=10))
+    dist.init_process_group("gloo", init_method=f"file://{root}/store", **options)
+    try:
+        table = ShardedFrozenTable(6, 32, dist.group.WORLD, initialize=False)
+        full = torch.arange(192).reshape(6, 32).remainder(8).to(torch.float8_e4m3fn)
+        table.embedding.weight.copy_(full.chunk(2)[rank])
+        table.embedding.scale.view(torch.uint8).fill_(127)
+        for counts in ((3, 1), (2, 0), (0, 2), (0, 0)):
+            ids = (torch.arange(counts[rank] * 24) + rank).remainder(6).reshape(-1, 1, 24)
+            actual, expected = table(ids), full.float()[ids].bfloat16()
+            assert actual.shape == expected.shape and actual.dtype == expected.dtype
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_host_table_ragged_3d_ids_including_empty_ranks(tmp_path):
+    torch.multiprocessing.spawn(_ragged_cpu, args=(str(tmp_path),), nprocs=2)
