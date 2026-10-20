@@ -82,7 +82,8 @@ def test_precision_aware_gate_and_store_param_remainders_default(
     """With FP32 main params and a non-delayed FP8 recipe, TE owns the master weights only for BF16
     params, and param remainders default to off so the checkpoints keep FP32 master weights. In
     all other configurations TE owns the master weights and param remainders default to on, except
-    with FP16 main params, where TE stores no remainders."""
+    with FP16 main params, where TE stores no remainders, and with CPU offload, whose optimizer
+    keeps FP32 master weights."""
     _skip_without_param_remainders_support()
 
     config = _config(
@@ -104,8 +105,30 @@ def test_precision_aware_gate_and_store_param_remainders_default(
     assert config.store_param_remainders is None  # The field keeps the user's intent.
     # Only takes effect where TE owns the master weights.
     assert config.resolved_store_param_remainders == (
-        not only_with_bf16_params and main_params_dtype == torch.float32
+        not only_with_bf16_params
+        and main_params_dtype == torch.float32
+        and not optimizer_cpu_offload
     )
+
+
+@pytest.mark.parametrize("store_param_remainders", [None, True])
+@pytest.mark.parametrize("fp8_recipe", [None, "delayed", "tensorwise"])
+def test_no_param_remainders_with_cpu_offload(fp8_recipe, store_param_remainders):
+    """The CPU-offloaded HybridDeviceOptimizer keeps full FP32 master weights, so the config must
+    not claim param remainders: the optimizer checkpoint format and its buffers follow this value.
+    """
+    _skip_without_param_remainders_support()
+
+    config = _config(
+        False,
+        fp8_recipe=fp8_recipe,
+        optimizer_cpu_offload=True,
+        store_param_remainders=store_param_remainders,
+        **_PAO,
+    )
+    assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+    assert not config._param_remainders_supported()
+    assert not config.resolved_store_param_remainders
 
 
 @pytest.mark.parametrize("store_param_remainders", [None, True])

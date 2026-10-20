@@ -1391,6 +1391,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
+                    if self._stores_param_remainders() and v.dtype != torch.int16:
+                        v = self._param_remainders_from_fp32(v)
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
@@ -1405,6 +1407,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if not isinstance(tensors[key], torch.Tensor):
                     continue
                 dst_tensors[key].copy_(tensors[key])
+
+    @staticmethod
+    def _param_remainders_from_fp32(remainders: torch.Tensor) -> torch.Tensor:
+        """Restore the int16 dtype of param remainders loaded through FP32 buffers.
+
+        The DP-zero and fully reshardable formats gather the parameter state in FP32 buffers,
+        which hold the int16 remainders exactly, but TE FusedAdam only accepts them as int16.
+        Values that are not int16 integers are FP32 master weights instead, which the cast would
+        silently truncate.
+        """
+        remainders_int16 = remainders.to(torch.int16)
+        if not torch.equal(remainders_int16.to(remainders.dtype), remainders):
+            raise RuntimeError(
+                "The distributed optimizer checkpoint stores full main params, but this run uses "
+                "int16 param remainders of the FP32 master weights. Set "
+                "--no-store-param-remainders to match the checkpoint, or skip loading the "
+                "optimizer state with --no-load-optim."
+            )
+        return remainders_int16
 
     def get_parameter_state_dp_reshardable(self):
         """Get internal representation of parameter state without any copies and modifications.
@@ -1822,13 +1843,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Backward compatibility: infer whether a checkpoint written before the format was recorded
         holds param remainders.
         """
-        # Such a checkpoint holds param remainders exactly when TE owned the master weights of
-        # BF16 params. That does not depend on this run's store_param_remainders or
-        # optimizer_cuda_graph, so both are ignored: an explicit store_param_remainders=False must
-        # still be detected as a mismatch, not load the remainders as FP32 master weights.
+        # Such a checkpoint holds param remainders when TE owned the master weights of BF16 params
+        # and store_param_remainders was not set to False. Those versions honored that setting
+        # but did not record it, so, like them, assume it matches this run's. optimizer_cuda_graph
+        # is ignored: with param remainders, those versions failed to construct the optimizer.
         return bool(
             self.config._te_master_weights_in_checkpoint_without_format()
             and self.config._param_remainders_supported()
+            and self.config.store_param_remainders is not False
         )
 
     def _param_groups_to_param2group_meta(

@@ -205,15 +205,14 @@ class OptimizerConfig:
 
         None (default) defaults to False when:
             - FP32 main params and
-            - a non-delayed FP8 recipe and
-            - no optimizer_cpu_offload.
+            - a non-delayed FP8 recipe
         and True in all other cases.
 
-        This is for backwards-compatibility for checkpoints written when this condition applies 
-        by Megatron Core versions that did not record the master weight format. 
+        This is for backwards-compatibility for checkpoints written when this condition applies
+        by Megatron Core versions that did not record the master weight format.
         Such versions did not enable store_param_remainders. Explicitly setting this flag to True
         saves memory, but makes old optimizer checkpoints incompatible.
-        Only takes effect with BF16 model params and FP32 main params.
+        Only takes effect with BF16 model params, FP32 main params and no optimizer_cpu_offload.
         The value in effect is the resolved_store_param_remainders property.
     """
 
@@ -483,10 +482,17 @@ class OptimizerConfig:
         return self._te_owns_master_weights(fp8_param_gather=True)
 
     def _param_remainders_supported(self) -> bool:
-        """Whether TE FusedAdam stores param remainders when asked to, wherever it owns the master
-        weights. It needs BF16 params, whose 16 bits the remainders complete, and FP32 master
-        weights: with FP16 master weights it silently ignores store_param_remainders."""
-        return self.bf16 and self.main_params_dtype == torch.float32 and is_te_min_version("2.1.0")
+        """Whether the precision-aware optimizer stores param remainders when asked to, wherever it
+        owns the master weights. TE FusedAdam needs BF16 params, whose 16 bits the remainders
+        complete, and FP32 master weights: with FP16 master weights it silently ignores
+        store_param_remainders. The CPU-offloaded HybridDeviceOptimizer always keeps full FP32
+        master weights."""
+        return (
+            self.bf16
+            and self.main_params_dtype == torch.float32
+            and not self.optimizer_cpu_offload
+            and is_te_min_version("2.1.0")
+        )
 
     @property
     def resolved_store_param_remainders(self) -> bool:
