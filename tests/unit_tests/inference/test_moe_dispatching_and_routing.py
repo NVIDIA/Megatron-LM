@@ -726,6 +726,11 @@ class TestNVLSAllGatherVDispatcher:
                 graph_output = _run_expert_and_combine()
 
             graph.replay()
+            expected = graph_output.clone()
+            graph.replay()
+            assert torch.equal(
+                graph_output.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+            )
 
         assert used_rsv["value"]
         assert ordered_calls["value"] > 0
@@ -926,7 +931,10 @@ class TestNVLSAllGatherVDispatcher:
                 with InferenceMode.active():
                     inference_output, _ = layer(hidden_states.clone())
 
-        torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+        assert torch.equal(
+            inference_output.contiguous().view(torch.uint8),
+            training_output.contiguous().view(torch.uint8),
+        )
 
     @pytest.mark.parametrize("mxfp8_swiglu", [False, True])
     def test_ep_invariant_combine_moe_matches_training(self, mxfp8_swiglu):

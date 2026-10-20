@@ -176,14 +176,20 @@ def test_training_unpermute_backward(monkeypatch):
     probs = torch.rand(tokens, experts, device="cuda")
     grad = torch.randn(tokens, hidden, device="cuda")
     outs = []
-    for on in (True, None):
+    outputs = []
+    for on in (True, None, True):
         r = rows.clone().requires_grad_()
         p = probs.clone().requires_grad_()
         out = _unpermute(r, inverse_map, experts, 2, monkeypatch, on, p)
+        outputs.append(out.detach().clone())
         outs.append(torch.autograd.grad(out, (r, p), grad))
     # The tree has the gradient of the plain sum.
     torch.testing.assert_close(outs[0][0], outs[1][0], rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(outs[0][1], outs[1][1], rtol=1e-5, atol=1e-5)
+    # Replaying the new tree must preserve every bit of the output and both gradients.
+    assert torch.equal(_bits(outputs[0]), _bits(outputs[2]))
+    for first, replay in zip(outs[0], outs[2]):
+        assert torch.equal(_bits(first), _bits(replay))
 
 
 @needs_cuda
