@@ -14,7 +14,7 @@ disabling autograd; this also changes the grad-enabled CP1 layout.
 
 ## Example
 
-Use a distributed launcher, release BF16 weights and its compressed token map:
+Use a distributed launcher, native release weights and its compressed token map:
 
 ```python
 from megatron.lite.runtime import create_runtime
@@ -31,11 +31,11 @@ handle = create_runtime(RuntimeConfig(backend="mlite", backend_cfg=backend)).bui
 
 Acceptance generates small random release-format safetensors (FP4 experts, FP8
 matrices with E8M0 scales, and native unquantized roles), then uses the strict
-loader. No preconverted BF16 weights are read or written. P40E is report-only.
+loader. No preconverted weights are needed for training. P40E is report-only.
 GPU attention tests use `CUBLAS_WORKSPACE_CONFIG=:4096:8`,
 `torch.use_deterministic_algorithms(True, warn_only=True)` and
-`impl_cfg.deterministic_mode=True`. Attention CP2/CP1 forward and input/KV/parameter
-backward gradients must be bitwise equal after CP reduction; whole-model CP is
+`impl_cfg.deterministic_mode=True`. Ratio-0/1 attention CP2/CP1 forward is bitwise equal; ratio-2 forward
+and all CP backward comparisons report rounding differences. Whole-model CP is
 report-only. Main attention gradients must be nonzero and finite.
 The 24-step random SFT gate freezes data, seed and calibrated Adam learning rate;
 last-seven mean loss must be at most 0.8 times first-seven. DCP restores persistent
@@ -54,3 +54,14 @@ Set `DS41_RUN_OFFICIAL_REFERENCE=1` and `DS41_REFERENCE_DIR` to its directory,
 then run `pytest experimental/lite/tests/unit/deepseek_v41/test_ratio_one.py`.
 Without opt-in these tests skip explicitly; once enabled, missing/wrong source
 fails. The oracle checks candidate/selection AST semantics, not model numerics.
+
+## Export
+
+`protocol.export_hf_weights(chunks, config, parallel_state)` streams HF/BF16
+weights by default; `target="release"` selects FP8 32x32 UE8M0 / MXFP4 storage.
+`protocol.save_hf_weights(chunks, path, config, parallel_state, target="release")`
+writes bounded HF shards. Every rank must participate, including EP/PP owners.
+Frozen Engram tables retain FP8/E8M0 storage and stream bounded row chunks.
+Online consumers may use `include_frozen=False` to omit unchanged tables.
+Native export is canonical and reload-idempotent; its decoded values obey
+quantization rounding bounds, but original release bytes need not be reproduced.

@@ -250,3 +250,15 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
     from megatron.lite.model.deepseek_v41.lite.checkpoint import load_hf_weights as load
 
     return load(chunk, hf_path, model_cfg, ps)
+
+
+def export_hf_weights(chunks, model_cfg, ps, **kwargs):
+    from megatron.lite.model.deepseek_v41.lite.export import export_hf_weights as export
+
+    yield from export(chunks, model_cfg, ps, **kwargs)
+
+
+def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
+    from megatron.lite.model.deepseek_v41.lite.export import save_hf_weights as save
+
+    save(chunks, path, model_cfg, ps, **kwargs)
