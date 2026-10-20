@@ -825,8 +825,12 @@ class MoELayer(BaseMoELayer):
         def wrapped_forward(*args, **kwargs):
             nonlocal num_calls
             num_calls += 1
-            self.token_dispatcher.skip_combine_forward_comm = num_calls > 1
-            self._combined_latent = combined_latent
+            # The first backward consumes the latent cache. A retained graph can
+            # run backward again: communicate normally then, without retaining a
+            # new activation or its recomputed autograd graph.
+            skip_combine = num_calls > 1 and (combined_latent is None or bool(combined_latent))
+            self.token_dispatcher.skip_combine_forward_comm = skip_combine
+            self._combined_latent = combined_latent if num_calls == 1 or skip_combine else None
             try:
                 return forward_fn(*args, **kwargs)
             finally:

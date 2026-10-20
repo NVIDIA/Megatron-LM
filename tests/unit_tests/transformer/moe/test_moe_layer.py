@@ -509,11 +509,26 @@ class TestMoELayerRecomputeSkipsCombineComm:
             moe_layer.zero_grad(set_to_none=True)
             hidden_states.grad = None
             output, _ = moe_layer(hidden_states)
+            repeat_backward = latent == "latent_norm" and tp_size == ep_size == 1
             with pytest.MonkeyPatch.context() as mp:
                 counts = self._count_collectives(mp)
-                output.backward(output_grad)
+                output.backward(output_grad, retain_graph=repeat_backward)
             grads = {name: p.grad.clone() for name, p in moe_layer.named_parameters()}
-            return output.detach().clone(), hidden_states.grad.clone(), grads, dict(counts)
+            input_grad = hidden_states.grad.clone()
+            if repeat_backward:
+                moe_layer.zero_grad(set_to_none=True)
+                hidden_states.grad = None
+                output.backward(output_grad)
+                assert torch.equal(
+                    input_grad.contiguous().view(torch.uint8),
+                    hidden_states.grad.contiguous().view(torch.uint8),
+                )
+                for name, param in moe_layer.named_parameters():
+                    assert torch.equal(
+                        grads[name].contiguous().view(torch.uint8),
+                        param.grad.contiguous().view(torch.uint8),
+                    ), name
+            return output.detach().clone(), input_grad, grads, dict(counts)
 
         output, input_grad, grads, counts = forward_backward()
         assert not moe_layer.token_dispatcher.skip_combine_forward_comm
@@ -523,11 +538,18 @@ class TestMoELayerRecomputeSkipsCombineComm:
         monkeypatch.setattr(MoELayer, "_skip_combine_comm_on_recompute", lambda self, fn: fn)
         ref_output, ref_input_grad, ref_grads, ref_counts = forward_backward()
 
-        assert torch.equal(output, ref_output)
-        assert torch.equal(input_grad, ref_input_grad)
+        assert torch.equal(
+            output.contiguous().view(torch.uint8), ref_output.contiguous().view(torch.uint8)
+        )
+        assert torch.equal(
+            input_grad.contiguous().view(torch.uint8), ref_input_grad.contiguous().view(torch.uint8)
+        )
         assert grads.keys() == ref_grads.keys()
         for name in grads:
-            assert torch.equal(grads[name], ref_grads[name]), name
+            assert torch.equal(
+                grads[name].contiguous().view(torch.uint8),
+                ref_grads[name].contiguous().view(torch.uint8),
+            ), name
 
         # Exactly the forward collectives of the combine are skipped in the backward pass.
         if moe_token_dispatcher_type == "alltoall":

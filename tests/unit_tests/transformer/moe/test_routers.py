@@ -180,7 +180,9 @@ def test_checkpointed_forward_routes_like_its_recompute():
         tp_random._unset_checkpointing()
     recompute_probs, recompute_indices = route()
     assert torch.equal(forward_indices, recompute_indices)
-    assert torch.equal(forward_probs, recompute_probs)
+    assert torch.equal(
+        forward_probs.contiguous().view(torch.uint8), recompute_probs.contiguous().view(torch.uint8)
+    )
 
 
 class _ProcessGroup:
