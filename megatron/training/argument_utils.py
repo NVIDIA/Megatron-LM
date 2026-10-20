@@ -408,7 +408,7 @@ def core_transformer_config_from_args(args, config_class=None):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
-    kw_args['pipeline_dtype'] = args.optimizer.params_dtype
+    kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     if kw_args.get('hash_moe_vocab_size') is None:
@@ -438,7 +438,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['num_query_groups'] = args.num_query_groups
     else:
         kw_args['num_query_groups'] = None
-    kw_args['config_logger_dir'] = args.optimizer.config_logger_dir
+    kw_args['config_logger_dir'] = args.config_logger_dir
     if args.rope_type is None:
         # Pop 'rope_type' to let the config class use the default value.
         kw_args.pop('rope_type', None)
