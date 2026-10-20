@@ -292,7 +292,7 @@ class OptimizerConfig:
     mode runs there with zero communication and zero redundancy, and reverse all_to_all
     stages scatter the result back to the original shards. layer_sharded requires
     optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
-    (split-QKV Newton-Schulz is not implemented on the layer-sharded path); __post_init__
+    (split-QKV Newton-Schulz is not implemented on the layer-sharded path); validate_run
     checks all three. Defaults to "duplicated"."""
 
     muon_use_syrk: bool = False
@@ -422,23 +422,17 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
-    def __post_init__(self):
-        """Check the validity of the config."""
-
-        # The following condition is used to avoid repetition in distrib_optimizer.py.
-        # This is because in distrib_optimizer.py, the process to handle parameters are
-        # different for different training precision settings. FP8 cases require different
-        # handling while FP8 delayed scaling is an exception because the Adam optimizer in
-        # TransformerEngine supports it in the kernel computation.
-        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
-        self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
-            self.use_precision_aware_optimizer
-            and (
-                self.main_params_dtype != torch.float32
-                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
-            )
-        )
+    def validate_run(
+        self,
+        *,
+        ddp_config: "DistributedDataParallelConfig",
+        use_torch_fsdp2: bool,
+        moe_single_grouped_weight: bool,
+        virtual_pipeline_model_parallel_size: int | None,
+        ckpt_format: str | None,
+    ) -> None:
+        if self.lr is not None and self.min_lr is not None:
+            assert self.min_lr <= self.lr
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
@@ -481,66 +475,53 @@ class OptimizerConfig:
                     "set muon_split_qkv=False."
                 )
 
+        # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
+        fp32 = (torch.float32, 'fp32')
         if self.use_precision_aware_optimizer:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
-            if not is_te_min_version("2.1.0"):
-                self.store_param_remainders = False
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
             # --use-precision-aware-optimizer.
             # TODO: Remove this check when apex's FusedAdam is no longer used.
-            if self.optimizer_cpu_offload:
-                return
-            try:
-                import inspect
+            if not self.optimizer_cpu_offload:
+                try:
+                    import inspect
 
-                # TODO: Move this below?
-                from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+                    # TODO: Move this below?
+                    from transformer_engine.pytorch.optimizers import FusedAdam as Adam
 
-                adam_args = inspect.signature(Adam).parameters
-                arg_names = [
-                    'master_weight_dtype',
-                    'exp_avg_dtype',
-                    'exp_avg_sq_dtype',
-                    'use_decoupled_grad',
-                ]
-                for name in arg_names:
-                    assert name in adam_args, (
-                        "Current FusedAdam of TE doesn't support --use-precision-aware-optimizer, "
-                        "please update TE version."
+                    adam_args = inspect.signature(Adam).parameters
+                    arg_names = [
+                        'master_weight_dtype',
+                        'exp_avg_dtype',
+                        'exp_avg_sq_dtype',
+                        'use_decoupled_grad',
+                    ]
+                    for name in arg_names:
+                        assert name in adam_args, (
+                            "Current FusedAdam of TE doesn't support "
+                            "--use-precision-aware-optimizer, please update TE version."
+                        )
+                except ImportError:
+                    raise RuntimeError(
+                        '--use-precision-aware-optimizer requires FusedAdam from '
+                        'TransformerEngine, but not found.'
                     )
-            except ImportError:
-                raise RuntimeError(
-                    '--use-precision-aware-optimizer requires FusedAdam from TransformerEngine, '
-                    'but not found.'
-                )
         else:
             assert (
-                self.main_grads_dtype == torch.float32
+                self.main_grads_dtype in fp32
             ), "main_grads_dtype can only be fp32 when not using precision-aware optimizer"
             assert (
-                self.main_params_dtype == torch.float32
+                self.main_params_dtype in fp32
             ), "main_params_dtype can only be fp32 when not using precision-aware optimizer"
             assert (
-                self.exp_avg_dtype == torch.float32
+                self.exp_avg_dtype in fp32
             ), "exp_avg_dtype can only be fp32 when not using precision-aware optimizer"
             assert (
-                self.exp_avg_sq_dtype == torch.float32
+                self.exp_avg_sq_dtype in fp32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
-
-    def validate_run(
-        self,
-        *,
-        ddp_config: "DistributedDataParallelConfig",
-        use_torch_fsdp2: bool,
-        moe_single_grouped_weight: bool,
-        virtual_pipeline_model_parallel_size: int | None,
-        ckpt_format: str | None,
-    ) -> None:
-        if self.lr is not None and self.min_lr is not None:
-            assert self.min_lr <= self.lr
 
         # Optimizer CPU offload check
         if self.optimizer_cpu_offload:
@@ -580,16 +561,6 @@ class OptimizerConfig:
             "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
         )
 
-        # Checked OUTSIDE the emerging-optimizer block below: with --optimizer
-        # sgd/adam that block is skipped entirely, which would silently ignore the
-        # mode — the one case where the loud failure matters most.
-        if self.muon_tp_mode == 'layer_sharded':
-            assert self.optimizer in ('muon', 'dist_muon'), (
-                f"--muon-tp-mode layer_sharded is only supported with --optimizer muon "
-                f"(got --optimizer {self.optimizer}). Other optimizers, including "
-                "adaptive_muon, do not implement layer sharding."
-            )
-
         if self.use_distributed_optimizer:
             assert not use_torch_fsdp2, \
                 "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
@@ -622,6 +593,24 @@ class OptimizerConfig:
         self.main_params_dtype = map_dtype(self.main_params_dtype)
         self.exp_avg_dtype = map_dtype(self.exp_avg_dtype)
         self.exp_avg_sq_dtype = map_dtype(self.exp_avg_sq_dtype)
+
+        if self.use_precision_aware_optimizer and not is_te_min_version("2.1.0"):
+            self.store_param_remainders = False
+
+        # The following condition is used to avoid repetition in distrib_optimizer.py.
+        # This is because in distrib_optimizer.py, the process to handle parameters are
+        # different for different training precision settings. FP8 cases require different
+        # handling while FP8 delayed scaling is an exception because the Adam optimizer in
+        # TransformerEngine supports it in the kernel computation.
+        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
+        self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
+            self.use_precision_aware_optimizer
+            and (
+                self.main_params_dtype != torch.float32
+                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                or self.optimizer_cpu_offload
+            )
+        )
 
         # emerging optimizer check
         if self.optimizer not in ('sgd', 'adam'):
