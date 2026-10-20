@@ -1,17 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import warnings
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from megatron.core.inference.utils import (
-    Counter,
-    detokenize_tokens,
-    get_language_model,
-    resolve_logits_dtype,
-)
+from megatron.core.inference.utils import Counter, detokenize_tokens, get_language_model
 from megatron.core.models.common.language_module.language_module import LanguageModule
 
 
@@ -81,51 +75,28 @@ class TestInferenceUtils:
             object() if general_gemm else None,
         )
 
-    @pytest.mark.parametrize("multimodal", [False, True])
     @pytest.mark.parametrize(
-        "logit_dtype, requested, mxfp8, general_gemm, expected, warns",
+        "params_dtype, mxfp8, general_gemm, expected",
         [
-            (None, None, False, True, torch.bfloat16, False),  # None: the head's own dtype ...
-            (torch.float32, None, False, True, torch.float32, False),  # ... set by `logit_dtype`
-            (None, torch.float32, False, True, torch.float32, False),  # honored via general_gemm
-            (torch.float32, torch.bfloat16, False, True, torch.bfloat16, False),  # input dtype
-            (None, torch.float32, False, False, torch.bfloat16, True),  # no general_gemm
-            (None, torch.float32, True, True, torch.bfloat16, True),  # MXFP8 output projection
-        ],
-    )
-    def test_resolve_logits_dtype(
-        self, monkeypatch, multimodal, logit_dtype, requested, mxfp8, general_gemm, expected, warns
-    ):
-        """`requested` wins when the head can emit it: always for the GEMM input dtype, through
-        TE general_gemm otherwise, never from the MXFP8 output projection. The fallback is the
-        language model's `logit_dtype`, else `params_dtype`, read through a multimodal wrapper."""
-        language_model = torch.nn.Linear(2, 2)
-        language_model.logit_dtype = logit_dtype
-        model = _Wrapper(language_model) if multimodal else language_model
-        model_config = SimpleNamespace(params_dtype=torch.bfloat16)
-        self._head_capabilities(monkeypatch, mxfp8, general_gemm)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            assert resolve_logits_dtype(model, model_config, requested) is expected
-        assert len([w for w in caught if "keeps the logits" in str(w.message)]) == int(warns)
-
-    @pytest.mark.parametrize(
-        "requested, general_gemm, expected",
-        [
-            (torch.float32, True, torch.float32),  # asked and able
-            (torch.bfloat16, False, torch.bfloat16),  # the input dtype needs nothing
-            (torch.float32, False, None),  # unable: the head keeps its own dtype
-            (None, True, None),  # nothing asked
+            (torch.bfloat16, False, True, torch.float32),  # general_gemm emits fp32 from bf16
+            (torch.float32, False, False, torch.float32),  # an fp32 head needs nothing
+            (torch.bfloat16, False, False, None),  # no general_gemm: the head keeps bf16
+            (torch.bfloat16, True, True, None),  # the MXFP8 output projection emits its input dtype
         ],
     )
     def test_language_module_inference_logits_dtype(
-        self, monkeypatch, requested, general_gemm, expected
+        self, monkeypatch, params_dtype, mxfp8, general_gemm, expected
     ):
-        """The model-side half of the contract: the head asks its output layer for the context's
-        `logits_dtype` exactly when `resolve_logits_dtype` would honor it, and for nothing
-        without a context."""
-        self._head_capabilities(monkeypatch, mxfp8=False, general_gemm=general_gemm)
-        head = SimpleNamespace(config=SimpleNamespace(params_dtype=torch.bfloat16))
-        context = SimpleNamespace(config=SimpleNamespace(logits_dtype=requested))
-        assert LanguageModule.inference_logits_dtype(head, context) is expected
-        assert LanguageModule.inference_logits_dtype(head, None) is None
+        """Under an inference context the head asks its output layer for fp32 exactly when it can
+        emit it (`lm_head_can_emit`); outside inference it asks for nothing."""
+        monkeypatch.setattr(
+            "megatron.core.fp8_utils.is_mxfp8_output_proj_active", lambda config: mxfp8
+        )
+        monkeypatch.setattr(
+            "megatron.core.extensions.transformer_engine.te_general_gemm",
+            object() if general_gemm else None,
+        )
+        head = object.__new__(LanguageModule)
+        object.__setattr__(head, "config", SimpleNamespace(params_dtype=params_dtype))
+        assert head.inference_logits_dtype(SimpleNamespace()) is expected
+        assert head.inference_logits_dtype(None) is None

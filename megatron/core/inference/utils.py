@@ -5,13 +5,12 @@ import contextlib
 import logging
 import multiprocessing
 import sys
-import warnings
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from megatron.core.utils import accepts_parameter, get_model_config, unwrap_model
+from megatron.core.utils import accepts_parameter, get_model_config
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -72,25 +71,6 @@ def lm_head_can_emit(model_config: "TransformerConfig", dtype: torch.dtype) -> b
     from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 
     return te_general_gemm is not None and not is_mxfp8_output_proj_active(model_config)
-
-
-def resolve_logits_dtype(
-    model: torch.nn.Module, model_config: "TransformerConfig", requested: Optional[torch.dtype]
-) -> torch.dtype:
-    """The dtype inference logits come out in: `requested` when the LM head can emit it, else the
-    head's own output dtype (its `logit_dtype`, else `params_dtype`), with a warning."""
-    native = getattr(get_language_model(unwrap_model(model)), "logit_dtype", None)
-    if native is None:
-        native = model_config.params_dtype
-    if requested is None:
-        return native
-    if requested == native or lm_head_can_emit(model_config, requested):
-        return requested
-    warnings.warn(
-        f"Inference keeps the logits in {native}: the LM head cannot emit {requested}, which "
-        "needs Transformer Engine general_gemm and is beyond the MXFP8 output projection."
-    )
-    return native
 
 
 def model_eos_token_ids(tokenizer: Any) -> frozenset:
