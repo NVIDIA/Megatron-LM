@@ -57,6 +57,16 @@ def validate_offload_params(offload_params) -> Optional[str]:
     return None
 
 
+def parse_stream_options(req) -> bool:
+    """Return `stream_options.include_usage`; a non-object `stream_options` is a ValueError."""
+    stream_options = req.get("stream_options")
+    if stream_options is None:
+        return False
+    if not isinstance(stream_options, dict):
+        raise ValueError("'stream_options' must be an object")
+    return bool(stream_options.get("include_usage", False))
+
+
 def apply_optional_sampling_default(app_config, config_key, value) -> None:
     """Set `app_config[config_key]` only when `value` was actually provided.
 

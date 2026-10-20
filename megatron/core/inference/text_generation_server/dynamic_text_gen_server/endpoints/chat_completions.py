@@ -45,6 +45,7 @@ from .common import (
     failed_requests_response,
     generation_finish_reason,
     parse_sampling_params,
+    parse_stream_options,
     reply_prompt_length,
     run_inference,
     sampling_params_for_choice,
@@ -1079,7 +1080,7 @@ class _ChatRequestOptions:
 
     @classmethod
     def from_request(cls, req, app_config):
-        """Read the options off the request body, applying the server's defaults."""
+        """Read the options off the request body; a malformed field raises ValueError."""
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         chat_template_kwargs = _sanitize_chat_template_kwargs(req.get("chat_template_kwargs"))
@@ -1092,13 +1093,7 @@ class _ChatRequestOptions:
         prevent_retokenization = req.get(
             "prevent_retokenization", not app_config.get("eval_mode", False)
         )
-        # Tolerate a malformed `stream_options` instead of 500ing requests that carry one.
-        stream_options = req.get("stream_options")
-        include_usage = (
-            bool(stream_options.get("include_usage", False))
-            if isinstance(stream_options, dict)
-            else False
-        )
+        include_usage = parse_stream_options(req)
         return cls(
             tools=tools,
             tool_choice=tool_choice,
@@ -1353,7 +1348,10 @@ try:
         offload_params_error = validate_offload_params(offload_params)
         if offload_params_error is not None:
             return Response(offload_params_error, status=400)
-        options = _ChatRequestOptions.from_request(req, current_app.config)
+        try:
+            options = _ChatRequestOptions.from_request(req, current_app.config)
+        except ValueError as error:
+            return Response(str(error), status=400)
 
         # --- 1. Parse Messages ---
         messages = req.get("messages")

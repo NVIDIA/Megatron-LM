@@ -320,6 +320,7 @@ _COMPLETIONS_DEFAULTS = {
                 "add_BOS": None,
                 "ignore_eos": None,
                 "streaming_interval": None,
+                "stream_options": None,
             },
             {},
             _CHAT_DEFAULTS,
@@ -338,6 +339,7 @@ _COMPLETIONS_DEFAULTS = {
                 "include_stop_str_in_output": None,
                 "ignore_eos": None,
                 "streaming_interval": None,
+                "stream_options": None,
             },
             {},
             _COMPLETIONS_DEFAULTS,
@@ -440,14 +442,6 @@ _COMPLETIONS_DEFAULTS = {
                 "streaming_interval": 2,
             },
             id="completions-max-tokens-stop-string-ignore-eos",
-        ),
-        # Only a streaming request reads stream_options; junk there is ignored otherwise.
-        pytest.param(
-            CHAT_PATH,
-            {"stream_options": ["include_usage"]},
-            {},
-            _CHAT_DEFAULTS,
-            id="chat-non-dict-stream-options-ignored",
         ),
     ],
 )
@@ -846,6 +840,32 @@ async def sse_payloads(response):
         json.loads(record.removeprefix("data: ")) for record in records[: -1 if done else None]
     ]
     return payloads, done
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+@pytest.mark.parametrize(
+    "stream_options",
+    # A truthy non-object used to fail the handler after the streams were submitted, stranding
+    # them on the engine; a falsy one was silently read as "no usage". Both are rejected before
+    # anything is submitted, streaming or not.
+    [["include_usage"], False],
+    ids=["list", "false"],
+)
+async def test_non_object_stream_options_are_rejected_before_submission(
+    path, stream, stream_options, monkeypatch
+):
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(
+        path, json={**BODIES[path], "stream": stream, "stream_options": stream_options}
+    )
+
+    assert response.status_code == 400
+    assert await response.get_data(as_text=True) == "'stream_options' must be an object"
+    assert client.prompt_tokens == []  # nothing reached the engine
 
 
 @pytest.mark.asyncio
