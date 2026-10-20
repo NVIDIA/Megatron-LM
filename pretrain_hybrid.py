@@ -123,6 +123,7 @@ def get_batch(data_iterator, vp_stage=None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
+            config=config,
         )
         return ContextParallelBatch.from_single_layout(
             config.linear_cp_layout,

@@ -99,6 +99,18 @@ wired into custom training loops. The trade-off is that it requires more manual 
 Megatron-LM's stock training loop already wires these calls in `megatron/training/training.py`,
 but custom training scripts must do the same work themselves.
 
+For scheduler-produced THD batches, use `--use-varlen-dataset`,
+`--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
+`--pad-packed-seq-alignment max`, and an explicit `--thd-max-packed-sequences`. The metadata capacity includes one
+reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
+fixed local token capacity; the source global batch size and micro-batch size 1
+must stay fixed. PP/VPP also requires `--cuda-graph-dynamic-microbatches`, which
+keeps graph inputs alive until their corresponding backward even when packing
+reduces the number of microbatches. Dynamic CP, EP communication overlap, delayed
+wgrad, and paged stash are outside this path. mHC wrappers and attention graph
+splitting require their separate graph integrations; these packing options do
+not enable mHC capture by themselves.
+
 ### Usage
 
 ```bash
