@@ -215,6 +215,7 @@ def dynamic_sparse_attention(
     inference_context: BaseInferenceContext,
     index_topk: int,
     softmax_scale: float,
+    backend: str = "triton",
 ) -> torch.Tensor:
     """Simplified-DSA attention over paged caches for a decode, prefill, or mixed batch.
 
@@ -233,6 +234,7 @@ def dynamic_sparse_attention(
         inference_context: Dynamic inference context for this step.
         index_topk: Number of keys each query attends to.
         softmax_scale: Attention softmax scale.
+        backend: ``triton`` (Megatron's kernels) or ``flashinfer`` (``dsa_gqa_flashinfer``).
 
     Returns:
         Attention output ``[T,1,Hq*Dv]``; rows for padding tokens are zero.
@@ -255,6 +257,30 @@ def dynamic_sparse_attention(
     max_context_length = inference_context.active_attn_metadata["mha_metadata"].state_data[
         "max_seqlen_k"
     ]
+    if backend == "flashinfer":
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+        if not dsa_gqa_flashinfer.flashinfer_dsa_supported(
+            query.device, index_topk, index_query.size(-1), key_cache.size(1), num_query_heads
+        ):
+            raise RuntimeError(
+                "dsa_inference_backend='flashinfer' needs FlashInfer with DSA kernels, CuTe DSL "
+                "4.7+, FA4, DeepSelect and Triton on SM100/SM103, top-k 512/1024/2048, indexer "
+                "dim 128, and a KV block size that is a multiple of 64."
+            )
+        output = dsa_gqa_flashinfer.flashinfer_sparse_attention(
+            query=query[:, 0],
+            key_cache=key_cache,
+            value_cache=value_cache,
+            index_query=index_query.reshape(num_tokens, -1),
+            index_key_cache=index_key_cache,
+            block_table=block_table.to(torch.int32),
+            # The configured bound, eager or graphed: FlashInfer compiles per launch shape.
+            plan=inference_context.dsa_flashinfer_plan(inference_context.max_sequence_length),
+            index_topk=index_topk,
+            softmax_scale=softmax_scale,
+        )
+        return output.view(num_tokens, 1, num_query_heads * value_cache.size(-1))
     output = _sparse_attention_rows(
         query=query[:, 0],
         key_cache=key_cache,
