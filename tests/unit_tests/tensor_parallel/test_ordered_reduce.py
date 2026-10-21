@@ -72,6 +72,11 @@ class TestOrderedReduce:
         self.group = get_tensor_model_parallel_group_if_none(tp_group=None)
 
     def teardown_method(self, method):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        torch.cuda.synchronize()
+        SymmetricMemoryManager.destroy()
+        orr._PEER_VIEWS.clear()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("exact", [False, True])
@@ -154,6 +159,27 @@ class TestOrderedReduce:
                 orr.symm_ordered_all_reduce(ar, sin, hdl, exact=exact)
                 ref_ar = orr.ordered_all_reduce(x, self.group, exact=exact)
                 assert torch.equal(_bits(ar), _bits(ref_ar))
+
+    @pytest.mark.parametrize("exact", [False, True])
+    def test_symmetric_push_matches_all_to_all(self, exact, monkeypatch):
+        """The learner's symmetric-memory push RS gives the all-to-all path's bits.
+
+        Sizes span one to several staging iterations per block and a ragged tail.
+        """
+        if orr._push_staging(self.group, torch.empty(1, device="cuda")) is None:
+            pytest.skip("symmetric memory is not available")
+        for dtype in (torch.bfloat16, torch.float32):
+            for rows, hidden in ((4, 2688), (12, 1000), (2048, 8192), (8192, 4096)):
+                x = _partials((rows, hidden), dtype, seed=rows + hidden + 1)
+                push = orr.ordered_reduce_scatter(x, self.group, exact=exact)
+                monkeypatch.setattr(orr, "USE_SYMM_PUSH", False)
+                a2a = orr.ordered_reduce_scatter(x, self.group, exact=exact)
+                monkeypatch.setattr(orr, "USE_SYMM_PUSH", True)
+                assert torch.equal(_bits(push), _bits(a2a))
+                ref = _left_fold(_all_partials(x, self.group), exact)
+                k = rows // TP
+                rank = self.group.rank()
+                assert torch.equal(_bits(push), _bits(ref[rank * k : (rank + 1) * k]))
 
     def test_cuda_graph_capture(self):
         x = _partials((256, 4096), torch.bfloat16, seed=5)

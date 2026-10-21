@@ -22,6 +22,11 @@ Paths:
   * all-to-all + fold (any group, NCCL): one ``all_to_all_single`` of the partials
     (the bytes a ring reduce-scatter moves, (TP-1)/TP of the input per rank) and one
     Triton pass that reads the TP partials of the owned rows and writes the output dtype.
+  * symmetric-memory push (training, NVLink): the partials are in ordinary memory (the TE
+    GEMM output). One kernel stores each peer's rows into that peer's fixed-size symmetric
+    staging buffer (chunked, double-buffered, one block-level barrier per chunk) and folds
+    the staged partials in rank order. No receive buffer of the input's size, no NCCL.
+    Falls back to all-to-all + fold for uneven splits or without symmetric memory.
   * symmetric-memory pull (inference, NVLink): the partials are already in a symmetric
     buffer; one kernel barriers through the signal pad, reads the owned slice (RS) or
     everything (one-shot AR) from every peer with plain loads (not multimem, whose
@@ -186,6 +191,167 @@ def _ordered_pull_kernel(
     )
 
 
+@triton.jit
+def _peer_ptr(
+    d: tl.constexpr, p0, p1, p2, p3, p4, p5, p6, p7
+):  # pylint: disable=too-many-return-statements
+    """The d-th of the peer pointers (d is a compile-time constant)."""
+    if d == 0:
+        return p0
+    elif d == 1:
+        return p1
+    elif d == 2:
+        return p2
+    elif d == 3:
+        return p3
+    elif d == 4:
+        return p4
+    elif d == 5:
+        return p5
+    elif d == 6:
+        return p6
+    else:
+        return p7
+
+
+@triton.jit
+def _push_chunk(
+    src_ptr,
+    s0,
+    s1,
+    s2,
+    s3,
+    s4,
+    s5,
+    s6,
+    s7,
+    n,
+    block_start,
+    slot,
+    pid,
+    nb,
+    lane,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Store this rank's partial of output chunk [block_start, +BLOCK) into every peer's staging."""
+    offs = block_start + lane
+    mask = offs < n
+    stage_base = ((slot * nb + pid) * WORLD_SIZE).to(tl.int64) * BLOCK
+    for d in tl.static_range(WORLD_SIZE):
+        if d != RANK:
+            val = tl.load(src_ptr + d * n + offs, mask=mask)
+            dst = _peer_ptr(d, s0, s1, s2, s3, s4, s5, s6, s7)
+            tl.store(dst + stage_base + RANK * BLOCK + lane, val, mask=mask)
+
+
+@triton.jit
+def _ordered_push_fold_kernel(
+    src_ptr,
+    s0,
+    s1,
+    s2,
+    s3,
+    s4,
+    s5,
+    s6,
+    s7,
+    out_ptr,
+    signal_pad_ptrs,
+    n,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ACC_FP64: tl.constexpr,
+    ROUND_FP32: tl.constexpr,
+):
+    """Reduce-scatter of a local (non-symmetric) tensor through symmetric staging buffers.
+
+    src holds this rank's partial of all WORLD_SIZE output slices (slice d at d * n). s_r is
+    rank r's staging buffer: [2 slots][num_blocks][WORLD_SIZE][BLOCK]. Block b stores the
+    BLOCK elements of every peer's slice it handles into that peer's staging (NVLink
+    stores), barriers with block b of every peer, pushes its next chunk into the other
+    slot, then folds the staged partials of the current chunk (its own from src) in rank
+    order. Every block of every rank handles the same element ranges, so after the
+    block-level barrier its inputs are complete. A peer writes slot s again only after
+    passing the barrier that follows this block's fold of slot s. The trailing barrier
+    makes the staging safe to reuse.
+    """
+    pid = tl.program_id(0)
+    nb = tl.num_programs(0)
+    acc_ty = tl.float64 if ACC_FP64 else tl.float32
+    lane = tl.arange(0, BLOCK)
+    my_stage = _peer_ptr(RANK, s0, s1, s2, s3, s4, s5, s6, s7)
+    step = nb.to(tl.int64) * BLOCK
+    first = pid.to(tl.int64) * BLOCK
+    # Software pipeline: chunk k+1 is pushed right after barrier k, so its NVLink stores
+    # are in flight while chunk k is folded.
+    _push_chunk(
+        src_ptr, s0, s1, s2, s3, s4, s5, s6, s7, n, first, 0, pid, nb, lane, RANK, WORLD_SIZE, BLOCK
+    )
+    slot = 0
+    for block_start in range(first, n, step):
+        sync_threads()
+        symm_mem_sync(
+            signal_pad_ptrs,
+            None,
+            RANK,
+            WORLD_SIZE,
+            hasPreviousMemAccess=True,
+            hasSubsequentMemAccess=True,
+        )
+        sync_threads()
+        # Uniform across ranks and threads: every rank runs the same chunk schedule.
+        _push_chunk(
+            src_ptr,
+            s0,
+            s1,
+            s2,
+            s3,
+            s4,
+            s5,
+            s6,
+            s7,
+            n,
+            block_start + step,
+            1 - slot,
+            pid,
+            nb,
+            lane,
+            RANK,
+            WORLD_SIZE,
+            BLOCK,
+        )
+        offs = block_start + lane
+        mask = offs < n
+        stage_base = ((slot * nb + pid) * WORLD_SIZE).to(tl.int64) * BLOCK
+        acc = tl.zeros([BLOCK], dtype=acc_ty)
+        for r in tl.static_range(WORLD_SIZE):
+            if r == RANK:
+                v = tl.load(src_ptr + r * n + offs, mask=mask).to(acc_ty)
+            else:
+                v = tl.load(my_stage + stage_base + r * BLOCK + lane, mask=mask).to(acc_ty)
+            if r == 0:
+                acc = v
+            else:
+                acc += v
+        if ROUND_FP32:
+            acc = acc.to(tl.float32)
+        tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+        slot = 1 - slot
+
+    sync_threads()
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=False,
+    )
+
+
 # ── Fold ────────────────────────────────────────────────────────────────────
 
 
@@ -244,6 +410,91 @@ def ordered_fold(
     return out
 
 
+# ── Symmetric-memory push path (learner: local tensor, NVLink group) ────────
+
+# Push staging: 16 warps, PUSH_VECS 16-byte vectors per thread and peer, two slots per block.
+_PUSH_WARPS = 16
+_PUSH_MAX_VECS = 4
+# Set to False to force the all-to-all path (same bits; for benchmarks and debugging).
+USE_SYMM_PUSH = True
+# Above this input size the push (one barrier per staging chunk) is not faster than NCCL
+# all-to-all + fold on GB200 TP4; both give the same bits, so the threshold is speed-only.
+PUSH_MAX_INPUT_BYTES = 64 << 20
+
+
+def _push_staging_bytes(world_size: int) -> int:
+    block_bytes = _PUSH_WARPS * 32 * 16 * _PUSH_MAX_VECS
+    return 2 * SYMM_MEM_KERNEL_CONFIG.max_num_blocks * world_size * block_bytes
+
+
+def _push_staging(group, tensor: torch.Tensor):
+    """The symmetric staging handle for the push reduce-scatter on ``group``, or None.
+
+    The staging is fixed-size: 2 x max_num_blocks x TP x 32 KiB per rank (32 MiB at TP 4,
+    64 MiB at TP 8), independent of the message size. It is allocated (collectively) on
+    the first eligible call; outside of a CUDA-graph capture.
+    """
+    if not (
+        USE_SYMM_PUSH
+        and HAVE_TRITON
+        and tensor.is_cuda
+        and 2 <= group.size() <= _MAX_PULL_WORLD_SIZE
+        and tensor.numel() * tensor.element_size() <= PUSH_MAX_INPUT_BYTES
+    ):
+        return None
+    # Imported here: megatron.core.inference imports tensor_parallel.
+    from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+    key = f"tp_ordered_push:{group.group_name}"
+    if not SymmetricMemoryManager.is_initialized(key):
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        size_mb = -(-_push_staging_bytes(group.size()) // (1 << 20))
+        SymmetricMemoryManager.get_buffer(key, process_group=group, size_mb=size_mb)
+    hdl = SymmetricMemoryManager.get_buffer(key).symm_mem_hdl
+    if hdl is None or hdl.world_size != group.size():
+        return None
+    return hdl
+
+
+def _launch_push_fold(
+    input_: torch.Tensor, output: torch.Tensor, hdl, exact: Optional[bool]
+) -> torch.Tensor:
+    ws = hdl.world_size
+    n = output.numel()
+    assert input_.numel() == n * ws and output.is_contiguous() and input_.is_contiguous()
+    if n == 0:
+        return output
+    vec = 16 // input_.element_size()
+    if "push" in _TUNE_OVERRIDE:
+        per_thread = _TUNE_OVERRIDE["push"][1]
+    else:
+        # Small messages: more blocks with less work each; larger: fewer barriers per byte.
+        per_thread = 2 if n * input_.element_size() <= (2 << 20) else _PUSH_MAX_VECS
+    assert per_thread <= _PUSH_MAX_VECS, "the staging is sized for _PUSH_MAX_VECS"
+    block = _PUSH_WARPS * 32 * vec * per_thread
+    num_blocks = max(1, min(triton.cdiv(n, block), SYMM_MEM_KERNEL_CONFIG.max_num_blocks))
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
+    acc_fp64, round_fp32 = _acc_flags(output.dtype, exact)
+    stage_numel = 2 * num_blocks * ws * block
+    views = _peer_views(hdl, 0, stage_numel, input_.dtype)
+    ptrs = list(views) + [views[0]] * (_MAX_PULL_WORLD_SIZE - ws)
+    _ordered_push_fold_kernel[(num_blocks, 1, 1)](
+        input_,
+        *ptrs,
+        output,
+        hdl.signal_pad_ptrs_dev,
+        n,
+        RANK=hdl.rank,
+        WORLD_SIZE=ws,
+        BLOCK=block,
+        ACC_FP64=acc_fp64,
+        ROUND_FP32=round_fp32,
+        num_warps=_PUSH_WARPS,
+    )
+    return output
+
+
 # ── All-to-all paths (any process group) ────────────────────────────────────
 
 
@@ -256,9 +507,12 @@ def ordered_reduce_scatter(
 ) -> torch.Tensor:
     """Reduce-scatter along dim 0 with the fixed rank-order sum.
 
-    Per rank: one all-to-all of the partials ((TP-1)/TP of the input over the wire, the same
-    as a ring reduce-scatter), one transient receive buffer of the input's size, and one
-    fold pass that reads TP x (output size) and writes the output. CUDA-graph capturable.
+    With symmetric memory and even splits: the push kernel (see module docstring), which
+    stores (TP-1)/TP of the input over NVLink and uses the fixed-size staging buffer.
+    Otherwise, per rank: one all-to-all of the partials ((TP-1)/TP of the input over the
+    wire, the same as a ring reduce-scatter), one transient receive buffer of the input's
+    size, and one fold pass that reads TP x (output size) and writes the output. Both are
+    CUDA-graph capturable (the staging is allocated on the first, uncaptured call).
     """
     world_size = group.size()
     rank = group.rank()
@@ -275,6 +529,12 @@ def ordered_reduce_scatter(
         out_split = [rows] * world_size
         in_split = list(input_split_sizes)
     out_shape = (rows, *input_.shape[1:])
+    if input_split_sizes is None:
+        staging = _push_staging(group, input_)
+        if staging is not None:
+            if output is None:
+                output = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+            return _launch_push_fold(input_, output, staging, exact)
     recv = torch.empty(
         (world_size * rows, *input_.shape[1:]), dtype=input_.dtype, device=input_.device
     )
@@ -417,8 +677,8 @@ def symm_ordered_all_reduce(
 ) -> torch.Tensor:
     """One-shot all-reduce: every rank reads all of every peer's partial and folds them.
 
-    Reads TP x the message per rank, so it is meant for small (latency-bound) messages
-    . Same bits as :func:`ordered_all_reduce`.
+    Reads TP x the message per rank, so it is meant for small (latency-bound) messages.
+    Same bits as :func:`ordered_all_reduce`.
     """
     assert input_.numel() == output.numel() and input_.dtype == output.dtype
     assert output.is_contiguous()
