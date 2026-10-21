@@ -152,7 +152,6 @@ class PPAttentionDecode:
                 stride=(mPageTable.stride[0], mPageTable.stride[1]),
             ),
         )
-        max_seqlen_k = Int32(mPageTable.shape[1] * mK.shape[1])
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
         self.v_dtype = v.element_type
@@ -260,7 +259,6 @@ class PPAttentionDecode:
             mMLPartial,
             mSeqUsedK,
             page_table,
-            max_seqlen_k,
             scale_softmax_log2,
             splits,
             h_kv,
@@ -295,7 +293,6 @@ class PPAttentionDecode:
         mMLPartial: cute.Tensor,
         mSeqUsedK: cute.Tensor,
         mPageTable: cute.Tensor,
-        max_seqlen_k: Int32,
         scale_softmax_log2: Float32,
         splits: Int32,
         h_kv: Int32,
