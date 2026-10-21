@@ -4,8 +4,9 @@
 
 """GTP symmetric memory: NCCL window registration for GTP communication buffers.
 
-This module keeps one ``ncclMemAlloc``-backed ``torch.cuda.MemPool`` per GTP process
-group. Once ``register_gtp_symm_pool(group)`` registers a pool on its group, PyTorch's
+This module keeps one ``torch.cuda.MemPool`` per GTP process group, backed by the
+VMM allocator (see megatron.core.allocator.vmm_symm_allocator). Once
+``register_gtp_symm_pool(group)`` registers a pool on its group, PyTorch's
 ProcessGroupNCCL hook window-registers every allocation made inside
 ``gtp_symm_pool_ctx(group)``, which lets NCCL run its symmetric / NVLS kernels on
 those buffers.
@@ -28,6 +29,7 @@ from contextlib import AbstractContextManager
 import torch
 import torch.distributed as dist
 
+import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
@@ -50,12 +52,26 @@ _registered: typing.Dict[str, typing.Any] = {}
 
 
 def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
-    """Return the per-group ``ncclMemAlloc``-backed MemPool, creating it once."""
+    """Return the per-group symmetric MemPool, creating it once. Pools come from the
+    VMM allocator, falling back to ``ncclMemAlloc`` (same pool API) if its extension
+    cannot build."""
     name = group.group_name
     pool = _pools.get(name)
     if pool is None:
-        nccl_allocator.init()
-        pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+        try:
+            vmm_symm_allocator.init()
+            pool = vmm_symm_allocator.create_vmm_mem_pool()
+        except RuntimeError as e:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"[MCORE][GTP] {e}\n"
+                "[MCORE][GTP] FALLING BACK to ncclMemAlloc-backed symmetric pools. "
+                "ncclMemAlloc maps every allocation on all P2P-visible peer GPUs, "
+                "which slows CPU-side kernel launching at scale.",
+            )
+            nccl_allocator.init()
+            pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
         _pools[name] = pool
     return pool
 
@@ -72,8 +88,9 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
     if not is_torch_min_version("2.9.0a0"):
         raise RuntimeError(
             "[GTP] --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require PyTorch >= 2.9: older "
-            "versions cannot create a symmetric memory pool (create_nccl_mem_pool silently "
-            "falls back to a non-symmetric one, so the reduce-scatter would not be symmetric)."
+            "versions cannot create a symmetric memory pool (create_vmm_mem_pool would "
+            "silently fall back to a non-symmetric one, so the reduce-scatter would not "
+            "be symmetric)."
         )
     pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
@@ -82,7 +99,7 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
     # so the registration below sees an initialized communicator.
     warmup = torch.zeros(1, device=torch.cuda.current_device())
     dist.all_reduce(warmup, group=group)
-    nccl_allocator.register_mem_pool(pool, group, symmetric=True)
+    vmm_symm_allocator.register_mem_pool(pool, group)
     _registered[group.group_name] = group
     log_single_rank(
         logger,
@@ -116,9 +133,9 @@ class RegisteredLIFOPool:
     The wgrad reduce-scatter can only use symmetric collectives if its send buffer is
     window-registered, so the wgrad is written into a buffer from this cache. ``alloc``
     pops a free buffer (or allocates a new one through ``gtp_symm_pool_ctx``); ``free``
-    returns it once the reduce-scatter has finished reading it. Buffers are shared by
-    all weights of the same size, so memory stays at the peak number of in-flight
-    reduce-scatters instead of one buffer per weight.
+    returns it with a completion event if the reduce-scatter is still reading it.
+    Buffers are shared by all weights of the same size, keeping memory at the peak
+    number of in-flight reduce-scatters instead of one buffer per weight.
 
     CUDA graphs: the eager warmup iterations run the same reduce-scatter overlap as
     the captured steps and are expected to pre-populate the free lists, so that during
@@ -130,9 +147,8 @@ class RegisteredLIFOPool:
     untagged tensors, which lets callers pass mixed buffer lists to both this pool and
     the plain scratch pool and have each take only its own.
 
-    Why LIFO: ordering cannot affect correctness (buffers enter the free list only
-    after their reduce-scatter has been waited on), but LIFO keeps the same buffer
-    reused for the same operation at steady state even if a key ever over-allocates,
+    Why LIFO: allocation waits for the buffer's prior-use completion event. LIFO keeps
+    the same buffer reused for the same operation at steady state even if a key ever over-allocates,
     whereas FIFO would rotate the assignment every iteration -- LIFO keeps memory
     behavior deterministic and repeatable across iterations.
     """
@@ -157,6 +173,9 @@ class RegisteredLIFOPool:
         bucket = self._free[(numel, dtype, group.group_name)]
         if bucket:
             flat = bucket.pop()
+            ready_event = getattr(flat, "_gtp_wgrad_reuse_event", None)
+            if ready_event is not None:
+                torch.cuda.current_stream(device=device).wait_event(ready_event)
         else:
             if torch.cuda.is_current_stream_capturing():
                 mine = sum(len(v) for k, v in self._free.items() if k[2] == group.group_name)
@@ -193,12 +212,24 @@ class RegisteredLIFOPool:
         out._gtp_symm_group = group  # marks the buffer as pool-owned; free() keys on this
         return out
 
-    def free(self, buf: torch.Tensor) -> None:
-        """Return ``buf`` to its group's free list; no-op for untagged (foreign) buffers."""
+    def has_free(
+        self, shape: torch.Size | tuple[int, ...], dtype: torch.dtype, group: dist.ProcessGroup
+    ) -> bool:
+        """True when ``alloc`` would pop rather than allocate.
+
+        Lets a caller tell "recycling" from "growing the pool" and wait for one of its own
+        in-flight buffers instead of raising the high-water mark.
+        """
+        return bool(self._free.get((int(math.prod(shape)), dtype, group.group_name)))
+
+    def free(self, buf: torch.Tensor, ready_event: torch.cuda.Event | None = None) -> None:
+        """Return a tagged buffer with an optional, recorded prior-use completion event."""
         group = getattr(buf, "_gtp_symm_group", None)
         if group is None:
             return
-        self._free[(buf.numel(), buf.dtype, group.group_name)].append(buf.view(-1))
+        flat = buf.view(-1)
+        flat._gtp_wgrad_reuse_event = ready_event
+        self._free[(buf.numel(), buf.dtype, group.group_name)].append(flat)
 
     def clear(self) -> None:
         """Drop every cached buffer. Called at teardown, before the pools they alias go away."""
@@ -221,7 +252,7 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # Deregister while the recycled send buffers are still alive. Their memory keeps
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
-        nccl_allocator.deregister_mem_pool(_pools[name], _registered[name])
+        vmm_symm_allocator.deregister_mem_pool(_pools[name], _registered[name])
     # Only now drop the buffers and the pools; the windows are gone, so the memory
     # is safe to release.
     symmetric_wgrad_pool.clear()

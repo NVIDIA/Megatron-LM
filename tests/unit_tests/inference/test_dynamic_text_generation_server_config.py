@@ -32,10 +32,14 @@ class _Tokenizer:
 class _CapturingClient:
     def __init__(self):
         self.sampling_params = []
+        self.offload_params = []
 
-    async def add_request(self, prompt_tokens, sampling_params, *, multi_modal_data=None):
+    def add_request_with_id(
+        self, prompt_tokens, sampling_params, *, multi_modal_data=None, offload_params=None
+    ):
         del prompt_tokens, multi_modal_data
         self.sampling_params.append(sampling_params)
+        self.offload_params.append(offload_params)
         raise RuntimeError("stop after request submission")
 
 
@@ -64,6 +68,23 @@ class _CapturingClient:
             True,
         ),
         (True, {"return_tokenized_data": True}, 0.7, 0.95, 20, True),
+        (
+            True,
+            {
+                "offload_params": {
+                    "ng_capture": {
+                        "mode": "text",
+                        "rollout_id": "r0",
+                        "model_call_id": "c1",
+                        "prev_len": 0,
+                    }
+                }
+            },
+            0.7,
+            0.95,
+            20,
+            False,
+        ),
     ],
 )
 async def test_chat_request_uses_server_defaults(
@@ -99,6 +120,7 @@ async def test_chat_request_uses_server_defaults(
     assert sampling_params.top_p == expected_top_p
     assert sampling_params.top_k == expected_top_k
     assert sampling_params.return_prompt_tokens is expected_prompt_tokens
+    assert inference_client.offload_params == [request_overrides.get("offload_params")]
 
 
 def test_sampling_config_reaches_frontend_process(monkeypatch):
@@ -128,18 +150,14 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         def getsockname(self):
             return ("127.0.0.1", 4321)
 
-        def setblocking(self, blocking):
-            captured["blocking"] = blocking
+        def close(self):
+            captured["socket_closed"] = True
 
-        def set_inheritable(self, inheritable):
-            captured["inheritable"] = inheritable
-
-        def fileno(self):
-            return 17
+    class FakeProcessContext:
+        Process = FakeProcess
 
     monkeypatch.setattr(server, "_SERVER_PROCESSES", [])
-    monkeypatch.setattr(server, "_SHARED_SOCKET", None)
-    monkeypatch.setattr(server.mp, "Process", FakeProcess)
+    monkeypatch.setattr(server, "_SERVER_PROCESS_CONTEXT", FakeProcessContext())
     monkeypatch.setattr(server, "_run_text_gen_server", fake_run_text_gen_server)
     monkeypatch.setattr(server.asyncio, "set_event_loop", lambda loop: None)
 
@@ -163,6 +181,8 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         eval_mode=True,
     )
 
+    # The port is taken from the socket; no fd is handed to the replica, which
+    # binds its own listener on that port.
     assert captured["run_args"] == (
         "tcp://coord:5555",
         tokenizer,
@@ -170,7 +190,6 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         4321,
         ["json"],
         True,
-        17,
         "127.0.0.1",
         "template",
         multimodal_prompt_config,
@@ -178,9 +197,12 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         0.8,
         5,
         True,
+        # block_size_tokens / prefix_caching_coordinator_policy: unset here, so the
+        # frontend does not hash and the coordinator keeps doing it.
+        None,
+        None,
     )
-    assert captured["blocking"] is False
-    assert captured["inheritable"] is True
+    assert captured["socket_closed"] is True
     assert server._SERVER_PROCESSES[0].daemon is True
     assert server._SERVER_PROCESSES[0].started is True
 
@@ -194,8 +216,15 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     captured = {}
 
     class FakeInferenceClient:
-        def __init__(self, coordinator_addr, deserialize):
+        def __init__(
+            self,
+            coordinator_addr,
+            deserialize,
+            block_size_tokens=None,
+            prefix_caching_coordinator_policy=None,
+        ):
             captured["client_init"] = (coordinator_addr, deserialize)
+            captured["client_hashing"] = (block_size_tokens, prefix_caching_coordinator_policy)
 
         def start(self):
             captured["client_started"] = True
@@ -207,9 +236,19 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
         captured["app"] = app
         captured["hypercorn_config"] = config
 
+    class FakeListener:
+        def fileno(self):
+            return 23
+
+        def close(self):
+            captured["listener_closed"] = True
+
     monkeypatch.setattr(server, "InferenceClient", FakeInferenceClient)
     monkeypatch.setattr(server, "serve", fake_serve)
     monkeypatch.setattr(server.endpoints, "__all__", [])
+    # Each replica binds its own listener, so leaving this unpatched would make the
+    # test take a real port and fail on whatever already holds it.
+    monkeypatch.setattr(server, "_bind_reuseport_socket", lambda _port, _host: FakeListener())
 
     tokenizer = object()
     multimodal_prompt_config = object()
@@ -231,6 +270,8 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
 
     app_config = captured["app"].config
     assert captured["client_init"] == ("tcp://coord:5555", False)
+    # Unset here, so this client does not hash and the coordinator keeps doing it.
+    assert captured["client_hashing"] == (None, None)
     assert captured["client_started"] is True
     assert captured["client_stopped"] is True
     assert app_config["tokenizer"] is tokenizer
@@ -242,7 +283,8 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     assert app_config["default_top_p"] == 0.8
     assert app_config["default_top_k"] == 5
     assert app_config["eval_mode"] is True
-    assert captured["hypercorn_config"].bind == ["127.0.0.1:4321"]
+    assert captured["hypercorn_config"].bind == ["fd://23"]
+    assert captured["listener_closed"] is True
 
 
 @pytest.mark.asyncio
@@ -287,7 +329,7 @@ async def test_completions_request_uses_sampling_defaults_and_overrides(
     response = await app.test_client().post("/v1/completions", json=payload)
 
     assert response.status_code == 500
-    assert len(inference_client.sampling_params) == 1
+    assert not inference_client.sampling_params[0].detokenize_generations
     sampling_params = inference_client.sampling_params[0]
     assert sampling_params.temperature == expected_temperature
     assert sampling_params.top_p == expected_top_p

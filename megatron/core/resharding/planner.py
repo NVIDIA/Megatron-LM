@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+
+from megatron.core.utils import unwrap_model
 
 from .shard_planner import plan_sharded_transfer
 from .utils import (
@@ -25,6 +28,14 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# Default number of logical parameters per lockstep execution batch, for copy
+# services that support multiple runs per plan (currently NCCL). Submitting the
+# whole model as one ncclGroup deadlocks NCCL once the group is large enough to
+# be split into several kernel plans (https://github.com/pytorch/pytorch/issues/174288),
+# so the transfer is issued in small, globally agreed batches instead. Override
+# with MEGATRON_REFIT_MAX_PARAMS_PER_BATCH; 0 disables the cap.
+DEFAULT_MAX_PARAMS_PER_BATCH = 32
+
 
 @dataclass(frozen=True)
 class _NativeParameterPart:
@@ -41,7 +52,9 @@ def _find_source_metadata(
     """Find source metadata, including the tied-output embedding alias."""
     src_meta_list = src_param_metadata.get(resolved_name)
     if not src_meta_list and resolved_name.endswith("output_layer.weight"):
-        for embedding_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+        prefix = resolved_name.removesuffix("output_layer.weight")
+        for suffix in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+            embedding_name = prefix + suffix
             src_meta_list = src_param_metadata.get(embedding_name)
             if src_meta_list:
                 break
@@ -391,8 +404,10 @@ def _build_execution_batch_ids(
     without another collective. Source and destination bytes are accumulated per
     rank; starting a new batch when any rank would cross the soft limit bounds
     both sender-side dequantization and receiver-side staging. All replicas and
-    shards of one resolved parameter stay in one batch. ``None`` assigns every
-    parameter to one model-wide batch, preserving the uncapped behavior.
+    shards of one resolved parameter stay in one batch. ``None`` disables the byte
+    limit; batches are then bounded only by the per-batch parameter cap
+    (``DEFAULT_MAX_PARAMS_PER_BATCH`` / ``MEGATRON_REFIT_MAX_PARAMS_PER_BATCH``), which
+    keeps every rank's NCCL P2P group small enough to stay in a single kernel plan.
     """
     parameter_order: list[str] = []
     destination_bytes: dict[str, dict[int, int]] = {}
@@ -410,10 +425,24 @@ def _build_execution_batch_ids(
                 destination_bytes[resolved_name].get(metadata.owner_rank, 0), tensor_bytes
             )
 
-    if max_batch_bytes is None:
+    # Cap on logical parameters per batch. A byte budget alone can still pack
+    # thousands of small tensors (norm weights, biases, router expert_bias) into
+    # one batch_isend_irecv; NCCL splits such large groups into kernel plans at
+    # rank-dependent points, and matching sends/recvs that land in different plans
+    # deadlock (https://github.com/pytorch/pytorch/issues/174288). Every rank
+    # evaluates this from the same roster and environment, so batches agree.
+    max_batch_params_env = os.environ.get("MEGATRON_REFIT_MAX_PARAMS_PER_BATCH")
+    max_batch_params: int | None = (
+        int(max_batch_params_env) if max_batch_params_env else DEFAULT_MAX_PARAMS_PER_BATCH
+    )
+    if max_batch_params <= 0:
+        max_batch_params = None
+
+    if max_batch_bytes is None and max_batch_params is None:
         return {resolved_name: 0 for resolved_name in parameter_order}, 1
-    if max_batch_bytes <= 0:
+    if max_batch_bytes is not None and max_batch_bytes <= 0:
         raise ValueError("max_batch_bytes must be positive or None")
+    byte_limit = float("inf") if max_batch_bytes is None else max_batch_bytes
 
     source_bytes: dict[str, dict[int, int]] = {}
     for resolved_name in parameter_order:
@@ -428,19 +457,24 @@ def _build_execution_batch_ids(
     batch_ids: dict[str, int] = {}
     batch_id = 0
     current_rank_bytes: dict[int, int] = {}
+    current_params = 0
     for resolved_name in parameter_order:
         parameter_rank_bytes = dict(source_bytes[resolved_name])
         for rank, tensor_bytes in destination_bytes[resolved_name].items():
             parameter_rank_bytes[rank] = parameter_rank_bytes.get(rank, 0) + tensor_bytes
 
-        if current_rank_bytes and any(
-            current_rank_bytes.get(rank, 0) + tensor_bytes > max_batch_bytes
+        over_bytes = any(
+            current_rank_bytes.get(rank, 0) + tensor_bytes > byte_limit
             for rank, tensor_bytes in parameter_rank_bytes.items()
-        ):
+        )
+        over_params = max_batch_params is not None and current_params >= max_batch_params
+        if current_rank_bytes and (over_bytes or over_params):
             batch_id += 1
             current_rank_bytes.clear()
+            current_params = 0
 
         batch_ids[resolved_name] = batch_id
+        current_params += 1
         for rank, tensor_bytes in parameter_rank_bytes.items():
             current_rank_bytes[rank] = current_rank_bytes.get(rank, 0) + tensor_bytes
 
@@ -701,30 +735,51 @@ def _build_tensor_reshard_specs(
 def _extract_module_metadata(
     module, owner_rank, num_experts, rank_offset, rank_list_cache
 ) -> list[ParameterMetadata]:
-    """Metadata for a module's params and persistent buffers, or [] if None.
-
-    Persistent buffers travel too so training state (e.g. MoE router expert_bias)
-    refits with the weights.
-    """
+    """Extract metadata with native or model-declared names and ownership."""
     if module is None:
         return []
-    pg = getattr(module, "pg_collection", None)
-    if pg is None:
-        raise ValueError("Module must have pg_collection")
-    layer_prefix_map = _build_layer_module_prefix_map(module)
-    return [
-        extract_param_metadata(
-            p,
-            name,
-            owner_rank,
-            pg,
-            num_experts=num_experts,
-            layer_module_prefix_map=layer_prefix_map,
-            rank_offset=rank_offset,
-            _rank_list_cache=rank_list_cache,
-        )
-        for name, p in named_refit_tensors(module)
-    ]
+    provider = getattr(module, "refit_modules", None)
+    components = provider() if provider else [("", module, getattr(module, "pg_collection", None))]
+    paths = {id(child): name for name, child in module.named_modules()} if provider else {}
+    metadata = []
+    for label, child, pg in components:
+        storage_prefix = ""
+        if provider:
+            child = unwrap_model(child)
+            path = paths.get(id(child))
+            if path is None:
+                raise ValueError("Refit modules must belong to the original model")
+            storage_prefix = path + "." if path else ""
+            experts = getattr(getattr(child, "config", None), "num_moe_experts", None)
+        else:
+            experts = num_experts
+        if pg is None:
+            raise ValueError("Module must have pg_collection")
+        layer_prefix_map = _build_layer_module_prefix_map(child)
+        for name, tensor in named_refit_tensors(child):
+            entry = extract_param_metadata(
+                tensor,
+                name,
+                owner_rank,
+                pg,
+                num_experts=experts,
+                layer_module_prefix_map=layer_prefix_map,
+                rank_offset=rank_offset,
+                _rank_list_cache=rank_list_cache,
+            )
+            if label:
+                entry.resolved_name = label + "." + (entry.resolved_name or entry.name)
+            entry.name = storage_prefix + entry.name
+            metadata.append(entry)
+    if provider:
+        names = {entry.name for entry in metadata}
+        if len(names) != len(metadata) or names != {
+            name for name, _ in named_refit_tensors(module)
+        }:
+            raise ValueError("Refit metadata must cover every parameter and persistent buffer once")
+        if len({entry.resolved_name for entry in metadata}) != len(metadata):
+            raise ValueError("Refit metadata contains duplicate matching tensor names")
+    return metadata
 
 
 def index_metadata_rosters(gathered_pairs: list):
@@ -762,6 +817,7 @@ def build_plan_from_rosters(
     my_plan = ReshardPlan(
         [], [], num_batches=num_batches, execution_batch_bytes=execution_batch_bytes
     )
+    total_tasks = 0
     for (
         task_id,
         dst_rank,
@@ -771,6 +827,7 @@ def build_plan_from_rosters(
         src_metadata,
         dst_metadata,
     ) in _iter_global_transfer_ops(dst_param_metadata_by_rank, src_param_metadata):
+        total_tasks = task_id + 1
         if dst_rank == my_global_rank:
             my_plan.recv_ops.append(
                 TransferOp(
@@ -796,6 +853,7 @@ def build_plan_from_rosters(
                 )
             )
 
+    my_plan.total_tasks = total_tasks
     logger.info(
         f"Rank {my_global_rank}: Built plan locally - {len(my_plan.recv_ops)} recvs, "
         f"{len(my_plan.send_ops)} sends"

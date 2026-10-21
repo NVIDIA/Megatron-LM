@@ -20,6 +20,9 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
 from megatron.core.inference.quantization.mxfp8_quantize import (
     mxfp8_quantize as mcore_mxfp8_quantize,
 )
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    mxfp8_quantize_into as mcore_mxfp8_quantize_into,
+)
 
 
 def _ceil_div(a, b):
@@ -183,9 +186,19 @@ class MXFP8Tensor:
         if self.backend == "flashinfer" and value.dtype == torch.float32:
             value = value.to(dtype=torch.bfloat16)
         value = value.contiguous()
-        quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
-        self.data.copy_(quantized.data)
-        self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
+        if (
+            self.backend == "triton"
+            and self.data.dtype == torch.float8_e4m3fn
+            and self.data.is_contiguous()
+            and self.scale.ndim == 1
+            and self.scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
+            and self.scale.is_contiguous()
+        ):
+            mcore_mxfp8_quantize_into(value, self.data, self.scale)
+        else:
+            quantized = MXFP8Tensor.from_bf16(value, backend=self.backend)
+            self.data.copy_(quantized.data)
+            self.scale.view(torch.uint8).copy_(quantized.scale.view(torch.uint8))
         if self.dtype is None:
             self.dtype = value.dtype
         return self

@@ -48,7 +48,6 @@ class TestNonPersistentSaveAndLoad:
         with (
             TempNamedDir(tmp_path_dist_ckpt / "test_non_persistent") as non_persistent_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
             mock.patch('torch.empty', new=deterministic_empty),
         ):
             init_basic_mock_args(mock_args, tp, pp)
@@ -76,12 +75,16 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, restore_training_state=True
+            )
             assert iteration == 4
             save_checkpoint(
                 6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, restore_training_state=True
+            )
             assert iteration == 6
             save_checkpoint(
                 8,
@@ -92,7 +95,9 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, restore_training_state=True
+            )
             assert iteration == 8
             assert "iter_0000003" in os.listdir(non_persistent_ckpt_dir)
             assert "iter_0000006" in os.listdir(non_persistent_ckpt_dir)
@@ -136,7 +141,6 @@ class TestLegacySaveAndLoad:
         with (
             TempNamedDir(tmp_path_dist_ckpt / "test_legacy") as legacy_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, legacy_ckpt_dir)
@@ -144,7 +148,9 @@ class TestLegacySaveAndLoad:
             save_checkpoint(
                 2, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
             )
-            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler)
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler, restore_training_state=True
+            )
             assert iteration == 2
             assert "iter_0000002" in os.listdir(legacy_ckpt_dir)
 

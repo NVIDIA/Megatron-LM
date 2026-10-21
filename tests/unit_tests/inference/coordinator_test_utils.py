@@ -14,6 +14,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 
 
 def make_coordinator_direct(
@@ -22,6 +23,7 @@ def make_coordinator_direct(
     enable_prefix_caching=True,
     deterministic_mode=True,
     prefix_caching_routing_alpha=0.5,
+    prefix_cache_ttl_seconds=300.0,
     max_requests=10,
     policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
     media_policy=MediaCacheCoordinatorPolicy.AFFINITY,
@@ -39,6 +41,7 @@ def make_coordinator_direct(
         enable_prefix_caching: Whether prefix caching is enabled.
         deterministic_mode: If True, sort identities for deterministic ordering.
         prefix_caching_routing_alpha: Alpha for prefix-aware scoring.
+        prefix_cache_ttl_seconds: How long a routed block is assumed still held.
         max_requests: Max requests per rank (None disables vectorized scoring).
         policy: Prefix caching coordinator routing policy.
         media_policy: Media-cache coordinator routing policy.
@@ -48,12 +51,15 @@ def make_coordinator_direct(
             or ``"rank-{}"``.  The integer rank index is substituted.
     """
     coordinator = object.__new__(DataParallelInferenceCoordinator)
+    coordinator.handoff_ownership = HandoffOwnership()
     coordinator.tokenizer = tokenizer
     coordinator.data_parallel_size = data_parallel_size
     coordinator.block_size_tokens = block_size_tokens
     coordinator.enable_prefix_caching = enable_prefix_caching
     coordinator.prefix_caching_coordinator_policy = policy
     coordinator.prefix_caching_routing_alpha = prefix_caching_routing_alpha
+    coordinator.prefix_cache_ttl_seconds = prefix_cache_ttl_seconds
+    coordinator._hash_expiry = deque()
     coordinator.media_cache_coordinator_policy = media_policy
     coordinator.media_cache_routing_weight = 1.0
     coordinator.vision_embedding_cache_enabled = vision_embedding_cache_enabled
