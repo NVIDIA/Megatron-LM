@@ -77,6 +77,13 @@ libraries. `LD_LIBRARY_PATH` must resolve the same NCCL installation at runtime.
 Set `NVTE_CUDA_ARCHS=90`, `NVTE_FRAMEWORK=pytorch` and
 `NVTE_BUILD_WITH_NCCL_EP=1` before that build.
 
+The separately JIT-built `megatron.core.nccl_allocator` also needs the NCCL
+header directory in `CPATH` and that environment-owned linker directory in
+`LIBRARY_PATH`. Otherwise its first compilation can fail on `nccl.h`, and later
+uses may only report the missing `nccl_allocator.so`. Set both paths before
+compilation and keep the original compiler error. In the measured environment,
+rebuilding with those paths resolved five allocator/offload regression cases.
+
 ## Collect, execute and classify separately
 
 The unit suite initializes distributed process groups even for many local
@@ -103,6 +110,15 @@ waiting on a multiprocessing queue. A finite per-test watchdog plus an
 append-only result journal preserved the last started test and allowed the
 unattempted remainder to be inventoried in a fresh process. Keep the timed-out
 case and any unexecuted cases in its file visible in the final report.
+
+Use the repository's pinned test dependencies when preparing the native overlay.
+For example, six JSONL dataset cases in this environment failed with
+`datasets==5.1.0` and a `MonthDayNano` pickling error. Using the repository LTS
+pin, `datasets==4.8.5`, resolved those six cases without changing PyTorch or the
+existing runtime. Preserve the initial failure and report the targeted rerun
+separately from the original inventory. Three optional FlashAttention CuTe
+imports still failed against the installed CUTLASS DSL `ThrMma` API; those
+collection gaps were retained rather than counted as executed tests.
 
 Run the determinism kernels separately from the broad compatibility inventory.
 Use both within-process contention replays and independent process launches;
