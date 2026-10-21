@@ -4414,7 +4414,6 @@ class TestMultiTokenPredictionHybrid:
                 use_mup=False,
                 inference_cuda_graph_scope=None,
                 sequence_parallel=False,
-                params_dtype=torch.float32,
             ),
             pre_process=False,
             post_process=True,
@@ -4425,6 +4424,7 @@ class TestMultiTokenPredictionHybrid:
             embedding=None,
             mtp=MTPStub(),
             output_layer=output_layer,
+            lm_head_can_emit_fp32=False,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
             pg_collection=types.SimpleNamespace(
