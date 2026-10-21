@@ -183,7 +183,7 @@ class TransformerConfig(ModelParallelConfig):
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
     """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
        and learnable offset."""
 
     attn_logit_softcapping: Optional[float] = None

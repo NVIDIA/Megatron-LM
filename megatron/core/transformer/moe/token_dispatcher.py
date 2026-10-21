@@ -2215,48 +2215,27 @@ def make_dispatch_manager(
             '_comm_manager.topk_idx',
         ]
 
-    if backend == "ncclep":
-        assert tp_size * ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
-        # Already one buffer per dispatch, held on the manager, so several at once need
-        # nothing further than one manager each.
-        manager = _NCCLEPManager(
-            group=group,
-            num_local_experts=num_local_experts,
-            router_topk=router_topk,
-            num_experts=num_experts,
-            config=config,
-        )
-        return manager, ['_comm_manager.token_probs', '_comm_manager.token_indices']
-
-    if owns_buffer:
+    # The other three take one argument list and expose one pair of CUDA-graph attributes;
+    # only ncclep already holds a buffer per manager, so only it can own one.
+    manager_cls, label, can_own_buffer = {
+        "ncclep": (_NCCLEPManager, "NCCL EP", True),
+        "deepep": (_DeepepManager, "DeepEP", False),
+        "deepepv2": (_DeepepV2Manager, "DeepEP v2", False),
+    }[backend]
+    if owns_buffer and not can_own_buffer:
         raise NotImplementedError(
             f"the {backend!r} flex backend stages through process-wide buffers, so it cannot "
             "serve a caller with several dispatches in flight at once; use hybridep or ncclep."
         )
-
-    if backend == "deepep":
-        assert tp_size * ep_size > 1, "DeepEP dispatcher requires TPxEP > 1"
-        manager = _DeepepManager(
-            group=group,
-            num_local_experts=num_local_experts,
-            router_topk=router_topk,
-            num_experts=num_experts,
-            config=config,
-        )
-        return manager, ['_comm_manager.token_probs', '_comm_manager.token_indices']
-
-    if backend == "deepepv2":
-        assert tp_size * ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
-        manager = _DeepepV2Manager(
-            group=group,
-            num_local_experts=num_local_experts,
-            router_topk=router_topk,
-            num_experts=num_experts,
-            config=config,
-        )
-        return manager, ['_comm_manager.token_probs', '_comm_manager.token_indices']
-
-    raise AssertionError(f"unreachable: {backend!r} passed the name check above")
+    assert tp_size * ep_size > 1, f"{label} dispatcher requires TPxEP > 1"
+    manager = manager_cls(
+        group=group,
+        num_local_experts=num_local_experts,
+        router_topk=router_topk,
+        num_experts=num_experts,
+        config=config,
+    )
+    return manager, ['_comm_manager.token_probs', '_comm_manager.token_indices']
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):

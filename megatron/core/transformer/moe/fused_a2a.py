@@ -684,23 +684,24 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        if buffer is None:
-            if _hybrid_ep_buffer is None:
-                num_tokens, hidden_dim = x.shape[-2:]
-                fp8_dispatch = False  # Currently, we do not support fp8 dispatch
-                init_hybrid_ep_buffer(
-                    group,
-                    hidden_dim,
-                    num_tokens,
-                    num_local_experts,
-                    num_sms_dispatch_api,
-                    num_sms_combine_api,
-                    num_blocks_permute,
-                    num_blocks_unpermute,
-                    fp8_dispatch,
-                    num_sms_preprocessing_api,
-                )
-            buffer = _hybrid_ep_buffer
+        if buffer is None and _hybrid_ep_buffer is None:
+            num_tokens, hidden_dim = x.shape[-2:]
+            fp8_dispatch = False  # Currently, we do not support fp8 dispatch
+            init_hybrid_ep_buffer(
+                group,
+                hidden_dim,
+                num_tokens,
+                num_local_experts,
+                num_sms_dispatch_api,
+                num_sms_combine_api,
+                num_blocks_permute,
+                num_blocks_unpermute,
+                fp8_dispatch,
+                num_sms_preprocessing_api,
+            )
+        # A caller running several dispatches at once brings its own buffer; everyone else
+        # shares the module-global one, lazily built just above.
+        buffer = _hybrid_ep_buffer if buffer is None else buffer
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
