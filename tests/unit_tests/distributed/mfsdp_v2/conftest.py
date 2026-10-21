@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch.distributed.distributed_c10d import _world
 
 
 @dataclasses.dataclass(frozen=True)
@@ -21,7 +22,7 @@ class DistributedSetup:
 
 @pytest.fixture(scope="function")
 def distributed_setup() -> Iterator[DistributedSetup]:
-    """Read torchrun rank state and set up this rank's local device."""
+    """Set up this rank's local device and clean up per-test process groups."""
     # Some MFSDP v2 tests are sensitive to NCCL algorithm/channel choices. Clear
     # the suite-wide NCCL defaults (set in the top-level conftest.py) before
     # init_device_mesh initializes NCCL communicators so this bucket uses NCCL
@@ -54,3 +55,21 @@ def distributed_setup() -> Iterator[DistributedSetup]:
             dist.barrier(device_ids=[device.index])
         else:
             dist.barrier()
+
+        # Centralize cleanup so tests do not need to track and destroy every subgroup.
+        # Fixture teardown also runs if a test fails or skips after setup, preventing
+        # communicator resources from accumulating across tests.
+        #
+        # Destruction order is the main risk: ranks must destroy overlapping groups in a
+        # consistent order to avoid NCCL hangs. pg_map preserves local insertion order,
+        # so this relies on consistent group creation order across ranks.
+        #
+        # Destroying WORLD adds a full distributed restart: fast ranks could reinitialize
+        # while peers are still shutting down, causing NCCL connection failures. PyTorch
+        # requires synchronization outside torch.distributed between destruction and
+        # reinitialization. Later test teardown also uses WORLD, so leave its destruction
+        # to session cleanup.
+        # https://docs.pytorch.org/docs/stable/distributed.html#reinitialization
+        for group in list(_world.pg_map):
+            if group is not dist.group.WORLD:
+                dist.destroy_process_group(group)

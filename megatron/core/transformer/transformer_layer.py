@@ -5,11 +5,15 @@ import functools
 import logging
 import warnings
 from abc import ABC
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import MHCCheckpointManager
+    from megatron.core.tensor_parallel.random import (
+        MHCCheckpointManager,
+        CheckpointWithoutOutputManager,
+    )
 
 import torch
 import torch.distributed
@@ -23,6 +27,7 @@ except ImportError:
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -35,7 +40,12 @@ from megatron.core.transformer.enums import (
 )
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.residual_recompute import (
+    ResidualStreamRecomputeContext,
+    checkpoint_residual_read,
+    checkpoint_residual_write,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -250,6 +260,7 @@ class MlpBuilder(Protocol):
         pg_collection: ProcessGroupCollection,
         is_mtp_layer: bool,
         name: str | None = None,
+        hash_moe_layer_threshold: int | None = None,
     ) -> MlpInterface: ...
 
 
@@ -312,11 +323,19 @@ class BaseTransformerLayer(ABC):
     implementation in `transformer_block.py` file for more details.
     """
 
+    #: Whether the layer accepts mHC n-stream hidden states ([s, b, n*C])
+    #: when owned directly by a TransformerBlock. Custom layer implementations
+    #: that implement this contract should override the marker with ``True``.
+    supports_mhc_connections: bool = False
+
+    #: Whether the layer owns wide-residual branch connections.
+    supports_wide_residual_connections: bool = False
+
     def __init__(self):
         pass
 
 
-class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAttentionLayer):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -344,7 +363,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules_config = submodules
+        # GraphableMegatronModule may create a local CUDA graph manager during super().__init__().
+        # Dense layers need a default before that hook runs, while MoETransformerLayer sets this
+        # to True before entering this constructor.
+        self.is_moe_layer = getattr(self, "is_moe_layer", False)
         super().__init__(config=config, vp_stage=vp_stage)
+
+        if (
+            config.wide_residual is not None
+            and not self.supports_wide_residual_connections
+            and not is_mtp_layer
+        ):
+            raise ValueError(
+                f"{type(self).__name__} does not implement wide-residual streams. Build the "
+                "decoder with WideResidualTransformerLayer when wide_residual is configured."
+            )
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -393,8 +426,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
             attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
-        if is_mtp_layer:
-            attention_optional_kwargs["is_mtp_layer"] = True
+        attention_optional_kwargs["is_mtp_layer"] = is_mtp_layer
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
@@ -461,27 +493,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "Consider migrating the `mlp` submodule spec to a direct call of the "
                 "`as_mlp_submodule` classmethod instead.",
             )
-        mlp_kwargs: Dict[str, Any] = {
-            "config": self.config,
-            "pg_collection": pg_collection,
-            "is_mtp_layer": self.is_mtp_layer,
-            "layer_number": self.layer_number,
-            "name": (name + ".mlp") if name is not None else None,
-        }
-        if hash_moe_layer_threshold is not None:
-            mlp_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
-        try:
-            self.mlp = submodules.mlp(**mlp_kwargs)
-        except TypeError:
-            if hash_moe_layer_threshold is not None:
-                raise
-            # Fallback for MLP builders that don't accept layer_number (dense MLP, TEFusedMLP).
-            self.mlp = submodules.mlp(
-                config=self.config,
-                pg_collection=pg_collection,
-                is_mtp_layer=self.is_mtp_layer,
-                name=(name + ".mlp") if name is not None else None,
-            )
+        self.mlp = submodules.mlp(
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=self.is_mtp_layer,
+            name=(name + ".mlp") if name is not None else None,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
+        )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
@@ -498,6 +516,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
+        # Batch-first shape of the padding_mask this layer received in eager execution (the
+        # cuda_graph_warmup_steps), recorded in _forward_attention before any MLP chunking.
+        self._padding_mask_shape_seen: Optional[tuple[int, ...]] = None
+        # Batch-first shape of the padding_mask input reserved by the TE CUDA graph of this layer;
+        # set in get_layer_static_inputs at capture, None when the graph has no such input.
+        self._cuda_graph_padding_mask_shape: Optional[tuple[int, ...]] = None
         if self.config.recompute_granularity == 'selective':
             assert self.config.recompute_modules is not None
             if "layernorm" in self.config.recompute_modules:
@@ -587,6 +611,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self._legacy_forward_post_mlp = klass._forward_post_mlp
                 break
 
+    def get_inner_quantization_context(self) -> AbstractContextManager:
+        """Return the quantization context for fine-grained layer execution."""
+        if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
+            from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
+
+            return get_fp8_context(self.config, self.layer_number - 1)
+        if self.config.fp4:
+            from megatron.core.fp4_utils import get_fp4_context  # to avoid circular import
+
+            return get_fp4_context(self.config, self.layer_number - 1)
+        return nullcontext()
+
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
 
@@ -611,7 +647,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             CudaGraphModule.mlp in self.config.cuda_graph_modules
             and self.submodules_config.mlp != IdentityOp
         ):
-            # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
+            # Cudagraphing MoE layers is handled by MoETransformerLayer.
             assert not self.is_moe_layer
             self.cudagraph_manager = CudaGraphManager(config)
 
@@ -639,10 +675,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 output_with_bias[0], forced_released_tensors=forced_released_tensors
             )
             return (output, *output_with_bias[1:])
-        output = offload_manager.group_offload(
+        return offload_manager.group_offload(
             output_with_bias, forced_released_tensors=forced_released_tensors
         )
-        return output
 
     def _forward_self_attention_output_with_bias(
         self,
@@ -656,46 +691,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
-        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
-        """Run input norm + self-attention and return the raw output before BDA."""
+        """Run input norm and self-attention, returning the raw output before BDA."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
-        checkpoint_input_layernorm = self.recompute_input_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
-        if checkpoint_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                ckpt_manager=mhc_recompute_manager,
-                retain_input_tensors=self._input_layernorm_returns_residual,
+        if attn_state:
+            raise RuntimeError(
+                "Raw HybridStack attention execution requires an ordinary TransformerLayer "
+                "without subclass-specific attention state."
             )
-            with attn_norm_manager as hidden_states:
-                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    apply_module(self.input_layernorm), hidden_states
-                )
-        else:
-            with attn_norm_manager as hidden_states:
-                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
-        if isinstance(input_layernorm_output, tuple):
-            if len(input_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of input_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(input_layernorm_output)}"
-                )
-            input_layernorm_output, residual = input_layernorm_output
-        else:
-            residual = hidden_states
-
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
@@ -715,12 +728,52 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention")
 
-        if checkpoint_input_layernorm:
+        if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
 
-        return attention_output_with_bias, attn_norm_manager, residual
+        return attention_output_with_bias, self.attn_norm_manager, residual
+
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this is an attention-only layer that supports two-stage execution."""
+        return (
+            isinstance(self.self_attention, TwoStageAttentionLayer)
+            and self.self_attention.supports_two_stage_attention()
+            and isinstance(self.cross_attention, IdentityOp)
+            and isinstance(self.mlp, IdentityOp)
+        )
+
+    def attention_bda_and_cross_attention(
+        self,
+        attention_output_with_bias,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        attn_state=(),
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
+        """Apply checkpoint bookkeeping, self-attention BDA, and cross-attention."""
+        if self._input_layernorm_checkpoint_active:
+            # discard the output of the input layernorm and register the recompute
+            # as a gradient hook of attention_output_with_bias[0]
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        if residual_stream_recompute_context is None:
+            hidden_states = self._apply_self_attn_bda_step(
+                attention_output_with_bias, residual, attn_state
+            )
+        else:
+            hidden_states = self._apply_self_attn_bda_step(
+                attention_output_with_bias,
+                residual,
+                attn_state,
+                residual_stream_recompute_context=residual_stream_recompute_context,
+            )
+        return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
 
     def _forward_attention(
         self,
@@ -738,6 +791,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -761,6 +815,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
+            input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
+                signature for the MLP phase. Self-attention does not consume them; hash-routed
+                MoE layers use them later in ``_forward_mlp``.
+            residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
+                Call-local ordered replay state for configured residual connections.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -769,7 +828,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 otherwise None.
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        if padding_mask is not None and self._padding_mask_shape_seen is None:
+            # Whole-layer batch-first mask shape, taken before MLP chunking splits the mask, so TE
+            # CUDA graph capture reserves (and replay passes) a mask of the layer's input shape.
+            self._padding_mask_shape_seen = tuple(padding_mask.shape)
+        if residual_stream_recompute_context is None:
+            input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        else:
+            input_layernorm_output, residual, attn_state = self._run_input_layernorm(
+                hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+            )
 
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
@@ -793,19 +861,90 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="self_attention")
 
-        if self._input_layernorm_checkpoint_active:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
-
-        hidden_states = self._apply_self_attn_bda_step(
-            attention_output_with_bias, residual, attn_state
+        return self.attention_bda_and_cross_attention(
+            attention_output_with_bias,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            inference_context=inference_context,
+            attn_state=attn_state,
+            residual_stream_recompute_context=residual_stream_recompute_context,
         )
-        return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
 
-    def _run_input_layernorm(self, hidden_states):
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        *,
+        packed_sequence_cp_metadata=None,
+    ):
+        """Run the training path through pre-attention and core attention."""
+        assert self.supports_two_stage_attention()
+
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(
+            hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+        )
+
+        nvtx_range_push(suffix="self_attention")
+        with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            attention_intermediate = self.self_attention.forward_pre_attn_and_core_attn(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            )
+        nvtx_range_pop(suffix="self_attention")
+
+        return attention_intermediate, residual, context, attn_state
+
+    def forward_post_core_attn(
+        self,
+        attention_intermediate: Tensor,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        attn_state=(),
+        context_mask: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
+        """Run the training path after core attention."""
+        assert self.supports_two_stage_attention()
+
+        attention_output_with_bias = self.self_attention.forward_post_core_attn(
+            attention_intermediate
+        )
+        return self.attention_bda_and_cross_attention(
+            attention_output_with_bias,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            attn_state=attn_state,
+            residual_stream_recompute_context=residual_stream_recompute_context,
+        )
+
+    def _get_self_attention_residual_connection(self):
+        """Return an optional architecture-owned self-attention connection."""
+
+        return None
+
+    def _get_mlp_residual_connection(self):
+        """Return an optional architecture-owned MLP connection."""
+
+        return None
+
+    def _run_input_layernorm(
+        self,
+        hidden_states,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
         """Run input layernorm with optional output-discarding checkpoint and
         fine-grained activation offloading.
 
@@ -817,15 +956,48 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Tuple ``(input_layernorm_output, residual, attn_state)`` where
             ``attn_state`` is an opaque payload subclasses can use to thread
             extra intermediates (e.g. mHC ``h_res``/``h_post``) through to
-            ``_apply_self_attn_bda_step``. Base returns ``()``.
+            ``_apply_self_attn_bda_step``. A configured residual connection uses
+            it for the corresponding write state; otherwise base returns ``()``.
         """
-        self.attn_norm_manager = self.off_interface(
-            self.offload_attn_norm, hidden_states, "attn_norm"
+        residual_connection = self._get_self_attention_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
         )
-        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm
+        connection_state = ()
+        if residual_connection is not None:
+            if recompute_context is None:
+                hidden_states, connection_state = apply_module(residual_connection)(
+                    hidden_states,
+                    operation="read",
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                    branch_input_dtype=self.config.params_dtype,
+                )
+            else:
+                hidden_states, connection_state = checkpoint_residual_read(
+                    residual_connection,
+                    hidden_states,
+                    recompute_context,
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                    branch_input_dtype=self.config.params_dtype,
+                )
+
+        self.attn_norm_manager = self.off_interface(
+            self.offload_attn_norm and recompute_context is None, hidden_states, "attn_norm"
+        )
+        replay_input_layernorm = recompute_context is not None and not isinstance(
+            self.input_layernorm, IdentityOp
+        )
+        self._input_layernorm_checkpoint_active = (
+            self.recompute_input_layernorm
+            or replay_input_layernorm
+            or (mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm)
+        )
         if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                retain_input_tensors=self._input_layernorm_returns_residual
+                ckpt_manager=(
+                    recompute_context.manager if replay_input_layernorm else mhc_recompute_manager
+                ),
+                retain_input_tensors=self._input_layernorm_returns_residual,
             )
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -835,24 +1007,46 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
+        if recompute_context is not None and self.config.fine_grained_activation_offloading:
+            output = (
+                input_layernorm_output[0]
+                if isinstance(input_layernorm_output, tuple)
+                else input_layernorm_output
+            )
+            self.off_interface.mark_not_offload(output)
+
         if self._input_layernorm_returns_residual:
             input_layernorm_output, residual = input_layernorm_output
         else:
-            residual = hidden_states
+            residual = (
+                hidden_states
+                if residual_connection is None
+                else residual_connection.residual_stream(connection_state)
+            )
 
-        if self.config.fp32_residual_connection:
+        if residual_connection is None and self.config.fp32_residual_connection:
             residual = residual.float()
-        return input_layernorm_output, residual, ()
+        return input_layernorm_output, residual, connection_state
 
-    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state=()):
+    def _apply_self_attn_bda_step(
+        self,
+        attention_output_with_bias,
+        residual,
+        attn_state=(),
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+    ):
         """bias-dropout-add for self-attention output + post-step offload commit.
 
-        Subclasses override this to swap in a fused kernel that consumes extra
-        intermediates threaded via ``attn_state`` (the third element returned
-        by ``_run_input_layernorm``). Base ignores ``attn_state``.
+        Subclasses may override this to consume custom intermediates threaded via
+        ``attn_state``. Base uses that state for an optional residual connection and
+        otherwise performs the ordinary bias-dropout-add.
         """
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
+        )
+        residual_connection = self._get_self_attention_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
         )
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -862,6 +1056,32 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+        elif residual_connection is not None:
+            if not attn_state:
+                raise RuntimeError("Missing state for the self-attention residual connection.")
+            is_terminal_write = bool(
+                recompute_context is not None
+                and recompute_context.is_block_end
+                and self._get_mlp_residual_connection() is None
+            )
+            if recompute_context is not None and not is_terminal_write:
+                hidden_states = checkpoint_residual_write(
+                    residual_connection,
+                    attention_output_with_bias,
+                    attn_state,
+                    recompute_context,
+                    dropout_probability=self.hidden_dropout,
+                    training=self.training,
+                )
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = apply_module(residual_connection)(
+                        attention_output_with_bias,
+                        operation="write",
+                        state=attn_state,
+                        dropout_probability=self.hidden_dropout,
+                        training=self.training,
+                    )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -871,8 +1091,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
+        forced_released_tensors = [residual] if residual_connection is None else []
         hidden_states = self.attn_norm_manager.group_offload(
-            hidden_states, forced_released_tensors=[residual]
+            hidden_states, forced_released_tensors=forced_released_tensors
         )
         self.attn_norm_manager = None
         return hidden_states
@@ -915,41 +1136,62 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        # Injected by __call__ for cuda graph keying; not a real forward arg.
+        # CUDA-graph key metadata and the dev mHC wrapper marker are not layer kwargs.
         kwargs.pop("dynamic_inference_decode_only", None)
         called_from_hybrid_mhc_wrapper = kwargs.pop("_called_from_hybrid_mhc_wrapper", False)
         if self.config.enable_hyper_connections and not called_from_hybrid_mhc_wrapper:
             raise RuntimeError(
-                "TransformerLayer.forward() must not be called directly when "
-                "enable_hyper_connections=True. Use HyperConnectionTransformerLayer "
-                "for transformer-only stacks; HyperConnectionHybridLayer drives the "
-                "wrapped TransformerLayer through this path automatically for hybrid "
-                "stacks."
+                "Use the mHC TransformerLayer/Hybrid wrapper when hyper connections are enabled."
             )
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             with _otel_managed_span('layer', 'megatron.layer.mlp'):
+                residual_stream_recompute_context = kwargs.get(
+                    "residual_stream_recompute_context", None
+                )
+                mlp_kwargs = {
+                    "padding_mask": kwargs.get("padding_mask", None),
+                    "packed_seq_params": kwargs.get("packed_seq_params", None),
+                }
+                if residual_stream_recompute_context is not None:
+                    mlp_kwargs["residual_stream_recompute_context"] = (
+                        residual_stream_recompute_context
+                    )
+                if kwargs.get("input_ids", None) is not None:
+                    mlp_kwargs["input_ids"] = kwargs["input_ids"]
                 output = self._forward_mlp(
-                    hidden_states,
-                    kwargs.get("inference_context", None),
-                    padding_mask=kwargs.get("padding_mask", None),
-                    input_ids=kwargs.get("input_ids", None),
-                    packed_seq_params=kwargs.get("packed_seq_params", None),
+                    hidden_states, kwargs.get("inference_context", None), **mlp_kwargs
                 )
             return output, context
 
     def _forward_pre_mlp_layernorm(
-        self, hidden_states: Tensor, mhc_recompute_manager: Optional['MHCCheckpointManager'] = None
+        self,
+        hidden_states: Tensor,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
-        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
-        checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+        self.mlp_norm_manager = self.off_interface(
+            self.offload_mlp_norm and residual_stream_recompute_context is None,
+            hidden_states,
+            "mlp_norm",
+        )
+        replay_pre_mlp_layernorm = residual_stream_recompute_context is not None and not isinstance(
+            self.pre_mlp_layernorm, IdentityOp
+        )
+        checkpoint_pre_mlp_layernorm = (
+            self.recompute_pre_mlp_layernorm
+            or replay_pre_mlp_layernorm
+            or (mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm)
         )
         if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                ckpt_manager=mhc_recompute_manager,
+                ckpt_manager=(
+                    residual_stream_recompute_context.manager
+                    if replay_pre_mlp_layernorm
+                    else mhc_recompute_manager
+                ),
                 retain_input_tensors=self._pre_mlp_layernorm_returns_residual,
             )
             with self.mlp_norm_manager as hidden_states:
@@ -960,9 +1202,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
 
+        if (
+            residual_stream_recompute_context is not None
+            and self.config.fine_grained_activation_offloading
+        ):
+            output = (
+                pre_mlp_layernorm_output[0]
+                if isinstance(pre_mlp_layernorm_output, tuple)
+                else pre_mlp_layernorm_output
+            )
+            self.off_interface.mark_not_offload(output)
+
         return pre_mlp_layernorm_output
 
-    def _maybe_unflatten_for_moe(self, hidden_states, padding_mask, packed_seq_params):
+    def _maybe_unflatten_for_moe(self, hidden_states, padding_mask, input_ids, packed_seq_params):
         """Un-flatten packed sequences to restore the batch dimension for MoE.
 
         When inter-document masking flattens MBS > 1 into [mbs*S, 1, H], the MoE
@@ -971,7 +1224,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         MoE layer restores the correct per-sample structure.
 
         Returns:
-            (hidden_states, padding_mask, mbs) where mbs is None if no
+            (hidden_states, padding_mask, input_ids, mbs) where mbs is None if no
             un-flattening was applied.
         """
         if (
@@ -979,12 +1232,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             or packed_seq_params is None
             or getattr(packed_seq_params, 'tokens_per_sample', None) is None
         ):
-            return hidden_states, padding_mask, None
+            return hidden_states, padding_mask, input_ids, None
 
         tokens_per_sample = packed_seq_params.tokens_per_sample
         mbs = hidden_states.shape[0] // tokens_per_sample
         if mbs <= 1:
-            return hidden_states, padding_mask, None
+            return hidden_states, padding_mask, input_ids, None
 
         # The flattened tensor has all tokens from sample 0, then all tokens
         # from sample 1, etc. A plain reshape would keep that ordering, but we
@@ -993,7 +1246,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states = hidden_states.view(mbs, tokens_per_sample, -1).transpose(0, 1).contiguous()
         if padding_mask is not None:
             padding_mask = padding_mask.view(mbs, tokens_per_sample)
-        return hidden_states, padding_mask, mbs
+        if input_ids is not None:
+            input_ids = input_ids.view(mbs, tokens_per_sample)
+        return hidden_states, padding_mask, input_ids, mbs
 
     def _maybe_reflatten_from_moe(self, output, packed_seq_params, mbs):
         """Re-flatten MoE output back to [mbs*S, 1, H] for the residual add."""
@@ -1002,7 +1257,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
 
     def _pre_mlp_layernorm_and_residual(
-        self, hidden_states, mhc_recompute_manager: Optional['MHCCheckpointManager'] = None
+        self,
+        hidden_states,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ):
         """Run pre-MLP layernorm (with optional recompute and offload), unpack a
         tuple-output layernorm, and apply the fp32-residual cast.
@@ -1010,57 +1268,75 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             Tuple ``(pre_mlp_layernorm_output, residual, mlp_state)`` where
             ``mlp_state`` is an opaque payload subclasses can use to thread
-            extra intermediates through to ``_apply_mlp_bda_step``. Base returns ``()``.
+            extra intermediates (e.g. mHC ``mlp_h_res`` / ``mlp_hc_h_post``)
+            through to ``_apply_mlp_bda_step``. A configured residual connection
+            uses it for the corresponding write state; otherwise base returns ``()``.
         """
+        residual_connection = self._get_mlp_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
+        )
+        connection_state = ()
+        if residual_connection is not None:
+            if recompute_context is None:
+                hidden_states, connection_state = apply_module(residual_connection)(
+                    hidden_states,
+                    operation="read",
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                    branch_input_dtype=self.config.params_dtype,
+                )
+            else:
+                hidden_states, connection_state = checkpoint_residual_read(
+                    residual_connection,
+                    hidden_states,
+                    recompute_context,
+                    fp32_residual_connection=self.config.fp32_residual_connection,
+                    branch_input_dtype=self.config.params_dtype,
+                )
+
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states,
+            mhc_recompute_manager=mhc_recompute_manager,
+            residual_stream_recompute_context=recompute_context,
         )
 
         if self._pre_mlp_layernorm_returns_residual:
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
         else:
-            residual = hidden_states
+            residual = (
+                hidden_states
+                if residual_connection is None
+                else residual_connection.residual_stream(connection_state)
+            )
 
-        if self.config.fp32_residual_connection:
+        if residual_connection is None and self.config.fp32_residual_connection:
             residual = residual.float()
 
-        return pre_mlp_layernorm_output, residual, ()
+        return pre_mlp_layernorm_output, residual, connection_state
 
     def _forward_mlp_output_with_bias(
         self,
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        packed_seq_params=None,
         input_ids: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
-        """Run pre-MLP norm + MLP/MoE and return the raw output before BDA."""
-        pre_mlp_layernorm_output, residual, _ = self._pre_mlp_layernorm_and_residual(
+        """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
+        pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
-        mlp_output_with_bias = self._run_mlp_with_moe_reshape(
-            pre_mlp_layernorm_output,
-            residual,
-            padding_mask,
-            inference_context,
-            input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
-        )
-        return mlp_output_with_bias, residual
+        if mlp_state:
+            raise RuntimeError(
+                "Raw HybridStack MLP execution requires an ordinary TransformerLayer "
+                "without subclass-specific MLP state."
+            )
 
-    def _run_mlp_with_moe_reshape(
-        self,
-        pre_mlp_layernorm_output: Tensor,
-        residual: Tensor,
-        padding_mask: Tensor | None,
-        inference_context: BaseInferenceContext | None,
-        input_ids: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
-    ) -> tuple[Tensor, Tensor | None]:
-        """Run ``_run_mlp`` with the packed-sequence MoE un-flatten/re-flatten around it."""
-        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        pre_mlp_layernorm_output, padding_mask, input_ids, moe_unflatten_mbs = (
+            self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, input_ids, packed_seq_params
+            )
         )
 
         mlp_output_with_bias = self._run_mlp(
@@ -1078,15 +1354,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output, packed_seq_params, moe_unflatten_mbs
             )
             mlp_output_with_bias = (mlp_output, mlp_bias)
-        return mlp_output_with_bias
+
+        return mlp_output_with_bias, residual
 
     def _forward_mlp(
         self,
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        packed_seq_params=None,
         input_ids: Optional[Tensor] = None,
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -1099,18 +1377,31 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from aux loss computations.
                 The MoELayer will internally transform this to [seq_length, bsz] format.
-            input_ids (Tensor, optional): The input IDs tensor. Shape [seq_length, bsz].
-                Only used for hash-based MoE routing. Defaults to None.
             packed_seq_params: Packed sequence parameters, used to detect flattened
                 batches that need reshaping for MoE sequence load balancing.
+            input_ids (Tensor, optional): Token IDs with shape [batch_size, seq_length].
+                Required by hash-routed MoE layers.
+            residual_stream_recompute_context: Call-local ordered replay state for the
+                configured MLP residual connection.
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-        pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
-            hidden_states
+        if residual_stream_recompute_context is None:
+            pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
+                hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
+                hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
+            )
+
+        pre_mlp_layernorm_output, padding_mask, input_ids, moe_unflatten_mbs = (
+            self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, input_ids, packed_seq_params
+            )
         )
 
-        mlp_output_with_bias = self._run_mlp_with_moe_reshape(
+        mlp_output_with_bias = self._run_mlp(
             pre_mlp_layernorm_output,
             residual,
             padding_mask,
@@ -1118,6 +1409,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
         )
+
+        if moe_unflatten_mbs is not None:
+            mlp_output, mlp_bias = mlp_output_with_bias
+            mlp_output = self._maybe_reflatten_from_moe(
+                mlp_output, packed_seq_params, moe_unflatten_mbs
+            )
+            mlp_output_with_bias = (mlp_output, mlp_bias)
 
         if (
             self.is_moe_layer
@@ -1135,7 +1433,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
-            return self._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state)
+            if residual_stream_recompute_context is None:
+                return self._apply_mlp_bda_step(mlp_output_with_bias, residual, mlp_state)
+            return self._apply_mlp_bda_step(
+                mlp_output_with_bias,
+                residual,
+                mlp_state,
+                residual_stream_recompute_context=residual_stream_recompute_context,
+            )
 
     def _run_mlp(
         self,
@@ -1176,7 +1481,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
-
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
@@ -1208,6 +1512,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     pre_mlp_layernorm_output,
                 )
         elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
+            if self.is_moe_layer and self.config.sequence_parallel:
+                # Slice replicated metadata into the same TP ownership frame as the
+                # activations before chunking. Newer callers may already provide local masks.
+                local_length = pre_mlp_layernorm_output.shape[0]
+
+                def local_metadata(value):
+                    if value is None or value.shape[1] == local_length:
+                        return value
+                    assert value.shape[1] == local_length * self.pg_collection.tp.size()
+                    return (
+                        tensor_parallel.scatter_to_sequence_parallel_region(
+                            value.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                        )
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+
+                padding_mask = local_metadata(padding_mask)
+                input_ids = local_metadata(input_ids)
             # Chunk input along sequence dimension
             num_chunks = min(
                 (
@@ -1219,9 +1542,32 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+            padding_mask_chunks = (
+                padding_mask.chunk(num_chunks, dim=1)
+                if padding_mask is not None
+                else (None,) * num_chunks
+            )
+            input_id_chunks = (
+                input_ids.chunk(num_chunks, dim=1)
+                if self.is_moe_layer and input_ids is not None
+                else (None,) * num_chunks
+            )
 
-            # Compute outputs for each chunk
-            outputs = [apply_module(self.mlp)(chunk) for chunk in chunks]
+            # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
+            outputs = []
+            for chunk, padding_mask_chunk, input_id_chunk in zip(
+                chunks, padding_mask_chunks, input_id_chunks
+            ):
+                chunk_moe_kwargs = {}
+                if input_id_chunk is not None:
+                    chunk_moe_kwargs["input_ids"] = input_id_chunk
+                if self.is_moe_layer:
+                    chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
+                outputs.append(
+                    apply_module(self.mlp)(
+                        chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs
+                    )
+                )
 
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
@@ -1246,14 +1592,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mlp_output_with_bias: tuple[Tensor, Tensor | None],
         residual: Tensor,
         mlp_state: tuple = (),
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
     ) -> Tensor:
         """
         Perform operations after the MLP computation: bias-dropout-add for
         the MLP output + post-step offload commit + viewless-tensor wrap.
 
-        Subclasses override this to swap in a fused kernel that consumes extra
-        intermediates threaded via ``mlp_state`` (the third element returned
-        by ``_pre_mlp_layernorm_and_residual``). Base ignores ``mlp_state``.
+        Subclasses may override this to consume custom intermediates threaded via
+        ``mlp_state``. Base uses that state for an optional residual connection and
+        otherwise performs the ordinary bias-dropout-add.
 
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
@@ -1284,6 +1631,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
+        residual_connection = self._get_mlp_residual_connection()
+        recompute_context = (
+            residual_stream_recompute_context if residual_connection is not None else None
+        )
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
@@ -1299,6 +1650,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif residual_connection is not None:
+            if not mlp_state:
+                raise RuntimeError("Missing state for the MLP residual connection.")
+            if recompute_context is not None and not recompute_context.is_block_end:
+                hidden_states = checkpoint_residual_write(
+                    residual_connection,
+                    mlp_output_with_bias,
+                    mlp_state,
+                    recompute_context,
+                    dropout_probability=self.hidden_dropout,
+                    training=self.training,
+                )
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = apply_module(residual_connection)(
+                        mlp_output_with_bias,
+                        operation="write",
+                        state=mlp_state,
+                        dropout_probability=self.hidden_dropout,
+                        training=self.training,
+                    )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
@@ -1308,8 +1680,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.mlp_norm_manager is not None:
+            forced_released_tensors = [residual] if residual_connection is None else []
             hidden_states = self.mlp_norm_manager.group_offload(
-                hidden_states, forced_released_tensors=[residual]
+                hidden_states, forced_released_tensors=forced_released_tensors
             )
             self.mlp_norm_manager = None
 
@@ -1495,19 +1868,33 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Add input_ids for hash-based MoE routing under CUDA graphs.
         # Only add for layers that actually use hash routing,
         # since other layers (e.g. on later PP stages) receive input_ids=None.
-        if (
-            self.is_moe_layer
-            and self.config.moe_n_hash_layers > 0
-            and getattr(self.mlp.router, 'is_hash_layer', False)
-        ):
+        if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
             input_ids_shape = (
                 (1, self.config.max_seqlen_per_dp_cp_rank)
                 if self._is_thd_cuda_graph()
-                else (micro_batch_size, seq_length)
+                else (micro_batch_size, static_inputs["hidden_states"].shape[0])
             )
             static_inputs["input_ids"] = torch.zeros(
                 input_ids_shape, dtype=torch.long, device=torch.cuda.current_device()
             )
+
+        # Reserve a padding_mask graph input when the eager warmup steps before capture gave this
+        # layer one, so the graphed router/z-loss/expert-bias see the same mask as eager mode. The
+        # shape is the layer's whole-batch mask (recorded in _forward_attention, before any MLP
+        # chunking), which is also what replay passes. TE fixes the kwarg set at capture, so
+        # replays must then always pass a mask; see _te_cuda_graph_replay for the all-False default.
+        self._cuda_graph_padding_mask_shape = None
+        if self._moe_router_in_cuda_graph():
+            mask_shape = self._padding_mask_shape_seen
+            if mask_shape is not None:
+                self._cuda_graph_padding_mask_shape = tuple(mask_shape)
+                static_inputs["padding_mask"] = torch.zeros(
+                    mask_shape, dtype=torch.bool, device=torch.cuda.current_device()
+                )
+        # THD reserves this input even for attention-only capture. Replay must
+        # preserve every captured kwarg, not only masks observed by a MoE router.
+        if "padding_mask" in static_inputs:
+            self._cuda_graph_padding_mask_shape = tuple(static_inputs["padding_mask"].shape)
         return static_inputs
 
     def _uses_graph_dynamic_dsa_route(self):
@@ -1526,6 +1913,38 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
             and has_dsa_indexer
         )
+
+    def _moe_router_in_cuda_graph(self) -> bool:
+        """Return True when this layer's MoE router runs inside the TE CUDA graph."""
+        return self.is_moe_layer and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.moe in self.config.cuda_graph_modules
+            or CudaGraphModule.moe_router in self.config.cuda_graph_modules
+        )
+
+    def _te_cuda_graph_padding_mask(
+        self, padding_mask: Optional[Tensor], device: torch.device
+    ) -> Optional[Tensor]:
+        """Reconcile the replay padding_mask with the graph's captured input set.
+
+        Returns the mask to pass to the graph: the caller's mask, an all-False mask when the graph
+        was captured with a padding_mask input but this batch has none, or None when the graph has
+        no such input. Raises when a mask is passed to a graph captured without one, since the
+        graph would silently ignore it and diverge from eager execution.
+        """
+        graph_mask_shape = self._cuda_graph_padding_mask_shape
+        if graph_mask_shape is None:
+            if padding_mask is not None and self._moe_router_in_cuda_graph():
+                raise RuntimeError(
+                    "padding_mask was passed to a TE CUDA graph that was captured without a "
+                    "padding_mask input: no mask reached this layer during "
+                    "cuda_graph_warmup_steps (is it 0?). The graphed router would silently ignore "
+                    "the mask. Run at least one eager warmup step with masked batches."
+                )
+            return None
+        if padding_mask is None:
+            padding_mask = torch.zeros(graph_mask_shape, dtype=torch.bool, device=device)
+        return padding_mask
 
     def _get_submodules_under_cudagraphs(self):
         """
@@ -1812,7 +2231,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
-        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+        # The graph only takes padding_mask when it was captured with that input; the eager MoE
+        # steps after the graph keep using the caller's mask from `kwargs`.
+        graph_kwargs = {k: v for k, v in kwargs.items() if k != "padding_mask"}
+        hidden_states = args[0] if args else kwargs["hidden_states"]
+        graph_padding_mask = self._te_cuda_graph_padding_mask(
+            kwargs.get("padding_mask"), hidden_states.device
+        )
+        if graph_padding_mask is not None:
+            graph_kwargs["padding_mask"] = graph_padding_mask
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **graph_kwargs))
 
         # Flush delayed offload groups from previous layers after graph replay.
         # The CPU is idle during the sync between graph replay and a2a comm,
@@ -1876,11 +2304,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
-                probs, routing_map = self.mlp.route(hidden_states)
-                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
+                hidden_states, probs = self.mlp.preprocess(
+                    hidden_states, probs, routing_map, kwargs.get("padding_mask")
+                )
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
-            mlp_output_with_bias = apply_module(self.mlp)(hidden_states)
+            # The cached router outputs are unmasked; eager preprocess needs the replay mask
+            # so the dispatcher can exclude padded rows.
+            mlp_output_with_bias = apply_module(self.mlp)(
+                hidden_states, padding_mask=kwargs.get("padding_mask")
+            )
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
@@ -1902,8 +2336,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     hidden_states, residual = hidden_states
 
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
-                probs, routing_map = self.mlp.route(hidden_states)
-                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                probs, routing_map = self.mlp.route(hidden_states, kwargs.get("padding_mask"))
+                hidden_states, probs = self.mlp.preprocess(
+                    hidden_states, probs, routing_map, kwargs.get("padding_mask")
+                )
                 return residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
@@ -1999,6 +2435,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
         elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
+            # Owned by the model-level graph `_setup_mtp_cuda_graphs` installs; a nested
+            # per-layer graph can be neither captured nor replayed ("Cannot prepare for
+            # replay during capturing stage").
+            and not self.is_mtp_layer
             and kwargs['attention_mask'] is None
             and (
                 (kwargs.get('inference_context') is not None)
@@ -2182,6 +2622,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     Cross-attention hyper connection is not supported.
     """
 
+    supports_mhc_connections: bool = True
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -2231,7 +2673,21 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
 
+        self._mhc_recompute_manager = None
         self._validate_mhc_recompute_attn_cuda_graph_split()
+        if self.config.cuda_graph_impl == "local":
+            if self.is_moe_layer and {
+                CudaGraphModule.moe,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            }.intersection(self.config.cuda_graph_modules):
+                raise NotImplementedError(
+                    "HyperConnectionTransformerLayer does not support local partial-MoE CUDA "
+                    "graph scopes. Transformer Engine capture retains the mHC MoE paths."
+                )
+            # GraphableMegatronModule runs before the MLP is built; decide again now
+            # that the actual dense/MoE layer type is known.
+            self.create_mcore_cudagraph_manager(self.config)
 
     def _uses_mhc_recompute_attn_cuda_graph_split(self) -> bool:
         """Whether the graph starts after eager mHC aggregation.
@@ -2304,6 +2760,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
 
         return static_inputs
+
+    def create_mcore_cudagraph_manager(self, config):
+        """Create only CUDA graph managers compatible with this mHC layer."""
+        # The first call comes from GraphableMegatronModule before TransformerLayer has
+        # constructed self.mlp and set self.is_moe_layer.
+        if not hasattr(self, "mlp"):
+            return
+
+        if self.is_moe_layer:
+            # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
+            # models may still request MLP graphs globally, so leave only this MoE layer eager.
+            if not config.cuda_graph_modules or (
+                CudaGraphModule.mlp in config.cuda_graph_modules
+                and CudaGraphModule.attn not in config.cuda_graph_modules
+            ):
+                return
+
+        super().create_mcore_cudagraph_manager(config)
 
     def _get_submodules_under_cudagraphs(self):
         """Override to include hyper connection modules.
@@ -2494,7 +2968,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
             self.self_attention_hyper_connection(
-                hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
             )
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
@@ -2515,6 +2989,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         else:
             with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
+
+        input_layernorm_output = self._reject_residual_returning_norm(
+            input_layernorm_output, "input_layernorm"
+        )
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -2592,7 +3070,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
         # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical
@@ -2620,57 +3098,26 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
-        nvtx_range_push(suffix="mlp")
-        should_chunk_mlp_for_prefill = (
-            self.config.mlp_chunks_for_prefill > 1
-            and inference_context is not None
-            and not inference_context.is_decode_only()
-            and not isinstance(self.mlp, IdentityOp)
-            and not self.config.transformer_impl == "inference_optimized"
+        pre_mlp_layernorm_output = self._reject_residual_returning_norm(
+            pre_mlp_layernorm_output, "pre_mlp_layernorm"
         )
-
-        moe_kwargs = {}
-        if self.is_moe_layer and input_ids is not None:
-            moe_kwargs['input_ids'] = input_ids
-        if self.is_moe_layer and packed_seq_params is not None:
-            moe_kwargs['packed_seq_params'] = packed_seq_params
-
-        if self.recompute_mlp:
-            # import here to avoid circular import
-            from megatron.core.recompute import use_te_checkpoint
-
-            if use_te_checkpoint(self.config):
-                from megatron.core.extensions.transformer_engine import te_checkpoint
-
-                mlp_output_with_bias = te_checkpoint(
-                    self.mlp,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
-                    **moe_kwargs,
-                )
-            else:
-                mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask, **moe_kwargs),
-                    False,
-                    pre_mlp_layernorm_output,
-                )
-        elif should_chunk_mlp_for_prefill:
-            num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
-            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
-            outputs = [self.mlp(chunk) for chunk in chunks]
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
-        else:
-            mlp_output_with_bias = self.mlp(
-                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
+        pre_mlp_layernorm_output, padding_mask, input_ids, moe_unflatten_mbs = (
+            self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, input_ids, packed_seq_params
             )
-
-        nvtx_range_pop(suffix="mlp")
+        )
+        mlp_output_with_bias = self._run_mlp(
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
+        )
+        if moe_unflatten_mbs is not None:
+            output, bias = mlp_output_with_bias
+            output = self._maybe_reflatten_from_moe(output, packed_seq_params, moe_unflatten_mbs)
+            mlp_output_with_bias = (output, bias)
 
         # During TE CUDA graph partial MoE capture, skip HC post-processing and return
         # intermediate outputs + HC state. The post-processing will be done during replay.
@@ -2854,7 +3301,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_push(suffix="self_attention_hyper_connection")
         aggregated, self_attn_h_res, self_attn_hc_h_post, residual = (
             self.self_attention_hyper_connection(
-                hidden_states, mhc_recompute_manager=mhc_recompute_manager, output_slot=output_slot
+                hidden_states,
+                mhc_recompute_manager=mhc_recompute_manager,
+                output_slot=output_slot,
+                return_residual=True,
             )
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
@@ -2933,7 +3383,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         nvtx_range_push(suffix="mlp_hyper_connection")
         hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
 
@@ -2974,7 +3424,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         probs, routing_map = self.mlp.route(
             pre_mlp_layernorm_output, padding_mask=kwargs.get("padding_mask")
         )
-        local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
+        local_tokens, probs = self.mlp.preprocess(
+            pre_mlp_layernorm_output, probs, routing_map, kwargs.get("padding_mask")
+        )
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
@@ -3062,8 +3514,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
             # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
-                probs, routing_map = self.mlp.route(hidden_states)
-                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                probs, routing_map = self.mlp.route(hidden_states, padding_mask=padding_mask)
+                hidden_states, probs = self.mlp.preprocess(
+                    hidden_states, probs, routing_map, padding_mask
+                )
                 nvtx_range_pop(suffix="mlp")
                 return (
                     residual,
@@ -3103,7 +3557,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
                 nvtx_range_push(suffix="mlp_hyper_connection")
                 hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
-                    hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                    hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
                 )
                 nvtx_range_pop(suffix="mlp_hyper_connection")
 
@@ -3134,7 +3588,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 # gating, and the expert-load counters, so dropping it makes the
                 # graphed path drift from eager on padded batches.
                 probs, routing_map = self.mlp.route(hidden_states, padding_mask=padding_mask)
-                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                hidden_states, probs = self.mlp.preprocess(
+                    hidden_states, probs, routing_map, padding_mask
+                )
                 return (
                     residual,
                     hidden_states,
@@ -3156,6 +3612,225 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mhc_recompute_manager=getattr(self, '_mhc_recompute_manager', None),
             )
         return output, context
+
+    def _run_input_layernorm(self, hidden_states):
+        """HC input layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.
+
+        Threads ``h_res`` and ``h_post`` (produced by the hyper-connection
+        pre-wrap) to ``_apply_self_attn_bda_step`` via the ``attn_state`` slot
+        in the return tuple. Also sets
+        ``self._input_layernorm_checkpoint_active`` for the post-self-attn
+        discard hook.
+
+        Returns ``(input_layernorm_output, residual, (h_res, h_post))`` where
+        ``residual`` is the n-stream hidden state captured before
+        aggregation — it flows to ``_apply_self_attn_bda_step`` via the base
+        skeleton's ``residual`` argument, and ``(h_res, h_post)`` flows via
+        ``attn_state``.
+        """
+        # Capture the n-stream residual BEFORE self_attention_hyper_connection
+        # aggregates n-stream -> single-stream. The fused bda kernel needs the
+        # original n-stream tensor.
+        residual = hidden_states
+
+        nvtx_range_push(suffix="self_attention_hyper_connection")
+        hidden_states, h_res, h_post, residual = self.self_attention_hyper_connection(
+            hidden_states, mhc_recompute_manager=self._mhc_recompute_manager, return_residual=True
+        )
+        nvtx_range_pop(suffix="self_attention_hyper_connection")
+
+        self.attn_norm_manager = self.off_interface(
+            self.offload_attn_norm, hidden_states, "attn_norm"
+        )
+        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm or (
+            self._mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
+        )
+        if self._input_layernorm_checkpoint_active:
+            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=self._mhc_recompute_manager
+            )
+            with self.attn_norm_manager as hidden_states:
+                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                    self.input_layernorm, hidden_states
+                )
+        else:
+            with self.attn_norm_manager as hidden_states:
+                input_layernorm_output = self.input_layernorm(hidden_states)
+
+        input_layernorm_output = self._reject_residual_returning_norm(
+            input_layernorm_output, "input_layernorm"
+        )
+        return input_layernorm_output, residual, (h_res, h_post)
+
+    @staticmethod
+    def _reject_residual_returning_norm(layernorm_output, norm_name):
+        """Reject layernorms that also return a residual.
+
+        Base ``TransformerLayer`` accepts a ``(output, residual)`` tuple from a
+        layernorm and uses the returned residual. mHC cannot: its residual must
+        be the n-stream tensor captured *before* the hyper-connection aggregates
+        n-stream -> single-stream, because ``fused_h_res_h_post_bda`` mixes it
+        with ``H_res``. A norm-supplied single-stream residual would silently
+        produce wrong shapes, so fail fast instead.
+        """
+        if isinstance(layernorm_output, tuple):
+            raise ValueError(
+                f"HyperConnectionTransformerLayer does not support a {norm_name} that "
+                f"returns a (output, residual) tuple. mHC requires the n-stream residual "
+                f"captured before hyper-connection aggregation. Use a layernorm submodule "
+                f"that returns only the normalized output."
+            )
+        return layernorm_output
+
+    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state=()):
+        """HC fused bias-dropout-add: combines apply_h_res + apply_h_post + bda.
+
+        Unpacks ``h_res`` and ``h_post`` from ``attn_state`` (threaded by
+        ``_run_input_layernorm`` via the base skeleton). Keeps the base class's
+        default so base-class call sites that pass only two arguments fail with a
+        readable message rather than a TypeError.
+        """
+        if not attn_state:
+            raise ValueError(
+                "HyperConnectionTransformerLayer._apply_self_attn_bda_step requires the "
+                "(h_res, h_post) attn_state produced by _run_input_layernorm. It was called "
+                "through a base-class path that does not thread mHC intermediates."
+            )
+        h_res, h_post = attn_state
+        nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
+                h_res,
+                residual,
+                h_post,
+                attention_output_with_bias,
+                self.hidden_dropout,
+                self.training,
+                self.config.bias_dropout_fusion,
+                self._mhc_recompute_manager,
+            )
+        nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
+        # HC omits forced_released_tensors — the n-stream residual is consumed
+        # by the fused kernel above, so the base class's "release residual after
+        # commit" trick doesn't apply.
+        hidden_states = self.attn_norm_manager.group_offload(hidden_states)
+        self.attn_norm_manager = None
+        return hidden_states
+
+    def _pre_mlp_layernorm_and_residual(self, hidden_states):
+        """HC pre-mlp layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.
+
+        Threads ``mlp_h_res`` and ``mlp_hc_h_post`` (produced by the
+        hyper-connection pre-wrap) to ``_apply_mlp_bda_step`` via the
+        ``mlp_state`` slot in the return tuple.
+
+        Returns ``(pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post))``
+        where ``residual`` is the n-stream hidden state captured before
+        aggregation — it flows to ``_apply_mlp_bda_step`` via the base
+        skeleton's ``residual`` argument, and ``(mlp_h_res, mlp_hc_h_post)``
+        flows via ``mlp_state``.
+        """
+        # Capture the n-stream residual BEFORE mlp_hyper_connection
+        # aggregates n-stream -> single-stream. The fused bda kernel needs the
+        # original n-stream tensor.
+        residual = hidden_states
+
+        nvtx_range_push(suffix="mlp_hyper_connection")
+        hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
+            hidden_states, mhc_recompute_manager=self._mhc_recompute_manager, return_residual=True
+        )
+        nvtx_range_pop(suffix="mlp_hyper_connection")
+
+        self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+        checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
+            self._mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+        )
+        if checkpoint_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=self._mhc_recompute_manager
+            )
+            with self.mlp_norm_manager as hidden_states:
+                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                    self.pre_mlp_layernorm, hidden_states
+                )
+        else:
+            with self.mlp_norm_manager as hidden_states:
+                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+
+        pre_mlp_layernorm_output = self._reject_residual_returning_norm(
+            pre_mlp_layernorm_output, "pre_mlp_layernorm"
+        )
+        return pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post)
+
+    def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state=()):
+        """HC fused bias-dropout-add for MLP: combines apply_h_res + apply_h_post + bda.
+
+        Unpacks ``mlp_h_res`` and ``mlp_hc_h_post`` from ``mlp_state`` (threaded
+        by ``_pre_mlp_layernorm_and_residual`` via the base skeleton). Computes the
+        per-call ``mhc_mlp_bda_manager`` from ``self._mhc_recompute_manager``:
+        the last layer of a recompute block does NOT pass the manager into the
+        fused-bda checkpoint — the block-end finalize hook handles its output
+        discard.
+
+        Keeps the base class's ``mlp_state`` default so base-class call sites that
+        pass only two arguments (``_te_cuda_graph_replay_impl``,
+        ``MoETransformerLayer._forward_mlp_postprocess``) fail with a readable
+        message rather than a TypeError.
+        """
+        if not mlp_state:
+            raise ValueError(
+                "HyperConnectionTransformerLayer._apply_mlp_bda_step requires the "
+                "(h_res, h_post) mlp_state produced by _pre_mlp_layernorm_and_residual. It "
+                "was called through a base-class path that does not thread mHC intermediates."
+            )
+        mlp_h_res, mlp_hc_h_post = mlp_state
+
+        is_last_in_recompute_block = bool(
+            self._mhc_recompute_manager is not None
+            and getattr(self._mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
+        )
+        mhc_mlp_bda_manager = None if is_last_in_recompute_block else self._mhc_recompute_manager
+
+        if self.recompute_pre_mlp_layernorm or (
+            mhc_mlp_bda_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+        ):
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                mlp_output_with_bias[0]
+            )
+
+        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
+                mlp_h_res,
+                residual,
+                mlp_hc_h_post,
+                mlp_output_with_bias,
+                self.hidden_dropout,
+                self.training,
+                self.config.bias_dropout_fusion,
+                mhc_mlp_bda_manager,
+            )
+        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+
+        # HC omits forced_released_tensors — the n-stream residual is consumed
+        # by the fused kernel above, so the base class's "release residual after
+        # commit" trick doesn't apply.
+        if self.mlp_norm_manager is not None:
+            hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
+            self.mlp_norm_manager = None
+
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+        return output
+
+    def supports_two_stage_attention(self) -> bool:
+        """Expose the incoming split interface on its supported mHC configurations."""
+        return (
+            not self.config.fp32_residual_connection
+            and not self._uses_mhc_recompute_attn_cuda_graph_split()
+            and super().supports_two_stage_attention()
+        )
 
 
 class MoETransformerLayer(TransformerLayer):
@@ -3414,8 +4089,10 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         if self.use_partial_cudagraphs:
-            hidden_states, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-                hidden_states, padding_mask, packed_seq_params
+            hidden_states, padding_mask, input_ids, moe_unflatten_mbs = (
+                self._maybe_unflatten_for_moe(
+                    hidden_states, padding_mask, input_ids, packed_seq_params
+                )
             )
 
             if self.moe_layer_recompute:
@@ -3429,7 +4106,7 @@ class MoETransformerLayer(TransformerLayer):
                         _forward_mlp_partial_cudagraphs,
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
-                        parallel_state.get_tensor_model_parallel_group(),
+                        self.pg_collection.tp,
                         hidden_states,
                         padding_mask=padding_mask,
                         input_ids=input_ids,
@@ -3461,6 +4138,6 @@ class MoETransformerLayer(TransformerLayer):
             return super()._forward_mlp(
                 hidden_states,
                 padding_mask=padding_mask,
-                input_ids=input_ids,
                 packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
             )

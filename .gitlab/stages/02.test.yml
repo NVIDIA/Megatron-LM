@@ -299,7 +299,7 @@ test:safe_imports:
     KUBERNETES_SERVICE_CPU_REQUEST: 8
     KUBERNETES_SERVICE_CPU_LIMIT: 12
   image:
-    name: python:3.11
+    name: python:3.12
     entrypoint: [""]
   needs: [test:build_image]
   script:

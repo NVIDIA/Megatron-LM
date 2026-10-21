@@ -31,6 +31,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -1010,9 +1011,7 @@ class AbsorbedMLASelfAttention(Attention):
         # attention use self.pg_collection.cp, which must point at this
         # microbatch's dynamic CP group. Restored before returning.
         _orig_cp_group = self.pg_collection.cp
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
+        self.pg_collection.cp = resolve_cp_group(_orig_cp_group, packed_seq_params)
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         if (
             thd_packed_seq

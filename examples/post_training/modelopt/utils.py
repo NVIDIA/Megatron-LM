@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 """Shared utilities for modelopt post-training scripts."""
+
 import os
 import sys
 from typing import Any
@@ -46,8 +47,10 @@ def get_eos_token_id(hf_tokenizer=None):
         tokenizer_size = getattr(hf_tokenizer, "vocab_size", None)
 
     def _valid_token_id(token_id):
-        return token_id is not None and token_id >= 0 and (
-            tokenizer_size is None or token_id < tokenizer_size
+        return (
+            token_id is not None
+            and token_id >= 0
+            and (tokenizer_size is None or token_id < tokenizer_size)
         )
 
     known_chat_eos_ids = {

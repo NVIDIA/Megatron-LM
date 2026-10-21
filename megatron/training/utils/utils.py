@@ -38,9 +38,7 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
         trace_alloc_record_context=True,
     )
 
-    def _oom_observer(
-        device: int, alloc: int, device_alloc: int, device_free: int
-    ) -> None:
+    def _oom_observer(device: int, alloc: int, device_alloc: int, device_free: int) -> None:
         """Dump a snapshot on OOM so we can inspect what was live at the failure."""
         rank = safe_get_rank()
         base, ext = os.path.splitext(profiling.memory_snapshot_path)

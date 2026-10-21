@@ -13,8 +13,9 @@ from typing import Optional
 import numpy as np
 import torch
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, tensor_parallel, tuning
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
+from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
@@ -33,6 +34,7 @@ from megatron.core.utils import (
     get_te_version,
     is_te_min_version,
     is_torch_min_version,
+    set_default_log_ranks,
 )
 from megatron.training import (
     get_adlr_autoresume,
@@ -40,7 +42,9 @@ from megatron.training import (
     get_tensorboard_writer,
     inprocess_restart,
 )
+from megatron.training.argument_utils import _triton_autotune_config_from_args
 from megatron.training.async_utils import init_persistent_async_worker
+from megatron.training.global_vars import get_run_config
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -59,12 +63,19 @@ def initialize_megatron(
     seed_ep_group=None,
     seed_etp_group=None,
     skip_random_seed=False,
+    skip_dependency_compilation=False,
+    *,
+    training: bool = False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
     `allow_no_cuda` should not be set unless using megatron for cpu only
     data processing. In general this arg should not be set unless you know
     what you are doing.
+    `skip_dependency_compilation` should only be set by workloads that do not
+    use the C++ dataset helpers.
+    `training` enables training rerun, checkpoint workers, autoresume and dataset
+    compilation in addition to the shared distributed execution and RNG setup.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -74,10 +85,19 @@ def initialize_megatron(
 
     args = get_args()
 
+    cfg = get_run_config()
+    cfg.validate()
+    if not training and args.tp_comm_overlap:
+        raise ValueError(
+            "--tp-comm-overlap uses fixed training user buffers and is not supported by "
+            "inference initialization. Disable it until inference has a validated buffer-sizing "
+            "contract. Inference-specific communication optimizations are unaffected."
+        )
+
     # set logging level
     setup_logging()
 
-    if args.async_save and args.use_persistent_ckpt_worker:
+    if training and args.async_save and args.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state
@@ -89,23 +109,32 @@ def initialize_megatron(
             tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
     args = get_args()
-    initialize_rerun_state_machine(
-        state_save_func=state_save_func,
-        state_restore_func=state_restore_func,
-        mode=RerunMode(args.rerun_mode),
-        error_injector=RerunErrorInjector(
-            error_injection_rate=args.error_injection_rate,
-            error_injection_type=RerunDiagnostic(args.error_injection_type),
-        ),
-        result_rejected_tracker_filename=args.result_rejected_tracker_filename,
-    )
+    if training:
+        initialize_rerun_state_machine(
+            state_save_func=state_save_func,
+            state_restore_func=state_restore_func,
+            mode=RerunMode(args.rerun_mode),
+            error_injector=RerunErrorInjector(
+                error_injection_rate=args.error_injection_rate,
+                error_injection_type=RerunDiagnostic(args.error_injection_type),
+            ),
+            result_rejected_tracker_filename=args.result_rejected_tracker_filename,
+        )
 
     if args.batch_invariant_mode:
-        print_rank_0("Enabling batch invariant mode globally")
-        enable_batch_invariant_mode()
+        backend = args.batch_invariant_backend
+        collective = args.batch_invariant_collective
+        print_rank_0(
+            f"Enabling batch invariant mode globally (backend={backend}, collective={collective})"
+        )
+        enable_batch_invariant_mode(backend, collective)
+
+    # Before any Triton kernel runs, including the kernel warm-up before model construction.
+    tuning.install(_triton_autotune_config_from_args(args), deterministic=args.deterministic_mode)
 
     # torch.distributed initialization
     def finish_mpu_init():
+        cfg = get_run_config()
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed(
@@ -115,14 +144,23 @@ def initialize_megatron(
             skip_model_parallel_init=skip_model_parallel_init,
         )
 
+        # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
+        # vision encoder on rank 0 and the language model at --mimo-llm-offset, so that
+        # alone would describe only the encoder; add the first LLM rank.
+        log_ranks = {0}
+        mimo_llm_offset = getattr(args, "mimo_llm_offset", None)
+        if mimo_llm_offset:
+            log_ranks.add(mimo_llm_offset)
+        set_default_log_ranks(log_ranks)
+
         # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
         if not skip_random_seed:
-            print_rank_0("> setting random seeds to {} ...".format(args.seed))
+            print_rank_0("> setting random seeds to {} ...".format(cfg.rng.seed))
             _set_random_seed(
-                args.seed,
-                args.data_parallel_random_init,
-                args.te_rng_tracker,
-                args.inference_rng_tracker,
+                cfg.rng.seed,
+                cfg.rng.data_parallel_random_init,
+                cfg.rng.te_rng_tracker,
+                cfg.rng.inference_rng_tracker,
                 use_cudagraphable_rng=args.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,
@@ -156,10 +194,12 @@ def initialize_megatron(
         finish_mpu_init()
 
         # Autoresume.
-        _init_autoresume()
+        if training:
+            _init_autoresume()
 
         # Compile dependencies.
-        _compile_dependencies()
+        if training and not skip_dependency_compilation:
+            _compile_dependencies()
 
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
@@ -551,7 +591,37 @@ def _warmup_jit_function(tp_size=None):
     else:
         dtype = torch.float32
 
-    # Warmup fused bias+gelu
+    # Check if TE activation function is used (in which case, no need to warmup custom fusions)
+    use_te_activation_func = getattr(args, 'use_te_activation_func', False)
+    gated_linear_unit = getattr(args, 'gated_linear_unit', False)
+
+    # Warmup bias_swiglu: swiglu activation (F.silu + GLU)
+    warmup_bias_swiglu = not use_te_activation_func and args.swiglu and args.bias_swiglu_fusion
+
+    warmup_bias_gelu = (
+        not use_te_activation_func
+        and not args.swiglu
+        and not getattr(args, 'quick_geglu', False)
+        and not gated_linear_unit
+        and args.bias_gelu_fusion
+    )
+
+    warmup_bias_geglu = (
+        not use_te_activation_func
+        and not args.swiglu
+        and not getattr(args, 'quick_geglu', False)
+        and gated_linear_unit
+        and args.bias_gelu_fusion
+    )
+
+    # NOTE: the torch.rand draws and the fused bias+dropout+add warmup below
+    # consume the default CUDA RNG stream before training starts. Downstream
+    # training numerics (and the golden values of the functional tests) encode
+    # exactly those consumptions, so they must stay UNCONDITIONAL with their
+    # historical shapes and order, independent of any argument; otherwise the
+    # RNG stream shifts for configs that differ from the golden baselines.
+    # Only the bias_swiglu/bias_gelu/bias_geglu calls are gated on arguments:
+    # they consume no RNG, so skipping them cannot perturb determinism.
     bias = torch.rand(
         args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
     )
@@ -564,18 +634,38 @@ def _warmup_jit_function(tp_size=None):
         dtype=dtype,
         device="cuda",
     )
-    # Warmup JIT fusions with the input grad_enable state of both forward
-    # prop and recomputation
-    for bias_grad, input_grad in zip([True, True], [False, True]):
-        bias.requires_grad, input.requires_grad = bias_grad, input_grad
-        for _ in range(5):
-            if args.swiglu:
-                output = bias_swiglu(input, bias)
-            else:
-                output = bias_gelu(bias, input)
-    del bias, input, output
 
-    # Warmup fused bias+dropout+add
+    # Warmup JIT fusions with the input grad_enable state of both forward
+    # prop and recomputation. The three branches are mutually exclusive.
+    if warmup_bias_swiglu:
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            bias.requires_grad, input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_swiglu(input, bias)
+        del output
+    elif warmup_bias_gelu:
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            bias.requires_grad, input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_gelu(bias, input)
+        del output
+    elif warmup_bias_geglu:
+        # bias_geglu splits the last dim into two GLU halves, so its tensors
+        # are 2x ffn-sized. torch.cat consumes no RNG, so doubling the drawn
+        # tensors here keeps the RNG stream identical to the historical code.
+        geglu_bias = torch.cat([bias, bias], dim=-1)
+        geglu_input = torch.cat([input, input], dim=-1)
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            geglu_bias.requires_grad, geglu_input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_geglu(geglu_bias, geglu_input)
+        del output, geglu_bias, geglu_input
+    del bias, input
+
+    # Warmup fused bias+dropout+add. Intentionally NOT gated on
+    # args.bias_dropout_fusion: the fused train calls consume RNG for the
+    # dropout mask, and conditioning them would shift downstream determinism
+    # relative to the historical behavior encoded in the golden values.
     if args.sequence_parallel:
         # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
         seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
@@ -602,6 +692,7 @@ def _warmup_jit_function(tp_size=None):
         for _ in range(5):
             output = bias_dropout_add_fused_train([input, bias], residual, dropout_rate)
     del bias, input, residual, output
+
     torch.cuda.empty_cache()
 
 
@@ -615,13 +706,13 @@ def setup_logging() -> None:
 
     Returns: None
     """
-    args = get_args()
+    cfg = get_run_config()
     logging_level = None
     env_logging_level = os.getenv('MEGATRON_LOGGING_LEVEL', None)
     if env_logging_level is not None:
         logging_level = int(env_logging_level)
-    if args.logging_level is not None:
-        logging_level = args.logging_level
+    if cfg.logger.logging_level is not None:
+        logging_level = cfg.logger.logging_level
 
     if logging_level is not None:
         if is_rank0():
@@ -634,6 +725,7 @@ def setup_logging() -> None:
             'GroupedGemmDsreluSm100',
             'GroupedGemmSreluSm100',
             'GroupedGemmWgradSm100',
+            'GroupedGemmWgradBlockScaledAPI',
             'absl',
         ]:
             logging.getLogger(noisy_logger_name).setLevel(logging.ERROR)

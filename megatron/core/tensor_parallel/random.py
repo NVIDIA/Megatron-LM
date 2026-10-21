@@ -26,7 +26,12 @@ from megatron.core.parallel_state import (
     get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
-from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
+from megatron.core.tensor_observation import suspend_tensor_observations
+from megatron.core.utils import (
+    is_te_min_version,
+    is_torch_min_version,
+    safely_set_viewless_tensor_data,
+)
 
 # ---------------------------------------------------------------------------
 # C++ extension: zero-copy storage sharing for CheckpointWithoutOutput
@@ -470,6 +475,82 @@ def get_all_rng_states():
         return {}
 
 
+_CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION = None
+
+
+def _probe_cudagraph_needs_generator_registration() -> bool:
+    """Capture an RNG op on an unregistered generator and report whether capture rejects it."""
+    generator = torch.Generator(device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            torch.rand(1, device="cuda", generator=generator)
+    except RuntimeError:
+        # Without lazy registration, capture fails with "RNG op during graph capture but
+        # generator is not registered with the capturing graph". Treat any capture failure
+        # as needing registration: on PyTorch with lazy registration, registering anyway
+        # only costs a deprecation warning, while skipping it on older builds is fatal.
+        return True
+    finally:
+        del graph
+    return False
+
+
+def cudagraph_needs_generator_registration() -> bool:
+    """Whether generators must be registered with a `torch.cuda.CUDAGraph` before capture.
+
+    PyTorch with pytorch/pytorch#176753 lazily registers every generator whose Philox
+    state is consumed during capture, and `CUDAGraph.register_generator_state()` became a
+    deprecated no-op that prints a warning on *every* call. Skip the explicit registration
+    there: it does nothing, and with one call per layer, per graph and per generator it floods
+    stderr (tens of thousands of lines per rank for dynamic inference with CUDA graphs).
+
+    The version string cannot identify that change: 2.14.0a0 nightlies built before it landed
+    still require explicit registration. Builds older than 2.14.0a0 always require it; for
+    newer builds, a small capture probe decides, and its result is cached.
+    """
+    global _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION
+    if _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION is not None:
+        return _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION
+    if not is_torch_min_version("2.14.0a0"):
+        needs_registration = True
+    elif torch.cuda.is_current_stream_capturing():
+        # The probe cannot capture while another capture is active; register to be safe
+        # and probe on a later call.
+        return True
+    else:
+        needs_registration = _probe_cudagraph_needs_generator_registration()
+    _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION = needs_registration
+    return needs_registration
+
+
+def prime_cuda_rng_states_for_graph_capture() -> None:
+    """Create each CUDA generator's capture state at the start of a graph capture.
+
+    Call as the first operation inside a `torch.cuda.graph` capture. PyTorch >= 2.14
+    (pytorch/pytorch#176753) creates this state lazily on the generator's first Philox use in
+    the capture and allocates it on the default stream. Mid-capture, that allocation makes the
+    caching allocator record and query events for blocks freed earlier in the capture; if a
+    block's recorded stream has since joined the capture (e.g. an NCCL stream after a pipeline
+    recv), the query raises cudaErrorCapturedEvent and invalidates the capture
+    (pytorch/pytorch#193982). Priming here, while nothing is pending, restores the pre-2.14
+    behavior of `capture_begin`. Each primed generator advances by one tiny draw per replay.
+    No-op outside a capture and on PyTorch < 2.14.
+    """
+    # TODO: Remove once the minimum supported PyTorch includes the upstream fix for lazy RNG
+    # capture-state allocation (pytorch/pytorch#193993 or its successor).
+    if cudagraph_needs_generator_registration() or not torch.cuda.is_current_stream_capturing():
+        return
+    scratch = torch.empty(1, device=torch.cuda.current_device())
+    generators = [torch.cuda.default_generators[scratch.device.index]]
+    if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
+        generators.extend((get_all_rng_states() or {}).values())
+    for generator in generators:
+        # Graph-safe trackers hold generators; tensor states cannot be drawn from under capture.
+        if isinstance(generator, torch.Generator) and generator.device == scratch.device:
+            scratch.uniform_(generator=generator)
+
+
 def model_parallel_cuda_manual_seed(
     seed: int,
     te_rng_tracker: bool = False,
@@ -782,7 +863,7 @@ class CheckpointFunction(torch.autograd.Function):
             else:
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -1072,6 +1153,51 @@ class MHCCheckpointManager:
         self.recompute_now()
 
 
+class CheckpointWithoutOutputManager:
+    """
+    Coordinates activation recomputation across multiple CheckpointWithoutOutput instances
+    within a TransformerBlock, enabling unified recomputation during backward pass.
+    This is particularly useful for scenarios where multiple checkpoint operations have
+    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
+
+    Usage:
+        manager = CheckpointWithoutOutputManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=manager)
+        ckpt_function.checkpoint(run_function, *args)
+        # other checkpointed operations
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
+    """
+
+    def __init__(self):
+        self.checkpoints = []
+        # Set by TransformerBlock before each layer forward.
+        # When True, the layer should keep block-boundary output uncheckpointed.
+        self.is_last_layer_in_recompute_block = False
+
+    def add_checkpoint(self, ckpt):
+        """Add a checkpoint to the manager."""
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        if ckpt.outputs is None:
+            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        for ckpt in self.checkpoints:
+            ckpt._discard_outputs()
+
+        # Register unified recompute hook
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._unified_recompute_hook)
+
+    def _unified_recompute_hook(self, grad_output):
+        for ckpt in self.checkpoints:
+            # Call _recompute for each checkpoint in forward order
+            # The _recompute method will restore the output tensor storage
+            ckpt._recompute(None)
+
+
 class CheckpointWithoutOutput(object):
     """
     Checkpoint a model or part of the model and release the output.
@@ -1112,15 +1238,16 @@ class CheckpointWithoutOutput(object):
         """
         from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot, MHCRecomputePhase
 
-        self.fp8 = bool(fp8)
+        # Preserve the upstream default TE recompute context and FP8 amax bookkeeping.
+        self.fp8 = fp8 is not None
         self.ckpt_manager = ckpt_manager
+        self.retain_input_tensors = retain_input_tensors
         if output_slot is not None and not isinstance(output_slot, MHCRecomputeArenaSlot):
             raise TypeError("output_slot must be an MHCRecomputeArenaSlot")
         self.output_slot = output_slot
         self.recompute_phase = MHCRecomputePhase(
             MHCRecomputePhase.BEFORE_COMBINE_BWD if recompute_phase is None else recompute_phase
         )
-        self.retain_input_tensors = retain_input_tensors
         self.run_function = None
         # Snapshot taken in checkpoint(), consumed and cleared in _recompute().
         # This replaced three separate fwd_* fields; declaring it here keeps the
@@ -1211,7 +1338,7 @@ class CheckpointWithoutOutput(object):
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
                 outputs = self.run_function(*inputs)
 
         self.run_function = None

@@ -51,7 +51,9 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import initialize_runtime_services, set_run_config
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -115,9 +117,7 @@ def _capture_engine_stats(llm) -> dict:
         "step_count": llm.engine.context.step_count,
         "lifetime_prefill_token_count": llm.engine.context.lifetime_prefill_token_count,
         "async_sched_step_count": llm.engine.context.async_sched_step_count,
-        "async_sched_compaction_step_count": (
-            llm.engine.context.async_sched_compaction_step_count
-        ),
+        "async_sched_compaction_step_count": (llm.engine.context.async_sched_compaction_step_count),
         "capture_stats": llm.engine.capture_stats,
     }
 
@@ -262,6 +262,8 @@ def main():
         extra_args_provider=add_offline_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_runtime_services(args)
     initialize_megatron()
     _validate_high_level_api_args(args)
 

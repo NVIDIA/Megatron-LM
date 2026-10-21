@@ -51,10 +51,10 @@ def validate_encoder_prefetch_args(args) -> None:
     if args.freeze_projection:
         raise ValueError("encoder prefetch requires a trainable projection")
     for field, label in (
-        ("encoder_tp", "TP"),
-        ("encoder_cp", "CP"),
-        ("encoder_pp", "PP"),
-        ("encoder_ep", "EP"),
+        ("mimo_encoder_tp", "TP"),
+        ("mimo_encoder_cp", "CP"),
+        ("mimo_encoder_pp", "PP"),
+        ("mimo_encoder_ep", "EP"),
     ):
         if getattr(args, field, 1) != 1:
             raise ValueError(f"encoder prefetch requires encoder {label}=1")

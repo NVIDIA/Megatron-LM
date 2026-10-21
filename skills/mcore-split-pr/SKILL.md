@@ -1,10 +1,8 @@
 ---
 name: mcore-split-pr
-description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups.
+description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups. Use when user asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'. Takes a PR URL or number as its argument.
 license: Apache-2.0
-when_to_use: User asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'.
-user_invocable: true
-argument: "PR URL or number"
+user-invocable: true
 metadata:
   author: Philip Petrakian <ppetrakian@nvidia.com>
 ---
@@ -41,11 +39,6 @@ workflow:
 - Never merge a PR while its base is a `pull-request/*` ref: the squash lands
   in the bot's scratch ref, not `main`, and the PR ends up MERGED and
   unreopenable. Retarget to `main` first.
-- Retarget each dependent PR back to `main` as soon as its base PR is
-  approved: copy-pr-bot deletes `pull-request/<N>` when PR N merges or
-  closes, and GitHub then auto-closes (unreopenably) every PR based on that
-  ref. After the base PR squash-merges, rebase dependents onto the new `main`
-  and force-push.
 - Wait for user approval before execution.
 - Execution creates draft PRs from the right base, applies file-scoped diffs
   with `git diff upstream/main..<source-branch> -- <paths> | git apply`, pushes

@@ -6,8 +6,7 @@ import logging
 import os
 import warnings
 from datetime import timedelta
-from math import log2
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -127,7 +126,7 @@ _CONTEXT_PARALLEL_GROUP = None
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
-# Dynamic context parallel groups
+# Dynamic context parallel groups, indexed by the runtime CP group size.
 _DYNAMIC_DP_CP_GROUPS = {}
 
 # Full data-parallel groups: span every distinct-data rank
@@ -437,14 +436,39 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1):
+def get_valid_dynamic_context_parallel_group_sizes(total_size: int) -> List[int]:
+    """Return runtime CP sizes that can partition a DPxCP rank list exactly."""
+    if total_size < 1:
+        raise ValueError(f"Dynamic CP group size must be positive, got {total_size}")
+
+    group_sizes = []
+    group_size = 1
+    while group_size < total_size:
+        if total_size % group_size == 0:
+            group_sizes.append(group_size)
+        group_size *= 2
+    group_sizes.append(total_size)
+    return group_sizes
+
+
+def create_dynamic_dp_cp_groups(
+    rank: int, ranks: Sequence[int], pg_options: object, min_cp_size: int = 1
+) -> Dict[int, torch.distributed.ProcessGroup]:
     """
     Creates groups required for dynamic DPxCP.
-    Creates a new group for every power of 2 from min_cp_size up to len(ranks).
+    Creates a group for every valid runtime size below the full DPxCP size.
     Returns a dictionary indexed by group size.
     """
     dynamic_dp_cp_groups = {}
-    group_sizes = [2**i for i in range(int(log2(len(ranks)))) if 2**i >= min_cp_size]
+    valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(len(ranks))
+    if min_cp_size not in valid_group_sizes:
+        raise ValueError(
+            f"min_dynamic_context_parallel_size={min_cp_size} is not a valid group size "
+            f"for DPxCP size {len(ranks)}; expected one of {valid_group_sizes}"
+        )
+    group_sizes = [
+        group_size for group_size in valid_group_sizes if min_cp_size <= group_size < len(ranks)
+    ]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
             group = create_group(
@@ -474,7 +498,7 @@ class RankGenerator(object):
         rank_offset: int = 0,
         gtp_remat: int = 1,
     ) -> None:
-        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 are not allowed in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
@@ -575,11 +599,12 @@ def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
     nccl_comm_cfgs[pg_name][key_value_pair[0]] = key_value_pair[1]
 
 
-def _inject_gtp_remat_axis(order_str: str, after: str = "tp") -> str:
+def _inject_gtp_remat_axis(order_str: str, after: str = "cp") -> str:
     """Inject the 'gtp_remat' axis into a RankGenerator order string for NCCL locality.
 
     Position controls locality (leftmost token = smallest stride = most adjacent ranks):
-      - dense/decoder: inject after 'tp' -> 'tp-gtp_remat-cp-ep-dp-pp' (GTP_remat local).
+      - dense/decoder: inject after 'cp' -> 'tp-cp-gtp_remat-ep-dp-pp' (CP kept more local than
+        GTP_remat).
       - expert: inject after 'ep' -> 'tp-cp-ep-gtp_remat-dp-pp' so EP keeps more-local placement
         than EGTP (the MoE EP all-to-all is the heavier expert-side collective).
     When gtp_remat/egtp_remat size is 1 the injected axis is a no-op (singleton groups).
@@ -602,8 +627,7 @@ def initialize_model_parallel(
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
-    dynamic_context_parallel: bool = False,
-    min_dynamic_context_parallel_size: int = 1,
+    hybrid_context_parallel: bool = False,
     expert_model_parallel_size: int = 1,
     gtp_remat_size: int = 1,
     expert_gtp_remat_size: int = 1,
@@ -619,6 +643,8 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    dynamic_context_parallel: bool = False,
+    min_dynamic_context_parallel_size: int = 1,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -682,6 +708,17 @@ def initialize_model_parallel(
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
 
+        hybrid_context_parallel (bool, default = False):
+            Deprecated alias for ``dynamic_context_parallel``.
+
+        dynamic_context_parallel (bool, default = False):
+            Create the runtime DPxCP subgroup family used by dynamic context
+            parallelism.
+
+        min_dynamic_context_parallel_size (int, default = 1):
+            Smallest runtime CP group to create. It must be one of the valid
+            subgroup sizes for the DPxCP domain.
+
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
             parallel group.
@@ -691,7 +728,7 @@ def initialize_model_parallel(
             Shards model weights along ``out_features`` across this many ranks;
             each weight is rematerialized independently (per-weight, not per-
             layer) via async all-gather on every forward AND backward pass. A
-            first-class orthogonal axis (world_size = TP*GTP*CP*DP). Maps to the
+            first-class orthogonal axis (world_size = TP*CP*GTP*DP). Maps to the
             dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
             NOTE: "remat" here is NOT activation recomputation/checkpointing.
 
@@ -851,7 +888,7 @@ def initialize_model_parallel(
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
-    decoder_order = _inject_gtp_remat_axis(order, after="tp")
+    decoder_order = _inject_gtp_remat_axis(order, after="cp")
 
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
@@ -1026,7 +1063,7 @@ def initialize_model_parallel(
         # PyTorch is performing lazy initialization of the communicator group.
         # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
         torch.distributed.barrier(
-            group=get_data_parallel_group(with_context_parallel=True),
+            group=get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
             device_ids=[torch.cuda.current_device()],
         )
         torch.cuda.synchronize()
@@ -1034,13 +1071,19 @@ def initialize_model_parallel(
         if "NCCL_COLLNET_ENABLE" in os.environ:
             del os.environ["NCCL_COLLNET_ENABLE"]
 
+    if hybrid_context_parallel:
+        warnings.warn(
+            "hybrid_context_parallel is deprecated; use dynamic_context_parallel instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if dynamic_context_parallel:
+            raise ValueError("Cannot set both hybrid_context_parallel and dynamic_context_parallel")
+        dynamic_context_parallel = True
+
     if dynamic_context_parallel:
-        # TODO: Are gloo groups needed for Dynamic CP?
         global _DYNAMIC_DP_CP_GROUPS
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
-            assert (
-                len(ranks_with_cp) % 2 == 0
-            ), "Dynamic context parallel requires an even number of ranks"
             _DYNAMIC_DP_CP_GROUPS.update(
                 create_dynamic_dp_cp_groups(
                     rank,
@@ -1050,15 +1093,21 @@ def initialize_model_parallel(
                 )
             )
 
+        # NCCL initializes communicators lazily. Touch every local runtime
+        # group, including the singleton CP-off group, in a deterministic order.
         data_parallel_size_with_cp = data_parallel_size * context_parallel_size
-        group_sizes = [
-            2**i
-            for i in range(int(log2(data_parallel_size_with_cp)))
-            if 2**i >= min_dynamic_context_parallel_size
-        ]
-        if data_parallel_size_with_cp not in group_sizes:
-            group_sizes.append(data_parallel_size_with_cp)
-        for group_size in group_sizes:
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
+            data_parallel_size_with_cp
+        )
+        if min_dynamic_context_parallel_size not in valid_group_sizes:
+            raise ValueError(
+                "min_dynamic_context_parallel_size="
+                f"{min_dynamic_context_parallel_size} is not a valid group size for "
+                f"DPxCP size {data_parallel_size_with_cp}; expected one of {valid_group_sizes}"
+            )
+        for group_size in valid_group_sizes:
+            if group_size < min_dynamic_context_parallel_size:
+                continue
             group = get_dynamic_data_context_parallel_groups(group_size=group_size)
             torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
             torch.cuda.synchronize()
@@ -1673,7 +1722,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         pp=pp_size,
         cp=cp_size,
         gtp_remat=gtp_remat_size,
-        order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='tp'),
+        order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp'),
         rank_offset=0,
     )
 
@@ -1888,11 +1937,12 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
-    """Get the dynamic context parallel groups the caller rank belongs to."""
-    # Dynamic CP groups are carved from the replicate 'dp-cp' ranks, so compare against the
-    # replicate DP-CP size; the GTP_remat-aware groups are not yet built when this is called
-    # from initialize_model_parallel.
+def get_dynamic_data_context_parallel_groups(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Get the dynamic CP group of ``group_size`` containing the caller rank."""
+    # Runtime DCP subdivides the replicate DPxCP domain, not the independent
+    # GTP-remat data-distribution axis.
     if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
@@ -1900,6 +1950,19 @@ def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=
     if check_initialized:
         assert _DYNAMIC_DP_CP_GROUPS is not None
     return _DYNAMIC_DP_CP_GROUPS[group_size]
+
+
+def get_hybrid_data_context_parallel_groups(
+    check_initialized: bool = True, group_size: Optional[int] = None
+) -> torch.distributed.ProcessGroup:
+    """Deprecated alias for :func:`get_dynamic_data_context_parallel_groups`."""
+    warnings.warn(
+        "get_hybrid_data_context_parallel_groups is deprecated; use "
+        "get_dynamic_data_context_parallel_groups instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
 
 
 def get_embedding_group(check_initialized=True):

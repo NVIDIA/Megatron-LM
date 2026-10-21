@@ -9,9 +9,10 @@ import torch
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.num_microbatches_calculator import get_num_microbatches, update_num_microbatches
 from megatron.training import get_args, get_timers, print_rank_0
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.global_vars import get_run_config
 from megatron.training.training import (
     evaluate_and_print_results,
     setup_model_and_optimizer,
@@ -161,6 +162,7 @@ def _train(
     end_of_epoch_callback,
 ):
     """Train the model."""
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
 
@@ -189,7 +191,7 @@ def _train(
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
-        train_dataloader.sampler.set_epoch(args.seed + epoch)
+        train_dataloader.sampler.set_epoch(cfg.rng.seed + epoch)
 
         # For all the batches in the dataset.
         for iteration_, batch in enumerate(train_dataloader):
@@ -208,7 +210,7 @@ def _train(
 
             # Logging.
             params_norm = None
-            if args.log_params_norm:
+            if cfg.logger.log_params_norm:
                 params_norm = calc_params_l2_norm(model)
             report_memory_flag = training_log(
                 losses_dict,
@@ -305,7 +307,8 @@ def finetune(
         args.load = args.pretrained_checkpoint
         original_rng = args.no_load_rng
         args.no_load_rng = True
-        _ = load_checkpoint(model, None, None)
+        _ = load_checkpoint(model, None, None, restore_training_state=True)
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.load = original_load
         args.no_load_rng = original_rng
         # This is critical when only model is loaded. We should make sure

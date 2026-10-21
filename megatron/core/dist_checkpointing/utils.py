@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Helpers for manipulating sharded tensors and sharded state dicts. """
+"""Helpers for manipulating sharded tensors and sharded state dicts."""
+
 import logging
 from contextlib import contextmanager
 from time import time
@@ -101,28 +102,6 @@ def extract_sharded_tensors_and_factories(
     """
     return extract_matching_values(
         sharded_state_dict, lambda v: isinstance(v, (ShardedTensor, ShardedTensorFactory))
-    )
-
-
-def extract_sharded_tensors_or_nonpersistent(
-    sharded_state_dict: ShardedStateDict,
-) -> Tuple[ShardedStateDict, StateDict]:
-    """Extract a dict consisting of only ShardedTensor, ShardedTensorFactory
-    and LocalNonpersistentObject objects from a given state dict with any objects.
-
-    Args:
-        sharded_state_dict: state dict possibly containing ShardedTensor, ShardedTensorFactory
-        and LocalNonpersistentObject objects
-
-    Returns:
-        Tuple[ShardedStateDict, StateDict]: tuple of:
-            - state dict with all ShardedTensor, ShardedTensorFactory and LocalNonpersistentObject
-              (keeping the original state dict structure)
-            - state dict with all other objects (keeping the original state dict structure)
-    """
-    return extract_matching_values(
-        sharded_state_dict,
-        lambda v: isinstance(v, (ShardedTensor, LocalNonpersistentObject, ShardedTensorFactory)),
     )
 
 
@@ -313,23 +292,6 @@ def debug_time(
             if level is None:
                 level = logging.DEBUG if threshold == float("-inf") else logging.WARNING
             last_logger.log(level, f"{stacked_name} took {result:.4f}s")
-
-
-def debug_msg(msg: str):
-    """Logs a debug message using the current logger stack.
-
-    This function formats and logs a debug message with the current logger
-    and name stack, preserving context from the logger_stack context manager.
-
-    Args:
-        msg (str): The message to be logged at the debug level.
-
-    Example:
-        debug_msg("Checkpoint initialized")
-        # Logs: "scope_name Checkpoint initialized" if called within logger_stack("scope_name")
-    """
-    with logger_stack(None, None) as (stacked_name, last_logger):
-        last_logger.debug(f"{stacked_name} {msg}")
 
 
 def _clean_metadata_for_serialization(metadata: dict) -> dict:

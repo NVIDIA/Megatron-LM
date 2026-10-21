@@ -4,16 +4,16 @@
 This module provides a singleton instance of AsyncCallsQueue which manages
 the async checkpoint save calls.
 """
+
 import inspect
 import logging
 import time
 from abc import ABC
 from typing import TYPE_CHECKING, Any
 
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
 from megatron.core.dist_checkpointing.strategies.nvrx import make_nvrx_async_request
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.training import get_args
+from megatron.training.global_vars import get_run_config
 from megatron.training.utils import print_rank_0
 
 
@@ -29,28 +29,24 @@ def _tag_current_span_call_idx(call_idx):
     if call_idx is None or call_idx == []:
         return
     try:
-        from opentelemetry import trace as _ot
         from nemo.lens.helpers import safe_set_span_attributes as _set
+        from opentelemetry import trace as _ot
 
         _set(_ot.get_current_span(), {'nvrx.call_idx': call_idx})
     except Exception:  # noqa: BLE001 -- telemetry must never break checkpointing
         pass
 
+
 if TYPE_CHECKING:
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
 else:
-    NVRxAsyncRequest = Any
+    AsyncRequest = Any
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import _results_queue
-    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
-        save_state_dict_async_finalize,
-    )
 except (ImportError, ModuleNotFoundError):
-    from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
-    from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
-        save_state_dict_async_finalize,
-    )
+    _results_queue = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +59,9 @@ def _get_async_calls_queue():
     global _async_calls_queue
 
     if _async_calls_queue is None:
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
+
         args = get_args()
-        _, async_modules = get_async_strategy(getattr(args, "async_strategy", "nvrx"))
-        AsyncCallsQueue = async_modules["AsyncCallsQueue"]
         _async_calls_queue = AsyncCallsQueue(
             persistent=getattr(args, "use_persistent_ckpt_worker", False)
         )
@@ -85,11 +81,12 @@ def build_otel_worker_bootstrap(args):
     class instance there would tie correctness to an import path staying
     resolvable in a separate process.
     """
+    cfg = get_run_config()
     import os
 
     from megatron.training.global_vars import build_telemetry_resource_attrs
 
-    service_name = getattr(args, 'otel_service_name', None)
+    service_name = cfg.logger.otel_service_name
     if not service_name and not os.environ.get('OTEL_SERVICE_NAME', '').strip():
         service_name = 'megatron-lm'
 
@@ -109,11 +106,12 @@ def build_otel_worker_bootstrap(args):
     #       set_enabled_span_groups() with this AFTER setup_telemetry, overriding
     #       the base-safe set -- giving it trace_region etc. (save-side
     #       checkpoint internals). An OLD worker ignores this key.
-    worker_span_groups = getattr(args, 'otel_span_groups', None)
+    worker_span_groups = cfg.logger.otel_span_groups
     resolved_span_groups = None
     if worker_span_groups:
         try:
             from nemo.lens.groups import SpanGroup as _BaseSpanGroup
+
             from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
             resolved = MegatronSpanGroup.resolve(worker_span_groups)
@@ -125,7 +123,7 @@ def build_otel_worker_bootstrap(args):
             # rather than risk handing the worker something it can't resolve.
             worker_span_groups = 'per_step'
 
-    enabled = bool(getattr(args, 'otel_enabled', False))
+    enabled = bool(cfg.logger.otel_enabled)
     return {
         'enabled': enabled,
         'service_name': service_name,
@@ -142,11 +140,13 @@ def build_otel_worker_bootstrap(args):
 
 
 def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+        get_write_results_queue,
+    )
+
     global _async_calls_queue
     args = get_args()
-    async_strategy, async_modules = get_async_strategy(getattr(args, "async_strategy", "nvrx"))
-    AsyncCallsQueue = async_modules["AsyncCallsQueue"]
-    get_write_results_queue = async_modules["get_write_results_queue"]
     # Recreate the async_calls_queue for persistent worker
     # This duplicate step is for backward compatiblity
     time_start = time.time()
@@ -156,28 +156,23 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         persistent=True,
         **(
             {"cpu_shm_mode": args.async_ckpt_use_cpu_shm}
-            if async_strategy == "nvrx"
-            and "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.__init__).parameters
+            if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.__init__).parameters
             else {}
         ),
     )
     # initialize the persistent caller with QoS priorities from args
     warmup_kwargs = {}
-    if async_strategy == "mcore":
-        # Note: nvidia-resiliency-ext uses is_daemon instead of mp_mode (always spawns)
-        warmup_kwargs["mp_mode"] = mp_mode
-    elif async_strategy == "nvrx":
-        if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
-            warmup_kwargs["cpu_shm_mode"] = args.async_ckpt_use_cpu_shm
-        elif args.async_ckpt_use_cpu_shm:
-            raise AssertionError(
-                "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
-                "Update nvidia-resiliency-ext to use --async-ckpt-use-cpu-shm."
-            )
-        # Older nvidia-resiliency-ext installs won't have this parameter yet --
-        # degrade to no worker-side telemetry rather than hard-failing checkpointing.
-        if "otel_bootstrap" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
-            warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap(args)
+    if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
+        warmup_kwargs["cpu_shm_mode"] = args.async_ckpt_use_cpu_shm
+    elif args.async_ckpt_use_cpu_shm:
+        raise AssertionError(
+            "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
+            "Update nvidia-resiliency-ext to use --async-ckpt-use-cpu-shm."
+        )
+    # Older nvidia-resiliency-ext installs won't have this parameter yet --
+    # degrade to no worker-side telemetry rather than hard-failing checkpointing.
+    if "otel_bootstrap" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
+        warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap(args)
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
         cpu_priority=args.async_ckpt_cpu_priority,
@@ -185,12 +180,11 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         **warmup_kwargs,
     )
     # initialize ckpt write results queue
-    if async_strategy == "nvrx":
-        if "mp_mode" not in inspect.signature(get_write_results_queue).parameters:
-            raise AssertionError(
-                "Installed nvidia-resiliency-ext does not support "
-                "get_write_results_queue(mp_mode=...). Update nvidia-resiliency-ext."
-            )
+    if "mp_mode" not in inspect.signature(get_write_results_queue).parameters:
+        raise AssertionError(
+            "Installed nvidia-resiliency-ext does not support "
+            "get_write_results_queue(mp_mode=...). Update nvidia-resiliency-ext."
+        )
     get_write_results_queue(mp_mode="fork")
     if rank == 0:
         print(
@@ -199,11 +193,11 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         )
 
 
-def schedule_async_save(async_request: AsyncRequest | NVRxAsyncRequest):
+def schedule_async_save(async_request: AsyncRequest):
     """Schedule the async save request.
 
     Args:
-        async_request (AsyncRequest | NVRxAsyncRequest): the async save request.
+        async_request (AsyncRequest): the async save request.
     """
     call_idx = _get_async_calls_queue().schedule_async_request(async_request)
     _tag_current_span_call_idx(call_idx)
@@ -253,7 +247,11 @@ def is_empty_async_queue() -> bool:
     return _async_calls_queue is None or _async_calls_queue.get_num_unfinalized_calls() == 0
 
 
-def reset_persistent_async_worker(async_strategy):
+def reset_persistent_async_worker():
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+        CachedMetadataFileSystemReader,
+    )
+
     global _async_calls_queue, _results_queue
 
     if _async_calls_queue is not None:
@@ -264,28 +262,22 @@ def reset_persistent_async_worker(async_strategy):
         del _results_queue
     _results_queue = None
     _async_calls_queue = None
-    _, module = get_async_strategy(async_strategy, "CachedMetadataFileSystemReader")
-    module.clear_metadata_cache()
+    CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
-def get_save_and_finalize_callbacks(
-    writer, save_state_dict_ret, async_strategy: str = "nvrx"
-) -> AsyncRequest | NVRxAsyncRequest:
+def get_save_and_finalize_callbacks(writer, save_state_dict_ret) -> AsyncRequest:
     """Creates an async save request for fsdp_dtensor & torch_dcp with a finalize function."""
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+        save_state_dict_async_finalize,  # pylint: disable=line-too-long
+    )
+
     save_fn, preload_fn, save_args = writer.get_save_function_and_args()
-    _, async_modules = get_async_strategy(async_strategy)
-    async_request_cls = async_modules["AsyncRequest"]
-    save_state_dict_async_finalize = async_modules["save_state_dict_async_finalize"]
 
     def finalize_fn():
         """Finalizes async checkpointing and synchronizes processes."""
         save_state_dict_async_finalize(*save_state_dict_ret)
 
     return make_nvrx_async_request(
-        async_request_cls,
-        save_fn,
-        save_args,
-        [finalize_fn],
-        async_fn_kwargs={},
-        preload_fn=preload_fn,
+        AsyncRequest, save_fn, save_args, [finalize_fn], async_fn_kwargs={}, preload_fn=preload_fn
     )

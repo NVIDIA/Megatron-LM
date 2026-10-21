@@ -145,13 +145,19 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
 
 
 @pytest.mark.internal
-def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch):
-    """Hybrid embedding and padding-mask SP splits must use the same explicit TP group."""
+@pytest.mark.parametrize("input_path", ["embedding", "precomputed", "pipeline"])
+@pytest.mark.parametrize("mtp_enabled", [False, True])
+def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_path, mtp_enabled):
+    """Align the decoder mask once while preserving the full mask for MTP."""
     from megatron.core import tensor_parallel
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.hybrid import hybrid_model
 
     tp_group = object()
     scatter_calls = []
+    mtp_masks = []
+    input_ids = torch.arange(8).view(1, 8)
+    caller_padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    local_hidden = torch.zeros(4, 1, 8)
 
     def fake_sp_scatter(input_, group=None):
         scatter_calls.append((input_.dtype, group))
@@ -166,39 +172,59 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch):
             return torch.zeros(input_ids.shape[1], input_ids.shape[0], 8)
 
     class FakeDecoder:
+        input_tensor = local_hidden
+
         def __call__(self, *, hidden_states, padding_mask, **_kwargs):
+            if hidden_states is None:
+                hidden_states = self.input_tensor
             assert padding_mask.shape == (1, hidden_states.shape[0])
             return hidden_states
 
+    class FakeMTP:
+        def prepare_cp_layout(self, **kwargs):
+            assert kwargs["padding_mask"] is caller_padding_mask
+            return SimpleNamespace(**kwargs)
+
+        def __call__(self, *, hidden_states, padding_mask, **_kwargs):
+            assert padding_mask is caller_padding_mask
+            mtp_masks.append(padding_mask)
+            return hidden_states
+
+    monkeypatch.setattr(hybrid_model, "resolve_cp_group", lambda group, params: None)
+    monkeypatch.setattr(hybrid_model, "prepare_mtp_sequence_roll_context", lambda **kwargs: None)
     model = SimpleNamespace(
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
             sequence_parallel=True,
             multi_latent_attention=False,
-            moe_n_hash_layers=0,
-            mtp_num_layers=None,
+            moe_num_hash_layers=0,
+            mtp_num_layers=1 if mtp_enabled else None,
+            freeze_base_model_for_mtp=False,
         ),
-        pre_process=True,
+        pre_process=input_path != "pipeline",
         post_process=False,
         embedding=FakeEmbedding(),
         decoder=FakeDecoder(),
-        pg_collection=SimpleNamespace(tp=tp_group),
+        pg_collection=SimpleNamespace(tp=tp_group, cp=None),
         position_embedding_type=None,
         share_embeddings_and_output_weights=False,
-        mtp_process=False,
+        mtp_process=mtp_enabled,
+        mtp=FakeMTP(),
     )
-    input_ids = torch.arange(8).view(1, 8)
-    output = HybridModel.forward(
+    output = hybrid_model.HybridModel.forward(
         model,
         input_ids=input_ids,
         position_ids=input_ids,
         attention_mask=None,
-        padding_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        padding_mask=caller_padding_mask,
+        decoder_input=local_hidden if input_path == "precomputed" else None,
     )
 
     assert output.shape == (4, 1, 8)
-    assert scatter_calls == [(torch.float32, tp_group), (torch.bool, tp_group)]
+    expected_scatter = [(torch.float32, tp_group)] if input_path == "embedding" else []
+    assert scatter_calls == expected_scatter + [(torch.bool, tp_group)]
+    assert len(mtp_masks) == int(mtp_enabled)
 
 
 # =============================================================================
@@ -1735,23 +1761,34 @@ class TestStaticInputs:
 
         assert static_inputs["padding_mask"].shape == (1, 128)
         assert not static_inputs["padding_mask"].any()
+        assert layer._cuda_graph_padding_mask_shape == (1, 128)
+        mask = static_inputs["padding_mask"]
+        assert layer._te_cuda_graph_padding_mask(mask, mask.device) is mask
+        torch.testing.assert_close(layer._te_cuda_graph_padding_mask(None, mask.device), mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_thd_hash_router_input_ids_use_per_rank_capacity(self):
-        """Hash routing input IDs must use the fixed [1, local_tokens] THD shape."""
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("micro_batch_size", [1, 2])
+    def test_hash_router_input_ids_follow_static_token_layout(self, packed, micro_batch_size):
+        """THD flattens batches; SBHD retains the static batch and local sequence axes."""
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
         layer.config.context_parallel_size = 2
-        layer.config.sequence_packing_scheduler = "dp_balanced"
+        layer.config.sequence_packing_scheduler = "dp_balanced" if packed else None
         layer.config.cuda_graph_impl = "transformer_engine"
-        layer.config.moe_n_hash_layers = 1
+        layer.config.moe_num_hash_layers = 1
         layer.is_moe_layer = True
         layer.mlp.router = torch.nn.Identity()
         layer.mlp.router.is_hash_layer = True
 
-        static_inputs = layer.get_layer_static_inputs(seq_length=256, micro_batch_size=2)
+        static_inputs = layer.get_layer_static_inputs(
+            seq_length=256, micro_batch_size=micro_batch_size
+        )
 
-        assert static_inputs["input_ids"].shape == (1, 128)
+        expected = (
+            (1, 128) if packed else (micro_batch_size, static_inputs["hidden_states"].shape[0])
+        )
+        assert static_inputs["input_ids"].shape == expected
 
 
 @pytest.mark.internal
@@ -1784,137 +1821,6 @@ def test_full_local_padding_mask_covers_every_non_preprocess_chunk(
         )
         is expected
     )
-
-
-def _make_balanced_dynamic_pack_config(monkeypatch, **overrides):
-    """Build a config that infers dynamic-pack routing while isolating backend probes."""
-    from megatron.core.transformer import transformer_config as transformer_config_module
-    from megatron.core.transformer.experimental_attention_variant import dsa_kernels
-    from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
-        _make_config,
-    )
-
-    monkeypatch.setattr(dsa_kernels, "use_fused_dsa_kernels", lambda _config: True)
-    monkeypatch.setattr(transformer_config_module, "HAVE_PACKAGING", True)
-    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
-    kwargs = dict(
-        context_parallel_size=2,
-        cp_partition_mode="contiguous",
-        sequence_packing_scheduler="dp_balanced",
-        max_seqlen_per_dp_cp_rank=128,
-        pad_packed_seq_alignment="max",
-        thd_max_packed_sequences=8,
-        csa_compress_ratios=[4, 4, 4, 4],
-        csa_dense_mode=False,
-        dsa_kernel_backend="none",
-        dsa_cp_balance_indexer=True,
-        cuda_graph_impl="transformer_engine",
-        cuda_graph_dynamic_microbatches=True,
-        pipeline_model_parallel_size=2,
-        pipeline_dtype=torch.bfloat16,
-    )
-    kwargs.update(overrides)
-    return _make_config(**kwargs)
-
-
-@pytest.mark.internal
-@pytest.mark.parametrize("virtual_pipeline_size", [None, 2])
-def test_balanced_dynamic_packs_are_inferred_for_attention_graph_with_pp_vpp(
-    monkeypatch, virtual_pipeline_size
-):
-    config = _make_balanced_dynamic_pack_config(
-        monkeypatch, virtual_pipeline_model_parallel_size=virtual_pipeline_size
-    )
-
-    assert config.pipeline_model_parallel_size == 2
-    assert config.virtual_pipeline_model_parallel_size == virtual_pipeline_size
-    assert config.dsa_cp_balance_indexer_graph_dynamic_packs
-
-
-@pytest.mark.internal
-def test_balanced_dynamic_packs_allows_verified_safe_row_limit_boundary(monkeypatch):
-    """Each half-call may contain exactly 32768 rows; only larger calls are unsafe."""
-    config = _make_balanced_dynamic_pack_config(monkeypatch, max_seqlen_per_dp_cp_rank=2 * 32768)
-
-    assert config.max_seqlen_per_dp_cp_rank // 2 == 32768
-
-
-@pytest.mark.internal
-def test_balanced_static_pack_graph_keeps_pp_rejection(monkeypatch):
-    with pytest.raises(ValueError, match="dynamic-pack routing is inferred"):
-        _make_balanced_dynamic_pack_config(monkeypatch, cuda_graph_impl="local")
-
-
-@pytest.mark.internal
-def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatch):
-    config = _make_balanced_dynamic_pack_config(monkeypatch, cuda_graph_modules=["mlp"])
-
-    assert config.pipeline_model_parallel_size == 2
-    assert not config.dsa_cp_balance_indexer_graph_dynamic_packs
-
-
-@pytest.mark.internal
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"dsa_cp_balance_indexer": False},
-        {"cuda_graph_impl": "local"},
-        {"cuda_graph_modules": ["mlp"]},
-        {"sequence_packing_scheduler": "default_dynamic_cp"},
-    ],
-)
-def test_balanced_dynamic_packs_require_all_inferred_conditions(monkeypatch, overrides):
-    config = _make_balanced_dynamic_pack_config(
-        monkeypatch,
-        pipeline_model_parallel_size=1,
-        cuda_graph_dynamic_microbatches=False,
-        **overrides,
-    )
-
-    assert not config.dsa_cp_balance_indexer_graph_dynamic_packs
-
-
-@pytest.mark.internal
-def test_balanced_dynamic_packs_cannot_be_set_as_a_constructor_option(monkeypatch):
-    with pytest.raises(TypeError, match="dsa_cp_balance_indexer_graph_dynamic_packs"):
-        _make_balanced_dynamic_pack_config(
-            monkeypatch, dsa_cp_balance_indexer_graph_dynamic_packs=True
-        )
-
-
-@pytest.mark.internal
-@pytest.mark.parametrize(
-    "overrides,match",
-    [
-        (
-            {"dynamic_context_parallel": True},
-            "Dynamic context parallelism requires sequence_packing_scheduler=default_dynamic_cp",
-        ),
-        (
-            {"cuda_graph_dynamic_microbatches": False},
-            "with PP/VPP requires cuda_graph_dynamic_microbatches=True",
-        ),
-        (
-            {"max_seqlen_per_dp_cp_rank": None, "pad_packed_seq_alignment": None},
-            "requires max_seqlen_per_dp_cp_rank",
-        ),
-        ({"max_seqlen_per_dp_cp_rank": 127}, "requires an even max_seqlen_per_dp_cp_rank"),
-        ({"max_seqlen_per_dp_cp_rank": 0}, "requires a positive max_seqlen_per_dp_cp_rank"),
-        ({"max_seqlen_per_dp_cp_rank": -2}, "requires a positive max_seqlen_per_dp_cp_rank"),
-        ({"max_seqlen_per_dp_cp_rank": 65538}, "above the verified-safe limit"),
-        (
-            {"overlap_moe_expert_parallel_comm": True},
-            "does not yet support overlap_moe_expert_parallel_comm or delay_wgrad_compute",
-        ),
-        (
-            {"delay_wgrad_compute": True},
-            "does not yet support overlap_moe_expert_parallel_comm or delay_wgrad_compute",
-        ),
-    ],
-)
-def test_balanced_dynamic_packs_validate_inferred_contract(monkeypatch, overrides, match):
-    with pytest.raises(ValueError, match=match):
-        _make_balanced_dynamic_pack_config(monkeypatch, **overrides)
 
 
 @pytest.mark.internal
