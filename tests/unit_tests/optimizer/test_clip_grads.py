@@ -60,7 +60,8 @@ def test_default_grad_norm_skip_threshold_does_not_compare_grad_norm():
 @pytest.mark.skipif(
     multi_tensor_scale_tensor_impl is None, reason="tensor-scale kernel (Transformer Engine) needed"
 )
-@pytest.mark.parametrize("max_norm", [1.0, 0.5])
+# 0.3 is not a power of two: a reciprocal-and-multiply coefficient would differ from the division.
+@pytest.mark.parametrize("max_norm", [1.0, 0.5, 0.3])
 def test_float64_device_norm_clips_like_the_python_float_path(max_norm):
     """ChainedOptimizer combines its optimizers' norms into a float64 device tensor (so that an
     optimizer-step CUDA graph capture has no host synchronization). Clipping with that tensor must
@@ -120,3 +121,33 @@ def test_chained_optimizer_combines_device_norms_in_float64():
         + torch.tensor([0.3], dtype=torch.float32) ** 2
     )
     assert norm.item() == math.sqrt(squares)
+
+
+def test_chained_optimizer_combines_python_float_norms_and_skips_missing_ones():
+    """Optimizers that report Python floats keep the ``math.sqrt`` form; optimizers that report no
+    norm (``None``) are left out, and no norms at all give 0.0."""
+
+    class MockOptimizer:
+        def __init__(self, norm, group):
+            self.config = OptimizerConfig(clip_grad=1.0)
+            self.norm = norm
+            self.group = group
+            self.is_stub_optimizer = False
+            self.model_chunks = []
+
+        def get_grad_stats_parallel_group(self):
+            return self.group
+
+        def get_grad_norm(self):
+            return self.norm
+
+    norm = ChainedOptimizer([MockOptimizer(3.0, "dp"), MockOptimizer(4.0, "dp-ep")]).get_grad_norm()
+    assert isinstance(norm, float) and norm == 5.0
+    assert (
+        ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(4.0, "dp-ep")]).get_grad_norm()
+        == 4.0
+    )
+    assert (
+        ChainedOptimizer([MockOptimizer(None, "dp"), MockOptimizer(None, "dp-ep")]).get_grad_norm()
+        == 0.0
+    )

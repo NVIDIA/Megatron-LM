@@ -57,7 +57,12 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
-    if transformer_cfg.transformer_impl == "inference_optimized":
+    if (
+        transformer_cfg.transformer_impl == "inference_optimized"
+        and transformer_cfg.num_moe_experts is None
+    ):
+        # MoE models fall through to the shared num_moe_experts branch below;
+        # get_gpt_decoder_block_spec already handles the inference_optimized impl.
         return get_gpt_layer_with_inference_spec(
             transformer_cfg.qk_layernorm,
             transformer_cfg.multi_latent_attention,
@@ -177,6 +182,7 @@ class GPTModelConfig(ModelConfig):
     ### GPT Model initialization ###
     seq_length: int = 1024
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     position_embedding_type: Literal["learned_absolute", "rope", "mrope", "yarn", "none"] = (
@@ -345,6 +351,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             vocab_size=padded_vocab_size,
             max_sequence_length=self._model_config.seq_length,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,
@@ -376,6 +383,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -392,6 +400,11 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
                 parameters for the layer-wise distributed optimizer.
+            use_layer_wise_param_layout: Optional LayerWise layout request kept for API
+                parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
+                is the single layout source (True: padded, False: compact). ``None`` defers to
+                it; with DDP and the layer-wise distributed optimizer, an explicit value that
+                disagrees with it raises ``ValueError``.
 
         Returns:
             List of model stages.
@@ -412,6 +425,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

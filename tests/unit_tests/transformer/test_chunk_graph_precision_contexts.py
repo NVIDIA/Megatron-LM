@@ -1,16 +1,23 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 """Precision handling inside chunk-wise CUDA graph captures: BF16 boundary layers must opt
-out of the block-wide FP8 context, and activation checkpointing must go through TE's checkpoint
-(mcore's tensor_parallel.checkpoint skips the checkpoint node while a graph is captured)."""
+out of the block-wide FP8 context, activation checkpointing must go through TE's checkpoint
+(mcore's tensor_parallel.checkpoint skips the checkpoint node while a graph is captured), and a
+graph replay must open the FP8 autocast the block forward would have opened."""
 
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core import fp8_utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_recipe, get_layer_fp8_context
 from megatron.core.recompute import use_te_checkpoint
+from megatron.core.transformer.chunk_cuda_graph import (
+    ChunkCudaGraphBlockMixin,
+    ChunkCudaGraphPostProcessBlock,
+)
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -157,3 +164,88 @@ class TestChunkGraphPrecisionContexts:
         with te.fp8_autocast(enabled=True, fp8_recipe=get_fp8_recipe(config)):
             with get_layer_fp8_context(config, 0):
                 assert FP8GlobalStateManager.is_fp8_enabled()
+        # A chunk graph replay runs under the block-wide FP8 autocast TransformerBlock.forward
+        # would have opened (the replay does not run the forward).
+        config.cuda_graph_impl = "chunk_wise"
+        assert not FP8GlobalStateManager.is_fp8_enabled()
+        with block._chunk_graph_replay_quantization_context():
+            assert FP8GlobalStateManager.is_fp8_enabled()
+        assert not FP8GlobalStateManager.is_fp8_enabled()
+
+    def test_chunk_replay_runs_under_the_block_fp8_context(self, monkeypatch):
+        """Replay enters the graphed callable without running the block forward, so the chunk
+        callable itself opens the FP8 autocast that TE's graphed callable reads its amax-reduction
+        and weight-cache bookkeeping from (delayed scaling never updates its scales otherwise).
+        Without FP8 the replay opens nothing."""
+        events = []
+
+        @contextmanager
+        def recording_fp8_context(config, layer_no=-1, is_init=False):
+            events.append(("fp8", layer_no, is_init))
+            yield
+            events.append("exit")
+
+        monkeypatch.setattr(fp8_utils, "get_fp8_context", recording_fp8_context)
+
+        class GraphedBase:
+            def _te_cuda_graph_replay(self, *args, **kwargs):
+                events.append(("replay", len(args), tuple(sorted(kwargs))))
+                return "output"
+
+        class Block(ChunkCudaGraphBlockMixin, GraphedBase):
+            def __init__(self, config):
+                self.config = config
+                self.pre_process = True
+                self.cuda_graphs = [object()]
+                self.current_microbatch = 0
+
+        def replay(**config):
+            events.clear()
+            block = Block(SimpleNamespace(cuda_graph_impl="chunk_wise", **config))
+            hidden_states = torch.ones(2, 1, 4)
+            assert block._te_cuda_graph_replay(hidden_states, attention_mask=None) == "output"
+            return list(events)
+
+        # layer_no=-1 is the block-wide context, exactly what TransformerBlock.forward opens.
+        assert replay(fp8="hybrid", pipeline_model_parallel_size=1) == [
+            ("fp8", -1, False),
+            ("replay", 1, ()),
+            "exit",
+        ]
+        assert replay(fp8=None, pipeline_model_parallel_size=1) == [("replay", 1, ())]
+
+    def test_postprocess_chunk_replay_opens_fp8_only_with_quantized_modules(self):
+        """The post-process callable (LM head, loss and optionally MTP) holds TE modules that run
+        under FP8 only with MTP layers on this stage or the MXFP8 output projection; otherwise its
+        replay opens no autocast, exactly like the eager post-process."""
+
+        def block(fp8, mtp_num_layers, mtp_process, **config_overrides):
+            config = dict(
+                cuda_graph_impl="chunk_wise",
+                fp8=fp8,
+                fp8_recipe="delayed",
+                fp8_output_proj=False,
+                mtp_num_layers=mtp_num_layers,
+            )
+            config.update(config_overrides)
+            post = object.__new__(ChunkCudaGraphPostProcessBlock)
+            object.__setattr__(post, "config", SimpleNamespace(**config))
+            object.__setattr__(post, "_owner", SimpleNamespace(mtp_process=mtp_process))
+            return post
+
+        assert not block("hybrid", None, False)._chunk_graph_has_quantized_modules()
+        # The MTP block lives on another stage.
+        assert not block("hybrid", 1, False)._chunk_graph_has_quantized_modules()
+        assert block("hybrid", 1, True)._chunk_graph_has_quantized_modules()
+        assert (
+            block(
+                "e4m3", None, False, fp8_output_proj=True, fp8_recipe="mxfp8"
+            )._chunk_graph_has_quantized_modules()
+            is HAVE_TE
+        )
+        assert isinstance(
+            block("hybrid", None, False)._chunk_graph_replay_quantization_context(), nullcontext
+        )
+        assert isinstance(
+            block(None, 1, True)._chunk_graph_replay_quantization_context(), nullcontext
+        )

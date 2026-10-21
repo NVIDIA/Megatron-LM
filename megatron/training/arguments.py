@@ -455,10 +455,23 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
+    # GTP_remat counts toward total_model_size (an independent weight-shard axis), so the
+    # args.data_parallel_size below is the replicate degree (matches
+    # parallel_state). gtp_weight_remat_size is derived from --tensor-parallel-num-weight-shards.
+    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+
+    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
     total_model_size = (
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
+        * args.gtp_weight_remat_size
     )
 
     # Total model size.
@@ -478,6 +491,7 @@ def validate_args(args, defaults={}):
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
+        * args.gtp_weight_remat_size
     )
     args.data_parallel_size = args.world_size // total_model_size
 
@@ -559,13 +573,38 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        submit_rollouts_at_rollout_granularity = args.rl_submission_granularity == "R"
-        if args.rl_generation_lag > 0:
-            assert args.rl_partial_rollouts, "--rl-generation-lag requires --rl-partial-rollouts."
-        if submit_rollouts_at_rollout_granularity:
+        if args.rl_max_inflight_requests is not None:
+            requests_per_batch = args.grpo_prompts_per_step * args.grpo_group_size
             assert (
-                args.rl_partial_rollouts
-            ), "Rollout submission granularity requires streaming grouped rollouts."
+                args.rl_generation_lag is None
+            ), "--rl-generation-lag and --rl-max-inflight-requests are mutually exclusive."
+            assert (
+                args.rl_max_inflight_requests >= 1
+            ), f"--rl-max-inflight-requests ({args.rl_max_inflight_requests}) must be >= 1."
+            if args.rl_max_inflight_requests > requests_per_batch:
+                assert args.rl_partial_rollouts, (
+                    f"--rl-max-inflight-requests above one training batch "
+                    f"({requests_per_batch} requests) requires --rl-partial-rollouts."
+                )
+            # Total in-flight requests = (lag + 1) trainer batches of P * G requests each.
+            args.rl_generation_lag = args.rl_max_inflight_requests / requests_per_batch - 1
+        if args.rl_generation_lag is None:
+            # With --rl-partial-rollouts the lag is autotuned from engine capacity
+            # at inference launch; otherwise generation is fully synchronous.
+            if not args.rl_partial_rollouts:
+                args.rl_generation_lag = 0
+        else:
+            assert (
+                args.rl_generation_lag >= -1
+            ), f"--rl-generation-lag ({args.rl_generation_lag}) must be >= -1."
+            if args.rl_generation_lag > 0:
+                assert (
+                    args.rl_partial_rollouts
+                ), "--rl-generation-lag requires --rl-partial-rollouts."
+        assert args.rl_submission_granularity == "B" or args.rl_partial_rollouts, (
+            f"--rl-submission-granularity {args.rl_submission_granularity} requires "
+            "--rl-partial-rollouts."
+        )
         assert (
             args.rl_consumption_granularity != "R"
         ), "--rl-consumption-granularity R is not currently supported."
@@ -1155,6 +1194,7 @@ def validate_args(args, defaults={}):
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
     args.mamba_training_ssm_states_dtype = map_dtype(args.mamba_training_ssm_states_dtype)
+    args.logit_dtype = map_dtype(getattr(args, 'logit_dtype', None))
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1191,16 +1231,6 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
-    if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
-        try:
-            import flashinfer  # noqa: F401
-        except ImportError as e:
-            raise ImportError(
-                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
-                "the flashinfer package; install it or pass "
-                "--inference-dynamic-batching-sampling-backend=torch."
-            ) from e
-
     if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
@@ -1210,13 +1240,18 @@ def validate_args(args, defaults={}):
         #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
         args.use_custom_fsdp = True
 
-        # Megatron-FSDP requires the DistributedOptimizer.
-        if not args.use_distributed_optimizer:
-            warn_rank_0(
-                'Megatron-FSDP is only compatible with --use-distributed-optimizer. Using DistributedOptimizer...',
-                args.rank,
-            )
-        args.use_distributed_optimizer = True
+        if args.megatron_fsdp_version == 2:
+            assert not args.use_distributed_optimizer, \
+                '--megatron-fsdp-version 2 is not compatible with --use-distributed-optimizer'
+        else:
+            # Megatron-FSDP v1 requires the DistributedOptimizer.
+            if not args.use_distributed_optimizer:
+                warn_rank_0(
+                    'Megatron-FSDP v1 is only compatible with --use-distributed-optimizer. '
+                    'Using DistributedOptimizer...',
+                    args.rank,
+                )
+            args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
         if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
@@ -1332,6 +1367,23 @@ def validate_args(args, defaults={}):
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
+
+    if args.accumulate_allreduce_grads_in_fp32:
+        # The FP32-accumulation reduce-scatters only exist to recover FP32 accumulation from a
+        # lower-precision wire dtype. With FP32 main_grads the plain ring reduce-scatter already
+        # sums in FP32 on both axes, so they buy no precision and cost one extra
+        # unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.
+        for arg_name in (
+            'ddp_reduce_scatter_with_fp32_accumulation',
+            'gtp_remat_reduce_scatter_with_fp32_accumulation',
+        ):
+            if getattr(args, arg_name, False):
+                setattr(args, arg_name, False)
+                warn_rank_0(
+                    f"Setting args.{arg_name} to False since "
+                    "--accumulate-allreduce-grads-in-fp32 already reduces in fp32"
+                )
+
     if args.cuda_graph_impl == "full_iteration":
         assert (
             not args.check_for_nan_in_loss_and_grad
@@ -1669,6 +1721,106 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
+    # Derive the internal gtp_weight_remat_size from the user-facing
+    # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
+    # from argument generation), so it is set here as a fresh attribute on args before it is
+    # consumed below (and in initialize/training, which read args.gtp_weight_remat_size directly).
+    # Mirrors ModelParallelConfig.__post_init__.
+    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+
+    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+    # Same for the expert layers: derive the internal expert_gtp_weight_remat_size from the
+    # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
+    # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
+    args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size = (
+        resolve_tensor_parallel_weight_shards(
+            args.expert_tensor_parallel_size,
+            args.expert_tensor_parallel_num_weight_shards,
+            getattr(args, "expert_gtp_weight_remat_size", 1),
+        )
+    )
+
+    if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+        if args.fp4 and not args.fp4_param_gather:
+            raise ValueError(
+                "GTP (--tensor-parallel-num-weight-shards / "
+                "--expert-tensor-parallel-num-weight-shards > 1) with --fp4-format requires "
+                "--fp4-param-gather so NVFP4 weights are all-gathered as native NVFP4."
+            )
+        gtp_weight_remat_size = args.gtp_weight_remat_size
+        egtp_weight_remat_size = args.expert_gtp_weight_remat_size
+        if get_device_arch_version() >= 10:
+            # Setting GTP communication groups for high priority streams for Blackwell and later
+            # architectures. Assigning high priority to communication streams ensures that
+            # communication kernels are scheduled with higher priority, minimizing the exposed
+            # communication when it is overlapped with other computation kernels.
+            if 'gtp_remat' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('gtp_remat')
+                warn_rank_0("Setting 'gtp_remat' group for high priority streams.")
+            if (
+                egtp_weight_remat_size > 1
+                and 'expt_gtp_remat' not in args.high_priority_stream_groups
+            ):
+                args.high_priority_stream_groups.append('expt_gtp_remat')
+                warn_rank_0("Setting 'expt_gtp_remat' group for high priority streams.")
+
+            # Sanity check for 'CUDA_GRAPHS_USE_NODE_PRIORITY'.
+            if args.cuda_graph_impl != "none":
+                assert os.environ.get('CUDA_GRAPHS_USE_NODE_PRIORITY') == "1", (
+                    'GTP requires CUDA_GRAPHS_USE_NODE_PRIORITY=1 to make sure fine-grained GTP '
+                    'comms can be well overlapped with GEMMs when CudaGraph is enabled for '
+                    'Blackwell and later architecture.'
+                )
+
+        # Sanity check for 'NCCL_PROTO'.
+        if os.environ.get('NCCL_PROTO', '').lower() == "simple":
+            warn_rank_0(
+                "Generally GTP prefers 'NCCL_PROTO=LL128 or LL' while get 'NCCL_PROTO=simple', "
+                "force setting NCCL_PROTO=Simple might introduce bad perf."
+            )
+
+        assert not args.ddp_average_in_collective, (
+            "GTP requires --ddp-average-in-collective off (the default); averaged collectives "
+            "would need per-buffer 1/gtp_remat scaling."
+        )
+
+        assert args.ckpt_format in ('torch', 'torch_dist'), (
+            f"GTP supports only --ckpt-format 'torch' (legacy) or 'torch_dist', got "
+            f"'{args.ckpt_format}'."
+        )
+        assert not (
+            getattr(args, 'dist_ckpt_optim_fully_reshardable', False)
+            and getattr(args, 'distrib_optim_fully_reshardable_mem_efficient', False)
+        ), (
+            "GTP does not support the distributed-optimizer fully-reshardable + "
+            "mem-efficient checkpoint mode. Disable "
+            "--distrib-optim-fully-reshardable-mem-efficient (or "
+            "--dist-ckpt-optim-fully-reshardable)."
+        )
+
+        # GTP with the mxfp8 recipe requires --fp8-param-gather: GTP keeps no bf16 weight and
+        # relies on the optimizer maintaining the fp8 shard (the forward all-gathers fp8 and does
+        # not re-quantize). Without fp8-param-gather the fp8 forward weight would never be updated.
+        if getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            assert getattr(args, 'fp8_param_gather', False), (
+                "GTP + mxfp8 requires --fp8-param-gather (the optimizer maintains the fp8 shard; "
+                "GTP does not keep or re-quantize a bf16 weight)."
+            )
+            # MXFP8 params cannot be mapped into the contiguous param buffer (TE's
+            # replace_raw_data does not support the MXFP8 tile-scaling layout), so the param
+            # all-gather must reuse the grad buffer instead.
+            assert getattr(args, 'reuse_grad_buf_for_mxfp8_param_ag', False), (
+                "GTP + mxfp8 + --fp8-param-gather requires --reuse-grad-buf-for-mxfp8-param-ag "
+                "(MXFP8 params keep their own quantized storage; mapping them into the param "
+                "buffer via replace_raw_data is unsupported)."
+            )
+
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False
@@ -1990,6 +2142,25 @@ def validate_args(args, defaults={}):
                 "Other algorithms cannot guarantee numerical stability yet."
             )
 
+    # The PG-distribution cache stores one file per parallelization group, keyed by
+    # that group's minimum global rank, and each file holds both the save and the
+    # load distribution. If save and load used different parallelization groups,
+    # two distinct groups could map to the same file (they can share a minimum
+    # global rank), so one side would silently read a distribution computed for the
+    # other group's layout. Require both sides to use the same group.
+    if args.ckpt_pg_tensors_cache_path is not None:
+        assert (
+            args.ckpt_fully_parallel_save_process_group
+            == args.ckpt_fully_parallel_load_process_group
+        ), (
+            "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
+            "--ckpt-fully-parallel-load-process-group to be identical, but got "
+            f"save='{args.ckpt_fully_parallel_save_process_group}' and "
+            f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
+            "parallelization group, so mixing groups can read a distribution computed for a "
+            "different layout."
+        )
+
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
@@ -2003,6 +2174,41 @@ def validate_args(args, defaults={}):
 
     if not args.async_save:
         args.async_strategy = "mcore"
+
+    if args.logits_save_dir is not None:
+        assert (
+            args.logits_save_top_k is not None
+        ), '--logits-save-top-k is required when --logits-save-dir is set.'
+        assert args.async_save, (
+            '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
+            'Logits are flushed as an async request in the checkpoint queue.'
+        )
+        if not args.freeze_all_layers:
+            warn_rank_0(
+                '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
+                'gradients will update the model while logits are dumped. This is intended only '
+                'when dumping logits during active training; for a frozen-teacher dump pass '
+                '--freeze-all-layers.'
+            )
+
+    if args.freeze_all_layers:
+        if args.use_distributed_optimizer:
+            warn_rank_0(
+                '--freeze-all-layers incompatible with use_distributed_optimizer. '
+                'Disabling use_distributed_optimizer.'
+            )
+            args.use_distributed_optimizer = False
+        if args.overlap_param_gather:
+            warn_rank_0(
+                '--freeze-all-layers incompatible with overlap_param_gather. '
+                'Disabling overlap_param_gather.'
+            )
+            args.overlap_param_gather = False
+
+    if args.override_ckpt_iteration is not None:
+        assert (
+            not args.finetune
+        ), "Cannot override checkpoint iteration together with finetune flag."
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -2476,7 +2682,7 @@ def _add_inference_args(parser):
         '--inference-dynamic-batching-buffer-size-gb',
         type=float,
         default=40.0,
-        help='Amount of on-GPU memory allocated for the KV cache. '
+        help='On-GPU portion of the shared KV cache block pool. '
         'The total amount of memory allocated for the KV cache '
         '(CPU + GPU memory) depends on the value set for the '
         'unified virtual memory (UVM) level (via '
@@ -2491,10 +2697,12 @@ def _add_inference_args(parser):
         '--inference-dynamic-batching-paused-buffer-size-gb',
         type=float,
         default=None,
-        help='Amount of memory reserved for paused requests in '
-        'the dynamic inference context. Active requests are '
-        'paused when there are not enough active blocks available '
-        'to continue generating a request.',
+        help='Memory used to derive the paused-request block retention '
+        'budget. This does not reserve blocks from active requests: '
+        'active requests may use the entire shared pool of usable KV '
+        'cache blocks. Under allocation pressure, paused requests '
+        'retain blocks only within this budget and excess paused '
+        'requests may be evicted.',
     )
     group.add_argument(
         '--inference-dynamic-batching-mamba-memory-ratio',
@@ -2629,7 +2837,14 @@ def _add_inference_args(parser):
         dest='inference_dynamic_batching_prefix_caching_mamba_gb',
         help='GPU memory budget (in GB) for the Mamba state cache '
         'used by prefix caching on hybrid models. When set, Mamba '
-        'states at block boundaries are cached for reuse.',
+        'states at block boundaries are cached for reuse. This budget '
+        'covers both the durable cache (the ssm_states/conv_states '
+        'slots reused across requests) and the per-step extraction '
+        'scratch (the intermediate_ssm_out/intermediate_conv_out '
+        'buffers, sized to min(ceil(max_tokens / block_size), '
+        '3 * max_requests) slots); the scratch is reserved first, so a '
+        'smaller max_tokens (or max_requests) shrinks the scratch and '
+        'leaves more durable slots.',
     )
     group.add_argument(
         '--inference-dynamic-batching-cuda-graph-max-tokens',
@@ -2653,16 +2868,22 @@ def _add_inference_args(parser):
         'is requested but the package is not installed.',
     )
     group.add_argument(
+        '--use-same-sampling-seed-across-dp-ranks',
+        action='store_false',
+        dest='offset_sampling_seed_by_dp_rank',
+        default=True,
+        help='Use the same inference sampling seed on every data-parallel rank. '
+        '--deterministic-mode also uses the same seed on every DP rank.',
+    )
+    group.add_argument(
         '--inference-dynamic-batching-async-sched-mode',
         type=str,
         default='legacy',
-        choices=['legacy', 'serial', 'overlap'],
+        choices=['legacy', 'async'],
         help='Async scheduling mode for dynamic batching. '
         '"legacy" (default) preserves the existing resolve-before-prepare '
-        'path. "serial" speculatively prepares and forwards decode-only '
-        'steps before resolving finished requests. "overlap" uses the same '
-        'async scheduling path while overlapping prepare/sample and '
-        'forward/resolve phases.',
+        'path. "async" overlaps asynchronous scheduling phases by reordering '
+        'them to prepare-before-resolve.',
     )
     group.add_argument(
         '--inference-dynamic-batching-logprobs-mode',
@@ -2864,6 +3085,10 @@ def _add_network_size_args(parser):
         "mamba_training_ssm_states_dtype",
         # Parsed manually as a JSON object below.
         "moe_megakernel_backend_config",
+        # internal/derived: controlled only via --tensor-parallel-num-weight-shards
+        "gtp_weight_remat_size",
+        # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
+        "expert_gtp_weight_remat_size",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3290,6 +3515,33 @@ def _add_logging_args(parser):
     )
     group = log_factory.build_group(parser, title="logging")
 
+    otel_group = parser.add_argument_group(title='opentelemetry')
+    otel_group.add_argument(
+        '--otel-enabled',
+        action='store_true',
+        default=False,
+        help='Enable OpenTelemetry telemetry (traces and metrics). '
+        'See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.',
+    )
+    otel_group.add_argument(
+        '--otel-service-name',
+        type=str,
+        default=None,
+        help='Override OTEL_SERVICE_NAME for this training run.',
+    )
+    otel_group.add_argument(
+        '--otel-span-groups',
+        type=str,
+        default=None,
+        help='Comma-separated span-group spec controlling which OTel '
+        'instrumentation boundaries are active.  Accepts preset keywords '
+        '("default", "per_step", "full", "all") or individual group names '
+        '("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", '
+        '"step", "forward_backward", "optimizer", "microbatch"), or a mix.  '
+        'Defaults to "default" (coarse job/checkpoint/evaluate spans only).  '
+        'Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.',
+    )
+
     return parser
 
 
@@ -3401,6 +3653,12 @@ def _add_regularization_args(parser):
         'complete local query groups; other layouts fall back to non-TP NS',
     )
     group.add_argument(
+        '--muon-use-syrk',
+        action='store_true',
+        help='Use the Triton SYRK kernel for the Gram matrix '
+        'in Newton-Schulz iteration.',
+    )
+    group.add_argument(
         '--muon-extra-scale-factor',
         type=float,
         default=1.0,
@@ -3464,11 +3722,26 @@ def _add_rl_args(parser):
     )
     group.add_argument(
         '--rl-generation-lag',
-        type=int,
-        default=0,
-        help='Number of trainer batches of rollout generation lag to allow. '
+        type=float,
+        default=None,
+        help='Number of trainer batches of rollout generation lag to allow '
         'The number of in-flight trainer batches is this value plus one. '
-        'Requires --rl-partial-rollouts when greater than 0.',
+        'May be fractional or negative; the minimum of -1 keeps a single unit '
+        'of generation work in flight. If omitted, the lag is autotuned to the '
+        'inference engine\'s request capacity when --rl-partial-rollouts is '
+        'set, and is 0 otherwise. '
+        'Requires --rl-partial-rollouts when greater than 0. '
+        'Mutually exclusive with --rl-max-inflight-requests.',
+    )
+    group.add_argument(
+        '--rl-max-inflight-requests',
+        type=int,
+        default=None,
+        help='Maximum number of inference requests RL generation may keep inflight: '
+        'equivalent to (--rl-generation-lag + 1) training batches '
+        'of grpo_prompts_per_step * grpo_group_size requests each. '
+        'Requires --rl-partial-rollouts when above one training batch; '
+        'mutually exclusive with --rl-generation-lag.',
     )
     # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
     group.add_argument(
@@ -4010,14 +4283,7 @@ def _add_checkpointing_args(parser):
 
     ckpt_factory = ArgumentGroupFactory(
         CheckpointConfig,
-        exclude=[
-            "most_recent_k",
-            "save_tokenizer_assets",
-            "save_optim",
-            "save_rng",
-            "load_optim",
-            "load_rng",
-        ],
+        exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"],
     )
     group = ckpt_factory.build_group(parser, "checkpointing")
 
@@ -4038,6 +4304,14 @@ def _add_checkpointing_args(parser):
         action='store_true',
         default=None,
         help='Do not load rng state when loading checkpoint.',
+    )
+    group.add_argument(
+        '--override-ckpt-iteration',
+        type=int,
+        default=None,
+        help='Override the iteration stored in the loaded checkpoint. '
+        'Also resets consumed_train_samples accordingly so the '
+        'data loader replays samples from that iteration onward.',
     )
     group.add_argument(
         '--use-dist-ckpt',
@@ -4063,6 +4337,20 @@ def _add_checkpointing_args(parser):
         action='store_true',
         dest='ckpt_fully_parallel_save_deprecated',
         help='Deprecated: see --no-ckpt-fully-parallel-save.',
+    )
+    group.add_argument(
+        '--ckpt-drop-redundant-extra-state',
+        action='store_true',
+        default=False,
+        help='Drop TE `_extra_state` artifacts that carry no '
+        'irreplaceable state (no FP8, or block/current FP8 '
+        'scaling) from the distributed checkpoint, keeping them '
+        'local instead of writing them. Only delayed-scaling '
+        '`_extra_state` (amax history + scale) is ever needed and '
+        'it is always persisted regardless of this flag. By '
+        'default (flag off) all `_extra_state` are persisted, '
+        'preserving the previous behavior. Older checkpoints load '
+        'unchanged either way.',
     )
     return parser
 
@@ -4116,6 +4404,16 @@ def _add_mixed_precision_args(parser):
         '--fp16-lm-cross-entropy',
         action='store_true',
         help='Move the cross entropy unreduced loss calculation' 'for lm head to fp16.',
+    )
+    group.add_argument(
+        '--output-logit-dtype',
+        type=str,
+        choices=['bf16', 'fp32'],
+        default=None,
+        dest='logit_dtype',
+        help='Output dtype for the language-model output-layer GEMM. When the '
+        'requested dtype differs from the input dtype, Transformer Engine '
+        'general_gemm is used. By default, logits use the output-layer input dtype.',
     )
     group.add_argument(
         '--reuse-grad-buf-for-mxfp8-param-ag',
@@ -4231,6 +4529,16 @@ def _add_distributed_args(parser):
         'with the standard ring implementation) but performs accumulation locally in FP32.',
     )
     group.add_argument(
+        '--gtp-remat-reduce-scatter-with-fp32-accumulation',
+        action='store_true',
+        default=False,
+        help='Same trade as --ddp-reduce-scatter-with-fp32-accumulation, but for '
+        'the wgrad reduce-scatter GTP weight-remat performs over the gtp_remat axis: send '
+        'low-precision values over the wire via an all-to-all and accumulate locally in FP32. '
+        'Independent of the DDP flag (different collective, different process group). Costs one '
+        'extra unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.',
+    )
+    group.add_argument(
         '--ddp-param-name-patterns-for-fp32-local-accumulation',
         nargs='+',
         default=[],
@@ -4279,6 +4587,13 @@ def _add_distributed_args(parser):
     )
     group.add_argument(
         '--use-distributed-optimizer', action='store_true', help='Use distributed optimizer.'
+    )
+    group.add_argument(
+        '--megatron-fsdp-version',
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help='Megatron-FSDP implementation version. Defaults to 1.',
     )
     group.add_argument(
         '--use-nccl-ub',

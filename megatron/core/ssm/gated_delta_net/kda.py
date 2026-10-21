@@ -26,6 +26,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     get_parameter_local_cp,
 )
+from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -189,7 +190,7 @@ class KimiDeltaAttention(_GDNBase):
         x = x.reshape(-1, self.value_head_dim)
         x = self.out_norm(x)
         gate = gate.reshape(-1, self.value_head_dim)
-        return (x * torch.sigmoid(gate.float())).to(x_dtype)
+        return apply_attention_output_gate(x, gate, 'elementwise', cast_mode='none').to(x_dtype)
 
     def forward(
         self,

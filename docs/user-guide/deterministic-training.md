@@ -46,6 +46,8 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html)).
 
+`--moe-router-fusion` is permitted, with one caveat on logging. The fused top-k / score kernels work on one token per warp and are bit-exact, and the auxiliary load-balancing loss gradient is the closed form `coeff * num_experts / (topk * num_tokens^2) * tokens_per_expert[e]`, which the fused backward computes from exact integer counts, so weights, `lm loss` and gradient norms stay bit-exact. The *value* of the aux loss, however, is reduced across thread blocks with a float `atomicAdd` inside Transformer Engine's `fused_moe_aux_loss`, so whenever an aux-loss coefficient is non-zero the logged `load_balancing_loss` can differ in its last bits between two otherwise identical runs (about 1e-7 relative). If that logged value itself must be reproducible, run with router fusion off.
+
 ## Verifying determinism
 
 The bit-exact correctness suite lives at `tests/unit_tests/determinism/correctness/`. It parametrizes over model presets (GPT-like, Llama-like, Hybrid/Mamba) × parallelism cells (TP, PP, VPP, EP, FSDP, and composites) and asserts that two runs of the same configuration produce bit-identical outputs and gradients. FP8 / FP4 recipes (`tensorwise`, `delayed`, `mxfp8`, `nvfp4`) are covered by `tests/unit_tests/determinism/correctness/test_fp8_determinism.py`; the Blackwell-only recipes are capability-skipped on Hopper.

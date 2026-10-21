@@ -12,7 +12,7 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig, T
 def _make_config(**overrides):
     kwargs = dict(num_layers=2, hidden_size=128, num_attention_heads=4, use_cpu_initialization=True)
     variant = overrides.get("experimental_attention_variant")
-    if variant in ("gdn", "kda"):
+    if variant in ("gdn", "gdn2", "kda"):
         kwargs.update(
             linear_attention_freq=1,
             linear_conv_kernel_dim=4,
@@ -75,6 +75,11 @@ def cp_config(request):
             id="gdn-contiguous-headwise",
         ),
         pytest.param(
+            dict(cp_partition_mode="contiguous", experimental_attention_variant="gdn2"),
+            "incompatible with experimental_attention_variant='gdn2'",
+            id="gdn2-contiguous",
+        ),
+        pytest.param(
             dict(cp_partition_mode="zigzag", experimental_attention_variant="dsv4_hybrid"),
             "requires cp_partition_mode='contiguous'",
             id="dsv4-zigzag",
@@ -113,6 +118,53 @@ def test_gdn_cp_conv_padding(cp_config, variant, linear_cp_mode, alignment):
             experimental_attention_variant=variant,
             linear_cp_mode=linear_cp_mode,
             gdn_conv_pad_alignment=alignment,
+        )
+
+
+@pytest.mark.parametrize("linear_cp_mode", ["headwise", "chunkwise"])
+def test_gdn2_cp_support(cp_config, linear_cp_mode):
+    """GDN2 runs headwise CP in either mode but cannot follow a Dynamic CP group."""
+    error = cp_config.get("dynamic_context_parallel", False)
+    with (
+        pytest.raises(ValueError, match="does not support dynamic_context_parallel")
+        if error
+        else nullcontext()
+    ):
+        config = _make_config(
+            **cp_config, experimental_attention_variant="gdn2", linear_cp_mode=linear_cp_mode
+        )
+        assert config.linear_cp_mode == linear_cp_mode
+
+
+@pytest.mark.parametrize(
+    ("variant", "linear_cp_mode", "key_heads", "value_heads", "error"),
+    [
+        # GDN2 always splits heads across CP ranks, so TP1/CP2 needs head counts divisible by 2
+        # in either mode. 1 key head and 2 value heads used to pass validation in chunkwise
+        # mode and then fail in the GDN2 Q/K split.
+        ("gdn2", "chunkwise", 1, 2, True),
+        ("gdn2", "headwise", 1, 2, True),
+        ("gdn2", "chunkwise", 2, 4, False),
+        # GDN and KDA chunkwise CP keep every TP-local head on each CP rank.
+        ("gdn", "chunkwise", 1, 2, False),
+        ("kda", "chunkwise", 1, 1, False),
+        ("gdn", "headwise", 1, 2, True),
+    ],
+)
+def test_gdn2_head_divisibility_uses_tp_times_cp(
+    variant, linear_cp_mode, key_heads, value_heads, error
+):
+    with (
+        pytest.raises(AssertionError, match="must be a multiple of linear_head_parallel_size")
+        if error
+        else nullcontext()
+    ):
+        _make_config(
+            context_parallel_size=2,
+            experimental_attention_variant=variant,
+            linear_cp_mode=linear_cp_mode,
+            linear_num_key_heads=key_heads,
+            linear_num_value_heads=value_heads,
         )
 
 

@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -243,10 +244,10 @@ def _postprocess_after_decoder(
         and model.config.cross_entropy_fusion_impl == "linear"
     ):
         # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
-        # materialised, so the loss comes straight out of the output layer. muP logit scaling
-        # does not apply on this path, as in GPTModel.
+        # materialised, so the loss comes straight out of the output layer and muP's output
+        # scaling is applied to the layer input instead (the layer has no bias).
         return model.output_layer(
-            hidden_states,
+            model._scale_fused_cross_entropy_input(hidden_states),
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
             output_cross_entropy_loss=True,
@@ -343,6 +344,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
+        logit_dtype (torch.dtype, optional): Dtype for the output-layer GEMM result.
+            Defaults to None, which uses the hidden-state dtype.
         parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
@@ -373,6 +376,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
@@ -406,6 +410,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
@@ -514,6 +519,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
@@ -621,6 +627,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
+                pg_collection=self.pg_collection,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:

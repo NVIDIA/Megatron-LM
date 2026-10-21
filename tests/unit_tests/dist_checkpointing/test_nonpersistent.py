@@ -38,6 +38,7 @@ class TestNonPersistentSaveAndLoad:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
 
         original_empty = torch.empty
 
@@ -131,6 +132,7 @@ class TestLegacySaveAndLoad:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         with (
             TempNamedDir(tmp_path_dist_ckpt / "test_legacy") as legacy_ckpt_dir,
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),

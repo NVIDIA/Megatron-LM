@@ -123,7 +123,7 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         language_config = get_language_model_config(deepcopy(base_config))
 
         vision_config = deepcopy(base_config)
-        vision_config = get_vision_model_config(base_config, apply_query_key_layer_scaling=self.checkpoint_args.apply_query_key_layer_scaling)
+        vision_config = get_vision_model_config(base_config)
 
         vision_projection_config = deepcopy(base_config)
         vision_projection_config = get_vision_projection_config(

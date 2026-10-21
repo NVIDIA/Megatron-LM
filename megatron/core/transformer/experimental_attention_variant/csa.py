@@ -2284,8 +2284,16 @@ class CompressedSparseAttention(MegatronModule):
         capturing = torch.cuda.is_current_stream_capturing()
         workspace = self._active_bshd_compact_indexer_workspace
         if capturing:
-            if workspace is not None and workspace.matches_shape(**match_kwargs):
-                return workspace
+            # As on the THD path: under full recompute the no-grad forward and the recompute
+            # can alternate return_softmax, so the active workspace is not necessarily the one
+            # this capture needs; any warmed-up workspace of the geometry serves.
+            candidates = [workspace] if workspace is not None else []
+            candidates += [w for w in self._bshd_compact_indexer_workspaces if w is not workspace]
+            for candidate in candidates:
+                if candidate.matches_shape(**match_kwargs):
+                    if candidate is not workspace:
+                        self._active_bshd_compact_indexer_workspace = candidate
+                    return candidate
             raise ValueError(
                 "BSHD compact CUDA graph capture requires an eagerly prepared compact "
                 "workspace for the active static geometry. Run eager warmup before capture."
@@ -2329,9 +2337,11 @@ class CompressedSparseAttention(MegatronModule):
         """Return persistent compact storage for a warmed-up THD graph geometry.
 
         Workspace sizing synchronizes with the host, so it is performed only
-        during eager CUDA-graph warmup. Capture reuses the active workspace;
-        when warmup was skipped or static shapes changed, capture must fail
-        clearly. Unsupported devices/frontends retain the non-compact path.
+        during eager CUDA-graph warmup. Capture reuses a warmed-up workspace of
+        the slot (the active one first, then the other geometries warm-up
+        prepared); when none matches, because warmup was skipped or static
+        shapes changed, capture must fail clearly. Unsupported devices/frontends
+        retain the non-compact path.
         """
         precision = self.config.dsa_indexer_precision
         self._compact_indexer_workspace_store(q.device)
@@ -2342,8 +2352,10 @@ class CompressedSparseAttention(MegatronModule):
 
         capturing = torch.cuda.is_current_stream_capturing()
         # Head and tail have different causal offsets and may have different
-        # geometry. Keep their quantization/candidate metadata separate, just as
-        # each attention module owns storage independently of the other layers.
+        # geometry. Keep their quantization/candidate metadata in separate slots;
+        # within a slot the layers built from one config share the workspaces
+        # (dsa_compact_indexer_workspace_sharing), so the slot is what keeps the
+        # head and tail of the balanced indexer apart.
         balanced = workspace_slot != "default"
         workspace = (
             self._active_balanced_thd_compact_indexer_workspaces.get(workspace_slot)
@@ -2578,7 +2590,14 @@ class CompressedSparseAttention(MegatronModule):
 
         nvtx_range_push("sparse_attn_kernel")
         output = csa_sparse_attn(
-            query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale, out_rope=out_rope
+            query,
+            kv_full,
+            self.attn_sink.float(),
+            flat_idxs,
+            self.softmax_scale,
+            out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2638,6 +2657,8 @@ class CompressedSparseAttention(MegatronModule):
             self.softmax_scale,
             topk_length=flat_tlen,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2699,6 +2720,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             out_rope=out_rope,
         )
         nvtx_range_pop("sparse_attn_kernel")
@@ -3045,6 +3067,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3154,6 +3178,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3262,6 +3288,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             thd_window_size=self.window_size,
             thd_compressed_is_sequence_major=True,
             out_rope=out_rope,
@@ -3816,6 +3843,8 @@ class CompressedSparseAttention(MegatronModule):
                     self.window_size,
                     kv_reconstruction_parts,
                     fused_out_rope,
+                    self.config.deterministic_mode,
+                    self.config.cuda_graph_impl != "none",
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
@@ -3846,6 +3875,8 @@ class CompressedSparseAttention(MegatronModule):
                 is_thd=True,
                 kv_reconstruction_parts=kv_reconstruction_parts,
                 out_rope=fused_out_rope,
+                deterministic=self.config.deterministic_mode,
+                cuda_graph=self.config.cuda_graph_impl != "none",
             )
         else:
             output = unfused_compressed_sparse_attn(

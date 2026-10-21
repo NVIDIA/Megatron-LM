@@ -164,6 +164,12 @@ step graph is captured into that same pool.
 Requirements: `--cuda-graph-modules` must be empty; MoE layers need static token shapes (drop-padding
 MoE, the HybridEP flex dispatcher with `--moe-expert-rank-capacity-factor`, or a MoE megakernel
 backend); `--overlap-moe-expert-parallel-comm` and `--delay-wgrad-compute` are not supported.
+GDN / KDA layers are rejected together with packed sequences: the FLA kernels derive their chunk
+indices on the host from the `cu_seqlens` values and cache them per tensor, so a captured block
+graph would replay the pack layout of the capture sample; fixed-length (non-packed) chunk graphs
+with those layers are fine. A graph replay runs under the block-wide FP8 autocast the eager block
+forward opens (the replay does not run the forward), so delayed scaling keeps reducing its amax
+and updating its scales, and the FP8 weight cache keeps following `is_first_microbatch`.
 `--fine-grained-activation-offloading` runs in a whole-block capture mode: the D2H/H2D copies are captured into each
 slot's graphs with static pinned host buffers and no cross-slot prefetch, so any number of live slots can replay. Because a
 slot's graphs are self-contained, the copies that eager overlaps with the *next* microbatch (the last groups' D2H at the end

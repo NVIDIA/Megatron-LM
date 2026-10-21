@@ -104,6 +104,9 @@ class TestValidateSegmentLayers:
             # Not allowed to have both standard Attention and MLA/DSA
             validate_segment_layers("MDM*-")
         with pytest.raises(ValueError):
+            # Not allowed to have both standard Attention and MLA (same reason
+            # as DSA: * uses the model-level rotary_pos_emb while + uses MLA's
+            # own decoupled RoPE).
             validate_segment_layers("M+M*-")
 
     def test_window_symbol(self):

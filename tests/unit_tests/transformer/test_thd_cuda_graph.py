@@ -32,6 +32,7 @@ import pytest
 import torch
 
 from megatron.core.datasets.data_schedule import _build_thd_padding_mask
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     _resolve_thd_padding_lengths,
@@ -1313,7 +1314,18 @@ class TestDecomposeReconstruct:
 
 
 def _build_chunk_gpt_model(
-    H, nh, nkv, ffn, max_seqlen, max_num_seqs, *, tp=1, sp=False, mtp_layers=0, vocab=128
+    H,
+    nh,
+    nkv,
+    ffn,
+    max_seqlen,
+    max_num_seqs,
+    *,
+    tp=1,
+    sp=False,
+    mtp_layers=0,
+    vocab=128,
+    **config_overrides,
 ):
     """GPTModel under the chunk-graph configuration of a packed-sequence (THD) training run."""
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -1343,6 +1355,7 @@ def _build_chunk_gpt_model(
         sequence_packing_scheduler="dp_balanced",
         pad_packed_seq_alignment="max",
         use_cpu_initialization=True,
+        **config_overrides,
     )
     layer_spec = get_gpt_layer_with_transformer_engine_spec()
     mtp_spec = (
@@ -1574,6 +1587,126 @@ class TestChunkGraphRegression:
                             error.item(),
                             ref_grad.norm().item(),
                         )
+        finally:
+            torch.cuda.synchronize()
+            if helper is not None and helper.graphs_created():
+                helper.delete_cuda_graphs()
+            destroy_num_microbatches_calculator()
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_delayed_scaling_updates_fp8_scales_on_replay(self, monkeypatch):
+        """Replay bypasses TransformerBlock.forward and the fp8_autocast it opens around the
+        layers. TE's graphed callable registers the block's FP8 metas with the global amax buffer
+        and runs the delayed-scaling reduce / scale update only inside an enclosing autocast, so
+        the chunk replay opens one itself; without it every scale would keep its capture-time
+        value for the rest of training (the control phase below)."""
+        from contextlib import nullcontext
+
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            init_num_microbatches_calculator,
+        )
+        from megatron.core.tensor_parallel.random import initialize_rng_tracker
+        from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        if not HAVE_TE:
+            pytest.skip("Transformer Engine not available")
+        import transformer_engine.pytorch as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        fp8_available, reason = FP8GlobalStateManager.is_fp8_available()
+        if not fp8_available:
+            pytest.skip(f"FP8 not available on this device: {reason}")
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=2,
+            micro_batch_size=1,
+            data_parallel_size=1,
+        )
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        helper = None
+        try:
+            tokens, max_num_seqs, vocab = 128, 4, 128
+            model = _build_chunk_gpt_model(
+                256,
+                4,
+                4,
+                512,
+                tokens,
+                max_num_seqs,
+                vocab=vocab,
+                fp8="hybrid",
+                fp8_recipe="delayed",
+                fp8_amax_history_len=4,
+                fp8_amax_compute_algo="max",
+            )
+            model.train()
+            model.zero_grad_buffer = lambda: None
+            batches = [
+                _thd_batch(seqlens, vocab, seed, tokens, max_num_seqs)
+                for seed, seqlens in enumerate(([120], [60, 60], [32, 88]))
+            ]
+
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=tokens, micro_batch_size=1
+            )
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+
+            # The modules whose forward quantizes under this recipe (the attention's FP8 meta
+            # exists but records nothing while fp8_dpa is off). TE restores the pre-capture FP8
+            # state after the capture: no amax has been reduced yet, every scale is still the
+            # initial one.
+            fp8_linears = [
+                module
+                for module in model.decoder.modules()
+                if isinstance(module, (te.Linear, te.LayerNormLinear, te.LayerNormMLP))
+            ]
+            assert fp8_linears, "the decoder graph holds no FP8 modules"
+
+            def forward_state():
+                return [
+                    (
+                        m.fp8_meta["scaling_fwd"].scale.clone(),
+                        m.fp8_meta["scaling_fwd"].amax_history.clone(),
+                    )
+                    for m in fp8_linears
+                ]
+
+            initial = forward_state()
+            assert all(torch.count_nonzero(history) == 0 for _, history in initial)
+            assert all(torch.all(scale == 1) for scale, _ in initial)
+
+            # Control: without the autocast around the replay nothing reduces the recorded amax
+            # or recomputes a scale, however many steps run.
+            monkeypatch.setattr(
+                ChunkCudaGraphBlockMixin,
+                "_chunk_graph_replay_quantization_context",
+                lambda self: nullcontext(),
+            )
+            for batch in batches[:2]:
+                _train_step(model, batch)
+            torch.cuda.synchronize()
+            for (scale, _), (initial_scale, _) in zip(forward_state(), initial):
+                assert torch.equal(scale, initial_scale), (scale, initial_scale)
+            assert all(torch.count_nonzero(history[1:]) == 0 for _, history in forward_state())
+            monkeypatch.undo()
+
+            for batch in batches:
+                _train_step(model, batch)
+            torch.cuda.synchronize()
+
+            for (scale, history), (initial_scale, _) in zip(forward_state(), initial):
+                # Each replay's forward exit reduced the amax the graph recorded and rolled it
+                # into the history, and recomputed the scale from it.
+                assert torch.count_nonzero(history[1:]) > 0, history
+                assert not torch.equal(scale, initial_scale), (scale, initial_scale)
         finally:
             torch.cuda.synchronize()
             if helper is not None and helper.graphs_created():

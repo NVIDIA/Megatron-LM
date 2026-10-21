@@ -305,7 +305,10 @@ class HyperConnectionModule(MegatronModule):
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
-        nn.init.xavier_uniform_(self.mapping_proj.weight)
+        # Honor the mcore convention: skip weight init when the caller will load a
+        # checkpoint over these parameters anyway (e.g. meta-device construction).
+        if self.config.perform_initialization:
+            nn.init.xavier_uniform_(self.mapping_proj.weight)
 
         # Set sequence_parallel attribute on parameters for gradient synchronization
         # across TP ranks when sequence_parallel is enabled.
@@ -939,3 +942,44 @@ class HyperConnectionCheckpoint:
         """
         block_size = int(math.sqrt(num_streams * num_layers / (num_streams + 2)))
         return max(1, block_size)
+
+
+def build_mhc_recompute_layer_plan(
+    num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
+) -> Tuple[list[Optional['MHCCheckpointManager']], list[bool]]:
+    """Build per-layer mHC recompute managers and recompute-block end markers."""
+    layer_managers: list[Optional['MHCCheckpointManager']] = [None] * num_layers
+    is_recompute_block_end = [False] * num_layers
+
+    if not use_mhc_recompute or num_layers == 0:
+        return layer_managers, is_recompute_block_end
+
+    # Imported at call time: the module-level import above is TYPE_CHECKING-only.
+    from megatron.core.tensor_parallel.random import MHCCheckpointManager
+
+    mhc_manager = MHCCheckpointManager()
+    for layer_index in range(num_layers):
+        is_last_in_transformer_block = layer_index == num_layers - 1
+        is_last_in_recompute_block = is_last_in_transformer_block
+        if mhc_recompute_layer_num is not None:
+            is_last_in_recompute_block = is_last_in_transformer_block or (
+                (layer_index + 1) % mhc_recompute_layer_num == 0
+            )
+
+        layer_managers[layer_index] = mhc_manager
+        is_recompute_block_end[layer_index] = is_last_in_recompute_block
+
+        if is_last_in_recompute_block and not is_last_in_transformer_block:
+            mhc_manager = MHCCheckpointManager()
+
+    return layer_managers, is_recompute_block_end
+
+
+def finalize_mhc_recompute_layer(
+    mhc_manager: Optional['MHCCheckpointManager'],
+    hidden_states: Tensor,
+    is_last_in_recompute_block: bool,
+) -> None:
+    """Finalize mHC recompute state when the current recompute block ends."""
+    if mhc_manager is not None and is_last_in_recompute_block:
+        mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)

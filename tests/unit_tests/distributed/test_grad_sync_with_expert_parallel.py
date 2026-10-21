@@ -8,9 +8,15 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TEColumnParallelLinear,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
@@ -102,6 +108,147 @@ def get_moe_model_and_buffers(
         non_ep_bucket_groups,
         ep_bucket_groups,
     )
+
+
+def _build_expert_linear(implementation: str, config: TransformerConfig) -> torch.nn.Module:
+    common_kwargs = {
+        "input_size": config.hidden_size,
+        "output_size": config.ffn_hidden_size,
+        "config": config,
+        "init_method": config.init_method,
+        "bias": False,
+        "skip_bias_add": False,
+        "is_expert": True,
+    }
+    if implementation == "native":
+        return ColumnParallelLinear(
+            **common_kwargs,
+            gather_output=False,
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
+        )
+    if implementation == "transformer_engine":
+        return TEColumnParallelLinear(
+            **common_kwargs,
+            gather_output=False,
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
+        )
+    if implementation == "transformer_engine_grouped":
+        return TEColumnParallelGroupedLinear(
+            num_gemms=config.num_moe_experts,
+            **common_kwargs,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+    raise AssertionError(f"Unsupported implementation: {implementation}")
+
+
+@pytest.mark.parametrize(
+    (
+        "tensor_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "gtp_weight_remat_size",
+        "expert_gtp_weight_remat_size",
+    ),
+    [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 1, 2)],
+)
+@pytest.mark.parametrize(
+    "implementation", ["native", "transformer_engine", "transformer_engine_grouped"]
+)
+def test_expert_grad_sync_uses_expert_data_parallel_group(
+    implementation: str,
+    tensor_model_parallel_size: int,
+    expert_tensor_parallel_size: int,
+    gtp_weight_remat_size: int,
+    expert_gtp_weight_remat_size: int,
+):
+    """Expert gradients must use expert DP when the expert and dense topologies differ."""
+    if expert_gtp_weight_remat_size > 1:
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if not HAVE_GTP:
+            pytest.skip("GTP requires TransformerEngine >= 2.19")
+    if Utils.world_size < 4 or Utils.world_size % 4 != 0:
+        pytest.skip("Test requires a world size divisible by four")
+    if Utils.world_size > 16:
+        pytest.skip("Rank-encoded gradients are intended for small unit-test world sizes")
+
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+            gtp_remat_size=gtp_weight_remat_size,
+            expert_gtp_remat_size=expert_gtp_weight_remat_size,
+        )
+
+        # Per-token loss leaves DDP's pre-collective gradient scaling at one.
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=4,
+            ffn_hidden_size=16,
+            num_moe_experts=2,
+            moe_ffn_hidden_size=16,
+            moe_router_topk=2,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+            tensor_parallel_num_weight_shards=(tensor_model_parallel_size * gtp_weight_remat_size),
+            expert_tensor_parallel_num_weight_shards=(
+                expert_tensor_parallel_size * expert_gtp_weight_remat_size
+            ),
+            calculate_per_token_loss=True,
+            gradient_accumulation_fusion=False,
+            perform_initialization=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+        )
+        module = _build_expert_linear(implementation, config).cuda()
+        model = DistributedDataParallel(
+            config,
+            ddp_config=DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True,
+                overlap_grad_reduce=False,
+                use_distributed_optimizer=False,
+                average_in_collective=False,
+            ),
+            module=module,
+        )
+
+        expert_dp_group = parallel_state.get_expert_data_parallel_group(
+            with_gtp_remat=False, partial_expert_data_parallel=True
+        )
+        ordinary_dp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=True
+        )
+        expert_dp_ranks = torch.distributed.get_process_group_ranks(expert_dp_group)
+        ordinary_dp_ranks = torch.distributed.get_process_group_ranks(ordinary_dp_group)
+        assert expert_dp_ranks != ordinary_dp_ranks
+
+        # Powers of two give every rank set a distinct sum, exposing the wrong collective group.
+        rank_value = float(2 ** torch.distributed.get_rank())
+        expected_value = float(sum(2**rank for rank in expert_dp_ranks))
+        ordinary_dp_value = float(sum(2**rank for rank in ordinary_dp_ranks))
+        assert expected_value != ordinary_dp_value
+
+        for param in model.parameters():
+            param.main_grad.fill_(rank_value)
+        model.finish_grad_sync()
+
+        for param in model.parameters():
+            torch.testing.assert_close(
+                param.main_grad, torch.full_like(param.main_grad, expected_value), rtol=0, atol=0
+            )
+
+        assert not model.buffers
+        assert len(model.expert_parallel_buffers) == 1
+        assert all(param.allreduce is False for param in model.parameters())
+    finally:
+        if expert_gtp_weight_remat_size > 1:
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import reset_gtp_state
+
+            reset_gtp_state()
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])

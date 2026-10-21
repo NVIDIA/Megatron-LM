@@ -5,7 +5,7 @@ import itertools
 import os
 import sys
 from functools import partial
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
@@ -95,6 +95,93 @@ class SFTDataset(torch.utils.data.Dataset):
                 break
         return ret
 
+    @staticmethod
+    def _infer_data_files_builder(data_files: List[str]) -> str:
+        extensions = {os.path.splitext(filename)[1].lower() for filename in data_files}
+        if extensions <= {".json", ".jsonl"}:
+            return "json"
+        if extensions == {".parquet"}:
+            return "parquet"
+        raise ValueError(
+            "--finetune-data-files must contain only .parquet or .json/.jsonl "
+            "files of a single format."
+        )
+
+    @staticmethod
+    def _materialize_data_files(hf_dataset: str, data_files: List[str]) -> List[str]:
+        from huggingface_hub import hf_hub_download
+
+        resolved_files = []
+        for filename in data_files:
+            if any(char in filename for char in "*?["):
+                raise ValueError(
+                    "--finetune-data-files requires explicit files; list each file instead of "
+                    "using a wildcard."
+                )
+
+            local_filename = filename
+            if not os.path.isabs(filename) and os.path.isdir(hf_dataset):
+                local_filename = os.path.join(hf_dataset, filename)
+
+            if os.path.isfile(local_filename):
+                resolved_files.append(local_filename)
+            elif os.path.exists(hf_dataset):
+                raise FileNotFoundError("Dataset file not found: {}".format(local_filename))
+            else:
+                resolved_files.append(
+                    hf_hub_download(
+                        repo_id=hf_dataset,
+                        filename=filename,
+                        repo_type="dataset",
+                        token=os.environ.get("HF_TOKEN", None),
+                    )
+                )
+        return resolved_files
+
+    @staticmethod
+    def _load_parquet_data_files(data_files: List[str]):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        tables = []
+        for filename in data_files:
+            # Some published HF parquet shards contain newer `datasets` feature
+            # metadata than the runtime parser understands. Dropping that metadata
+            # lets `datasets.Dataset` infer equivalent features from Arrow schema.
+            tables.append(
+                pq.read_table(filename, memory_map=True).replace_schema_metadata(None)
+            )
+
+        table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
+        return datasets.Dataset(table)
+
+    @staticmethod
+    def _load_dataset_synchronized(load_dataset_func):
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return load_dataset_func()
+
+        if torch.distributed.get_rank() == 0:
+            raw_samples = load_dataset_func()
+        torch.distributed.barrier()
+        if torch.distributed.get_rank() != 0:
+            raw_samples = load_dataset_func()
+        torch.distributed.barrier()
+        return raw_samples
+
+    @staticmethod
+    def _normalize_input_ids(input_ids) -> List[int]:
+        if isinstance(input_ids, transformers.BatchEncoding):
+            input_ids = input_ids["input_ids"]
+        if isinstance(input_ids, torch.Tensor):
+            input_ids = input_ids.tolist()
+        if input_ids and isinstance(input_ids[0], list):
+            if len(input_ids) != 1:
+                raise ValueError(
+                    "Expected one tokenized chat sample but got {}".format(len(input_ids))
+                )
+            input_ids = input_ids[0]
+        return input_ids
+
     def __init__(
         self,
         num_packed_samples: int,
@@ -103,6 +190,8 @@ class SFTDataset(torch.utils.data.Dataset):
         seq_length: int,
         num_shards: int = 1,
         shard_index: int = 0,
+        hf_dataset_split: str = "train",
+        hf_dataset_data_files: List[str] | None = None,
     ):
         """A simple dataset implementation for supervised fine-tuning.
 
@@ -119,12 +208,16 @@ class SFTDataset(torch.utils.data.Dataset):
             seq_length: max sequence length
             num_shards: number of shards for distributed training
             shard_index: shard index for distributed training
+            hf_dataset_split: Hugging Face dataset split for explicit files
+            hf_dataset_data_files: optional explicit Hugging Face dataset files
         """
         if not isinstance(tokenizer, transformers.PreTrainedTokenizerBase):
             raise ValueError("SFTDataset only supports transformers.PreTrainedTokenizerBase!")
 
         self.num_packed_samples = num_packed_samples
         self.hf_dataset = hf_dataset
+        self.hf_dataset_split = hf_dataset_split
+        self.hf_dataset_data_files = hf_dataset_data_files
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.data_transformation = lambda data: data
@@ -139,10 +232,39 @@ class SFTDataset(torch.utils.data.Dataset):
             REMOVE_THINK_CHAT_TEMPLATE, ""
         )
 
-        hf_dataset_kwargs = SFTDataset.hf_dataset_to_kwargs.get(
-            self.hf_dataset, {"split": "train"}
+        hf_dataset_kwargs = dict(
+            SFTDataset.hf_dataset_to_kwargs.get(self.hf_dataset, {"split": "train"})
         )
-        self._raw_samples = datasets.load_dataset(self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs)
+        if self.hf_dataset_data_files:
+            data_files_builder = SFTDataset._infer_data_files_builder(
+                self.hf_dataset_data_files
+            )
+            data_files = SFTDataset._load_dataset_synchronized(
+                lambda: SFTDataset._materialize_data_files(
+                    self.hf_dataset, self.hf_dataset_data_files
+                )
+            )
+            if data_files_builder == "parquet":
+                self._raw_samples = SFTDataset._load_dataset_synchronized(
+                    lambda: SFTDataset._load_parquet_data_files(data_files)
+                )
+            else:
+                hf_dataset_kwargs = {
+                    "split": self.hf_dataset_split,
+                    "data_files": {self.hf_dataset_split: data_files},
+                }
+                self._raw_samples = SFTDataset._load_dataset_synchronized(
+                    lambda: datasets.load_dataset(
+                        data_files_builder,
+                        token=os.environ.get("HF_TOKEN", None),
+                        **hf_dataset_kwargs,
+                    )
+                )
+        else:
+            self._raw_samples = datasets.load_dataset(
+                self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs
+            )
+
         self._raw_samples = self._raw_samples.shard(
             num_shards=self.num_shards, index=shard_index
         )
@@ -261,7 +383,10 @@ class SFTDataset(torch.utils.data.Dataset):
                 return None
 
         # We always add eos between samples for training purpose.
-        input_ids = self.tokenizer.apply_chat_template(example)
+        input_ids = SFTDataset._normalize_input_ids(
+            self.tokenizer.apply_chat_template(example)
+        )
+
         current_loss_mask = [1] * len(input_ids)
         input_ids = input_ids + [get_eos_token_id(self.tokenizer)]
         current_loss_mask += [0]
@@ -335,6 +460,8 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     else:
         kwargs = {
             "hf_dataset": args.finetune_hf_dataset,
+            "hf_dataset_split": args.finetune_data_split,
+            "hf_dataset_data_files": args.finetune_data_files,
             "tokenizer": hf_tokenizer,
             "seq_length": args.seq_length,
             # Optional kwargs

@@ -32,7 +32,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -617,9 +617,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
+        In batch-invariant mode, the symmetric RSV buffer is still used for data
+        visibility, but the rank reduction is an explicit fp32 rank-order loop
+        rather than a hardware multimem reduction.
+
         Args:
-            hidden_states: [global_max, hidden_size] expert outputs (fp32 when
-                written directly to the RSV buffer, bf16 otherwise).
+            hidden_states: [global_max, hidden_size] expert outputs (fp32
+                when written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
@@ -637,7 +641,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        multimem_reduce_scatter_v(
+        reduce_scatter_v = (
+            batch_invariant.ordered_reduce_scatter_v
+            if batch_invariant.enabled()
+            else multimem_reduce_scatter_v
+        )
+        reduce_scatter_v(
             output,
             rsv["tensor"],
             rsv["handle"],

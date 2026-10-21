@@ -11,6 +11,7 @@ replayed with a single launch per pass.
 """
 
 from collections import OrderedDict
+from contextlib import nullcontext
 
 import torch
 
@@ -60,6 +61,34 @@ class ChunkCudaGraphBlockMixin:
             and module._uses_graph_dynamic_dsa_route()
             for module in self.modules()
         )
+
+    def _chunk_graph_has_quantized_modules(self):
+        """Whether the captured block holds modules the block-level FP8 autocast applies to.
+
+        The decoder block always does. The post-process block overrides this: only its MTP
+        layers and an MXFP8 output projection are Transformer Engine modules run under FP8.
+        """
+        return True
+
+    def _chunk_graph_replay_quantization_context(self):
+        """Quantization context of a chunk graph replay (``nullcontext`` without FP8).
+
+        Replay enters the graphed callable directly, so the ``fp8_autocast`` the eager block
+        forward opens around its layers (``TransformerBlock.forward``, the MTP layers) never
+        runs. Transformer Engine's graphed callable takes all of its FP8 bookkeeping from the
+        autocast enclosing the replay: inside one it registers the block's FP8 metas with the
+        global amax buffer, the first callable of the autocast owns the backward-side
+        ``reduce_and_update_fp8_tensors`` and the autocast exit runs the forward-side one (delayed
+        scaling: without the context the amax history is never reduced and every scale keeps its
+        capture-time value), and that same first callable forwards ``is_first_microbatch`` to the
+        FP8 weight-cache update (every recipe). The graphs themselves are fixed, so the context
+        only drives this bookkeeping; a BF16 boundary layer stays BF16 as it was recorded.
+        """
+        if not getattr(self.config, 'fp8', None) or not self._chunk_graph_has_quantized_modules():
+            return nullcontext()
+        from megatron.core.fp8_utils import get_fp8_context
+
+        return get_fp8_context(self.config)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Build the static inputs of a complete decoder-block graph."""
@@ -293,7 +322,8 @@ class ChunkCudaGraphBlockMixin:
             f"Chunk CUDA graph replay requested microbatch {microbatch_id}, but the capture only "
             f"contains {len(self.cuda_graphs)} graph slots."
         )
-        return super()._te_cuda_graph_replay(*args, **kwargs)
+        with self._chunk_graph_replay_quantization_context():
+            return super()._te_cuda_graph_replay(*args, **kwargs)
 
 
 class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
@@ -344,6 +374,15 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Shared parameters are serialized by their owning module."""
         return {}
+
+    def _chunk_graph_has_quantized_modules(self):
+        """The MTP layers run under FP8 like eager (``get_layer_fp8_context``) and the LM head
+        is a Transformer Engine module only with the MXFP8 output projection; a post-process
+        block with neither opens no autocast, exactly as the eager post-process does not."""
+        from megatron.core.fp8_utils import is_mxfp8_output_proj_active
+
+        mtp_on_this_stage = (self.config.mtp_num_layers or 0) > 0 and self._owner.mtp_process
+        return mtp_on_this_stage or is_mxfp8_output_proj_active(self.config)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Static inputs of the post-process graph (packed sequences only)."""

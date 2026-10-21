@@ -17,7 +17,15 @@ name: Approve Test Queue
 on:
   schedule:
     - cron: "*/5 * * * *" # Runs every 5 minutes
+  # Scheduled events can be delayed, so refill released queue slots immediately.
+  workflow_run:
+    workflows: ["CICD Megatron-LM"]
+    types: [completed]
   workflow_dispatch: # Allows manual triggering
+
+concurrency:
+  group: approve-test-queue
+  cancel-in-progress: false
 
 jobs:
   approve-queue:
@@ -38,10 +46,10 @@ jobs:
             contributor_type: external
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
@@ -79,6 +87,7 @@ jobs:
           GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
+          INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
           if CONTRIBUTOR_TYPE == "external":
               # Global limit across all branches — no division needed since we count globally.
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
@@ -131,10 +140,12 @@ jobs:
               return None
 
           def is_internal_contributor(pr_info):
-              """Return True if the PR author is a member of NVIDIA or NVIDIA-NeMo org (is_org_member)."""
+              """Return True for internal service accounts or NVIDIA organization members."""
               login = pr_info.get("user", {}).get("login", "")
               org_roles = sso_users.get(login, {}).get("org_roles", [])
-              return any(role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles)
+              return login in INTERNAL_SERVICE_ACCOUNTS or any(
+                  role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles
+              )
 
           def get_pr_base_branch(workflow_run):
               """

@@ -72,7 +72,7 @@ concurrency:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.94.1
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
     if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
 
   bump:
@@ -83,7 +83,7 @@ jobs:
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_merge_group == 'true'
            || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@v1.4.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@6dfd1b435cca9e3c2640f7b31c4f37e42c6bf796 # v1.4.0
     with:
       release-branch-pattern: "core_[rv][0-9]*.[0-9]*.[0-9]*"
       release-ref: ${{ inputs.release-ref || github.sha }}
@@ -123,7 +123,7 @@ jobs:
       github.repository == 'NVIDIA/Megatron-LM'
       && (success() || !failure())
       && !cancelled()
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@6a2f81195fd910ae91d3c001d2e32ceb6d82e975 # v1.0.0
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}

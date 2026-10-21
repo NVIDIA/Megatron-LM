@@ -13,7 +13,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
@@ -305,9 +305,11 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
-            # TODO: When LatentMoE gains GTP plumbing on dev, resolve the non-expert GTP
-            # rematerialization group when `moe_latent_proj` is opted in, and pass that group
-            # plus `pg_collection.dp_cp` as the replica group to both latent projections.
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -319,6 +321,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
             fc2_linear_cls = (
                 TERMSNormDuplicatedLinear
@@ -328,10 +331,11 @@ class MoELayer(BaseMoELayer):
             fc2_extra_kwargs = (
                 {"tp_group": pg_collection.tp}
                 if fc2_linear_cls is TERMSNormDuplicatedLinear
-                else {}
+                else {"gtp_remat_group": gtp_remat_group}
             )
-            # TODO: When those GTP kwargs are added, carry them into this wrapper together with
-            # its owning TP group; TE tensor-parallel execution remains local with `tp_size=1`.
+            # TODO: When TERMSNormDuplicatedLinear accepts `gtp_remat_group`, carry it into this
+            # wrapper together with its owning TP group; TE tensor-parallel execution remains
+            # local with `tp_size=1`.
             self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
@@ -593,7 +597,16 @@ class MoELayer(BaseMoELayer):
         experts.
         """
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
-            hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
+            wgrad = _DelayedExpertWgrad(self)
+            hidden_states = _RegisterDelayedWgradForExperts.apply(wgrad, hidden_states)
+            # Flex creates the shared/routed fork inside token_dispatch for every backend.
+            # All-to-all forks in dispatch_preprocess, before the wgrad node above.
+            if self.shared_expert_overlap and isinstance(
+                self.token_dispatcher, MoEFlexTokenDispatcher
+            ):
+                return self.token_dispatcher.token_dispatch(
+                    hidden_states, probs, dispatch_backward_callback=wgrad.launch
+                )
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
@@ -687,8 +700,17 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
+            # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
+            # these kwargs).
+            output_buffer, grad_input_buffer = self.token_dispatcher.get_expert_zero_copy_buffers()
+            expert_kwargs = {}
+            if output_buffer is not None:
+                expert_kwargs["output_buffer"] = output_buffer
+            if grad_input_buffer is not None:
+                expert_kwargs["grad_input_buffer"] = grad_input_buffer
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
@@ -950,8 +972,8 @@ class _RecordExpertDgradCompletion(torch.autograd.Function):
 
     Placed in the forward graph just before the expert computation so that during
     the backward pass, when the expert dgrad completes, we record an event. The
-    subsequent ``_RegisterDelayedWgradForExperts`` waits on this event before
-    launching the delayed wgrad computation on a separate CUDA stream.
+    deferred wgrad stream waits on this event before launching weight-gradient
+    computation, independently of dispatch backward completion.
     """
 
     @staticmethod
@@ -968,42 +990,56 @@ class _RecordExpertDgradCompletion(torch.autograd.Function):
         return (None,) + grad_outputs
 
 
-class _RegisterDelayedWgradForExperts(torch.autograd.Function):
-    """Autograd function that orchestrates delayed wgrad computation for MoE experts.
+class _DelayedExpertWgrad:
+    """Per-forward launch and completion state for deferred expert weight gradients."""
 
-    Placed in the forward graph at the dispatch boundary. During the backward pass,
-    this function:
-      1. Records an event on the current (backward) stream to signal the dgrad is done.
-      2. Executes the delayed wgrad computation on a dedicated CUDA stream.
-      3. Waits for the wgrad computation to complete.
-      4. Invokes the registered gradient processing callback (e.g., FSDP reduce-scatter).
-    """
+    def __init__(self, module: MoELayer):
+        self.module = module
+        self.completion = torch.cuda.Event()
+        self.launched = False
 
-    @staticmethod
-    def forward(ctx, module: MoELayer, *inputs):
-        """Forward pass that stores the MoE module and passes through inputs unchanged."""
-        ctx.module = module
-        return inputs[0] if len(inputs) == 1 else inputs
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        """Backward pass that executes delayed wgrad computation on a separate stream."""
-        module = ctx.module
-        event = module._delayed_wgrad_event
+    def launch(self):
+        """Submit wgrad after expert dgrad, without waiting for dispatch communication."""
+        if self.launched:
+            return
+        module = self.module
         wgrad_stream = module._delayed_wgrad_stream
-
-        wgrad_stream.wait_event(event)
+        wgrad_stream.wait_event(module._delayed_wgrad_event)
         with torch.cuda.stream(wgrad_stream):
             nvtx_range_push("delayed_expert_wgrad")
             module.backward_dw(routed_experts=True, shared_experts=False)
             nvtx_range_pop("delayed_expert_wgrad")
-            event.record(wgrad_stream)
+            self.completion.record(wgrad_stream)
+        self.launched = True
 
-        torch.cuda.current_stream().wait_event(event)
-
-        for param in module.parameters():
+    def finish(self):
+        """Join wgrad and run deferred gradient hooks at the original graph boundary."""
+        # Dispatchers without an earlier launch retain the original scheduling.
+        self.launch()
+        torch.cuda.current_stream().wait_event(self.completion)
+        for param in self.module.parameters():
             if getattr(param, "post_wgrad_grad_acc_hook", None) is not None:
                 param.post_wgrad_grad_acc_hook()
+        self.module = None
 
-        ctx.module = None
+
+class _RegisterDelayedWgradForExperts(torch.autograd.Function):
+    """Join expert wgrad at the original dispatch boundary.
+
+    Keep completion and deferred gradient hooks here even when the dispatcher
+    launches wgrad earlier on its routed branch. With Flex shared overlap, this
+    boundary follows the shared/routed input-gradient merge in backward.
+    """
+
+    @staticmethod
+    def forward(ctx, wgrad: _DelayedExpertWgrad, *inputs):
+        """Store the state for this forward and pass through inputs unchanged."""
+        ctx.wgrad = wgrad
+        return inputs[0] if len(inputs) == 1 else inputs
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Wait for this forward's wgrad before processing its gradients."""
+        ctx.wgrad.finish()
+        ctx.wgrad = None
         return (None,) + grad_outputs

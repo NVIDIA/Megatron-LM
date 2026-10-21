@@ -264,6 +264,7 @@ class TestGPTModelConfigInitialization:
         assert config.should_pad_vocab is False
         assert config.seq_length == 1024
         assert config.fp16_lm_cross_entropy is False
+        assert config.logit_dtype is None
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
         assert config.position_embedding_type == "learned_absolute"
@@ -282,6 +283,7 @@ class TestGPTModelConfigInitialization:
             transformer=_make_transformer(),
             seq_length=4096,
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -290,6 +292,7 @@ class TestGPTModelConfigInitialization:
         )
         assert config.seq_length == 4096
         assert config.fp16_lm_cross_entropy is True
+        assert config.logit_dtype == torch.float32
         assert config.parallel_output is False
         assert config.share_embeddings_and_output_weights is True
         assert config.position_embedding_type == "rope"
@@ -681,6 +684,7 @@ class TestGPTModelBuilderBuildModel:
             vocab_size=32000,
             seq_length=4096,
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -702,6 +706,7 @@ class TestGPTModelBuilderBuildModel:
         assert kw["vocab_size"] == 32000
         assert kw["max_sequence_length"] == 4096
         assert kw["fp16_lm_cross_entropy"] is True
+        assert kw["logit_dtype"] == torch.float32
         assert kw["parallel_output"] is False
         assert kw["share_embeddings_and_output_weights"] is True
         assert kw["position_embedding_type"] == "rope"

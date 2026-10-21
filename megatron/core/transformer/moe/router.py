@@ -9,6 +9,9 @@ import torch
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -1154,7 +1157,12 @@ class InferenceTopKRouter(TopKRouter):
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
-        probs, top_indices = self._compiled_topk_routing(
+        routing = (
+            topk_routing_with_score_function
+            if is_batch_invariant_mode_enabled()
+            else self._compiled_topk_routing
+        )
+        probs, top_indices = routing(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,

@@ -863,10 +863,6 @@ def float16_to_fp32(val):
 def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
     """Mark a parameter or buffer so that ``Float16Module`` keeps it in FP32.
 
-    Some parameters must stay in FP32 even when the rest of the model is converted to
-    FP16/BF16 (e.g. the ``ape`` and ``attn_sink`` parameters of DeepSeek V4 sparse
-    attention, which are FP32 in the reference checkpoint).
-
     Args:
         tensor: The parameter or buffer to mark.
 
@@ -880,20 +876,20 @@ def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
 def convert_module_to_dtype_except_fp32_marked(
     module: torch.nn.Module, dtype: torch.dtype
 ) -> torch.nn.Module:
-    """Cast floating-point parameters and buffers of ``module`` to ``dtype``.
-
-    Tensors marked with :func:`mark_keep_in_fp32` are left untouched.
+    """Cast floating-point parameters and buffers except those marked to stay in FP32.
 
     Args:
         module: The module to convert in place.
-        dtype: The target floating-point dtype (``torch.half`` or ``torch.bfloat16``).
+        dtype: The target floating-point dtype.
 
     Returns:
         The converted module.
     """
     return module._apply(
-        lambda t: (
-            t.to(dtype) if t.is_floating_point() and not getattr(t, 'keep_in_fp32', False) else t
+        lambda tensor: (
+            tensor.to(dtype)
+            if tensor.is_floating_point() and not getattr(tensor, 'keep_in_fp32', False)
+            else tensor
         )
     )
 

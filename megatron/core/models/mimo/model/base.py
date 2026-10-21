@@ -2,6 +2,7 @@
 
 import logging
 import warnings
+from contextlib import ExitStack, contextmanager
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -292,6 +293,51 @@ class MimoModel(MegatronModule):
             if submodule is not None:
                 yield submodule
 
+    def _active_ddp_modules(self):
+        """Yield this rank's active DDP-wrapped submodules."""
+        for module in self._active_submodules():
+            if isinstance(module, DistributedDataParallel):
+                yield module
+
+    @contextmanager
+    def no_sync(self):
+        """Disable grad-ready registration on overlapped inner DDP modules."""
+        with ExitStack() as stack:
+            for module in self._active_ddp_modules():
+                if module.ddp_config.overlap_grad_reduce:
+                    stack.enter_context(module.no_sync())
+            yield
+
+    def enable_forward_pre_hook(self):
+        """Enable parameter-gather pre-hooks on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.enable_forward_pre_hook()
+
+    def disable_forward_pre_hook(self, param_sync: bool = True):
+        """Disable parameter-gather pre-hooks on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.disable_forward_pre_hook(param_sync=param_sync)
+
+    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
+        """Start parameter synchronization on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.start_param_sync(force_sync=force_sync, force_dispatch=force_dispatch)
+
+    def start_grad_sync(self, *unused):
+        """Start gradient synchronization on overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_grad_reduce:
+                module.start_grad_sync()
+
+    def free_overlap_buffers(self):
+        """Release parameter-gather buffers owned by overlapped inner DDP modules."""
+        for module in self._active_ddp_modules():
+            if module.ddp_config.overlap_param_gather:
+                module.free_overlap_buffers()
+
     def zero_grad_buffer(self):
         """Zero each active submodule's DDP grad buffer."""
         for module in self._active_submodules():
@@ -503,6 +549,8 @@ class MimoModel(MegatronModule):
             language_grid = grid_map[MIMO_LANGUAGE_MODULE_KEY]
             encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
             language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
+            if "gtp_remat" in language_grid.dim_names:
+                language_dp *= language_grid.shape[language_grid.dim_names.index("gtp_remat")]
             assert encoder_dp <= language_dp, (
                 f"Bridge fan-out split metadata with non-uniform per-sample sizes "
                 f"requires encoder DP <= LM DP (got encoder='{encoder_name}' "
@@ -654,6 +702,7 @@ class MimoModel(MegatronModule):
                 position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
+                loss_mask=loss_mask,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
@@ -683,6 +732,7 @@ class MimoModel(MegatronModule):
                 position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
+                loss_mask=loss_mask,
                 attention_mask=attention_mask,
                 packed_seq_params=packed_seq_params,
             )
@@ -804,6 +854,7 @@ class MimoModel(MegatronModule):
             position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
+            loss_mask=loss_mask,
             attention_mask=None,
             packed_seq_params=packed_seq_params,
         )

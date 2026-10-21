@@ -7,6 +7,8 @@ import logging
 import math
 import warnings
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
+from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -136,6 +138,8 @@ def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
 
 def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
     """Copy optimizer-relevant metadata when creating param views/copies."""
+    if hasattr(source, 'allreduce'):
+        destination.allreduce = source.allreduce
     if hasattr(source, 'shared'):
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
@@ -251,7 +255,10 @@ class MegatronOptimizer(ABC):
     def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
         """Start the optimizer prefetch that may overlap gradient finalization."""
 
-        self.prefetch_optimizer_state_for_step()
+        if self._defer_optimizer_state_prefetch_to_step:
+            self.prefetch_optimizer_master_weights_for_step()
+        else:
+            self.prefetch_optimizer_state_for_step()
 
     def prefetch_optimizer_master_weights_for_step(self) -> None:
         """Prefetch master weights without restoring an optimizer-state chunk."""
@@ -326,6 +333,7 @@ class MegatronOptimizer(ABC):
           - parameter should not be shared (i.e., grads shouldn't be double counted while
             computing norms).
           - should not be a replica due to tensor model parallelism.
+          - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
         for param in params:
@@ -352,9 +360,12 @@ class MegatronOptimizer(ABC):
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
+                param,
+                tp_group=getattr(self, 'tp_group', None),
+                expert_tp_group=getattr(self, 'expert_tp_group', None),
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
         return grads_for_norm
 
@@ -519,6 +530,7 @@ class MegatronOptimizer(ABC):
                 and getattr(params[0], "__fsdp_param__", False)
             ),
             tp_group=getattr(self, 'tp_group', None),
+            expert_tp_group=getattr(self, 'expert_tp_group', None),
         )
 
     @abstractmethod
@@ -879,9 +891,15 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
+            # The reuse_grad_buf (fp8-param-gather) path stages master params into the DDP
+            # param buffer, which only DistributedOptimizer owns. Non-DistOpt LayerWise
+            # children (tagged ``_layer_wise_non_distopt_child``) and optimizers without the
+            # staging method must instead copy master -> model params so the forward sees the
+            # update.
             if (
                 self.config.reuse_grad_buf_for_mxfp8_param_ag
                 and not self._layer_wise_non_distopt_child
+                and hasattr(self, "_copy_main_params_to_param_buffer")
             ):
                 # In the case of overlap_param_gather,
                 # copy is manually called in the training loop
@@ -932,6 +950,120 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
+
+
+def _strip_module_prefix(name: str) -> str:
+    """Strip wrapper ``module.`` prefixes (DDP/Float16Module) off a dotted param name."""
+    while name.startswith('module.'):
+        name = name[len('module.') :]
+    return name
+
+
+def _backfill_gtp_sharded_param_map(
+    id_to_sharded_param_map: dict, float16_groups, model_sharded_state_dict=None
+) -> None:
+    """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
+
+    WHAT: ``get_param_id_to_sharded_param_map`` matches an optimizer param to its model
+    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). Two GTP_remat
+    cases break that match:
+      1. Native-FP8 GTP weights: the model entry's data is a *dequantized BF16 copy* of the param
+         (make_tp_sharded_tensor_for_checkpoint). The copy carries a ``_gtp_dequant_src`` backlink
+         to the live FP8 param, so the model's OWN entry is reused here (identity first, tagged
+         ``_debug_name`` second) -- preserving its full offsets (expert axes included) and
+         replica_id.
+      2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
+         tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
+         ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
+         aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
+         loudly instead of writing colliding shards across EP groups.
+
+    WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
+    matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
+    Distributed Adam uses its own ``DistributedOptimizer.sharded_state_dict`` (flat-buffer path)
+    and is unaffected.
+
+    No-op when GTP is unavailable or when every param already matched.
+    """
+    try:
+        from megatron.core.tensor_parallel.gtp_api import (
+            is_gtp_param,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        )
+    except ImportError:
+        return  # GTP not built in -- nothing to backfill.
+
+    # is_gtp_param matches both the legacy BF16 slice params and native-FP8 GTP params.
+    unmatched = [
+        (param_id, p)
+        for param_id, p in enumerate(chain.from_iterable(float16_groups))
+        if param_id not in id_to_sharded_param_map and is_gtp_param(p)
+    ]
+    if not unmatched:
+        return
+
+    from ..dist_checkpointing.dict_utils import nested_values
+    from ..dist_checkpointing.mapping import ShardedTensor
+
+    # Index the model's own entries by (a) the dequantized-copy backlink and (b) checkpoint key.
+    src_id_to_entry = {}
+    key_to_entry = {}
+    if model_sharded_state_dict is not None:
+        for entry in nested_values(model_sharded_state_dict):
+            src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+            if src is not None:
+                src_id_to_entry[id(src)] = entry
+            key = getattr(entry, 'key', None)
+            if key is not None:
+                # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.
+                key_to_entry[key] = None if key in key_to_entry else entry
+
+    # Groups sourced lazily (below) only when a rebuild is needed, so GTP models on
+    # explicit grids (e.g. MiMo) don't require the global MPU groups unless they hit it.
+    tp_group = None
+    dp_cp_gtp_remat_group = None
+    for param_id, p in unmatched:
+        # Case 1: reuse the model's own entry (native-FP8 dequantized copy broke the id match).
+        entry = src_id_to_entry.get(id(p))
+        if entry is None:
+            name = _strip_module_prefix(getattr(p, '_debug_name', '') or '')
+            candidate = key_to_entry.get(name)
+            # Reuse only a plain ShardedTensor with this shard's local shape; a factory
+            # (gathered data, e.g. Mamba in_proj) must take the per-shard rebuild below.
+            if (
+                candidate is not None
+                and isinstance(candidate, ShardedTensor)
+                and tuple(candidate.data.shape) == tuple(p.shape)
+            ):
+                entry = candidate
+        if entry is not None:
+            id_to_sharded_param_map[param_id] = entry
+            continue
+        # Case 2: rebuild. Not EP-aware -- an expert param rebuilt here would collide across
+        # expert-parallel groups (duplicate writers), so it must have matched above.
+        if not getattr(p, 'allreduce', True):
+            raise ValueError(
+                f"GTP expert-parallel param '{getattr(p, '_debug_name', '')}' (id {param_id}) "
+                "has no matching model ShardedTensor; refusing the EP-unaware rebuild (it would "
+                "write duplicate shards across expert-parallel groups)."
+            )
+        if tp_group is None:
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
+            dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            )
+        # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
+        # keeps the function usable in tests where the name was not tagged.
+        key = p._debug_name or f'_gtp_optim_param_{param_id}'
+        rebuilt = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {key: p},
+            prefix='',
+            tensor_parallel_layers_axis_map={key: 0},
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_gtp_remat_group,
+        )
+        id_to_sharded_param_map[param_id] = rebuilt[key]
 
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
@@ -997,6 +1129,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                                 main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            tensor_parallel.copy_gtp_attributes(main_param, param)
                             copy_optimizer_param_metadata(main_param, param)
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
@@ -1181,39 +1314,47 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict = self.state_dict()
 
         # Optimizer state ids enumerate the inner optimizer params: the fp32 main
-        # copies of float16 params and the native fp32 params, interleaved in the
-        # original param-group order. Yield the model-side param for each inner
-        # param in that order so the ids line up even when both kinds are present.
+        # copies of float16 params, native fp32 params, and any frozen params,
+        # interleaved in the original param-group order. Map each fp32 main copy
+        # back to its model-side param; all other params already are model params.
+        main_param_id_to_model_param = {
+            id(main_param): model_param
+            for model_group, main_group in zip(
+                self.float16_groups, self.fp32_from_float16_groups, strict=True
+            )
+            for model_param, main_param in zip(model_group, main_group, strict=True)
+        }
+
         def model_params_in_optimizer_order():
-            for inner_group, float16_group, fp32_group in zip(
-                self.optimizer.param_groups, self.float16_groups, self.fp32_from_fp32_groups
+            for param in chain.from_iterable(
+                inner_group['params'] for inner_group in self.optimizer.param_groups
             ):
-                float16_params = iter(float16_group)
-                fp32_param_ids = {id(p) for p in fp32_group}
-                for param in inner_group['params']:
-                    yield param if id(param) in fp32_param_ids else next(float16_params)
+                yield main_param_id_to_model_param.get(id(param), param)
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, model_params_in_optimizer_order()
+        )
+
+        _backfill_gtp_sharded_param_map(
+            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
         )
 
         # Convert fp32_from_fp16_params
         assert len(state_dict['fp32_from_fp16_params']) == len(
             state_dict['optimizer']['param_groups']
         )
-        # State ids of the fp32 main copies only, skipping native fp32 params.
+        # State ids of the fp32 main copies only, skipping native fp32 and frozen params.
         float16_param_ids_per_group = []
-        for state_group, inner_group, fp32_group in zip(
-            state_dict['optimizer']['param_groups'],
-            self.optimizer.param_groups,
-            self.fp32_from_fp32_groups,
+        for state_group, inner_group in zip(
+            state_dict['optimizer']['param_groups'], self.optimizer.param_groups, strict=True
         ):
-            fp32_param_ids = {id(p) for p in fp32_group}
             float16_param_ids_per_group.append(
                 [
                     param_id
-                    for param_id, param in zip(state_group['params'], inner_group['params'])
-                    if id(param) not in fp32_param_ids
+                    for param_id, param in zip(
+                        state_group['params'], inner_group['params'], strict=True
+                    )
+                    if id(param) in main_param_id_to_model_param
                 ]
             )
         state_dict['fp32_from_fp16_params'] = [
@@ -1223,10 +1364,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     fp32_param,
                     prefix=f'optimizer.state.fp32_param',
                 )
-                for param_id, fp32_param in zip(param_ids, fp32_group)
+                for param_id, fp32_param in zip(param_ids, fp32_group, strict=True)
             ]
             for fp32_group, param_ids in zip(
-                state_dict['fp32_from_fp16_params'], float16_param_ids_per_group
+                state_dict['fp32_from_fp16_params'], float16_param_ids_per_group, strict=True
             )
         ]
 
@@ -1514,26 +1655,80 @@ class ChainedOptimizer(MegatronOptimizer):
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
         self._share_optimizer_state_offload_streams()
+        self._defer_later_children_state_prefetch()
+
+    def _defer_later_children_state_prefetch(self) -> None:
+        """Bound the chain's tensor-state staging to one manager's two slots.
+
+        Children step one after another. Only the first offloading child restores its first
+        state chunk ahead of the update, where the copy overlaps gradient clipping. Each later
+        child restores its own when its step begins, into the staging windows the previous
+        child handed over, instead of holding a chunk through every earlier child's update.
+        """
+
+        # A nested chain such as LayerWise counts through the manager of its child.
+        offloading_children = [
+            child
+            for child in self.chained_optimizers
+            if any(self._iter_optimizer_state_offloaders(child))
+        ]
+        for child in offloading_children[1:]:
+            self._defer_state_prefetch_to_step(child)
+
+    @classmethod
+    def _defer_state_prefetch_to_step(cls, optimizer: MegatronOptimizer) -> None:
+        """Move ``optimizer``'s first state-chunk restore from gradient finalization to its step.
+
+        A nested chain is marked too, because LayerWise prefetches its managed child through
+        its own gradient-finalization policy rather than the child's.
+        """
+
+        if getattr(optimizer, '_optimizer_state_offloader', None) is not None:
+            optimizer.set_optimizer_state_offload_deferred_lifecycle(
+                state_prefetch_to_step=True,
+                master_offload_for_param_sync=(
+                    optimizer._defer_optimizer_master_offload_for_param_sync
+                ),
+            )
+            return
+        optimizer._defer_optimizer_state_prefetch_to_step = True
+        for child in getattr(optimizer, 'chained_optimizers', ()):
+            if any(cls._iter_optimizer_state_offloaders(child)):
+                cls._defer_state_prefetch_to_step(child)
+
+    @staticmethod
+    def _iter_optimizer_state_offloaders(optimizer: MegatronOptimizer):
+        """Yield every chunked offload manager in ``optimizer``, nested chains included."""
+
+        manager = getattr(optimizer, '_optimizer_state_offloader', None)
+        if manager is not None:
+            yield manager
+        for child in getattr(optimizer, 'chained_optimizers', ()):
+            yield from ChainedOptimizer._iter_optimizer_state_offloaders(child)
 
     def _share_optimizer_state_offload_streams(self) -> None:
-        """Serialize all nested offload managers on one D2H/H2D stream pair."""
+        """Serialize all nested offload managers on one D2H/H2D stream pair and one pair of
+        staging windows."""
 
-        managers = []
-
-        def collect(current_optimizer: MegatronOptimizer) -> None:
-            manager = getattr(current_optimizer, '_optimizer_state_offloader', None)
-            if manager is not None:
-                managers.append(manager)
-            for child in getattr(current_optimizer, 'chained_optimizers', ()):
-                collect(child)
-
-        collect(self)
+        managers = list(self._iter_optimizer_state_offloaders(self))
         if len(managers) < 2:
             return
 
         d2h_stream, h2d_stream = managers[0].transfer_streams
         for manager in managers[1:]:
             manager.use_transfer_streams(d2h_stream, h2d_stream)
+            manager.use_staging_pool(managers[0].staging_pool)
+
+    def _hold_optimizer_state_staging(self):
+        """Keep the shared staging windows alive while the children step one after another.
+
+        Each child then hands its windows to the next instead of freeing them while its last
+        D2H copies are still in flight; see ``_StagingSlotPool``. Only the children loop holds
+        them, so post-step parameter staging does not run beside two idle windows.
+        """
+
+        manager = next(self._iter_optimizer_state_offloaders(self), None)
+        return manager.staging_pool.hold() if manager is not None else nullcontext()
 
     @property
     def optimizer(self):
@@ -1580,15 +1775,13 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.offload_optimizer_state_for_forward(offload_master=offload_master)
 
     def prefetch_optimizer_state_for_step(self) -> None:
-        """Eagerly prefetch state/master data for every optimizer in the chain.
+        """Prefetch for the next chained step without exceeding the chain's staging bound.
 
-        This general-purpose entry can exceed a configured chunk staging bound because every
-        child may hold a prefetched window concurrently. LayerWise uses a dedicated
-        gradient-finalization policy for its single managed Muon child.
+        This is the gradient-finalization policy: children deferred to their own step restore
+        only master weights here, so at most one child holds a prefetched state chunk.
         """
 
-        for optimizer in self.chained_optimizers:
-            optimizer.prefetch_optimizer_state_for_step()
+        self.prefetch_optimizer_state_for_gradient_finalization()
 
     def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
         """Start each child's gradient-finalization prefetch policy."""
@@ -1802,13 +1995,14 @@ class ChainedOptimizer(MegatronOptimizer):
     def _step(self) -> bool:
         """Step all optimizers in this chain."""
         success = True
-        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
-            self._before_child_step(optimizer_idx)
-            success &= optimizer.step_with_ready_grads()
-            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
-                assert success
-                assert len(optimizer.model_chunks) == 1
-                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        with self._hold_optimizer_state_staging():
+            for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                self._before_child_step(optimizer_idx)
+                success &= optimizer.step_with_ready_grads()
+                if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+                    assert success
+                    assert len(optimizer.model_chunks) == 1
+                    optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
         return success
 
     def _should_defer_mxfp8_param_sync(self) -> bool:
@@ -1948,8 +2142,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 # squares are summed in the norms' dtype and the root is taken in float64, but on
                 # the device, so that an optimizer-step CUDA graph capture needs no host
                 # synchronization (``math.sqrt(tensor)`` would be one). clip_grad_by_total_norm_fp32
-                # then forms the clip coefficient in float64 as well and rounds it once to fp32
-                # for the scale kernel, exactly like the Python-float path.
+                # then forms the clip coefficient with a float64 true division and rounds it once
+                # to fp32 for the scale kernel, as the Python-float path does.
                 grad_norm = torch.sqrt(sum(x**2 for x in grad_norms).to(torch.float64))
             else:
                 grad_norm = math.sqrt(sum(x**2 for x in grad_norms))
@@ -1970,6 +2164,8 @@ class ChainedOptimizer(MegatronOptimizer):
                     self.config.use_precision_aware_optimizer
                     and getattr(params[0], "__fsdp_param__", False)
                 ),
+                tp_group=getattr(self.chained_optimizers[0], 'tp_group', None),
+                expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
             )
         else:
             num_zeros_in_grad = 0

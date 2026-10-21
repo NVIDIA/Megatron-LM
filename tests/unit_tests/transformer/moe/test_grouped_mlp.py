@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import situlu, squared_relu
+from megatron.core.enums import Fp8Recipe
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -68,6 +69,23 @@ def test_grouped_tensor_requires_grouped_gemm():
         )
 
 
+def test_clamped_swiglu_allows_te_op_fuser():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        activation_func_clamp_value=10.0,
+        use_transformer_engine_op_fuser=True,
+    )
+
+    assert config.activation_func_clamp_value == 10.0
+    assert config.use_transformer_engine_op_fuser is True
+
+
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
     interleaved = torch.tensor([[1, 2, 5, 6, 3, 4, 7, 8], [11, 12, 15, 16, 13, 14, 17, 18]])
     expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14, 15, 16, 17, 18]])
@@ -92,6 +110,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             single_grouped_weight,
             single_grouped_bias=False,
             delay_wgrad_compute=False,
+            scale_bias=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -104,6 +123,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.scale_bias = scale_bias
 
         def need_backward_dw(self):
             return False
@@ -177,18 +197,79 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
     assert ops[0].weight1 is module.linear_fc1.weight1
     assert ops[0].bias0 is module.linear_fc1.bias0
     assert ops[0].bias1 is module.linear_fc1.bias1
+    assert ops[0].scale_bias is False
     assert ops[1].glu_interleave_size == 16
     assert ops[2].device == "meta"
     assert ops[2].weight is module.linear_fc2.weight
+    assert ops[2].scale_bias is False
     assert hasattr(ops, "forward_pre_hook")
     assert hasattr(ops, "forward_post_hook")
 
 
-def test_fused_forward_caches_ops_and_forwards_expected_arguments():
+def test_fused_forward_deterministic_mode_applies_probs_on_fc2_output():
+    """On the MXFP8 / NVFP4 recipes (the only ones TE fuses into its CuTe grouped MLP, whose
+    dprob accumulation uses atomics) deterministic mode feeds a unit scale to the fused op and
+    multiplies the routing probs onto the FC2 output instead; the BF16 path is unchanged."""
+
     class FakeFusedOps:
         def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens):
-            self.args = (hidden_states, fc1_tokens, probs, fc2_tokens)
+            self.probs = probs
             return hidden_states + 1
+
+    def make_module(fc2_bias, mxfp8=True):
+        module = TEGroupedMLP.__new__(TEGroupedMLP)
+        module.config = SimpleNamespace(
+            fp8=mxfp8,
+            fp8_recipe=Fp8Recipe.mxfp8 if mxfp8 else None,
+            fp4=False,
+            moe_router_padding_for_quantization=False,
+            moe_token_dispatcher_type=None,
+            moe_flex_dispatcher_backend=None,
+            moe_use_grouped_tensor=True,
+            moe_paged_stash=False,
+            delay_offload_until_cuda_graph=False,
+            deterministic_mode=True,
+        )
+        module._use_grouped_tensor = True
+        module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
+        module.quantization_unpadding = lambda tensor, token_counts: tensor
+        module._fused_ops = (FakeFusedOps(),)
+        module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
+        return module
+
+    hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
+    tokens_per_expert = torch.tensor([1, 1])
+    probs = torch.tensor([0.25, 0.5])
+
+    module = make_module(fc2_bias=False)
+    output = module._fused_forward(hidden_states, tokens_per_expert, probs)
+    assert torch.equal(module._fused_ops[0].probs, torch.ones_like(probs))
+    assert output.dtype == hidden_states.dtype
+    torch.testing.assert_close(output.float(), (hidden_states.float() + 1) * probs[:, None])
+
+    # BF16 op fuser: no CuTe fused grouped MLP, the scaled-GLU op's scale gradient is already
+    # reproducible, so the probs reach the fused op unchanged and nothing is post-multiplied.
+    module = make_module(fc2_bias=False, mxfp8=False)
+    output = module._fused_forward(hidden_states, tokens_per_expert, probs)
+    assert torch.equal(module._fused_ops[0].probs, probs)
+    torch.testing.assert_close(output, hidden_states + 1)
+
+    with pytest.raises(RuntimeError, match="FC2 without bias"):
+        make_module(fc2_bias=True)._fused_forward(hidden_states, tokens_per_expert, probs)
+    # NCCL-EP zero-copy hands the fused op a symmetric output buffer that the combine reads
+    # directly; the post-multiply cannot target it, so the combination is rejected.
+    with pytest.raises(RuntimeError, match="zero_copy"):
+        make_module(fc2_bias=False)._fused_forward(
+            hidden_states, tokens_per_expert, probs, output_buffer=torch.empty_like(hidden_states)
+        )
+
+
+@pytest.mark.parametrize("fc2_bias", [False, True], ids=["no_fc2_bias", "fc2_bias"])
+def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
+    class FakeFusedOps:
+        def __call__(self, *args):
+            self.args = args
+            return args[0] + 1
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     # `_fused_forward` calls `skip_routed_expert_padding(config)` (added by PR 4071), which
@@ -208,6 +289,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
     module.quantization_unpadding = lambda tensor, token_counts: tensor
     module._fused_ops = None
+    module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
     hidden_states = torch.zeros(2, 4)
@@ -222,6 +304,10 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     torch.testing.assert_close(fused_ops.args[1], tokens_per_expert)
     torch.testing.assert_close(fused_ops.args[2], probs)
     torch.testing.assert_close(fused_ops.args[3], tokens_per_expert)
+    if fc2_bias:
+        torch.testing.assert_close(fused_ops.args[4], probs)
+    else:
+        assert len(fused_ops.args) == 4
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
@@ -334,6 +420,43 @@ def test_make_fused_impl_post_forward_hook_dispatches_submodule_hooks():
     torch.testing.assert_close(output, torch.full_like(output, 2))
 
 
+def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad():
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, *, fuse_wgrad_accumulation):
+            super().__init__()
+            self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+            self.bias = torch.nn.Parameter(torch.zeros(2))
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.linear_fc1 = FakeGroupedLinear(fuse_wgrad_accumulation=True)
+    module.linear_fc2 = FakeGroupedLinear(fuse_wgrad_accumulation=False)
+
+    fc1_main_grad = torch.empty_like(module.linear_fc1.weight)
+    module.linear_fc1.weight.get_main_grad = lambda: fc1_main_grad
+    module.linear_fc1.weight.overwrite_main_grad = False
+
+    existing_main_grad = torch.empty_like(module.linear_fc1.bias)
+    module.linear_fc1.bias.main_grad = existing_main_grad
+    module.linear_fc1.bias.get_main_grad = pytest.fail
+    module.linear_fc1.bias.overwrite_main_grad = False
+
+    fc2_main_grad = torch.empty_like(module.linear_fc2.weight)
+    module.linear_fc2.weight.get_main_grad = lambda: fc2_main_grad
+    module.linear_fc2.weight.overwrite_main_grad = False
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    assert module.linear_fc1.weight.main_grad is fc1_main_grad
+    assert module.linear_fc1.weight.overwrite_main_grad is True
+    assert module.linear_fc1.bias.main_grad is existing_main_grad
+    assert module.linear_fc1.bias.overwrite_main_grad is True
+    assert getattr(module.linear_fc2.weight, "main_grad", None) is None
+    assert module.linear_fc2.weight.overwrite_main_grad is False
+
+
 def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(
@@ -349,6 +472,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             single_grouped_weight,
             single_grouped_bias=False,
             delay_wgrad_compute=False,
+            scale_bias=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -361,6 +485,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.scale_bias = scale_bias
 
         def need_backward_dw(self):
             return False
@@ -442,6 +567,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     assert ops[2].weight1 is module.linear_fc2.weight1
     assert ops[2].bias0 is module.linear_fc2.bias0
     assert ops[2].bias1 is module.linear_fc2.bias1
+    assert ops[2].scale_bias is True
 
 
 def _make_fake_te_namespace():
@@ -461,6 +587,7 @@ def _make_fake_te_namespace():
             single_grouped_weight,
             single_grouped_bias=False,
             delay_wgrad_compute=False,
+            scale_bias=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -473,6 +600,7 @@ def _make_fake_te_namespace():
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.scale_bias = scale_bias
 
         def need_backward_dw(self):
             return False
@@ -496,9 +624,9 @@ def _make_fake_te_namespace():
             glu_interleave_size,
             *,
             activation_recompute_in_mlp=False,
-            alpha=None,
             limit=None,
-            glu_linear_offset=None,
+            alpha=1.702,
+            glu_linear_offset=1.0,
         ):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
@@ -537,8 +665,15 @@ def _make_fake_te_namespace():
     )
 
 
-def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
-    """quick_gelu + clamp value → ScaledClampedQGeGLU(limit=clamp)."""
+@pytest.mark.parametrize(
+    ("activation_func", "expected_alpha", "expected_offset"),
+    [(quick_gelu, 1.702, 1.0), (F.silu, 1.0, 0.0)],
+    ids=("quick-geglu", "clamped-swiglu"),
+)
+def test_make_fused_ops_uses_clamped_qgeglu(
+    monkeypatch, activation_func, expected_alpha, expected_offset
+):
+    """Clamped quick GeGLU and SwiGLU use the appropriate TE parameters."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
@@ -548,10 +683,10 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
         activation_func_clamp_value=7.0,
-        activation_func=quick_gelu,
+        activation_func=activation_func,
         gated_linear_unit=True,
     )
-    module.activation_func = quick_gelu
+    module.activation_func = activation_func
     module.activation_recompute = True
     common = dict(
         device="cuda",
@@ -573,6 +708,8 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
     assert activation.glu_interleave_size == 4
     assert activation.activation_recompute_in_mlp is True
     assert activation.limit == 7.0
+    assert activation.alpha == expected_alpha
+    assert activation.glu_linear_offset == expected_offset
 
 
 def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch):
@@ -760,6 +897,76 @@ def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
     )
 
     assert module._is_fused_impl_supported() is False
+
+
+@pytest.mark.parametrize("activation_func_clamp_value", [None, 10.0], ids=("unclamped", "clamped"))
+def test_is_fused_impl_supported_requires_cutedsl_for_swiglu(
+    monkeypatch, activation_func_clamp_value
+):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        activation_func_clamp_value=activation_func_clamp_value,
+    )
+
+    assert module._is_fused_impl_supported() is False
+
+
+def test_is_fused_impl_supported_requires_scaled_fc2_bias(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+
+    class FakeGroupedLinearWithoutScaleBias(FakeGroupedLinear):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    fake_te.pytorch.GroupedLinear = FakeGroupedLinearWithoutScaleBias
+    fake_te.pytorch.ops.GroupedLinear = FakeGroupedLinearWithoutScaleBias
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinearWithoutScaleBias, activation_func=F.silu, gated_linear_unit=True
+    )
+    module.linear_fc2.use_bias = True
+
+    assert module._is_fused_impl_supported() is False
+
+
+@pytest.mark.parametrize(
+    ("te_217_or_later", "include_clamped_qgeglu", "expected"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_is_fused_impl_supported_gates_clamped_swiglu(
+    monkeypatch, te_217_or_later, include_clamped_qgeglu, expected
+):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(
+        experts_module, "is_te_min_version", lambda version: version == "2.14.0" or te_217_or_later
+    )
+    _install_fake_te_ops_modules(
+        monkeypatch, fake_te, include_clamped_qgeglu=include_clamped_qgeglu
+    )
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        activation_func_clamp_value=10.0,
+    )
+
+    assert module._is_fused_impl_supported() is expected
 
 
 @pytest.mark.parametrize(

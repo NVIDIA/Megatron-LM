@@ -31,14 +31,19 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stac
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    te_supports_batch_invariant_attention,
+)
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.test_moe_dispatching_and_routing import (
     NANOV3_BASE,
     _make_base_config,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 # Request state constants for parametrized tests.
 NONE = "none"  # 0 requests (dummy rank)
@@ -57,6 +62,13 @@ ALL_STATES = [NONE, DECODE, PREFILL, MIXED, PREFILL_AT_MAX_TOKENS, MIXED_GIANT_P
 # ranks form data-parallel replicas, each running the same EP combo
 # independently.
 _EP_SIZE = 4
+requires_te_batch_invariant_attention = pytest.mark.skipif(
+    not te_supports_batch_invariant_attention() or not (HAVE_FA3 or HAVE_FA4),
+    reason=(
+        "Batch-invariant attention requires TransformerEngine PR #3204 or >= 2.18 "
+        "and FlashAttention-3 or -4."
+    ),
+)
 
 # Combinatorial sweep: unordered combinations with repetition of ALL_STATES
 # across the EP ranks. Since rank assignment is symmetric (shuffling ranks
@@ -260,6 +272,72 @@ class _TestDynamicInferenceBase:
 @pytest.mark.internal
 class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
     """NVLS dispatcher: combinatorial sweep of EP request states."""
+
+    @requires_te_batch_invariant_attention
+    @torch.inference_mode()
+    def test_batch_invariant_prefill_matches_full_forward(self):
+        """Dynamic prefill should exactly match the full-sequence forward."""
+        from megatron.core.inference.inference_request import DynamicInferenceRequest
+        from megatron.core.inference.sampling_params import SamplingParams
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        clear_nvte_env_vars()
+        config = _make_base_config(
+            num_layers=3,
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            attention_dropout=0.0,
+            flash_attention_version=4 if HAVE_FA4 else 3,
+            inference_grouped_gemm_backend="torch",
+            inference_moe_token_dispatcher_type="nvls",
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_inference_stack_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=self.MAX_SEQ_LEN,
+            hybrid_layer_pattern="ME*",
+        ).cuda()
+        model.eval()
+
+        input_ids = torch.arange(64, device="cuda", dtype=torch.long).unsqueeze(0)
+        with set_batch_invariant_mode(True):
+            InferenceMode.unset_active()
+            full_logits = model(
+                input_ids=input_ids,
+                position_ids=None,
+                attention_mask=None,
+                runtime_gather_output=True,
+            )
+
+            ctx = self._build_context(
+                model,
+                num_cuda_graphs=0,
+                use_cuda_graphs_for_non_decode_steps=False,
+                max_requests=4,
+                max_tokens=128,
+            )
+            request = DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=input_ids.cpu().squeeze(0),
+                sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+            )
+            ctx.add_request(request)
+            ctx.initialize_attention_state()
+
+            InferenceMode.set_active()
+            inference_logits = model(
+                input_ids=input_ids,
+                position_ids=None,
+                attention_mask=None,
+                inference_context=ctx,
+                runtime_gather_output=True,
+            )
+
+        torch.testing.assert_close(inference_logits, full_logits, atol=0, rtol=0)
 
     # ------------------------------------------------------------------
     # test_ep_state_cross_product: combinatorial sweep with mixed CUDA graphs

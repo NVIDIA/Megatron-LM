@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -9,6 +10,8 @@ from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
+from megatron.core.tokenizers.text.libraries.sft_tokenizer import SFTTokenizer
+from megatron.core.tokenizers.text.text_tokenizer import MegatronTokenizerText
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
@@ -60,6 +63,58 @@ def get_chat_template():
                 {% if add_generation_prompt %}
                 <|assistant|>
                 {% endif %}"""
+
+
+def test_sft_tokenizer_wrapper_forwards_chat_template_kwargs():
+    tokenizer = object.__new__(MegatronTokenizerText)
+    tokenizer.library = "sft"
+    tokenizer._tokenizer = MagicMock()
+    expected = (np.array([1, 2]), np.array([1, 2]))
+    tokenizer._tokenizer.tokenize_conversation.return_value = expected
+    messages = [{"role": "user", "content": "solve"}]
+    template_kwargs = {"tools": [{"type": "function"}]}
+
+    result = tokenizer.tokenize_conversation(
+        messages,
+        return_target=True,
+        add_generation_prompt=False,
+        chat_template_kwargs=template_kwargs,
+    )
+
+    assert result is expected
+    tokenizer._tokenizer.tokenize_conversation.assert_called_once_with(
+        conversation=messages,
+        return_target=True,
+        add_generation_prompt=False,
+        chat_template_kwargs=template_kwargs,
+    )
+
+
+def test_sft_tokenizer_passes_tools_to_huggingface_chat_template():
+    huggingface_tokenizer = MagicMock()
+    huggingface_tokenizer.apply_chat_template.return_value = {"input_ids": np.array([[11, 12, 13]])}
+    tokenizer = object.__new__(SFTTokenizer)
+    tokenizer._tokenizer = huggingface_tokenizer
+    tokenizer._prompt_format = "default"
+    tokenizer._prompt_config = SimpleNamespace(
+        custom_chat_template="test-template", has_system_role=True
+    )
+    messages = [
+        {"role": "user", "content": "solve"},
+        {"role": "assistant", "content": "2", "reasoning_content": "1 + 1"},
+    ]
+    tools = [{"type": "function", "function": {"name": "python"}}]
+
+    tokens, targets = tokenizer.tokenize_conversation(
+        messages,
+        return_target=True,
+        add_generation_prompt=False,
+        chat_template_kwargs={"tools": tools},
+    )
+
+    np.testing.assert_array_equal(tokens, np.array([11, 12, 13]))
+    np.testing.assert_array_equal(targets, tokens)
+    assert huggingface_tokenizer.apply_chat_template.call_args.kwargs["tools"] == tools
 
 
 def test_sp_tokenizer():
