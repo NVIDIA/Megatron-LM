@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""GPT/Hybrid block graph constants must survive positional embedding cache cleanup."""
+"""GPT/Hybrid positional embedding caches must survive train/generation transitions."""
 
 import gc
 import types
@@ -21,19 +21,19 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class _RotaryConsumer(torch.nn.Module):
-    """Read the constant inside HybridModel.forward without attention/MLP kernels."""
+    """Expose HybridModel's embedding without attention/MLP kernels."""
+
+    input_tensor = None
 
     def forward(self, rotary_pos_emb, **kwargs):
-        return rotary_pos_emb + 1
+        return rotary_pos_emb
 
 
 @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
 @pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
-def test_block_graph_rotary_survives_cache_clear(model_type, position_embedding_type):
+def test_block_graph_rotary_survives_train_generation_switch(model_type, position_embedding_type):
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
-    model = None
-
     try:
         config = TransformerConfig(
             num_layers=1 if model_type == "gpt" else 2,
@@ -84,55 +84,67 @@ def test_block_graph_rotary_survives_cache_clear(model_type, position_embedding_
         hidden = torch.zeros((16, 1, 32), device="cuda")
         InferenceMode.set_active()
 
-        def forward():
+        def forward(inference_context=None):
             if model_type == "hybrid":
                 return model.forward(
                     input_ids=None,
                     position_ids=None,
                     attention_mask=None,
                     decoder_input=hidden,
-                    inference_context=context,
+                    inference_context=inference_context,
                     runtime_gather_output=True,
                 )
-            return (
-                model._preprocess(
-                    input_ids=None,
-                    position_ids=None,
-                    decoder_input=hidden,
-                    inference_context=context,
-                )[1]
-                + 1  # For hybrid, it's in the decoder
-            )
+            return model._preprocess(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=hidden,
+                inference_context=inference_context,
+            )[1]
 
-        with torch.no_grad():
-            refs = []
+        with torch.inference_mode():
             graphs = []
-
-            def record_rotary(module, args, output):
-                tensor = output[0] if isinstance(output, tuple) else output
-                refs.append(weakref.ref(tensor))
-
             for seq_len in (64, 128):
                 context.max_sequence_length = seq_len
                 # Capture must retain the same constant used by warmup.
-                expected = forward().clone()
+                ref = weakref.ref(forward(context))
+                expected = forward(context) + 1
                 graph = torch.cuda.CUDAGraph()
-                with model.rotary_pos_emb.register_forward_hook(record_rotary):
-                    with torch.cuda.graph(graph):
-                        output = forward()
-                graphs.append((graph, output, expected))
+                with torch.cuda.graph(graph):
+                    output = forward(context) + 1
+                graphs.append((seq_len, ref, graph, output, expected))
 
-            model.rotary_pos_emb.clear_cache()
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Generation -> training: captured constants survive cleanup and can be
+        # saved for backward even though generation populated them in inference mode.
+        model.train()
+        InferenceMode.unset_active()
+        model.rotary_pos_emb.clear_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        for seq_len, ref, *_ in graphs:
+            assert ref() is not None, "block graph lost its cached positional embedding"
+            hidden = torch.zeros((seq_len, 1, 32), device="cuda")
+            embedding = forward()
+            assert embedding is ref()
+            assert not embedding.is_inference()
+            activations = torch.randn_like(embedding, requires_grad=True)
+            (activations * embedding).sum().backward()
+            torch.testing.assert_close(activations.grad, embedding, rtol=0, atol=0)
+        del embedding
 
-            assert len(refs) == 2
-            for ref in refs:
-                assert ref() is not None, "block graph lost its cached positional embedding"
-                assert any(
-                    tensor is ref() for tensor, _ in model.rotary_pos_emb._embedding_cache.values()
-                )
-            for graph, output, expected in graphs:
+        # Training -> generation: discard ordinary training entries while preserving
+        # the tensors and addresses consumed by the already-captured graphs.
+        hidden = torch.zeros((16, 1, 32), device="cuda")
+        training_ref = weakref.ref(forward())
+        model.eval()
+        InferenceMode.set_active()
+        model.rotary_pos_emb.clear_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert training_ref() is None
+        with torch.inference_mode():
+            for seq_len, ref, graph, output, expected in graphs:
+                context.max_sequence_length = seq_len
+                assert forward(context) is ref()
                 graph.replay()
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
