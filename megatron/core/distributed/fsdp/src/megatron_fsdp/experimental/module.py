@@ -32,9 +32,14 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .indexed_order import IndexedOrder
+from .execution_order import ExecutionOrder
 from .module_utils import get_parameter_owner
-from .parameter_group import FsdpParameterGroup, effective_dtype, get_containing_parameter_group
+from .parameter_group import (
+    FsdpParameter,
+    FsdpParameterGroup,
+    effective_dtype,
+    get_containing_parameter_group,
+)
 from .placement import BlockAtomic, RowAtomic
 from .schedule import SchedulePolicy
 
@@ -77,19 +82,25 @@ class FsdpModule:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        grad_divisor: int = 1,
+        grad_scale: float = 1.0,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        grad_accumulation_count: int | None = None,
     ) -> None:
-        """Initialize FSDP runtime state on an already-constructed module."""
+        """Initialize FSDP runtime state on an already-constructed module.
+
+        Args:
+            grad_accumulation_count: Total parameter-gradient callbacks per reduction
+                window. Defaults to one per owned trainable parameter.
+        """
         self._context = context
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
-        if grad_divisor <= 0:
-            raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
+        if grad_scale <= 0:
+            raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             first_parameter = next(iter(group_parameters.values()))
@@ -107,18 +118,16 @@ class FsdpModule:
                         main_weight_placements, group_dtype
                     ),
                     mixed_precision_policy=mixed_precision_policy,
-                    grad_divisor=grad_divisor,
+                    grad_scale=grad_scale,
                     use_symmetric_memory=use_symmetric_memory,
                     parameter_to_owner=context.parameter_to_owner,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            sum(
-                len(group.fsdp_parameters)
-                for group in self._parameter_groups
-                if group.requires_grad
-            )
+            grad_accumulation_count
+            if grad_accumulation_count is not None
+            else sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``register_hooks`` is
@@ -181,7 +190,7 @@ class FsdpModule:
 
         The hook runs when this module's backward is complete, so it can reshard
         this module's parameters and reduce their gradients. It is invoked once
-        all of this module's trainable parameters have accumulated gradients, or
+        all expected gradient-accumulation callbacks have arrived, or
         via a full-backward hook when the module owns no trainable parameters.
 
         Args:
@@ -190,11 +199,17 @@ class FsdpModule:
         """
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
-            module.register_full_backward_hook(
-                lambda hooked_module, _grad_input, _grad_output: post_backward_hook(
-                    cast(FsdpModule, hooked_module)
-                )
-            )
+
+            def grad_checking_post_backward_hook(module, grad_input, _grad_output):
+                if all(grad is None for grad in grad_input):
+                    # With no input gradients, this hook runs before internal backward.
+                    module.context._delayed_post_backward_callbacks.append(
+                        (module, post_backward_hook)
+                    )
+                else:
+                    post_backward_hook(module)
+
+            module.register_full_backward_hook(grad_checking_post_backward_hook)
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
@@ -230,6 +245,13 @@ class FsdpModule:
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: grad_hook(parameter)
                 )
+
+    def _trainable_fsdp_parameters(self) -> Iterator[FsdpParameter]:
+        """Iterate this module's trainable parameters in a stable order."""
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            yield from group.fsdp_parameters
 
     @staticmethod
     def _pre_load_state_dict(
@@ -304,21 +326,25 @@ class FsdpModule:
                 )
 
     def _prefetch_parameter_groups(
-        self, order: IndexedOrder[nn.Module], prefetch_size: int | None
+        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
     ) -> None:
         """Prefetch successors from ``order`` according to this module's budget."""
-        next_module = order.next_item(cast(nn.Module, self))
+        module = cast(nn.Module, self)
+        order.advance(module)
+        next_module = order.next_item()
         if prefetch_size is None:
             if next_module is not None:
                 cast(FsdpModule, next_module)._unshard_parameter_groups()
             return
 
         prefetched_size = 0
+        offset = 1
         while next_module is not None and prefetched_size < prefetch_size:
             fsdp_module = cast(FsdpModule, next_module)
             fsdp_module._unshard_parameter_groups()
             prefetched_size += fsdp_module.num_parameter_elements
-            next_module = order.next_item(next_module)
+            offset += 1
+            next_module = order.next_item(offset)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.

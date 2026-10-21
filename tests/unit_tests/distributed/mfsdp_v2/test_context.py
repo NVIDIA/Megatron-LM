@@ -179,8 +179,8 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
-def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeypatch):
-    """Sibling roots should enqueue one wait on their shared reduction stream."""
+def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_setup, monkeypatch):
+    """Sibling roots should share one final wait across accumulated microbatches."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
@@ -189,12 +189,16 @@ def test_sibling_roots_enqueue_one_post_backward_wait(distributed_setup, monkeyp
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
-    post_backward = Mock(wraps=context.post_backward)
-    monkeypatch.setattr(context, "post_backward", post_backward)
+    finish_grad_sync = Mock(wraps=context.finish_grad_sync)
+    monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
+
+    with microbatch(context, is_last=False):
+        model(torch.ones(2, 4, device=device)).sum().backward()
+    finish_grad_sync.assert_not_called()
 
     model(torch.ones(2, 4, device=device)).sum().backward()
 
-    post_backward.assert_called_once_with()
+    finish_grad_sync.assert_called_once_with()
 
 
 def test_nested_prefetch_orders_use_dfs(distributed_setup):

@@ -112,9 +112,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    eval_iters: int | None = 100
+    eval_iters: int | list[int | None] | None = field(
+        default=100, metadata={"argparse_meta": {"type": int}}
+    )
     """Number of iterations to run for evaluation. Used for both validation and test. If not set,
-    evaluation will not run."""
+    evaluation will not run. Full/multiple validation resolves this to per-dataset counts."""
 
     eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
@@ -140,9 +142,6 @@ class ValidationConfig:
 
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
-
-    test_mode: bool = False
-    """Run all real-time test alongside the experiment."""
 
     full_validation: bool = False
     """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""
@@ -682,6 +681,17 @@ class CheckpointConfig:
 
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
+
+    stream_ckpt_dequant: bool = False
+    """Inference-only load path for models with quantized params (--fp8-param-gather or
+    --fp4-param-gather). The distributed checkpoint load quantizes each destination param in place
+    from a per-tensor high-precision scratch, instead of dequantizing the entire state dict to high
+    precision before the load starts, which allocates a full high-precision replica of the model
+    and can OOM on large models. The loaded state dict then holds the quantized params themselves,
+    so it is weights-only: it requires --no-load-optim, refuses --finetune,
+    --load-main-params-from-ckpt and any optimizer. Supports the tensorwise, mxfp8, blockwise and
+    nvfp4 recipes (not delayed scaling) and, with --ckpt-fully-parallel-load, only the broadcast
+    exchange algorithm. Pass it explicitly on the inference command line."""
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support
