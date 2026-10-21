@@ -29,8 +29,10 @@ Each of these raises with a message naming the fix; none of them fails silently.
   chunk, because chunk *c*'s combine runs while *c+1*'s dispatch is still in flight. `deepep` and
   `deepepv2` stage through process-wide buffers and are refused with `NotImplementedError`; use
   `hybridep` or `ncclep`.
-* **`NVTE_CUTEDSL_FUSED_GROUPED_MLP=1`, exported *before* TransformerEngine is imported.** Without
-  it TE does not register the fused grouped-MLP kernel and `check_fused_grouped_mlp` raises.
+* **A TE that registers the fused grouped-MLP kernel.** `check_fused_grouped_mlp` raises if it
+  does not. On TE older than the `split_alignment` API, registration is gated on
+  `NVTE_CUTEDSL_FUSED_GROUPED_MLP=1` exported *before* TransformerEngine is imported; newer TE
+  matches the fusion itself and ignores the variable.
 * **An MXFP8 quantization autocast around the layer's forward.** This path implements MXFP8 block
   scaling only. No live autocast, or a non-MXFP8 recipe, raises rather than quietly discarding the
   configured one. If `first_last_layers_bf16` leaves a layer in bf16, that layer will raise.
@@ -74,7 +76,7 @@ and which keyword surface the expert-compute step exposes.
 python -m pytest tests/unit_tests/transformer/moe/test_moe_ep_overlap_backend_seam.py -q
 ```
 
-Expected: `51 passed, 2 xfailed`.
+Expected: `55 passed, 2 xfailed`.
 
 **Schedule tests — one GPU.** These run the chunked schedule for real against a fake dispatch
 manager, including the headline numerical gate
@@ -101,7 +103,7 @@ A *new* failure in either file is a real regression; an `xpass` is a fix landing
 
 They use a fake dispatch manager, so they exercise the schedule, not a real expert-parallel
 collective. Covering the real thing needs ≥2 ranks with `hybridep` or `ncclep` available, MXFP8,
-and `NVTE_CUTEDSL_FUSED_GROUPED_MLP=1`; the cheapest end-to-end check is to take a working MoE
+and a TE that registers the fused kernel; the cheapest end-to-end check is to take a working MoE
 training script and add `--moe-ep-chunk-overlap`, confirming the loss curve matches the run
 without it.
 

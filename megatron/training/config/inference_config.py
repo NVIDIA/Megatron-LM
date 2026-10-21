@@ -161,7 +161,9 @@ class InferenceSetupConfig:
         "raw_logprobs"
     )
     """How returned inference log-probs are computed engine-wide. "raw_logprobs" (default) uses the
-    unmodified model logits; "processed_logprobs" uses temperature and filters by top-k/top-p."""
+    unmodified model logits; "processed_logprobs" applies temperature and top-k/top-p to
+    sampled-token and top-N log-probs. Prompt log-probs, including prompt top-N, are always
+    raw."""
 
     # ---------------- CUDA graphs ----------------
 
@@ -252,6 +254,20 @@ class InferenceSetupConfig:
     inference_disable_ep_consensus: bool = False
     """Skip the EP-group consensus all-reduce in the inference engine control loop and step on local
     state only. Only safe when EP coordination is not required (e.g. ep_world_size == 1)."""
+
+    inference_shards: str | None = None
+    """Partition the world using comma-separated ``key=value`` fields per shard, with
+    shards separated by ``+`` or ``;``. Keys are ``tp``, ``pp``, ``ep``, ``expt_tp``,
+    ``dp``, ``cp`` (currently only 1), and ``role``. For example,
+    ``tp=2,role=prefill+tp=1,dp=2,role=decode`` uses four ranks: one TP=2 prefill
+    engine and two TP=1 decode engines. Shard sizes (``tp * pp * dp``) must sum to
+    the world size. Native disaggregation requires every shard to declare a role,
+    both prefill and decode roles to be present, and prefix caching to be enabled.
+    See "Disaggregated Prefill and Decode" in ``docs/mcore-inference-user-guide.md``
+    for a frontend launch example."""
+
+    disagg_kv_transport_backend: Literal["nixl", "nccl"] = "nixl"
+    """Backend for native disaggregated KV and recurrent-state transfers."""
 
     # ---------------- Mamba inference state dtypes ----------------
     # NOTE: These are provided on the CLI as strings ("bf16"/"fp16"/"fp32") but are mapped to the
@@ -349,6 +365,7 @@ class InferenceSetupConfig:
             PrefixCachingEvictionPolicy,
             mtp_layer_types_from_model,
         )
+        from megatron.core.inference.shards_spec import spec_declares_disaggregation
         from megatron.core.transformer.enums import InferenceCudaGraphScope
         from megatron.core.utils import get_attr_wrapped_model
 
@@ -440,6 +457,12 @@ class InferenceSetupConfig:
                 self.inference_dynamic_batching_allow_stale_multimodal_embeddings
             ),
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
+            disaggregation_shards=(
+                self.inference_shards
+                if spec_declares_disaggregation(self.inference_shards)
+                else None
+            ),
+            kv_transport_backend=self.disagg_kv_transport_backend,
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,

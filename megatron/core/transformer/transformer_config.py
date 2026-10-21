@@ -343,6 +343,9 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # DSA
     ####################
+    dsa_indexer_mode: Literal['standard', 'simplified'] = 'standard'
+    """DSA indexer formulation. Simplified uses one Q head and a plain Q/K dot product."""
+
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -358,6 +361,11 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
+    dsa_fwd_use_dense_attn: bool = False
+    """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
+
+    dsa_reset_indexer_on_load: bool = False
+    """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss.
@@ -369,11 +377,34 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
-    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] | None = None
-    """Optional fused DSA kernel backend.
-    When unset, DSv4 hybrid uses ``cudnn`` and other attention variants use ``none``.
-    ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
-    backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
+    dsa_kernel_backend: (
+        Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
+        | None
+    ) = None
+    """Which DSA implementation to run. This is the only backend selector.
+
+    When unset, DSv4 hybrid resolves to ``cudnn`` and every other attention variant to
+    ``none``, which the DSA-over-GQA path then resolves again as described below.
+
+    Support matrix:
+
+    =================== ============ ============ =========================================
+    value               DSA over MLA DSA over GQA notes
+    =================== ============ ============ =========================================
+    ``none``            yes          no           no fused kernels; PyTorch fallback
+    ``tilelang``        yes          no           fused TileLang kernels
+    ``cudnn``           yes          no           fused cuDNN kernels
+    ``min-memory-triton`` no         yes          chunked min-memory, Triton kernels
+    ``min-memory-torch``  no         yes          chunked min-memory, Triton dispatch off
+    ``reference``       no           yes          dense-mask reference the kernels are A/B'd against
+    =================== ============ ============ =========================================
+
+    ``cudnn`` selects the fused cuDNN indexer, which exists only on the standard-indexer path
+    and so is MLA-only: the simplified indexer the GQA path requires has no cuDNN branch.
+
+    On the DSA-over-GQA path ``none`` resolves to ``min-memory-triton``, since "no fused
+    kernels" has no meaning there. ``tilelang`` and ``cudnn`` are rejected rather than silently
+    downgraded; see ``__post_init__``."""
 
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
@@ -395,7 +426,6 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
-
     dsa_indexer_weights_proj_use_quantization: bool = True
     """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
     quantization context. Disable this to keep the projection parameter outside FP8/FP4;
@@ -659,7 +689,8 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm", "residual_stream".
+    "shortcut_pre_mlp_layernorm", "residual_stream", "dsa_simple_routing",
+    "dsa_indexer_k", "dsa_selected_scores".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -679,6 +710,17 @@ class TransformerConfig(ModelParallelConfig):
             Requires moe_shortcut_connection=True and selective recomputation.
     "residual_stream": replay wide-residual reads, connected norms, and writes via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager.
+    "dsa_simple_routing": recompute the simplified DSA routing top-k in the backward pass
+            instead of saving the forward indices, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_topk) of index storage. Applies only to the
+            min-memory DSA backends, which are the only ones that can save the routing.
+    "dsa_indexer_k": reproject the full DSA indexer K in the backward pass instead of saving
+            it, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_head_dim) of storage.
+    "dsa_selected_scores": recompute the selected DSA indexer logits in the backward pass
+            instead of saving roughly O(batch * seq_len * dsa_indexer_topk) of them. Only the
+            sparse KL objective materializes these, so this has no effect without
+            dsa_indexer_use_sparse_loss.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
@@ -833,6 +875,7 @@ class TransformerConfig(ModelParallelConfig):
     """When set, GLU activations in the shared expert MLP will use a block
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
+    Requires BF16 or FP16 model parameters when GLU is enabled.
     """
     moe_shortcut_connection: bool = False
     """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
@@ -1034,6 +1077,9 @@ class TransformerConfig(ModelParallelConfig):
     backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via
     TransformerEngine's transformer_engine.pytorch.ep API."""
 
+    moe_virtual_expert_load_balance: bool = False
+    """Balance MoE routes by materializing virtual experts over HybridEP."""
+
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
@@ -1180,7 +1226,7 @@ class TransformerConfig(ModelParallelConfig):
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
-    advanced fused kernels."""
+    advanced fused kernels. Requires BF16 or FP16 model parameters when GLU is enabled."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
     """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
@@ -2367,6 +2413,90 @@ class TransformerConfig(ModelParallelConfig):
                 self.num_moe_experts is not None and self.num_moe_experts > 0
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
+        if self.moe_virtual_expert_load_balance:
+            MAX_VIRTUAL_EXPERT_EP_SIZE = 64
+
+            def require(condition: bool, message: str) -> None:
+                if not condition:
+                    raise ValueError(f"Virtual-expert load balancing requires {message}.")
+
+            required_values = {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_routing_map_mode": "indices",
+                "bf16": True,
+                "params_dtype": torch.bfloat16,
+                "fp4": None,
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "moe_expert_rank_capacity_factor": None,
+                "moe_paged_stash": False,
+                "moe_use_grouped_tensor": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "moe_router_enable_expert_bias": False,
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_hybridep_pad_uneven_dispatch_inputs": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            for name, value in required_values.items():
+                require(getattr(self, name) == value, f"{name}={value!r}")
+            require(
+                2 <= self.expert_model_parallel_size <= MAX_VIRTUAL_EXPERT_EP_SIZE,
+                f"2<=expert_model_parallel_size<={MAX_VIRTUAL_EXPERT_EP_SIZE}",
+            )
+            require(
+                self.num_moe_experts is not None and self.num_moe_experts <= 8192,
+                "1<=num_moe_experts<=8192",
+            )
+            require(
+                self.num_moe_experts % self.expert_model_parallel_size == 0,
+                "num_moe_experts divisible by expert_model_parallel_size",
+            )
+            require(
+                1 <= self.moe_router_topk <= min(32, self.num_moe_experts),
+                "1<=moe_router_topk<=min(32, num_moe_experts)",
+            )
+            routing = self.moe_router_load_balancing_type
+            require(
+                "sinkhorn" not in ((routing,) if isinstance(routing, str) else routing),
+                "no sinkhorn routing",
+            )
+            require(
+                (self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu))
+                or (
+                    not self.gated_linear_unit
+                    and self.activation_func == squared_relu
+                    and self.use_fused_weighted_squared_relu
+                ),
+                "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation",
+            )
+            require(
+                (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                "moe_latent_size (or hidden_size) divisible by 128",
+            )
+            require(self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128")
+            mxfp8 = self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            require(
+                not self.fp8 or mxfp8,
+                "fp8=None for BF16, or fp8='e4m3' with fp8_recipe='mxfp8' " "and fp8_param=True",
+            )
+            require(
+                not self.moe_router_padding_for_quantization or mxfp8,
+                "moe_router_padding_for_quantization=False unless using native MXFP8",
+            )
+            require(
+                self.moe_flex_dispatcher_num_sms is None or self.moe_flex_dispatcher_num_sms > 0,
+                "moe_flex_dispatcher_num_sms>0",
+            )
+
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
@@ -2522,6 +2652,9 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc",
                     "shortcut_pre_mlp_layernorm",
                     "residual_stream",
+                    "dsa_simple_routing",
+                    "dsa_indexer_k",
+                    "dsa_selected_scores",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -3093,6 +3226,29 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
+        has_glu_interleave = self.moe_mlp_glu_interleave_size is not None or (
+            self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        )
+        if self.gated_linear_unit and has_glu_interleave and self.params_dtype == torch.float32:
+            raise ValueError(
+                "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
+            )
+        if self.gated_linear_unit and self.moe_mlp_glu_interleave_size is not None:
+            assert self.expert_gtp_weight_remat_size == 1, (
+                "Routed expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable routed expert GLU interleave or expert GTP weight sharding."
+            )
+        if (
+            self.gated_linear_unit
+            and self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        ):
+            assert self.gtp_weight_remat_size == 1, (
+                "Shared expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable shared expert GLU interleave or GTP weight sharding."
+            )
+
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
                 raise ValueError(
@@ -3600,7 +3756,17 @@ class TransformerConfig(ModelParallelConfig):
                             'mlp cuda graph is only supported for dense layers, '
                             'but not found in the model.'
                         )
-                    if (
+                    if self.moe_virtual_expert_load_balance:
+                        # The virtual-expert planner keeps its routing metadata private to one
+                        # forward, which only the whole-layer moe scope preserves.
+                        assert not {
+                            CudaGraphModule.moe_router,
+                            CudaGraphModule.moe_preprocess,
+                        } & set(self.cuda_graph_modules), (
+                            'virtual-expert load balancing supports the moe CUDA graph scope only; '
+                            'moe_router and moe_preprocess are not supported.'
+                        )
+                    elif (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
@@ -3926,8 +4092,128 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
+        if self.dsa_fwd_use_dense_attn:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
+        if self.dsa_indexer_mode == "simplified":
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
+        if self.dsa_reset_indexer_on_load:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
+
         if self.experimental_attention_variant == "dsa":
+            assert self.dsa_indexer_mode in (
+                'standard',
+                'simplified',
+            ), "dsa_indexer_mode must be 'standard' or 'simplified'."
+            simplified_indexer = self.dsa_indexer_mode == 'simplified'
+            # The dense indexer warmup and the indexer reset were built for, and have only
+            # been exercised with, the simplified indexer. The standard DeepSeek indexer
+            # reaches the same code paths, so refuse the combination rather than let an
+            # untested one run.
+            assert (
+                simplified_indexer or not self.dsa_fwd_use_dense_attn
+            ), "dsa_fwd_use_dense_attn requires dsa_indexer_mode='simplified'."
+            assert (
+                simplified_indexer or not self.dsa_reset_indexer_on_load
+            ), "dsa_reset_indexer_on_load requires dsa_indexer_mode='simplified'."
+            if simplified_indexer:
+                assert (
+                    self.num_query_groups == 1
+                ), "The initial simplified DSA implementation requires num_query_groups == 1."
+                assert self.dsa_indexer_n_heads in (None, 1), (
+                    "Simplified DSA derives one indexer Q head from the single KV group; "
+                    "leave dsa_indexer_n_heads unset or set it to 1."
+                )
+                assert self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim > 0, (
+                    "Simplified DSA requires a positive dsa_indexer_head_dim when "
+                    "explicitly set."
+                )
+                assert (
+                    self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
+                ), "dsa_indexer_topk must be set to a positive integer when using DSA."
+                self.dsa_indexer_n_heads = 1
+                if self.dsa_indexer_head_dim is None:
+                    self.dsa_indexer_head_dim = self.kv_channels
+                # Simplified DSA scores a plain Q/K dot product, with no Hadamard rotation to
+                # apply. dsa_indexer_rotate_activation defaults True for the standard indexer,
+                # so resolve it here rather than making every simplified config turn it off.
+                self.dsa_indexer_rotate_activation = False
+            else:
+                # The standard indexer belongs to DSA over MLA, which upstream reaches through
+                # the 'D' layer-pattern symbol. That symbol sets experimental_attention_variant
+                # for the user without supplying indexer parameters, so requiring them here
+                # would reject a configuration upstream considers valid. Sanity-check what is
+                # set and leave the rest to that path's own owner.
+                assert (
+                    self.dsa_indexer_topk is None or self.dsa_indexer_topk > 0
+                ), "dsa_indexer_topk must be positive when set."
+            # These limits are DSGroupedSelfAttention's, and the simplified indexer is the only
+            # signal the config has for it. Non-MLA alone also caught standard-indexer
+            # DSAttention with one query group, which has none of them.
+            dsa_over_gqa = not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            # 'none' is the field default and means "no fused kernels" on the MLA path. The GQA
+            # path has no such mode, so resolve it to the chunked min-memory backend -- the one
+            # intended for production -- rather than failing. Note this is not a literal reading
+            # of "none": that backend does use Triton kernels. Resolve before anything reads the
+            # field, so the checks below see the backend that will actually run.
+            if dsa_over_gqa and self.dsa_kernel_backend == 'none':
+                self.dsa_kernel_backend = 'min-memory-triton'
+            min_memory_dsa_backend = self.dsa_kernel_backend in (
+                'min-memory-triton',
+                'min-memory-torch',
+            )
+            dense_dsa_warmup = self.dsa_fwd_use_dense_attn
+            assert (
+                not dense_dsa_warmup or min_memory_dsa_backend
+            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_kernel_backend."
+            # The simplified indexer has only ever been exercised on the GQA path. Rather than
+            # let an untested combination run, refuse it; the MLA path keeps the standard indexer.
+            assert not (
+                self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            ), "dsa_indexer_mode='simplified' is not supported with multi_latent_attention."
+
+            if dsa_over_gqa:
+                assert self.dsa_kernel_backend in (
+                    'min-memory-triton',
+                    'min-memory-torch',
+                    'reference',
+                ), (
+                    "DSA over GQA supports dsa_kernel_backend in ('min-memory-triton', "
+                    f"'min-memory-torch', 'reference'); got {self.dsa_kernel_backend!r}. "
+                    "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
+                )
+                # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
+                # below). The GQA path does not: its min-memory kernels have no
+                # sequence-parallel gather and no CP support yet.
+                assert (
+                    self.context_parallel_size == 1
+                ), "Context parallelism is not supported by DSA over GQA."
+                assert (
+                    not self.sequence_parallel
+                ), "Sequence parallelism is not supported by DSA over GQA."
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if min_memory_dsa_backend:
+                if dense_dsa_warmup:
+                    assert not self.dsa_indexer_use_sparse_loss, (
+                        "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
+                        "dsa_indexer_use_sparse_loss."
+                    )
+                    assert (
+                        self.dsa_indexer_loss_coeff or 0.0
+                    ) > 0.0, "dsa_fwd_use_dense_attn requires dsa_indexer_loss_coeff > 0."
+                else:
+                    assert (
+                        self.dsa_indexer_loss_coeff or 0.0
+                    ) > 0.0, "min-memory dsa_kernel_backend requires dsa_indexer_loss_coeff > 0."
+                assert simplified_indexer or self.dsa_indexer_rotate_activation, (
+                    "min-memory dsa_kernel_backend requires dsa_indexer_rotate_activation for "
+                    "the standard DeepSeek indexer."
+                )
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -4023,6 +4309,11 @@ class TransformerConfig(ModelParallelConfig):
                         "moe_token_dispatcher_type='alltoall'."
                     )
                     if self.batch_invariant_backend == "te_native":
+                        # Import lazily: the TE extension imports TransformerConfig.
+                        from megatron.core.extensions.transformer_engine import (
+                            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+                        )
+
                         assert (
                             not self.use_transformer_engine_op_fuser
                         ), "Batch-invariant training does not support TE op fuser."
@@ -4031,7 +4322,8 @@ class TransformerConfig(ModelParallelConfig):
                         ), (
                             "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
                             "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
-                            "padding uses the required 256-row alignment."
+                            "padding uses the required "
+                            f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
                         )
                 mxfp8_params_enabled = (
                     bool(self.fp8)

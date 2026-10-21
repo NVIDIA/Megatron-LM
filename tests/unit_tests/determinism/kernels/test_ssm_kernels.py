@@ -287,11 +287,11 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
-def _gdp_case():
+def _gdp_case(M=2):
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 
     seeded()
-    T, H, K, V, M = 4096, 16, 128, 128, 2
+    T, H, K, V = 4096, 16, 128, 128
     bounds = [0, 1000, 2500, 4096]
     q = torch.randn(1, T, H, K, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, T * M, H, K, device="cuda", dtype=torch.bfloat16)
@@ -341,10 +341,11 @@ def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
     "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
     "model owners; not gated until root-caused.",
 )
-def test_chunk_gated_delta_product_varlen_replays():
-    fn, args = _gdp_case()
+@pytest.mark.parametrize("M", [1, 2])  # M=1 is GDN's dynamic-inference prefill
+def test_chunk_gated_delta_product_varlen_replays(M):
+    fn, args = _gdp_case(M)
     assert_replays_bit_exact(
-        fn, args, replays=4, backward=False, what="chunk_gated_delta_product_varlen"
+        fn, args, replays=4, backward=False, what=f"chunk_gated_delta_product_varlen (M={M})"
     )
 
 
@@ -567,6 +568,69 @@ def test_gdn_torch_l2norm_matches_fla_and_replays(dtype, head_dim, compiled):
     assert_replays_bit_exact(
         normalize, (x.requires_grad_(True),), replays=3, contention=True, what="GDN torch L2 norm"
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("sequence_length", [64, 65])
+@pytest.mark.parametrize("with_initial_state", [False, True])
+@pytest.mark.parametrize("output_final_state", [False, True])
+def test_torch_chunk_gated_delta_rule_cuda_graph(
+    dtype, sequence_length, with_initial_state, output_final_state
+):
+    """Capture forward/backward and replay changed inputs without a CPU state allocation."""
+    from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
+
+    def make_inputs(seed):
+        seeded(seed)
+        shape = (2, sequence_length, 2, 8)
+        q = torch.nn.functional.normalize(torch.randn(shape, device="cuda"), dim=-1).to(dtype)
+        k = torch.nn.functional.normalize(torch.randn_like(q).float(), dim=-1).to(dtype)
+        v = torch.randn(2, sequence_length, 2, 12, device="cuda", dtype=dtype) * 0.1
+        g = -torch.rand(2, sequence_length, 2, device="cuda") * 0.1
+        beta = torch.rand_like(g).to(dtype)
+        values = [q, k, v, g, beta]
+        if with_initial_state:
+            values.append(torch.randn(2, 2, 8, 12, device="cuda") * 0.1)
+        return tuple(value.detach().requires_grad_(True) for value in values)
+
+    def forward_backward(values):
+        output, state = torch_chunk_gated_delta_rule(
+            *values[:5],
+            initial_state=values[5] if with_initial_state else None,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=False,
+        )
+        outputs = (output,) if state is None else (output, state)
+        loss = sum(value.float().sum() for value in outputs)
+        return (*outputs, *torch.autograd.grad(loss, values))
+
+    static_inputs = make_inputs(42)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            forward_backward(static_inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = forward_backward(static_inputs)
+
+    for seed in (101, 102, 103):
+        inputs = make_inputs(seed)
+        expected = forward_backward(inputs)
+        with torch.no_grad():
+            for destination, source in zip(static_inputs, inputs):
+                destination.copy_(source)
+        graph.replay()
+        for actual, reference in zip(captured, expected):
+            assert torch.isfinite(actual).all()
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        previous = tuple(value.detach().clone() for value in captured)
+        graph.replay()
+        for actual, reference in zip(captured, previous):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():

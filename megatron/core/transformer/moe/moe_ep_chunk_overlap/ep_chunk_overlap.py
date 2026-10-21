@@ -19,9 +19,12 @@ from itertools import chain
 import torch
 from torch.autograd.function import once_differentiable
 
+from megatron.core.extensions.transformer_engine import TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
 from megatron.core.tensor_parallel.gtp_api import is_gtp_param
 
-EXPERT_ALIGNMENT_TO_GROUPED_GEMM = 256
+# Aliased, not re-declared: a local 256 would silently size the chunk capacity against a
+# different alignment than the GEMM the schedule hands the chunk to.
+EXPERT_ALIGNMENT_TO_GROUPED_GEMM = TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
 
 
 def balanced_chunk_sizes(num_tokens: int, num_chunks: int) -> tuple[int, ...]:
@@ -156,7 +159,8 @@ def check_fused_grouped_mlp(fc1_op, activation_op, fc2_op) -> None:
     if not fused.is_supported():
         raise RuntimeError(
             f"TransformerEngine did not register {fused.__name__}, so this path would silently "
-            "run three unfused ops. Export NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 BEFORE importing TE."
+            "run three unfused ops. TE before the split_alignment API also needs "
+            "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 exported BEFORE importing TE."
         )
 
     validate_grouped_mlp_dims(fc1_op, activation_op, fc2_op)
