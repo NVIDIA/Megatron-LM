@@ -366,3 +366,23 @@ def test_indexer_submits_all_documents_once_with_global_key_ranges(monkeypatch, 
     )
     assert len(calls) == 1 and calls[0][2] == max(m.counts)
     assert result.shape == (32, 512)
+
+
+@pytest.mark.parametrize('world', [1, 2, 4])
+@pytest.mark.parametrize('ratio', [0, 1, 2])
+def test_paged_cp_metadata_preserves_global_slots_and_local_positions(world, ratio):
+    cu = torch.tensor([0, 3, 3, 13, 32])
+    full = attention._documents(cu, 'cpu')
+    reference = attention._paged_plan(full, ratio, 'cpu')
+    for rank in range(world):
+        layout = attention._documents(cu, 'cpu', local_rows=32 // world, rank=rank, world=world)
+        plan = attention._paged_plan(layout, ratio, 'cpu')
+        raw_equal(plan.swa_slots, reference.swa_slots)
+        raw_equal(plan.comp_slots, reference.comp_slots)
+        raw_equal(plan.swa_table, reference.swa_table)
+        raw_equal(plan.comp_table, reference.comp_table)
+        local = torch.arange(layout.local_rows)
+        req = plan.token_to_req.long()
+        qlen = layout.query_cu[req + 1] - layout.query_cu[req]
+        positions = layout.query_seq[req] - qlen + local - layout.query_cu[req]
+        raw_equal(positions.long(), layout.positions)

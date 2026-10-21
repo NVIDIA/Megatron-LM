@@ -57,7 +57,9 @@ class _SWAInsert(torch.autograd.Function):
         if ctx.empty:
             if kv.shape[0] != 0:
                 raise ValueError('Empty SWA queries require empty KV rows')
-            return q.clone(), kv.clone()
+            records = torch.empty((0, 64, 528), dtype=torch.uint8, device=q.device)
+            ctx.mark_non_differentiable(records)
+            return q.clone(), kv.clone(), records
         from vllm.models.deepseek_v41.common.ops.cache_utils import dequantize_and_gather_k_cache
 
         rows, heads, dim = q.shape
@@ -86,10 +88,11 @@ class _SWAInsert(torch.autograd.Function):
         lengths = torch.tensor([rows], dtype=torch.int32, device=q.device)
         dequantize_and_gather_k_cache(decoded, packed, lengths, None, table, block, 0)
         ctx.save_for_backward(positions, cache)
-        return rotated[:, :heads], decoded[0]
+        ctx.mark_non_differentiable(packed)
+        return rotated[:, :heads], decoded[0], packed
 
     @staticmethod
-    def backward(ctx, dq, dkv):
+    def backward(ctx, dq, dkv, _records):
         if ctx.empty:
             return dq, dkv, None, None, None
         positions, cache = ctx.saved_tensors
@@ -393,6 +396,144 @@ def _projections(attention, x):
     return raw, qr, kv, q, qa, _row_scales(qa.scale, *qr.shape)
 
 
+class _PagedSparse(_Sparse):
+    """Forward is ``attend()``, the serving paged path; backward is :class:`_Sparse`'s
+    on the gathered KV and indices (no bitwise requirement)."""
+
+    @staticmethod
+    def forward(ctx, q, kv, sink, indices, lengths, scale, attend):
+        ctx.save_for_backward(q, kv, sink, indices)
+        ctx.scale = scale
+        return attend()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return (*_Sparse.backward(ctx, grad), None)
+
+
+def inference_path():
+    """The BI attention path the installed vLLM serves FLASHMLA_SPARSE_DSV41 with:
+    ``paged`` (vllm#62365: every causal row on FlashMLA's unsplit sparse decode kernel
+    over the quantized caches) or ``gather`` (dequantize-and-gather, then the sparse
+    prefill kernel)."""
+    from vllm.model_executor.kernels import batch_invariant
+
+    return 'paged' if hasattr(batch_invariant, 'sparse_paged_indices') else 'gather'
+
+
+def _paged_plan(layout, ratio, device):
+    """Each document as a vLLM request whose SWA and compressed caches start on a
+    64-row block: block tables, and each record's slot there (records are in THD row /
+    document-compressed-row order as written above)."""
+    key = ('paged', ratio)
+    if key not in layout.remap:
+        from types import SimpleNamespace
+
+        lengths = layout.lengths
+        counts = [n // ratio if ratio else 0 for n in lengths]
+        swa_blocks = [-(-n // 64) for n in lengths]
+        comp_blocks = [-(-c // 64) for c in counts]
+        swa_first = [sum(swa_blocks[:d]) for d in range(len(lengths))]
+        comp_first = [sum(comp_blocks[:d]) for d in range(len(lengths))]
+        swa_table = torch.zeros(len(lengths), max(swa_blocks, default=1), dtype=torch.int32)
+        comp_table = torch.zeros(
+            len(lengths), max(max(comp_blocks, default=1), 1), dtype=torch.int32
+        )
+        for d, (b, c) in enumerate(zip(swa_blocks, comp_blocks)):
+            swa_table[d, :b] = swa_first[d] + torch.arange(b)
+            comp_table[d, :c] = comp_first[d] + torch.arange(c)
+        swa_slots = torch.cat([swa_first[d] * 64 + torch.arange(n) for d, n in enumerate(lengths)])
+        comp_slots = torch.cat(
+            [torch.zeros(0, dtype=torch.int64)]
+            + [comp_first[d] * 64 + torch.arange(c) for d, c in enumerate(counts)]
+        )
+        token_to_req = torch.cat(
+            [torch.full((n,), d, dtype=torch.int32) for d, n in enumerate(lengths)]
+        )
+        layout.remap[key] = SimpleNamespace(
+            swa_blocks=max(sum(swa_blocks), 1),
+            comp_blocks=max(sum(comp_blocks), 1),
+            swa_table=swa_table.to(device),
+            comp_table=comp_table.to(device),
+            swa_slots=swa_slots.to(device),
+            comp_slots=comp_slots.to(device),
+            comp_rows=sum(counts),
+            token_to_req=token_to_req[layout.offset : layout.offset + layout.local_rows].to(device),
+            is_valid=torch.ones(layout.local_rows, dtype=torch.bool, device=device),
+            replay_start=torch.zeros(len(lengths), dtype=torch.int32, device=device),
+        )
+    return layout.remap[key]
+
+
+def _paged_attention(q, swa_records, comp_records, topk, ratio, sink, scale, layout, window):
+    """vllm#62365's BI attention (``DeepseekV4FlashMLAAttention._forward_bi``):
+    ``sparse_paged_indices`` and the unsplit ``flash_mla_with_kvcache`` on the
+    quantized caches. The records are the ones written above, moved to block-aligned
+    per-document pages (the kernels read records by slot, so moving them keeps bits)."""
+    from vllm.model_executor.kernels.batch_invariant import sparse_paged_indices
+    from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, flash_mla_with_kvcache
+
+    rows, heads = q.shape[:2]
+    device = q.device
+    plan = _paged_plan(layout, ratio, device)
+    swa = torch.zeros((plan.swa_blocks, 64, 528), dtype=torch.uint8, device=device)
+    swa.view(-1, 528)[plan.swa_slots] = swa_records.view(-1, 528)[: layout.total]
+    extra = None
+    if ratio:
+        extra = torch.zeros((plan.comp_blocks, 64, 288), dtype=torch.uint8, device=device)
+        extra.view(-1, 288)[plan.comp_slots] = comp_records.view(-1, 288)[: plan.comp_rows]
+    top_k = topk.shape[1] if ratio else 0
+    indices = torch.empty((rows, window + top_k), dtype=torch.int32, device=device)
+    swa_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    extra_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    sparse_paged_indices(
+        topk if ratio else None,
+        plan.token_to_req,
+        plan.is_valid,
+        layout.query_cu,
+        layout.query_seq,
+        plan.replay_start,
+        plan.comp_table if ratio else None,
+        64,
+        plan.swa_table,
+        64,
+        0,
+        rows,
+        window,
+        ratio,
+        top_k,
+        indices[:, :window],
+        swa_lens,
+        indices[:, window:] if ratio else None,
+        extra_lens if ratio else None,
+    )
+    padded = 64 if heads <= 64 else 128
+    query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
+    bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
+    out = torch.empty_like(query)
+    for start in range(0, rows, 65535):  # one CTA per row along grid.y
+        end = min(start + 65535, rows)
+        flash_mla_with_kvcache(
+            q=query[start:end].unsqueeze(1),
+            k_cache=swa.unsqueeze(-2),
+            block_table=None,
+            head_dim_v=q.shape[-1],
+            tile_scheduler_metadata=FlashMLASchedMeta(),
+            cache_seqlens=None,
+            is_fp8_kvcache=True,
+            indices=indices[start:end, :window].unsqueeze(1),
+            topk_length=swa_lens[start:end],
+            softmax_scale=scale,
+            attn_sink=bias,
+            extra_k_cache=extra.unsqueeze(-2) if ratio else None,
+            extra_indices_in_kvcache=indices[start:end, window:].unsqueeze(1) if ratio else None,
+            extra_topk_length=extra_lens[start:end] if ratio else None,
+            out=out[start:end].unsqueeze(1),
+            enable_batch_invariant=True,
+        )
+    return out[:, :heads]
+
+
 def _projection_rows(projected, lo, hi):
     from dataclasses import replace
 
@@ -491,7 +632,9 @@ def swa_forward(
         ('q_projection', q),
     ):
         emit(name, value)
-    q, kv = _SWAInsert.apply(q, kv, positions, rope_cache, attention.config.layernorm_epsilon)
+    q, kv, swa_records = _SWAInsert.apply(
+        q, kv, positions, rope_cache, attention.config.layernorm_epsilon
+    )
     emit('q_rope', q)
     emit('kv_cache_decoded', kv)
     from vllm.models.deepseek_v41.common.ops import combine_topk_swa_indices
@@ -502,10 +645,12 @@ def swa_forward(
     from .parallel import gather_rows
 
     kv = gather_rows(kv, layout.cp_group)
-    ratio, width, total = 0, 0, 0
+    if inference_path() == 'paged':
+        swa_records = gather_rows(swa_records.view(-1, 528)[:rows], layout.cp_group)
+    ratio, width, total, comp_records = 0, 0, 0, None
     topk = torch.empty((rows, 0), device=x.device, dtype=torch.int32)
     if source is not None:
-        compressed, topk, ratio = source(x, qr, qa)
+        compressed, topk, ratio, comp_records = source(x, qr, qa)
         width = layout.max_length // ratio
         total = compressed.shape[0]
         kv = torch.cat((compressed, kv), 0)
@@ -524,7 +669,25 @@ def swa_forward(
     indices = torch.where(indices >= 0, table[indices.clamp_min(0).long()], indices)
     emit('swa_indices', indices)
     sink = attention.core_attention.native.attn_sink
-    out = _Sparse.apply(q, kv, sink, indices, lens, attention.q_head_dim**-0.5)
+    scale = attention.q_head_dim**-0.5
+    if inference_path() == 'paged':
+
+        def attend():
+            return _paged_attention(
+                q.detach(),
+                swa_records,
+                comp_records,
+                topk,
+                ratio,
+                sink.detach(),
+                scale,
+                layout,
+                attention.config.csa_window_size,
+            )
+
+        out = _PagedSparse.apply(q, kv, sink, indices, lens, scale, attend)
+    else:
+        out = _Sparse.apply(q, kv, sink, indices, lens, scale)
     emit('core_attn', out)
     if not project:
         return out
@@ -640,8 +803,10 @@ class SWAAttention(DS41SelfAttention):
         def sources(x, qr, qa):
             from .compressed import source
 
-            decoded, topk = source(self, x, qr, qa, self._deployment_rope, layout, lambda *_: None)
-            return decoded, topk, self._dsv4_compress_ratio
+            decoded, topk, records = source(
+                self, x, qr, qa, self._deployment_rope, layout, lambda *_: None
+            )
+            return decoded, topk, self._dsv4_compress_ratio, records
 
         out = swa_forward(
             self,

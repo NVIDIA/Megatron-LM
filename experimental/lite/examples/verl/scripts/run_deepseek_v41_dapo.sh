@@ -279,7 +279,7 @@ COMMAND=(
   "+${VLLM}.kv_cache_dtype=nvfp4_ds_mla"
   "+${VLLM}.all2all_backend=allgather_reducescatter"
   "+${VLLM}.kernel_config={enable_flashinfer_autotune:true,moe_backend:deep_gemm_mega_moe}"
-  "+${VLLM}.engram_config={cpu_offload:true,use_thp:true,embedding_across_dp:true,dp_shared_memory:false,host_table_layout:per_rank}"
+  "+${VLLM}.engram_config={cpu_offload:true,use_thp:true,embedding_across_dp:true,dp_shared_memory:false}"
   "+${VLLM}.language_model_only=True"
   "+${VLLM}.worker_extension_cls=verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
   "${SPEC_ARGS[@]}"

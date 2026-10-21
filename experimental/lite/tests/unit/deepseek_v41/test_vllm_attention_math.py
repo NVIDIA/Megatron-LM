@@ -18,7 +18,7 @@ def test_zero_row_swa_has_empty_finite_gradients_without_importing_vllm(monkeypa
     monkeypatch.setattr(builtins, '__import__', guarded)
     q = torch.empty(0, 72, 512, dtype=torch.bfloat16, requires_grad=True)
     kv = torch.empty(0, 512, dtype=torch.bfloat16, requires_grad=True)
-    output, decoded = _SWAInsert.apply(
+    output, decoded, _ = _SWAInsert.apply(
         q, kv, torch.empty(0, dtype=torch.int64), torch.empty(1, 64), 1e-6
     )
     assert output.shape == q.shape and decoded.shape == kv.shape

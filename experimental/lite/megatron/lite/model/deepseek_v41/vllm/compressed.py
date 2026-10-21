@@ -102,10 +102,11 @@ class _Record(torch.autograd.Function):
         dequantize_and_gather_k_cache(decoded, cache, m.lengths, None, m.table, 64, 0)
         ctx.save_for_backward(m.positions[m.closers] // ratio * ratio, rope, m.closers)
         ctx.rows = latent.shape[0]
-        return decoded[0]
+        ctx.mark_non_differentiable(cache)
+        return decoded[0], cache
 
     @staticmethod
-    def backward(ctx, grad):
+    def backward(ctx, grad, _records):
         from .attention import _rotate
 
         positions, rope, closers = ctx.saved_tensors
@@ -221,14 +222,14 @@ def source(attention, x, qr, qa, rope, documents, emit):
         emit('compressor_projection', raw)
         latent = _Pool.apply(raw, norm, ratio, eps, m)
         emit('compressor_latent', latent[m.closers])
-        decoded = _Record.apply(latent, rope, ratio, m)
+        decoded, records = _Record.apply(latent, rope, ratio, m)
         with torch.no_grad():
             keys = index_keys(latent, wk, knorm, rope, ratio, eps, m)
         emit('indexer_k_values', keys[0])
         emit('indexer_k_scales', keys[1])
-        return decoded, keys
+        return decoded, keys, records
 
-    decoded, keys = state.resolve(layer, policy.kv, ('vllm_kv', geometry), produce)
+    decoded, keys, records = state.resolve(layer, policy.kv, ('vllm_kv', geometry), produce)
 
     def candidates(rows):
         release = context.release
@@ -279,4 +280,4 @@ def source(attention, x, qr, qa, rope, documents, emit):
     topk = state.resolve(layer, policy.index, ('vllm_index', geometry), select)
     emit('compressed_kv_decoded', decoded)
     emit('indexer_topk', topk)
-    return decoded, topk
+    return decoded, topk, records
