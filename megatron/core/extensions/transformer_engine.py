@@ -42,7 +42,11 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -1395,6 +1399,28 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
+        # Batch-invariant mode at TP >= 3: NCCL's summation order for an element depends on
+        # where it sits in the message, so Megatron does the forward reduction itself with
+        # the fixed rank-order sum (tensor_parallel/ordered_reduce.py) and TE runs the local
+        # GEMM only. TP = 2 is a single commutative addition and stays in TE.
+        self._explicit_bi_tp_reduce = (
+            parallel_mode == "row"
+            and not explicit_expert_comm
+            and self.config.batch_invariant_mode
+            and tp_size >= 3
+        )
+        if self._explicit_bi_tp_reduce:
+            input_size = divide(input_size, tp_size)
+            te_parallel_mode = None
+            tp_size = 1
+            tp_group_for_te = None
+            # TE must not reduce (userbuffers / symmetric all-reduce) nor add the bias
+            # before the reduction; the bias is added after it in forward().
+            extra_kwargs.pop("symmetric_ar_type", None)
+            for key in ("ub_overlap_rs", "ub_overlap_ag", "ub_split_rs", "ub_atomic_gemm_rs"):
+                if key in extra_kwargs:
+                    extra_kwargs[key] = False
+
         self.te_quant_params: Optional[TEQuantizationParams] = None
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
@@ -1425,7 +1451,7 @@ class TELinear(te.pytorch.Linear):
                 ),
                 init_method=condition_init_method(config, init_method),
                 bias=bias,
-                return_bias=self.te_return_bias,
+                return_bias=self.te_return_bias or (self._explicit_bi_tp_reduce and bias),
                 parallel_mode=te_parallel_mode,
                 **extra_kwargs,
             )
@@ -1445,6 +1471,40 @@ class TELinear(te.pytorch.Linear):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+
+    def _set_bi_row_parallel_attributes(self):
+        """Restore row-parallel parameter metadata on a layer built with TE parallel_mode=None.
+
+        TE marks a parallel_mode=None weight as split along dim 0; the weight is the dim-1
+        shard of a row-parallel layer. The bias is replicated, and under sequence
+        parallelism its gradient is reduced over TP like the one TE's row mode marks.
+        """
+        self.weight.tensor_model_parallel = True
+        self.weight.partition_dim = 1
+        self.weight.partition_stride = 1
+        if self.use_bias:
+            self.bias.tensor_model_parallel = False
+            self.bias.sequence_parallel = self.config.sequence_parallel
+
+    def reset_parameters(self, defer_init=False):
+        """Reset parameters (keeping the row-parallel metadata, see above)."""
+        super().reset_parameters(defer_init=defer_init)
+        if getattr(self, "_explicit_bi_tp_reduce", False) and not defer_init:
+            self._set_bi_row_parallel_attributes()
+
+    def _bi_tp_reduce(self, out):
+        """Batch-invariant forward TP reduction of the local GEMM output (see __init__)."""
+        bias = None
+        if self.use_bias:
+            out, bias = out
+        if self.config.sequence_parallel:
+            out = reduce_scatter_to_sequence_parallel_region(out, group=self._tp_group)
+        else:
+            out = reduce_from_tensor_model_parallel_region(out, group=self._tp_group)
+        if bias is not None and not self.te_return_bias:
+            out = out + bias
+            bias = None
+        return out, bias
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -1469,6 +1529,9 @@ class TELinear(te.pytorch.Linear):
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
+
+        if self._explicit_bi_tp_reduce:
+            return self._bi_tp_reduce(out)
 
         # TE only returns a tuple when return_bias is True, otherwise
         # it returns a single Tensor, we always want to return two

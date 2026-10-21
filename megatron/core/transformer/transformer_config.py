@@ -1438,7 +1438,9 @@ class TransformerConfig(ModelParallelConfig):
     (persistent Triton matmul; any dtype)."""
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
-    """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
+    """Cross-rank EP combine collective under batch_invariant_mode (at TP >= 3 it also selects
+    the TP reduction sum: "ordered" = fp32 rank-order fold, "multimem" = fp64 accumulate with
+    one rounding to fp32; see tensor_parallel/ordered_reduce.py). "ordered"
     (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
     deterministic by construction on any hardware. "multimem" keeps the native
     NVLS in-switch reduce-scatter: measured to return the correctly-rounded
