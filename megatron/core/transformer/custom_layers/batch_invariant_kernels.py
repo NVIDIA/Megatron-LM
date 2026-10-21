@@ -648,8 +648,10 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
             discipline instead of kernel substitution.
     """
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
-    import transformer_engine.pytorch as te
-    import transformer_engine.pytorch.cpp_extensions as te_cpp
+    te = _import_module_if_available("transformer_engine.pytorch")
+    te_cpp = _import_module_if_available("transformer_engine.pytorch.cpp_extensions")
+    if te is None or te_cpp is None:
+        return
 
     if not skip_gemm:
         # Patch general_gemm once

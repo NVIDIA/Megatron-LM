@@ -98,6 +98,7 @@ def _serve(model, prompts, chunked, spec_tokens):
             buffer_size_gb=0.25,
             block_size_tokens=256,
             max_tokens=256 if chunked else None,
+            max_requests=8,
             enable_chunked_prefill=chunked,
             num_speculative_tokens=spec_tokens,
             num_cuda_graphs=None,
