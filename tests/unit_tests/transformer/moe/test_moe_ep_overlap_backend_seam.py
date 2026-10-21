@@ -41,10 +41,10 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_ep_chunk_overlap import ep_chunk_overlap
 from megatron.core.transformer.moe.moe_ep_chunk_overlap.ep_chunk_overlap import (
     CachedForwardChunkActivation,
+    DispatchedChunk,
     MoEEPChunkOverlapRuntime,
     _MoEEPChunkOverlapConfig,
 )
-from megatron.core.transformer.moe.moe_ep_chunk_overlap.transport import DispatchedChunk
 
 _HIDDEN_SIZE = 256  # TE fused grouped MLP needs % 64, MXFP8 % 32; 256 is the only measured value
 _FFN_HIDDEN_SIZE = 128
@@ -124,28 +124,6 @@ class _RecordingTensor(torch.Tensor):
         self.seam.log.append(f"record_stream:{self.role}")
 
 
-class _FakeDispatchHandle:
-    """The one thing the runtime reads off a DeepEP handle: the raw per-expert receive counts."""
-
-    def __init__(self) -> None:
-        self.psum_num_recv_tokens_per_expert = torch.tensor(
-            [_CAPACITY // 2, _CAPACITY], dtype=torch.int32
-        )
-
-
-class _FakeTransport:
-    """Records the handle-lifetime declarations; the collectives themselves are the schedule's."""
-
-    def __init__(self, log: list) -> None:
-        self._log = log
-        self.handle_stream_calls: list = []
-
-    def record_handle_stream(self, handle, stream) -> None:
-        """Record the claim the runtime is making on a dispatch handle's tensors."""
-        self.handle_stream_calls.append((handle, stream))
-        self._log.append("record_handle_stream")
-
-
 class _FakeExpertCompute:
     """An expert compute that does the least the seam allows.
 
@@ -166,32 +144,28 @@ class _FakeExpertCompute:
         #: a FRESH flat tensor per call, so no later chunk holds a reference that can overwrite it.
         self.dprob_returns: list = []
 
-    def run_expert_forward(
-        self,
-        runtime,
-        *,
-        recv_x,
-        received_topk_weights,
-        cumulative_recv_tokens,
-        dispatch_handle,
-        stream,
-        offload,
-    ):
-        """Record the call and return one row of nothing per received row."""
+    def run_expert_forward(self, runtime, *, dispatched, stream, offload):
+        """Record the call and return one row of nothing per received row.
+
+        The chunk arrives as one ``DispatchedChunk`` now that the schedule keeps the dispatch
+        NODE rather than a transport handle. Its fields are unpacked into the recorded call so
+        the storage-aliasing assertions below still see them by name; ``dispatched`` itself is
+        kept for the identity checks and is not a tensor, so it never enters that comparison.
+        """
         self._log.append("run_expert_forward")
         self.forward_calls.append(
             dict(
                 runtime=runtime,
-                recv_x=recv_x,
-                received_topk_weights=received_topk_weights,
-                cumulative_recv_tokens=cumulative_recv_tokens,
-                dispatch_handle=dispatch_handle,
+                dispatched=dispatched,
+                recv_x=dispatched.recv_x,
+                recv_probs=dispatched.recv_probs,
+                split_sizes=dispatched.split_sizes,
                 stream=stream,
                 offload=offload,
             )
         )
-        self.saved_returns.append(_make_saved(dispatch_handle=dispatch_handle))
-        return torch.zeros((recv_x.shape[0], _HIDDEN_SIZE)), self.saved_returns[-1]
+        self.saved_returns.append(_make_saved(dispatch_graph=dispatched.graph))
+        return torch.zeros((dispatched.recv_x.shape[0], _HIDDEN_SIZE)), self.saved_returns[-1]
 
     def run_expert_backward(self, *, recv_x, saved, stream):
         """Record the call; return dX and a FRESH flat routing gradient, as the seam requires."""
@@ -217,13 +191,12 @@ class _FakeExpertCompute:
 
 
 class _Seam:
-    """The three collaborators the runtime talks to, plus the one log that orders their calls."""
+    """The two collaborators the runtime talks to, plus the one log that orders their calls."""
 
     def __init__(self) -> None:
         self.log: list = []
         self.stream_claims: list = []
         self.experts = _FakeExperts()
-        self.transport = _FakeTransport(self.log)
         self.expert_compute = _FakeExpertCompute(self.log)
 
     def install(self, monkeypatch) -> None:
@@ -245,10 +218,8 @@ class _Seam:
             ("run_expert_backward", compute.run_expert_backward),
         ):
             monkeypatch.setattr(ep_chunk_overlap, name, replacement)
-        # A bound method put on a CLASS is not re-bound on attribute access, so the runtime would
-        # never reach the fake. These thunks take it as ``self`` and pass it on as the first
-        # positional argument -- which is what the module functions were handed as ``runtime``,
-        # leaving each fake's signature the kwarg-rename detector it already was.
+        # A bound method put on a CLASS is not re-bound on access, so the runtime never reaches the
+        # fake. These thunks take it as ``self`` and pass it on as the ``runtime`` positional.
         for name, replacement in (
             (
                 "run_chunk_wgrad",
@@ -272,7 +243,9 @@ class _StubbedRuntime(MoEEPChunkOverlapRuntime):
         self.config = config
         self.device = torch.device("cpu")
         self._experts = seam.experts
-        self._transport = seam.transport
+        # The schedule's own collectives, which nothing here issues: the two
+        # `routed_experts_compute_*` methods under test never read them.
+        self._managers = ()
         # Cached exactly as the production constructor caches it: `quantize_expert_weights`
         # and the wgrad stages read the tuple off the runtime rather than rebuilding it.
         self.expert_params = ep_chunk_overlap.expert_weight_parameters(
@@ -299,23 +272,38 @@ def _make_runtime(seam: _Seam, monkeypatch) -> MoEEPChunkOverlapRuntime:
 
 
 def _make_dispatched(seam: _Seam) -> DispatchedChunk:
-    """One chunk's receive, with payload tensors that record the runtime's allocator claims."""
+    """One chunk's receive, with payload tensors that record the runtime's allocator claims.
+
+    ``graph`` is opaque: the runtime only carries it into the saved chunk, where the SCHEDULE
+    differentiates it. Anything this seam touched on it would be a claim the schedule has
+    already made on the comm stream, so an ``_Opaque`` here is the assertion that it does not.
+    """
     return DispatchedChunk(
         recv_x=_RecordingTensor.wrapping(torch.zeros((_CAPACITY, _HIDDEN_SIZE)), "recv_x", seam),
-        received_topk_weights=_RecordingTensor.wrapping(
-            torch.zeros((_CAPACITY,)), "received_topk_weights", seam
+        recv_probs=_RecordingTensor.wrapping(torch.zeros((_CAPACITY,)), "recv_probs", seam),
+        split_sizes=_RecordingTensor.wrapping(
+            torch.tensor([_CAPACITY // 2, _CAPACITY // 2]), "split_sizes", seam
         ),
-        dispatch_handle=_FakeDispatchHandle(),
+        graph=_Opaque("dispatch graph"),
     )
 
 
-def _make_saved(*, dispatch_handle: object | None = None) -> CachedForwardChunkActivation:
-    """What a forward chunk hands its backward: three opaque tensors and one readable handle."""
+def _make_grad_recv(seam: _Seam) -> torch.Tensor:
+    """The backward dispatch's receive: one tensor now, not a whole chunk.
+
+    The backward takes the gradient the schedule got by differentiating the combine node, so
+    there is no second ``DispatchedChunk`` and no second set of routing metadata to claim.
+    """
+    return _RecordingTensor.wrapping(torch.zeros((_CAPACITY, _HIDDEN_SIZE)), "grad_recv", seam)
+
+
+def _make_saved(*, dispatch_graph: object | None = None) -> CachedForwardChunkActivation:
+    """What a forward chunk hands its backward: three opaque tensors and the dispatch node."""
     return CachedForwardChunkActivation(
         dispatched_tokens=_Opaque("dispatched tokens"),
         routing_probs=_Opaque("routing probs"),
         fc2_output=_Opaque("fc2 output"),
-        dispatch_handle=_FakeDispatchHandle() if dispatch_handle is None else dispatch_handle,
+        dispatch_graph=_Opaque("dispatch graph") if dispatch_graph is None else dispatch_graph,
     )
 
 
@@ -764,10 +752,12 @@ class TestPerChunkOffloadGroup:
         """One chunk through the production ``run_expert_forward``."""
         return ep_chunk_overlap.run_expert_forward(
             self.runtime,
-            recv_x=torch.zeros((_CAPACITY, _HIDDEN_SIZE)),
-            received_topk_weights=torch.zeros((_CAPACITY,)),
-            cumulative_recv_tokens=torch.tensor([_CAPACITY // 2, _CAPACITY]),
-            dispatch_handle=_FakeDispatchHandle(),
+            dispatched=DispatchedChunk(
+                recv_x=torch.zeros((_CAPACITY, _HIDDEN_SIZE)),
+                recv_probs=torch.zeros((_CAPACITY,)),
+                split_sizes=torch.tensor([_CAPACITY // 2, _CAPACITY // 2]),
+                graph=_Opaque("dispatch graph"),
+            ),
             stream=_AmbientStream(),
             offload=offload,
         )
@@ -786,16 +776,16 @@ class TestPerChunkOffloadGroup:
         assert group.log == ["enter", "exit", "commit"], "the commit is outside the hook scope"
         assert self.ops.calls[0][0] is group.group_input
 
-    def test_the_saved_root_is_the_commit_and_the_transport_gets_its_detach(self):
+    def test_the_saved_root_is_the_commit_and_the_combine_gets_its_detach(self):
         """The backward starts at the commit, which is what waits for this chunk's reload; saving
         the fused output instead would skip that wait and read tensors still in flight."""
-        transport_output, saved = self._run(offload=True)
+        combine_input, saved = self._run(offload=True)
 
         group = self.groups[0]
         assert group.committed is self.ops.output
         assert saved.fc2_output is group.commit_output
-        assert transport_output is not saved.fc2_output
-        assert transport_output.requires_grad is False
+        assert combine_input is not saved.fc2_output
+        assert combine_input.requires_grad is False
 
     def test_the_gate_is_handed_to_the_interface_rather_than_branched_on(self):
         """offload=False still builds the interface: being the identity is the interface's job,
@@ -902,42 +892,41 @@ class TestExpertComputeSeam:
 
         prologue, delegated = seam.log[:-1], seam.log[-1]
         assert delegated == "run_expert_forward", "the prologue must precede the GEMMs, not follow"
+        # Exactly the three that cross from the comm stream to this one. The rest is read back
+        # there, by the combine or the dispatch node's backward, so it must NOT be claimed.
         assert set(prologue) == {
             "record_stream:recv_x",
-            "record_stream:received_topk_weights",
-            "record_handle_stream",
+            "record_stream:recv_probs",
+            "record_stream:split_sizes",
         }
         # Every claim names the stream the expert compute was handed, the one its GEMMs run on.
         assert {stream for _role, stream in seam.stream_claims} == {self.ambient}
-        assert seam.transport.handle_stream_calls == [(dispatched.dispatch_handle, self.ambient)]
 
         call = seam.expert_compute.forward_calls[0]
         assert call["stream"] is self.ambient, "it is handed its stream, never asks for one"
+        assert call["dispatched"] is dispatched
         assert call["recv_x"] is dispatched.recv_x
-        # Row layout is TE's business: it gets DeepEP's raw per-expert counts, undigested.
-        assert (
-            call["cumulative_recv_tokens"]
-            is dispatched.dispatch_handle.psum_num_recv_tokens_per_expert
-        )
+        # Row layout is TE's business: it gets the manager's per-expert counts, undigested.
+        assert call["split_sizes"] is dispatched.split_sizes
         # And THIS runtime, so the op shell it resolves is this layer's and not another's.
         assert call["runtime"] is runtime
-        assert call["dispatch_handle"] is dispatched.dispatch_handle
         assert fc2_output.shape[0] == _CAPACITY
-        # The handle rides in the saved chunk, which is where the backward's collectives read it.
-        assert saved.dispatch_handle is dispatched.dispatch_handle
+        # The dispatch NODE rides in the saved chunk, which is where the backward differentiates
+        # it to get the dispatch adjoint.
+        assert saved.dispatch_graph is dispatched.graph
 
     def test_routed_experts_compute_backward_declares_the_backward_receive(self, monkeypatch):
         """The backward prologue: the same claim on the backward dispatch's own receive."""
         seam = _Seam()
         runtime = _make_runtime(seam, monkeypatch)
-        dispatched = _make_dispatched(seam)
+        grad_recv = _make_grad_recv(seam)
 
-        runtime.routed_experts_compute_backward(saved=_make_saved(), dispatched=dispatched)
+        runtime.routed_experts_compute_backward(saved=_make_saved(), grad_recv=grad_recv)
 
-        assert seam.log == ["record_stream:recv_x", "run_expert_backward"]
-        assert seam.stream_claims == [("recv_x", self.ambient)]
+        assert seam.log == ["record_stream:grad_recv", "run_expert_backward"]
+        assert seam.stream_claims == [("grad_recv", self.ambient)]
         assert seam.expert_compute.backward_calls[0]["stream"] is self.ambient
-        assert seam.expert_compute.backward_calls[0]["recv_x"] is dispatched.recv_x
+        assert seam.expert_compute.backward_calls[0]["recv_x"] is grad_recv
 
     def test_moe_forward_fires_the_parameter_all_gather(self):
         """Statically: ``moe_forward`` calls ``ensure_expert_parameters_ready``.
@@ -985,40 +974,41 @@ class TestExpertComputeSeam:
         seam = _Seam()
         runtime = _make_runtime(seam, monkeypatch)
         forward_dispatch = _make_dispatched(seam)
-        backward_dispatch = _make_dispatched(seam)
+        backward_grad = _make_grad_recv(seam)
 
         fc2_output, _ = runtime.routed_experts_compute_forward(
             dispatched=forward_dispatch, offload=False
         )
         grad_input, _ = runtime.routed_experts_compute_backward(
-            saved=_make_saved(), dispatched=backward_dispatch
+            saved=_make_saved(), grad_recv=backward_grad
         )
 
         # By STORAGE, not shape or start address: a `.view()` of the receive under any name lands
         # in `shared` below -- the destination that was removed. Keyword-only args catch the rest.
-        for call, dispatched, produced in (
-            (seam.expert_compute.forward_calls[0], forward_dispatch, fc2_output),
-            (seam.expert_compute.backward_calls[0], backward_dispatch, grad_input),
+        for call, receive_tensor, produced in (
+            (seam.expert_compute.forward_calls[0], forward_dispatch.recv_x, fc2_output),
+            (seam.expert_compute.backward_calls[0], backward_grad, grad_input),
         ):
-            receive = dispatched.recv_x.untyped_storage().data_ptr()
+            receive = receive_tensor.untyped_storage().data_ptr()
             shared = {
                 name
                 for name, value in call.items()
                 if isinstance(value, torch.Tensor) and value.untyped_storage().data_ptr() == receive
             }
             assert shared == {"recv_x"}, shared
-            assert call["recv_x"] is dispatched.recv_x
+            assert call["recv_x"] is receive_tensor
             # And what comes back -- the payload the collective reads -- is its own allocation.
             assert produced.untyped_storage().data_ptr() != receive
 
-    def test_the_saved_chunk_crosses_the_runtime_with_only_its_handle_read(self, monkeypatch):
-        """One saved chunk crosses the seam, and the runtime reads only ``dispatch_handle`` off it.
+    def test_the_saved_chunk_crosses_the_runtime_with_nothing_read_off_it(self, monkeypatch):
+        """One saved chunk crosses the seam and the runtime reads NOTHING off it.
 
-        Its four tensor fields are ``_Opaque``, so any attribute the runtime touches -- a shape,
-        a ``record_stream`` -- raises here instead of becoming a wrong answer on eight GPUs. That
+        Its four fields are ``_Opaque``, so any attribute the runtime touches -- a shape, a
+        ``record_stream`` -- raises here instead of becoming a wrong answer on eight GPUs. That
         opacity is what lets the expert compute put its whole autograd graph in those slots, and
-        makes keeping alive anything they imply (DeepEP receives included) its job. The handle is
-        the one exception: the runtime hands it to the transport.
+        makes keeping alive anything they imply its job. The handle that used to be the one
+        exception is gone with the transport: the dispatch NODE now rides in its slot and only
+        the SCHEDULE differentiates it, on the comm stream, outside this seam.
 
         Nothing carries the weight gradients -- they stay parked in TE's FIFOs from the dgrad
         that enqueued them until ``run_chunk_wgrad`` drains them inside the same chunk, so the
@@ -1032,12 +1022,10 @@ class TestExpertComputeSeam:
             dispatched=dispatched, offload=False
         )
         assert saved is seam.expert_compute.saved_returns[-1]
-        assert saved.dispatch_handle is dispatched.dispatch_handle
+        assert saved.dispatch_graph is dispatched.graph
 
         handed_back = _make_saved()
-        runtime.routed_experts_compute_backward(
-            saved=handed_back, dispatched=_make_dispatched(seam)
-        )
+        runtime.routed_experts_compute_backward(saved=handed_back, grad_recv=_make_grad_recv(seam))
         assert seam.expert_compute.backward_calls[0]["saved"] is handed_back
 
         # STATE, not surface: the three wgrad stages are methods on the runtime, but a wgrad
@@ -1061,7 +1049,7 @@ class TestExpertComputeSeam:
         runtime = _make_runtime(seam, monkeypatch)
 
         _grad_input, grad_probs = runtime.routed_experts_compute_backward(
-            saved=_make_saved(), dispatched=_make_dispatched(seam)
+            saved=_make_saved(), grad_recv=_make_grad_recv(seam)
         )
 
         # By STORAGE: a copy anywhere on this path would show up as a different allocation.
@@ -1069,7 +1057,7 @@ class TestExpertComputeSeam:
         assert grad_probs.shape == (_CAPACITY,)
 
         _grad_input, other_chunk = runtime.routed_experts_compute_backward(
-            saved=_make_saved(), dispatched=_make_dispatched(seam)
+            saved=_make_saved(), grad_recv=_make_grad_recv(seam)
         )
         assert other_chunk.data_ptr() != grad_probs.data_ptr(), "one allocation per chunk"
 

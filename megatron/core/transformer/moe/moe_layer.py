@@ -383,11 +383,8 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_ep_chunk_overlap:
             from megatron.core.transformer.moe.moe_ep_chunk_overlap import MoEEPChunkOverlapRuntime
 
-            # The recompute and moe_paged_stash refusals moved to
-            # TransformerConfig.__post_init__. The one below stays here because it is not
-            # decidable there: expert_gtp_weight_remat_size is itself derived in
-            # ModelParallelConfig.__post_init__ and num_local_experts comes from the live
-            # process group.
+            # The recompute and moe_paged_stash refusals moved to TransformerConfig.__post_init__.
+            # Not this one: remat size is derived later, num_local_experts from the live group.
             if self.config.expert_gtp_weight_remat_size != 1:
                 # TE's num_groups == 1 dense shortcuts read past sum(split_sizes): wrong or NaN
                 # expert wgrads, with the forward and dgrad bit-identical.
@@ -397,9 +394,8 @@ class MoELayer(BaseMoELayer):
                         f"least 2 local experts, got {self.num_local_experts}."
                     )
 
-            # One dispatch manager per token chunk, each built by the trunk's own backend
-            # selection so this path carries no backend knowledge of its own. They cannot be
-            # one object: chunk c's combine runs while c+1's dispatch is still in flight.
+            # One per chunk, through the trunk's own backend selection: chunk c's combine runs
+            # while c+1's dispatch is still in flight, so they cannot share staging.
             num_chunks = self.config.moe_ep_chunk_overlap_num_chunks
             managers = [
                 make_dispatch_manager(
@@ -583,10 +579,8 @@ class MoELayer(BaseMoELayer):
         passed through untouched and the dispatcher decides whether its backend excludes padded
         rows.
         """
-        # The overlap path owns routing and dispatch, so there is nothing to preprocess.
-        # Hold the routing map for it, exactly as the flex dispatcher holds it on its own
-        # manager: the expert-compute step runs as a separate callable under 1F1B and does
-        # not receive it.
+        # Nothing to preprocess: that path owns routing and dispatch. The routing map is held
+        # for it because the expert-compute step is a separate callable under 1F1B.
         if self._ep_chunk_overlap_active():
             self._ep_chunk_overlap_routing_map = routing_map
             if self.config.moe_latent_size:

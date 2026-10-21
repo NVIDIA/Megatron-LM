@@ -1277,9 +1277,8 @@ class _HybridEPManager(_DispatchManager):
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
 
         if not self.drop_and_pad:
-            # Unconditional outside drop_and_pad, where setup_metadata already fixed the counts
-            # at capacity. It used to be written only when one of the two branches below ran,
-            # which left it unset for a caller that pins num_permuted_tokens itself.
+            # Unconditional outside drop_and_pad, where setup_metadata already fixed the counts:
+            # the old form left it unset for a caller that pins num_permuted_tokens itself.
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         if self.num_permuted_tokens is None:
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
@@ -2080,6 +2079,14 @@ def make_dispatch_manager(
     router_topk = tp_size * config.moe_router_topk
     num_experts = tp_size * config.num_moe_experts
 
+    # FIRST, so a typo is reported as a typo: the owns_buffer refusal below would otherwise
+    # answer it with "that backend stages through process-wide buffers", which is not true.
+    if backend not in ("deepep", "deepepv2", "hybridep", "ncclep"):
+        raise ValueError(
+            f"Invalid backend: {backend}"
+            "Please set --moe-flex-dispatcher-backend to deepep, deepepv2, hybridep, or ncclep"
+        )
+
     if backend == "hybridep":
         manager = _HybridEPManager(
             group=group,
@@ -2136,10 +2143,7 @@ def make_dispatch_manager(
         )
         return manager, ['_comm_manager.token_probs', '_comm_manager.token_indices']
 
-    raise ValueError(
-        f"Invalid backend: {backend}"
-        "Please set --moe-flex-dispatcher-backend to deepep, deepepv2, hybridep, or ncclep"
-    )
+    raise AssertionError(f"unreachable: {backend!r} passed the name check above")
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):

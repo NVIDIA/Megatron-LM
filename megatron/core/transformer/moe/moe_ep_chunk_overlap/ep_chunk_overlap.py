@@ -32,11 +32,13 @@ EXPERT_ALIGNMENT_TO_GROUPED_GEMM = 256
 
 
 def balanced_chunk_sizes(num_tokens: int, num_chunks: int) -> tuple[int, ...]:
+    """Split ``num_tokens`` into ``num_chunks`` sizes that differ by at most one."""
     base, remainder = divmod(num_tokens, num_chunks)
     return tuple(base + (1 if index < remainder else 0) for index in range(num_chunks))
 
 
 def chunk_offsets(chunk_sizes: tuple[int, ...]) -> tuple[int, ...]:
+    """Exclusive prefix sums of ``chunk_sizes``, with the total appended."""
     offsets = [0]
     for size in chunk_sizes:
         offsets.append(offsets[-1] + size)
@@ -53,10 +55,8 @@ class _MoEEPChunkOverlapConfig:
     num_token_chunks: int
     world_size: int
     num_comm_SMs: int | None
-    #: Experts owned by THIS rank. Supplied by the caller, never re-derived here: world_size is
-    #: the DISPATCH group (expert-tensor-parallel x expert-parallel), so num_experts // world_size
-    #: is too small by the expert-tensor-parallel factor and would silently under-fetch the
-    #: expert weights and under-size receive capacity.
+    #: Experts owned by THIS rank, supplied by the caller: world_size is the DISPATCH group
+    #: (ETP x EP), so num_experts // world_size would under-fetch weights and under-size capacity.
     num_local_experts: int
 
     def __post_init__(self) -> None:
@@ -70,18 +70,22 @@ class _MoEEPChunkOverlapConfig:
 
     @property
     def chunk_sizes(self) -> tuple[int, ...]:
+        """Token count of each of this rank's chunks."""
         return balanced_chunk_sizes(self.num_local_tokens, self.num_token_chunks)
 
     @property
     def chunk_offsets(self) -> tuple[int, ...]:
+        """Row offset of each of this rank's chunks, with the total appended."""
         return chunk_offsets(self.chunk_sizes)
 
     @property
     def largest_token_chunk_size(self) -> int:
+        """Rows in the largest chunk; every per-chunk buffer is sized for this one."""
         return -(-self.num_local_tokens // self.num_token_chunks)
 
     @property
     def max_num_expanded_tokens_per_chunk(self) -> int:
+        """One chunk's receive capacity, rounded up to the grouped-GEMM alignment."""
         num_local_experts = self.num_local_experts
         rows = self.world_size * self.largest_token_chunk_size * min(
             self.router_topk, num_local_experts
@@ -104,6 +108,8 @@ class DispatchedChunk:
 
 @dataclass
 class CachedForwardChunkActivation:
+    """What one chunk's forward leaves behind for its backward."""
+
     dispatched_tokens: torch.Tensor
     routing_probs: torch.Tensor
     fc2_output: torch.Tensor
@@ -133,6 +139,7 @@ def ensure_expert_parameters_ready(experts: torch.nn.Module) -> None:
 def expert_weight_parameters(
     experts: torch.nn.Module, num_local_experts: int
 ) -> tuple[torch.nn.Parameter, ...]:
+    """Every expert ``weightN`` parameter, fc1's before fc2's."""
     return tuple(
         linear.get_parameter(f"weight{index}")
         for linear in (experts.linear_fc1, experts.linear_fc2)
@@ -204,6 +211,7 @@ def build_activation_op(
 def build_expert_ops(
     config: _MoEEPChunkOverlapConfig, experts: torch.nn.Module
 ) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
+    """Build the fused expert op sequence, and return it with its two GroupedLinear ops."""
     from transformer_engine.pytorch import ops as te_ops
 
     num_local_experts = config.num_local_experts
@@ -247,6 +255,7 @@ def check_dispatch_capacity(payload: torch.Tensor, capacity: int) -> torch.Tenso
 
 
 def autocast_recipe() -> object:
+    """The quantization recipe of the live autocast; raises when no autocast surrounds it."""
     from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
     if not FP8GlobalStateManager.is_fp8_enabled():
@@ -371,6 +380,7 @@ class _MoEEPChunkOverlapFunction(torch.autograd.Function):
         runtime: "MoEEPChunkOverlapRuntime",
         *expert_weights: torch.Tensor,
     ) -> torch.Tensor:
+        """Run the chunked forward, saving each chunk's activation for the backward."""
         output, saved_fwd = runtime.moe_forward(
             hidden_states,
             routing_map,
@@ -387,6 +397,7 @@ class _MoEEPChunkOverlapFunction(torch.autograd.Function):
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output: torch.Tensor | None):
+        """Run the chunked backward, returning grads for the inputs and expert weights."""
         runtime = ctx.runtime
         saved_fwd = ctx.saved_fwd
 
@@ -449,6 +460,7 @@ class MoEEPChunkOverlapRuntime:
     def forward(
         self, hidden_states: torch.Tensor, dense_probs: torch.Tensor, routing_map: torch.Tensor
     ) -> tuple[torch.Tensor, None]:
+        """Run the overlap path for one layer, returning ``(output, bias)`` like MoELayer."""
         input_shape = hidden_states.shape
         flat_hidden = hidden_states.view(-1, self._hidden_size)
         num_tokens = flat_hidden.shape[0]
@@ -489,6 +501,7 @@ class MoEEPChunkOverlapRuntime:
         self.comm_stream = torch.cuda.Stream(device=self.device)
 
     def expert_ops(self) -> torch.nn.Module:
+        """The fused expert op sequence, built on first use."""
         if self._ops is None:
             self._ops, self._fc1_op, self._fc2_op = build_expert_ops(self.config, self._experts)
         return self._ops
@@ -559,9 +572,8 @@ class MoEEPChunkOverlapRuntime:
         """Run one chunk's expert compute on the ambient stream; return its rows and saved state."""
         stream = torch.cuda.current_stream(self.device)
 
-        # The three tensors that cross from the comm stream to this one. Everything else the
-        # dispatch allocated is read back on the comm stream, by the combine or by its own
-        # backward, so it never changes streams.
+        # The three that cross from the comm stream to this one. The rest is read back there,
+        # by the combine or by the dispatch node's backward, so it never changes streams.
         dispatched.recv_x.record_stream(stream)
         dispatched.recv_probs.record_stream(stream)
         dispatched.split_sizes.record_stream(stream)
@@ -580,6 +592,7 @@ class MoEEPChunkOverlapRuntime:
         return grad_input, grad_probs
 
     def run_chunk_wgrad(self, *, stream: torch.cuda.Stream) -> None:
+        """Flush one chunk's deferred weight-gradient GEMMs, FC2 then FC1, on ``stream``."""
         with torch.cuda.stream(stream):
             for label, op in (("FC2", self._fc2_op), ("FC1", self._fc1_op)):
                 op.backward_dw()
@@ -640,6 +653,7 @@ class MoEEPChunkOverlapRuntime:
         *,
         offload: bool,
     ) -> tuple[torch.Tensor, tuple[CachedForwardChunkActivation, ...]]:
+        """Forward the layer chunk by chunk, each dispatch overlapping the previous GEMM."""
         config = self.config
         capacity = config.max_num_expanded_tokens_per_chunk
 
@@ -668,16 +682,14 @@ class MoEEPChunkOverlapRuntime:
             rows = slice(offsets[c], offsets[c + 1])
             manager = self._managers[c]
             with torch.cuda.stream(comm_stream):
-                # The NODE is kept, not just its result: differentiating it in the backward is
-                # how this path gets the combine adjoint, so the adjoint is always the backend's
-                # own and cannot drift from the one the trunk dispatcher runs.
+                # The NODE, not just its result: differentiating it is how the backward gets the
+                # combine adjoint, so the adjoint cannot drift from the trunk dispatcher's.
                 with torch.enable_grad():
                     chunk_hidden = hidden_states[rows].detach().requires_grad_(True)
                     chunk_probs = dense_probs[rows].detach().requires_grad_(True)
                     manager.setup_metadata(routing_map[rows], chunk_probs)
-                    # Pin the permuted-token count. Left unset, the backend reads it back out
-                    # of pinned memory -- the host read a graph capture cannot serve -- and it
-                    # reaches the backward too, through the combine node's saved context.
+                    # Pin it, or the backend reads the count back out of pinned memory: the host
+                    # read a capture cannot serve. It reaches the backward via the combine's ctx.
                     manager.num_permuted_tokens = capacity
                     recv_x = manager.dispatch(chunk_hidden)
                     recv_probs = manager.dispatched_probs
@@ -724,6 +736,7 @@ class MoEEPChunkOverlapRuntime:
     def moe_backward(
         self, saved_fwd: tuple[CachedForwardChunkActivation, ...], grad_output: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor | None, ...]]:
+        """Backward the layer chunk by chunk, each combine adjoint overlapping a GEMM."""
         config = self.config
         offsets = config.chunk_offsets
         capacity = config.max_num_expanded_tokens_per_chunk

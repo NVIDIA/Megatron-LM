@@ -33,9 +33,9 @@ from megatron.core.transformer.moe.moe_ep_chunk_overlap.ep_chunk_overlap import 
     CachedForwardChunkActivation,
     MoEEPChunkOverlapRuntime,
 )
-from megatron.core.transformer.moe.moe_ep_chunk_overlap.transport import MoEEPTransportType
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -74,15 +74,71 @@ def _expert_math(hidden, topk_indices, topk_weights, fc1_weight, fc2_weight):
     return (expert_output * topk_weights.unsqueeze(-1)).sum(dim=1)
 
 
+class _FakeDispatchManager:
+    """One chunk's collectives, as the identity plus the padding the schedule insists on.
+
+    The schedule holds every dispatch at ``max_num_expanded_tokens_per_chunk`` and
+    ``check_dispatch_capacity`` raises otherwise, so an identity leg would not even run: this
+    one pads to capacity and takes the padding back in the combine. Both legs are ordinary
+    differentiable ops, which is the point -- the schedule gets its adjoints by differentiating
+    the nodes these build, so a fake that returned a detached tensor would make the backward
+    this file exists to test unrunnable.
+
+    What it does NOT do is permute into expert-major order. The production manager does; what
+    is on trial here is the chunking and the custom backward, and a permutation would only
+    make the one-shot reference harder to write without covering anything new.
+    """
+
+    def __init__(self) -> None:
+        #: Set by `_ensure_built`, which is where the geometry is first known.
+        self.capacity: int | None = None
+        self._live_rows: int | None = None
+        self.dispatched_probs: torch.Tensor | None = None
+        #: The schedule pins this before every dispatch; production reads it to skip a host
+        #: sync. Nothing here needs it, but it must be assignable or the schedule would fail.
+        self.num_permuted_tokens: int | None = None
+
+    def setup_metadata(self, routing_map, probs, padding_mask=None):
+        """Take this chunk's routing, exactly as the trunk manager is handed it."""
+        self._routing_map = routing_map
+        self._probs = probs
+
+    def dispatch(self, hidden_states):
+        self._live_rows = hidden_states.shape[0]
+        self.dispatched_probs = self._pad(self._probs)
+        return self._pad(hidden_states)
+
+    def combine(self, hidden_states):
+        return hidden_states[: self._live_rows]
+
+    def get_number_of_tokens_per_expert(self):
+        """Per-LOCAL-expert receive counts, summing to the live rows, with no permutation to
+        describe: one expert nominally owns them all."""
+        counts = torch.zeros(_NUM_EXPERTS, dtype=torch.long, device=self._probs.device)
+        counts[0] = self._live_rows
+        return counts
+
+    def _pad(self, tensor):
+        """Zero-pad to capacity. ``torch.cat`` so the padding is part of the graph: its backward
+        is the slice that drops those rows' gradients, which is what the real combine does."""
+        rows = self.capacity - tensor.shape[0]
+        return torch.cat([tensor, tensor.new_zeros((rows, *tensor.shape[1:]))], dim=0)
+
+
+def _routing_map_of(dense_probs: torch.Tensor) -> torch.Tensor:
+    """The boolean map the router hands the layer: true exactly where a probability is live."""
+    return dense_probs.detach() != 0
+
+
 class _AutogradRuntime(MoEEPChunkOverlapRuntime):
     """The real runtime with its native compute replaced by autograd over the same expert math.
 
     Only the build step and the per-chunk stages are overridden, so the two-stream schedule, the
     generation lifecycle, the chunking and the autograd node under test are production code; the
-    collectives become identities, leaving the stream and event plumbing running for real over
-    compute autograd can differentiate. One object plays every role: ``_transport`` points back
-    at it, and its wgrad methods simply OVERRIDE the runtime's own, so the schedule's
-    ``self.<stage>()`` reaches this class by ordinary inheritance.
+    collectives become `_FakeDispatchManager`'s pad-and-unpad, leaving the stream and event
+    plumbing running for real over compute autograd can differentiate. Its wgrad methods simply
+    OVERRIDE the runtime's own, so the schedule's ``self.<stage>()`` reaches this class by
+    ordinary inheritance.
     """
 
     fc1_weight: torch.Tensor
@@ -92,10 +148,9 @@ class _AutogradRuntime(MoEEPChunkOverlapRuntime):
     wgrad_log: list
 
     def _ensure_built(self, flat_hidden):
-        # Phase TWO only, as the production runtime splits it: the inherited __init__ is now the
-        # keyword surface, so a renamed keyword raises THERE rather than being absorbed here.
-        # No super(): that builds a real transport and reads `weight{i}` off the experts.
-        if self._transport is not None:
+        # Phase TWO only: the inherited __init__ is the keyword surface, so a renamed keyword
+        # raises there. No super() -- it reads `weight{i}` and makes a real comm stream.
+        if self.comm_stream is not None:
             return
         self.config = ep_chunk_overlap._MoEEPChunkOverlapConfig(
             num_local_tokens=flat_hidden.shape[0],
@@ -110,7 +165,10 @@ class _AutogradRuntime(MoEEPChunkOverlapRuntime):
         )
         self.device = torch.device(flat_hidden.device)
         self.comm_stream = torch.cuda.Stream(device=self.device)
-        self._transport = self
+        # The managers were built by `_build_facade` and validated by the inherited __init__;
+        # only the capacity is new here, because the geometry is what this phase resolves.
+        for manager in self._managers:
+            manager.capacity = self.config.max_num_expanded_tokens_per_chunk
         # Dropped, not left at the constructor's None: both compute stages are overridden, so an
         # accidental `expert_ops()` must be an AttributeError, not a real `build_expert_ops`.
         del self._ops, self._fc1_op, self._fc2_op
@@ -140,46 +198,40 @@ class _AutogradRuntime(MoEEPChunkOverlapRuntime):
         """
         self.wgrad_log.append("flush")
 
-    def dispatch_forward(self, hidden_states, topk_indices, topk_weights, stream):
-        """Transport leg: the identity. A plain tuple stands in for the receive it would build."""
-        return (hidden_states, topk_indices, topk_weights)
-
     def routed_experts_compute_forward(self, dispatched, *, offload):
         # RECORDED, not asserted: the per-chunk offload group lives in the stage this fake
         # replaces, so the gate arriving once per chunk is all of offloading this class can see.
         self.offload_log.append(offload)
-        hidden_states, topk_indices, topk_weights = dispatched
-        hidden = hidden_states.detach().float().requires_grad_(True)
-        weights = topk_weights.detach().float().requires_grad_(True)
+        # The WHOLE capacity window, as the real compute takes it: its dX must come back at
+        # capacity. Padded rows carry zero probabilities, so they contribute and take nothing.
+        hidden = dispatched.recv_x.detach().float().requires_grad_(True)
+        probs = dispatched.recv_probs.detach().float().requires_grad_(True)
         with torch.enable_grad():
-            output = _expert_math(hidden, topk_indices, weights, self.fc1_weight, self.fc2_weight)
+            # Top-k off the DENSE row, which is the form the schedule now dispatches; the
+            # one-shot reference takes the same two lines, so the two stay comparable.
+            weights, indices = torch.topk(probs, k=self._router_topk, dim=-1, sorted=True)
+            output = _expert_math(hidden, indices, weights, self.fc1_weight, self.fc2_weight)
         # The saved chunk carries this fake's own inner graph in the same three slots the real
-        # one carries TE's; the dispatch handle is the transport's and this fake has none.
+        # one carries TE's, plus the dispatch NODE, which only the schedule differentiates.
         saved = CachedForwardChunkActivation(
-            dispatched_tokens=hidden, routing_probs=weights, fc2_output=output, dispatch_handle=None
+            dispatched_tokens=hidden,
+            routing_probs=probs,
+            fc2_output=output,
+            dispatch_graph=dispatched.graph,
         )
-        return output.detach().to(hidden_states.dtype), saved
+        return output.detach().to(dispatched.recv_x.dtype), saved
 
-    def combine_forward(self, fc2_output, handle, stream):
-        """Transport leg: the identity, as the two dispatch legs are."""
-        return fc2_output
-
-    def record_handle_stream(self, handle, stream):
-        """Transport leg: this fake's handle is None, so there is nothing to keep alive."""
-
-    def dispatch_backward(self, grad_output, handle, stream):
-        """Transport leg: the identity. Takes the HANDLE, as the real transport does."""
-        return grad_output
-
-    def routed_experts_compute_backward(self, saved, dispatched):
+    def routed_experts_compute_backward(self, saved, grad_recv):
         inputs = [saved.dispatched_tokens, saved.routing_probs, self.fc1_weight, self.fc2_weight]
-        grad_hidden, grad_weights, grad_fc1, grad_fc2 = torch.autograd.grad(
-            saved.fc2_output, inputs, dispatched.float()
+        grad_hidden, grad_probs, grad_fc1, grad_fc2 = torch.autograd.grad(
+            saved.fc2_output, inputs, grad_recv.float()
         )
         # Parked rather than returned, exactly as TE parks a deferred wgrad: the weight gradients
         # stay the wgrad stage's work and never cross the seam.
         self._wgrad_queue.append((grad_fc1, grad_fc2))
-        return grad_hidden.to(dispatched.dtype), grad_weights
+        # Flat, as the production stage returns it; the schedule views it back onto the
+        # dispatch node's own probability output.
+        return grad_hidden.to(grad_recv.dtype), grad_probs.reshape(-1)
 
     def run_chunk_wgrad(self, *, stream):
         """Wgrad leg. The stream is checked here now that the schedule supplies it directly."""
@@ -200,10 +252,6 @@ class _AutogradRuntime(MoEEPChunkOverlapRuntime):
         self.fc1_main_grad += grad_fc1
         self.fc2_main_grad += grad_fc2
 
-    def combine_backward(self, grad_permuted, grad_probs_permuted, handle, stream):
-        """Transport leg: the identity."""
-        return grad_permuted, grad_probs_permuted
-
 
 class _StubOverlap:
     """Stand-in facade that records its calls and keeps its inputs in the autograd graph."""
@@ -211,8 +259,8 @@ class _StubOverlap:
     def __init__(self):
         self.calls = []
 
-    def forward(self, hidden_states, dense_probs):
-        self.calls.append((hidden_states, dense_probs))
+    def forward(self, hidden_states, dense_probs, routing_map):
+        self.calls.append((hidden_states, dense_probs, routing_map))
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         scale = dense_probs.sum(dim=-1, keepdim=True).to(flat.dtype)
         return (flat * scale).view(hidden_states.shape), None
@@ -235,9 +283,8 @@ def _make_config(**overrides) -> TransformerConfig:
         # The facade requires a communication-SM budget even though the feature stays off in most
         # of these configs; the value is inert unless the flex DeepEP dispatcher is selected.
         moe_flex_dispatcher_num_sms=40,
-        # EXPLICIT, because the field's own default is still 'deepep' for the trunk dispatcher and
-        # that name no longer selects a transport on the overlap path -- it raises. Before the
-        # DeepEP V2 removal these configs took that default and exercised that transport implicitly.
+        # EXPLICIT: the field still defaults to 'deepep' for the trunk dispatcher, and that name
+        # no longer selects a backend here -- it raises. These configs used to take that default.
         moe_flex_dispatcher_backend="hybridep",
     )
     kwargs.update(overrides)
@@ -304,6 +351,9 @@ def _build_facade(*, hidden_size, ffn_hidden_size, num_chunks, offload) -> MoEEP
         experts=experts,
         tp_ep_group=get_default_pg_collection().tp_ep,
         num_local_experts=_NUM_EXPERTS,
+        # ONE PER CHUNK, as `moe_layer.py` builds them; the inherited __init__ refuses any
+        # other count.
+        managers=[_FakeDispatchManager() for _ in range(num_chunks)],
     )
 
 
@@ -418,7 +468,7 @@ class TestOverlapAutograd:
         facade = self._make_facade(num_chunks=num_chunks)
         hidden, dense_probs = self._make_inputs()
 
-        output, _ = facade.forward(hidden, dense_probs)
+        output, _ = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
         output.float().pow(2).sum().backward()
 
         # Reference: the identical math in one shot, through ordinary autograd.
@@ -464,13 +514,13 @@ class TestOverlapAutograd:
         # inputs any second value differs from the first and the assertion proves nothing.
         hidden, dense_probs = self._make_inputs()
 
-        output, _ = facade.forward(hidden, dense_probs)
+        output, _ = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
         output.float().sum().backward()
         first_grad = facade.fc1_main_grad.clone()
 
         hidden.grad = None
         dense_probs.grad = None
-        output, _ = facade.forward(hidden, dense_probs)
+        output, _ = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
         output.float().sum().backward()
 
         assert len(self.published) == 2
@@ -489,13 +539,13 @@ class TestOverlapAutograd:
         hidden, dense_probs = self._make_inputs()
 
         with torch.no_grad():
-            output, bias = facade.forward(hidden, dense_probs)
+            output, bias = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
         assert bias is None
         assert output.shape == hidden.shape
         assert self.published == [], "eval must never publish weight gradients"
 
         # The generation was released, so training still works afterwards.
-        trained, _ = facade.forward(hidden, dense_probs)
+        trained, _ = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
         trained.float().sum().backward()
         assert len(self.published) == 1
 
@@ -506,7 +556,7 @@ class TestOverlapAutograd:
         facade = self._make_facade(num_chunks=num_chunks, offload=True)
         hidden, dense_probs = self._make_inputs()
 
-        output, _ = facade.forward(hidden, dense_probs)
+        output, _ = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
         output.float().sum().backward()
 
         assert facade.offload_log == [True] * num_chunks
@@ -526,12 +576,12 @@ class TestOverlapAutograd:
         hidden, dense_probs = self._make_inputs()
 
         with torch.no_grad():
-            facade.forward(hidden, dense_probs)
+            facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
 
         assert facade.offload_log == [False, False]
         # And the training path that follows still gets the gate, so this is a no_grad rule and
         # not the facade having dropped the flag altogether.
-        output, _ = facade.forward(hidden, dense_probs)
+        output, _ = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
         output.float().sum().backward()
         assert facade.offload_log == [False, False, True, True]
 
@@ -583,8 +633,14 @@ class TestMoELayerSeam:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-class TestOverlapTransportSelection:
-    """``moe_flex_dispatcher_backend`` is what selects this path's transport, and nothing else."""
+class TestOverlapBackendSelection:
+    """``moe_flex_dispatcher_backend`` is what selects this path's collectives, and nothing else.
+
+    There is no transport type any more and no mapping of its own to get wrong: the layer builds
+    the trunk's dispatch managers through ``make_dispatch_manager``, the single place a flex
+    backend name becomes an implementation. So what is left to gate is that the overlap path
+    reaches that function and asks it for one manager per chunk.
+    """
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -593,35 +649,56 @@ class TestOverlapTransportSelection:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize(
-        "backend,expected",
-        [("ncclep", MoEEPTransportType.NCCL_EP), ("hybridep", MoEEPTransportType.HYBRID_EP)],
-    )
-    def test_the_backend_name_selects_its_transport(self, backend, expected):
-        config = _make_config(moe_ep_chunk_overlap=True)
-        # Assigned after validation: 'ncclep' is rejected outside the flex dispatcher, which
-        # asserts TP x EP > 1 and so cannot be built at this test's expert-parallel size.
-        config.moe_flex_dispatcher_backend = backend
+    def test_the_backend_name_selects_its_manager(self):
+        """Only 'hybridep' is reachable here. 'ncclep' used to be checked alongside it because
+        the mapping was a dict this path owned and nothing was constructed; now the manager IS
+        built, and ``make_dispatch_manager`` asserts TP x EP > 1 for that backend, which this
+        test's expert-parallel size of 1 cannot satisfy."""
+        config = _make_config(moe_ep_chunk_overlap=True, moe_flex_dispatcher_backend="hybridep")
 
         layer = _make_layer(config)
 
-        assert layer.moe_ep_chunk_overlap._transport_type is expected  # noqa: SLF001
+        managers = layer.moe_ep_chunk_overlap._managers  # noqa: SLF001
+        assert all(isinstance(manager, _HybridEPManager) for manager in managers)
 
-    def test_the_default_transport_is_hybridep(self):
-        """The DEFAULT itself, gated. Nothing in production reaches it -- ``moe_layer.py`` always
-        passes ``transport_type`` explicitly -- so only this test would catch it changing.
+    def test_there_is_one_manager_per_token_chunk(self):
+        """Not one shared manager: chunk c's combine runs while c+1's dispatch is still in
+        flight, and HybridEP's cached replay reads buffer-resident staging from offset 0, so a
+        second dispatch into the same buffer invalidates the first one's handle."""
+        config = _make_config(
+            moe_ep_chunk_overlap=True,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_ep_chunk_overlap_num_chunks=3,
+        )
 
-        ONE constructor, where there were two: the facade that carried the second copy of this
-        default was folded into the runtime.
-        """
-        default = signature(MoEEPChunkOverlapRuntime.__init__).parameters["transport_type"].default
-        assert default is MoEEPTransportType.HYBRID_EP, default
+        layer = _make_layer(config)
 
-    def test_an_unmapped_backend_raises_instead_of_silently_taking_the_default(self):
+        managers = layer.moe_ep_chunk_overlap._managers  # noqa: SLF001
+        assert len(managers) == 3
+        assert len({id(manager) for manager in managers}) == 3, "distinct objects, not one reused"
+
+    def test_a_manager_count_that_does_not_match_the_chunk_count_is_refused(self):
+        """The runtime's own guard, reached directly: ``moe_layer`` builds the list from the same
+        field, so only this test would catch the two drifting apart."""
+        with pytest.raises(ValueError, match="one dispatch manager per token chunk"):
+            overlap_module.MoEEPChunkOverlapRuntime(
+                num_experts=_NUM_EXPERTS,
+                router_topk=_ROUTER_TOPK,
+                hidden_size=_HIDDEN_SIZE,
+                ffn_hidden_size=_FFN_HIDDEN_SIZE,
+                num_chunks=2,
+                num_comm_SMs=_NUM_COMM_SMS,
+                experts=torch.nn.Identity(),
+                tp_ep_group=get_default_pg_collection().tp_ep,
+                num_local_experts=_NUM_EXPERTS,
+                managers=[_FakeDispatchManager()],
+            )
+
+    def test_an_unmapped_backend_raises_instead_of_silently_taking_a_default(self):
         config = _make_config(moe_ep_chunk_overlap=True)
         config.moe_flex_dispatcher_backend = "not-a-backend"
 
-        with pytest.raises(ValueError, match="no transport for"):
+        with pytest.raises(ValueError, match="Invalid backend"):
             _make_layer(config)
 
 
@@ -668,11 +745,13 @@ class TestSplitExecutionMap:
         class _StubRuntime:
             calls = 0
 
-            def forward(self, hidden_states, probs):
+            def forward(self, hidden_states, probs, routing_map):
                 """Deterministic in both inputs, so a dropped or reordered phase shows up.
 
                 Shape contract copied from the real runtime: it flattens to [tokens, hidden]
-                and returns ``flat_output.view(input_shape), None``.
+                and returns ``flat_output.view(input_shape), None``. The routing map arrives
+                as the third argument because ``preprocess`` stashes it for the expert phase,
+                which under 1F1B is a separate callable that is handed nothing else.
                 """
                 type(self).calls += 1
                 flat = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -936,12 +1015,14 @@ class _OffloadingRuntime(_AutogradRuntime):
 
     def routed_experts_compute_forward(self, dispatched, *, offload):
         self.offload_log.append(offload)
-        hidden_states, topk_indices, topk_weights = dispatched
-        dispatched_tokens = hidden_states.detach().float().requires_grad_(True)
-        routing_probs = topk_weights.detach().float().requires_grad_(True)
+        dispatched_tokens = dispatched.recv_x.detach().float().requires_grad_(True)
+        routing_probs = dispatched.recv_probs.detach().float().requires_grad_(True)
         stream = torch.cuda.current_stream(self.device)
         offload_group = off_interface(offload, dispatched_tokens, "fused_group_mlp")
         with torch.cuda.stream(stream), torch.enable_grad():
+            topk_weights, topk_indices = torch.topk(
+                routing_probs, k=self._router_topk, dim=-1, sorted=True
+            )
             # Sliced and opted out BEFORE the group, as the real path opts its quantized weight
             # shadows out: a weight saved per chunk would be offloaded once per chunk.
             fc1_slices = [weight for weight in self.fc1_weight]
@@ -950,15 +1031,15 @@ class _OffloadingRuntime(_AutogradRuntime):
                 off_interface.mark_not_offload(weight)
             with offload_group as group_input:
                 output = _linear_expert_math(
-                    group_input, topk_indices, routing_probs, fc1_slices, fc2_slices
+                    group_input, topk_indices, topk_weights, fc1_slices, fc2_slices
                 )
             # The commit is the root the backward starts from, so it is what `saved` carries.
             output = offload_group.group_offload(output)
-        return output.detach().to(hidden_states.dtype), CachedForwardChunkActivation(
+        return output.detach().to(dispatched.recv_x.dtype), CachedForwardChunkActivation(
             dispatched_tokens=dispatched_tokens,
             routing_probs=routing_probs,
             fc2_output=output,
-            dispatch_handle=None,
+            dispatch_graph=dispatched.graph,
         )
 
 
@@ -1112,7 +1193,7 @@ class TestOffloadedExpertComputeRoundTrip:
                 activation_offload_fraction=1.0,
             )
             hidden, dense_probs = self._make_inputs()
-            output, _ = facade.forward(hidden, dense_probs)
+            output, _ = facade.forward(hidden, dense_probs, _routing_map_of(dense_probs))
             # No synchronize here: that is what retires every D2H before any H2D can race it.
             output.float().pow(2).sum().backward()
             resident_bytes = manager.offload_summary_bytes.get("fused_group_mlp", 0)
