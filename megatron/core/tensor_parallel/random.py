@@ -918,7 +918,7 @@ def _as_tuple(value: Any) -> tuple:
 class _ArgLayout:
     """Positional layout of a call: tensors travel through autograd, other values stay here."""
 
-    def __init__(self, args: tuple):
+    def __init__(self, args: tuple) -> None:
         self.tensor_positions = tuple(
             i for i, arg in enumerate(args) if isinstance(arg, torch.Tensor)
         )
@@ -944,7 +944,7 @@ class _TERecomputeContext:
     ``recompute_phase=True``.
     """
 
-    def __init__(self, enabled: bool):
+    def __init__(self, enabled: bool) -> None:
         self.enabled = enabled and HAVE_TE
         self.fp8_enabled = self.enabled and FP8GlobalStateManager.is_fp8_enabled()
         self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if self.fp8_enabled else None
@@ -1029,7 +1029,7 @@ class _RecomputeRegion:
         use_te_context: bool,
         retain_input_tensors: bool,
         output_slot: Optional[Any] = None,
-    ):
+    ) -> None:
         self.state: Optional[_RegionState] = None
         self._function = function
         self._layout = _ArgLayout(args)
