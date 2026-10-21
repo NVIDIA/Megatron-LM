@@ -544,6 +544,46 @@ def quantize_indexer_mxfp8(
     return buffers.data, out_scale
 
 
+def quantize_indexer_mxfp8_packed_ue8m0(x: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize BF16 ``x`` ``(..., 128)`` with TE to E4M3 and DeepGEMM's packed UE8M0 scales.
+
+    Returns the E4M3 data (``x.shape``) and int32 scales (``x.shape[:-1]``) in DeepGEMM's
+    packed UE8M0 1x32 layout: byte ``g`` (little endian) of a row's int32 is the E8M0
+    exponent of its 32-element group ``g``. They are views of TE's logical (unswizzled)
+    rowwise scales, whose 4 bytes per 128-element row are exactly that int32; the bytes were
+    checked identical to ``deep_gemm.utils.per_token_cast_to_fp8(gran_k=32,
+    use_packed_ue8m0=True)`` (deepgemm-vs-fe study, GB300). Q ``(T, H, 128)`` gives ``(T, H)``
+    scales, K ``(Sk, 128)`` gives ``(Sk,)``. Storage is allocated per call, like
+    :func:`quantize_indexer_mxfp8` without ``buffers``, so a CUDA graph capture takes it from
+    its pool; the returned views keep it alive.
+    """
+    if x.shape[-1] != 128:
+        raise ValueError(
+            f"DeepGEMM packed UE8M0 scales need a head_dim of 128 (one int32 per row), "
+            f"got {tuple(x.shape)}"
+        )
+    buffers = create_indexer_mxfp8_quantization_buffers(x)
+    source = x
+    if buffers.padded_input is not None:
+        buffers.padded_input[: buffers.num_rows].copy_(x.reshape(buffers.num_rows, x.shape[-1]))
+        source = buffers.padded_input
+    buffers.quantizer.update_quantized(source, buffers.quantized)
+    logical_scale = buffers.logical_scale
+    if (
+        logical_scale.dtype != torch.uint8
+        or logical_scale.ndim != 2
+        or logical_scale.shape[1] != 4
+        or logical_scale.shape[0] < buffers.num_rows
+        or not logical_scale.is_contiguous()
+    ):
+        raise RuntimeError(
+            "Transformer Engine MXFP8 logical scales must be contiguous uint8 (rows, 4), got "
+            f"{logical_scale.dtype} {tuple(logical_scale.shape)}"
+        )
+    scales = logical_scale[: buffers.num_rows].view(torch.int32).view(x.shape[:-1])
+    return buffers.data, scales
+
+
 __all__ = [
     "HAVE_TE_MXFP8",
     "HAVE_TRITON",
@@ -555,5 +595,6 @@ __all__ = [
     "make_indexer_mxfp8_scale_cu_seqlens",
     "pack_indexer_mxfp8_scale",
     "quantize_indexer_mxfp8",
+    "quantize_indexer_mxfp8_packed_ue8m0",
     "refresh_indexer_mxfp8_scale_cu_seqlens",
 ]
