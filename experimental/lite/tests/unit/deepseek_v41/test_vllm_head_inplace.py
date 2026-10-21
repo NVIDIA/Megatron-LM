@@ -48,9 +48,12 @@ def test_core_ce_buffer_ownership_and_vjp(owned):
     expected = torch.autograd.grad(
         torch.nn.functional.cross_entropy(x @ weight.T, labels), (x, weight)
     )
-    with patch('megatron.lite.model.deepseek_v41.vllm.model.head_logits', ViewLinear.apply):
+    with patch(
+        'megatron.lite.model.deepseek_v41.vllm.model.head_logits',
+        lambda x, w, *, dtype: ViewLinear.apply(x, w),
+    ):
         logits = (
-            Head.forward(SimpleNamespace(weight=weight), x)[0]
+            Head.forward(SimpleNamespace(weight=weight, logits_dtype="float32"), x)[0]
             if owned
             else ViewLinear.apply(x, weight)
         )
