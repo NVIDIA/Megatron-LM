@@ -1828,7 +1828,6 @@ def validate_args(args, defaults={}):
             args.async_save = False
 
     if args.logits_save_dir is not None:
-        assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
         assert args.async_save, (
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
@@ -1840,6 +1839,10 @@ def validate_args(args, defaults={}):
                 'when dumping logits during active training; for a frozen-teacher dump pass '
                 '--freeze-all-layers.'
             )
+        assert args.rampup_batch_size is None, (
+            '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
+            'mapping assumes a fixed global batch size.'
+        )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -2315,7 +2318,9 @@ def _add_inference_args(parser):
                        choices=['raw_logprobs', 'processed_logprobs'],
                        help='How returned inference log-probs are computed engine-wide. '
                             '"raw_logprobs" (default) uses the unmodified model logits; '
-                            '"processed_logprobs" uses temperature and filters by top-k/top-p.')
+                            '"processed_logprobs" applies temperature and top-k/top-p to '
+                            'sampled-token and top-N log-probs. Prompt log-probs, '
+                            'including prompt top-N, are always raw.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
@@ -2407,7 +2412,6 @@ def _add_network_size_args(parser):
         "gated_linear_unit",
         "bias_activation_fusion",
         "activation_func_fp8_input_store",
-        "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
         "fp8_dot_product_attention",
@@ -3798,8 +3802,10 @@ def _add_varlen_dataset_args(parser):
 
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')
-
-    group.add_argument('--logits-save-top-k', type=int, default=None,
+    # -- Teacher saving --
+    group.add_argument('--logits-save-dir', type=str, default=None,
+                       help='Directory to save logits.')
+    group.add_argument('--logits-save-top-k', type=int, default=128,
                        help='Number of top logits to save.')
     group.add_argument('--logits-save-top-p', type=float, default=None,
                        help='Top-P (nucleus) threshold applied after top-K '
@@ -3810,19 +3816,15 @@ def _add_logits_distillation_args(parser):
                        help='Minimum number of entries kept per token when '
                             'top-P masking is active, regardless of '
                             'cumulative mass. Default: 1.')
-    group.add_argument('--logits-save-dir', type=str, default=None,
-                       help='Directory to save logits.')
     group.add_argument('--logits-save-dtype', type=str, default='fp16',
                        choices=['fp16', 'bf16', 'fp32'],
                        help='Dtype for on-disk top-K log-probabilities.')
+    # -- Student loading --
     group.add_argument('--logits-load-dir', type=str, default=None,
                        help='Directory to load logits.')
     group.add_argument('--logits-load-decode-threads', type=int, default=4,
                        help='Number of decode threads for cached-logits zstd '
                             'decompression and torch.load processing.')
-    group.add_argument('--logits-load-prefetch-factor', type=int, default=3,
-                       help='PyTorch DataLoader prefetch factor for decoded '
-                            'cached-logits iterations. (Non-MSC only)')
     group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
                        help='For MSC/object-storage logits tar shards, number '
                             'of whole tar shards to prefetch into the MSC '
@@ -3834,6 +3836,11 @@ def _add_logits_distillation_args(parser):
                        default=False,
                        help='When set, KD loss errors are logged as warnings and '
                             'training falls back to LM-only loss instead of crashing.')
+    group.add_argument('--logits-load-ignore-hash', action='store_true',
+                       default=False,
+                       help='When set, skip cached-logits tar metadata hash validation. '
+                            'Use only when intentionally loading logits saved with an '
+                            'older or otherwise incompatible dataset hash.')
     return parser
 
 
