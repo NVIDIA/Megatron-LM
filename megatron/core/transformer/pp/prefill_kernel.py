@@ -12,6 +12,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cute.typing import Float32, Int32, Int64
 from flash_attn.cute.mask import Sm100FusedMask as FusedMask
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
@@ -25,7 +26,7 @@ from flash_attn.cute.tile_scheduler import (
 )
 from flash_attn.cute.utils import as_bshkrd_tensor, ex2_emulation_2, smid
 
-from .fold import fold_pair, fold_stats, normalize_scale, vcopy, view16
+from .fold import fold_pair, fold_stats, normalize_scale, vcopy, view16, zero_key_rows
 
 _TUNE_HD256_CAUSAL = {
     "ex2_emu_freq": 14,
@@ -371,6 +372,7 @@ class PPAttentionForward:
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
         self.tma_copy_q_bytes = q_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
         self.tma_copy_kv_bytes = k_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
+        self.v_stage_elems = cute.cosize(v_smem_layout)
 
         @cute.struct
         class SharedStorage:
@@ -388,6 +390,7 @@ class PPAttentionForward:
             fold_done_mbar_ptr: cute.struct.MemRange[Int64, 1]
             fold_args: cute.struct.MemRange[Float32, self.fold_args_len]
             tmem_dealloc_mbar: Int64
+            v_tail_mbar: cute.struct.MemRange[Int64, 2]
             tmem_holding_buf: Int32
 
         self.shared_storage = SharedStorage
@@ -484,7 +487,9 @@ class PPAttentionForward:
         ).make_participants()
         load_kv_producer, load_kv_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.kv_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
+            producer_group=make_thread_cooperative_group(
+                3 if cutlass.const_expr(mPageTable is not None) else 1
+            ),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             tx_count=self.tma_copy_kv_bytes,
             barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
@@ -565,6 +570,13 @@ class PPAttentionForward:
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
 
+        v_tail_mbar = storage.v_tail_mbar.data_ptr()
+        if cutlass.const_expr(mPageTable is not None):
+            if warp_idx == self.load_warp_id:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(v_tail_mbar, 1)
+                    cute.arch.mbarrier_init(v_tail_mbar + 1, 1)
+                cute.arch.mbarrier_init_fence()
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
         sQ = smem.allocate_tensor(
@@ -647,6 +659,11 @@ class PPAttentionForward:
 
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            load_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            is_leader_load = load_rank % self.cta_group_size == 0
+            load_peer_rank = load_rank ^ 1
+            load_lane = cute.arch.lane_idx()
+            tail_phase = Int32(0)
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
@@ -804,6 +821,7 @@ class PPAttentionForward:
                             tKsK[None, k_handle.index],
                             tma_bar_ptr=k_handle.barrier,
                         )
+                        self._paged_arrive(k_handle.barrier, is_leader_load, mPageTable)
                     kv_coord += 1
                     v_page_idx_prev = (
                         k_page_idx if cutlass.const_expr(mPageTable is not None) else None
@@ -825,6 +843,7 @@ class PPAttentionForward:
                                 tKsK[None, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
                             )
+                            self._paged_arrive(k_handle.barrier, is_leader_load, mPageTable)
                         for iter in cutlass.range(self.iterations_pv, unroll=1):
                             v_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
@@ -837,6 +856,7 @@ class PPAttentionForward:
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
                             )
+                            self._paged_arrive(v_handle.barrier, is_leader_load, mPageTable)
                         v_page_idx_prev = (
                             k_page_idx if cutlass.const_expr(mPageTable is not None) else None
                         )
@@ -844,18 +864,72 @@ class PPAttentionForward:
                         if cutlass.const_expr(mPageTable is not None):
                             if kv_coord < seqlen_kv_loop_end:
                                 k_page_idx = mPageTable[batch_coord, kv_coord]
-                    for iter in cutlass.range(self.iterations_pv, unroll=1):
-                        v_handle = load_kv_producer.acquire_and_advance()
-                        cute.copy(
-                            tma_atom_v,
-                            (
-                                tVgV[None, iter, seqlen_kv_loop_end - 1]
-                                if cutlass.const_expr(mPageTable is None)
-                                else tVgV[None, iter, 0, v_page_idx_prev]
-                            ),
-                            tVsV[None, v_handle.index],
-                            tma_bar_ptr=v_handle.barrier,
-                        )
+                    if cutlass.const_expr(mPageTable is None):
+                        for iter in cutlass.range(self.iterations_pv, unroll=1):
+                            v_handle = load_kv_producer.acquire_and_advance()
+                            cute.copy(
+                                tma_atom_v,
+                                tVgV[None, iter, seqlen_kv_loop_end - 1],
+                                tVsV[None, v_handle.index],
+                                tma_bar_ptr=v_handle.barrier,
+                            )
+                    else:
+                        tail_keys = seqlen_k - (seqlen_kv_loop_end - 1) * 128
+                        tail_tx = Int32(self.tma_copy_kv_bytes)
+                        if tail_keys < 128:
+                            tail_tx = Int32(0)
+                        for iter in cutlass.range(self.iterations_pv, unroll=1):
+                            v_handle = load_kv_producer.acquire_and_advance(expected_tx=tail_tx)
+                            if tail_keys < 128:
+                                if is_leader_load:
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_arrive_and_expect_tx(
+                                            v_tail_mbar, self.tma_copy_kv_bytes
+                                        )
+                                cute.copy(
+                                    tma_atom_v,
+                                    tVgV[None, iter, 0, v_page_idx_prev],
+                                    tVsV[None, v_handle.index],
+                                    tma_bar_ptr=v_tail_mbar,
+                                )
+                                if is_leader_load:
+                                    cute.arch.mbarrier_wait(v_tail_mbar, tail_phase)
+                                    with cute.arch.elect_one():
+                                        cute.arch.mbarrier_arrive(
+                                            v_tail_mbar + 1,
+                                            peer_cta_rank_in_cluster=load_peer_rank,
+                                            scope=_nvvm.MemScopeKind.CLUSTER,
+                                        )
+                                else:
+                                    cute.arch.mbarrier_wait(v_tail_mbar + 1, tail_phase)
+                                tail_phase = tail_phase ^ 1
+                                zero_key_rows(
+                                    sV,
+                                    v_handle.index * self.v_stage_elems,
+                                    tail_keys,
+                                    load_lane,
+                                    64,
+                                    64,
+                                )
+                                cute.arch.fence_proxy("async.shared", space="cluster")
+                                cute.arch.sync_warp()
+                                with cute.arch.elect_one():
+                                    if is_leader_load:
+                                        cute.arch.mbarrier_arrive(v_handle.barrier)
+                                    else:
+                                        cute.arch.mbarrier_arrive(
+                                            v_handle.barrier,
+                                            peer_cta_rank_in_cluster=load_peer_rank,
+                                            scope=_nvvm.MemScopeKind.CLUSTER,
+                                        )
+                            else:
+                                cute.copy(
+                                    tma_atom_v,
+                                    tVgV[None, iter, 0, v_page_idx_prev],
+                                    tVsV[None, v_handle.index],
+                                    tma_bar_ptr=v_handle.barrier,
+                                )
+                                self._paged_arrive(v_handle.barrier, is_leader_load, mPageTable)
 
                 work_tile = tile_sched.advance_to_next_work()
             load_kv_producer.tail()
@@ -1410,6 +1484,14 @@ class PPAttentionForward:
         tmem.free(tmem_ptr)
 
         return
+
+    @cute.jit
+    def _paged_arrive(self, barrier, is_leader, mPageTable: Optional[cute.Tensor]):
+        """Two extra full-barrier arrivals for a paged load stage whose tail is not zeroed."""
+        if cutlass.const_expr(mPageTable is not None):
+            if is_leader:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(barrier, arrive_count=2)
 
     @cute.jit
     def softmax_step(

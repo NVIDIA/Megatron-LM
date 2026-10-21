@@ -55,17 +55,27 @@ class _Case:
         k_cache = torch.randn(shape, device=dev, dtype=torch.bfloat16)
         v_cache = torch.randn(shape, device=dev, dtype=torch.bfloat16)
         self.q, self.ref = [], []
+        self.written = torch.zeros(pool, BLOCK, dtype=torch.bool, device=dev)
         used = 0
         for b, n in enumerate(self.lengths):
             ids = perm[used : used + blocks[b]]
             used += blocks[b]
             self.table[b, : blocks[b]] = ids
+            rows = self.written[ids.long()].view(-1)
+            rows[:n] = True
+            self.written[ids.long()] = rows.view(-1, BLOCK)
             q = torch.randn(1, n, h_q, head_dim, device=dev, dtype=torch.bfloat16)
             k = k_cache[ids.long()].reshape(1, -1, h_kv, head_dim)[:, :n].contiguous()
             v = v_cache[ids.long()].reshape(1, -1, h_kv, head_dim)[:, :n].contiguous()
             self.q.append(q[0])
             self.ref.append(self.attn.prefill(q, k, v)[0])
+        self.k_cache, self.v_cache = k_cache, v_cache
         self.k, self.v, self.pages = page_view(k_cache, v_cache, self.table)
+
+    def poison(self, value):
+        """Fill every cache slot no prompt wrote with `value`."""
+        for cache in (self.k_cache, self.v_cache):
+            cache.masked_fill_(~self.written[..., None, None], value)
 
     def prefill(self, starts):
         """Prefill rows [start, len) of each prompt; keys [0, len) are in the cache."""
@@ -138,6 +148,26 @@ class TestPPAttentionInference:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(_bits(out), _bits(ref))
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf")])
+    def test_unwritten_cache_slots(self, head_dim, h_q, h_kv, value):
+        """Cache slots no request wrote must not reach the output, whatever they hold."""
+        case = _Case(head_dim, h_q, h_kv)
+        decoder = case.decoder()
+        starts = [n // 2 for n in LENGTHS]
+
+        def outputs():
+            outs = list(case.prefill([0] * len(LENGTHS))) + list(case.prefill(starts))
+            for n in (1, 3):
+                q, _, seqused = case.tail(n)
+                outs.append(decoder.verify(q, case.k, case.v, case.pages, seqused))
+            return [o.clone() for o in outs]
+
+        clean = outputs()
+        case.poison(value)
+        for out, ref in zip(outputs(), clean):
+            assert torch.isfinite(out).all()
+            assert torch.equal(_bits(out), _bits(ref))
 
     @pytest.mark.parametrize("super_block_tiles", [1, 8])
     def test_poisoned_workspaces(self, head_dim, h_q, h_kv, super_block_tiles):
