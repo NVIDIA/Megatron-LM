@@ -32,6 +32,7 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
     routes = torch.ones(4, 2, dtype=torch.bool)
     layer.route = Mock(return_value=(probs, routes))
     layer.megakernel_experts = torch.nn.Identity()
+    layer.megakernel_experts.handles_shared_expert = True
     layer.megakernel_experts.forward = Mock(return_value=hidden)
     checkpoint = Mock(side_effect=lambda fn, config, group, *args: fn(*args))
     monkeypatch.setattr(moe_layer, "precision_aware_checkpoint", checkpoint)

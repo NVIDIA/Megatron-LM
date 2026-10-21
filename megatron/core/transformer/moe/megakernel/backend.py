@@ -12,6 +12,8 @@ from torch import nn
 class MegakernelBackend(nn.Module, ABC):
     """Backend-neutral interface for replacing an MCore MoE layer."""
 
+    handles_shared_expert: bool = False
+
     @abstractmethod
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor

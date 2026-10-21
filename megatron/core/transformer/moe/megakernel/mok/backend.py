@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
+    handles_shared_expert = True
+
     def __init__(
         self,
         config: TransformerConfig,
