@@ -1,15 +1,14 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain and SFT Mamba."""
 
 import os
 from functools import partial
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 
 from megatron.core import mpu, parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -49,14 +48,13 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.global_vars import (
-    get_run_config,
-    set_run_config,
+from megatron.training.argument_utils import (
+    gpt_data_config_from_args,
+    pretrain_cfg_container_from_args,
 )
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
@@ -472,52 +470,51 @@ def is_dataset_built_on_rank(vp_stage=None):
     ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
+def flex_data_config_from_args(args, *, standalone=False):
+    """``cfg.data`` for this entry point: the shared factory, less the varlen family.
+
+    ``get_batch`` keys the packed-sequence metadata on ``--sft`` and ``is_dataset_built_on_rank``
+    has no packed-sequence parameter, so a varlen dataset cannot be consumed here; the request is
+    rejected instead of silently building plain GPT data (``pretrain_hybrid.py`` supports it).
+    """
+    if getattr(args, "use_varlen_dataset", False):
+        raise ValueError(
+            "pretrain_hybrid_flex.py does not support --use-varlen-dataset (its batch path has no "
+            "varlen packing support); use pretrain_hybrid.py for varlen data."
+        )
+    return gpt_data_config_from_args(args, standalone=standalone)
+
+
 def core_gpt_dataset_config_from_args(args):
-    cfg = get_run_config()
-    tokenizer = get_tokenizer()
+    """Build the GPT dataset config from parsed CLI args.
 
-    # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
-
-    return GPTDatasetConfig(
-        random_seed=cfg.rng.seed,
-        sequence_length=args.seq_length,
-        blend=blend,
-        blend_per_split=blend_per_split,
-        split=args.split,
-        num_dataset_builder_threads=args.num_dataset_builder_threads,
-        path_to_cache=args.data_cache_path,
-        mmap_bin_files=args.mmap_bin_files,
-        tokenizer=tokenizer,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-        object_storage_cache_path=args.object_storage_cache_path,
-        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        inter_document_masking=getattr(args, 'dataloader_inter_document_masking', False),
-    )
+    Kept for callers of the legacy shape; the provider builds from ``cfg.data`` instead. As
+    before, the seed is the run config's and the tokenizer is the run's; the returned config is
+    prepared (Megatron Core's post-init has run). Every data argument is forwarded, including the
+    layout and validation fields the previous factory left at Megatron Core's defaults.
+    """
+    data = flex_data_config_from_args(args, standalone=True)
+    data.dataset.random_seed = get_run_config().rng.seed
+    data.dataset.prepare(get_tokenizer())
+    return data.dataset
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
-    """Build the train test and validation datasets.
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, *, data_config=None
+):
+    """Build the train, validation and test datasets.
 
     Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+        train_val_test_num_samples: the number of samples for the train, validation and test
+            splits.
+        vp_stage: the virtual pipeline stage the datasets are built for.
+        data_config: ``cfg.data``: the dataset config, prepared with the run's tokenizer, the
+            loader settings and the dataset class. ``build_train_valid_test_datasets`` passes it;
+            it is read from the run config when omitted.
     """
-    args = get_args()
-
-    config = core_gpt_dataset_config_from_args(args)
-
-    if args.sft:
-        dataset_type = SFTDataset
-    else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        else:
-            dataset_type = GPTDataset
+    if data_config is None:
+        data_config = get_run_config().data
+    dataset_type, config, _ = data_config.dataset_build()
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
@@ -585,7 +582,9 @@ if __name__ == "__main__":
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
 
-    full_config = pretrain_cfg_container_from_args(args)
+    full_config = pretrain_cfg_container_from_args(
+        args, data_cfg=flex_data_config_from_args(args)
+    )
     set_run_config(full_config)
     pretrain(full_config,
              train_valid_test_datasets_provider,

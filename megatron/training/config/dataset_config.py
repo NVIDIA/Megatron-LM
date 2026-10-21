@@ -382,8 +382,8 @@ def resolve_dataset_class(
             f"class and only GPTFIMDataset reads them (got {dataset_type.__name__} with "
             f"{type(dataset).__name__})."
         )
-    if dataset.varlen_sbhd_validation and (family != "varlen" or mock):
-        raise ValueError("varlen_sbhd_validation requires VarlenDataset with real data.")
+    if dataset.varlen_sbhd_validation and family == "varlen" and mock:
+        raise ValueError("varlen_sbhd_validation requires real data (VarlenDataset, not its mock).")
     return dataset_type
 
 

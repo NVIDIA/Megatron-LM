@@ -37,7 +37,7 @@ from megatron.training.config import (
     PretrainConfigContainer,
 )
 from megatron.training.config import container as container_module
-from megatron.training.config.dataset_config import MIRROR_FIELDS
+from megatron.training.config.dataset_config import LAYOUT_MIRRORS, MIRROR_FIELDS
 from megatron.training.datasets.fim_dataset import GPTFIMDataset
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset
@@ -420,12 +420,20 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
         sequence_parallel=True,
         hybrid_context_parallel=True,
     )
-    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     # The owners stay editable after construction: no stale copy on the dataset config.
     cfg.rng.seed = 42
     cfg.validation.multiple_validation_sets = True
     cfg.validate()
     assert dataset.random_seed is None  # validation writes nothing
+    # data_parallel_size needs the world size: an explicit wrong value passes validate() and is
+    # rejected by finalize() before anything is written.
+    dataset.data_parallel_size = 99
+    with pytest.raises(ValueError, match="data.dataset.data_parallel_size=99 disagrees"):
+        cfg.finalize()
+    assert dataset.data_parallel_size == 99 and dataset.random_seed is None
+    assert not cfg._finalized
+    dataset.data_parallel_size = 2  # an agreeing explicit value is accepted
     cfg.finalize()
     assert dataset.random_seed == 42
     assert dataset.full_validation is True and dataset.multiple_validation_sets is True
@@ -439,16 +447,51 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
         cfg.validate()
 
 
-def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokenizer):
+def test_layout_without_a_model_section_survives_a_reload(
+    container_factory, monkeypatch, tokenizer
+):
+    """What a run without a model section (pretrain_hybrid_flex.py) saves reproduces its layout
+    mirrors: Megatron Core's defaults."""
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = None
-    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     cfg.finalize()
+    cfg.data.dataset.prepare(tokenizer)
+    layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_MIRRORS)
+    assert layout == (1, None, 0, False)
+    cfg.validate()  # the prepared defaults are not explicit values
+    reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
+    reloaded.finalize()
+    reloaded.data.dataset.prepare(tokenizer)
+    assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_MIRRORS) == layout
+
+
+def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokenizer):
+    """pretrain_hybrid_flex.py builds its container without a model config: the seed and the
+    validation flags are written, the layout mirrors have no owner."""
+    _, cfg = container_factory(
+        ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
+    )
+    cfg.model = None
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     dataset = cfg.data.dataset
-    assert dataset.random_seed == cfg.rng.seed and dataset.full_validation is False
+    # Without a model config the layout mirrors have no owner: an explicit value is rejected (it
+    # would not be saved with the section), Core's defaults apply at prepare().
+    dataset.data_parallel_size = 4
+    with pytest.raises(ValueError, match="data_parallel_size=4 is not written .*no model config"):
+        cfg.validate()
+    dataset.data_parallel_size = None
+    dataset.context_parallel_size = 7
+    with pytest.raises(ValueError, match="context_parallel_size=7 is not written"):
+        cfg.validate()
+    dataset.context_parallel_size = None
+    cfg.finalize()
+    assert dataset.random_seed == cfg.rng.seed
+    assert dataset.full_validation is True and dataset.multiple_validation_sets is False
     assert dataset.context_parallel_size is None and dataset.data_parallel_size is None
     dataset.prepare(tokenizer)  # Core defaults apply to the layout
     assert (dataset.data_parallel_size, dataset.sequence_parallel_size) == (1, 0)
+    cfg.validate()  # the prepared defaults are not explicit values
 
 
 @pytest.mark.parametrize(
@@ -538,7 +581,7 @@ def test_full_container_round_trips_before_and_after_prepare(
     assert from_file.data.dataset.to_cfg_dict() == cfg.data.dataset.to_cfg_dict()
     # After finalize() and prepare() the file still carries no runtime state.
     cfg.model = None
-    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 2)
     cfg.finalize()
     cfg.data.dataset.prepare(tokenizer)
     assert cfg.data.dataset.is_prepared
@@ -616,6 +659,38 @@ def test_runtime_services_prepare_a_finalized_dataset_config(
     assert not unbound.data.dataset.is_prepared
     with pytest.raises(RuntimeError, match="not prepared"):
         unbound.data.dataset_build()
+
+
+def test_set_global_variables_finalizes_a_dataset_section(
+    container_factory, monkeypatch, tokenizer
+):
+    """The compatibility bootstrap: a container with a dataset section is finalized before the
+    runtime services bind the tokenizer; a loader-only container is validated only, as before."""
+    globals_ = ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE")
+    for name in globals_:
+        monkeypatch.setattr(global_vars, name, None)
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 1)
+
+    def build(_args):
+        global_vars._GLOBAL_TOKENIZER = tokenizer
+        return tokenizer
+
+    monkeypatch.setattr(global_vars, "_build_tokenizer", build)
+    monkeypatch.setattr(global_vars, "_set_wandb_writer", lambda args: None)
+    monkeypatch.setattr(global_vars, "_set_telemetry", lambda args, **kwargs: None)
+    monkeypatch.setattr(global_vars, "initialize_training_runtime_services", lambda args: None)
+    args, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    cfg.model = None
+    global_vars.set_global_variables(args, cfg)
+    assert global_vars.get_run_config() is cfg and cfg._finalized
+    assert cfg.data.dataset.is_prepared and cfg.data.dataset.tokenizer is tokenizer
+    dataset_type, config, _ = cfg.data.dataset_build()
+    assert dataset_type is MockGPTDataset and config is cfg.data.dataset
+    for name in globals_:
+        monkeypatch.setattr(global_vars, name, None)
+    args, loader_only = container_factory(["--seq-length", "64"])
+    global_vars.set_global_variables(args, loader_only, build_tokenizer=False)
+    assert global_vars.get_run_config() is loader_only and not loader_only._finalized
 
 
 # The data builders hand the data section to providers that declare it (and only to those).
