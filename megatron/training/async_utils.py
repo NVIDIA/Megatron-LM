@@ -129,7 +129,7 @@ def build_otel_worker_bootstrap(args):
         'span_groups': worker_span_groups,
         'resolved_span_groups': resolved_span_groups,
         'rank': args.rank,
-        'world_size': args.world_size,
+        'world_size': cfg.dist.world_size,
         # Same reasoning as _set_telemetry(): building these calls NVML
         # (_detect_gpu_identity), and the worker discards them when 'enabled' is
         # False, so don't build them on the disabled path. The key is always

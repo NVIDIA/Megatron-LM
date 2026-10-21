@@ -111,12 +111,6 @@ class HybridModelConfig(ModelConfig):
         else:
             super().__setattr__(name, value)
 
-    def finalize(self) -> None:
-        """One time validation to run once config is ready to be used by builder."""
-
-        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
-            self.transformer.finalize()
-
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""

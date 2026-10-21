@@ -121,7 +121,6 @@ from megatron.core.rerun_state_machine import (
     destroy_rerun_state_machine,
     get_rerun_state_machine,
 )
-from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -1427,6 +1426,7 @@ def get_start_time_from_progress_log():
     of floating-point operations completed in last saved checkpoint.
     """
     args = get_args()
+    cfg = get_run_config()
     assert args.save is not None
     progress_log_filename = os.path.join(args.save, "progress.txt")
 
@@ -1462,7 +1462,7 @@ def get_start_time_from_progress_log():
                 if latest_num_floating_point_operations_uncommitted is not None:
                     latest_num_floating_point_operations = latest_num_floating_point_operations_uncommitted
                     latest_num_floating_point_operations_uncommitted = None
-            if world_size_in_line != args.world_size:
+            if world_size_in_line != cfg.dist.world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
                 start_num_floating_point_operations = None
@@ -1992,7 +1992,7 @@ def pretrain(
                 f"ExptTP={cfg_container.rl.rl_inference_expert_tensor_model_parallel_size}"
             )
             inference_pg_collection = build_inference_pg_collection(
-                args.world_size,
+                cfg_container.dist.world_size,
                 tp_size=cfg_container.rl.rl_inference_tensor_model_parallel_size,
                 pp_size=cfg_container.rl.rl_inference_pipeline_model_parallel_size,
                 cp_size=1 if force_cp1_inference_model else None,
@@ -3146,7 +3146,7 @@ def setup_model_and_optimizer(
     data_parallel_size = (
         mpu.get_data_parallel_world_size()
         if mpu.model_parallel_is_initialized()
-        else get_batch_parallel_size(args)
+        else cfg.get_batch_parallel_size()
     )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
@@ -3280,7 +3280,7 @@ def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
     samples_seen_value = samples_seen.item()
     if samples_seen_value >= 0:
         return int(samples_seen_value)
-    return get_num_microbatches() * cfg.train.micro_batch_size * get_batch_parallel_size(args)
+    return get_num_microbatches() * cfg.train.micro_batch_size * cfg.get_batch_parallel_size()
 
 
 def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
@@ -3746,12 +3746,12 @@ def training_log(
     # Count independent sequences; weight-sharding ranks may share a sequence through CP.
     batch_size = (
         cfg.train.micro_batch_size
-        * get_batch_parallel_size(args)
+        * cfg.get_batch_parallel_size()
         * get_num_microbatches()
     )
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
+    one_logger_utils.track_app_tag(batch_size, cfg.dist.world_size, args.seq_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
     if packed_sequence_stats and wandb_writer:
@@ -3792,10 +3792,10 @@ def training_log(
             if wandb_writer:
                 wandb_writer.log({'loss-scale': loss_scale}, iteration)
         if cfg.logger.log_world_size_to_tensorboard:
-            writer.add_scalar('world-size', args.world_size, iteration)
-            writer.add_scalar('world-size vs samples', args.world_size, train_state.consumed_train_samples)
+            writer.add_scalar('world-size', cfg.dist.world_size, iteration)
+            writer.add_scalar('world-size vs samples', cfg.dist.world_size, train_state.consumed_train_samples)
             if wandb_writer:
-                wandb_writer.log({'world-size': args.world_size}, iteration)
+                wandb_writer.log({'world-size': cfg.dist.world_size}, iteration)
         if grad_norm is not None:
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm, train_state.consumed_train_samples)
@@ -3953,7 +3953,7 @@ def training_log(
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
-        llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
+        llm_world_size = cfg.get_model_world_size()
 
         throughput = num_floating_point_operations(
             cfg.model,
@@ -3996,7 +3996,7 @@ def training_log(
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
         if cfg.logger.log_energy:
-            energy = (energy_monitor.lap() / total_iterations) / args.world_size
+            energy = (energy_monitor.lap() / total_iterations) / cfg.dist.world_size
             power = energy / elapsed_time_per_iteration
             log_string += f' energy per GPU (J/iter/GPU): {energy:.1f} |'
             log_string += f' power per GPU (W/GPU): {power:.1f} |'
@@ -4099,7 +4099,7 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
                     cfg, sequence_length=args.seq_length, micro_batch_size=cfg.train.micro_batch_size,
-                    data_parallel_size=args.data_parallel_size, world_size=args.world_size,
+                    data_parallel_size=cfg.get_data_parallel_size(), world_size=cfg.dist.world_size,
                     num_microbatches=num_microbatches, verbose=True,
                 )
             report_memory(
@@ -4142,10 +4142,11 @@ def _should_compute_params_norm(args, iteration, is_first_iteration):
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
+    cfg = get_run_config()
     train_state = get_train_state()
     if args.save is None:
         return
-    llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
+    llm_world_size = cfg.get_model_world_size()
 
     # Compute job throughput.
     # train_state.resume_num_floating_point_operations keeps track of floating-point operations
@@ -4728,7 +4729,7 @@ def train(
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
         # Bootstrap fallback before process groups are initialized.
-        return get_batch_parallel_size(args)
+        return cfg.get_batch_parallel_size()
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if cfg.rl.perform_rl_step:
@@ -4937,7 +4938,7 @@ def train(
             'total_flops_since_current_train_start': num_floating_point_operations_since_current_train_start,
             'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
-            'world_size': getattr(args, 'mimo_llm_world_size', args.world_size),
+            'world_size': cfg.get_model_world_size(),
             'seq_length': args.seq_length,
         }
 
@@ -5646,7 +5647,7 @@ def evaluate(
     eval_micro_batch_size = cfg.validation.eval_micro_batch_size
     # Divide by independently assigned sequences; CP ranks share the same sequence.
     eval_num_microbatches = eval_batch_size // (
-        eval_micro_batch_size * get_batch_parallel_size(args)
+        eval_micro_batch_size * cfg.get_batch_parallel_size()
     )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).

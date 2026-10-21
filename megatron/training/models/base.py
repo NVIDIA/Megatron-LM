@@ -160,6 +160,13 @@ class ModelConfig:
     Should take the model as the only argument and return a new model as the only return value.
     """
 
+    def finalize(self) -> None:
+        """Resolve nested transformer settings before deriving dependent run configs."""
+        transformer = getattr(self, "transformer", None)
+        finalize = getattr(transformer, "finalize", None)
+        if callable(finalize):
+            finalize()
+
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.
         Dynamically imports the builder from the string path.
@@ -252,6 +259,12 @@ class ModelProviderConfig(ModelConfig):
     """Shared transformer architecture, precision, and parallelism settings."""
     seq_length: int
     """Maximum position capacity, independent of the actual data sequence length."""
+    training_world_size: int | None = None
+    """Ranks in the training model's grid, or None to use the full launch.
+
+    Heterogeneous applications may reserve other ranks for encoders. This is not
+    the global launch size owned by DistributedInitConfig.
+    """
     vocab_size: int | None = None
     """Resolved model vocabulary, or None until tokenizer initialization."""
     should_pad_vocab: bool = False

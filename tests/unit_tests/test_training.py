@@ -347,6 +347,7 @@ class TestPackedSampleAccounting:
     ):
         """Sequence shards count each sample once for progress and sample-based LR schedules."""
         import megatron.training.training as training
+        from megatron.core.transformer import TransformerConfig
 
         args = SimpleNamespace(
             gtp_remat_num_sequence_shards=num_sequence_shards,
@@ -359,6 +360,15 @@ class TestPackedSampleAccounting:
             micro_batch_size=2,
             train_iters=None,
             train_samples=10_000,
+        )
+        run_config.dist.world_size = 8
+        run_config.model.transformer = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            context_parallel_size=total_cp,
+            tensor_parallel_num_weight_shards=weight_shards,
+            tensor_parallel_num_sequence_shards=num_sequence_shards,
         )
         run_config.train = TrainingConfig(micro_batch_size=2, train_samples=10_000)
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)

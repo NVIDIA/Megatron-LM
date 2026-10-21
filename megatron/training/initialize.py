@@ -433,7 +433,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         init_process_group_kwargs = {
             'backend': cfg.dist.distributed_backend,
             'store': store,
-            'world_size': args.world_size,
+            'world_size': cfg.dist.world_size,
             'rank': args.rank,
             'timeout': timedelta(minutes=cfg.dist.distributed_timeout_minutes),
         }

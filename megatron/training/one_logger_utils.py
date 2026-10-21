@@ -282,14 +282,14 @@ def on_pretrain_start():
 
             one_logger.log_metrics({
                 'train_iterations_warmup': 5,
-                'data_parallel_size' : args.data_parallel_size,
+                'data_parallel_size' : cfg.get_data_parallel_size(),
                 'context_parallel_size': cfg.model.transformer.context_parallel_size,
                 'global_batch_size': cfg.train.global_batch_size,
                 'micro_batch_size': cfg.train.micro_batch_size,
                 'pipeline_model_parallel_size': cfg.model.transformer.pipeline_model_parallel_size,
                 'tensor_model_parallel_size': cfg.model.transformer.tensor_model_parallel_size,
                 'expert_model_parallel_size' : cfg.model.transformer.expert_model_parallel_size,
-                'world_size': args.world_size,
+                'world_size': cfg.dist.world_size,
                 'model_seq_length': args.seq_length,
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,

@@ -107,6 +107,9 @@ class ProfilingConfig:
 class DistributedInitConfig:
     """Configuration settings for distributed training initialization."""
 
+    world_size: int = field(default_factory=lambda: int(os.getenv("WORLD_SIZE", "1")))
+    """Total number of ranks in the launch, including all modules in heterogeneous models."""
+
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
 

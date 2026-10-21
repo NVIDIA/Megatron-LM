@@ -2,11 +2,12 @@
 """Container validation is read-only; runtime initialization owns derivation."""
 
 import copy
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.training import global_vars
 from megatron.training.config import (
@@ -15,14 +16,26 @@ from megatron.training.config import (
     InferenceSetupConfig,
     RLConfig,
 )
-from megatron.training.models import GPTModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, ModelProviderConfig
 
 
 @pytest.mark.parametrize("inference", [False, True])
-def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_config, inference):
-    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+@pytest.mark.parametrize(
+    "transformer_impl,cuda_graph_impl",
+    [
+        ("transformer_engine", "transformer_engine"),
+        ("transformer_engine", "local"),
+        ("local", "local"),
+    ],
+)
+def test_validation_is_read_only_and_finalization_runs_once(
+    monkeypatch, run_config, inference, transformer_impl, cuda_graph_impl
+):
+    transformer = TransformerConfig(
+        num_layers=2, hidden_size=32, num_attention_heads=4, transformer_impl=transformer_impl
+    )
     # Native configs can enable graphs after construction, before runtime setup.
-    transformer.cuda_graph_impl = "transformer_engine"
+    transformer.cuda_graph_impl = cuda_graph_impl
     model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     cfg = (
         InferenceConfigContainer(
@@ -42,13 +55,13 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
         assert cfg.to_dict() == before
         assert not cfg._finalized
 
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(world_size=1))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     rng_finalize = Mock(wraps=cfg.rng.finalize_model_config)
     monkeypatch.setattr(cfg.rng, "finalize_model_config", rng_finalize)
     cfg.finalize()
     assert cfg._finalized
-    assert cfg.rng.te_rng_tracker
-    assert transformer.use_te_rng_tracker
+    assert cfg.rng.te_rng_tracker is (transformer_impl == "transformer_engine")
+    assert transformer.use_te_rng_tracker is cfg.rng.te_rng_tracker
     if not inference:
         assert cfg.ddp.grad_buffer_offload
     after = copy.deepcopy(cfg.to_dict())
@@ -61,7 +74,7 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
 
 
 def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config):
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(world_size=1))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
     transformer.cuda_graph_impl = "transformer_engine"
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
@@ -86,7 +99,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
 
 
 def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(world_size=1))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     run_config.train.micro_batch_size = 1
     run_config.finalize()
     serialized = run_config.to_dict()
@@ -97,3 +110,48 @@ def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
     restored.finalize()
     assert restored._finalized
     assert restored.to_dict() == serialized
+
+
+@pytest.mark.parametrize("model_cls", [GPTModelConfig, HybridModelConfig, ModelProviderConfig])
+@pytest.mark.parametrize("params_dtype", [torch.float16, torch.bfloat16])
+def test_model_finalization_precedes_optimizer_precision(run_config, model_cls, params_dtype):
+    finalizations = []
+
+    class DeferredPrecisionConfig(TransformerConfig):
+        def finalize(self):
+            assert self.use_te_rng_tracker  # RNG policy must reach the model first.
+            finalizations.append(params_dtype)
+            self.fp16 = params_dtype == torch.float16
+            self.bf16 = params_dtype == torch.bfloat16
+            self.params_dtype = params_dtype
+            self.fp8_recipe = "tensorwise"
+
+    transformer = DeferredPrecisionConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    run_config.model = model_cls(transformer=transformer, seq_length=16)
+    run_config.rng.te_rng_tracker = True
+    run_config.dist.world_size = 1
+    run_config.train.micro_batch_size = 1
+    run_config.optimizer = OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
+    assert run_config.optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    run_config.validate()
+    run_config.validate()
+    assert finalizations == []
+    assert transformer.params_dtype is torch.float32
+
+    run_config.finalize()
+    # The legacy CLI-built optimizer must derive the same resolved precision too.
+    runtime_optimizer = run_config.finalize_optimizer_config(
+        OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
+    )
+    for optimizer in (run_config.optimizer, runtime_optimizer):
+        assert optimizer.fp16 == transformer.fp16
+        assert optimizer.bf16 == transformer.bf16
+        assert optimizer.params_dtype is params_dtype
+        assert optimizer.fp8_recipe == "tensorwise"
+        assert not optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    run_config.validate()
+    run_config.finalize()
+    assert finalizations == [params_dtype]
+    assert run_config.model.vocab_size is None  # Tokenizer binding still happens later.

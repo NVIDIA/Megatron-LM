@@ -3029,9 +3029,9 @@ def load_checkpoint(
         )
 
         ckpt_world_size = getattr(ckpt_args, 'world_size', 0)
-        run_world_size = getattr(args, 'world_size', 0)
+        run_world_size = cfg.dist.world_size
         ckpt_dp = getattr(ckpt_args, 'data_parallel_size', 0)
-        run_dp = getattr(args, 'data_parallel_size', 0)
+        run_dp = cfg.get_data_parallel_size()
         mismatch_msg = '(TP, PP) mismatch after resume ({} vs {} from checkpoint)'.format(
             run_tp_pp, ckpt_tp_pp
         )

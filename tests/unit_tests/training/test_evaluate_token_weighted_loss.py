@@ -18,6 +18,7 @@ from megatron.training.state import TrainState
 def test_evaluate_weights_valid_tokens_across_batches_ranks_and_iterations(
     sft, scheduled, empty, run_config
 ):
+    run_config.dist.world_size = 2
     run_config.validation.eval_global_batch_size = 4
     run_config.validation.eval_micro_batch_size = 1
     run_config.validation.eval_iters = 2

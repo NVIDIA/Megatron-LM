@@ -57,6 +57,21 @@ def _runtime_args():
     )
 
 
+def test_launch_world_size_is_captured_at_config_construction(monkeypatch):
+    from megatron.training.argument_utils import _default_config_from_args
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    launch_config = DistributedInitConfig()
+    monkeypatch.setenv("WORLD_SIZE", "16")
+    assert launch_config.world_size == 8
+    # CLI launch inputs override the environment at the existing config boundary.
+    cli_config = _default_config_from_args(DistributedInitConfig, Namespace(world_size=4))
+    assert cli_config.world_size == 4
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    assert "world_size" not in vars(parser.parse_args([]))
+
+
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
 @pytest.mark.parametrize(
     "overrides", [None, "overlap.yaml", {"qkv_fprop": {"method": "ring_exchange"}}]
@@ -141,7 +156,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
-    args.rank, args.world_size = 0, 4
+    args.rank, args.world_size = 0, 999
     # These topology values are normally resolved by validate_args.
     args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
     args.gtp_remat_num_sequence_shards = 1
@@ -150,6 +165,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     original_args = vars(args).copy()
     # Keep the legacy defaults different so an accidental args read is detected.
     run_config.dist = DistributedInitConfig(
+        world_size=4,
         distributed_backend="gloo",
         distributed_timeout_minutes=37,
         local_rank=1,
@@ -368,6 +384,7 @@ def test_runtime_service_order_and_microbatch_inputs(
 ):
     args = _runtime_args()
     cfg = run_config
+    cfg.dist.world_size = 2
     cfg.train.global_batch_size = 8
     cfg.train.micro_batch_size = 2
     # Runtime services must use the container even when legacy args disagree.
@@ -462,10 +479,37 @@ def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_g
         (8, None, {"tensor_model_parallel_size": 2}, 4, 4),
         (16, 8, {"tensor_model_parallel_size": 2}, 4, 4),
         (
+            32,
+            None,
+            {
+                "tensor_model_parallel_size": 2,
+                "pipeline_model_parallel_size": 2,
+                "pipeline_dtype": torch.float32,
+                "context_parallel_size": 2,
+            },
+            4,
+            4,
+        ),
+        (
             16,
             None,
             {
                 "tensor_model_parallel_size": 2,
+                "tensor_parallel_num_weight_shards": 8,
+                "sequence_parallel": True,
+                "tensor_parallel_num_sequence_shards": 4,
+                "context_parallel_size": 4,
+            },
+            1,
+            2,
+        ),
+        (
+            64,
+            32,
+            {
+                "tensor_model_parallel_size": 2,
+                "pipeline_model_parallel_size": 2,
+                "pipeline_dtype": torch.float32,
                 "tensor_parallel_num_weight_shards": 8,
                 "sequence_parallel": True,
                 "tensor_parallel_num_sequence_shards": 4,
@@ -486,18 +530,19 @@ def test_training_batch_topology_uses_model_config(
     expected_batch,
 ):
     args = _runtime_args()
-    args.world_size = world_size
-    if training_world_size is not None:
-        args.mimo_llm_world_size = training_world_size
+    args.world_size = args.mimo_llm_world_size = 999
     args.data_parallel_size = args.batch_parallel_size = 999
+    original_args = vars(args).copy()
+    run_config.dist.world_size = world_size
     run_config.train.micro_batch_size = 2
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     run_config.model = ModelProviderConfig(
         transformer=TransformerConfig(
             num_layers=2, hidden_size=32, num_attention_heads=4, **parallel_kwargs
         ),
         seq_length=32,
         vocab_size=128,
+        training_world_size=training_world_size,
     )
     microbatches = Mock()
     monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)
@@ -521,9 +566,11 @@ def test_training_batch_topology_uses_model_config(
     )
     run_config.finalize()
     global_vars.initialize_runtime_services(args, build_tokenizer=False, training=True)
-    assert args.world_size == world_size
-    assert args.data_parallel_size == expected_dp
-    assert args.batch_parallel_size == expected_batch
+    assert vars(args) == original_args
+    assert run_config.dist.world_size == world_size
+    assert run_config.get_model_world_size() == (training_world_size or world_size)
+    assert run_config.get_data_parallel_size() == expected_dp
+    assert run_config.get_batch_parallel_size() == expected_batch
     assert microbatches.call_args.kwargs['data_parallel_size'] == expected_batch
     assert telemetry[0]['dl.data_parallel.size'] == expected_dp
     assert telemetry[0]['dl.tensor_parallel.size'] == 2
@@ -543,6 +590,7 @@ def test_callback_model_config_owns_shared_inputs(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.max_position_embeddings = 2048
+    args.mimo_llm_world_size = 8
     args.padded_vocab_size = known_vocab
     transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     convert = Mock(return_value=transformer)
@@ -560,6 +608,7 @@ def test_callback_model_config_owns_shared_inputs(
     assert cfg.model.builder is None
     assert cfg.model.transformer is transformer
     assert cfg.model.seq_length == 2048
+    assert cfg.model.training_world_size == 8
     assert cfg.model.vocab_size == (256 if known_vocab is None else known_vocab)
     assert ModelProviderConfig.from_dict(model.as_dict()).as_dict() == model.as_dict()
     restored = PretrainConfigContainer.from_dict(cfg.to_dict())
@@ -707,7 +756,8 @@ def test_callbacks_construct_from_registered_model_config(
 def test_model_precision_is_derived_centrally(monkeypatch, run_config):
     from megatron.core.optimizer import OptimizerConfig
 
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(world_size=1))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    run_config.dist.world_size = 1
     run_config.train.micro_batch_size = 1
 
     run_config.model = ModelProviderConfig(
@@ -755,7 +805,7 @@ def test_native_batch_defaults_preserve_explicit_eval_sizes(
     run_config.validate()
     run_config.validate()
     assert run_config.to_dict() == before
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(world_size=2))
+    run_config.dist.world_size = 2
     run_config.finalize()
     # Runtime re-entry must not apply derivations a second time.
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
@@ -769,7 +819,8 @@ def test_native_batch_defaults_preserve_explicit_eval_sizes(
 
 @pytest.mark.parametrize("mode", ["constant", "decrease", "schedule"])
 def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run_config, mode):
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(world_size=2))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    run_config.dist.world_size = 2
     run_config.train.micro_batch_size = 2
     run_config.train.global_batch_size = 10
     run_config.train.decrease_batch_size_if_needed = mode == "decrease"
@@ -789,6 +840,7 @@ def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run
 
 @pytest.mark.parametrize("invalid_policy", ["eval", "rl"])
 def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_config, invalid_policy):
+    run_config.dist.world_size = 2
     run_config.train.micro_batch_size = 3
     if invalid_policy == "eval":
         run_config.validation.eval_micro_batch_size = 4
@@ -800,11 +852,59 @@ def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_conf
     before = deepcopy(run_config.to_dict())
     run_config.validate()
     assert run_config.to_dict() == before
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(world_size=2))
     with pytest.raises(error, match=message):
         run_config.finalize()
     assert run_config.to_dict() == before
     assert not run_config._finalized
+
+
+@pytest.mark.parametrize("world_size, training_world_size", [(0, None), (-1, None), (4, 8), (4, 0)])
+def test_training_topology_rejects_invalid_rank_counts(
+    monkeypatch, run_config, world_size, training_world_size
+):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    run_config.dist.world_size = world_size
+    run_config.model.training_world_size = training_world_size
+    run_config.train.micro_batch_size = 1
+    before = deepcopy(run_config.to_dict())
+    with pytest.raises(ValueError, match="Training model world size must fit"):
+        run_config.finalize()
+    assert run_config.to_dict() == before
+    assert not run_config._finalized
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"tensor_model_parallel_size": 0}, "Parallel sizes must be positive"),
+        ({"pipeline_model_parallel_size": 0}, "Parallel sizes must be positive"),
+        ({"context_parallel_size": 0}, "Parallel sizes must be positive"),
+        ({"gtp_weight_remat_size": 0}, "Parallel sizes must be positive"),
+        ({"tensor_parallel_num_sequence_shards": 0}, "must be positive"),
+        (
+            {"tensor_parallel_num_sequence_shards": 2, "gtp_weight_remat_size": 2},
+            "Runtime context-parallel size",
+        ),
+        (
+            {
+                "context_parallel_size": 2,
+                "gtp_weight_remat_size": 3,
+                "tensor_parallel_num_sequence_shards": 2,
+            },
+            "must divide",
+        ),
+        ({"tensor_model_parallel_size": 3}, "world_size .* must be divisible"),
+    ],
+)
+def test_parallel_size_helpers_reject_invalid_topology(monkeypatch, run_config, overrides, error):
+    run_config.dist.world_size = 8
+    for name, value in overrides.items():
+        monkeypatch.setattr(run_config.model.transformer, name, value)
+    before = deepcopy(run_config.to_dict())
+    for helper in (run_config.get_data_parallel_size, run_config.get_batch_parallel_size):
+        with pytest.raises(ValueError, match=error):
+            helper()
+    assert run_config.to_dict() == before
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])

@@ -3062,7 +3062,7 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     from megatron.training.config import DistributedInitConfig
 
-    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig, exclude=["world_size"])
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--use-megatron-fsdp', action='store_true', default=False,

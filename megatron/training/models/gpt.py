@@ -220,10 +220,11 @@ class GPTModelConfig(ModelConfig):
     def finalize(self) -> None:
         """One time validation to run once config is ready to be used by builder."""
 
-        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
-            self.transformer.finalize()
+        super().finalize()
 
-        if self.transformer.cuda_graph_impl != "none":
+        if self.transformer.cuda_graph_impl != "none" and "transformer_engine" in (
+            self.transformer.transformer_impl, self.transformer.cuda_graph_impl
+        ):
             assert self.transformer.use_te_rng_tracker, (
                 "Transformer engine's RNG tracker is required for cudagraphs, it can be "
                 "enabled with use_te_rng_tracker=True'."

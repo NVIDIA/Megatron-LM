@@ -18,7 +18,6 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
-from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
@@ -233,7 +232,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         global_batch_size=cfg.train.global_batch_size,
         micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
-        data_parallel_size=get_batch_parallel_size(args),
+        data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=args.seq_length,
@@ -344,7 +343,7 @@ def _set_tensorboard_writer(args):
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
                                    'tensorboard writer')
 
-    if cfg.logger.tensorboard_dir and args.rank == (args.world_size - 1):
+    if cfg.logger.tensorboard_dir and args.rank == (cfg.dist.world_size - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
             print('> setting tensorboard ...')
@@ -362,7 +361,7 @@ def _set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
-    if cfg.logger.wandb_project and args.rank == (args.world_size - 1):
+    if cfg.logger.wandb_project and args.rank == (cfg.dist.world_size - 1):
         if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
@@ -397,7 +396,7 @@ def _set_one_logger(args):
     global _GLOBAL_ONE_LOGGER
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
-    if cfg.logger.enable_one_logger and args.rank == (args.world_size - 1):
+    if cfg.logger.enable_one_logger and args.rank == (cfg.dist.world_size - 1):
         if cfg.logger.one_logger_async or cfg.logger.wandb_project:
             one_logger_async = True
         else:
@@ -524,16 +523,18 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.data_parallel.size', 'data_parallel_size'),
         ('dl.sequence_length', 'seq_length'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]
     if include_training:
+        resource_attrs['dl.data_parallel.size'] = cfg.get_data_parallel_size()
         fields.extend([
             ('dl.batch_size', 'global_batch_size'),
             ('megatron.train_iters', 'train_iters'),
             ('megatron.micro_batch_size', 'micro_batch_size'),
         ])
+    else:
+        fields.append(('dl.data_parallel.size', 'data_parallel_size'))
     for attr, arg_name in fields:
         val = getattr(args, arg_name, None)
         if val is not None:
@@ -651,7 +652,7 @@ def _set_telemetry(args, *, include_training: bool = True):
     )
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
-        config, rank=args.rank, world_size=args.world_size,
+        config, rank=args.rank, world_size=cfg.dist.world_size,
         resource_attributes=resource_attrs,
     )
 

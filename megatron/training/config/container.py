@@ -49,6 +49,47 @@ class ConfigContainerBase:
 
     _finalized: bool = field(default=False, init=False, repr=False, compare=False)
 
+    def get_model_world_size(self) -> int:
+        """Return ranks in the model grid, which may be a subset of the launch."""
+        world_size = getattr(self.model, "training_world_size", None)
+        if world_size is None:
+            world_size = self.dist.world_size
+        if not 0 < world_size <= self.dist.world_size:
+            raise ValueError("Training model world size must fit within the global launch")
+        return world_size
+
+    def get_data_parallel_size(self) -> int:
+        """Return replica DP, excluding batch partitions within GTP weight groups."""
+        world_size = self.get_model_world_size()
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        # Runtime CP already includes sequence shards inside each GTP weight group.
+        model_parallel_size = tp * pp * (cp // sequence_shards) * weight_size
+        if world_size % model_parallel_size:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by TP x PP x "
+                f"CP x weight-remat size ({model_parallel_size})"
+            )
+        return world_size // model_parallel_size
+
+    def get_batch_parallel_size(self) -> int:
+        """Return independent batch partitions, including GTP batch shards but not CP."""
+        data_parallel_size = self.get_data_parallel_size()
+        transformer = self.model.transformer
+        return (
+            data_parallel_size
+            * transformer.gtp_weight_remat_size
+            // transformer.gtp_remat_num_sequence_shards
+        )
+
     def validate(self) -> None:
         """Check sub-configs without mutation; callers may validate repeatedly."""
         for config_field in dataclass_fields(self):
@@ -293,7 +334,7 @@ class PretrainConfigContainer(ConfigContainerBase):
     straggler: StragglerDetectionConfig | None = None
 
     def finalize_optimizer_config(self, optimizer: OptimizerConfig) -> OptimizerConfig:
-        """Derive shared precision for the configured or legacy-built optimizer."""
+        """Derive configured or legacy-built optimizer precision from the finalized model."""
         # Reconstruct so optimizer-local derived precision settings are recomputed too.
         return replace(
             optimizer,
@@ -354,14 +395,15 @@ class PretrainConfigContainer(ConfigContainerBase):
         return global_batch_size, eval_global_batch_size, eval_micro_batch_size
 
     def validate(self) -> None:
-        """Validate each section, then the RL section against the rest of the run."""
+        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
         self.rl.validate_ddp_config(self.ddp)
         super().validate()
+        self._validate_gtp_config()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
 
-    def _validate_rl_config(self, global_batch_size: int | None) -> None:
-        """Check RL policy against the supplied or resolved training batch size."""
+    def _validate_gtp_config(self) -> None:
+        """Check GTP compatibility with checkpointing and distributed configuration."""
         transformer = getattr(self.model, "transformer", None)
         if transformer is not None and transformer.gtp_remat_num_sequence_shards > 1:
             if self.checkpoint.ckpt_format != "torch_dist":
@@ -370,6 +412,10 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
+
+    def _validate_rl_config(self, global_batch_size: int | None) -> None:
+        """Check RL policy against the supplied or resolved training batch size."""
+        transformer = getattr(self.model, "transformer", None)
         cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
         self.rl.validate_run(
             cuda_graph_impl=cuda_graph_impl,
@@ -382,26 +428,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         )
 
     def _finalize(self) -> None:
-        from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
-        from megatron.training import get_args
-
-        # Launch size remains a runtime input until the remaining args migration.
-        # Model topology comes only from its config, including the MIMO language grid.
-        args = get_args()
-        transformer = self.model.transformer
-        sequence_shards = transformer.gtp_remat_num_sequence_shards
-        if transformer.context_parallel_size % sequence_shards:
-            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
-        layout = GTPParallelLayout(
-            world_size=getattr(args, "mimo_llm_world_size", args.world_size),
-            tp=transformer.tensor_model_parallel_size,
-            pp=transformer.pipeline_model_parallel_size,
-            cp=transformer.context_parallel_size // sequence_shards,
-            weight_size=transformer.gtp_weight_remat_size,
-            num_sequence_shards=sequence_shards,
-        )
-        batch_sizes = self._resolve_batch_sizes(layout.batch_parallel_size)
+        batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
+        # Resolve RNG and model settings before deriving optimizer precision.
+        super()._finalize()
+        self.model.finalize()
         optimizer = self.finalize_optimizer_config(self.optimizer)
         (
             self.train.global_batch_size,
@@ -409,10 +440,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
         self.optimizer = optimizer
-        # Runtime consumers still read these derived facts from args during migration.
-        args.data_parallel_size = layout.dp
-        args.batch_parallel_size = layout.batch_parallel_size
-        super()._finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
 

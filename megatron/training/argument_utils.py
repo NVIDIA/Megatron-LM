@@ -789,6 +789,7 @@ def model_provider_config_from_args(
     return model_config_cls(
         transformer=transformer,
         seq_length=args.max_position_embeddings,
+        training_world_size=getattr(args, "mimo_llm_world_size", None),
         vocab_size=vocab_size,
         logit_dtype=getattr(args, "logit_dtype", None),
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
