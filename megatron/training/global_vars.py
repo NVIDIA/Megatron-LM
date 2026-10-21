@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron global variables."""
 
@@ -165,13 +165,20 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct training runtime services."""
+    """Register caller-provided args/config and construct training runtime services.
+
+    A container that carries a dataset section (``cfg.data.dataset``) is finalized here, as
+    ``initialize_megatron`` does, because the runtime services bind the tokenizer to the finalized
+    section; every other container is validated only, as before.
+    """
 
     assert args is not None
     assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     cfg_container.validate()
+    if getattr(getattr(cfg_container, "data", None), "dataset", None) is not None:
+        cfg_container.finalize()
     set_run_config(cfg_container)
     set_args(args)
     initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
@@ -187,6 +194,7 @@ def initialize_runtime_services(
     if build_tokenizer:
         _build_tokenizer(args)
     resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
+    _prepare_dataset_config(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -309,6 +317,28 @@ def rebuild_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
     return _build_tokenizer(args)
+
+
+def _prepare_dataset_config(cfg) -> None:
+    """Bind the run's tokenizer to ``cfg.data.dataset`` (Megatron Core's post-init runs once).
+
+    Only GPT entry points carry a dataset there, and nothing happens without a tokenizer
+    (``build_tokenizer=False``: the provider then reports the unprepared config). The container
+    must be finalized first, as ``initialize_megatron`` and ``set_global_variables`` do (the
+    mirrors are written then). A config prepared earlier with this tokenizer is left as is; one
+    prepared with another tokenizer is an error: ``prepare()`` decides.
+    """
+    data = getattr(cfg, "data", None)
+    dataset = getattr(data, "dataset", None)
+    if dataset is None or _GLOBAL_TOKENIZER is None:
+        return
+    if not getattr(cfg, "_finalized", False):
+        raise RuntimeError(
+            "cfg.data.dataset cannot bind the tokenizer before the container is finalized: call "
+            "cfg.finalize() before initialize_runtime_services(), as initialize_megatron() and "
+            "set_global_variables() do."
+        )
+    dataset.prepare(_GLOBAL_TOKENIZER)
 
 
 def _set_tensorboard_writer(args):

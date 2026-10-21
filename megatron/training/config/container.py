@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import os
 from dataclasses import dataclass, field
@@ -16,7 +16,14 @@ except ImportError:
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
+from megatron.training.config.dataset_config import (
+    LAYOUT_MIRRORS,
+    MIRROR_FIELDS,
+    DataConfig,
+    mirror_is_unset,
+)
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
@@ -34,7 +41,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -76,12 +83,19 @@ class ConfigContainerBase:
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))
-    
+
+    @classmethod
+    def _upgrade_config_dict(cls, config_dict: dict[str, Any], legacy_args: Any) -> dict[str, Any]:
+        """Hook for containers that complete configurations saved by older versions."""
+        return config_dict
+
     @classmethod
     def from_dict(
         cls: Type[T],
         config_dict: dict[str, Any],
         mode: InstantiationMode = InstantiationMode.STRICT,
+        *,
+        legacy_args: Any = None,
     ) -> T:
         """
         Create a config container from a dictionary.
@@ -89,6 +103,8 @@ class ConfigContainerBase:
         Args:
             config_dict: Dictionary containing configuration
             mode: Serialization mode (strict or lenient)
+            legacy_args: Optional validated argparse namespace used to complete sections that
+                the dictionary predates (see ``PretrainConfigContainer``)
 
         Returns:
             A new instance of this class initialized with the dictionary values
@@ -101,6 +117,7 @@ class ConfigContainerBase:
         # Apply backward compatibility: remove init=False fields that may have been
         # serialized by older versions (these are computed in __post_init__)
         config_dict = sanitize_dataclass_config(config_dict)
+        config_dict = cls._upgrade_config_dict(config_dict, legacy_args)
 
         # Check for extra keys in strict mode
         expected_fields = {f.name for f in dataclass_fields(cls) if not f.name.startswith("_")}
@@ -121,13 +138,21 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
+    def from_yaml(
+        cls: Type[T],
+        yaml_path: str,
+        mode: InstantiationMode = InstantiationMode.LENIENT,
+        *,
+        legacy_args: Any = None,
+    ) -> T:
         """
         Create a config container from a YAML file.
 
         Args:
             yaml_path: Path to the YAML file
             mode: Serialization mode (strict or lenient)
+            legacy_args: Optional validated argparse namespace used to complete sections that
+                the file predates (see ``PretrainConfigContainer``)
 
         Returns:
             A new instance of this class initialized with the YAML file values
@@ -151,7 +176,10 @@ class ConfigContainerBase:
         # Convert to OmegaConf first for better compatibility with instantiate
         conf = OmegaConf.create(config_dict)
 
-        return cls.from_dict(OmegaConf.to_container(conf, resolve=True), mode=mode)
+        config_dict = OmegaConf.to_container(conf, resolve=True)
+        if legacy_args is None:
+            return cls.from_dict(config_dict, mode=mode)
+        return cls.from_dict(config_dict, mode=mode, legacy_args=legacy_args)
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -269,6 +297,16 @@ class ConfigContainerBase:
 
         return result
 
+def _current_world_size() -> int:
+    """The world size the run is launched with: the initialized process group, else ``WORLD_SIZE``
+    (the source of ``args.world_size``); ``finalize()`` runs before distributed initialization."""
+    import torch
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return int(os.getenv("WORLD_SIZE", "1"))
+
+
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
     """Top-level container holding all configuration objects."""
@@ -278,7 +316,10 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: HybridModelConfig | GPTModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
-    # dataset: GPTDatasetConfig # TODO (@maanug): add support
+    data: DataConfig = field(default_factory=DataConfig)
+    """The dataset config, the loader settings and the dataset class. The GPT entry points build
+    their datasets from it (``gpt_data_config_from_args``); every other entry point carries the
+    loader settings only (``data.dataset is None``). See ``megatron.training.config.dataset_config``."""
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)
     rng: RNGConfig = field(default_factory=RNGConfig)
@@ -306,11 +347,146 @@ class PretrainConfigContainer(ConfigContainerBase):
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+        self._validate_data_section()
+
+    def get_data_parallel_size(self, world_size: int) -> int | None:
+        """The data-parallel size of this run's model layout, or ``None`` without a model config.
+
+        The same quotient as ``validate_args``: ``world_size // (tp * pp * cp * weight-remat)`` with
+        the *configured* context-parallel size. The model config stores the resolved one (configured
+        CP times the GTP sequence shards), so the shards are divided out first; ``GTPParallelLayout``
+        checks the divisions.
+        """
+        transformer = getattr(self.model, "transformer", None)
+        if transformer is None:
+            return None
+        shards = getattr(transformer, "gtp_remat_num_sequence_shards", 1) or 1
+        resolved_cp = transformer.context_parallel_size
+        if resolved_cp % shards:
+            raise ValueError(
+                f"context_parallel_size ({resolved_cp}) must be a multiple of the GTP sequence "
+                f"shards ({shards})."
+            )
+        layout = GTPParallelLayout(
+            world_size=world_size,
+            tp=transformer.tensor_model_parallel_size,
+            pp=transformer.pipeline_model_parallel_size,
+            cp=resolved_cp // shards,
+            weight_size=getattr(transformer, "gtp_weight_remat_size", 1) or 1,
+            num_sequence_shards=shards,
+        )
+        return layout.dp
+
+    def _written_mirrors(self) -> tuple[str, ...]:
+        """The dataset mirrors this container writes at ``finalize()``: all of them, less the layout
+        fields when there is no model config to derive them from."""
+        if getattr(self.model, "transformer", None) is None:
+            return tuple(name for name in MIRROR_FIELDS if name not in LAYOUT_MIRRORS)
+        return MIRROR_FIELDS
+
+    def _data_owner_values(self, world_size: int | None = None) -> dict[str, Any]:
+        """The values the other sections own for the mirrors this container writes.
+
+        ``data_parallel_size`` needs the world size as well as the model layout and is left out
+        without one; the other layout fields need the model layout; the seed and the validation
+        flags are always available.
+        """
+        if self.data.dataset is None:
+            return {}
+        mirrors = self._written_mirrors()
+        values: dict[str, Any] = {}
+        if "random_seed" in mirrors:
+            values["random_seed"] = self.rng.seed
+        if "full_validation" in mirrors:
+            values["full_validation"] = self.validation.full_validation
+        if "multiple_validation_sets" in mirrors:
+            values["multiple_validation_sets"] = self.validation.multiple_validation_sets
+        transformer = getattr(self.model, "transformer", None)
+        if "context_parallel_size" in mirrors:
+            values["context_parallel_size"] = transformer.context_parallel_size
+        if "sequence_parallel_size" in mirrors:
+            values["sequence_parallel_size"] = transformer.tensor_model_parallel_size * int(
+                bool(transformer.sequence_parallel)
+            )
+        if "hybrid_context_parallel" in mirrors:
+            values["hybrid_context_parallel"] = bool(
+                getattr(transformer, "hybrid_context_parallel", False)
+            )
+        if "data_parallel_size" in mirrors and world_size is not None:
+            values["data_parallel_size"] = self.get_data_parallel_size(world_size)
+        return values
+
+    @staticmethod
+    def _check_mirror(dataset: Any, name: str, owned: Any) -> None:
+        """An explicit mirror value must agree with the section that owns it."""
+        explicit = getattr(dataset, name)
+        if explicit is not None and explicit != owned:
+            raise ValueError(
+                f"data.dataset.{name}={explicit!r} disagrees with the section that owns it "
+                f"({owned!r}); the container writes this field at finalize(), leave it unset."
+            )
+
+    def _validate_data_section(self) -> None:
+        """Cross-section checks for ``data.dataset``: the model capacity covers the sample length,
+        an explicit mirror agrees with the section that owns it, and a mirror this container does
+        not write is left unset (it is not saved with the section, so a reloaded run could not
+        reproduce it). ``data_parallel_size`` needs the world size and is checked at ``finalize()``.
+        """
+        dataset = self.data.dataset
+        if dataset is None:
+            return
+        capacity = getattr(self.model, "seq_length", None)
+        if isinstance(capacity, int) and isinstance(dataset.sequence_length, int):
+            if capacity < dataset.sequence_length:
+                raise ValueError(
+                    f"model.seq_length ({capacity}, the position-embedding capacity, "
+                    "--max-position-embeddings) must be greater than or equal to "
+                    f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
+                )
+        for name, owned in self._data_owner_values().items():
+            self._check_mirror(dataset, name, owned)
+        written = self._written_mirrors()
+        for name in MIRROR_FIELDS:
+            if name in written or mirror_is_unset(dataset, name):
+                continue
+            raise ValueError(
+                f"data.dataset.{name}={getattr(dataset, name)!r} is not written by this container "
+                "(there is no model config to derive the layout from) and is not saved with the "
+                "section: leave it unset."
+            )
 
     def _finalize(self) -> None:
+        dataset = self.data.dataset
+        owned: dict[str, Any] = {}
+        if dataset is not None:
+            # With the world size known, data_parallel_size gets the agreement check as well,
+            # before anything is written.
+            owned = self._data_owner_values(world_size=_current_world_size())
+            for name, value in owned.items():
+                self._check_mirror(dataset, name, value)
         super()._finalize()
+        for name, value in owned.items():
+            setattr(dataset, name, value)
+        self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+    @classmethod
+    def _upgrade_config_dict(cls, config_dict: dict[str, Any], legacy_args: Any) -> dict[str, Any]:
+        """Complete a run configuration saved before the ``data`` section existed.
+
+        The section takes its defaults when missing; with ``legacy_args`` the loader settings come
+        from the legacy arguments. Dataset sections are supplied by the GPT entry points, as for a
+        fresh run, never inferred from the arguments here.
+        """
+        if "data" in config_dict or legacy_args is None:
+            return config_dict
+        from megatron.training.argument_utils import dataloader_config_from_args
+
+        config_dict["data"] = cls._convert_value_to_dict(
+            DataConfig(dataloader=dataloader_config_from_args(legacy_args))
+        )
+        return config_dict
 
 
 @dataclass(kw_only=True)
