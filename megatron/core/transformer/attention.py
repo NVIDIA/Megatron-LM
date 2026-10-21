@@ -5,6 +5,7 @@ import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import partial
 from typing import Callable, Optional, Protocol, Tuple, Union
 
 import torch
@@ -1058,6 +1059,64 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # Auto: prefer the newest available generation.
         return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
 
+    def exact_decode_and_prefill(
+        self,
+        context: BaseInferenceContext,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqlens_k,
+        block_table,
+        is_decode_only,
+        softmax_offset: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Exact attention over the paged KV cache, with the bytes of the training forward.
+
+        Mixed batches run the varlen prefill kernel; decode-only batches run split decode
+        (one token per request) or verify (several tokens per request).
+        """
+        from megatron.core.transformer.exact_attention.decode_api import (
+            get_exact_decoder,
+            page_view,
+        )
+
+        assert not self.training
+        if softmax_offset is not None:
+            raise ValueError("exact attention does not support a softmax offset")
+        attn = self.core_attention.kernel(q.device)
+        k_pages, v_pages, page_table = page_view(k, v, block_table)
+        seqused_k = seqlens_k.to(torch.int32)
+        if not is_decode_only:
+            if context.using_cuda_graph_this_step():
+                raise ValueError("exact attention does not support CUDA graphs for prefill steps")
+            out = attn.prefill_paged(
+                q.squeeze(1), k_pages, v_pages, cu_seqlens_q.to(torch.int32), seqused_k, page_table
+            )
+            return out.unsqueeze(1)
+        num_requests = seqlens_k.shape[0]
+        tokens = int(max_seqlen_q) if self.batch_invariant_mode else q.shape[0] // num_requests
+        rows = num_requests * tokens
+        decoder = get_exact_decoder(
+            attn,
+            context.max_requests,
+            context.max_sequence_length,
+            context.num_speculative_tokens + 1,
+        )
+        out = q.new_zeros(q.shape) if rows < q.shape[0] else torch.empty_like(q)
+        decoder.verify(
+            q[:rows].reshape(num_requests, tokens, q.shape[2], q.shape[3]),
+            k_pages,
+            v_pages,
+            page_table,
+            seqused_k,
+            out=out[:rows].view(num_requests, tokens, q.shape[2], q.shape[3]),
+        )
+        return out
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -1669,7 +1728,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
+                flash_fn = self.flash_decode_and_prefill
+                if self.config.attention_backend == AttnBackend.exact:
+                    flash_fn = partial(self.exact_decode_and_prefill, inference_context)
+                core_attn_out = flash_fn(
                     q,
                     k,
                     v,
