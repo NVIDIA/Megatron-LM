@@ -37,7 +37,10 @@ def prepare_packed_seq_params(
         and packed_seq_params.cp_group is None
     ):
         packed_seq_params.cp_group = cp_group
-    packed_seq_params = finalize_packed_seq_params(packed_seq_params)
+    # The fused TP x CP layout route only matters for sequence-parallel shards.
+    packed_seq_params = finalize_packed_seq_params(
+        packed_seq_params, sequence_parallel=getattr(config, "sequence_parallel", False)
+    )
     if packed_seq_params is None:
         return packed_seq_params
     if getattr(config, "hca_aligned_backward", False) and not cuda_graph_captures_attention(config):
