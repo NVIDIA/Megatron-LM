@@ -57,3 +57,27 @@ def test_ratio_two_geometry_and_open_group_adjoint():
     assert torch.isfinite(dx).all() and torch.isfinite(dw).all()
     assert dx[-1].eq(0).all() and dx[:-1].count_nonzero()
     assert dw.count_nonzero()
+
+
+def test_packed_documents_pool_like_separate_requests():
+    from megatron.lite.model.deepseek_v41.vllm.compressed import metadata, pool_vjp
+
+    torch.manual_seed(48)
+    lengths = [31, 0, 17, 6]
+    for ratio, width in ((1, 512), (2, 1024)):
+        m = metadata(lengths, ratio, 'cpu')
+        counts = [n // ratio for n in lengths]
+        assert m.counts == counts and m.lengths.tolist() == [sum(counts)]
+        assert m.slots[m.slots >= 0].tolist() == list(range(sum(counts)))
+        raw = torch.randn(sum(lengths), width)
+        weight = torch.randn(512)
+        grad = torch.randn(sum(lengths), 512)
+        dx, dw = pool_vjp(raw, weight, ratio, grad, 1e-6, m.closers)
+        pieces, total, start = [], torch.zeros(512), 0
+        for n in lengths:
+            a, b = pool_vjp(raw[start : start + n], weight, ratio, grad[start : start + n], 1e-6)
+            pieces.append(a)
+            total += b
+            start += n
+        torch.testing.assert_close(dx, torch.cat(pieces), rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(dw, total, rtol=1e-5, atol=1e-5)

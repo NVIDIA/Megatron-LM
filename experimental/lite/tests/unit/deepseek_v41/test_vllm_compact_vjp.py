@@ -127,49 +127,90 @@ def test_thd_projections_are_batched_and_metadata_tracks_boundary_changes(monkey
         _dsv4_compress_ratio=0,
     )
     params = SimpleNamespace(qkv_format='thd', cu_seqlens_q_padded=torch.tensor([0, 3, 3, 9]))
-    calls, rows, tails = [], [], []
+    calls, layouts = [], []
 
     def projections(module, x):
         calls.append(x.shape[0])
         return x
 
-    def document(module, hidden, positions, cache, *, projected, metadata, project, **kwargs):
-        assert project is False
+    def batched(module, hidden, positions, cache, *, projected, layout, source, **kwargs):
+        # One call over every document; positions restart per document.
+        assert source is None
         raw_equal(hidden.flatten(1), projected)
-        raw_equal(positions, torch.arange(hidden.shape[0]))
-        raw_equal(metadata[0], torch.tensor([0, hidden.shape[0]]))
-        raw_equal(metadata[1], torch.tensor([hidden.shape[0]]))
-        rows.append(hidden.shape[0])
-        return hidden.flatten(1) * 2
-
-    def tail(module, out, positions, cache):
-        # One row-wise wo_a/wo_b over every document's rows, positions restarting per doc.
-        lengths = [b - a for a, b in zip(cu.tolist(), cu.tolist()[1:])]
-        raw_equal(positions, torch.cat([torch.arange(n) for n in lengths]))
-        tails.append(out.shape[0])
-        return out
+        raw_equal(positions, torch.cat([torch.arange(n) for n in layout.lengths]))
+        raw_equal(layout.cu, torch.tensor([lo for lo, _ in layout.documents] + [9]).int())
+        raw_equal(layout.seq, torch.tensor(layout.lengths).int())
+        layouts.append(layout.documents)
+        return hidden * 2
 
     monkeypatch.setattr(attention, '_projections', projections)
-    monkeypatch.setattr(attention, '_projection_rows', lambda x, lo, hi: x[lo:hi])
-    monkeypatch.setattr(attention, 'swa_forward', document)
-    monkeypatch.setattr(attention, 'output_projection', tail)
-    cu = params.cu_seqlens_q_padded
+    monkeypatch.setattr(attention, 'swa_forward', batched)
     x = torch.randn(9, 1, 32, requires_grad=True)
     for grad_enabled in (False, True):
         with torch.set_grad_enabled(grad_enabled):
             output, _ = attention.SWAAttention.forward(state, x, packed_seq_params=params)
         raw_equal(output, x * 2)
-    assert calls == [9, 9] and rows == [3, 6, 3, 6] and tails == [9, 9]
+    assert calls == [9, 9] and layouts == [[(0, 3), (3, 3), (3, 9)]] * 2
     cached = params._deployment_documents
     assert params._deployment_documents is cached
     params.cu_seqlens_q_padded[1] = 2
     attention.SWAAttention.forward(state, x, packed_seq_params=params)
-    assert rows[-3:] == [2, 1, 6] and params._deployment_documents is not cached
+    assert layouts[-1] == [(0, 2), (2, 3), (3, 9)] and params._deployment_documents is not cached
     output.sum().backward()
     raw_equal(x.grad, torch.full_like(x, 2))
+    params.cu_seqlens_q_padded = torch.tensor([0, 4])
+    with pytest.raises(ValueError, match='tiling'):
+        attention.SWAAttention.forward(state, x, packed_seq_params=params)
     params.cu_seqlens_q_padded = torch.tensor([0, 0])
     output, _ = attention.SWAAttention.forward(state, x[:0], packed_seq_params=params)
     assert output.shape == x[:0].shape and calls == [9, 9, 9]
+
+
+def _combine_reference(topk, cu, lengths, window, ratio, top_k, stride, width):
+    """vLLM ``CombineTopkSwaIndicesKernel`` (op-build 8a7fa58d76) for full prefills."""
+    rows = []
+    for b, (lo, hi) in enumerate(zip(cu, cu[1:])):
+        for pos in range(hi - lo):
+            count = min((pos + 1) // ratio, top_k) if ratio else 0
+            picked = [
+                stride * b + t if 0 <= t < width else -1 for t in topk[lo + pos][:count].tolist()
+            ]
+            swa = [stride * b + width + j for j in range(max(pos - window + 1, 0), pos + 1)]
+            rows.append(picked + swa)
+    return rows
+
+
+@pytest.mark.parametrize('ratio', [0, 1, 2])
+def test_batched_index_remap_reads_each_documents_own_rows(ratio):
+    torch.manual_seed(47)
+    lengths, window, top_k = [31, 0, 17, 40], 8, 6
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + n)
+    documents = list(zip(cu, cu[1:]))
+    counts = [n // ratio if ratio else 0 for n in lengths]
+    topk = torch.full((cu[-1], top_k), -1, dtype=torch.int32)
+    for (lo, hi), count in zip(documents, counts):
+        for pos in range(hi - lo):
+            valid = min((pos + 1) // ratio, top_k) if ratio else 0
+            topk[lo + pos, :valid] = torch.randperm(max((pos + 1) // max(ratio, 1), 1))[:valid]
+    layout = attention._documents(documents, 'cpu')
+    total, width = sum(counts), max(counts)
+    stride, table = attention._remap(layout, ratio, width, total, 'cpu')
+    batched = _combine_reference(topk, cu, lengths, window, ratio, top_k, stride, width)
+    for (lo, hi), count, first in zip(documents, counts, [sum(counts[:d]) for d in range(4)]):
+        alone = _combine_reference(
+            topk[lo:hi], [0, hi - lo], [hi - lo], window, ratio, top_k, count + hi - lo, count
+        )
+        for pos in range(hi - lo):
+            got = [int(table[v]) if v >= 0 else -1 for v in batched[lo + pos]]
+            # Single-document KV is [own compressed | own rows]; batched KV is
+            # [all compressed | all rows]: translate the single-document address.
+            want = [
+                -1 if v < 0 else first + v if v < count else total + lo + v - count
+                for v in alone[pos]
+            ]
+            assert got == want
 
 
 def test_projection_rows_preserve_fp8_codes_and_scale_bytes(monkeypatch):

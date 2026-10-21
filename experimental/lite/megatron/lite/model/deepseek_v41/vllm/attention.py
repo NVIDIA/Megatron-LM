@@ -408,6 +408,42 @@ def _projection_rows(projected, lo, hi):
     return raw[lo:hi], qr[lo:hi], kv[lo:hi], q[lo:hi], sliced
 
 
+def _documents(documents, device):
+    """THD document row ranges as vLLM requests: per-document positions, query start
+    locations and lengths, plus per-ratio index remaps (see :func:`swa_forward`)."""
+    from types import SimpleNamespace
+
+    lengths = [hi - lo for lo, hi in documents]
+    starts = [lo for lo, _ in documents] + [documents[-1][1] if documents else 0]
+    return SimpleNamespace(
+        documents=documents,
+        lengths=lengths,
+        positions=torch.cat(
+            [torch.zeros(0, dtype=torch.int64)] + [torch.arange(n) for n in lengths]
+        ).to(device),
+        cu=torch.tensor(starts, dtype=torch.int32, device=device),
+        seq=torch.tensor(lengths, dtype=torch.int32, device=device),
+        remap={},
+    )
+
+
+def _remap(layout, ratio, width, total, device):
+    """``combine_topk_swa_indices`` addresses request ``b``'s workspace as
+    ``M*b + [compressed (N rows) | SWA rows]``. Map that to the packed KV
+    ``[every document's compressed rows | every THD row]`` actually passed."""
+    if ratio not in layout.remap:
+        counts = [n // ratio if ratio else 0 for n in layout.lengths]
+        first = [sum(counts[:d]) for d in range(len(counts))]
+        rows = [lo for lo, _ in layout.documents]
+        stride = width + max(layout.lengths, default=0)
+        v = torch.arange(len(counts) * stride, device=device)
+        b, r = v // stride, v % stride
+        compressed = torch.tensor(first, dtype=torch.int64, device=device)[b] + r
+        swa = total + torch.tensor(rows, dtype=torch.int64, device=device)[b] + r - width
+        layout.remap[ratio] = stride, torch.where(r < width, compressed, swa).int()
+    return layout.remap[ratio]
+
+
 def swa_forward(
     attention,
     hidden,
@@ -417,12 +453,14 @@ def swa_forward(
     observe=None,
     source=None,
     projected=None,
-    metadata=None,
+    layout=None,
     project=True,
 ):
+    """All packed documents in one pass: every op is row-wise or per request, so each
+    document's rows carry the bits of a single-document call."""
     emit = observe or (lambda name, value: None)
     x = hidden.reshape(-1, hidden.shape[-1])
-    raw, qr, kv, q, qa = _projections(attention, x)[:5] if projected is None else projected
+    raw, qr, kv, q, qa = (_projections(attention, x) if projected is None else projected)[:5]
     for name, value in (
         ('qkv_projection', raw),
         ('q_norm', qr),
@@ -436,29 +474,28 @@ def swa_forward(
     from vllm.models.deepseek_v41.common.ops import combine_topk_swa_indices
 
     rows = x.shape[0]
-    if metadata is None:
-        metadata = (
-            torch.tensor([0, rows], device=x.device, dtype=torch.int32),
-            torch.tensor([rows], device=x.device, dtype=torch.int32),
-        )
-    cu, lengths = metadata
-    ratio, offset = 0, 0
+    if layout is None:
+        layout = _documents([(0, rows)], x.device)
+    ratio, width, total = 0, 0, 0
     topk = torch.empty((rows, 0), device=x.device, dtype=torch.int32)
     if source is not None:
         compressed, topk, ratio = source(x, qr, qa)
-        offset = compressed.shape[0]
+        width = max((n // ratio for n in layout.lengths), default=0)
+        total = compressed.shape[0]
         kv = torch.cat((compressed, kv), 0)
+    stride, table = _remap(layout, ratio, width, total, x.device)
     indices, lens = combine_topk_swa_indices(
         topk,
-        cu,
-        lengths,
-        lengths,
+        layout.cu,
+        layout.seq,
+        layout.seq,
         attention.config.csa_window_size,
         ratio,
         topk.shape[1],
-        rows + offset,
-        offset,
+        stride,
+        width,
     )
+    indices = torch.where(indices >= 0, table[indices.clamp_min(0).long()], indices)
     emit('swa_indices', indices)
     sink = attention.core_attention.native.attn_sink
     out = _Sparse.apply(q, kv, sink, indices, lens, attention.q_head_dim**-0.5)
@@ -557,46 +594,30 @@ class SWAAttention(DS41SelfAttention):
         cached = getattr(packed_seq_params, '_deployment_documents', None)
         if cached is None or cached[0] is not cu or cached[1] != cu._version:
             boundaries = cu.tolist()
-            documents = [
-                (
-                    lo,
-                    hi,
-                    torch.arange(hi - lo, device=cu.device),
-                    (cu.new_tensor([0, hi - lo]), cu.new_tensor([hi - lo])),
-                )
-                for lo, hi in zip(boundaries, boundaries[1:])
-            ]
-            cached = (cu, cu._version, documents, torch.cat([d[2] for d in documents]))
+            if boundaries[0] != 0 or boundaries[-1] != hidden_states.shape[0]:
+                raise ValueError('Deployment SWA requires THD documents tiling all rows')
+            documents = _documents(list(zip(boundaries, boundaries[1:])), cu.device)
+            cached = (cu, cu._version, documents)
             packed_seq_params._deployment_documents = cached
         if hidden_states.shape[0] == 0:
             return hidden_states * 0, None
-        projected = _projections(self, hidden_states.reshape(-1, hidden_states.shape[-1]))
-        pieces = []
-        for document, (lo, hi, positions, metadata) in enumerate(cached[2]):
-            if hi > lo:
+        layout = cached[2]
 
-                def sources(x, qr, qa):
-                    from .compressed import source
+        def sources(x, qr, qa):
+            from .compressed import source
 
-                    decoded, topk = source(
-                        self, x, qr, qa, self._deployment_rope, document, lambda name, value: None
-                    )
-                    return decoded, topk, self._dsv4_compress_ratio
+            decoded, topk = source(
+                self, x, qr, qa, self._deployment_rope, layout.documents, lambda *_: None
+            )
+            return decoded, topk, self._dsv4_compress_ratio
 
-                pieces.append(
-                    swa_forward(
-                        self,
-                        hidden_states[lo:hi],
-                        positions,
-                        self._deployment_rope,
-                        source=sources if self._dsv4_compress_ratio else None,
-                        projected=_projection_rows(projected, lo, hi),
-                        metadata=metadata,
-                        project=False,
-                    )
-                )
-        if not pieces:
-            return hidden_states * 0, None
-        out = torch.cat(pieces, 0) if len(pieces) > 1 else pieces[0]
-        result = output_projection(self, out, cached[3], self._deployment_rope)
-        return result.reshape_as(hidden_states), None
+        out = swa_forward(
+            self,
+            hidden_states,
+            layout.positions,
+            self._deployment_rope,
+            source=sources if self._dsv4_compress_ratio else None,
+            projected=_projections(self, hidden_states.reshape(-1, hidden_states.shape[-1])),
+            layout=layout,
+        )
+        return out, None
