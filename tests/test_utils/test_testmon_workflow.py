@@ -59,10 +59,16 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
     yq.write_text(
         f"#!{sys.executable}\n"
         "import json, sys, yaml\n"
-        "assert sys.argv[1:4] == ['-o', 'json', '[.products[].test_case[]]']\n"
-        "with open(sys.argv[4]) as stream:\n"
+        "assert sys.argv[1:3] == ['-o', 'json']\n"
+        "if len(sys.argv) == 5:\n"
+        "    assert sys.argv[3] == '[.products[].test_case[]]'\n"
+        "else:\n"
+        "    assert sys.argv[3] == "
+        "'[.products[].test_case[] | { \"bucket\": .}] | sort_by(.model, .test_case)'\n"
+        "with open(sys.argv[4]) if len(sys.argv) == 5 else sys.stdin as stream:\n"
         "    recipe = yaml.safe_load(stream)\n"
-        "print(json.dumps([case for product in recipe['products'] for case in product['test_case']]))\n"
+        "cases = [case for product in recipe['products'] for case in product['test_case']]\n"
+        "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
     )
     yq.chmod(0o755)
     for platform in ("h100", "gb200"):
@@ -762,7 +768,7 @@ def test_full_test_guards_override_selective_requests(
 
 
 @pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
-def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
+def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_environment, has_tests):
     # Hosted runners provide zstd, but the existing GPU baselines use gzip.
     zstd = tmp_path / "zstd"
     zstd.write_text("#!/bin/sh\nprintf '1.5.7\\n'\n")
@@ -799,7 +805,34 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     bucket = "tests/unit_tests/test_example.py"
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
-    assert workflow["jobs"]["select"]["name"] == "unit tests selection"
+    assert workflow["jobs"]["select"]["name"] == (
+        "${{ inputs.unit_testmon_mode == 'enforce' && 'unit tests selection' || 'Parse unit tests' }}"
+    )
+    assert "if" not in workflow["jobs"]["select"]
+    for step in workflow["jobs"]["select"]["steps"]:
+        if step["id"] in {"checkout", "parse-unit-tests"}:
+            assert "if" not in step
+        else:
+            assert "inputs.unit_testmon_mode == 'enforce'" in step["if"]
+    parser = _step("_unit-tests.yml", "select", "parse-unit-tests")
+    for platform in ("h100", "gb200"):
+        result, parsed = _run(
+            parser["run"], tmp_path, {**shell_environment, "RECIPE_PLATFORM": f"dgx_{platform}"}
+        )
+        assert result.returncode == 0, result.stderr
+        recipe = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
+        )
+        assert json.loads(parsed["unit-tests"]) == [
+            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+        ]
+    assert restore["env"]["BUCKETS"] == "${{ steps.parse-unit-tests.outputs.unit-tests }}"
+    assert workflow["jobs"]["select"]["outputs"]["unit-tests"] == (
+        "${{ steps.parse-unit-tests.outputs.unit-tests }}"
+    )
+    assert workflow[True]["workflow_call"]["outputs"]["unit-tests"]["value"] == (
+        "${{ jobs.select.outputs.unit-tests }}"
+    )
     assert workflow["jobs"]["run"]["needs"] == "select"
     expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
     expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
@@ -810,7 +843,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     context = {"needs": needs, "inputs": inputs}
     assert eval(expression, {"__builtins__": {}}, context) == has_tests
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
-        "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
+        "${{ fromJSON(needs.select.outputs.matrix || needs.select.outputs.unit-tests) }}"
     )
     assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
         "${{ matrix.mode || 'full' }}"
@@ -819,14 +852,23 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
     # CPU failures stop GPU scheduling; full-suite requests bypass selection.
     needs.select.result = "failure"
     assert not eval(expression, {"__builtins__": {}}, context)
-    needs.select.result = "skipped"
     inputs.unit_testmon_mode = "full"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    needs.select.result = "success"
     assert eval(expression, {"__builtins__": {}}, context)
     callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    assert "cicd-parse-unit-tests" not in yaml.safe_dump(callers)
     for job in callers.values():
         if job.get("uses") == "./.github/workflows/_unit-tests.yml":
             assert "strategy" not in job
-            assert "buckets" in job["with"]
+            assert "buckets" not in job["with"]
+    coverage = _step("cicd-main.yml", "Coverage", "coverage")
+    for variable, job in (
+        ("H100_BUCKETS", "cicd-unit-tests-latest"),
+        ("GB200_BUCKETS", "cicd-unit-tests-latest-gb200"),
+    ):
+        assert job in callers["Coverage"]["needs"]
+        assert coverage["env"][variable] == "${{ needs." + job + ".outputs.unit-tests || '[]' }}"
 
     for platform in ("dgx_h100", "dgx_gb200"):
         directory = tmp_path / f"unit-test-plan-{platform}"
@@ -844,7 +886,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
             )
         )
     result, outputs = _run(
-        _step("cicd-main.yml", "Coverage", "coverage")["run"],
+        coverage["run"],
         tmp_path,
         {
             "SELECTIVE": "true",
