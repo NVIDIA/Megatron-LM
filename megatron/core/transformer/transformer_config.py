@@ -1497,12 +1497,9 @@ class TransformerConfig(ModelParallelConfig):
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
     inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
-
-    Decode-only dynamic-inference graphs use this fixed prefix when their
-    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
-    and oversized decode graphs retain the full dispatcher buffer. Requires
-    the NVLS inference dispatcher and EP > 1.
+    """Deprecated and ignored. FlashInfer routed MXFP8 MoE sizes its per-row work by the
+    inference dispatcher's device-side valid-token count on every step, so no host-side
+    row bound is needed. Setting this emits a warning.
     """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
@@ -2166,24 +2163,11 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.inference_flashinfer_mxfp8_token_capacity is not None:
-                if self.inference_flashinfer_mxfp8_token_capacity <= 0:
-                    raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity must be > 0, got "
-                        f"{self.inference_flashinfer_mxfp8_token_capacity}"
-                    )
-                if (
-                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
-                    or not mxfp8_enabled
-                    or self.inference_moe_token_dispatcher_type != "nvls"
-                    or self.expert_model_parallel_size <= 1
-                ):
-                    raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity requires "
-                        "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
-                        "fp8_recipe='mxfp8', "
-                        "inference_moe_token_dispatcher_type='nvls' and "
-                        "expert_model_parallel_size > 1"
-                    )
+                warnings.warn(
+                    "inference_flashinfer_mxfp8_token_capacity is deprecated and ignored: "
+                    "FlashInfer routed MXFP8 MoE sizes its per-row work by the dispatcher's "
+                    "device-side valid-token count on every step."
+                )
 
             if self.batch_invariant_mode:
                 if self.inference_grouped_gemm_backend not in (

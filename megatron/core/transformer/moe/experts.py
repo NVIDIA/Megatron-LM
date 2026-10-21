@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
 import weakref
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
@@ -88,8 +89,17 @@ try:
 except ImportError:
     HAVE_FLASHINFER = False
 
+# Patch until TRTLLM kernels are updated.
+# Track flashinfer-ai/flashinfer#6783 flashinfer-ai/flashinfer#6784 flashinfer-ai/flashinfer#6785
+FLASHINFER_HAS_ACTIVE_TOKENS = (
+    HAVE_FLASHINFER
+    and os.environ.get("MCORE_FLASHINFER_ACTIVE_TOKENS", "1") != "0"
+    and "num_active_tokens" in inspect.signature(fused_moe.cutlass_fused_moe).parameters
+)
+
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe.flashinfer_bf16 import combine_valid_rows
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     flashinfer_routed_mxfp8_moe,
     prepare_routed_mxfp8_weights,
@@ -1351,7 +1361,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
-        self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1584,14 +1593,37 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 num_experts=self.num_local_experts * self.ep_group.size(),
                 local_expert_offset=self.ep_group.rank() * self.num_local_experts,
                 activation_type=self._flashinfer_activation_type.value,
+                valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
                 out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
-                token_capacity=self._flashinfer_mxfp8_token_capacity,
-                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
             return output, None
+        routing_ids = routing_map.int()
+        rsv = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        bounded = rsv is not None and self.ep_group.size() > 1
+        if bounded and FLASHINFER_HAS_ACTIVE_TOKENS:
+            # FlashInfer with a device token count: use the kernel's own finalize.
+            fused_moe.cutlass_fused_moe(
+                hidden_states,
+                routing_ids,
+                probs,
+                self._fc1_weight,
+                self._fc2_weight,
+                torch.float32,
+                quant_scales=None,
+                activation_type=self._flashinfer_activation_type,
+                ep_size=self.ep_group.size(),
+                ep_rank=self.ep_group.rank(),
+                output=rsv,
+                num_active_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            )
+            return rsv, None
+        # enable_alltoall swaps the kernel's one-block-per-buffer-row, zero-filling finalize
+        # for a persistent one bounded by its device count of locally routed rows;
+        # combine_valid_rows then zeroes the live tokens it skipped into the fp32 RSV buffer,
+        # bounded by valid_tokens.
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
-            routing_map.int(),
+            routing_ids,
             probs,
             self._fc1_weight,
             self._fc2_weight,
@@ -1600,12 +1632,20 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._flashinfer_activation_type,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
-            # FlashInfer's BF16 CUTLASS kernel requires a BF16 output, while the
-            # NVLS reduce-scatter buffer is FP32. Let the kernel return BF16;
-            # token_combine() copies it into the symmetric FP32 buffer.
-            output=None,
+            enable_alltoall=bounded,
         )[0]
-        return output, None
+        if not bounded:
+            # The kernel writes bf16 only; token_combine() converts it where no NVLS buffer exists.
+            return output, None
+        combine_valid_rows(
+            output,
+            routing_ids,
+            InferenceAllGatherDispatcherBase._valid_tokens(),
+            rsv,
+            local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+            num_local_experts=self.num_local_experts,
+        )
+        return rsv, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
