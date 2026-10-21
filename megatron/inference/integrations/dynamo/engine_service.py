@@ -73,6 +73,8 @@ async def _serve() -> None:
             )
             reporter.observe("ready", endpoint.to_dict())
         await engine.engine_loop_task
+        # The parent sends SHUTDOWN to the coordinator right after STOP; reap it before exiting.
+        await engine.join_coordinator_process()
     finally:
         reporter.stop()
 

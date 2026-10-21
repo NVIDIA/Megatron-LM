@@ -203,6 +203,9 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             self._client.shutdown_coordinator()
             self._client.stop()
 
+        # Reap the coordinator child on the rank that spawned it.
+        await self._inference_engine.join_coordinator_process()
+
         if dist.get_rank() == 0:
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
                 stop_text_gen_server,
