@@ -2283,6 +2283,26 @@ def update_train_iters(train: TrainingConfig) -> None:
     print_rank_0(f'setting training iterations to {train.train_iters}')
 
 
+def _get_samples_for_iterations(num_iterations: float) -> float:
+    """Return the samples consumed by the first ``num_iterations`` training iterations.
+
+    Walks the global num-microbatches calculator like ``update_train_iters``, then resets it
+    to sample 0. The fractional part of ``num_iterations`` uses the next iteration's batch and
+    a negative count uses the first batch, so a one-entry schedule gives
+    ``num_iterations * global_batch_size``.
+    """
+    full_iterations = max(int(num_iterations), 0)
+    consumed_samples = 0
+    for _ in range(full_iterations):
+        update_num_microbatches(consumed_samples, consistency_check=False)
+        consumed_samples += get_current_global_batch_size()
+    update_num_microbatches(consumed_samples, consistency_check=False)
+    consumed_samples += (num_iterations - full_iterations) * get_current_global_batch_size()
+    # Reset
+    update_num_microbatches(0, consistency_check=False)
+    return consumed_samples
+
+
 def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
     """Resolve the absolute DDP grad-bucket size.
 
@@ -2735,8 +2755,27 @@ def get_optimizer_param_scheduler(optimizer):
     cfg = get_run_config()
     args = get_args()
 
+    # Iteration-based training with a step batch size schedule.
+    if cfg.train.train_iters and cfg.train.step_batch_size_schedule is not None:
+        if args.lr_decay_iters is None:
+            args.lr_decay_iters = cfg.train.train_iters
+        # Each step advances the scheduler by the scheduled global batch size, so convert
+        # iteration counts into the samples the schedule consumes over those iterations.
+        lr_decay_steps = _get_samples_for_iterations(args.lr_decay_iters)
+        wd_incr_steps = _get_samples_for_iterations(cfg.train.train_iters)
+        wsd_decay_steps = None
+        if args.lr_wsd_decay_iters is not None:
+            # The WSD anneal covers the last lr_wsd_decay_iters iterations of the decay.
+            wsd_decay_steps = lr_decay_steps - _get_samples_for_iterations(
+                args.lr_decay_iters - args.lr_wsd_decay_iters
+            )
+        if args.lr_warmup_fraction is not None:
+            lr_warmup_iters = args.lr_warmup_fraction * args.lr_decay_iters
+        else:
+            lr_warmup_iters = args.lr_warmup_iters
+        lr_warmup_steps = _get_samples_for_iterations(lr_warmup_iters)
     # Iteration-based training.
-    if cfg.train.train_iters:
+    elif cfg.train.train_iters:
         if args.lr_decay_iters is None:
             args.lr_decay_iters = cfg.train.train_iters
         lr_decay_steps = args.lr_decay_iters * cfg.train.global_batch_size

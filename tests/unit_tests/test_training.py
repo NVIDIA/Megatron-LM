@@ -396,6 +396,167 @@ class TestPackedSampleAccounting:
         assert _get_optimizer_param_scheduler_increment(args, 3342) == 3342
 
 
+class TestStepBatchSizeScheduleIterationHorizon:
+    """Iteration-based LR and weight decay phases end on the configured iterations when a
+    step batch size schedule changes the number of samples per iteration."""
+
+    TRAIN_ITERS = 100
+    MAX_LR = 1e-3
+    MIN_LR = 1e-4
+    END_WD = 0.1
+
+    def _build_scheduler(self, monkeypatch, run_config, schedule, data_parallel_size, **lr_args):
+        from megatron.core import num_microbatches_calculator as calculator
+
+        # The schedule uses 8 samples per iteration for the first 400 samples (50 iterations),
+        # then 16. Without --global-batch-size, validate_args sets it to mbs * dp size.
+        global_batch_size = 8 if schedule is None else data_parallel_size
+        run_config.train = TrainingConfig(
+            micro_batch_size=1,
+            global_batch_size=global_batch_size,
+            train_iters=self.TRAIN_ITERS,
+            step_batch_size_schedule=schedule,
+        )
+        args = SimpleNamespace(
+            lr=self.MAX_LR,
+            min_lr=self.MIN_LR,
+            lr_warmup_init=0.0,
+            lr_decay_style="cosine",
+            lr_wsd_decay_style="linear",
+            lr_decay_iters=None,
+            lr_wsd_decay_iters=None,
+            lr_warmup_fraction=None,
+            lr_warmup_iters=0,
+            start_weight_decay=0.0,
+            end_weight_decay=self.END_WD,
+            weight_decay_incr_style="linear",
+            use_checkpoint_opt_param_scheduler=False,
+            override_opt_param_scheduler=False,
+        )
+        vars(args).update(lr_args)
+        monkeypatch.setattr(training, "get_args", lambda: args)
+        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+        calculator.init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=global_batch_size,
+            micro_batch_size=1,
+            data_parallel_size=data_parallel_size,
+            step_batch_size_schedule=schedule,
+        )
+        optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
+        scheduler = training.get_optimizer_param_scheduler(optimizer)
+        # Building the scheduler leaves the calculator at the start of the schedule.
+        assert calculator.get_current_global_batch_size() == 8
+        return args, optimizer, scheduler
+
+    @staticmethod
+    def _first_iteration(values, predicate, start=1):
+        """1-based iteration of the first value at or after ``start`` matching ``predicate``."""
+        return next((i for i, v in enumerate(values, 1) if i >= start and predicate(v)), None)
+
+    @pytest.mark.parametrize("data_parallel_size", [1, 2])
+    @pytest.mark.parametrize("schedule", [None, "0:8 400:16"], ids=["constant", "schedule"])
+    @pytest.mark.parametrize(
+        "lr_args,warmup_end,anneal_start,decay_end",
+        [
+            ({"lr_warmup_iters": 10}, 10, None, 100),
+            ({"lr_warmup_fraction": 0.1, "lr_decay_iters": 80}, 8, None, 80),
+            (
+                {"lr_warmup_iters": 10, "lr_decay_style": "WSD", "lr_wsd_decay_iters": 20},
+                10,
+                81,
+                100,
+            ),
+        ],
+        ids=["cosine", "warmup_fraction", "wsd"],
+    )
+    def test_phases_end_on_configured_iterations(
+        self,
+        monkeypatch,
+        run_config,
+        data_parallel_size,
+        schedule,
+        lr_args,
+        warmup_end,
+        anneal_start,
+        decay_end,
+    ):
+        from megatron.core import num_microbatches_calculator as calculator
+
+        args, optimizer, scheduler = self._build_scheduler(
+            monkeypatch, run_config, schedule, data_parallel_size, **lr_args
+        )
+
+        # Step the scheduler the way train_step does.
+        lrs, wds = [], []
+        consumed_samples = 0
+        for _ in range(self.TRAIN_ITERS):
+            calculator.update_num_microbatches(consumed_samples, consistency_check=True)
+            scheduler.step(increment=_get_optimizer_param_scheduler_increment(args, None))
+            consumed_samples += calculator.get_current_global_batch_size()
+            lrs.append(optimizer.param_groups[0]["lr"])
+            wds.append(optimizer.param_groups[0]["weight_decay"])
+
+        first = self._first_iteration
+        after_warmup = warmup_end + 1
+        assert first(lrs, lambda lr: lr == pytest.approx(self.MAX_LR)) == warmup_end
+        if anneal_start is not None:
+            anneal_at = first(lrs, lambda lr: lr != pytest.approx(self.MAX_LR), start=after_warmup)
+            assert anneal_at == anneal_start
+        min_lr_at = first(lrs, lambda lr: lr == pytest.approx(self.MIN_LR), start=after_warmup)
+        assert min_lr_at == decay_end
+        assert first(wds, lambda wd: wd == pytest.approx(self.END_WD)) == self.TRAIN_ITERS
+
+    @pytest.mark.parametrize(
+        "schedule,expected",
+        [(None, 50.5 * 8), ("0:8 400:16", 400 + 0.5 * 16)],
+        ids=["constant", "schedule"],
+    )
+    def test_fractional_warmup_iterations(self, monkeypatch, run_config, schedule, expected):
+        # 0.5 * 101 = 50.5 warmup iterations. Under the schedule the half iteration uses the
+        # batch of iteration 51, the first one at 16 samples.
+        _, _, scheduler = self._build_scheduler(
+            monkeypatch,
+            run_config,
+            schedule,
+            data_parallel_size=1,
+            lr_warmup_fraction=0.5,
+            lr_decay_iters=101,
+        )
+
+        assert scheduler.lr_warmup_steps == pytest.approx(expected)
+
+    @pytest.mark.parametrize("data_parallel_size", [1, 2])
+    @pytest.mark.parametrize(
+        "lr_args",
+        [
+            {"lr_warmup_iters": 10},
+            {"lr_warmup_fraction": 0.125, "lr_decay_iters": 80},
+            {"lr_decay_style": "WSD", "lr_wsd_decay_iters": 20},
+            {"lr_decay_style": "WSD", "lr_wsd_decay_iters": 150},
+        ],
+        ids=["warmup_iters", "warmup_fraction", "wsd", "wsd_longer_than_decay"],
+    )
+    def test_one_entry_schedule_matches_constant_batch(
+        self, monkeypatch, run_config, data_parallel_size, lr_args
+    ):
+        horizons = []
+        for schedule in (None, "0:8"):
+            _, _, scheduler = self._build_scheduler(
+                monkeypatch, run_config, schedule, data_parallel_size, **lr_args
+            )
+            horizons.append(
+                (
+                    scheduler.lr_warmup_steps,
+                    scheduler.lr_decay_steps,
+                    scheduler.wsd_decay_steps,
+                    scheduler.wd_incr_steps,
+                )
+            )
+
+        assert horizons[1] == horizons[0]
+
+
 class TestSaveGrads:
     """Tests for the save_grads function."""
 
