@@ -554,7 +554,8 @@ class MoELayer(BaseMoELayer):
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
+        if self.token_dispatcher is not None:
+            hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
         )
