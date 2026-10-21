@@ -1,20 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Split decode and speculative verify with the bytes of the exact attention forward."""
+"""Split decode and speculative verify with the bytes of the PP attention forward."""
 
 from typing import Optional
 
 import torch
 
-from .api import TILE_KEYS, ExactAttention
+from .api import TILE_KEYS, PPAttention
 
 try:
     import cutlass.cute as cute
     from cutlass.cute.typing import Float32, Int32
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
-    from .combine_kernel import ExactAttentionCombine
-    from .decode_kernel import ExactAttentionDecode
+    from .combine_kernel import PPAttentionCombine
+    from .decode_kernel import PPAttentionDecode
 except ImportError:
     pass
 
@@ -25,7 +25,7 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-class ExactAttentionDecoder:
+class PPAttentionDecoder:
     """Decode and verify over a paged KV cache of 128-key pages.
 
     Each work item covers one super-block of one (request, kv head) and writes an FP32
@@ -35,7 +35,7 @@ class ExactAttentionDecoder:
     """
 
     def __init__(
-        self, attn: ExactAttention, *, max_batch: int, max_context: int, verify_tokens: int = 8
+        self, attn: PPAttention, *, max_batch: int, max_context: int, verify_tokens: int = 8
     ):
         self.attn = attn
         self.max_batch = int(max_batch)
@@ -75,7 +75,7 @@ class ExactAttentionDecoder:
         scale = Float32(attn.softmax_scale)
         key = ("split", rows, tokens, qlens is not None)
         if key not in self._compiled:
-            fwd = ExactAttentionDecode(
+            fwd = PPAttentionDecode(
                 super_block_tiles=attn.G,
                 tokens_per_item=tokens,
                 rows_per_item=rows,
@@ -125,7 +125,7 @@ class ExactAttentionDecoder:
         key_c = ("combine", rows)
         if key_c not in self._compiled:
             self._compiled[key_c] = cute.compile(
-                ExactAttentionCombine(
+                PPAttentionCombine(
                     attn.G, attn.head_dim, smax=max(32, 32 * _ceil_div(self.s_max, 32))
                 ),
                 to_cute_tensor(o_view),
@@ -200,11 +200,11 @@ class ExactAttentionDecoder:
 _DECODERS = {}
 
 
-def get_exact_decoder(attn: ExactAttention, max_batch: int, max_context: int, verify_tokens: int):
+def get_pp_decoder(attn: PPAttention, max_batch: int, max_context: int, verify_tokens: int):
     """Shared decoder per attention instance and workspace bound."""
     key = (id(attn), max_batch, max_context, verify_tokens)
     if key not in _DECODERS:
-        _DECODERS[key] = ExactAttentionDecoder(
+        _DECODERS[key] = PPAttentionDecoder(
             attn, max_batch=max_batch, max_context=max_context, verify_tokens=verify_tokens
         )
     return _DECODERS[key]
@@ -214,7 +214,7 @@ def page_view(k_cache, v_cache, block_table):
     """View [blocks, block_size, H, D] caches as 128-key pages and map the block table."""
     block = k_cache.shape[1]
     if block % TILE_KEYS:
-        raise ValueError(f"exact attention needs a KV block size divisible by {TILE_KEYS}")
+        raise ValueError(f"PP attention needs a KV block size divisible by {TILE_KEYS}")
     per = block // TILE_KEYS
     k_pages = k_cache.view(-1, TILE_KEYS, *k_cache.shape[2:])
     v_pages = v_cache.view(-1, TILE_KEYS, *v_cache.shape[2:])

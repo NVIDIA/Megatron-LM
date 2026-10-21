@@ -16,7 +16,7 @@ SMAX = 1024
 BATCH = 16
 
 
-class ExactAttentionCombine:
+class PPAttentionCombine:
     """Fold the super-block partials left to right; warp w of block x owns row 4 * x + w."""
 
     WARPS = 4

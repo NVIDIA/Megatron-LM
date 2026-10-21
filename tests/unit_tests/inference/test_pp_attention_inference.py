@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.transformer.exact_attention.decode_api import page_view
+from megatron.core.transformer.pp.decode_api import page_view
 
 BLOCK = 256
 LENGTHS = (300, 1000, 129)
@@ -12,9 +12,9 @@ LENGTHS = (300, 1000, 129)
 def _supported_gpu():
     if not torch.cuda.is_available():
         return False
-    from megatron.core.transformer.exact_attention.api import HAVE_EXACT_ATTENTION
+    from megatron.core.transformer.pp.api import HAVE_PP_ATTENTION
 
-    return HAVE_EXACT_ATTENTION and torch.cuda.get_device_capability()[0] == 10
+    return HAVE_PP_ATTENTION and torch.cuda.get_device_capability()[0] == 10
 
 
 gpu = pytest.mark.skipif(
@@ -41,11 +41,11 @@ class _Case:
     """Random prompts in a shuffled 256-key block cache, plus dense reference outputs."""
 
     def __init__(self, head_dim, h_q, h_kv):
-        from megatron.core.transformer.exact_attention.api import get_exact_attention
+        from megatron.core.transformer.pp.api import get_pp_attention
 
         torch.manual_seed(0)
         dev = torch.device("cuda")
-        self.attn = get_exact_attention(dev, head_dim, h_q, h_kv, 8, None)
+        self.attn = get_pp_attention(dev, head_dim, h_q, h_kv, 8, None)
         blocks = [-(-n // BLOCK) for n in LENGTHS]
         pool = sum(blocks) + 2
         perm = torch.randperm(pool, device=dev).to(torch.int32)
@@ -80,9 +80,9 @@ class _Case:
         return out.split([r.shape[0] for r in rows])
 
     def decoder(self, verify_tokens=8):
-        from megatron.core.transformer.exact_attention.decode_api import get_exact_decoder
+        from megatron.core.transformer.pp.decode_api import get_pp_decoder
 
-        return get_exact_decoder(self.attn, 8, 2048, verify_tokens)
+        return get_pp_decoder(self.attn, 8, 2048, verify_tokens)
 
     def tail(self, n):
         q = torch.stack([q[-n:] for q in self.q]).contiguous()
@@ -99,7 +99,7 @@ CASES = [(128, 8, 2), (256, 8, 2), (256, 16, 1)]
 
 @gpu
 @pytest.mark.parametrize("head_dim,h_q,h_kv", CASES)
-class TestExactAttentionInference:
+class TestPPAttentionInference:
     def test_prefill_matches_training_forward(self, head_dim, h_q, h_kv):
         case = _Case(head_dim, h_q, h_kv)
         for out, ref in zip(case.prefill([0] * len(LENGTHS)), case.ref):

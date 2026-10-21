@@ -18,7 +18,7 @@ from flash_attn.cute.tile_scheduler import (
 from flash_attn.cute.utils import ex2_emulation_2
 
 
-class ExactAttentionDecode:
+class PPAttentionDecode:
     """Split decode over paged KV: one work item per (flat = b * h_kv + kvh, super-block)."""
 
     def __init__(
