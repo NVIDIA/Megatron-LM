@@ -40,17 +40,7 @@ class _MXFP8Linear(torch.autograd.Function):
                 raise ValueError("Swizzled prequant requires the tensor-core consumer")
             codes, scales = activation.data.reshape(flat.shape), activation.scale
         raw = _row_scales(scales, *flat.shape) if tc else scales
-        decoded_x = (
-            (
-                codes.float().reshape(flat.shape[0], -1, 32)
-                * torch.exp2(raw.float() - 127).unsqueeze(-1)
-            )
-            .reshape(flat.shape)
-            .bfloat16()
-            .to(x.dtype)
-        )
         packed, weight_scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
-        decoded_w = dequantize_block_fp8(packed, weight_scales, (32, 32)).to(x.dtype)
         row_scales = weight_scales.view(torch.uint8).repeat_interleave(32, dim=0)
         if tc:
             row_scales = swizzle_mxfp8_scale(row_scales, *weight.shape)
@@ -61,17 +51,35 @@ class _MXFP8Linear(torch.autograd.Function):
             from vllm.model_executor.kernels.batch_invariant import block32_scaled_mm
 
             output = block32_scaled_mm(codes, scales, packed, row_scales, x.dtype)
-        ctx.save_for_backward(decoded_x, decoded_w)
+        ctx.compact, ctx.input_dtype = True, x.dtype
+        ctx.save_for_backward(codes, raw, packed, weight_scales)
         return output.reshape(*x.shape[:-1], weight.shape[0])
 
     @staticmethod
     def backward(ctx, grad):
-        activation, weight = ctx.saved_tensors
-        flat_grad = grad.reshape(-1, weight.shape[0]).float()
-        with torch.autocast(device_type=grad.device.type, enabled=False):
-            dx = (flat_grad @ weight.float()).reshape(ctx.input_shape).to(activation.dtype)
-            dw = (flat_grad.T @ activation.float()).to(ctx.weight_dtype)
-        return dx, dw, None
+        if getattr(ctx, 'compact', False):
+            codes, raw, packed, scales = ctx.saved_tensors
+            activation = (
+                (
+                    codes.float().reshape(codes.shape[0], -1, 32)
+                    * torch.exp2(raw.float() - 127).unsqueeze(-1)
+                )
+                .reshape(codes.shape)
+                .bfloat16()
+                .to(ctx.input_dtype)
+            )
+            weight = dequantize_block_fp8(packed, scales, (32, 32)).to(ctx.input_dtype)
+        else:
+            activation, weight = ctx.saved_tensors
+        return linear_vjp(ctx, grad, activation, weight)
+
+
+def linear_vjp(ctx, grad, activation, weight):
+    flat_grad = grad.reshape(-1, weight.shape[0]).float()
+    with torch.autocast(device_type=grad.device.type, enabled=False):
+        dx = (flat_grad @ weight.float()).reshape(ctx.input_shape).to(activation.dtype)
+        dw = (flat_grad.T @ activation.float()).to(ctx.weight_dtype)
+    return dx, dw, None
 
 
 class _BF16Linear(torch.autograd.Function):

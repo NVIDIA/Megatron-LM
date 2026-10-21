@@ -277,9 +277,6 @@ class _FP8OutputProjection(torch.autograd.Function):
         from vllm.utils.deep_gemm import fp8_einsum
 
         from megatron.lite.model.deepseek_v41.lite.export import to_release
-        from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
-
-        from .experts import dequantize_activation, unpack_scales
 
         heads, dim = x.shape[-2:]
         inner = heads * dim // groups
@@ -311,19 +308,11 @@ class _FP8OutputProjection(torch.autograd.Function):
             to_release("layers.0.attn.wo_a.weight", weight.reshape(groups * rank, inner))
         )
         codes, descale = (tensors["layers.0.attn.wo_a.weight"], tensors["layers.0.attn.wo_a.scale"])
-        decoded_w = (
-            dequantize_block_fp8(codes, descale, (32, 32)).reshape(groups, rank, inner).to(x.dtype)
-        )
+        # Keep canonical packed bytes before the vendor layout transform.
+        saved_codes, saved_scale = codes.clone(), descale.clone()
         codes, native_scale = deepgemm_post_process_fp8_weight_block(
             codes, descale, (32, 32), True, is_bmm=True, bmm_batch_size=groups
         )
-        decoded_x = torch.stack(
-            [
-                dequantize_activation(encoded[:, g], unpack_scales(scale[:, g], inner // 32))
-                for g in range(groups)
-            ],
-            1,
-        ).to(x.dtype)
         _compile_einsum_configs(
             x.shape[0],
             SimpleNamespace(weight=codes),
@@ -341,12 +330,34 @@ class _FP8OutputProjection(torch.autograd.Function):
         fp8_einsum(
             "bhr,hdr->bhd", (encoded, scale), (codes, native_scale), result, recipe=(1, 1, 32)
         )
-        ctx.save_for_backward(decoded_x, decoded_w, positions, cache)
+        ctx.compact, ctx.input_dtype = True, x.dtype
+        ctx.save_for_backward(encoded, scale, saved_codes, saved_scale, positions, cache)
         return result
 
     @staticmethod
     def backward(ctx, grad):
-        activation, weight, positions, cache = ctx.saved_tensors
+        if getattr(ctx, 'compact', False):
+            from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
+
+            from .experts import dequantize_activation, unpack_scales
+
+            encoded, scale, codes, sf, positions, cache = ctx.saved_tensors
+            groups, rank = grad.shape[-2:]
+            inner = codes.shape[-1]
+            activation = torch.stack(
+                [
+                    dequantize_activation(encoded[:, g], unpack_scales(scale[:, g], inner // 32))
+                    for g in range(groups)
+                ],
+                1,
+            ).to(ctx.input_dtype)
+            weight = (
+                dequantize_block_fp8(codes, sf, (32, 32))
+                .reshape(groups, rank, inner)
+                .to(ctx.input_dtype)
+            )
+        else:
+            activation, weight, positions, cache = ctx.saved_tensors
         with torch.autocast(device_type=grad.device.type, enabled=False):
             g = grad.float()
             dx = torch.einsum('tgd,gdk->tgk', g, weight.float()).to(activation.dtype)

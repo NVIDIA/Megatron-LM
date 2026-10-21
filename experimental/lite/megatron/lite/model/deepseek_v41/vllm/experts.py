@@ -35,16 +35,37 @@ def quantize_activation(x):
     return per_token_group_quant_fp8(x.contiguous(), 32, eps=1e-4, use_ue8m0=True)
 
 
+def _activation_surrogate(first, scores, limit):
+    gate, up = first.float().chunk(2, -1)
+    if limit is not None:
+        gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+    return torch.nn.functional.silu(gate) * up * scores.float().unsqueeze(-1)
+
+
+class _Activation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, first, scores, limit):
+        ctx.save_for_backward(first, scores)
+        ctx.limit = limit
+        return _activation_surrogate(first, scores, limit)
+
+    @staticmethod
+    def backward(ctx, grad):
+        first, scores = ctx.saved_tensors
+        with torch.enable_grad():
+            first, scores = first.detach().requires_grad_(), scores.detach().requires_grad_()
+            output = _activation_surrogate(first, scores, ctx.limit)
+            df, ds = torch.autograd.grad(output, (first, scores), grad)
+        return df, ds, None
+
+
 def activation(fc1, scores, limit):
     if not fc1.is_cuda:
         raise RuntimeError("Deployment expert activation requires CUDA")
     from vllm.model_executor.kernels.batch_invariant import swiglu_apply_weight_to_fp8
 
-    # Only the owned VJP uses this FP32 surrogate; native codes drive GEMM2.
-    gate, up = fc1.float().chunk(2, -1)
-    if limit is not None:
-        gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-    hidden = torch.nn.functional.silu(gate) * up * scores.float().unsqueeze(-1)
+    # Only the owned VJP uses this surrogate; native codes drive GEMM2.
+    hidden = _Activation.apply(fc1, scores, limit)
     if not fc1.shape[0]:
         return hidden, (
             hidden.to(torch.float8_e4m3fn),
@@ -160,21 +181,15 @@ class _Shared(torch.autograd.Function):
     def forward(ctx, x, weight, encoded):
         from vllm.utils.deep_gemm import _import_deep_gemm
 
-        from megatron.lite.primitive.quantization.block_fp8 import (
-            dequantize_block_fp8,
-            quantize_block_fp8,
-        )
+        from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 
         deep_gemm = _import_deep_gemm()
         if deep_gemm is None:
             raise RuntimeError("Pinned DeepGEMM is required for shared MegaMoE numerics")
         a, scale = encoded
         codes, sf = quantize_block_fp8(weight, (32, 32), scale_format='e8m0')
-        ctx.save_for_backward(
-            dequantize_activation(a, scale).to(x.dtype),
-            dequantize_block_fp8(codes, sf, (32, 32)).to(x.dtype),
-        )
-        ctx.weight_dtype, ctx.input_shape = weight.dtype, x.shape
+        ctx.save_for_backward(a, scale, codes, sf)
+        ctx.weight_dtype, ctx.input_shape, ctx.input_dtype = weight.dtype, x.shape, x.dtype
         output = x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)
         if x.shape[0]:
             rows = (sf.view(torch.uint8).repeat_interleave(32, 0).to(torch.int32) << 23).view(
@@ -191,9 +206,14 @@ class _Shared(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        from .linear import _MXFP8Linear
+        from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 
-        return _MXFP8Linear.backward(ctx, grad)
+        from .linear import linear_vjp
+
+        a, scale, codes, sf = ctx.saved_tensors
+        activation = dequantize_activation(a, scale).to(ctx.input_dtype)
+        weight = dequantize_block_fp8(codes, sf, (32, 32)).to(ctx.input_dtype)
+        return linear_vjp(ctx, grad, activation, weight)
 
 
 def shared_rows(x, module, encoded, limit):
