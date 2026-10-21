@@ -149,10 +149,11 @@ class TestPPAttentionInference:
         torch.cuda.synchronize()
         assert torch.equal(_bits(out), _bits(ref))
 
+    @pytest.mark.parametrize("super_block_tiles", [1, 8])
     @pytest.mark.parametrize("value", [float("nan"), float("inf")])
-    def test_unwritten_cache_slots(self, head_dim, h_q, h_kv, value):
+    def test_unwritten_cache_slots(self, head_dim, h_q, h_kv, value, super_block_tiles):
         """Cache slots no request wrote must not reach the output, whatever they hold."""
-        case = _Case(head_dim, h_q, h_kv)
+        case = _Case(head_dim, h_q, h_kv, super_block_tiles)
         decoder = case.decoder()
         starts = [n // 2 for n in LENGTHS]
 

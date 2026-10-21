@@ -906,8 +906,7 @@ class PPAttentionForward:
                                     v_handle.index * self.v_stage_elems,
                                     tail_keys,
                                     load_lane,
-                                    64,
-                                    64,
+                                    self.v_stage_elems,
                                 )
                                 cute.arch.fence_proxy("async.shared", space="cluster")
                                 cute.arch.fence_acq_rel_cluster()

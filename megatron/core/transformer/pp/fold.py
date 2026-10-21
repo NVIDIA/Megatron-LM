@@ -31,23 +31,21 @@ def vcopy(src, dst):
 
 
 @cute.jit
-def zero_key_rows(
-    buf,
-    stage_off,
-    first_key,
-    lane,
-    d_elems: cutlass.Constexpr[int],
-    d_stride: cutlass.Constexpr[int],
-):
-    """Zero keys >= first_key of one 128-key MN-major V stage, one key row per lane step."""
+def zero_key_rows(buf, stage_off, first_key, lane, stage_elems: cutlass.Constexpr[int]):
+    """Zero keys >= first_key of one 128-key V stage in the MN-major 128B-swizzled layout.
+
+    Head-dim columns come in 64-wide atoms of 128 keys, so key k of atom a starts at
+    a * 64 * 128 + 64 * k; the swizzle only moves 16-byte chunks within one key's row.
+    """
+    assert stage_elems % (64 * 128) == 0
     zero = cute.make_rmem_tensor((8,), buf.element_type)
     zero.fill(0.0)
     for j in cutlass.range_constexpr(4):
         key = lane + 32 * j
         if key >= first_key:
-            row = stage_off + 64 * (key % 16) + 1024 * (key // 16)
-            for c in cutlass.range_constexpr(d_elems // 8):
-                vcopy(zero, view16(buf, row + (c * 8) % 64 + d_stride * (c * 8 // 64), 8))
+            for c in cutlass.range_constexpr(stage_elems // 128 // 8):
+                atom, col = divmod(c * 8, 64)
+                vcopy(zero, view16(buf, stage_off + atom * 64 * 128 + 64 * key + col, 8))
 
 
 @cute.jit

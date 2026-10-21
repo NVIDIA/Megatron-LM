@@ -626,8 +626,7 @@ class PPAttentionDecode:
                                 v_handle.index * self.v_stage_elems,
                                 tail_keys,
                                 ltidx % 32,
-                                128,
-                                8192,
+                                self.v_stage_elems,
                             )
                             cute.arch.fence_proxy("async.shared", space="cta")
                             cute.arch.sync_warp()
