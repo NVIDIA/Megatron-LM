@@ -1194,10 +1194,18 @@ class TEGroupedMLP(MegatronModule):
         # distinct names a fused decoder layer followed only by unfused, e.g. bf16 MTP, experts
         # looked like "the last fused_group_mlp group" and was never offloaded).
         offload_group_mlp = self.offload_expert_fc1 and self.offload_moe_act
+        # TE leaves its native grouped-tensor path while CPU offloading is active, and the
+        # split-quantize fallback it takes instead cannot consume the capacity-padded inputs
+        # HybridEP / virtual experts hand grouped-tensor experts (rows > sum(tokens_per_expert)).
+        # Keep fc1 outside the offload context there and start the group at the activation.
+        group_includes_fc1 = offload_group_mlp and not self._use_grouped_tensor
         offload_expert_fc1 = self.offload_expert_fc1 and not offload_group_mlp
-        offload_moe_act = self.offload_moe_act and not offload_group_mlp
+        offload_moe_act = (self.offload_moe_act and not offload_group_mlp) or (
+            offload_group_mlp and not group_includes_fc1
+        )
+        moe_act_group_name = "fused_group_mlp" if offload_group_mlp else "moe_act"
         group_mlp_manager = off_interface(
-            offload_group_mlp, permuted_local_hidden_states, "fused_group_mlp"
+            group_includes_fc1, permuted_local_hidden_states, "fused_group_mlp"
         )
         with group_mlp_manager as permuted_local_hidden_states:
             expert_fc1_manager = off_interface(
@@ -1213,7 +1221,7 @@ class TEGroupedMLP(MegatronModule):
                 delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
-            moe_act_manager = off_interface(offload_moe_act, fc1_output, "moe_act")
+            moe_act_manager = off_interface(offload_moe_act, fc1_output, moe_act_group_name)
 
             if setup_activation_checkpoint:
                 self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
