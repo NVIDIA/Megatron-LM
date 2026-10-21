@@ -53,7 +53,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnBackend, AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -380,7 +380,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             tmp_config.num_query_groups = world_size
         else:
             tmp_config = self.config
-        self.core_attention = submodules.core_attention(
+        core_attention_cls = submodules.core_attention
+        if self.config.attention_backend == AttnBackend.exact:
+            from megatron.core.transformer.exact_attention.dot_product_attention import (
+                ExactDotProductAttention,
+            )
+
+            core_attention_cls = ExactDotProductAttention
+        self.core_attention = core_attention_cls(
             config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,

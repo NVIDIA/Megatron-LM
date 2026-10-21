@@ -67,6 +67,7 @@ def set_attention_backend(config: 'TransformerConfig') -> None:
         AttnBackend.fused: (0, 1, 0),
         AttnBackend.unfused: (0, 0, 1),
         AttnBackend.auto: (1, 1, 1),
+        AttnBackend.exact: (0, 0, 0),
     }
     flash, fused, unfused = backend_flags[attention_backend]
     check_and_set_env_variable('NVTE_FLASH_ATTN', flash, attention_backend)
