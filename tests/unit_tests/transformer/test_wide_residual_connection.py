@@ -403,11 +403,11 @@ class TestStreamwiseSigmoidWideResidualConnection:
             return update
 
         monkeypatch.setattr(
-            "megatron.core.transformer.wide_residual_layer.streamwise_sigmoid_writeback",
+            "megatron.core.transformer.wide_residual_policy.streamwise_sigmoid_writeback",
             record_writeback,
         )
         monkeypatch.setattr(
-            "megatron.core.transformer.wide_residual_layer.F.dropout", preserve_dropout_input
+            "megatron.core.transformer.wide_residual_policy.F.dropout", preserve_dropout_input
         )
         connection(
             (branch_update, bias),
