@@ -16,16 +16,14 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
@@ -34,7 +32,6 @@ from megatron.core.parallel_state import (
     get_hybrid_data_context_parallel_groups,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -54,13 +51,15 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (
+from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_config_from_args: legacy shape, importable from here)
+    core_gpt_dataset_config_from_args,
     gpt_data_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import get_run_config, is_run_config_initialized, set_run_config
+from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
+from megatron.training.global_vars import set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -357,65 +356,23 @@ def forward_step(data_iterator, model: HybridModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
-    """Whether the dataset should be built on the current rank."""
-    args = get_args()
-    config = core_transformer_config_from_args(args)
-    if mpu.get_tensor_model_parallel_rank() != 0:
-        return False
-    elif is_packed_sequence:
-        return True
-    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
-        ignore_virtual=False,
-        vp_stage=vp_stage,
-    )
-
-
-def core_gpt_dataset_config_from_args(args: Any) -> MCoreGPTDatasetConfig:
-    """Build the GPT dataset config from parsed CLI args.
-
-    Kept for callers of the legacy shape; the provider builds from ``cfg.data`` instead. As
-    before, the seed is the run config's and a tokenizer is built from ``args``; the returned
-    config is prepared (Megatron Core's post-init has run).
-    """
-    data = gpt_data_config_from_args(args, standalone=True)
-    if is_run_config_initialized():
-        data.dataset.random_seed = get_run_config().rng.seed
-    data.dataset.prepare(build_tokenizer(args))
-    return data.dataset
-
-
 def train_valid_test_datasets_provider(
     train_val_test_num_samples, vp_stage=None, *, data_config=None
 ):
     """Build the train, validation and test datasets.
 
-    Args:
-        train_val_test_num_samples: the number of samples for the train, validation and test
-            splits.
-        vp_stage: the virtual pipeline stage the datasets are built for.
-        data_config: ``cfg.data``: the dataset config, prepared with the run's tokenizer, the
-            loader settings and the dataset class. ``build_train_valid_test_datasets`` passes it;
-            it is read from the run config when omitted.
+    The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
+    ``pretrain_gpt.py`` and ``pretrain_hybrid_flex.py``; this script uses the shared rank
+    predicate. ``data_config`` is ``cfg.data`` (the dataset config prepared with the run's
+    tokenizer, the loader settings and the dataset class): ``build_train_valid_test_datasets``
+    passes it, the run config's is used when omitted.
     """
-    if data_config is None:
-        data_config = get_run_config().data
-    dataset_type, config, is_packed_sequence = data_config.dataset_build()
-
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
-
-    is_dataset_built = partial(
-        is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+    return build_gpt_datasets(
+        train_val_test_num_samples,
+        vp_stage,
+        data_config=data_config,
+        built_on_rank=is_dataset_built_on_rank,
     )
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, is_dataset_built, config
-    ).build()
-
-    print_rank_0("> finished creating GPT datasets ...")
-
-    return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":

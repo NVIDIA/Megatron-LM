@@ -8,7 +8,6 @@ from typing import Optional, Union
 import torch
 
 from megatron.core import mpu, parallel_state
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -40,6 +39,7 @@ from megatron.core.utils import (
 )
 from megatron.elastification.arguments import add_flextron_args
 from megatron.training import (
+    argument_utils,
     get_args,
     get_timers,
     get_tokenizer,
@@ -53,7 +53,8 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.datasets.providers import build_gpt_datasets
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -460,7 +461,10 @@ def forward_step(data_iterator, model: HybridModel):
 
 
 
-def is_dataset_built_on_rank(vp_stage=None):
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+    """Whether the dataset should be built on the current rank: the first and last pipeline stages,
+    tensor-parallel rank 0. ``is_packed_sequence`` is the shared provider's call shape and is
+    ignored here: this script builds packed datasets on the same ranks as plain ones, as before."""
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False
@@ -470,33 +474,29 @@ def is_dataset_built_on_rank(vp_stage=None):
     ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
-def flex_data_config_from_args(args, *, standalone=False):
-    """``cfg.data`` for this entry point: the shared factory, less the varlen family.
-
-    ``get_batch`` keys the packed-sequence metadata on ``--sft`` and ``is_dataset_built_on_rank``
-    has no packed-sequence parameter, so a varlen dataset cannot be consumed here; the request is
-    rejected instead of silently building plain GPT data (``pretrain_hybrid.py`` supports it).
-    """
+def _reject_varlen(args):
+    """``get_batch`` keys the packed-sequence metadata on ``--sft`` and the rank predicate above
+    builds on the first and last stages only, so a varlen dataset cannot be consumed here; the
+    request is an error instead of a silent plain-GPT run (``pretrain_hybrid.py`` supports it)."""
     if getattr(args, "use_varlen_dataset", False):
         raise ValueError(
             "pretrain_hybrid_flex.py does not support --use-varlen-dataset (its batch path has no "
             "varlen packing support); use pretrain_hybrid.py for varlen data."
         )
+
+
+def flex_data_config_from_args(args, *, standalone=False):
+    """``cfg.data`` for this entry point: the shared factory, less the varlen family."""
+    _reject_varlen(args)
     return gpt_data_config_from_args(args, standalone=standalone)
 
 
 def core_gpt_dataset_config_from_args(args):
-    """Build the GPT dataset config from parsed CLI args.
-
-    Kept for callers of the legacy shape; the provider builds from ``cfg.data`` instead. As
-    before, the seed is the run config's and the tokenizer is the run's; the returned config is
-    prepared (Megatron Core's post-init has run). Every data argument is forwarded, including the
-    layout and validation fields the previous factory left at Megatron Core's defaults.
-    """
-    data = flex_data_config_from_args(args, standalone=True)
-    data.dataset.random_seed = get_run_config().rng.seed
-    data.dataset.prepare(get_tokenizer())
-    return data.dataset
+    """The legacy call shape for this entry point: the shared
+    ``argument_utils.core_gpt_dataset_config_from_args`` after the varlen check, prepared with the
+    run's tokenizer as before (the provider builds from ``cfg.data``)."""
+    _reject_varlen(args)
+    return argument_utils.core_gpt_dataset_config_from_args(args, tokenizer=get_tokenizer())
 
 
 def train_valid_test_datasets_provider(
@@ -504,30 +504,17 @@ def train_valid_test_datasets_provider(
 ):
     """Build the train, validation and test datasets.
 
-    Args:
-        train_val_test_num_samples: the number of samples for the train, validation and test
-            splits.
-        vp_stage: the virtual pipeline stage the datasets are built for.
-        data_config: ``cfg.data``: the dataset config, prepared with the run's tokenizer, the
-            loader settings and the dataset class. ``build_train_valid_test_datasets`` passes it;
-            it is read from the run config when omitted.
+    The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
+    ``pretrain_gpt.py`` and ``pretrain_hybrid.py``; this script passes its own rank predicate.
+    ``data_config`` is ``cfg.data``: ``build_train_valid_test_datasets`` passes it, the run
+    config's is used when omitted.
     """
-    if data_config is None:
-        data_config = get_run_config().data
-    dataset_type, config, _ = data_config.dataset_build()
-
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
-
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
+    return build_gpt_datasets(
         train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage),
-        config
-    ).build()
-
-    print_rank_0("> finished creating GPT datasets ...")
-
-    return train_ds, valid_ds, test_ds
+        vp_stage,
+        data_config=data_config,
+        built_on_rank=is_dataset_built_on_rank,
+    )
 
 
 def mamba_flex_extra_args_provider(parser):

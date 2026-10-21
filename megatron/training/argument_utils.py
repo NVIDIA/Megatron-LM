@@ -19,6 +19,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
@@ -928,6 +929,30 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     return DataConfig(
         dataset=dataset, dataloader=dataloader_config_from_args(args), dataset_type=dataset_type
     )
+
+
+def core_gpt_dataset_config_from_args(
+    args: Namespace, *, tokenizer: Any = None, dataset_type: type | None = None
+) -> GPTDatasetConfig:
+    """A standalone, prepared dataset config from the legacy arguments.
+
+    The call shape the GPT entry points had before ``cfg.data`` existed, kept for scripts that build
+    the dataset config outside the container (the providers build from ``cfg.data``): the section of
+    ``gpt_data_config_from_args(args, standalone=True)`` (mirrors from ``args``), with the seed of
+    the registered run config when there is one, the dataset class pinned to ``dataset_type`` when
+    given (``tools/prepare_cache.py`` builds ``GPTDataset`` whatever the flags name), validated,
+    then prepared with ``tokenizer`` or a tokenizer built from ``args``.
+    """
+    from megatron.training.global_vars import get_run_config, is_run_config_initialized
+
+    data = gpt_data_config_from_args(args, standalone=True)
+    if is_run_config_initialized():
+        data.dataset.random_seed = get_run_config().rng.seed
+    if dataset_type is not None:
+        data.dataset_type = dataset_type
+    data.validate()
+    data.dataset.prepare(build_tokenizer(args) if tokenizer is None else tokenizer)
+    return data.dataset
 
 
 def dataloader_config_from_args(args: Namespace) -> DataloaderConfig:

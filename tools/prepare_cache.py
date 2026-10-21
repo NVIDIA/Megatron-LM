@@ -13,9 +13,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.training import get_train_valid_test_num_samples
-from megatron.training.argument_utils import gpt_data_config_from_args
+from megatron.training import argument_utils, get_train_valid_test_num_samples
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import set_args, unset_global_variables
 from megatron.training.training import update_train_iters
@@ -126,18 +124,14 @@ def _print_effective_configuration(
 def core_gpt_dataset_config_from_args(args: Any) -> MCoreGPTDatasetConfig:
     """Build the Megatron Core GPTDatasetConfig used for offline cache preparation.
 
-    The shared factory on the legacy arguments, standalone (the mirrors come from ``args``, the
-    seed is ``args.seed``) and prepared with a tokenizer built from ``args``, with the dataset
-    class pinned to the plain ``GPTDataset`` this tool builds. The modes the tool does not build
-    (``--mock-data``, ``--sft``, ``--fim-data``) are rejected here as well, and the section is
-    validated, so a missing data source is reported before the builder runs.
+    The shared ``argument_utils.core_gpt_dataset_config_from_args`` (a standalone section from the
+    legacy arguments, mirrors and seed from ``args``, a tokenizer built from ``args``) with the
+    dataset class pinned to the plain ``GPTDataset`` this tool builds, after rejecting the modes it
+    does not build (``--mock-data``, ``--sft``, ``--fim-data``); the section is validated there, so
+    a missing data source is reported before the builder runs.
     """
     _reject_unsupported_modes(args)
-    data = gpt_data_config_from_args(args, standalone=True)
-    data.dataset_type = GPTDataset
-    data.validate()
-    data.dataset.prepare(build_tokenizer(args))
-    return data.dataset
+    return argument_utils.core_gpt_dataset_config_from_args(args, dataset_type=GPTDataset)
 
 
 def build_dataset_caches(args: Any) -> Dict[str, Any]:

@@ -551,3 +551,48 @@ def _assert_same_datasets(expected, built):
         assert sample.keys() == expected_sample.keys()
         for key in expected_sample:
             assert (sample[key] == expected_sample[key]).all(), key
+
+
+# The shared provider body and the shared legacy wrapper.
+
+
+def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
+    """The provider body is megatron.training.datasets.providers.build_gpt_datasets; each script's
+    train_valid_test_datasets_provider keeps the legacy shape and passes its rank predicate (the
+    shared GPT / hybrid rule, or hybrid-flex's own, which accepts the packed-sequence flag)."""
+    from megatron.training.datasets import providers
+
+    for name in ("gpt", "hybrid", "hybrid_flex"):
+        module = _entry_point(name)
+        calls = []
+        monkeypatch.setattr(
+            module, "build_gpt_datasets", lambda *a, **k: calls.append((a, k)) or (1, 2, 3)
+        )
+        sentinel = object()
+        built = module.train_valid_test_datasets_provider((8, 8, 8), 1, data_config=sentinel)
+        assert built == (1, 2, 3)
+        ((positional, keywords),) = calls
+        assert positional == ((8, 8, 8), 1)
+        expected = {"data_config": sentinel, "built_on_rank": module.is_dataset_built_on_rank}
+        assert keywords == expected
+        shared = module.is_dataset_built_on_rank is providers.is_dataset_built_on_rank
+        assert shared is (name != "hybrid_flex")
+        parameters = inspect.signature(module.is_dataset_built_on_rank).parameters
+        assert {"vp_stage", "is_packed_sequence"} <= set(parameters)
+
+
+def test_legacy_wrapper_is_the_shared_helper(monkeypatch, corpus):
+    """pretrain_gpt and pretrain_hybrid expose argument_utils.core_gpt_dataset_config_from_args
+    itself; hybrid-flex and the cache tool wrap it (the run's tokenizer; the class pinned to
+    GPTDataset). The helper takes the registered run config's seed, validates, and prepares with
+    the tokenizer it is given."""
+    shared = argument_utils.core_gpt_dataset_config_from_args
+    assert _entry_point("gpt").core_gpt_dataset_config_from_args is shared
+    assert _entry_point("hybrid").core_gpt_dataset_config_from_args is shared
+    args, cfg, _ = _prepare(monkeypatch, *corpus["blend"])
+    cfg.rng.seed = 77
+    own = SimpleNamespace(vocab_size=2048)
+    config = shared(args, tokenizer=own)
+    assert config.is_prepared and config.tokenizer is own and config.random_seed == 77
+    with pytest.raises(ValueError, match="GPTDataset needs a data source"):
+        shared(_validated(["--mock-data"], {}), dataset_type=GPTDataset)
