@@ -70,34 +70,38 @@ class TestInferenceUtils:
         assert detokenize_tokens(tokenizer, [5, 11, 2]) == "5 11"
 
     @staticmethod
-    def _head_capabilities(monkeypatch, mxfp8, general_gemm):
+    def _head_capabilities(monkeypatch, mxfp8, general_gemm, batch_invariant=False):
         monkeypatch.setattr(
             "megatron.core.fp8_utils.is_mxfp8_output_proj_active", lambda config: mxfp8
         )
         monkeypatch.setattr(
             "megatron.core.extensions.transformer_engine.te_general_gemm",
             object() if general_gemm else None,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+            "is_batch_invariant_mode_enabled",
+            lambda: batch_invariant,
         )
 
     @pytest.mark.parametrize(
-        "params_dtype, mxfp8, general_gemm, expected",
+        "params_dtype, mxfp8, general_gemm, batch_invariant, expected",
         [
-            (torch.bfloat16, False, True, True),  # general_gemm emits fp32 from bf16
-            (torch.float32, False, False, True),  # an fp32 head needs nothing
-            (torch.bfloat16, False, False, False),  # no general_gemm
-            (torch.bfloat16, True, True, False),  # the MXFP8 head emits its input dtype
+            (torch.bfloat16, False, True, False, True),  # general_gemm emits fp32 from bf16
+            (torch.float32, False, False, False, True),  # an fp32 head needs nothing
+            (torch.bfloat16, False, False, False, False),  # no general_gemm
+            (torch.bfloat16, True, True, False, False),  # the MXFP8 head emits its input dtype
+            (torch.bfloat16, False, True, True, False),  # BI mode keeps training's bf16 rounding
+            (torch.float32, False, False, True, True),  # fp32 short-circuit is sound under BI
         ],
     )
-    def test_lm_head_can_emit_fp32(self, monkeypatch, params_dtype, mxfp8, general_gemm, expected):
+    def test_lm_head_can_emit_fp32(
+        self, monkeypatch, params_dtype, mxfp8, general_gemm, batch_invariant, expected
+    ):
         """The GEMM input dtype is always available; fp32 from a half-precision head needs TE
-        general_gemm and is beyond the MXFP8 output projection."""
-        monkeypatch.setattr(
-            "megatron.core.fp8_utils.is_mxfp8_output_proj_active", lambda config: mxfp8
-        )
-        monkeypatch.setattr(
-            "megatron.core.extensions.transformer_engine.te_general_gemm",
-            object() if general_gemm else None,
-        )
+        general_gemm, is beyond the MXFP8 output projection, and is skipped under batch-invariant
+        mode (whose guarantee is bitwise parity with the training forward)."""
+        self._head_capabilities(monkeypatch, mxfp8, general_gemm, batch_invariant)
         config = SimpleNamespace(params_dtype=params_dtype)
         assert lm_head_can_emit(config, torch.float32) is expected
         assert lm_head_can_emit(config, params_dtype) is True

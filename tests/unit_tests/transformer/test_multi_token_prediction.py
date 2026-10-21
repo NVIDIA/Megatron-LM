@@ -4414,6 +4414,7 @@ class TestMultiTokenPredictionHybrid:
                 use_mup=False,
                 inference_cuda_graph_scope=None,
                 sequence_parallel=False,
+                params_dtype=torch.float32,
             ),
             pre_process=False,
             post_process=True,

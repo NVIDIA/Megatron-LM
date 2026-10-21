@@ -1610,7 +1610,7 @@ class TestChunkedPrefillCudaGraphs:
     def test_chunked_prefill_cuda_graphs(
         self, model_provider, ssm_mixer, chunked_prefill, num_cuda_graphs
     ):
-        """Verify generated tokens match across chunked prefill and CUDA graph configs."""
+        """Verify generated tokens match across chunked-prefill configs, per CUDA-graph mode."""
         skip_if_mamba_sequence_packing_not_available(model_provider, ssm_mixer or "mamba")
 
         clear_nvte_env_vars()
@@ -1635,9 +1635,12 @@ class TestChunkedPrefillCudaGraphs:
         # (only ~1.5 of the 512-token prompts fit per step).
         context_max_tokens = 768 if chunked_prefill else None
 
-        # Baseline: no chunked prefill, no CUDA graphs.
+        # Baseline: no chunked prefill, same CG config (CG padding can flip fp32 near-tie argmax).
         baseline_engine = self._build_engine(
-            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+            model,
+            enable_chunked_prefill=False,
+            num_cuda_graphs=num_cuda_graphs,
+            context_max_tokens=None,
         )
         baseline_outputs, baseline_steps = self._run_to_completion(
             baseline_engine, prompts, num_tokens_to_generate
