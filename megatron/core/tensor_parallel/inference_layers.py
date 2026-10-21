@@ -561,7 +561,7 @@ def is_inference_column_parallel_linear(module) -> bool:
     expose ``set_barrier_before_all_gather``. Returns ``False`` for anything else
     (including ``None`` and non-inference linear implementations).
     """
-    return isinstance(
+    return HAVE_TE and isinstance(
         module, (InferenceColumnParallelLinear, InferenceLayerNormColumnParallelLinear)
     )
 
