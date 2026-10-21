@@ -1131,7 +1131,7 @@ def _install_offload_probe(monkeypatch) -> _OffloadProbe:
     "its H2D with no wait on the group's D2H event, so a backward reaching a group before any "
     "prefetch ran reads the pinned buffer unfilled. Every group takes that path because "
     "bulk_reload_group never drains _groups_to_reload. Strict, so this flags itself for removal "
-    "once the fix lands: notes/BUG-offload-inline-reload-race.md, bugrepro_offload_race.py.",
+    "once the fix lands: NVIDIA/Megatron-LM#7399.",
 )
 class TestOffloadedExpertComputeRoundTrip:
     """Every activation the per-chunk group offloads must come back bit-identical."""
