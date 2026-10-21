@@ -156,7 +156,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
-        "test_runtime_cp_attention.py.",
+        "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
+        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -577,7 +578,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vmm_symm_allocator",
-        sources=("megatron/core/allocator/vmm_symm_allocator.py",),
+        sources=(
+            "megatron/core/allocator/vmm_symm_allocator.py",
+            "megatron/core/allocator/csrc/vmm_symm_allocator.cpp",
+        ),
         kind="cuda-ext",
         exempt_reason="Pluggable allocator (CUDA VMM driver calls); allocation only, no "
         "compute kernel.",
@@ -719,8 +723,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
-        "test_te_wrappers.py. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not "
-        "replayed.",
+        "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
+        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
+        "GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
@@ -835,6 +840,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
         "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
+    ),
+    KernelEntry(
+        name="mfsdp_muon_dispatch",
+        sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/muon.py",),
+        tests=("tests/unit_tests/distributed/mfsdp_v2/test_muon.py",),
+        kind="dispatch",
+        notes="FsdpMuon calls Emerging Optimizers Muon on matrices gathered to their owners. "
+        "test_muon_matches_reference checks weights, momentum, and forward outputs bitwise "
+        "against unsharded Muon across multiple steps, including an optimizer-state reload. "
+        "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(

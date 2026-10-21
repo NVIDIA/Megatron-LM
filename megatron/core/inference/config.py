@@ -809,7 +809,13 @@ class InferenceConfig:
     ``AsyncScheduleMode.LEGACY`` to disable it."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
-    """Whether returned log-probs are modified by the sampling parameters or not."""
+    """Whether log-probs of engine-sampled tokens are modified by the sampling parameters.
+
+    `'processed_logprobs'` applies each request's temperature, top-k, and top-p to the
+    log-probs of tokens the engine sampled, including the top-N log-probs at those
+    positions. Prompt log-probs and prompt top-N log-probs score tokens the engine did
+    not sample, so they always use the raw distribution in both modes.
+    """
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
