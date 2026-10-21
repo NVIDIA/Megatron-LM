@@ -152,15 +152,11 @@ class VanillaColumnParallelLinear(nn.Module):
     def weight(self) -> torch.nn.Parameter:
         return self.linear.weight
 
-    def forward(self, x: torch.Tensor):
-        """Returns ``out``, or ``(out, norm_out)`` with ``return_layernorm_output``."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.linear(x)
-        norm_out = None
-        if self.return_layernorm_output:
-            out, norm_out = out
         if self.gather_output and self.tp_size > 1:
             out = _AllGatherLastDim.apply(out, self.tp_size, self.tp_group)
-        return out if norm_out is None else (out, norm_out)
+        return out
 
 
 class ColumnParallelLinear(nn.Module):
@@ -218,11 +214,15 @@ class ColumnParallelLinear(nn.Module):
             )
         self.gather_output = gather_output
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
+        """Returns ``out``, or ``(out, norm_out)`` with ``return_layernorm_output``."""
         out = self.linear(x)
+        norm_out = None
+        if self.return_layernorm_output:
+            out, norm_out = out
         if self.gather_output and self.tp_size > 1:
             out = _AllGatherLastDim.apply(out, self.tp_size, self.tp_group)
-        return out
+        return out if norm_out is None else (out, norm_out)
 
 
 class RowParallelLinear(nn.Module):
