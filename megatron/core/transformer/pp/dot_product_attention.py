@@ -87,6 +87,8 @@ class PPDotProductAttention(MegatronModule):
         """Query/key/value are [s, b, h, d], or [t, h, d] with qkv_format 'thd'."""
         if attention_bias is not None:
             raise ValueError("PP attention does not support attention_bias")
+        if key.shape[0] != query.shape[0]:
+            raise ValueError("PP attention over a KV cache needs the dynamic inference engine")
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             cu = packed_seq_params.cu_seqlens_q_padded
             if cu is None:

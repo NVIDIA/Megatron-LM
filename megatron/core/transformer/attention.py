@@ -1095,7 +1095,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             )
             return out.unsqueeze(1)
         num_requests = seqlens_k.shape[0]
-        tokens = int(max_seqlen_q) if self.batch_invariant_mode else q.shape[0] // num_requests
+        tokens = context.num_speculative_tokens + 1
         rows = num_requests * tokens
         decoder = get_pp_decoder(
             attn,
