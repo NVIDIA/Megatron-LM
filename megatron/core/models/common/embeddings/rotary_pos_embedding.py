@@ -39,7 +39,7 @@ class _RotaryCacheKey:
     seq_len: int
     offset: int
     packed_seq: bool
-    cp_group: Optional[torch.distributed.ProcessGroup]
+    cp_group: torch.distributed.ProcessGroup | None
     device: torch.device
     dtype: torch.dtype
 
@@ -129,7 +129,7 @@ class RotaryEmbedding(nn.Module):
         max_seq_len: int,
         offset: int,
         packed_seq: bool,
-        cp_group: Optional[torch.distributed.ProcessGroup],
+        cp_group: torch.distributed.ProcessGroup | None,
     ) -> tuple[Tensor, float]:
         """Share constants across calls without allowing graph references to be evicted."""
         if cp_group is None:
