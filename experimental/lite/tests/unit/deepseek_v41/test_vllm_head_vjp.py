@@ -15,7 +15,7 @@ def test_head_projection_vjp_uses_compute_weight_and_master_dtype():
     grad = torch.randn(5, 11)
     compute = weight + (weight.bfloat16().float() - weight).detach()
     output = torch.nn.functional.linear(x.float(), compute)
-    expected = torch.autograd.grad(output, (x, weight), grad)
+    expected = torch.autograd.grad(output, (x, weight), grad.bfloat16().float())
     ctx = SimpleNamespace(
         saved_tensors=(x.detach(), weight.detach().bfloat16()), weight_dtype=weight.dtype
     )
