@@ -35,6 +35,12 @@ def build_rl_inference_model(
     if not rl_config.uses_separate_inference_model(
         context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
     ):
+        if rl_config.rl_offload_inference_model_weights:
+            raise ValueError(
+                "--rl-offload-inference-model-weights requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with "
+                "the training model."
+            )
         return None
     cfg_container = get_run_config()
     if spec_declares_disaggregation(args.inference_shards):
