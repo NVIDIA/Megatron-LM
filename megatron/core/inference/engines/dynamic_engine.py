@@ -2768,6 +2768,47 @@ class DynamicInferenceEngine(AbstractEngine):
                         }
                     )
 
+    def _promote_recomputed_prompt_scores(self, entry: RequestEntry) -> None:
+        """Restore the original prompt scores from the first complete recomputation.
+
+        A request checkpointed before its prompt scores arrive recomputes them into
+        a later record segment, but completion and streaming read them from the first.
+
+        Args:
+            entry (RequestEntry): Entry whose first record segment to repair.
+        """
+        record = entry.record
+        original_request = record[0]
+        expected_count = len(original_request.prompt_tokens) - 1
+        needs_top_n = original_request.sampling_params.top_n_logprobs > 0
+
+        def has_complete_prompt_scores(request: DynamicInferenceRequest) -> bool:
+            return len(request.prompt_log_probs or []) >= expected_count and (
+                not needs_top_n or len(request.prompt_top_n_logprobs or []) >= expected_count
+            )
+
+        if (
+            len(record.requests) == 1
+            or not original_request.sampling_params.return_log_probs
+            or original_request.sampling_params.skip_prompt_log_probs
+            or expected_count <= 0
+            or has_complete_prompt_scores(original_request)
+        ):
+            return
+
+        # A recomputation scores its whole prompt from position zero, with cached
+        # rows placed ahead of computed ones, so its leading rows are the originals.
+        for recomputed_request in record.requests[1:]:
+            if has_complete_prompt_scores(recomputed_request):
+                original_request.prompt_log_probs = list(
+                    recomputed_request.prompt_log_probs[:expected_count]
+                )
+                if needs_top_n:
+                    original_request.prompt_top_n_logprobs = list(
+                        recomputed_request.prompt_top_n_logprobs[:expected_count]
+                    )
+                return
+
     def _process_request_outputs(
         self,
         request_ids: torch.Tensor,
@@ -3179,6 +3220,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Cached rows that follow this step's rows, i.e. the skipped start of
             # the next chunk, go after them.
             self._place_cached_prompt_log_probs(request)
+
+            # Both record.merge() and coordinator streaming read original prompt
+            # scores from record[0], so repair it as soon as recomputation completes.
+            self._promote_recomputed_prompt_scores(self.requests[request_id])
 
             # Merge only after the final token's scores and metadata have been applied.
             if finished_entry is not None:
@@ -3736,7 +3781,9 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether request, token, and KV-cache capacity permit a chunk.
         """
-        request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
+        request_can_be_added, _, kv_cache_available = self.context.check_availability(
+            req, prefill_chunk_length=1
+        )
         is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
         token_capacity_available = self.context.active_token_count < self.context.max_tokens
         return (
@@ -4055,6 +4102,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     # than a block cannot be block-aligned; leave it unchanged).
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
+
+                request_available, tokens_available, kv_available = self.context.check_availability(
+                    req, prefill_chunk_length
+                )
+                if not (
+                    (is_continuing_chunked_prefill or request_available)
+                    and tokens_available
+                    and kv_available
+                ):
+                    can_schedule = False
+                    break
 
                 # Add hashes to pending set (prefix-caching bookkeeping).
                 if prefix_caching_enabled:

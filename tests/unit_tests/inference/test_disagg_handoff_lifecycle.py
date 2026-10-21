@@ -784,6 +784,7 @@ def test_eviction_recovery_waits_for_imported_prefix(handoff_loop, chunked):
     engine._can_schedule_chunked_prefill = mock.Mock(return_value=True)
     engine._cg_admission_gating_active = mock.Mock(return_value=False)
     context._compute_prefix_match = mock.Mock(return_value=SimpleNamespace(prefix_skip_tokens=0))
+    context.check_availability = mock.Mock(return_value=(True, True, True))
     context.add_request = mock.Mock(
         side_effect=lambda _: allocator.retain_memory_blocks(
             [allocator.kv_hash_to_block_id[block_hash]]

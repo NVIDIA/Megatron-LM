@@ -2464,6 +2464,41 @@ def test_cached_prompt_log_probs_wait_for_preceding_scores(scored_before):
     assert not request.cached_prompt_log_probs
 
 
+def test_recomputed_prompt_scores_repair_the_original_segment():
+    """Scores lost to a checkpoint are restored from the first complete recomputation."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    original = DynamicInferenceRequest(
+        request_id=3,
+        prompt_tokens=torch.arange(9),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=4,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=3,
+        ),
+    )
+    # The request was checkpointed after one generated token, before its scores arrived.
+    original.generated_tokens = [9]
+    record = DynamicInferenceRequestRecord.from_request(original)
+    record.checkpoint()
+    recomputed = record[-1]
+    entry = RequestEntry(record=record, future=mock.Mock())
+
+    # A partial recomputation leaves the original segment untouched.
+    recomputed.prompt_log_probs = [-float(i) for i in range(4)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(4)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs is None
+
+    # The recomputed prompt includes the generated token, so it has one extra row.
+    recomputed.prompt_log_probs = [-float(i) for i in range(9)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(9)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs == recomputed.prompt_log_probs[:8]
+    assert original.prompt_top_n_logprobs == recomputed.prompt_top_n_logprobs[:8]
+    assert original.prompt_log_probs is not recomputed.prompt_log_probs
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}

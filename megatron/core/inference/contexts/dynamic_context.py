@@ -3418,9 +3418,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             speculative_reserve_blocks=speculative_reserve_blocks,
         )
 
-    def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
+    def check_availability(
+        self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
+    ) -> Tuple[bool, bool, bool]:
         """
         Check if the request can be added to the context.
+
+        Args:
+            req (DynamicInferenceRequest): Request to check.
+            prefill_chunk_length (Optional[int]): Prompt tokens in the chunk to admit.
+                Defaults to the whole remaining prompt.
         """
         # Note that for hybrid models checking the total request count is sufficient
         # because we allocate a single set of Mamba state tensors for each request.
@@ -3432,7 +3439,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
             request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
-        match = self._compute_prefix_match(req, req.remaining_prompt_length)
+        if prefill_chunk_length is None:
+            prefill_chunk_length = req.remaining_prompt_length
+
+        match = self._compute_prefix_match(req, prefill_chunk_length)
         matched_block_ids = match.matched_block_ids
         num_blocks_from_pool = match.num_blocks_from_pool
 
