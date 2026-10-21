@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _create_fsdp_muon_optimizer,
     _get_qkv_split_shapes,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
@@ -507,6 +508,19 @@ def _get_megatron_optimizer_based_on_param_groups(
     if skip_megatron_wrapping and config.optimizer_cpu_offload:
         raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
 
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
+    fsdp_parameters = None
+    if is_mfsdp_v2:
+        fsdp_parameters = [param for group in param_groups for param in group['params']]
+        if not is_te_min_version("2.18.0"):
+            # Older TE optimizers cannot handle empty local shards. Keep their original
+            # parameter membership for checkpointing, including when Muon owns other weights.
+            param_groups = [
+                dict(group, params=[p for p in group['params'] if p.to_local().numel() > 0])
+                for group in param_groups
+            ]
+            param_groups = [group for group in param_groups if group['params']]
+
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
     # for the purposes of grad stats reductions.
@@ -684,7 +698,12 @@ def _get_megatron_optimizer_based_on_param_groups(
         setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
     elif isinstance(model_chunks[0], FullyShardedDataParallelV2):
         optimizer = FullyShardedOptimizer(
-            optimizer, config, grad_scaler, init_state_fn, model_chunks=model_chunks
+            optimizer,
+            config,
+            grad_scaler,
+            None,
+            model_chunks=model_chunks,
+            parameters=fsdp_parameters,
         )
         # get_grad_norm divides each rank's contribution by that gradient's replication
         # factor, so summing it over every rank is correct by construction.
@@ -773,8 +792,18 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
-        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
+    if is_mfsdp_v2:
+        if eopt_name != 'muon':
+            raise NotImplementedError(
+                "MFSDP v2 currently supports only Muon among emerging optimizers."
+            )
+        if config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 owns optimizer sharding; disable use_distributed_optimizer.")
+        if use_layer_wise:
+            raise ValueError("MFSDP v2 Muon does not use the layer-wise distributed optimizer.")
+        if config.muon_split_qkv:
+            raise NotImplementedError("MFSDP v2 Muon requires muon_split_qkv=False.")
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -915,22 +944,35 @@ def _get_megatron_emerging_optimizer(
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
         # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
-        # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
+        # constructed here. Scalar optimizers that also appear
         # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
         if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
-            optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
-            )
+            if is_mfsdp_v2:
+                optimizer, init_state_fn = _create_fsdp_muon_optimizer(config, groups)
+            else:
+                optimizer, init_state_fn = _create_emerging_optimizer(
+                    config, groups, eopt_name, model_chunks, pg_collection
+                )
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
                 continue
-            if config.bf16:
+            if is_mfsdp_v2:
+                # FsdpMuon owns the distributed update; this wrapper supplies the MCore
+                # gradient-statistics and checkpoint interfaces. Its existing weight refresh
+                # is retained even though FsdpMuon also refreshes model weights in step().
+                optimizer = FullyShardedOptimizer(
+                    optimizer, config, None, init_state_fn, model_chunks=model_chunks
+                )
+                grad_stats_parallel_group = torch.distributed.group.WORLD
+            elif config.bf16:
                 optimizer = Float16OptimizerWithFloat16Params(
                     optimizer, config, None, init_state_fn
                 )
+                grad_stats_parallel_group = model_parallel_group
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
-            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+                grad_stats_parallel_group = model_parallel_group
+            setattr(optimizer, 'grad_stats_parallel_group', grad_stats_parallel_group)
             tp_group = pg_collection.tp
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
@@ -1163,19 +1205,6 @@ def get_megatron_optimizer(
                 param_groups = _get_param_groups(
                     model_chunk, config, config_overrides, param_group_process_group
                 )
-                if not is_te_min_version("2.18.0"):
-                    # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
-                    # https://github.com/NVIDIA/TransformerEngine/issues/3207.
-                    # Empty local shards have no optimizer state or data to update, so omit them.
-                    for param_group in param_groups:
-                        param_group['params'] = [
-                            parameter
-                            for parameter in param_group['params']
-                            if parameter.to_local().numel() > 0
-                        ]
-                    param_groups = [
-                        param_group for param_group in param_groups if param_group['params']
-                    ]
                 # MFSDP v2 owns its sharded parameter and gradient storage, so
                 # FullyShardedOptimizer does not need DDP param-and-grad buffers.
                 buffers = None
