@@ -71,6 +71,25 @@ def test_two_binding_hooks_own_input_and_output_adaptation(direct):
     assert_bit_exact(x.grad, {}, 2 * (2 * x.detach()).cos(), {})
     assert_bit_exact(context.grad, {}, torch.ones_like(context), {})
 
+    class NativeLayer(MegatronModule):
+        @bind_layer_interface
+        def forward(self, hidden_states, aux_inputs):
+            assert aux_inputs.context is context
+            return hidden_states.sin()
+
+    native = bare(NativeLayer)
+    call = native.forward if direct else native
+    assert_bit_exact(call(x, context=context), {}, x.sin(), {})
+    result = call(x, aux_inputs=LayerAuxInputs(context=context))
+    output, aux_outputs = (result, LayerAuxOutputs()) if direct else result
+    assert_bit_exact(output, {}, x.sin(), {})
+    assert aux_outputs.bias is None
+    with pytest.raises(TypeError, match="cannot be mixed"):
+        call(x, LayerAuxInputs(context=context), context=context)
+    if not direct:
+        with pytest.raises(TypeError, match="without legacy arguments"):
+            native(x, aux_inputs=LayerAuxInputs(context=context), context=context)
+
 
 def test_split_stages_use_the_same_two_binding_hooks():
     class Layer(MegatronModule):
@@ -104,8 +123,12 @@ def test_split_stages_use_the_same_two_binding_hooks():
     )
     assert len(state) == 3 and state[2] is mask
     assert events == ["bind_inputs"]
-    output, aux_outputs = module.forward_post_core_attn(*state)
+    legacy_output, legacy_context = module.forward_post_core_attn(*state)
+    assert events == ["bind_inputs"]
+    assert legacy_context is mask
+    output, aux_outputs = module.forward_post_core_attn(*state, aux_inputs=LayerAuxInputs())
     assert events == ["bind_inputs", "bind_outputs"]
+    assert_bit_exact(legacy_output, {}, output, {})
     assert_bit_exact(output, {}, 2 * x + (2 * x).sin(), {})
     assert aux_outputs.bias is mask
 
@@ -117,5 +140,8 @@ def test_transformer_split_stage_does_not_bind_context_as_bias():
     layer.self_attention = nn.Module()
     layer.self_attention.forward_post_core_attn = Mock(return_value=(x, None))
     layer.attention_bda_and_cross_attention = Mock(return_value=(x, context))
-    output, aux_outputs = layer.forward_post_core_attn(x, x, context=context)
+    assert layer.forward_post_core_attn(x, x, context=context) is x
+    output, aux_outputs = layer.forward_post_core_attn(
+        x, x, context=context, aux_inputs=LayerAuxInputs()
+    )
     assert output is x and aux_outputs.bias is None

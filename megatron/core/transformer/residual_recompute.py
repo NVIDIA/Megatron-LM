@@ -205,13 +205,19 @@ def checkpoint_residual_write(
 ) -> Tensor:
     """Checkpoint one residual write while preserving standard module hooks."""
 
-    output, bias = branch_output
+    if isinstance(branch_output, tuple):
+        output, bias = branch_output
+        return_tuple = True
+    else:
+        output, bias = branch_output, None
+        return_tuple = False
 
     def run_write(
         branch_update: Tensor, branch_bias: Tensor | None, *connection_state: Tensor
     ) -> Tensor:
+        value = (branch_update, branch_bias) if return_tuple else branch_update
         return apply_module(connection)(
-            (branch_update, branch_bias),
+            value,
             operation="write",
             state=connection_state,
             dropout_probability=dropout_probability,

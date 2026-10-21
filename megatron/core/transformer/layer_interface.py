@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 from torch import Tensor
 from torch.utils._pytree import register_pytree_node
 
-from megatron.core.utils import experimental_api
+from megatron.core.utils import deprecate_inference_params, experimental_api
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -132,11 +132,15 @@ def _normalize_layer_output(result) -> LayerOutput:
 
 @experimental_api
 def bind_layer_output_stage(stage):
-    """Apply the layer's output hook to a completed split stage."""
+    """Bind a split stage's output when its caller supplies shared inputs."""
 
     @wraps(stage)
     def forward(self, *args, **kwargs):
-        return self.bind_layer_outputs(stage(self, *args, **kwargs))
+        aux_inputs = kwargs.pop("aux_inputs", None)
+        if aux_inputs is not None and not isinstance(aux_inputs, LayerAuxInputs):
+            raise TypeError("aux_inputs must be a LayerAuxInputs instance")
+        result = stage(self, *args, **kwargs)
+        return self.bind_layer_outputs(result) if aux_inputs is not None else result
 
     return forward
 
@@ -179,18 +183,24 @@ class LayerInterface(Protocol):
         ...
 
 
-def _parse_layer_aux_inputs(args, kwargs):
+def _parse_layer_aux_inputs(args, kwargs, *, allow_aux_keyword=False):
     """Extract a shared invocation, or return None for an ordinary forward call."""
     positional_inputs = len(args) >= 2 and isinstance(args[1], LayerAuxInputs)
-    if not positional_inputs and "inputs" not in kwargs:
+    input_key = "inputs" if "inputs" in kwargs else "aux_inputs"
+    keyword_inputs = kwargs.get(input_key)
+    if (
+        not positional_inputs
+        and "inputs" not in kwargs
+        and not (allow_aux_keyword and isinstance(keyword_inputs, LayerAuxInputs))
+    ):
         return None
     if positional_inputs:
         if len(args) != 2 or kwargs:
             raise TypeError("LayerAuxInputs cannot be mixed with legacy arguments")
         return args
-    aux_inputs = kwargs["inputs"]
+    aux_inputs = keyword_inputs
     if not isinstance(aux_inputs, LayerAuxInputs):
-        raise TypeError("inputs must be a LayerAuxInputs instance")
+        raise TypeError(f"{input_key} must be a LayerAuxInputs instance")
     if len(args) == 1 and len(kwargs) == 1:
         return args[0], aux_inputs
     if not args and len(kwargs) == 2 and ("x" in kwargs or "hidden_states" in kwargs):
@@ -212,7 +222,8 @@ def bind_layer_interface(forward):
     """Bind inputs and outputs through the layer's two hooks.
 
     Module calls bind around PyTorch hooks and graph dispatch; direct forward calls
-    bind around forward execution. Explicit-argument calls bypass both hooks.
+    bind around forward execution. Flat calls to native-container forwards bind
+    inputs for compatibility while preserving their natural output.
     Use ``copy_signature`` beneath this decorator for forwarding-only methods.
     """
     return _bind_layer_method(forward, bind_outputs=True)
@@ -234,6 +245,10 @@ def _bind_layer_method(method, *, bind_outputs):
         raise TypeError("A LayerAuxInputs forward needs an explicit hidden-state parameter")
     hidden_parameter = parameters[0]
     field_names = {field.name for field in fields(LayerAuxInputs)} | {"aux_inputs"}
+    required_aux_inputs = any(
+        parameter.name == "aux_inputs" and parameter.default is inspect.Parameter.empty
+        for parameter in parameters[1:]
+    )
     binding = []
     for parameter in parameters[1:]:
         if parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
@@ -252,6 +267,22 @@ def _bind_layer_method(method, *, bind_outputs):
     def forward(self, *args, **kwargs):
         shared_inputs = _parse_layer_aux_inputs(args, kwargs)
         if shared_inputs is None:
+            # Native container forwards still accept their former flat keyword calls.
+            # Keep those calls on the ordinary forward path and preserve their natural output.
+            if required_aux_inputs and "aux_inputs" not in kwargs and len(args) <= 1:
+                legacy = kwargs.copy()
+                has_hidden = bool(args) or hidden_parameter.name in legacy
+                if has_hidden:
+                    hidden = args[0] if args else legacy.pop(hidden_parameter.name)
+                    if "inference_params" in legacy:
+                        legacy["inference_context"] = deprecate_inference_params(
+                            legacy.get("inference_context"), legacy.pop("inference_params")
+                        )
+                    if legacy.keys() <= field_names:
+                        bound_args, bound_kwargs = self.bind_layer_inputs(
+                            hidden, LayerAuxInputs(**legacy), forward=forward
+                        )
+                        return method(self, *bound_args, **bound_kwargs)
             return method(self, *args, **kwargs)
         return _call_layer_interface(
             self, method.__get__(self), *shared_inputs, forward=forward, bind_outputs=bind_outputs

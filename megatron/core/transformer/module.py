@@ -89,7 +89,7 @@ class MegatronModule(torch.nn.Module, LayerInterface):
         # Bind once, before graph selection or PyTorch hooks, and convert the
         # result only after the normal module execution path has completed.
         if getattr(self.forward, "_layer_input_schema", None) is not None:
-            shared_inputs = _parse_layer_aux_inputs(args, kwargs)
+            shared_inputs = _parse_layer_aux_inputs(args, kwargs, allow_aux_keyword=True)
             if shared_inputs is not None:
                 return _call_layer_interface(self, self._call_with_bound_args, *shared_inputs)
         return self._call_with_bound_args(*args, **kwargs)

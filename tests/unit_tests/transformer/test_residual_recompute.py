@@ -27,7 +27,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
+from megatron.core.transformer.layer_interface import bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -404,7 +404,7 @@ def test_residual_connection_rejects_branch_dtype_on_write():
 
     with pytest.raises(TypeError, match="read-only"):
         connection(
-            (branch_input, None),
+            branch_input,
             operation="write",
             state=state,
             branch_input_dtype=torch.bfloat16,
@@ -670,7 +670,7 @@ class TestResidualStreamRecomputeIntegration:
             32, 3, reference_config.hidden_size, device="cuda", requires_grad=True
         )
         offloaded_input = reference_input.detach().clone().requires_grad_(True)
-        reference_output = reference(hidden_states=reference_input, aux_inputs=LayerAuxInputs())
+        reference_output = reference(hidden_states=reference_input, attention_mask=None)
         reference_output.float().square().mean().backward()
 
         FineGrainedActivationOffloadingInterface.reset_instance()
@@ -682,7 +682,7 @@ class TestResidualStreamRecomputeIntegration:
             delta_offload_bytes_across_pp_ranks=0,
             activation_offload_fraction=1.0,
         )
-        offloaded_output = offloaded(hidden_states=offloaded_input, aux_inputs=LayerAuxInputs())
+        offloaded_output = offloaded(hidden_states=offloaded_input, attention_mask=None)
         offloaded_output.float().square().mean().backward()
         FineGrainedActivationOffloadingInterface.reset()
 
@@ -746,13 +746,12 @@ class TestResidualStreamRecomputeIntegration:
         recomputed.residual_connection.register_forward_hook(
             record_read("replay"), with_kwargs=True
         )
-        reference_output = reference(hidden_states=reference_input, aux_inputs=LayerAuxInputs())
+        reference_output = reference(hidden_states=reference_input)
         reference_output.square().mean().backward()
 
         context = build_residual_stream_recompute_plan(1, 1)[0]
         recomputed_output = recomputed(
-            hidden_states=recomputed_input,
-            aux_inputs=LayerAuxInputs(residual_stream_recompute_context=context),
+            hidden_states=recomputed_input, residual_stream_recompute_context=context
         )
         assert len(context.manager.checkpoints) == 2
         context.finalize(recomputed_output)
@@ -816,9 +815,9 @@ class TestResidualStreamRecomputeIntegration:
         input_dtype = torch.float32 if fp32_residual_connection else reference_config.params_dtype
         reference_input = torch.randn(4, 3, 8, device="cuda", dtype=input_dtype, requires_grad=True)
         recomputed_input = reference_input.detach().clone().requires_grad_(True)
-        reference_output = reference(hidden_states=reference_input, aux_inputs=LayerAuxInputs())
+        reference_output = reference(hidden_states=reference_input, attention_mask=None)
         reference_output.square().mean().backward()
-        recomputed_output = recomputed(hidden_states=recomputed_input, aux_inputs=LayerAuxInputs())
+        recomputed_output = recomputed(hidden_states=recomputed_input, attention_mask=None)
         recomputed_output.square().mean().backward()
 
         assert reference_output.shape == reference_input.shape
@@ -888,9 +887,8 @@ class TestResidualStreamRecomputeIntegration:
         hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
         output = stack(
             hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(
-                attention_mask=None, packed_seq_params=boundary_packed_seq_params
-            ),
+            attention_mask=None,
+            packed_seq_params=boundary_packed_seq_params,
         )
 
         assert events == [
@@ -918,7 +916,7 @@ class TestResidualStreamRecomputeIntegration:
         ).cuda()
         hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
+        output = stack(hidden_states=hidden_states, attention_mask=None)
         output.square().mean().backward()
 
         assert output.shape == hidden_states.shape

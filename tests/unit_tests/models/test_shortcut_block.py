@@ -252,6 +252,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         return (hidden_states,)
 
     def attn_post(hidden_states, **kwargs):
+        assert isinstance(kwargs.pop("aux_inputs"), LayerAuxInputs)
         assert kwargs == expected_layer_kwargs
         return hidden_states, LayerAuxOutputs()
 

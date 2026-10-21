@@ -393,7 +393,8 @@ The binding decorators have three roles:
 
 - `@bind_layer_interface` binds inputs and normalizes outputs for a complete layer.
 - `@bind_layer_input_stage` binds inputs for a split stage, preserving its intermediate output.
-- `@bind_layer_output_stage` normalizes a completion stage's output, preserving its arguments.
+- `@bind_layer_output_stage` normalizes a completion stage's output when passed
+  `aux_inputs=LayerAuxInputs(...)`; legacy calls keep their natural output.
 
 A `MegatronModule` can keep an ordinary explicit-argument `forward` and opt into
 the shared interface:
@@ -418,8 +419,8 @@ Decorated implementations may return a tensor when no auxiliary outputs remain. 
 supplies `LayerAuxOutputs()`, so callers always unpack the same pair. Existing core
 `(hidden_states, bias)` results are normalized to `LayerAuxOutputs(bias=bias)` for
 shared calls. Explicit-argument core calls retain their tensor/bias contract.
-The existing `inputs=` keyword remains a compatibility entry point for the
-container and cannot be mixed with legacy arguments.
+Module calls accept the container positionally or through `inputs=` or `aux_inputs=`.
+The container cannot be mixed with legacy arguments.
 
 Forwarding layers can receive the existing container by declaring `aux_inputs`:
 
@@ -467,7 +468,10 @@ return self.bind_layer_outputs(result)
 `_call_with_bound_args` retains normal PyTorch hooks and CUDA-graph dispatch. Direct
 `.forward(...)` calls use the same binding hooks around the raw implementation,
 retaining PyTorch's usual bypass of module hooks and graph dispatch. Layers do not
-receive execution callbacks. Explicit legacy calls bypass the two binding hooks.
+receive execution callbacks. Explicit core calls bypass the two binding hooks.
+Native container forwards also accept legacy flat keyword calls: their input hook
+packs those fields, while the call retains the layer's natural output format.
+Direct `.forward(..., aux_inputs=...)` calls retain that natural format.
 
 For example, input adaptation can delegate to the default signature-based binding:
 
@@ -551,7 +555,8 @@ those inputs do not escape the call.
 Transformer and Mamba pre-core stages accept `(hidden_states, aux_inputs)` through
 `@bind_layer_input_stage`. It calls the same `bind_layer_inputs` hook, selecting the
 stage's signature through the `forward` argument. Intermediate state stays opaque:
-pass the entire result to `forward_post_core_attn(*state)`. No separate stage-specific binding
+pass the entire result to `forward_post_core_attn(*state, aux_inputs=aux_inputs)`
+for a bound output. Legacy calls can pass `*state` alone. No separate stage-specific binding
 hook is needed.
 
 Unused attention/rotary/padding arguments have been removed from Mamba's pre-core
@@ -563,9 +568,10 @@ ignores packed-sequence CP metadata for MambaMixer and GDN, whose forward signat
 do not consume it; GDP declares the field and receives it. The explicit split-stage
 mixer call still forwards the metadata only when `chunkwise_context_parallel` is enabled.
 
-Completed Transformer and Mamba split stages return `(hidden_states, aux_outputs)`.
-Their `forward_post_core_attn` methods use `@bind_layer_output_stage`, which calls the
-same `bind_layer_outputs(result)` hook without needing the original inputs.
+Completed Transformer and Mamba split stages return `(hidden_states, aux_outputs)`
+when passed `aux_inputs`. Their `forward_post_core_attn` methods use
+`@bind_layer_output_stage`, which calls the same `bind_layer_outputs(result)` hook.
+Without `aux_inputs`, they return their natural legacy output.
 Shortcut consumes the completed output pair directly. Core projection stages retain
 their internal `(output, bias)` contract for residual fusion.
 
@@ -626,7 +632,7 @@ happens after execution or graph replay. TransformerLayer's forward returns
 `aux_inputs=` call, and its legacy `(hidden_states, context)` otherwise. The outer
 binding preserves an already-bound result. Graph replay hooks make the same distinction
 for completed calls. The split-stage completion returns only hidden states, which
-`@bind_layer_output_stage` wraps in the standard output format;
+`@bind_layer_output_stage` wraps in the standard output format when passed `aux_inputs`;
 TransformerLayer does not override `bind_layer_outputs`. HyperConnectionTransformerLayer
 extracts its per-call recompute manager in `__call__` before binding and forwards an
 auxiliary-input snapshot with that field cleared. It does not override

@@ -476,12 +476,10 @@ class TestMultiTokenPredictionLayer:
         MultiTokenPredictionBlock.forward(
             block,
             hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(
-                input_ids=torch.zeros(1, 2, dtype=torch.long),
-                position_ids=torch.zeros(1, 2, dtype=torch.long),
-                attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
-                mtp_input_mask=mtp_input_mask,
-            ),
+            input_ids=torch.zeros(1, 2, dtype=torch.long),
+            position_ids=torch.zeros(1, 2, dtype=torch.long),
+            attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
+            mtp_input_mask=mtp_input_mask,
         )
 
         torch.testing.assert_close(seen_inputs[0], hidden_states)
@@ -532,9 +530,10 @@ class TestMultiTokenPredictionLayer:
         MultiTokenPredictionBlock.forward(
             block,
             hidden_states=torch.ones_like(decoder_input),
-            aux_inputs=LayerAuxInputs(
-                input_ids=None, position_ids=None, decoder_input=decoder_input, attention_mask=None
-            ),
+            input_ids=None,
+            position_ids=None,
+            decoder_input=decoder_input,
+            attention_mask=None,
         )
 
         torch.testing.assert_close(
@@ -613,12 +612,10 @@ class TestMultiTokenPredictionLayer:
         MultiTokenPredictionBlock.forward(
             block,
             hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(
-                input_ids=torch.zeros(1, 5, dtype=torch.long),
-                position_ids=torch.zeros(1, 5, dtype=torch.long),
-                attention_mask=torch.ones(1, 1, 5, 5, dtype=torch.bool),
-                packed_seq_params=packed_seq_params,
-            ),
+            input_ids=torch.zeros(1, 5, dtype=torch.long),
+            position_ids=torch.zeros(1, 5, dtype=torch.long),
+            attention_mask=torch.ones(1, 1, 5, 5, dtype=torch.bool),
+            packed_seq_params=packed_seq_params,
         )
 
         expected_once = [1, 2, 12, 4, 14] if packed else [1, 2, 3, 4, 14]
@@ -1644,12 +1641,10 @@ class TestMTPHiddenStateRollUnderParallelism:
         output = MultiTokenPredictionBlock.forward(
             block,
             hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(
-                input_ids=token_ids,
-                position_ids=token_ids.clone(),
-                attention_mask=None,
-                packed_seq_params=packed_seq_params,
-            ),
+            input_ids=token_ids,
+            position_ids=token_ids.clone(),
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
         )
         return rolled_history, mixed_states, layer_inputs, output
 

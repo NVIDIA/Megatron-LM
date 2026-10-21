@@ -11,7 +11,7 @@ from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConn
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
+from megatron.core.transformer.layer_interface import bind_layer_interface
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
@@ -194,7 +194,7 @@ class TestHybridStackMHC:
         stack = _get_stack(config, num_local_layers=3).cuda()
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
+        output = stack(hidden_states, attention_mask=None)
 
         assert output.shape == hidden_states.shape
         assert torch.isfinite(output).all()
@@ -233,10 +233,7 @@ class TestHybridStackMHC:
             record_input_ids,
         )
 
-        output = stack(
-            hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(attention_mask=None, input_ids=input_ids),
-        )
+        output = stack(hidden_states, attention_mask=None, input_ids=input_ids)
         output.float().sum().backward()
 
         assert len(seen_input_ids) == 2
@@ -251,7 +248,7 @@ class TestHybridStackMHC:
             8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
 
-        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
+        output = stack(hidden_states, attention_mask=None)
 
         assert output.shape == hidden_states.shape
         assert output.dtype == torch.bfloat16
@@ -274,7 +271,7 @@ class TestHybridStackMHC:
         ).cuda()
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
+        output = stack(hidden_states, attention_mask=None)
 
         assert output.shape == hidden_states.shape
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in stack.layers)
@@ -306,7 +303,7 @@ class TestHybridStackMHC:
         ).cuda()
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
 
-        output = stack(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
+        output = stack(hidden_states, attention_mask=None)
 
         wrapped_layer = stack.layers[0]
         assert isinstance(wrapped_layer, HyperConnectionHybridLayer)
@@ -413,10 +410,10 @@ class TestHybridStackMHC:
         monkeypatch.setattr(layer.hyper_connection, "forward", fake_hyper_connection_forward)
         monkeypatch.setattr(layer.hyper_connection, "fused_h_res_h_post_bda", fake_bda)
 
-        output, _ = layer(hidden_states, LayerAuxInputs(mhc_recompute_manager=manager))
+        output = layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
         assert output is hidden_states
         assert seen_managers == [None]
 
         manager.is_last_layer_in_recompute_block = False
-        layer(hidden_states, LayerAuxInputs(mhc_recompute_manager=manager))
+        layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
         assert seen_managers[-1] is manager

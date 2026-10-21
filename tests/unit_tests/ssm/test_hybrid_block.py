@@ -37,7 +37,6 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
-from megatron.core.transformer.layer_interface import LayerAuxInputs, LayerAuxOutputs
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
@@ -657,10 +656,7 @@ def test_attention_shortcut_wide_residual_ep2_serial_overlap_parity(
         def run(model):
             model.zero_grad(set_to_none=True)
             hidden_states = base_hidden.detach().clone().requires_grad_(True)
-            output = model(
-                hidden_states=hidden_states,
-                aux_inputs=LayerAuxInputs(attention_mask=attention_mask),
-            )
+            output = model(hidden_states, attention_mask=attention_mask)
             output.float().square().mean().backward()
             gradients = {
                 name: parameter.grad.detach().float().clone()
@@ -878,9 +874,7 @@ class TestHybridBlock:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         )
         attention_mask = attention_mask.cuda()
-        output = block(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        output = block(hidden_states, attention_mask=attention_mask)
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == block.config.hidden_size
@@ -895,9 +889,7 @@ class TestHybridBlock:
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         ).cuda()
-        return block(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        return block(hidden_states, attention_mask=attention_mask)
 
     @pytest.mark.timeout(60)
     @pytest.mark.parametrize(
@@ -946,7 +938,7 @@ class TestHybridBlock:
         hs, am = build_inputs()
 
         def run(block, hs, am):
-            out = block(hidden_states=hs, aux_inputs=LayerAuxInputs(attention_mask=am))
+            out = block(hs, attention_mask=am)
             out.float().sum().backward()
             grads = {
                 n: p.grad.detach().float().cpu()
@@ -1069,9 +1061,7 @@ class TestHybridBlock:
             16, 2, block.config.hidden_size, device="cuda", requires_grad=True
         )
         attention_mask = torch.ones((2, 1, 16, 16), dtype=torch.bool, device="cuda")
-        output = block(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        output = block(hidden_states, attention_mask=attention_mask)
 
         assert output.shape == hidden_states.shape
         assert isinstance(block.layers[0], WideResidualMambaLayer)
@@ -1112,11 +1102,11 @@ class TestHybridBlock:
 
         with torch.no_grad():
             model_parallel_cuda_manual_seed(123)
-            atomic_output = layer(hidden_states, LayerAuxInputs(attention_mask=attention_mask))
+            atomic_output = layer(hidden_states, attention_mask=attention_mask)
 
             model_parallel_cuda_manual_seed(123)
             stage_one_state = layer.forward_pre_attn_and_core_attn(
-                hidden_states, LayerAuxInputs(attention_mask=attention_mask)
+                hidden_states, attention_mask=attention_mask, packed_sequence_cp_metadata=None
             )
             two_stage_output = layer.forward_post_core_attn(*stage_one_state)
 
@@ -1128,9 +1118,6 @@ class TestHybridBlock:
                     assert_bitwise_equal(actual_item, expected_item)
             elif actual is None:
                 assert expected is None
-            elif isinstance(actual, LayerAuxOutputs):
-                assert_bitwise_equal(actual.bias, expected.bias)
-                assert_bitwise_equal(actual.mhc_multistream, expected.mhc_multistream)
             else:
                 assert torch.equal(actual, expected)
 
@@ -1190,9 +1177,7 @@ class TestHybridBlock:
 
             monkeypatch.setattr(attn_layer, "_forward_mlp", fail_if_mlp_runs)
 
-        output = block(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        output = block(hidden_states, attention_mask=attention_mask)
         output.float().square().mean().backward()
 
         assert output.shape == hidden_states.shape
@@ -1273,10 +1258,7 @@ class TestHybridBlock:
         def run(block, hidden_states):
             block.train()
             model_parallel_cuda_manual_seed(4321)
-            output = block(
-                hidden_states=hidden_states,
-                aux_inputs=LayerAuxInputs(attention_mask=attention_mask),
-            )
+            output = block(hidden_states, attention_mask=attention_mask)
             output.float().square().mean().backward()
             gradients = {
                 name: parameter.grad.detach().clone()
@@ -1355,7 +1337,7 @@ class TestHybridBlock:
             16, 2, block.config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
         )
 
-        output = block(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None))
+        output = block(hidden_states, attention_mask=None)
         output.float().square().mean().backward()
 
         assert output.shape == hidden_states.shape
@@ -1418,9 +1400,7 @@ class TestHybridBlock:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         )
         attention_mask = attention_mask.cuda()
-        output = block(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        output = block(hidden_states, attention_mask=attention_mask)
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == block.config.hidden_size

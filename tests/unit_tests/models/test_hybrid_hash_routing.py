@@ -198,9 +198,7 @@ def make_stack(layers, **config_overrides):
 def run_stack(stack, input_ids):
     hidden_states = torch.randn(4, 2, 8, requires_grad=True)
     output = HybridStack.forward(
-        stack,
-        hidden_states=hidden_states,
-        aux_inputs=LayerAuxInputs(attention_mask=None, input_ids=input_ids),
+        stack, hidden_states=hidden_states, attention_mask=None, input_ids=input_ids
     )
     assert output.shape == hidden_states.shape
     return output

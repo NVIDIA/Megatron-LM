@@ -325,6 +325,8 @@ def assert_forward_backward(module, x, inputs, explicit):
                 value.grad = None
             if aux_keyword:
                 result = module(hidden_states=x, aux_inputs=inputs)
+            elif not packed and "aux_inputs" in explicit:
+                result = module.forward(hidden_states=x, **explicit)
             else:
                 result = module(x, inputs) if packed else module(hidden_states=x, **explicit)
             if packed or aux_keyword:

@@ -527,11 +527,13 @@ class ShortcutMoEBlock(MegatronModule, LayerInterface):
             with quant_context_factory(attn_config, self.attn_layer_idx):
                 if attn_recompute_context is None:
                     attn_layer_output, aux_outputs = self.compute_layer.forward_post_core_attn(
-                        *paired_state
+                        *paired_state, aux_inputs=compute_aux_inputs
                     )
                 else:
                     attn_layer_output, aux_outputs = self.compute_layer.forward_post_core_attn(
-                        *paired_state, residual_stream_recompute_context=attn_recompute_context
+                        *paired_state,
+                        aux_inputs=compute_aux_inputs,
+                        residual_stream_recompute_context=attn_recompute_context,
                     )
                 assert aux_outputs.bias is None, "Shortcut blocks require complete residual layers"
 

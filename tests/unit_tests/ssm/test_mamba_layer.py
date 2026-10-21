@@ -13,7 +13,6 @@ from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.test_utilities import Utils
@@ -107,8 +106,10 @@ class TestMambaLayer:
             ((inference_context, padding_mask), {}),
             ((), dict(inference_context=inference_context, padding_mask=padding_mask)),
         ):
-            output, _ = self.layer.forward_post_core_attn(ssm_output, residual, *args, **kwargs)
-            assert output is projected
+            assert (
+                self.layer.forward_post_core_attn(ssm_output, residual, *args, **kwargs)
+                is projected
+            )
             project.assert_called_with(ssm_output)
             write.assert_called_with(mixer_output, residual)
 
@@ -150,7 +151,7 @@ class TestMambaLayer:
         dtype = torch.float32 if fp32_residual else torch.bfloat16
         hidden_states = torch.randn(16, 2, 3 * config.hidden_size, device="cuda", dtype=dtype)
         atomic_input = hidden_states.detach().clone().requires_grad_(True)
-        atomic_output = layer(hidden_states=atomic_input, aux_inputs=LayerAuxInputs())
+        atomic_output = layer(atomic_input)
         atomic_output.float().square().mean().backward()
         atomic_grads = {
             name: param.grad.clone()
@@ -162,7 +163,7 @@ class TestMambaLayer:
         split_input = hidden_states.detach().clone().requires_grad_(True)
         stage_state = layer.forward_pre_attn_and_core_attn(split_input)
         assert len(stage_state) == 3
-        split_output, _ = layer.forward_post_core_attn(*stage_state)
+        split_output = layer.forward_post_core_attn(*stage_state)
         split_output.float().square().mean().backward()
         split_grads = {
             name: param.grad for name, param in layer.named_parameters() if param.grad is not None
@@ -180,10 +181,12 @@ class TestMambaLayer:
         write = Mock(return_value=split_output)
         monkeypatch.setattr(layer, "_apply_mixer_update", write)
         recompute_context = object()
-        output, _ = layer.forward_post_core_attn(
-            *stage_state, residual_stream_recompute_context=recompute_context
+        assert (
+            layer.forward_post_core_attn(
+                *stage_state, residual_stream_recompute_context=recompute_context
+            )
+            is split_output
         )
-        assert output is split_output
         assert write.call_args.args[1] is stage_state[1]
         assert write.call_args.args[2] is stage_state[2]
         assert write.call_args.kwargs["recompute_context"] is recompute_context
@@ -200,7 +203,7 @@ class TestMambaLayer:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         )
         attention_mask = attention_mask.cuda()
-        output, _ = layer(hidden_states, LayerAuxInputs(attention_mask=attention_mask))
+        output = layer(hidden_states, attention_mask=attention_mask)
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == layer.config.hidden_size

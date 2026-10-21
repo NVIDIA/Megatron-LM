@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal, TypeAlias, overload
+from typing import Literal, Optional, TypeAlias, overload
 
 import torch
 from torch import Tensor, nn
 
-# Residual arithmetic consumes projection outputs and their deferred bias only.
-ResidualBranchOutput: TypeAlias = tuple[Tensor, Tensor | None]
+ResidualBranchOutput: TypeAlias = Tensor | tuple[Tensor, Optional[Tensor]]
 ResidualConnectionState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionWriteState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionOperation: TypeAlias = Literal["read", "write"]
@@ -68,7 +67,7 @@ class ResidualConnection(nn.Module, ABC):
 
     def forward(
         self,
-        value: Tensor | ResidualBranchOutput,
+        value: ResidualBranchOutput,
         *,
         operation: ResidualConnectionOperation,
         state: ResidualConnectionState | None = None,
@@ -169,7 +168,7 @@ class ResidualConnection(nn.Module, ABC):
     ) -> Tensor:
         self._validate_branch_output(branch_output)
         self._validate_tensor_state(state, state_name="connection state", allow_empty=False)
-        output, _ = branch_output
+        output = branch_output[0] if isinstance(branch_output, tuple) else branch_output
         if output.shape[:-1] != state[0].shape[:-1]:
             raise ValueError(
                 f"{type(self).__name__} received incompatible non-hidden dimensions while "
@@ -217,8 +216,12 @@ class ResidualConnection(nn.Module, ABC):
 
     @staticmethod
     def _validate_branch_output(branch_output: ResidualBranchOutput) -> None:
+        if torch.is_tensor(branch_output):
+            return
         if not isinstance(branch_output, tuple) or len(branch_output) != 2:
-            raise TypeError("A residual branch must return an (output, bias) tensor tuple.")
+            raise TypeError(
+                "A residual branch must return a tensor or an (output, bias) tensor tuple."
+            )
         output, bias = branch_output
         if not torch.is_tensor(output) or (bias is not None and not torch.is_tensor(bias)):
             raise TypeError(

@@ -49,7 +49,6 @@ from megatron.core.transformer.enums import (
     CudaGraphScope,
     InferenceCudaGraphScope,
 )
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
@@ -1127,7 +1126,7 @@ class TestParallelHybridBlockCudagraphs:
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
         hidden_states = parallel_mamba_block(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
+            hidden_states=hidden_states, attention_mask=attention_mask
         )
 
         for _ in range(num_layers):
