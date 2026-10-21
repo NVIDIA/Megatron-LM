@@ -37,10 +37,8 @@ def build_model(model_cfg, *, impl_cfg):
 
     from .model import DeepseekV41Model
 
-    if getattr(impl_cfg, "attention_core", "flashmla") != "flashmla":
-        raise NotImplementedError(
-            "Only attention_core=flashmla and head_dtype=float32 are implemented"
-        )
+    if getattr(impl_cfg, "attention_core", "flashmla") not in ("flashmla", "mega"):
+        raise ValueError("attention_core must be 'flashmla' or 'mega'")
 
     if (
         impl_cfg.token_map is None

@@ -108,11 +108,16 @@ def test_recipe_options_are_explicit_and_future_modes_fail_before_build(monkeypa
     assert (default.attention_core, default.head_dtype) == ("flashmla", "float32")
     protocol.validate_impl_cfg_keys({"attention_core": "mega", "head_dtype": "bfloat16"})
     with patch.object(native, "build_model", Mock()) as build:
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError):
             protocol.build_model(
-                SimpleNamespace(), impl_cfg=protocol.ImplConfig(attention_core="mega")
+                SimpleNamespace(), impl_cfg=protocol.ImplConfig(attention_core="sparse")
             )
         build.assert_not_called()
+        protocol.build_model(
+            SimpleNamespace(engram_layer_ids=[]),
+            impl_cfg=protocol.ImplConfig(attention_core="mega"),
+        )
+        assert build.call_args.kwargs["impl_cfg"].attention_core == "mega"
         protocol.build_model(
             SimpleNamespace(engram_layer_ids=[]),
             impl_cfg=protocol.ImplConfig(head_dtype="bfloat16"),

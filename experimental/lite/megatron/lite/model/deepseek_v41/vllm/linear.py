@@ -55,10 +55,10 @@ def accumulate_wgrad(owners, dw, like):
 
 class _MXFP8Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, activation, owners=None):
+    def forward(ctx, x, weight, activation, owners=None, row_perm=None):
         if not x.is_cuda or not weight.is_cuda:
             raise RuntimeError("Deployment MXFP8 linear requires CUDA")
-        ctx.owners, ctx.like = owners, _like(weight)
+        ctx.owners, ctx.like, ctx.row_perm = owners, _like(weight), row_perm
         from vllm.model_executor.kernels.linear.mxfp8.batch_invariant import _uses_tensor_core
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
             mxfp8_e4m3_quantize,
@@ -80,15 +80,21 @@ class _MXFP8Linear(torch.autograd.Function):
         raw = _row_scales(scales, *flat.shape) if tc else scales
         packed, weight_scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
         row_scales = weight_scales.view(torch.uint8).repeat_interleave(32, dim=0)
+        kernel_codes = packed
+        if row_perm is not None:
+            # vLLM gathers whole rows of the loaded per-row-scale weight
+            # (permute on load): quantize first, then permute codes and scales.
+            kernel_codes = packed.view(torch.uint8).index_select(0, row_perm).view(packed.dtype)
+            row_scales = row_scales.index_select(0, row_perm)
         if tc:
             row_scales = swizzle_mxfp8_scale(row_scales, *weight.shape)
             output = torch.ops.vllm.bi_pinned_mxfp8_mm(
-                codes, packed.t(), scales, row_scales, x.dtype
+                codes, kernel_codes.t(), scales, row_scales, x.dtype
             )
         else:
             from vllm.model_executor.kernels.batch_invariant import block32_scaled_mm
 
-            output = block32_scaled_mm(codes, scales, packed, row_scales, x.dtype)
+            output = block32_scaled_mm(codes, scales, kernel_codes, row_scales, x.dtype)
         ctx.compact, ctx.input_dtype = True, x.dtype
         ctx.save_for_backward(codes, raw, packed, weight_scales)
         return output.reshape(*x.shape[:-1], weight.shape[0])
@@ -109,8 +115,13 @@ class _MXFP8Linear(torch.autograd.Function):
             weight = dequantize_block_fp8(packed, scales, (32, 32)).to(ctx.input_dtype)
         else:
             activation, weight = ctx.saved_tensors
+        perm = getattr(ctx, 'row_perm', None)
+        if perm is not None:
+            # Output column j is natural row perm[j]: un-permute the gradient once.
+            flat = grad.reshape(-1, grad.shape[-1])
+            grad = torch.empty_like(flat).index_copy_(1, perm, flat)
         dx, dw, _ = linear_vjp(ctx, grad, activation, weight)
-        return dx, dw, None, None
+        return dx, dw, None, None, None
 
 
 def linear_vjp(ctx, grad, activation, weight):
@@ -153,18 +164,21 @@ class _BF16Linear(torch.autograd.Function):
         return dx, accumulate_wgrad(owners, dw, ctx.like), None
 
 
-def linear(x, weight, *, fp8, activation=None):
+def linear(x, weight, *, fp8, activation=None, row_perm=None):
     """BI GEMM ``x @ weight.T``. ``weight``: a tensor (gradient returned through
     autograd), or a tuple of parameters whose rows are stacked and whose FP32 dW goes
     straight to each owner's ``main_grad``. Pass a tuple only for parameters that have
-    no other gradient path: DDP then skips their ``.grad``."""
+    no other gradient path: DDP then skips their ``.grad``. ``row_perm`` (MXFP8 only)
+    gathers output rows of the quantized weight, as vLLM's permute-on-load does."""
     owners = tuple(weight) if isinstance(weight, (tuple, list)) else None
     if owners is not None:
         weight = owners[0] if len(owners) == 1 else torch.cat(owners)
     if fp8:
         if x.shape[-1] != weight.shape[-1] or any(n % 32 for n in weight.shape):
             raise ValueError("MXFP8 requires matching K and 32-aligned weights")
-        return _MXFP8Linear.apply(x, weight, activation, owners)
+        return _MXFP8Linear.apply(x, weight, activation, owners, row_perm)
+    if row_perm is not None:
+        raise ValueError("Output row permutation is only implemented for MXFP8")
     if activation is not None:
         raise ValueError("BF16 linear cannot consume MXFP8 prequant")
     return _BF16Linear.apply(x, weight, owners)

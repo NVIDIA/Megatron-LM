@@ -97,7 +97,9 @@ class DeepseekV41Model(NativeModel):
         return output
 
     def _build_attention(self, config, index):
-        return build_attention(config, index, self.context)
+        attention = build_attention(config, index, self.context)
+        attention.attention_core = getattr(self.impl, "attention_core", "flashmla")
+        return attention
 
     def _build_mlp(self, config, release, index):
         spec = get_mlp_module_spec(

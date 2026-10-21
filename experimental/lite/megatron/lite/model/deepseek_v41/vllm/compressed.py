@@ -187,7 +187,8 @@ def source(attention, x, qr, qa, rope, documents, emit):
     """Compressed KV and indexer top-k of all packed documents at once.
 
     ``documents`` is cached global THD metadata with a local query span. Returns
-    globally ordered compressed rows and document-local top-k per query. Reuses Lite's
+    globally ordered compressed rows (decoded, cache records and the pre-RoPE latent of
+    the group-boundary rows) and document-local top-k per query. Reuses Lite's
     source-state lifetime and native parameter ownership."""
     core = attention.core_attention
     context, policy = core.context, core.policy
@@ -227,9 +228,10 @@ def source(attention, x, qr, qa, rope, documents, emit):
             keys = index_keys(latent, wk, knorm, rope, ratio, eps, m)
         emit('indexer_k_values', keys[0])
         emit('indexer_k_scales', keys[1])
-        return decoded, keys, records
+        # The mega core inserts and quantizes the boundary-row latent itself.
+        return decoded, keys, records, latent[m.closers]
 
-    decoded, keys, records = state.resolve(layer, policy.kv, ('vllm_kv', geometry), produce)
+    decoded, keys, records, latent = state.resolve(layer, policy.kv, ('vllm_kv', geometry), produce)
 
     def candidates(rows):
         release = context.release
@@ -280,4 +282,4 @@ def source(attention, x, qr, qa, rope, documents, emit):
     topk = state.resolve(layer, policy.index, ('vllm_index', geometry), select)
     emit('compressed_kv_decoded', decoded)
     emit('indexer_topk', topk)
-    return decoded, topk, records
+    return decoded, topk, records, latent

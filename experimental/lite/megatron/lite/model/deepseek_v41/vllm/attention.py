@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Caller-owned sparse FlashMLA with native parameter names and owners."""
+"""Caller-owned sparse FlashMLA (default) or mega attention core with native parameter
+names and owners."""
+import functools
+
 import torch
 
 from .linear import linear
@@ -375,7 +378,7 @@ class _FP8OutputProjection(torch.autograd.Function):
         )
 
 
-def _projections(attention, x):
+def _projections(attention, x, row_perm=None):
     raw = linear(
         x, (attention.linear_q_down_proj.weight, attention.linear_kv_proj.weight), fp8=True
     )
@@ -389,7 +392,9 @@ def _projections(attention, x):
         attention.config.layernorm_epsilon,
     )
     qa = QuantizedActivation(codes, scales, qr.dtype, qr.shape, kMxfp8Dynamic)
-    q = linear(qr, (attention.linear_q_up_proj.weight,), fp8=True, activation=qa).bfloat16()
+    q = linear(
+        qr, (attention.linear_q_up_proj.weight,), fp8=True, activation=qa, row_perm=row_perm
+    ).bfloat16()
     q = q.reshape(-1, attention.num_attention_heads_per_partition, attention.q_head_dim)
     from .linear import _row_scales
 
@@ -707,6 +712,167 @@ def output_projection(attention, out, positions, rope_cache, emit=None):
     return result
 
 
+@functools.lru_cache(maxsize=None)
+def _fused_permutations(heads, dim, groups, device):
+    from vllm.models.deepseek_v41.common.ops.fused_layout import (
+        o_fused_permutation,
+        q_fused_permutation,
+    )
+
+    q = q_fused_permutation(heads, dim).to(device)
+    o = o_fused_permutation(groups, dim).to(device)
+    blocks = o.view(-1, 32)
+    if (blocks - blocks[:, :1] != torch.arange(32, device=device)).any() or (
+        blocks[:, 0] % 32
+    ).any():
+        raise ValueError("The fused output layout must move whole 32-column blocks")
+    return q, o
+
+
+def fused_permutations(attention, device):
+    """``wq_b`` output rows (vLLM's load-time row gather) and ``wo_a`` input columns
+    (32-wide blocks move whole, so block-FP8 codes and scales permute with them) in the
+    mega kernel's fused query/output layouts."""
+    return _fused_permutations(
+        attention.num_attention_heads_per_partition,
+        attention.q_head_dim,
+        attention.config.o_groups,
+        torch.device(device),
+    )
+
+
+class _MegaWoA(torch.autograd.Function):
+    """``wo_a`` on the mega core's FP8 output: vLLM's ``fp8_einsum('bhr,hdr->bhd')`` over
+    the release-encoded weight with columns in the fused output layout. Backward: the
+    output FP8 cast is an identity STE into the core's gradient carrier; BF16 tensor-core
+    products with FP32 accumulation, all groups in one batched call."""
+
+    @staticmethod
+    def forward(ctx, data, scale, carrier, weight, groups, perm):
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            deepgemm_post_process_fp8_weight_block,
+        )
+        from vllm.utils.deep_gemm import fp8_einsum
+
+        from megatron.lite.model.deepseek_v41.lite.export import to_release
+
+        width = weight.shape[-1]
+        rank = weight.numel() // (groups * width)
+        # The release serialization (as published to vLLM), then vLLM's column gather.
+        tensors = dict(to_release("layers.0.attn.wo_a.weight", weight.reshape(-1, width)))
+        codes = tensors["layers.0.attn.wo_a.weight"].view(torch.uint8)[:, perm]
+        blocks = tensors["layers.0.attn.wo_a.scale"].view(torch.uint8)[:, perm[::32] // 32]
+        codes = codes.contiguous().view(torch.float8_e4m3fn)
+        blocks = blocks.contiguous().view(torch.float8_e8m0fnu)
+        rows = (blocks.view(torch.uint8).repeat_interleave(32, 0).to(torch.int32) << 23).view(
+            torch.float32
+        )
+        wq, ws = deepgemm_post_process_fp8_weight_block(
+            wq=codes,
+            ws=rows,
+            quant_block_shape=(1, 32),
+            use_e8m0=False,
+            is_bmm=True,
+            bmm_batch_size=groups,
+        )
+        z = torch.empty((data.shape[0], groups, rank), dtype=torch.bfloat16, device=data.device)
+        if data.shape[0]:
+            fp8_einsum(
+                "bhr,hdr->bhd",
+                (data[:, :groups], scale[:, :groups]),
+                (wq, ws),
+                z,
+                recipe=(1, 1, 32),
+            )
+        ctx.save_for_backward(data, scale, codes, blocks, perm)
+        ctx.weight, ctx.groups = weight, groups
+        return z
+
+    @staticmethod
+    def backward(ctx, grad):
+        from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
+
+        from .linear import accumulate_wgrad
+        from .mega_attention import dequantize_output
+
+        data, scale, codes, blocks, perm = ctx.saved_tensors
+        decoded = dequantize_block_fp8(codes, blocks, (32, 32)).to(torch.bfloat16)
+        groups, width = ctx.groups, decoded.shape[-1]
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            o = dequantize_output(data, scale).bfloat16().transpose(0, 1)  # [g, T, r]
+            w = decoded.view(groups, -1, width)  # [g, d, r]
+            g = grad.bfloat16().transpose(0, 1)  # [g, T, d]
+            d_o = torch.bmm(g, w).transpose(0, 1)
+            if g.is_cuda:
+                dw_fused = torch.bmm(g.transpose(1, 2), o, out_dtype=torch.float32)
+            else:  # CPU derivative references: the same rounded operands in FP32
+                dw_fused = torch.bmm(g.transpose(1, 2).float(), o.float())
+            dw_fused = dw_fused.reshape(-1, width)
+            dw = torch.empty_like(dw_fused)
+            dw[:, perm] = dw_fused
+        weight = ctx.weight
+        dw = accumulate_wgrad((weight,), dw.reshape(weight.shape), weight)
+        return None, None, d_o, dw, None, None
+
+
+def _local_boundaries(layout, ratio):
+    """This rank's contiguous range of the globally ordered group-boundary rows
+    (``(position + 1) % ratio == 0``); host-only, once per packed batch and ratio."""
+    key = ('mega_boundaries', ratio)
+    if key not in layout.remap:
+        flag = ((layout.global_positions + 1) % ratio == 0).long().cumsum(0)
+        before = int(flag[layout.offset - 1]) if layout.offset else 0
+        layout.remap[key] = before, int(flag[layout.offset + layout.local_rows - 1])
+    return layout.remap[key]
+
+
+def mega_forward(attention, hidden, layout, cu_seqlens, source):
+    """``attention_core=mega``: vLLM's ``FLASHMLA_MEGA_ATTN_DSV41`` prefill.
+
+    Same projections, compressor and indexer as the FlashMLA core; ``wq_b`` rows and
+    ``wo_a`` columns use the kernel's fused layouts. The core inserts and quantizes the
+    SWA KV and the compressed latent itself (:mod:`.mega_attention`). Under context
+    parallelism the core gathers SWA KV and latents across the contiguous equal row
+    slices; it takes this rank's queries and boundary-row latents."""
+    from .mega_attention import mega_attention
+
+    x = hidden.reshape(-1, hidden.shape[-1])
+    q_perm, o_perm = fused_permutations(attention, x.device)
+    _, qr, kv, q, qa = _projections(attention, x, row_perm=q_perm)[:5]
+    ratio = attention._dsv4_compress_ratio
+    latent = topk = None
+    if ratio:
+        _, topk, _, latent = source(x, qr, qa)  # boundary rows of every rank
+        if layout.cp_group is not None:
+            lo, hi = _local_boundaries(layout, ratio)
+            latent = latent[lo:hi]
+    out = mega_attention(
+        q,
+        kv,
+        latent,
+        topk,
+        layout.positions,
+        attention.core_attention.native.attn_sink,
+        compress_ratio=ratio,
+        cos_sin_cache=attention._deployment_rope,
+        window=attention.config.csa_window_size,
+        top_k=attention.release.index_topk,
+        cu_seqlens=cu_seqlens,
+        cp_group=layout.cp_group,
+        deterministic=bool(getattr(attention.config, 'deterministic_mode', False)),
+    )
+    z = _MegaWoA.apply(
+        out.data,
+        out.scale,
+        out.grad,
+        attention.linear_o_group_proj,
+        attention.config.o_groups,
+        o_perm,
+    )
+    result = linear(z.flatten(1), (attention.linear_proj.weight,), fp8=True).bfloat16()
+    return result.reshape_as(hidden)
+
+
 def build_attention(config, index, context):
     """Reuse the native allocation/spec and replace only the attention forward."""
     from megatron.core.extensions.transformer_engine import (
@@ -803,10 +969,18 @@ class SWAAttention(DS41SelfAttention):
         def sources(x, qr, qa):
             from .compressed import source
 
-            decoded, topk, records = source(
+            decoded, topk, records, _ = source(
                 self, x, qr, qa, self._deployment_rope, layout, lambda *_: None
             )
             return decoded, topk, self._dsv4_compress_ratio, records
+
+        if getattr(self, 'attention_core', 'flashmla') == 'mega':
+            from .compressed import source
+
+            def boundary_sources(x, qr, qa):
+                return source(self, x, qr, qa, self._deployment_rope, layout, lambda *_: None)
+
+            return mega_forward(self, hidden_states, layout, layout.host_cu, boundary_sources), None
 
         out = swa_forward(
             self,
