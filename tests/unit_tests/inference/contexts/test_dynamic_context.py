@@ -28,6 +28,13 @@ from tests.unit_tests.inference.paged_attention_test_utils import reference_page
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(scope="module", autouse=True)
+def select_local_cuda_device():
+    """Bind each torchrun process before a module-level test initializes CUDA or Triton."""
+    if torch.cuda.is_available():
+        torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+
+
 @contextlib.contextmanager
 def rounder_override(n):
     original_token_rounder = DynamicInferenceContext.TOKEN_ROUNDER
