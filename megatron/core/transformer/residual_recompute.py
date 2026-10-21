@@ -1,17 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Ordered output-discard replay for residual-stream operations.
+"""Shared replay contexts, planning, and residual-connection dispatch.
 
-Wide-residual maps are static model parameters, so replay only needs the
-residual-stream inputs and branch outputs already present in the autograd graph.
-Within each replay block, cheap reads, connected norms, and non-terminal writes
-are reconstructed in forward order during backward.
+Connections choose which operations can be replayed and which state stays live.
+Callers register operations in forward order and finalize each block at its live boundary.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 import torch
 from torch import Tensor
@@ -30,10 +28,6 @@ from megatron.core.transformer.residual_recompute_plan import (
     build_recompute_layer_managers,
     finalize_recompute_block,
 )
-from megatron.core.typed_torch import apply_module
-
-if TYPE_CHECKING:
-    from megatron.core.transformer.transformer_config import TransformerConfig
 
 _R = TypeVar("_R")
 
@@ -56,18 +50,6 @@ class ResidualStreamRecomputeContext:
         """Discard this block's registered outputs once its live boundary exists."""
 
         finalize_recompute_block(self.manager, hidden_states, self.is_block_end)
-
-
-def residual_stream_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
-    """Return whether selective residual-stream replay is active for this forward."""
-
-    return bool(
-        training
-        and torch.is_grad_enabled()
-        and config.recompute_granularity == "selective"
-        and config.recompute_modules is not None
-        and "residual_stream" in config.recompute_modules
-    )
 
 
 def build_residual_stream_recompute_plan(
@@ -111,33 +93,14 @@ def checkpoint_residual_read(
     fp32_residual_connection: bool,
     branch_input_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, ResidualConnectionState]:
-    """Checkpoint a residual read while retaining its carried stream as state.
+    """Checkpoint a residual read with its implementation's state and replay policy."""
 
-    An optional branch-input dtype request is captured by the replay closure so eager execution
-    and backward reconstruction produce the same branch dtype.
-    """
-
-    def run_read(stream: Tensor) -> tuple[Tensor, ...]:
-        branch_input, state = apply_module(connection)(
-            stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
-        )
-        if state[0].shape != stream.shape:
-            raise ValueError("Residual connection read returned an incompatible carried stream.")
-        return (branch_input, *state[1:])
-
-    outputs = context.checkpoint(run_read, hidden_states)
-    if torch.is_tensor(outputs):
-        outputs = (outputs,)
-    if not isinstance(outputs, tuple) or not outputs:
-        raise TypeError("Checkpointed residual read must return a non-empty tensor tuple.")
-    if not all(torch.is_tensor(output) for output in outputs):
-        raise TypeError("Checkpointed residual read state must contain only tensors.")
-
-    # This mirrors ResidualConnection's defensive state promotion. Normal full-model
-    # FP32-residual inputs are already FP32, making .float() an alias rather than a cast kernel;
-    # direct/custom low-precision inputs still need the conversion to preserve replay state.
-    residual_stream = hidden_states.float() if fp32_residual_connection else hidden_states
-    return outputs[0], (residual_stream, *outputs[1:])
+    return connection._checkpoint_read(
+        hidden_states,
+        context,
+        fp32_residual_connection=fp32_residual_connection,
+        branch_input_dtype=branch_input_dtype,
+    )
 
 
 def checkpoint_residual_write(
@@ -149,27 +112,8 @@ def checkpoint_residual_write(
     dropout_probability: float,
     training: bool,
 ) -> Tensor:
-    """Checkpoint one residual write while preserving standard module hooks."""
+    """Checkpoint a residual write with its implementation's replay policy."""
 
-    if isinstance(branch_output, tuple):
-        output, bias = branch_output
-        return_tuple = True
-    else:
-        output, bias = branch_output, None
-        return_tuple = False
-
-    def run_write(
-        branch_update: Tensor, branch_bias: Tensor | None, *connection_state: Tensor
-    ) -> Tensor:
-        value = (branch_update, branch_bias) if return_tuple else branch_update
-        return apply_module(connection)(
-            value,
-            state=connection_state,
-            dropout_probability=dropout_probability,
-            training=training,
-        )
-
-    hidden_states = context.checkpoint(run_write, output, bias, *state)
-    if not torch.is_tensor(hidden_states):
-        raise TypeError("Checkpointed residual write must return a tensor.")
-    return hidden_states
+    return connection._checkpoint_write(
+        branch_output, state, context, dropout_probability=dropout_probability, training=training
+    )

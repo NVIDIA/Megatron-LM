@@ -47,10 +47,7 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-from megatron.core.transformer.residual_recompute import (
-    build_residual_stream_recompute_plan,
-    residual_stream_recompute_enabled,
-)
+from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.residual_recompute_plan import (
     build_recompute_block_end_plan,
     build_recompute_layer_managers,
@@ -66,6 +63,7 @@ from megatron.core.transformer.utils import (
 from megatron.core.transformer.wide_residual_layer import (
     build_wide_residual_readout,
     expand_wide_residual_stream,
+    wide_residual_recompute_enabled,
 )
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
@@ -662,7 +660,7 @@ class HybridStack(MegatronModule):
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
         use_residual_stream_recompute = (
             self.uses_wide_residual_stream
-            and residual_stream_recompute_enabled(self.config, self.training)
+            and wide_residual_recompute_enabled(self.config, self.training)
         )
         residual_stream_recompute_plan = (
             build_residual_stream_recompute_plan(

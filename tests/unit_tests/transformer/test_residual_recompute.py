@@ -31,19 +31,20 @@ from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
     ResidualConnection,
     ResidualConnectionState,
-    ResidualConnectionWriteState,
 )
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     build_residual_stream_recompute_plan,
     checkpoint_residual_read,
     checkpoint_residual_write,
-    residual_stream_recompute_enabled,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+from megatron.core.transformer.wide_residual_layer import (
+    WideResidualTransformerLayer,
+    wide_residual_recompute_enabled,
+)
 from megatron.core.typed_torch import apply_module
 from tests.unit_tests.test_utilities import Utils
 
@@ -60,8 +61,45 @@ class _StaticTestConnection(ResidualConnection):
                 torch.randn(branch_width, stream_width) / branch_width**0.5
             )
 
-    def _read(self, hidden_states: Tensor) -> tuple[Tensor, ResidualConnectionWriteState]:
-        return hidden_states @ self.read_map, ()
+    def _read(
+        self,
+        hidden_states: Tensor,
+        *,
+        fp32_residual_connection: bool,
+        branch_input_dtype: torch.dtype | None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        branch_input = hidden_states @ self.read_map
+        if branch_input_dtype is not None:
+            branch_input = branch_input.to(branch_input_dtype)
+        residual = hidden_states.float() if fp32_residual_connection else hidden_states
+        return branch_input, (residual,)
+
+    def _checkpoint_read(
+        self, hidden_states, context, *, fp32_residual_connection, branch_input_dtype
+    ):
+        def read_branch(stream):
+            branch_input, _ = apply_module(self)(
+                stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
+            )
+            return branch_input
+
+        branch_input = context.checkpoint(read_branch, hidden_states)
+        residual = hidden_states.float() if fp32_residual_connection else hidden_states
+        return branch_input, (residual,)
+
+    def _checkpoint_write(self, branch_output, state, context, *, dropout_probability, training):
+        is_tuple = isinstance(branch_output, tuple)
+        output, bias = branch_output if is_tuple else (branch_output, None)
+
+        def write_update(update, bias, *connection_state):
+            return apply_module(self)(
+                (update, bias) if is_tuple else update,
+                state=connection_state,
+                dropout_probability=dropout_probability,
+                training=training,
+            )
+
+        return context.checkpoint(write_update, output, bias, *state)
 
     def _write(
         self,
@@ -350,7 +388,7 @@ def _assert_matching_gradients(reference: nn.Module, recomputed: nn.Module) -> N
 
 
 def test_residual_connection_subclass_honors_requested_branch_dtype():
-    """Subclasses inherit the default terminal-cast hook."""
+    """Each concrete reader owns its requested branch dtype conversion."""
 
     connection = _StaticTestConnection(stream_width=12, branch_width=6, operation="read")
     hidden_states = torch.randn(4, 12, dtype=torch.float32)
@@ -453,10 +491,10 @@ class TestResidualStreamRecomputePlan:
 
     def test_training_gate(self):
         config = _wide_recompute_config()
-        assert residual_stream_recompute_enabled(config, training=True)
-        assert not residual_stream_recompute_enabled(config, training=False)
+        assert wide_residual_recompute_enabled(config, training=True)
+        assert not wide_residual_recompute_enabled(config, training=False)
         with torch.no_grad():
-            assert not residual_stream_recompute_enabled(config, training=True)
+            assert not wide_residual_recompute_enabled(config, training=True)
 
 
 class TestResidualStreamRecomputeConfig:
