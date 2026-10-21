@@ -192,7 +192,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         args.pixel_shuffle,
         args.use_tile_tags,
         args.max_num_tiles,
-        args.tokenizer_prompt_format,
+        cfg.tokenizer.tokenizer_prompt_format,
     )
 
     if args.use_mcore_inference:
@@ -300,7 +300,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     raise NotImplementedError("no output name defined for", config.task)
 
                 prompt, generated = get_prompt_and_generated(
-                    generation, args.tokenizer_prompt_format
+                    generation, cfg.tokenizer.tokenizer_prompt_format
                 )
                 if config.task == "VideoMME":
                     output["questions"][0][output_name] = generated

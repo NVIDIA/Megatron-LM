@@ -3,6 +3,7 @@ import logging
 import warnings
 from copy import deepcopy
 
+from megatron.training.global_vars import get_run_config
 import torch
 from config import (
     get_language_model_config,
@@ -49,6 +50,7 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
+    cfg = get_run_config()
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
@@ -80,7 +82,7 @@ def model_provider(
             pixel_shuffle=args.pixel_shuffle,
             use_tile_tags=args.use_tile_tags,
             max_num_tiles=args.max_num_tiles,
-            tokenizer_type=args.tokenizer_prompt_format,
+            tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
         )
         old_seq_length = args.seq_length
         args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -260,7 +262,7 @@ def model_provider(
     tokenizer = get_tokenizer()
     image_token_index = tokenizer.image_token_index
 
-    tile_tags = _get_tile_tags(args, tokenizer)
+    tile_tags = _get_tile_tags(args, tokenizer, cfg.tokenizer.tokenizer_prompt_format)
 
     model = LLaVAModel(
         language_transformer_config=language_config,
@@ -296,7 +298,7 @@ def model_provider(
         conv_merging=getattr(args, "conv_merging", False),
         tile_tags=tile_tags,
         max_num_tiles=args.max_num_tiles,
-        tokenizer_type=args.tokenizer_prompt_format,
+        tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
         use_vision_backbone_fp8_arch=getattr(args, "use_vision_backbone_fp8_arch", False),
         dynamic_resolution=getattr(args, "dynamic_resolution", False),
         class_token_len=getattr(args, "class_token_len", None),
@@ -331,7 +333,7 @@ def model_provider(
     return model
 
 
-def _get_tile_tags(args, tokenizer):
+def _get_tile_tags(args, tokenizer, tokenizer_prompt_format):
     """Tile tags are used in NVLM to surround image tiles with text tags."""
     if not args.use_tile_tags:
         return None
@@ -339,18 +341,18 @@ def _get_tile_tags(args, tokenizer):
     # We expect the tokenized length of the tags is same.
     if args.max_num_tiles < 10:
         thumbnail_tag_text = "<tile_global_thumbnail>"
-        if args.tokenizer_prompt_format == "nvlm-yi-34b":
+        if tokenizer_prompt_format == "nvlm-yi-34b":
             thumbnail_tag_text = "<tile_global>"
 
-        if args.tokenizer_prompt_format.startswith("nemotron"):
+        if tokenizer_prompt_format.startswith("nemotron"):
             tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
         else:
             tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
     elif args.max_num_tiles <= 12:
         thumbnail_tag_text = "<tile_global_thumbnail0>"
-        if args.tokenizer_prompt_format == "nvlm-yi-34b":
+        if tokenizer_prompt_format == "nvlm-yi-34b":
             thumbnail_tag_text = "<tile_global0>"
-        elif args.tokenizer_prompt_format.startswith("nemotron") or args.tokenizer_prompt_format == "llama3p1":
+        elif tokenizer_prompt_format.startswith("nemotron") or tokenizer_prompt_format == "llama3p1":
             thumbnail_tag_text = "<tile_global_thumbnail>"
         tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
     else:

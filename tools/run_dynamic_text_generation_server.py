@@ -192,7 +192,7 @@ def parse_args_and_detect_vlm(
     return args, is_vlm
 
 
-def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
+def _build_engine_for_vlm_or_gpt(cfg, is_vlm: bool) -> DynamicInferenceEngine:
     """Build a DynamicInferenceEngine, wrapping with VLMInferenceWrapper when needed.
 
     The default ``get_dynamic_inference_engine`` only knows about GPT/Hybrid
@@ -245,7 +245,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
                 args.pixel_shuffle,
                 args.use_tile_tags,
                 args.max_num_tiles,
-                args.tokenizer_prompt_format,
+                cfg.tokenizer.tokenizer_prompt_format,
             )
             max_num_tiles = args.max_num_tiles + int(getattr(args, 'use_thumbnail', False))
             max_img_tokens = max_num_tiles * args.num_img_embeddings_per_tile
@@ -487,7 +487,7 @@ if __name__ == "__main__":
 
         chat_template = _load_chat_template(getattr(args, 'chat_template', None))
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
+        engine = _build_engine_for_vlm_or_gpt(cfg, is_vlm=is_vlm)
 
         try:
             asyncio.run(
