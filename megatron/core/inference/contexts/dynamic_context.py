@@ -449,6 +449,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
         )
+        # FlashInfer's DSA kernels take a per-step plan built with the row metadata.
+        self.dsa_flashinfer = (
+            self.cache_dsa_indexer_keys and model_config.dsa_inference_backend == "flashinfer"
+        )
+        self.dsa_query_heads = (
+            model_config.num_attention_heads // model_config.tensor_model_parallel_size
+        )
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -1706,6 +1713,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         if self.cache_dsa_indexer_keys:
             self._allocate_dsa_row_metadata()
+            if self.dsa_flashinfer:
+                self._allocate_dsa_flashinfer_plan()
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -2223,6 +2232,79 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.dsa_block_rows[:blocks],
             self.dsa_block_requests[:blocks],
             blocks,
+        )
+
+    def _allocate_dsa_flashinfer_plan(self) -> None:
+        """Allocate the per-step plan of FlashInfer's DSA kernels (``dsa_gqa_flashinfer``) at
+        its largest sizes. Built on the CPU in initialize_attention_state() and copied with the
+        bookkeeping; a step's views depend only on its padded batch, so CUDA graphs read static
+        buffers."""
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+        sizes = dsa_gqa_flashinfer.plan_sizes(self.max_tokens, self.max_requests, False)
+        tiles = sizes["tiles"]
+        tiled = tiles * dsa_gqa_flashinfer.TILE_ROWS
+        group = dsa_gqa_flashinfer.union_group(self.dsa_query_heads)
+        self._dsa_fi_capacity = {
+            "decode_requests": self.max_requests,
+            "decode_lengths": self.max_requests,
+            "tile_requests": tiles,
+            "tile_ordinals": tiles,
+            "row_ends": tiled,
+            "query_rows": tiled,
+            "request_rows": self.max_requests,
+            "sample_ends": self.max_requests,
+            "batch_starts": tiled // group + 1,
+        }
+        total = sum(self._dsa_fi_capacity.values())
+        self._cpu_dsa_fi_buf = torch.zeros(total, dtype=torch.int32, pin_memory=True)
+        self._gpu_dsa_fi_buf = torch.zeros(
+            total, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._cpu_dsa_fi_views, self._gpu_dsa_fi_views, offset = {}, {}, 0
+        for name, size in self._dsa_fi_capacity.items():
+            self._cpu_dsa_fi_views[name] = self._cpu_dsa_fi_buf[offset : offset + size]
+            self._gpu_dsa_fi_views[name] = self._gpu_dsa_fi_buf[offset : offset + size]
+            offset += size
+        self._dsa_fi_lengths = {name: 0 for name in self._dsa_fi_capacity}
+        self._dsa_fi_sizes = {"decode_rows": 0, "tiles": 0}
+
+    def _fill_dsa_flashinfer_plan(
+        self, real_bs: int, padded_bs: int, query_lengths: Tensor, kv_lengths: Tensor
+    ) -> None:
+        """Fill this step's FlashInfer DSA plan on the CPU; sizes follow the padded batch."""
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+        padded_tokens = self.padded_active_token_count
+        decode_only = self.is_decode_only()
+        arrays = dsa_gqa_flashinfer.build_step_plan(
+            query_lengths[:real_bs].tolist(),
+            kv_lengths[:real_bs].tolist(),
+            padded_rows=padded_tokens,
+            padded_requests=padded_bs,
+            decode_only=decode_only,
+            heads=self.dsa_query_heads,
+        )
+        for name, values in arrays.items():
+            assert values.size <= self._dsa_fi_capacity[name], name
+            self._cpu_dsa_fi_views[name][: values.size] = torch.from_numpy(values)
+            self._dsa_fi_lengths[name] = values.size
+        self._dsa_fi_sizes = dsa_gqa_flashinfer.plan_sizes(padded_tokens, padded_bs, decode_only)
+
+    def dsa_flashinfer_plan(self, max_context_length: int):
+        """This step's FlashInfer DSA plan (``dsa_gqa_flashinfer.StepPlan``)."""
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+        assert self.dsa_flashinfer, "The FlashInfer DSA plan is not enabled."
+        views = {
+            name: view[: self._dsa_fi_lengths[name]]
+            for name, view in self._gpu_dsa_fi_views.items()
+        }
+        return dsa_gqa_flashinfer.StepPlan(
+            decode_rows=self._dsa_fi_sizes["decode_rows"],
+            num_tiles=self._dsa_fi_sizes["tiles"],
+            max_context=max_context_length,
+            **views,
         )
 
     def dsa_filter_blocks(self) -> Tuple[Tensor, Tensor, Tensor]:
@@ -3070,6 +3152,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._fill_dsa_row_metadata(
                 real_bs, padded_bs, self._cpu_mha_query_lengths, self._cpu_mha_kv_seq_lengths
             )
+            if self.dsa_flashinfer:
+                self._fill_dsa_flashinfer_plan(
+                    real_bs, padded_bs, self._cpu_mha_query_lengths, self._cpu_mha_kv_seq_lengths
+                )
 
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
@@ -3249,6 +3335,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         if self.cache_dsa_indexer_keys:
             self._gpu_dsa_row_buf.copy_(self._cpu_dsa_row_buf, non_blocking=record_done_event)
+            if self.dsa_flashinfer:
+                self._gpu_dsa_fi_buf.copy_(self._cpu_dsa_fi_buf, non_blocking=record_done_event)
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
