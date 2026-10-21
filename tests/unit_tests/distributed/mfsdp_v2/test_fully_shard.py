@@ -670,6 +670,67 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
     )
 
 
+@pytest.mark.parametrize("set_to_none", [True, False])
+def test_fused_wgrad_accumulation_matches_unfused(distributed_setup, set_to_none):
+    """TE wgrad accumulation into main_grad matches FSDP's unfused gradient path.
+
+    A size-1 DP-inner axis, several microbatches, and a grad divisor make a skipped
+    post-backward, a missed zeroing, or a wrong scale visible in the reduced gradients.
+    """
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires a DP-outer axis with at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size, 1), mesh_dim_names=("dp_outer", "dp_inner"))
+    num_microbatches = 3
+    torch.manual_seed(4321 + rank)
+    x = torch.randn(num_microbatches, 8, 32, device=device, dtype=torch.bfloat16)
+
+    def train(fused: bool) -> list[torch.Tensor]:
+        torch.manual_seed(1234)
+        model = te.GroupedLinear(
+            2,
+            32,
+            32,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device=device,
+            fuse_wgrad_accumulation=fused,
+        )
+        with fully_shard_context(device=device) as context:
+            fully_shard(
+                model,
+                mesh=mesh,
+                placements=_hfsdp_placements(),
+                mixed_precision_policy=MixedPrecisionPolicy(
+                    main_params_dtype=torch.float32, main_grads_dtype=torch.float32
+                ),
+                grad_scale=0.25,
+            )
+        if fused:
+            for group in model.parameter_groups:
+                group.enable_fused_wgrad_accumulation()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        fully_shard_optimizer(optimizer)
+
+        grads = []
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=set_to_none)
+            for index in range(num_microbatches):
+                with microbatch(context, is_last=index == num_microbatches - 1):
+                    model(x[index], [3, 5]).float().square().mean().backward()
+            assert model.phase is FsdpModule.Phase.RESTING
+            grads.extend(parameter.grad.to_local().clone() for parameter in model.parameters())
+            optimizer.step()
+        return grads
+
+    for fused, local in zip(train(fused=True), train(fused=False)):
+        # Fused accumulation skips the BF16 rounding of each microbatch's gradient.
+        torch.testing.assert_close(fused, local, rtol=2e-2, atol=1e-4)
+
+
 def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
     """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
     rank = distributed_setup.rank

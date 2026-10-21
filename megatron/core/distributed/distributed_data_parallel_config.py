@@ -241,6 +241,12 @@ class DistributedDataParallelConfig:
       No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
     """
 
+    megatron_fsdp_fuse_expert_wgrad_accumulation: bool = False
+    """MFSDP v2 only. When expert gradients need no per-microbatch reduction (expert-DP
+      inner axis of size 1), let TransformerEngine accumulate expert weight gradients
+      directly into main_grad instead of adding each microbatch's gradient separately.
+    """
+
     megatron_fsdp_use_decoupled_grad: bool = False
     """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
       gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting

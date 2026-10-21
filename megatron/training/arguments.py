@@ -3666,6 +3666,10 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
+    group.add_argument('--megatron-fsdp-fuse-expert-wgrad-accumulation', action='store_true',
+                       help="With Megatron-FSDP v2 and an expert-DP inner axis of size 1, let "
+                            "TransformerEngine accumulate expert weight gradients directly into "
+                            "main_grad.")
     group.add_argument(
             '--megatron-fsdp-enable-fine-grained-param-gather',
             action='store_true',

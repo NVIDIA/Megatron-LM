@@ -722,6 +722,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             grad_scale=expert_grad_scale,
                             **common_fully_shard_kwargs,
                         )
+                        if ddp_config.megatron_fsdp_fuse_expert_wgrad_accumulation:
+                            _enable_fused_expert_wgrad_accumulation(submodule.experts)
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
@@ -867,6 +869,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
+        if ddp_config.megatron_fsdp_fuse_expert_wgrad_accumulation and (
+            config.delay_wgrad_compute
+            or config.overlap_dispatch_backward_with_experts_wgrad
+            or config.overlap_moe_expert_parallel_comm
+            or config.cuda_graph_impl not in ("none", "full_iteration")
+            # TE may read overwrite_main_grad at forward time, so forwards and backwards of
+            # one step must alternate rather than run several forwards ahead (PP warmup).
+            or config.pipeline_model_parallel_size > 1
+        ):
+            raise ValueError(
+                "MFSDP v2 fused expert wgrad accumulation does not support delayed wgrad, "
+                "EP overlap, pipeline parallelism, or per-layer CUDA graphs."
+            )
         if config.calculate_per_token_loss and (
             config.pipeline_model_parallel_size != 1
             or ddp_config.num_distributed_optimizer_instances != 1
@@ -1100,6 +1115,21 @@ def _build_expert_mesh_and_placements(
         optimizer=[axis.optimizer],
     )
     return dp_mesh, placements
+
+
+def _enable_fused_expert_wgrad_accumulation(experts: torch.nn.Module) -> None:
+    """Let TE accumulate expert weight gradients directly into the experts' main_grad.
+
+    Experts build their fused TE ops on the first forward, so the flags set here still
+    reach the ops' accumulate_into_main_grad.
+    """
+    if not hasattr(experts, "linear_fc1"):
+        raise ValueError("MFSDP v2 fused expert wgrad accumulation requires grouped TE experts.")
+    for group in experts.parameter_groups:
+        if group.requires_grad:
+            group.enable_fused_wgrad_accumulation()
+    experts.linear_fc1.fuse_wgrad_accumulation = True
+    experts.linear_fc2.fuse_wgrad_accumulation = True
 
 
 def _build_hybrid_dp_mesh(outer_group, inner_group, device_type):

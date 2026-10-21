@@ -362,9 +362,9 @@ def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad
     hook(object())
 
     assert module.linear_fc1.weight.main_grad is fc1_main_grad
-    assert module.linear_fc1.weight.overwrite_main_grad is True
+    assert module.linear_fc1.weight.overwrite_main_grad is False
     assert module.linear_fc1.bias.main_grad is existing_main_grad
-    assert module.linear_fc1.bias.overwrite_main_grad is True
+    assert module.linear_fc1.bias.overwrite_main_grad is False
     assert getattr(module.linear_fc2.weight, "main_grad", None) is None
     assert module.linear_fc2.weight.overwrite_main_grad is False
 
