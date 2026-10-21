@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import functools
 import inspect
 import logging
 from typing import Optional, Tuple, Union
@@ -338,6 +339,11 @@ class LanguageModule(MegatronModule):
             return self.output_layer.weight
         return None
 
+    @functools.cached_property
+    def lm_head_can_emit_fp32(self) -> bool:
+        """Whether the LM head emits fp32 logits natively; fixed once the model is built."""
+        return lm_head_can_emit(self.output_layer, torch.float32)
+
     @torch.inference_mode()
     def compute_mtp_single_step(
         self,
@@ -390,7 +396,7 @@ class LanguageModule(MegatronModule):
             mtp_hidden,
             weight=output_weight,
             runtime_gather_output=True,
-            output_dtype=torch.float32 if lm_head_can_emit(self.config, torch.float32) else None,
+            output_dtype=torch.float32 if self.lm_head_can_emit_fp32 else None,
         )
         logits = logits.float()
         logits = self._scale_logits(logits)
