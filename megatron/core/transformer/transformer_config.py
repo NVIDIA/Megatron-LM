@@ -655,8 +655,9 @@ class TransformerConfig(ModelParallelConfig):
     the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
     gdn_gated_output_norm_fusion: bool = False
-    """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
-    layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
+    """Fuse GDN-family output RMSNorm with SiLU gating for GDN or sigmoid gating for KDA.
+    Unsupported configurations and layouts raise on every forward; see
+    docs/developer/gdn_ew_fusion.md for requirements."""
 
     ####################
     # initialization
@@ -2908,10 +2909,16 @@ class TransformerConfig(ModelParallelConfig):
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
                 "experimental_attention_variant='gdn'."
             )
-        if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant != "gdn":
+        # Explicit allow-list: GDN_ATTENTION_VARIANTS also contains "gdn2", which has no
+        # fused gated output norm. The deprecated "gated_delta_net" alias is already
+        # normalized to "gdn" above.
+        if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant not in (
+            "gdn",
+            "kda",
+        ):
             raise ValueError(
                 "gdn_gated_output_norm_fusion is only supported with "
-                "experimental_attention_variant='gdn' "
+                "experimental_attention_variant='gdn' or 'kda' "
                 "or deprecated alias experimental_attention_variant='gated_delta_net'."
             )
 
