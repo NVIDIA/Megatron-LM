@@ -254,9 +254,7 @@ class InferenceStateHandoffMixin:
         """Prevent recovery prefill from duplicating blocks reserved by imports."""
         return set(self._pending_handoff_hash_owners)
 
-    def schedule_waiting_requests(
-        self, prompt_logprob_updates: Dict[int, Dict[str, object]] | None = None
-    ) -> None:
+    def schedule_waiting_requests(self) -> None:
         """Recover evicted decodes locally, but reject new prompt submissions.
 
         Side: decode engine; pull and push transport paths.
@@ -279,7 +277,7 @@ class InferenceStateHandoffMixin:
             # forward's logits. The legacy path does not retain logits across steps.
             self._admit_pending_kv_imports()
             return
-        super().schedule_waiting_requests(prompt_logprob_updates)
+        super().schedule_waiting_requests()
 
     def setup_kv_transfer(self, role: str, *, require_handoff_claim: bool = False) -> None:
         """Bring up the KV transfer agents for this engine.

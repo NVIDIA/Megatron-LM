@@ -23,11 +23,6 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
-from megatron.core.inference.contexts.kv_block_allocator import (
-    PendingPromptLogprobsRow,
-    PromptLogprobsKey,
-    PromptLogprobsReservation,
-)
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -280,41 +275,6 @@ class _AsyncScheduleLogProbsTransfer:
     num_decode_requests: int
     cpu_ready_event: Optional[torch.cuda.Event]
     gpu_result: _AsyncScheduleLogProbsGPUResult
-
-
-@dataclass(frozen=True)
-class _PromptLogprobsBlockWrite:
-    """Rows that will fill one sidecar after asynchronous score transfer."""
-
-    logical_block_index: int
-    reservation: PromptLogprobsReservation
-    target_positions: np.ndarray
-    result_row_indices: np.ndarray
-
-
-@dataclass
-class _PromptLogprobsRequestWrite:
-    """Deferred sidecar writes for one request in the consumed batch."""
-
-    active_index: int
-    request_id: int
-    key: PromptLogprobsKey
-    prompt_row_count: int
-    block_writes: List[_PromptLogprobsBlockWrite]
-    publication_only_reservations: List[PromptLogprobsReservation]
-    update: Dict[str, Any]
-    pending_row: Optional[PendingPromptLogprobsRow] = None
-
-
-@dataclass
-class _PromptLogprobsWritePlan:
-    """Stable prompt-sidecar targets captured before request bookkeeping."""
-
-    request_writes: List[_PromptLogprobsRequestWrite] = field(default_factory=list)
-    updates: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-    latest_reservations: Dict[int, PromptLogprobsReservation] = field(
-        default_factory=dict, repr=False
-    )
 
 
 # pylint: disable=line-too-long
@@ -1761,261 +1721,6 @@ class TextGenerationController(MTPControllerMixin):
 
         return top_n_results if top_n_results else None
 
-    def _store_prompt_logprob_sidecars(
-        self,
-        log_probs: Optional[List[List[float]]],
-        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
-    ) -> Dict[int, Dict[str, Any]]:
-        """Store prompt rows in physical sidecars and return continuation carries."""
-        if not log_probs:
-            return {}
-
-        plan = self._reserve_prompt_logprob_sidecars([len(rows) for rows in log_probs])
-        self._fill_prompt_logprob_sidecars(
-            plan, log_probs, top_n_logprobs, publish_unregistered=True
-        )
-        return plan.updates
-
-    def _reserve_prompt_logprob_sidecars(
-        self, row_counts: Optional[List[int]]
-    ) -> _PromptLogprobsWritePlan:
-        """Snapshot lazy sidecar destinations before request bookkeeping mutates them."""
-        plan = _PromptLogprobsWritePlan()
-        if row_counts is None:
-            return plan
-
-        context = self.inference_wrapped_model.inference_context
-        if not context.enable_prefix_caching:
-            return plan
-        allocator = context.kv_block_allocator
-        active_slice = slice(context.paused_request_count, context.total_request_count)
-        query_lengths = context.request_query_lengths[active_slice].tolist()
-        if len(row_counts) != len(query_lengths):
-            raise RuntimeError(
-                f"received {len(row_counts)} prompt-score row counts for "
-                f"{len(query_lengths)} active requests"
-            )
-        source_positions = context.token_to_position_in_request[: context.active_token_count].split(
-            query_lengths
-        )
-        request_ids = context.request_ids[active_slice].tolist()
-        prefill_status = context.request_in_prefill_status_tensor[active_slice].tolist()
-        block_size = context.block_size_tokens
-
-        for active_idx, (request_id, is_prefill, positions, row_count) in enumerate(
-            zip(request_ids, prefill_status, source_positions, row_counts)
-        ):
-            key = context.prompt_logprobs_cache_keys.get(request_id)
-            if not is_prefill or key is None:
-                continue
-
-            row_count = int(row_count)
-            is_partial_prefill = request_id == context.chunked_prefill_request_id
-            prompt_row_count = row_count if is_partial_prefill else max(row_count - 1, 0)
-            stored_row_count = prompt_row_count - 1 if is_partial_prefill else prompt_row_count
-            assert stored_row_count >= 0
-            prompt_positions = (
-                positions[:stored_row_count].cpu().numpy().astype(np.int64, copy=True) + 1
-            )
-
-            pending_row = None
-            if is_partial_prefill:
-                assert prompt_row_count > 0
-                assert prompt_row_count == len(positions)
-                pending_row = PendingPromptLogprobsRow()
-
-            request_block_ids = context.request_to_kv_block_ids[
-                context.paused_request_count + active_idx
-            ]
-            valid_block_ids = request_block_ids[request_block_ids >= 0].tolist()
-            block_hashes = context.prompt_logprobs_block_hashes.get(request_id, ())
-            block_refs = dict(context.prompt_logprobs_matched_refs.get(request_id, {}))
-            block_writes = []
-            publication_only_reservations = []
-            request_reservations = {}
-
-            def reserve_block(logical_block_index: int) -> PromptLogprobsReservation:
-                """Reserve one current request block and chain same-block plan writes."""
-                block_id = valid_block_ids[logical_block_index]
-                expected_hash = (
-                    block_hashes[logical_block_index]
-                    if logical_block_index < len(block_hashes)
-                    else None
-                )
-                reservation = allocator.reserve_prompt_logprobs(
-                    logical_block_index=logical_block_index,
-                    block_id=block_id,
-                    key=key,
-                    expected_block_hash=expected_hash,
-                    block=block_refs.get(logical_block_index),
-                    expected_predecessor=plan.latest_reservations.get(block_id),
-                )
-                plan.latest_reservations[block_id] = reservation
-                request_reservations[logical_block_index] = reservation
-                if reservation.block is not None:
-                    block_refs[logical_block_index] = reservation.block
-                return reservation
-
-            for logical_block_index in np.unique(prompt_positions // block_size):
-                logical_block_index = int(logical_block_index)
-                row_mask = prompt_positions // block_size == logical_block_index
-                local_positions = (prompt_positions[row_mask] % block_size).astype(np.int32)
-                assert logical_block_index < len(valid_block_ids)
-                reservation = reserve_block(logical_block_index)
-                block_writes.append(
-                    _PromptLogprobsBlockWrite(
-                        logical_block_index=logical_block_index,
-                        reservation=reservation,
-                        target_positions=local_positions,
-                        result_row_indices=np.flatnonzero(row_mask).astype(np.int64),
-                    )
-                )
-
-            if pending_row is not None:
-                pending_target_position = int(positions[-1]) + 1
-                pending_logical_block_index, pending_local_position = divmod(
-                    pending_target_position, block_size
-                )
-                if pending_logical_block_index < len(valid_block_ids):
-                    reservation = request_reservations.get(pending_logical_block_index)
-                    if reservation is None:
-                        reservation = reserve_block(pending_logical_block_index)
-                    pending_row.bind(allocator, reservation, pending_local_position)
-
-            # A later request can reuse every row in a retained sidecar and
-            # therefore have no score rows to write for that block. It must
-            # still participate in the plan's publication order when an
-            # earlier reservation can replace the allocator's current entry.
-            for logical_block_index, block_ref in sorted(block_refs.items()):
-                if logical_block_index in request_reservations:
-                    continue
-                if logical_block_index >= len(block_hashes):
-                    continue
-                block_id = valid_block_ids[logical_block_index]
-                prior_reservation = plan.latest_reservations.get(block_id)
-                if (
-                    allocator.block_prompt_logprobs.get(block_id) is block_ref
-                    and prior_reservation is None
-                ):
-                    continue
-                publication_only_reservations.append(reserve_block(logical_block_index))
-
-            final_prefill = not is_partial_prefill
-            if final_prefill:
-                prompt_token_count = int(positions[-1]) + 1
-                if prompt_token_count > 1:
-                    expected_block_count = (prompt_token_count + block_size - 1) // block_size
-                    planned_blocks = set(block_refs).union(
-                        write.logical_block_index for write in block_writes
-                    )
-                    assert set(range(expected_block_count)).issubset(planned_blocks)
-
-            update = {
-                "blocks": block_refs,
-                "prompt_row_count": prompt_row_count,
-                "complete": final_prefill,
-                "pending_row": pending_row,
-                "filled": False,
-            }
-            plan.updates[request_id] = update
-            plan.request_writes.append(
-                _PromptLogprobsRequestWrite(
-                    active_index=active_idx,
-                    request_id=request_id,
-                    key=key,
-                    prompt_row_count=prompt_row_count,
-                    block_writes=block_writes,
-                    publication_only_reservations=publication_only_reservations,
-                    update=update,
-                    pending_row=pending_row,
-                )
-            )
-            if final_prefill:
-                # Decode and later checkpoint segments must not keep collecting
-                # rows under this request ID. The engine owns the captured refs.
-                context.prompt_logprobs_cache_keys.pop(request_id, None)
-                context.prompt_logprobs_block_hashes.pop(request_id, None)
-                context.prompt_logprobs_matched_refs.pop(request_id, None)
-
-        return plan
-
-    def _fill_prompt_logprob_sidecars(
-        self,
-        plan: _PromptLogprobsWritePlan,
-        log_probs: Optional[List[List[float]]],
-        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
-        *,
-        publish_unregistered: bool = False,
-    ) -> None:
-        """Fill stable reservations after copied score data becomes available."""
-        if not plan.request_writes:
-            return
-        if log_probs is None:
-            raise RuntimeError("missing copied prompt logprobs for reserved sidecars")
-
-        allocator = self.inference_wrapped_model.inference_context.kv_block_allocator
-        for request_write in plan.request_writes:
-            if request_write.update["filled"]:
-                continue
-            active_idx = request_write.active_index
-            prompt_row_count = request_write.prompt_row_count
-            request_log_probs = log_probs[active_idx]
-            selected = np.asarray(request_log_probs[:prompt_row_count], dtype=np.float32)
-            if selected.shape != (prompt_row_count,):
-                raise RuntimeError(
-                    f"request {request_write.request_id} has {selected.size} copied prompt scores; "
-                    f"expected {prompt_row_count}"
-                )
-
-            if request_write.key.top_n > 0 and prompt_row_count > 0:
-                if top_n_logprobs is None or active_idx not in top_n_logprobs:
-                    raise RuntimeError(
-                        f"missing top-{request_write.key.top_n} prompt logprobs for "
-                        f"request {request_write.request_id}"
-                    )
-                prompt_top_n = top_n_logprobs[active_idx][:prompt_row_count]
-                top_values = np.stack([values.cpu().numpy() for values, _ in prompt_top_n]).astype(
-                    np.float32, copy=False
-                )
-                top_ids = np.stack(
-                    [token_ids.cpu().numpy() for _, token_ids in prompt_top_n]
-                ).astype(np.int32, copy=False)
-            else:
-                top_values = None
-                top_ids = None
-
-            for block_write in request_write.block_writes:
-                row_indices = block_write.result_row_indices
-                block_ref = allocator.fill_prompt_logprobs_reservation(
-                    block_write.reservation,
-                    target_positions=block_write.target_positions,
-                    selected_logprobs=selected[row_indices],
-                    top_n_logprobs=(top_values[row_indices] if top_values is not None else None),
-                    top_n_token_ids=(top_ids[row_indices] if top_ids is not None else None),
-                    publish_unregistered=publish_unregistered,
-                )
-                request_write.update["blocks"][block_write.logical_block_index] = block_ref
-
-            if request_write.pending_row is not None:
-                request_write.pending_row.fill(
-                    selected[-1:],
-                    top_values[-1:] if top_values is not None else None,
-                    top_ids[-1:] if top_ids is not None else None,
-                )
-                if request_write.pending_row.block is not None:
-                    logical_block_index = request_write.pending_row.logical_block_index
-                    assert logical_block_index is not None
-                    request_write.update["blocks"][
-                        logical_block_index
-                    ] = request_write.pending_row.block
-
-            for reservation in request_write.publication_only_reservations:
-                allocator.publish_prompt_logprobs_reservation(
-                    reservation, publish_unregistered=publish_unregistered
-                )
-
-            request_write.update["filled"] = True
-
     def _run_dummy_base_forward(self, input_ids: Tensor, position_ids: Tensor) -> None:
         """Run the base-model portion of an expert-parallel dummy step.
 
@@ -2187,12 +1892,7 @@ class TextGenerationController(MTPControllerMixin):
         return finished_routing_block_ids
 
     def _dynamic_step_context_bookkeeping(
-        self,
-        *,
-        finalize_requests=None,
-        log_probs=None,
-        top_n_logprobs=None,
-        prompt_logprob_updates=None,
+        self, *, finalize_requests=None, log_probs=None, top_n_logprobs=None
     ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -2200,7 +1900,6 @@ class TextGenerationController(MTPControllerMixin):
             finalize_requests: Engine callback assembling finished results before release.
             log_probs: Selected-token scores in the consumed request order.
             top_n_logprobs: Top-n scores in the consumed request order.
-            prompt_logprob_updates: Prompt sidecars captured before request cleanup.
 
         Returns:
             Dict [str, Tensor]: A dictionary containing:
@@ -2292,7 +1991,6 @@ class TextGenerationController(MTPControllerMixin):
                 finished_handoff_block_ids=finished_handoff_block_ids,
                 finished_handoff_ssm_slots=finished_handoff_ssm_slots,
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,
-                prompt_logprob_updates=prompt_logprob_updates,
             )
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
@@ -3185,12 +2883,7 @@ class TextGenerationController(MTPControllerMixin):
             )
 
     def _finalize_async_sched_requests(
-        self,
-        request_result,
-        sample_result,
-        log_probs_transfer,
-        finalize_requests,
-        prompt_logprob_plan=None,
+        self, request_result, sample_result, log_probs_transfer, finalize_requests
     ) -> None:
         """Assemble completed requests before lifecycle cleanup can reuse their storage.
 
@@ -3199,14 +2892,11 @@ class TextGenerationController(MTPControllerMixin):
             sample_result: Sample and accepted-token counts.
             log_probs_transfer: Pending score transfer, or None.
             finalize_requests: Engine callback, or None for standalone controller use.
-            prompt_logprob_plan: Stable prompt-score reservations for a prefill step.
         """
         if finalize_requests is None or not request_result.finished_request_ids.numel():
             return
         self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
         log_probs, top_n_logprobs = request_result.log_probs_result
-        if prompt_logprob_plan is not None:
-            self._fill_prompt_logprob_sidecars(prompt_logprob_plan, log_probs, top_n_logprobs)
         finalize_requests(
             request_ids=request_result.active_request_ids,
             finished_request_ids=request_result.finished_request_ids,
@@ -3218,9 +2908,6 @@ class TextGenerationController(MTPControllerMixin):
             finished_handoff_block_ids=request_result.finished_handoff_block_ids,
             finished_handoff_ssm_slots=request_result.finished_handoff_ssm_slots,
             finished_handoff_decode_tokens=request_result.finished_handoff_decode_tokens,
-            prompt_logprob_updates=(
-                prompt_logprob_plan.updates if prompt_logprob_plan is not None else None
-            ),
         )
 
     def _run_async_sched_resolve(
@@ -3306,7 +2993,6 @@ class TextGenerationController(MTPControllerMixin):
         *,
         finalize_requests=None,
         log_probs_transfer=None,
-        prompt_logprob_plan=None,
     ) -> _AsyncScheduleRequestResult:
         """Run complete request lifecycle bookkeeping for a no-overlap step.
 
@@ -3316,7 +3002,6 @@ class TextGenerationController(MTPControllerMixin):
                 the current output.
             finalize_requests: Engine callback assembling finished results before release.
             log_probs_transfer: Pending selected and top-n score transfer.
-            prompt_logprob_plan: Stable prompt-score reservations for this prefill step.
 
         Returns:
             _AsyncScheduleRequestResult: Stable sampled output and lifecycle results.
@@ -3358,7 +3043,7 @@ class TextGenerationController(MTPControllerMixin):
             finished_routing_block_ids=finished_routing_block_ids,
         )
         self._finalize_async_sched_requests(
-            result, sample_result, log_probs_transfer, finalize_requests, prompt_logprob_plan
+            result, sample_result, log_probs_transfer, finalize_requests
         )
 
         mutable_sampled_tokens_cpu = sampled_tokens_cpu.clone()
@@ -3386,7 +3071,6 @@ class TextGenerationController(MTPControllerMixin):
         decode_only: DecodeOnly,
         log_probs: Optional[List[List[float]]],
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
-        prompt_logprob_updates: Optional[Dict[int, Dict[str, Any]]] = None,
         *,
         count_compaction: bool,
     ) -> DynamicBatchControllerStepResult:
@@ -3402,8 +3086,6 @@ class TextGenerationController(MTPControllerMixin):
                 grouped by active request.
             top_n_logprobs (Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]): Top-n
                 log probabilities and token IDs grouped by active request.
-            prompt_logprob_updates: Prompt sidecar references captured before
-                request lifecycle bookkeeping.
             count_compaction (bool): Whether finished requests discarded successor rows.
 
         Returns:
@@ -3429,16 +3111,12 @@ class TextGenerationController(MTPControllerMixin):
                 "accepted_tokens": request_result.accepted_tokens_cpu,
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
-                "prompt_logprob_updates": prompt_logprob_updates or {},
                 "cuda_graph_request_count": cuda_graph_request_count,
             },
         )
 
     async def _run_async_sched_step_no_overlap(
-        self,
-        *,
-        schedule_waiting_requests: Optional[Callable[[Dict[int, Dict[str, Any]]], None]],
-        finalize_requests=None,
+        self, *, schedule_waiting_requests: Optional[Callable[[], None]], finalize_requests=None
     ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> update -> admit -> forward``.
 
@@ -3446,8 +3124,8 @@ class TextGenerationController(MTPControllerMixin):
         first two phases, admits requests, and launches a primer-only forward.
 
         Args:
-            schedule_waiting_requests: Engine callback that stages consumed prompt
-                scores and admits eligible prefill requests.
+            schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
+                that admits eligible non-chunked prefill requests.
             finalize_requests: Engine callback assembling finished results before release.
 
         Returns:
@@ -3460,9 +3138,7 @@ class TextGenerationController(MTPControllerMixin):
         request_result = None
         cuda_graph_request_count = None
         log_probs_transfer = None
-        log_probs = None
-        top_n_logprobs = None
-        prompt_logprob_updates = {}
+        prompt_logprob_writes = []
 
         with torch.inference_mode():
             if had_pending_forward:
@@ -3479,13 +3155,9 @@ class TextGenerationController(MTPControllerMixin):
 
                 log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
                 log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
-                row_counts = (
-                    log_probs_transfer.row_counts
-                    if log_probs_transfer is not None and context.enable_prefix_caching
-                    else None
-                )
-                prompt_logprob_plan = self._reserve_prompt_logprob_sidecars(row_counts)
-                prompt_logprob_updates = prompt_logprob_plan.updates
+                # The rows arrive after update and admission, so record their
+                # blocks now and pin them until the rows are stored.
+                prompt_logprob_writes = context.capture_prompt_logprob_writes()
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
 
@@ -3500,7 +3172,6 @@ class TextGenerationController(MTPControllerMixin):
                     resolved_sequence_lengths,
                     finalize_requests=finalize_requests,
                     log_probs_transfer=log_probs_transfer,
-                    prompt_logprob_plan=prompt_logprob_plan,
                 )
 
             # -------------------------------------------------------------------------
@@ -3508,7 +3179,7 @@ class TextGenerationController(MTPControllerMixin):
             # -------------------------------------------------------------------------
             # This is the only async-scheduling admission mutation point.
             if schedule_waiting_requests is not None:
-                schedule_waiting_requests(prompt_logprob_updates)
+                schedule_waiting_requests()
 
             # -------------------------------------------------------------------------
             # Forward
@@ -3527,14 +3198,6 @@ class TextGenerationController(MTPControllerMixin):
             elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
                 self._run_dummy_async_sched_base_step()
 
-        if had_pending_forward:
-            # The reservations above own every mutable row/block identity needed
-            # by sidecar storage, so score D2H can overlap update, admission, and
-            # the successor forward without writing onto recycled KV storage.
-            self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
-            log_probs, top_n_logprobs = request_result.log_probs_result
-            self._fill_prompt_logprob_sidecars(prompt_logprob_plan, log_probs, top_n_logprobs)
-
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
         if not had_pending_forward:
             if active_request_count == 0:
@@ -3543,13 +3206,15 @@ class TextGenerationController(MTPControllerMixin):
                 return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
+        self._finalize_async_sched_log_probs(request_result, sample_result, log_probs_transfer)
+        log_probs, top_n_logprobs = request_result.log_probs_result
+        context.commit_prompt_logprob_writes(prompt_logprob_writes, log_probs, top_n_logprobs)
         result = self._build_async_sched_step_result(
             request_result,
             cuda_graph_request_count,
             decode_only,
             log_probs,
             top_n_logprobs,
-            prompt_logprob_updates,
             count_compaction=False,
         )
         await asyncio.sleep(0)
@@ -3873,7 +3538,11 @@ class TextGenerationController(MTPControllerMixin):
                         )
             range_pop()
 
-            prompt_logprob_updates = self._store_prompt_logprob_sidecars(log_probs, top_n_logprobs)
+            # Cache prompt log-prob rows on their blocks before update_requests
+            # changes the layout that locates them.
+            context.commit_prompt_logprob_writes(
+                context.capture_prompt_logprob_writes(), log_probs, top_n_logprobs
+            )
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests
@@ -3897,7 +3566,6 @@ class TextGenerationController(MTPControllerMixin):
                     finalize_requests=finalize_requests,
                     log_probs=log_probs,
                     top_n_logprobs=top_n_logprobs,
-                    prompt_logprob_updates=prompt_logprob_updates,
                 )
 
             ret = {
@@ -3909,7 +3577,6 @@ class TextGenerationController(MTPControllerMixin):
                 ),
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
-                "prompt_logprob_updates": prompt_logprob_updates,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
             if self.num_speculative_tokens > 0:
@@ -3925,7 +3592,7 @@ class TextGenerationController(MTPControllerMixin):
         skip_bookkeeping: Optional[bool] = False,
         *,
         run_async_overlap: bool = True,
-        schedule_waiting_requests: Optional[Callable[[Dict[int, Dict[str, Any]]], None]] = None,
+        schedule_waiting_requests: Optional[Callable[[], None]] = None,
         finalize_requests: Optional[Callable[..., None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
@@ -3934,8 +3601,8 @@ class TextGenerationController(MTPControllerMixin):
             skip_bookkeeping (Optional[bool]): If true, skip context bookkeeping
                 on the legacy path.
             run_async_overlap (bool): Whether to run the overlap ordering.
-            schedule_waiting_requests: Engine callback used by the no-overlap path
-                to stage consumed prompt scores and admit eligible prefill requests.
+            schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
+                used by the no-overlap path to admit eligible prefill requests.
             finalize_requests: Engine callback assembling finished results before release.
 
         Returns:

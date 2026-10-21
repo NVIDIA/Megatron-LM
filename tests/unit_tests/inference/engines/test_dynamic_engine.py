@@ -1557,8 +1557,7 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     engine.context = types.SimpleNamespace(
         chunked_prefill_request_id=-1, kv_block_allocator=types.SimpleNamespace()
     )
-    engine.requests = {request.request_id: RequestEntry(record=record, future=mock.Mock())}
-    engine._discard_prompt_logprob_state = mock.Mock()
+    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -1658,13 +1657,9 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     request = record[-1]
     future = asyncio.get_running_loop().create_future()
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.requests = {41: RequestEntry(record=record, future=future)}
+    engine.requests = {41: types.SimpleNamespace(record=record, future=future)}
     engine.context = types.SimpleNamespace(
-        kv_block_allocator=types.SimpleNamespace(),
-        remove_vlm_request_data=mock.Mock(),
-        prompt_logprobs_cache_keys={},
-        prompt_logprobs_block_hashes={},
-        prompt_logprobs_matched_refs={},
+        kv_block_allocator=types.SimpleNamespace(), remove_vlm_request_data=mock.Mock()
     )
     engine.controller = types.SimpleNamespace(
         tokenizer=types.SimpleNamespace(
@@ -1711,7 +1706,7 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     )
     failed_record = DynamicInferenceRequestRecord.from_request(failed)
     failed_future = asyncio.get_running_loop().create_future()
-    engine.requests = {42: RequestEntry(record=failed_record, future=failed_future)}
+    engine.requests = {42: types.SimpleNamespace(record=failed_record, future=failed_future)}
     engine.failed_request_ids = []
     engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
     submit = dynamic_engine.Headers.SUBMIT_REQUEST.value
@@ -1764,10 +1759,8 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     )
     to_record = DynamicInferenceRequestRecord.from_request
     engine.requests = {
-        request.request_id: RequestEntry(record=to_record(request), future=mock.Mock())
-        for request in requests
+        request.request_id: types.SimpleNamespace(record=to_record(request)) for request in requests
     }
-    engine._discard_prompt_logprob_state = mock.Mock()
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
     engine.controller = types.SimpleNamespace(
@@ -2431,6 +2424,46 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     )
 
 
+@pytest.mark.parametrize("scored_before", [0, 2])
+def test_cached_prompt_log_probs_wait_for_preceding_scores(scored_before):
+    """Cached rows for a later chunk are placed only after the scores before them."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        tokenizer=types.SimpleNamespace(detokenize=lambda token_ids: f"tok_{token_ids[0]}")
+    )
+    start = scored_before + 2
+    request = types.SimpleNamespace(
+        prompt_log_probs=[-float(i) for i in range(scored_before)] or None,
+        prompt_top_n_logprobs=[{f"tok_{i}": -float(i)} for i in range(scored_before)] or None,
+        sampling_params=types.SimpleNamespace(top_n_logprobs=1),
+        cached_prompt_log_probs=[
+            (
+                start,
+                torch.tensor([-start, -start - 1.0]).numpy(),
+                torch.tensor([[-start], [-start - 1.0]]).numpy(),
+                torch.tensor([[start], [start + 1]]).numpy(),
+            )
+        ],
+    )
+
+    # The two computed rows before the cached run have not arrived yet.
+    engine._place_cached_prompt_log_probs(request)
+    assert len(request.prompt_log_probs or []) == scored_before
+
+    request.prompt_log_probs = (request.prompt_log_probs or []) + [
+        -float(scored_before),
+        -float(scored_before + 1),
+    ]
+    request.prompt_top_n_logprobs = (request.prompt_top_n_logprobs or []) + [{}, {}]
+    engine._place_cached_prompt_log_probs(request)
+    assert request.prompt_log_probs == [-float(i) for i in range(start + 2)]
+    assert request.prompt_top_n_logprobs[start:] == [
+        {f"tok_{start}": -float(start)},
+        {f"tok_{start + 1}": -float(start + 1)},
+    ]
+    assert not request.cached_prompt_log_probs
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
@@ -2438,25 +2471,19 @@ def test_streaming_partials_are_sent():
         generated_tokens=[11, 12, 13],
         generated_log_probs=[-0.1, -0.2, -0.3],
         generated_top_n_logprobs=[{"eleven": -0.01}, {"twelve": -0.02}, {"thirteen": -0.03}],
-        prompt_log_probs=None,
-        prompt_top_n_logprobs=None,
+        prompt_log_probs=[-0.4],
+        prompt_top_n_logprobs=[{"prompt": -0.04}],
         sampling_params=types.SimpleNamespace(
             streaming=True, return_log_probs=True, skip_prompt_log_probs=False
         ),
     )
-    entry = types.SimpleNamespace(record=[request], prompt_logprobs_complete=True)
-    engine.requests = {7: entry}
-    engine._materialize_prompt_logprob_sidecars = mock.Mock(
-        side_effect=lambda _, **__: request.__dict__.update(
-            prompt_log_probs=[-0.4], prompt_top_n_logprobs=[{"prompt": -0.04}]
-        )
-    )
+    engine.requests = {7: types.SimpleNamespace(record=[request])}
     engine.socket_for_receiving_requests = mock.Mock()
 
     engine._try_send_streaming_partials()
 
-    engine._materialize_prompt_logprob_sidecars.assert_called_once_with(entry, retain_state=True)
-    # Metadata names the request IDs so the coordinator can route the body.
+    # Partials go out as [metadata, body] frames: the metadata names the request
+    # ids so the coordinator can route without decoding the bodies.
     engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
     assert msgpack.unpackb(frames[0], raw=False) == [Headers.ENGINE_REPLY_PARTIAL.value, [7]]
