@@ -94,7 +94,12 @@ class DeepseekV41Model(NativeModel):
         return output
 
     def _build_attention(self, config, index):
-        return build_attention(config, index, self.context)
+        attention = build_attention(config, index, self.context)
+        modes = (
+            {'full'} if self.impl.recompute is True else set(str(self.impl.recompute).split(','))
+        )
+        attention.retain_sparse_stats = bool(modes & {'full', 'attn'})
+        return attention
 
     def _build_mlp(self, config, release, index):
         spec = get_mlp_module_spec(

@@ -108,7 +108,7 @@ class _SWAInsert(torch.autograd.Function):
 
 class _Sparse(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, sink, indices, lengths, scale):
+    def forward(ctx, q, kv, sink, indices, lengths, scale, retain_stats=False):
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
         heads = q.shape[1]
@@ -116,7 +116,7 @@ class _Sparse(torch.autograd.Function):
         query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
         bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
         output = torch.empty_like(query)
-        flash_mla_sparse_fwd(
+        output, _, lse = flash_mla_sparse_fwd(
             q=query,
             kv=kv[:, None].contiguous(),
             indices=indices[:, None],
@@ -125,18 +125,21 @@ class _Sparse(torch.autograd.Function):
             topk_length=lengths,
             out=output,
         )
-        ctx.save_for_backward(q, kv, sink, indices)
+        # Retain exact FlashMLA statistics during checkpoint replay, as the
+        # reference FlashMLA core does. Without recompute, replay saves memory.
+        ctx.save_for_backward(q, kv, sink, indices, *((output, lse) if retain_stats else ()))
         ctx.scale = scale
         return output[:, :heads]
 
     @staticmethod
     def backward(ctx, grad):
-        q, kv, sink, indices = ctx.saved_tensors
+        q, kv, sink, indices = ctx.saved_tensors[:4]
         if q.shape[0] == 0:
             return (
                 torch.zeros_like(q),
                 torch.zeros_like(kv),
                 torch.zeros_like(sink),
+                None,
                 None,
                 None,
                 None,
@@ -160,10 +163,9 @@ class _Sparse(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
-        # Recompute only the pinned forward's saved statistics; the public
-        # forward above and its output bits remain unchanged. cuDNN owns the
-        # full-query batched VJP rather than Python's 32-row autograd loop.
+        # Exact saved/replayed FlashMLA statistics feed the whole-query cuDNN VJP.
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
@@ -176,14 +178,17 @@ class _Sparse(torch.autograd.Function):
         bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
         # Every unused slot is -1 in this caller's compact layout.
         lengths = None
-        output, _, lse = flash_mla_sparse_fwd(
-            q=query,
-            kv=kv[:, None].contiguous(),
-            indices=indices[:, None],
-            sm_scale=ctx.scale,
-            attn_sink=bias,
-            topk_length=lengths,
-        )
+        if len(ctx.saved_tensors) == 6:
+            output, lse = ctx.saved_tensors[4:]
+        else:
+            output, _, lse = flash_mla_sparse_fwd(
+                q=query,
+                kv=kv[:, None].contiguous(),
+                indices=indices[:, None],
+                sm_scale=ctx.scale,
+                attn_sink=bias,
+                topk_length=lengths,
+            )
         dout = torch.nn.functional.pad(grad, (0, 0, 0, padded - heads)).contiguous()
         sparse._ensure_dsa_namespace()
         result = sparse._DSA.sparse_attention_backward_wrapper(
@@ -212,6 +217,7 @@ class _Sparse(torch.autograd.Function):
             result["dq"][:, :heads],
             result["dkv"].to(kv.dtype),
             result["d_sink"][:heads].to(sink.dtype),
+            None,
             None,
             None,
             None,
@@ -432,7 +438,15 @@ def swa_forward(attention, hidden, positions, rope_cache, *, observe=None, sourc
     )
     emit('swa_indices', indices)
     sink = attention.core_attention.native.attn_sink
-    out = _Sparse.apply(q, kv, sink, indices, lens, attention.q_head_dim**-0.5)
+    out = _Sparse.apply(
+        q,
+        kv,
+        sink,
+        indices,
+        lens,
+        attention.q_head_dim**-0.5,
+        getattr(attention, 'retain_sparse_stats', False),
+    )
     emit('core_attn', out)
     weight = attention.linear_o_group_proj
     groups = attention.config.o_groups

@@ -118,3 +118,34 @@ def test_tensor_core_vjp_matches_fp32_control(kind, gradient_dtype, monkeypatch)
         )
         check(dx, (g.float() @ w.float()).bfloat16())
         check(dw, g.float().T @ x.float())
+
+
+def test_sparse_statistics_storage_does_not_change_forward_or_cpu_vjp(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from megatron.lite.model.deepseek_v41.vllm.attention import _Sparse
+
+    def forward(**kwargs):
+        output = kwargs['out'].copy_(kwargs['q'])
+        return output, None, output.new_zeros(output.shape[:2], dtype=torch.float32)
+
+    with monkeypatch.context() as patch:
+        patch.setitem(
+            sys.modules,
+            'vllm.v1.attention.ops.flashmla',
+            SimpleNamespace(flash_mla_sparse_fwd=forward),
+        )
+        q = torch.randn(3, 2, 64, requires_grad=True)
+        kv = torch.randn(5, 64, requires_grad=True)
+        sink = torch.randn(2, requires_grad=True)
+        indices = torch.tensor([[0, 1, -1], [1, 2, 3], [2, 3, 4]], dtype=torch.int32)
+        outputs, gradients = [], []
+        for retained in (False, True):
+            output = _Sparse.apply(q, kv, sink, indices, None, 0.125, retained)
+            assert len(output.grad_fn.saved_tensors) == (6 if retained else 4)
+            outputs.append(output)
+            gradients.append(torch.autograd.grad(output.sum(), (q, kv, sink)))
+        assert torch.equal(outputs[0].view(torch.int32), outputs[1].view(torch.int32))
+        for before, after in zip(*gradients):
+            assert torch.equal(before, after)
