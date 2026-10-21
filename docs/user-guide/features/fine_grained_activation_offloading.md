@@ -181,11 +181,17 @@ Forward pass (Layer N):                    Backward pass (Layer N):
 3. **`group_offload`**: Triggers asynchronous D2H copy on a dedicated CUDA stream (`d2h_stream`), optionally releases GPU storage of input tensors.
 4. **Backward**: Before the group's backward, tensors are reloaded from CPU to GPU on `h2d_stream`, and the compute stream waits for the transfer to complete.
 
-Every committed forward group occupies a slot in the backward reload queue, including groups
-kept on GPU by the offload policy. GPU-resident groups are consumed as no-op slots without
-recording a reload event. The group-start autograd marker retains the corresponding forward
-group so backward can consume its current no-op slot before preloading the next group. This
-preserves the reload cadence for partial offloading without reloading earlier groups too soon.
+Committed forward groups occupy slots in the backward reload queue, including groups kept on GPU
+by the fraction or PP-rank delta policy. These resident groups are consumed as no-op slots without
+recording a reload event. The group-start autograd marker retains the corresponding forward group
+so backward can consume its current no-op slot before preloading the next group.
+
+Groups explicitly reserved by the post-warmup margin policy are excluded from this queue. Their
+backward markers still trigger prefetches, providing compute time to reload earlier groups. This
+also handles delayed norm commits: although `attn_norm` starts before `core_attn`, it commits after
+the attention residual addition. Enqueuing both resident margin groups in commit order would spend
+the first two prefetch opportunities consuming their slots instead of reloading earlier activations.
+Warmup has no reserved margin yet, so all warmup groups retain their reload slots.
 
 ### Warmup and Adaptive Offloading
 
@@ -206,7 +212,7 @@ also does not add explicit cache eviction. After warmup, `post_warmup_callback` 
 policy independently, preserving the preference for earlier forward groups:
 
 
-1. **Reserve margin**: The last N groups (by deduplication count) are kept on GPU to avoid reload blocking the compute stream.
+1. **Reserve margin**: The last group of each module name is kept on GPU and excluded from the reload queue, leaving its backward marker available to trigger prefetches.
 2. **Apply PP rank delta**: Higher PP ranks offload fewer bytes (controlled by `delta_offload_bytes_across_pp_ranks`).
 3. **Apply fraction**: Only the first N% of the remaining eligible groups are offloaded across all configured modules (controlled by `activation_offload_fraction`).
 4. **Print summary table**: An ASCII table of per-rank offload bytes is printed for debugging.

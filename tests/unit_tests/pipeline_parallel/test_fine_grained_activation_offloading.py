@@ -206,6 +206,102 @@ def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatc
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("fraction", [0.5, 1.0])
+@pytest.mark.parametrize("core_layers", [(True, True, True), (True, False, False, False)])
+@pytest.mark.parametrize("pre_reload", [False, True])
+def test_margin_groups_allow_prefetch_after_delayed_norm_commit(
+    monkeypatch, fraction, core_layers, pre_reload
+):
+    """Norm commits after attention; resident margins must not consume prefetch slots."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    input_tensor = torch.full((128, 128), 0.1, device="cuda", requires_grad=True)
+
+    def forward():
+        off_interface.init_chunk_handler(
+            pp_rank=0,
+            vp_size=None,
+            vp_stage=None,
+            min_offloaded_tensor_size=1,
+            delta_offload_bytes_across_pp_ranks=0,
+            activation_offload_fraction=fraction,
+        )
+        output = input_tensor
+        for has_core in core_layers:
+            norm_scope = off_interface(True, output, "attn_norm")
+            with norm_scope as residual:
+                output = residual.sin()
+            if has_core:
+                core_scope = off_interface(True, output, "core_attn")
+                with core_scope as activation:
+                    output = activation.sin()
+                output = core_scope.group_offload(output)
+            # Match the production residual path: norm's commit is delayed until
+            # after attention and residual addition, but its start marker is first.
+            output = norm_scope.group_offload(output + residual)
+        return output
+
+    try:
+        reference = input_tensor
+        for has_core in core_layers:
+            residual = reference
+            reference = reference.sin()
+            if has_core:
+                reference = reference.sin()
+            reference = reference + residual
+        expected_grad = torch.autograd.grad(reference.sum(), input_tensor)[0]
+        expected_output = reference.detach()
+        del reference
+
+        output = forward()
+        torch.cuda.synchronize()
+        output.sum().backward()
+        torch.cuda.synchronize()
+        del output
+        input_tensor.grad = None
+        off_interface.reset()
+
+        output = forward()
+        chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
+        last_by_name = {group._name: group for group in chunk.offload_groups}
+        for group in chunk.offload_groups:
+            if group is last_by_name[group._name]:
+                assert group.is_offload_margin and not group.offload
+                assert group not in chunk._groups_to_reload
+            else:
+                assert not group.is_offload_margin
+                # This includes groups kept resident by fraction, whose slots
+                # must remain present to avoid reverting partial-offload cadence.
+                assert group in chunk._groups_to_reload
+
+        reload_streams = []
+        original_reload = chunk.reload
+
+        def record_reload(state, non_blocking=None):
+            reload_streams.append(torch.cuda.current_stream())
+            return original_reload(state, non_blocking=non_blocking)
+
+        monkeypatch.setattr(chunk, "reload", record_reload)
+        torch.cuda.synchronize()
+        if pre_reload:
+            chunk.pre_reload_last_layer()
+        output.sum().backward()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, expected_output)
+        torch.testing.assert_close(input_tensor.grad, expected_grad)
+        assert reload_streams
+        assert all(
+            stream == chunk.h2d_stream for stream in reload_streams
+        ), "A delayed norm commit caused a compute-stream fallback reload"
+        assert not chunk._groups_to_reload
+        assert all(not group._tensors for group in chunk.offload_groups)
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
 def _reset_cuda_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():

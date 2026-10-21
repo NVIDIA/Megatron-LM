@@ -393,6 +393,8 @@ class OffloadTensorGroup:
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
         self.offload = True
+        # Margin groups stay resident to provide compute time for the first reloads.
+        self.is_offload_margin = False
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
         self._offload_info_collected = False
@@ -634,6 +636,7 @@ class PipelineOffloadManager:
         for name, group in last_group_with_same_name.items():
             if self._offload_margin > 0:
                 group.offload = False
+                group.is_offload_margin = True
                 self._offload_margin -= 1
                 debug_rank(f"setting offload to false for group {name} at chunk index {chunk_idx}")
             else:
@@ -1260,9 +1263,12 @@ class ChunkOffloadHandler:
         # commit runs, so match by name instead of assuming LIFO order.
         group_to_offload = self.find_group_with_name(self._groups_to_offload, name)
         assert group_to_offload is not None, f"Group {name} not found in {self._groups_to_offload}"
-        # Preserve every forward group as a backward reload slot, even when
-        # the offload policy keeps its tensors on GPU.
-        self._groups_to_reload.append(group_to_offload)
+        # Fraction/PP-delta resident groups retain slots to prevent early reloads.
+        # Margin groups instead provide the initial prefetch opportunities. Their
+        # backward markers still trigger reloads, but their slots must not consume
+        # those opportunities (e.g. attn_norm commits after core_attn).
+        if not group_to_offload.is_offload_margin:
+            self._groups_to_reload.append(group_to_offload)
         if self.should_bulk_offload(group_to_offload):
             self.bulk_offload_group(group_to_offload)
             # Manually release tensors not auto-freed by torch GC
