@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DS4.1 model body on native Core attention, MoE, mHC and vocabulary layers."""
 import torch
 from torch import nn
 
@@ -18,6 +17,7 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.utils import ensure_params_ready
 from megatron.lite.model.deepseek_v41.lite.components.assembly import (
     DS41AttentionSources,
     SourceContext,
@@ -44,8 +44,6 @@ from megatron.lite.primitive.parallel.source_state import KVSourceState
 
 
 class CoreAttentionSources(DS41AttentionSources):
-    """Core Attention constructs once before Hybrid supplies ratio/RoPE."""
-
     def __init__(self, *, compress_ratio=0, rotary_pos_emb=None, **kwargs):
         super().__init__(compress_ratio=compress_ratio, rotary_pos_emb=rotary_pos_emb, **kwargs)
 
@@ -180,6 +178,7 @@ class DeepseekV41Model(MegatronModule):
         calculate_entropy=False,
         hidden_states=None,
     ):
+        ensure_params_ready(self.parameters())
         params = packed_seq_params
         validate_runtime_cp(self.release, self.ps.cp_group, params)
         ids = input_ids.reshape(-1)
