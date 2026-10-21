@@ -940,8 +940,16 @@ parameter layout rather than relying only on the requested configuration.
 
 The initial integration supports TP/ETP/CP/PP/GTP=1, sequential microbatch
 forward/backward, ordinary SwiGLU, native MCore DDP, and device-resident
-activations. Graph capture, outer activation recomputation, delayed WGRAD,
-Flex dispatch, shared-expert overlap, and FSDP are rejected. Routed precision
+activations. Local whole-layer CUDA graphs (`cuda_graph_impl: local` with
+`cuda_graph_modules: []`) reuse MCore's graph runner and native DDP hooks.
+MXFP8 CUDA graphs require `fp8_param: true`; MXFP8 compute with BF16 primary
+parameters is supported only in eager mode. BF16 compute also supports local graphs.
+Prepared scales refresh in place after parameter gathering and before replay;
+the graphs retain their runtime storage until `delete_cuda_graphs()` is called.
+Training graphs require forward/backward pairs; `no_grad` replay is rejected
+before launch. Evaluation through a captured training runner is unsupported.
+Other graph modes, outer activation recomputation, delayed WGRAD, Flex dispatch,
+and FSDP are rejected. Routed precision
 must be uniform; `first_last_layers_bf16` overrides are rejected. Expert parallelism
 comes from the layer's explicit EP process group.
 
@@ -949,7 +957,8 @@ The training entrypoint initializes contexts after DDP, optimizer, and checkpoin
 setup and closes them on exit. Library users call
 `initialize_dist_moe_runtime(model_chunks, ddp_config=..., max_num_local_input_tokens=...)`
 after equivalent setup and `close_dist_moe_runtime(model_chunks)` after the last
-backward and before destroying process groups. These functions are exported by
+backward and before destroying process groups. Library users must delete local
+graphs before closing the runtime or loading model weights. These functions are exported by
 `megatron.core.transformer.moe.megakernel.dist_moe`.
 
 Backend options are `num_sms`, `device_scratch_capacity_factor`,
