@@ -105,7 +105,171 @@ class _FusedMoE(torch.autograd.Function):
         return result[0], result[1], None, None, *result[2:]
 
 
+def _mx(w):
+    from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4, quantize_mxfp4
+
+    return dequantize_mxfp4(*quantize_mxfp4(w.detach().bfloat16())).bfloat16()  # exact
+
+
+def _fp8(w):
+    from megatron.lite.primitive.quantization.block_fp8 import (
+        dequantize_block_fp8,
+        quantize_block_fp8,
+    )
+
+    codes, scale = quantize_block_fp8(w.detach().bfloat16(), (32, 32), scale_format="e8m0")
+    return dequantize_block_fp8(codes, scale, (32, 32)).bfloat16()  # exact
+
+
+def _requant_l2(h):
+    """The kernel's L1-epilogue requant of the FP32 activation, decoded: 1x32 groups, UE8M0
+    scale = smallest power of two with amax / scale <= 448 (DeepGEMM ``get_ue8m0_sf_exp``,
+    exponent floor 2^-22), E4M3 round-to-nearest-even."""
+    groups = h.detach().float().reshape(*h.shape[:-1], h.shape[-1] // 32, 32)
+    bits = groups.abs().amax(-1, keepdim=True).view(torch.int32).to(torch.int64)
+    exp = torch.clamp((bits + 0x7FFFFF - 0x600000) >> 23, min=113) - 8
+    codes = (groups * torch.exp2((127 - exp).float())).to(torch.float8_e4m3fn)
+    return (codes.float() * torch.exp2((exp - 127).float())).reshape(h.shape)
+
+
+def _mlp_grads(a, score, grad, w1, w2, limit, need):
+    """VJP of ``q(swiglu(bf16(a @ w1.T)) * score) @ w2.T`` over decoded operands, as the
+    fused kernel computes it (GEMM1 accumulator rounded to BF16 before the clamp/SwiGLU,
+    ``q`` the FP8 requant, identity STE). BF16 tensor-core GEMMs with FP32 accumulation.
+    Returns FP32 (da, dscore, dw1, dw2), None where unneeded."""
+    from .linear import tc_mm
+
+    need_a, need_s, need_w1, need_w2 = need
+    h = tc_mm(a, w1.T).float()
+    with torch.enable_grad():
+        h_ = h.requires_grad_(need_a or need_w1)
+        s_ = score.detach().float().requires_grad_(need_s)
+        gate, up = h_.chunk(2, -1)
+        if limit is not None:
+            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+        act = torch.nn.functional.silu(gate) * up * s_.unsqueeze(-1)
+    dw2 = tc_mm(grad.T, _requant_l2(act), torch.float32) if need_w2 else None
+    dh = ds = None
+    wanted = [t for t in (h_, s_) if t.requires_grad]
+    if wanted:
+        grads = iter(torch.autograd.grad(act, wanted, tc_mm(grad, w2, torch.float32)))
+        dh = next(grads) if h_.requires_grad else None
+        ds = next(grads) if s_.requires_grad else None
+    da = tc_mm(dh, w1, torch.float32) if need_a else None
+    dw1 = tc_mm(dh.T, a, torch.float32) if need_w1 else None
+    return da, ds, dw1, dw2
+
+
+def _all_gather(x, group):
+    out = x.new_empty((group.size() * x.shape[0], *x.shape[1:]))
+    torch.distributed.all_gather_into_tensor(out, x.contiguous(), group=group)
+    return out
+
+
+def _reduce_scatter(x, group):
+    out = x.new_empty((x.shape[0] // group.size(), *x.shape[1:]))
+    torch.distributed.reduce_scatter_tensor(out, x.contiguous(), group=group)
+    return out
+
+
+class _DenseMoE(torch.autograd.Function):
+    """#260 MegaMoE backward: per-expert decoded VJP over EP-all-gathered rows, FP32
+    reduce-scatter back, expert dW straight into ``main_grad``. Same fused forward."""
+
+    @staticmethod
+    def forward(ctx, x, scores, indices, options, *masters):
+        group, limit, buffer, packed = options
+        ctx.options = group, limit
+        ctx.save_for_backward(x, scores, indices, *masters)
+        return experts.launch(x, scores, indices, packed, buffer, limit, group.size())
+
+    @staticmethod
+    def backward(ctx, grad):
+        from .linear import accumulate_wgrad
+
+        x, weights, ids, *masters = ctx.saved_tensors
+        group, limit = ctx.options
+        local = len(masters) // 2 - 1
+        need_x, need_w = ctx.needs_input_grad[:2]
+        need_m = ctx.needs_input_grad[4:]
+        fc1, fc2, s1, s2 = masters[:local], masters[local : 2 * local], *masters[2 * local :]
+        grad = grad.float()
+        with torch.autocast(device_type="cuda", enabled=False):
+            a = experts.dequantize_activation(*experts.quantize_activation(x.detach().bfloat16()))
+            dx, _, dw1s, dw2s = _mlp_grads(
+                a,
+                a.new_ones(a.shape[0]),
+                grad,
+                _fp8(s1),
+                _fp8(s2),
+                limit,
+                (need_x, False, need_m[-2], need_m[-1]),
+            )
+            dx = torch.zeros_like(a) if dx is None else dx
+            world, rank = group.size(), group.rank()
+            rows, k = ids.shape
+            if world > 1:
+                capacity = torch.tensor([rows], device=x.device)
+                torch.distributed.all_reduce(capacity, torch.distributed.ReduceOp.MAX, group=group)
+                pad = int(capacity) - rows
+
+                def padded(t, v=0):
+                    return torch.nn.functional.pad(t, (0, 0, 0, pad), value=v)
+
+                a_all = _all_gather(padded(a.bfloat16()), group)
+                g_all = _all_gather(padded(grad.bfloat16()), group)
+                w_all = _all_gather(padded(weights.float()), group)
+                ids_all = _all_gather(padded(ids, -1), group)
+            else:
+                a_all, g_all, w_all, ids_all = a, grad, weights.float(), ids
+            da_all = torch.zeros(a_all.shape, dtype=torch.float32, device=a_all.device)
+            dw_all = torch.zeros_like(w_all)
+            flat = ids_all.flatten()
+            dfc1, dfc2 = [None] * local, [None] * local
+            for e in range(local):
+                pos = (flat == rank * local + e).nonzero().flatten()
+                if not pos.numel():
+                    dfc1[e] = torch.zeros_like(fc1[e]) if need_m[e] else None
+                    dfc2[e] = torch.zeros_like(fc2[e]) if need_m[local + e] else None
+                    continue
+                token = pos // k
+                da, dsc, d1, d2 = _mlp_grads(
+                    a_all[token],
+                    w_all.flatten()[pos],
+                    g_all[token],
+                    _mx(fc1[e]),
+                    _mx(fc2[e]),
+                    limit,
+                    (need_x, need_w, need_m[e], need_m[local + e]),
+                )
+                if da is not None:
+                    da_all.index_add_(0, token, da)
+                if dsc is not None:
+                    dw_all.view(-1)[pos] = dsc
+                dfc1[e] = None if d1 is None else accumulate_wgrad((fc1[e],), d1, fc1[e])
+                dfc2[e] = None if d2 is None else accumulate_wgrad((fc2[e],), d2, fc2[e])
+            if world > 1:
+                da_all = _reduce_scatter(da_all, group)[:rows]
+                dw_all = _reduce_scatter(dw_all, group)[:rows]
+            dx = (dx + da_all).to(x.dtype) if need_x else None
+            dweights = dw_all.to(weights.dtype) if need_w else None
+        return (
+            dx,
+            dweights,
+            None,
+            None,
+            *dfc1,
+            *dfc2,
+            None if dw1s is None else accumulate_wgrad((s1,), dw1s, s1),
+            None if dw2s is None else accumulate_wgrad((s2,), dw2s, s2),
+        )
+
+
 class MegaMoE(MoELayer):
+    # A/B of the fused-forward backward: "grouped" (variable-row EP A2A + grouped VJP)
+    # or "megamoe" (#260 dense EP all-gather + per-expert VJP).
+    backward_impl = 'grouped'
+
     def forward(self, hidden_states, input_ids=None, **kwargs):
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         group, rank = self.ep_group, self.ep_group.rank()
@@ -142,10 +306,11 @@ class MegaMoE(MoELayer):
             chunks = torch.tensor(max(1, (x.shape[0] + capacity - 1) // capacity), device=x.device)
             torch.distributed.all_reduce(chunks, torch.distributed.ReduceOp.MAX, group=group)
             outputs = []
+            fused = _DenseMoE if self.backward_impl == 'megamoe' else _FusedMoE
             for chunk in range(int(chunks)):
                 rows = slice(chunk * capacity, (chunk + 1) * capacity)
                 outputs.append(
-                    _FusedMoE.apply(
+                    fused.apply(
                         x[rows],
                         weights[rows],
                         indices[rows],

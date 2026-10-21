@@ -127,29 +127,39 @@ def test_thd_projections_are_batched_and_metadata_tracks_boundary_changes(monkey
         _dsv4_compress_ratio=0,
     )
     params = SimpleNamespace(qkv_format='thd', cu_seqlens_q_padded=torch.tensor([0, 3, 3, 9]))
-    calls, rows = [], []
+    calls, rows, tails = [], [], []
 
     def projections(module, x):
         calls.append(x.shape[0])
         return x
 
-    def document(module, hidden, positions, cache, *, projected, metadata, **kwargs):
+    def document(module, hidden, positions, cache, *, projected, metadata, project, **kwargs):
+        assert project is False
         raw_equal(hidden.flatten(1), projected)
         raw_equal(positions, torch.arange(hidden.shape[0]))
         raw_equal(metadata[0], torch.tensor([0, hidden.shape[0]]))
         raw_equal(metadata[1], torch.tensor([hidden.shape[0]]))
         rows.append(hidden.shape[0])
-        return hidden * 2
+        return hidden.flatten(1) * 2
+
+    def tail(module, out, positions, cache):
+        # One row-wise wo_a/wo_b over every document's rows, positions restarting per doc.
+        lengths = [b - a for a, b in zip(cu.tolist(), cu.tolist()[1:])]
+        raw_equal(positions, torch.cat([torch.arange(n) for n in lengths]))
+        tails.append(out.shape[0])
+        return out
 
     monkeypatch.setattr(attention, '_projections', projections)
     monkeypatch.setattr(attention, '_projection_rows', lambda x, lo, hi: x[lo:hi])
     monkeypatch.setattr(attention, 'swa_forward', document)
+    monkeypatch.setattr(attention, 'output_projection', tail)
+    cu = params.cu_seqlens_q_padded
     x = torch.randn(9, 1, 32, requires_grad=True)
     for grad_enabled in (False, True):
         with torch.set_grad_enabled(grad_enabled):
             output, _ = attention.SWAAttention.forward(state, x, packed_seq_params=params)
         raw_equal(output, x * 2)
-    assert calls == [9, 9] and rows == [3, 6, 3, 6]
+    assert calls == [9, 9] and rows == [3, 6, 3, 6] and tails == [9, 9]
     cached = params._deployment_documents
     assert params._deployment_documents is cached
     params.cu_seqlens_q_padded[1] = 2
@@ -200,3 +210,39 @@ def test_projection_rows_preserve_fp8_codes_and_scale_bytes(monkeypatch):
         expected = torch.zeros_like(qr)
         expected[3:130] = 1
         raw_equal(qr.grad, expected)
+
+
+def test_owner_weight_gradients_accumulate_into_fp32_main_grad(monkeypatch):
+    import sys
+
+    # The placeholder provider imports Transformer Engine; only its shape is observed.
+    monkeypatch.setitem(
+        sys.modules,
+        'megatron.lite.primitive.parallel.linear',
+        SimpleNamespace(_dummy_wgrad=lambda w: torch.empty_like(w)),
+    )
+    torch.manual_seed(46)
+    a, b = torch.randn(4, 8), torch.randn(2, 8)
+    dw = torch.randn(6, 8)
+    for owner in (a, b):
+        owner.main_grad = torch.ones(owner.shape)
+    like = torch.cat((a, b))
+    placeholder = linear.accumulate_wgrad((a, b), dw, like)
+    assert placeholder.shape == like.shape
+    raw_equal(a.main_grad, 1 + dw[:4])
+    raw_equal(b.main_grad, 1 + dw[4:])
+    assert a.grad_added_to_main_grad and b.grad_added_to_main_grad
+    # Without an FP32 main_grad the gradient goes back through autograd.
+    c = torch.randn(6, 8, dtype=torch.bfloat16)
+    raw_equal(linear.accumulate_wgrad((c,), dw, c), dw.bfloat16())
+    ctx = SimpleNamespace(
+        saved_tensors=(torch.randn(3, 8).bfloat16(), b.bfloat16()),
+        input_shape=(3, 8),
+        weight_dtype=torch.bfloat16,
+        owners=(b,),
+        like=b,
+    )
+    before = b.main_grad.clone()
+    g = torch.randn(3, 2).bfloat16()
+    linear._BF16Linear.backward(ctx, g)
+    raw_equal(b.main_grad, before + linear.tc_mm(g.T, ctx.saved_tensors[0], torch.float32))

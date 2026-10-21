@@ -35,8 +35,8 @@ def test_mxfp8_owned_vjp_uses_actual_decoded_operands():
     ctx = SimpleNamespace(
         saved_tensors=(x, weight), input_shape=x.shape, weight_dtype=torch.float32
     )
-    dx, dw, ignored = _MXFP8Linear.backward(ctx, grad)
-    assert ignored is None
+    dx, dw, *ignored = _MXFP8Linear.backward(ctx, grad)
+    assert ignored == [None, None]
     torch.testing.assert_close(dx, (grad.float() @ weight.float()).bfloat16())
     torch.testing.assert_close(dw, grad.float().T @ x.float())
 

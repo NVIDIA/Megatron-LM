@@ -269,6 +269,7 @@ class _FP8OutputProjection(torch.autograd.Function):
         inner = heads * dim // groups
         rank = weight.numel() // (groups * inner)
         ctx.shape, ctx.weight_shape, ctx.weight_dtype = (x.shape, weight.shape, weight.dtype)
+        ctx.like = weight
         if x.shape[0] == 0:
             ctx.save_for_backward(
                 x.new_empty((0, groups, inner)),
@@ -325,18 +326,19 @@ class _FP8OutputProjection(torch.autograd.Function):
         if getattr(ctx, 'compact', False):
             from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 
-            from .experts import dequantize_activation, unpack_scales
-
             encoded, scale, codes, sf, positions, cache = ctx.saved_tensors
             groups, rank = grad.shape[-2:]
             inner = codes.shape[-1]
-            activation = torch.stack(
-                [
-                    dequantize_activation(encoded[:, g], unpack_scales(scale[:, g], inner // 32))
-                    for g in range(groups)
-                ],
-                1,
-            ).to(ctx.input_dtype)
+            # FP8 code times a power of two is exact in BF16: decode all groups at once.
+            dtype = torch.bfloat16 if ctx.input_dtype == torch.bfloat16 else torch.float32
+            rows = encoded.shape[0]
+            raw = scale.contiguous().view(torch.uint8).reshape(rows, groups, -1)[..., : inner // 32]
+            sf_rows = (raw.to(torch.int32) << 23).view(torch.float32).to(dtype)
+            activation = (
+                (encoded.to(dtype).reshape(rows, groups, -1, 32) * sf_rows.unsqueeze(-1))
+                .reshape(rows, groups, inner)
+                .to(ctx.input_dtype)
+            )
             weight = (
                 dequantize_block_fp8(codes, sf, (32, 32))
                 .reshape(groups, rank, inner)
@@ -357,10 +359,13 @@ class _FP8OutputProjection(torch.autograd.Function):
                 )
 
             dx = bmm(g, w).permute(1, 0, 2).to(activation.dtype)
-            dw = bmm(g.transpose(1, 2), a).to(ctx.weight_dtype)
+            dw = bmm(g.transpose(1, 2), a).reshape(ctx.weight_shape)
+        like = getattr(ctx, 'like', None)
+        from .linear import accumulate_wgrad
+
         return (
             _rotate(dx.reshape(ctx.shape), positions, cache),
-            dw.reshape(ctx.weight_shape),
+            dw.to(ctx.weight_dtype) if like is None else accumulate_wgrad((like,), dw, like),
             None,
             None,
             None,
@@ -368,8 +373,9 @@ class _FP8OutputProjection(torch.autograd.Function):
 
 
 def _projections(attention, x):
-    fused = torch.cat((attention.linear_q_down_proj.weight, attention.linear_kv_proj.weight))
-    raw = linear(x, fused, fp8=True)
+    raw = linear(
+        x, (attention.linear_q_down_proj.weight, attention.linear_kv_proj.weight), fp8=True
+    )
     from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
     from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
@@ -380,7 +386,7 @@ def _projections(attention, x):
         attention.config.layernorm_epsilon,
     )
     qa = QuantizedActivation(codes, scales, qr.dtype, qr.shape, kMxfp8Dynamic)
-    q = linear(qr, attention.linear_q_up_proj.weight, fp8=True, activation=qa).bfloat16()
+    q = linear(qr, (attention.linear_q_up_proj.weight,), fp8=True, activation=qa).bfloat16()
     q = q.reshape(-1, attention.num_attention_heads_per_partition, attention.q_head_dim)
     from .linear import _row_scales
 
@@ -412,6 +418,7 @@ def swa_forward(
     source=None,
     projected=None,
     metadata=None,
+    project=True,
 ):
     emit = observe or (lambda name, value: None)
     x = hidden.reshape(-1, hidden.shape[-1])
@@ -456,13 +463,22 @@ def swa_forward(
     sink = attention.core_attention.native.attn_sink
     out = _Sparse.apply(q, kv, sink, indices, lens, attention.q_head_dim**-0.5)
     emit('core_attn', out)
+    if not project:
+        return out
+    return output_projection(attention, out, positions, rope_cache, emit).reshape_as(hidden)
+
+
+def output_projection(attention, out, positions, rope_cache, emit=None):
+    """wo_a/wo_b over all THD rows at once: both are row-wise, so batching documents
+    keeps every output row's bits and encodes each weight once per layer call."""
+    emit = emit or (lambda name, value: None)
     weight = attention.linear_o_group_proj
     groups = attention.config.o_groups
     z = _FP8OutputProjection.apply(out, weight, positions, rope_cache, groups)
     emit('wo_a', z)
-    result = linear(z.flatten(1), attention.linear_proj.weight, fp8=True).bfloat16()
+    result = linear(z.flatten(1), (attention.linear_proj.weight,), fp8=True).bfloat16()
     emit('wo_b', result)
-    return result.reshape_as(hidden)
+    return result
 
 
 def build_attention(config, index, context):
@@ -550,7 +566,7 @@ class SWAAttention(DS41SelfAttention):
                 )
                 for lo, hi in zip(boundaries, boundaries[1:])
             ]
-            cached = (cu, cu._version, documents)
+            cached = (cu, cu._version, documents, torch.cat([d[2] for d in documents]))
             packed_seq_params._deployment_documents = cached
         if hidden_states.shape[0] == 0:
             return hidden_states * 0, None
@@ -576,6 +592,11 @@ class SWAAttention(DS41SelfAttention):
                         source=sources if self._dsv4_compress_ratio else None,
                         projected=_projection_rows(projected, lo, hi),
                         metadata=metadata,
+                        project=False,
                     )
                 )
-        return torch.cat(pieces, 0) if pieces else hidden_states * 0, None
+        if not pieces:
+            return hidden_states * 0, None
+        out = torch.cat(pieces, 0) if len(pieces) > 1 else pieces[0]
+        result = output_projection(self, out, cached[3], self._deployment_rope)
+        return result.reshape_as(hidden_states), None
