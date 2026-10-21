@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Iteration demand recording, strict replay, and weak module ownership."""
+"""Single-iteration capture, scheduler replay, and weak module ownership."""
 
 import gc
 from contextlib import nullcontext
@@ -20,138 +20,302 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import (
-    IterationOrder,
     iteration,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context import FsdpContext
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    IterationOrder,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.common import mfsdp_iteration
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    _make_unshard_backward_hook,
+    _make_unshard_forward_hook,
+)
+from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 
 
-def _demand(order, module, phase):
-    if order.recording:
-        order.record(module, phase)
-    expected, expected_phase = order.advance()
-    if expected is not module or expected_phase != phase:
-        raise RuntimeError("Demand diverged from the recorded iteration order.")
+def _demand(context, module, phase, budget=0):
+    order = FsdpContext._advance_order(context, module, phase)
+    if order is not None:
+        FsdpModule._prefetch_parameter_groups(module, order, budget)
 
 
 class _Unit(nn.Module):
-    def __init__(self):
+    def __init__(self, context):
         super().__init__()
-        self._unshard_event = None
+        self.context = context
+        self.config = SimpleNamespace(
+            cuda_graph_impl="none", virtual_pipeline_model_parallel_size=2
+        )
         self.num_parameter_elements = 1
         self._unshard_parameter_groups = Mock()
+        self._unshard_event = object()
+        self._schedule_policy = SimpleNamespace(
+            forward_prefetch_size=None, backward_prefetch_size=None
+        )
+
+    def _nvtx_range(self, name):
+        return nullcontext()
+
+    unshard = FsdpModule.unshard
+    _prefetch_parameter_groups = FsdpModule._prefetch_parameter_groups
 
 
-def test_record_and_replay_mixed_occurrences():
-    """Record every demand, including a repeated materialized owner, across phases."""
-    a, b = _Unit(), _Unit()
-    order = IterationOrder()
-    events = [
-        (a, "forward"),
-        (a, "forward"),
-        (b, "forward"),
-        (b, "backward"),
-        (a, "forward"),
-        (a, "backward"),
-    ]
-    gathers = Mock()
-    gathers.attach_mock(a._unshard_parameter_groups, "a")
-    gathers.attach_mock(b._unshard_parameter_groups, "b")
-    for replay in (False, True, True):
-        gathers.reset_mock()
-        with order.iteration("train"):
-            for index, (module, phase) in enumerate(events):
-                _demand(order, module, phase)
-                # Demand always materializes the current owner before prefetch.
-                module._unshard_event = object()
-                before = (
-                    a._unshard_parameter_groups.call_count + b._unshard_parameter_groups.call_count
-                )
-                order.prefetch(None)
-                after = (
-                    a._unshard_parameter_groups.call_count + b._unshard_parameter_groups.call_count
-                )
-                assert after - before == int(replay and index + 1 < len(events))
-                if replay and index + 1 < len(events):
-                    expected = "a" if events[index + 1][0] is a else "b"
-                    assert gathers.mock_calls[-1][0] == expected
-                module._unshard_event = None
-        assert not order.active
-    assert a._unshard_parameter_groups.called and b._unshard_parameter_groups.called
-    with order.iteration("validation"):
-        _demand(order, a, "forward")
-    assert len(order._orders) == 2
-    # Zero disables prefetch; a positive budget allows more than one owner.
-    with order.iteration("train"):
-        _demand(order, a, "forward")
-        a._unshard_event = object()
-        before = b._unshard_parameter_groups.call_count
-        order.prefetch(0)
-        assert b._unshard_parameter_groups.call_count == before
-        order.prefetch(2)
-        assert b._unshard_parameter_groups.call_count == before + 1
-        _demand(order, *events[1])
-        # Lookahead already passed occurrences 1 and 2. Further prefetch must
-        # continue at 3 and 4 even while the execution cursor is still at 2.
-        order.prefetch(None)
-        assert gathers.mock_calls[-1][0] == "b"
-        order.prefetch(None)
-        assert gathers.mock_calls[-1][0] == "a"
-        for module, phase in events[2:]:
-            _demand(order, module, phase)
-
-
-def test_replay_rejects_changed_or_incomplete_iterations():
-    """Divergence, missing/extra demand, and failed recordings invalidate the cache."""
-    a, b = _Unit(), _Unit()
-    order = IterationOrder()
-    for changed in ([(b, "forward")], [(a, "backward")], [], [(a, "forward"), (a, "forward")]):
-        with order.iteration("train"):
-            _demand(order, a, "forward")
-        with pytest.raises(RuntimeError):
-            with order.iteration("train"):
-                for module, phase in changed:
-                    _demand(order, module, phase)
-        assert not order.active and "train" not in order._orders
-    with pytest.raises(ValueError):
-        with order.iteration("train"):
-            _demand(order, a, "forward")
-            raise ValueError("failed compute")
-    assert "train" not in order._orders
-    with order.iteration("train"):
-        with pytest.raises(RuntimeError, match="overlap"):
-            with order.iteration("validation"):
-                pass
-        _demand(order, a, "forward")
-    with order.iteration("train", rerecord=True):
-        _demand(order, b, "forward")
-    with order.iteration("train"):
-        _demand(order, b, "forward")
-
-
-def test_iteration_does_not_retain_modules():
-    """Completed sequences retain only weak references and detect a missing owner."""
-    context = SimpleNamespace(
+@pytest.fixture
+def context(monkeypatch):
+    # Exercise the production schedule wrapper without allocating CUDA resources.
+    monkeypatch.setattr(mfsdp_iteration, "FsdpModule", _Unit)
+    context = Mock(
         ensure_finalized=Mock(),
         iteration_order=IterationOrder(),
         allgather_stream=Mock(),
         current_stream=Mock(),
     )
-    a, b = _Unit(), _Unit()
+    context._advance_order = lambda module, phase: FsdpContext._advance_order(
+        context, module, phase
+    )
+    return context
+
+
+def test_capture_replay_and_validation(context):
+    """One training order survives validation; replay resets its execution cursor."""
+    a, b = _Unit(context), _Unit(context)
+    events = [
+        (a, "forward"),
+        (a, "forward"),
+        (b, "forward"),
+        (b, "backward"),
+        (a, "recompute"),
+        (a, "backward"),
+    ]
+    gathers = Mock()
+    gathers.attach_mock(a._unshard_parameter_groups, "a")
+    gathers.attach_mock(b._unshard_parameter_groups, "b")
+    gathers.attach_mock(context.current_stream.return_value.wait_event, "wait")
+    prefetched = []
+
+    @with_mfsdp_iteration
+    def run(model, forward_only=False, budget=None):
+        order = context.iteration_order
+        if forward_only:
+            assert order.mode == "demand"
+            before = b._unshard_parameter_groups.call_count
+            FsdpModule.unshard(b, "forward")
+            assert b._unshard_parameter_groups.call_count == before + 1
+            return
+        assert order.mode == "record_replay"
+        for module, phase in events:
+            module._schedule_policy.forward_prefetch_size = budget
+            module._schedule_policy.backward_prefetch_size = budget
+            before = len(gathers.mock_calls)
+            FsdpModule.unshard(module, phase)
+            calls = gathers.mock_calls[before:]
+            assert calls[0][0] == ("a" if module is a else "b")
+            assert calls[1][0] == "wait"
+            prefetched.extend(call[0] for call in calls[2:])
+
+    run(a, forward_only=True)
+    assert not context.iteration_order.captured
+    nested = with_mfsdp_iteration(run)
+    for schedule, replay in ((run, False), (nested, True), (run, True)):
+        gathers.reset_mock()
+        prefetched.clear()
+        schedule([a, b])
+        assert prefetched == (["a", "b", "b", "a", "a"] if replay else [])
+        order = context.iteration_order
+        assert order.captured and not order.active
+        assert order.position == len(events)
+        _, phase = order[4]
+        assert phase == "recompute"
+        run([a, b], forward_only=True)
+        assert context.iteration_order is order and order.position == len(events)
+        assert order.mode == "record_replay"
+        # The construction order was replaced; out-of-scope calls must not
+        # consume the saved training trace (e.g. ordinary validation).
+        before = len(gathers.mock_calls)
+        FsdpModule.unshard(b, "forward")
+        assert [call[0] for call in gathers.mock_calls[before:]] == ["b", "wait"]
+        assert order.position == len(events)
+    prefetched.clear()
+    run(a, budget=0)
+    assert not prefetched
+    run(a, budget=2)
+    # Each demand scans its own window, including overlapping occurrences.
+    assert prefetched == ["a", "b", "b", "b", "b", "a", "a", "a", "a"]
+
+
+def test_static_recompute_and_manual_unshard_preserve_cursor(context):
+    """Only execution demands consume static order; its phase selects the budget."""
+    a, b = _Unit(context), _Unit(context)
+    order = context.iteration_order
+    for module, phase in ((a, "forward"), (b, "forward"), (b, "backward"), (a, "backward")):
+        order.append((ref(module), phase))
+    order.backward_start = 2
+
+    a.unshard()
+    FsdpModule.unshard(a, "recompute")
+    assert order.position == 0
+    assert a._unshard_parameter_groups.call_count == 2
+    b._unshard_parameter_groups.assert_not_called()
+
+    FsdpModule.unshard(a, "forward")
+    assert order.position == 1
+    b._unshard_parameter_groups.assert_called_once_with()
+
+    # Backward uses its own budget, independently of the forward setting.
+    order.reset_cursor(order.backward_start)
+    b._schedule_policy.backward_prefetch_size = 0
+    a._unshard_parameter_groups.reset_mock()
+    FsdpModule.unshard(b, "backward")
+    assert order.position == 3
+    a._unshard_parameter_groups.assert_not_called()
+
+
+@pytest.mark.parametrize("captured", [False, True], ids=["capturing", "replaying"])
+def test_manual_unshard_preserves_iteration_order(context, captured):
+    """Parameter inspection must neither record demands nor consume the saved trace."""
+    a, b = _Unit(context), _Unit(context)
+    if captured:
+        with iteration(context):
+            a.unshard("forward")
+            b.unshard("backward")
     with iteration(context):
-        _demand(context.iteration_order, a, "forward")
-        _demand(context.iteration_order, b, "backward")
+        order = context.iteration_order
+        before = list(order), order.position
+        a.unshard()
+        assert (list(order), order.position) == before
+        a.unshard("forward")
+        b.unshard("backward")
+
+
+@pytest.mark.parametrize("phase", ["forward", "backward"])
+@pytest.mark.parametrize("active", [False, True], ids=["static", "capturing"])
+def test_combined_hooks_only_consume_active_order(context, phase, active):
+    """Fine-grained repeated owner demands require an iteration scope."""
+    owner, other = _Unit(context), _Unit(context)
+    owner.is_root = Mock(return_value=True)
+    order = context.iteration_order
+    if active:
+        order.mode = "record_replay"
+        order.active = True
+    else:
+        order.append((ref(owner), phase))
+        order.append((ref(other), phase))
+    before = list(order), order.position
+    if phase == "forward":
+        hook = _make_unshard_forward_hook(owner)
+        for _ in range(2):
+            hook(None, (), {})
+    else:
+        hook = _make_unshard_backward_hook(owner)
+        for _ in range(2):
+            hook(None, ())
+    assert owner._unshard_parameter_groups.call_count == 2
+    if active:
+        assert [(module_ref(), event_phase) for module_ref, event_phase in order] == [
+            (owner, phase),
+            (owner, phase),
+        ]
+        assert order.position == 2
+    else:
+        assert (list(order), order.position) == before
+        other._unshard_parameter_groups.assert_not_called()
+
+
+def test_recorded_root_backward_does_not_read_static_order(context, monkeypatch):
+    """The first captured backward demand need not have a construction-order entry."""
+    order = context.iteration_order
+    order.mode = "record_replay"
+    order.active = True
+    module = Mock(spec=FsdpModule, context=context, phase=FsdpModule.Phase.RESTING)
+    module.is_root.return_value = True
+    module._nvtx_label = Mock(return_value="backward")
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", Mock())
+    FsdpModule.pre_backward(module)
+    module.unshard.assert_called_once_with("backward")
+    context.register_post_backward_hook.assert_called_once_with()
+
+
+def test_failed_or_changed_iterations_require_capture(context):
+    """Mismatched, incomplete, extra, and failed calls invalidate the single order."""
+    a, b = _Unit(context), _Unit(context)
+    events = [(a, "forward")]
+
+    @with_mfsdp_iteration
+    def run(model, fail=False):
+        for module, phase in events:
+            _demand(context, module, phase)
+        if fail:
+            raise ValueError("failed compute")
+
+    for changed in ([(b, "forward")], [(a, "backward")], [], [(a, "forward"), (a, "forward")]):
+        events = [(a, "forward")]
+        with iteration(context):
+            _demand(context, a, "forward")
+        events = changed
+        with pytest.raises(RuntimeError):
+            run(a)
+        assert not context.iteration_order.active and not context.iteration_order.captured
+    with pytest.raises(ValueError):
+        run(a, fail=True)
+    assert not context.iteration_order.captured
+    with iteration(context):
+        with pytest.raises(RuntimeError, match="active"):
+            with iteration(context):
+                pass
+        _demand(context, b, "forward")
+    events = [(b, "forward")]
+    run(a)
+    assert context.iteration_order.captured
+    context.allgather_stream.wait_stream.side_effect = ValueError("failed stream sync")
+    with pytest.raises(ValueError):
+        with iteration(context):
+            pass
+    assert not context.iteration_order.active and not context.iteration_order.captured
+
+
+def test_capture_does_not_retain_modules(context):
+    """Captured occurrences keep weak references and reject a destroyed owner."""
+    a, b = _Unit(context), _Unit(context)
+    with iteration(context):
+        _demand(context, a, "forward")
+        _demand(context, b, "backward")
     b_ref = ref(b)
     del b
     gc.collect()
     assert b_ref() is None
+
+    @with_mfsdp_iteration
+    def run(model):
+        _demand(context, model, "forward", budget=None)
+
     with pytest.raises(RuntimeError, match="destroyed"):
-        with iteration(context):
-            _demand(context.iteration_order, a, "forward")
-            context.iteration_order.prefetch(None)
-    assert not context.iteration_order.active
+        run(a)
+    assert not context.iteration_order.active and not context.iteration_order.captured
+
+
+@pytest.mark.parametrize(
+    "mode, captured",
+    [("static", False), ("record_replay", False), ("record_replay", True), ("demand", True)],
+)
+def test_repeated_backward_keeps_static_guard(mode, captured, monkeypatch):
+    """Active scopes observe repeated backward calls; static mode keeps its guard."""
+    context = Mock(iteration_order=IterationOrder())
+    context.iteration_order.mode = mode
+    context.iteration_order.captured = captured
+    context.iteration_order.active = mode != "static"
+    module = Mock(spec=FsdpModule, context=context, phase=FsdpModule.Phase.BACKWARD)
+    module.is_root.return_value = False
+    push = Mock()
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", push)
+    FsdpModule.pre_backward(module)
+    if mode == "static":
+        module.unshard.assert_not_called()
+        context.current_stream.assert_not_called()
+    else:
+        module.unshard.assert_called_once_with("backward")
+    push.assert_not_called()
 
 
 @pytest.mark.parametrize("reentrant", [False, True])
@@ -185,15 +349,22 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
         fully_shard(model, mesh=mesh, placements=placements)
-    forward_reset = Mock(wraps=context.forward_order.reset)
-    backward_reset = Mock(wraps=context.backward_order.reset)
-    monkeypatch.setattr(context.forward_order, "reset", forward_reset)
-    monkeypatch.setattr(context.backward_order, "reset", backward_reset)
+    reset = Mock(wraps=context.iteration_order.reset_cursor)
+    monkeypatch.setattr(context.iteration_order, "reset_cursor", reset)
     ref_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
     torch.manual_seed(4321 + distributed_setup.rank)
     x = torch.randn(2, 8, device=device)
+
+    def step(model, forward_only=False):
+        if forward_only:
+            return model(x)
+        loss = model(x.detach().requires_grad_()).square().mean()
+        loss.backward()
+        return loss
+
+    run = with_mfsdp_iteration(step) if record_iteration else step
     for _ in range(3):
         ref_optimizer.zero_grad()
         expected = baseline(x.detach().requires_grad_()).square().mean()
@@ -203,25 +374,26 @@ def test_checkpoint_demand_recording(distributed_setup, reentrant, record_iterat
             parameter.grad.div_(distributed_setup.world_size)
         ref_optimizer.step()
         optimizer.zero_grad()
-        with iteration(context) if record_iteration else nullcontext():
-            actual = model(x.detach().requires_grad_()).square().mean()
-            actual.backward()
+        actual = run(model)
         optimizer.step()
         torch.testing.assert_close(actual, expected)
     for _ in range(2):
         with torch.no_grad():
-            with iteration(context, key="validation") if record_iteration else nullcontext():
-                torch.testing.assert_close(model(x), baseline(x))
-    assert forward_reset.call_count == (0 if record_iteration else 5)
-    assert backward_reset.call_count == (0 if record_iteration else 3)
+            torch.testing.assert_close(run(model, forward_only=True), baseline(x))
+    assert reset.call_count == (0 if record_iteration else 8)
+    if not record_iteration:
+        assert [call.args for call in reset.call_args_list] == [
+            (),
+            (context.iteration_order.backward_start,),
+        ] * 3 + [(), ()]
     if record_iteration:
-        demands = context.iteration_order._orders["default"]
+        demands = context.iteration_order
         assert "recompute" in [phase for _, phase in demands]
     else:
-        assert not context.iteration_order._orders
+        assert not context.iteration_order.captured
     # Group-packed shards need the FSDP layout to reconstruct parameters;
     # DTensor.full_tensor() assumes ordinary per-tensor chunking instead.
-    with iteration(context, key="parameter_check"):
+    with iteration(context, forward_only=True):
         for unit in (model, model.fc1, model.fc2):
             unit.unshard()
         try:

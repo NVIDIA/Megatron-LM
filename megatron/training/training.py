@@ -5656,8 +5656,6 @@ def evaluate(
         eval_micro_batch_size * get_batch_parallel_size(args)
     )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
-    if getattr(args, 'megatron_fsdp_record_prefetch_order', False):
-        forward_backward_func = with_mfsdp_iteration(forward_backward_func)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:

@@ -13,11 +13,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+    microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    iteration as iteration_scope,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import microbatch
+from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 
 
 def test_shared_module_recording_matches_dense_training(distributed_setup):
@@ -52,20 +50,24 @@ def test_shared_module_recording_matches_dense_training(distributed_setup):
     fully_shard_optimizer(optimizer)
     num_microbatches = 3
     base_inputs = torch.arange(16, dtype=torch.float32, device=device).reshape(2, 8) / 16
+
+    @with_mfsdp_iteration
+    def train_step(model, iteration):
+        for index in range(num_microbatches):
+            inputs = base_inputs + 0.1 * distributed_setup.rank + 0.02 * (iteration + index)
+            expected = dense(inputs)
+            (expected.square().mean() / num_microbatches).backward()
+            with microbatch(context, is_last=index == num_microbatches - 1):
+                actual = model(inputs)
+                (actual.square().mean() / num_microbatches).backward()
+            torch.testing.assert_close(actual, expected)
+        context.finish_grad_sync()
+
     for iteration in range(2):
         dense_optimizer.zero_grad(set_to_none=True)
         optimizer.zero_grad(set_to_none=True)
-        with iteration_scope(context):
-            for index in range(num_microbatches):
-                inputs = base_inputs + 0.1 * distributed_setup.rank + 0.02 * (iteration + index)
-                expected = dense(inputs)
-                (expected.square().mean() / num_microbatches).backward()
-                with microbatch(context, is_last=index == num_microbatches - 1):
-                    actual = model(inputs)
-                    (actual.square().mean() / num_microbatches).backward()
-                torch.testing.assert_close(actual, expected)
-            context.finish_grad_sync()
-        demands = context.iteration_order._orders["default"]
+        train_step(model, iteration)
+        demands = context.iteration_order
         assert [module_ref() for module_ref, phase in demands if phase == "forward"] == [
             model,
             model.first,

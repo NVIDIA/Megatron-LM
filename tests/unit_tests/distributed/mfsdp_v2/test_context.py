@@ -134,8 +134,7 @@ def test_context_does_not_keep_modules_alive(distributed_setup):
 
     assert model_ref() is None
     assert child_ref() is None
-    assert all(module_ref() is None for module_ref in context.forward_order)
-    assert all(module_ref() is None for module_ref in context.backward_order)
+    assert all(module_ref() is None for module_ref, _ in context.iteration_order)
 
 
 def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
@@ -176,14 +175,12 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert model.layers[1].context is context
     assert model.layers[0].is_root()
     assert model.layers[1].is_root()
-    assert [module_ref() for module_ref in context.forward_order] == [
-        model.layers[0],
-        model.layers[1],
-    ]
-    assert [module_ref() for module_ref in context.backward_order] == [
-        model.layers[1],
-        model.layers[0],
-    ]
+    assert [
+        module_ref() for module_ref, phase in context.iteration_order if phase == "forward"
+    ] == [model.layers[0], model.layers[1]]
+    assert [
+        module_ref() for module_ref, phase in context.iteration_order if phase == "backward"
+    ] == [model.layers[1], model.layers[0]]
 
 
 def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(distributed_setup, monkeypatch):
@@ -225,18 +222,12 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
         model(torch.ones(2, 4, device=device))
 
     context = model.context
-    assert [module_ref() for module_ref in context.forward_order] == [
-        model,
-        model.left,
-        model.left.inner,
-        model.right,
-    ]
-    assert [module_ref() for module_ref in context.backward_order] == [
-        model,
-        model.right,
-        model.left,
-        model.left.inner,
-    ]
+    assert [
+        module_ref() for module_ref, phase in context.iteration_order if phase == "forward"
+    ] == [model, model.left, model.left.inner, model.right]
+    assert [
+        module_ref() for module_ref, phase in context.iteration_order if phase == "backward"
+    ] == [model, model.right, model.left, model.left.inner]
 
 
 def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
@@ -270,16 +261,12 @@ def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     assert model.left.is_root()
     assert model.right.is_root()
     assert not model.left.inner.is_root()
-    assert [module_ref() for module_ref in context.forward_order] == [
-        model.left,
-        model.left.inner,
-        model.right,
-    ]
-    assert [module_ref() for module_ref in context.backward_order] == [
-        model.right,
-        model.left,
-        model.left.inner,
-    ]
+    assert [
+        module_ref() for module_ref, phase in context.iteration_order if phase == "forward"
+    ] == [model.left, model.left.inner, model.right]
+    assert [
+        module_ref() for module_ref, phase in context.iteration_order if phase == "backward"
+    ] == [model.right, model.left, model.left.inner]
 
 
 def test_fully_shard_requires_context(distributed_setup):

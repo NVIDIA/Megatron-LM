@@ -2,23 +2,56 @@
 
 """Iteration boundary shared by MFSDP v2 pipeline schedule entry points."""
 
-from contextlib import ExitStack
+from contextlib import contextmanager
 from functools import wraps
 from inspect import signature
 
 import torch
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.iteration import iteration
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import iteration
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
-def with_mfsdp_iteration(schedule):
-    """Record/replay hooks across the complete schedule, including every VPP chunk.
+@contextmanager
+def _mfsdp_iteration(model, forward_only=False):
+    """Manage one shared context across a complete scheduler invocation.
 
-    Nested combined calls join the outer scope. Non-MFSDP models and CUDA graph
-    schedules retain their existing behavior; graph replay bypasses Python hooks
-    and needs a separate recording lifecycle.
+    Nested calls join the active scope. CUDA graph schedules bypass capture
+    because their replay does not execute Python hooks.
     """
+    chunks = model if isinstance(model, list) else [model]
+    # PP constructs every VPP chunk inside the same fully_shard_context.
+    context = next(
+        (
+            module.context
+            for chunk in chunks
+            for module in chunk.modules()
+            if isinstance(module, FsdpModule)
+        ),
+        None,
+    )
+    if context is None:
+        yield
+        return
+    config = getattr(chunks[0], "config", None)
+    if getattr(config, "cuda_graph_impl", "none") != "none" or context.iteration_order.active:
+        yield
+        return
+    forward_only = forward_only or not torch.is_grad_enabled()
+    if (
+        forward_only
+        and len(chunks) == 1
+        and not getattr(config, "virtual_pipeline_model_parallel_size", None)
+    ):
+        # Ordinary validation retains static forward prefetch.
+        yield
+        return
+    with iteration(context, forward_only=forward_only):
+        yield
+
+
+def with_mfsdp_iteration(schedule):
+    """Give a pipeline scheduler an MFSDP capture/replay boundary."""
     parameters = signature(schedule)
 
     @wraps(schedule)
@@ -26,37 +59,8 @@ def with_mfsdp_iteration(schedule):
         arguments = parameters.bind(*args, **kwargs)
         arguments.apply_defaults()
         values = arguments.arguments
-        models = values["model"]
-        chunks = models if isinstance(models, list) else [models]
-        contexts = dict.fromkeys(
-            module.context
-            for chunk in chunks
-            for module in chunk.modules()
-            if isinstance(module, FsdpModule)
-        )
-        if not contexts:
-            return schedule(*args, **kwargs)
-        config = chunks[0].config
-        if getattr(config, "cuda_graph_impl", "none") != "none":
-            return schedule(*args, **kwargs)
-        if any(context.iteration_order.active for context in contexts):
-            if not all(context.iteration_order.active for context in contexts):
-                raise RuntimeError("All FSDP contexts must join the same outer iteration scope.")
-            return schedule(*args, **kwargs)
-        key = (
-            schedule.__name__,
-            values.get("forward_only", False),
-            torch.is_grad_enabled(),
-            values["num_microbatches"],
-            len(chunks),
-            values.get("seq_length"),
-            values.get("micro_batch_size"),
-            getattr(config, "microbatch_group_size_per_vp_stage", None),
-            getattr(config, "overlap_moe_expert_parallel_comm", False),
-        )
-        with ExitStack() as stack:
-            for context in contexts:
-                stack.enter_context(iteration(context, key=key))
+        assert "model" in values, "The schedule function must have a 'model' argument."
+        with _mfsdp_iteration(values["model"], values.get("forward_only", False)):
             return schedule(*args, **kwargs)
 
     return wrapped
