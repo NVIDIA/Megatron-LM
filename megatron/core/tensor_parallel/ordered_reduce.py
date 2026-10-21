@@ -286,35 +286,6 @@ def ordered_reduce_scatter(
     return ordered_fold(recv.view(world_size, *out_shape), output, exact)
 
 
-def _ordered_reduce_scatter_pipelined(
-    input_: torch.Tensor, group, output: torch.Tensor, chunks: int, exact: Optional[bool] = None
-) -> torch.Tensor:
-    """Equal-split ordered reduce-scatter in ``chunks`` row chunks: the fold of chunk c
-    overlaps the all-to-all of chunk c + 1. Same bits as :func:`ordered_reduce_scatter`."""
-    world_size = group.size()
-    rows = input_.shape[0] // world_size
-    src = input_.view(world_size, rows, -1)
-    recv = torch.empty_like(src)
-    dst = output.view(rows, -1)
-    bounds = [rows * c // chunks for c in range(chunks + 1)]
-    works = []
-    for c in range(chunks):
-        lo, hi = bounds[c], bounds[c + 1]
-        works.append(
-            torch.distributed.all_to_all(
-                [recv[r, lo:hi] for r in range(world_size)],
-                [src[r, lo:hi] for r in range(world_size)],
-                group=group,
-                async_op=True,
-            )
-        )
-    for c in range(chunks):
-        lo, hi = bounds[c], bounds[c + 1]
-        works[c].wait()
-        ordered_fold(recv[:, lo:hi], dst[lo:hi], exact)
-    return output
-
-
 def ordered_all_reduce(input_: torch.Tensor, group, exact: Optional[bool] = None) -> torch.Tensor:
     """All-reduce with the fixed rank-order sum (ordered reduce-scatter + all-gather).
 
@@ -379,11 +350,11 @@ def _pull_launch_config(n: int, element_size: int) -> Tuple[int, int, int]:
     vec = 16 // element_size
     if "pull" in _TUNE_OVERRIDE:
         num_warps, per_thread = _TUNE_OVERRIDE["pull"]
-    elif n <= SYMM_MEM_KERNEL_CONFIG.max_num_blocks * 128 * vec:
-        # Latency-bound: many short CTAs.
-        num_warps, per_thread = 4, 1
+    elif n <= SYMM_MEM_KERNEL_CONFIG.max_num_blocks * 512 * vec:
+        # Up to one 16-byte load per thread per peer across the whole grid.
+        num_warps, per_thread = 16, 1
     else:
-        # Bandwidth-bound: wide CTAs with several 16-byte loads per peer in flight.
+        # Bandwidth-bound: two 16-byte loads per peer in flight per thread.
         num_warps, per_thread = 16, 2
     block = num_warps * 32 * vec * per_thread
     # The grid must be identical on every rank and fit the signal pad (kernel_config.py).
