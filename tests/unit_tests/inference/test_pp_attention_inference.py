@@ -40,22 +40,23 @@ def test_page_view_rejects_block_size():
 class _Case:
     """Random prompts in a shuffled 256-key block cache, plus dense reference outputs."""
 
-    def __init__(self, head_dim, h_q, h_kv, super_block_tiles=8):
+    def __init__(self, head_dim, h_q, h_kv, super_block_tiles=8, lengths=LENGTHS):
+        self.lengths = lengths
         from megatron.core.transformer.pp.api import get_pp_attention
 
         torch.manual_seed(0)
         dev = torch.device("cuda")
         self.attn = get_pp_attention(dev, head_dim, h_q, h_kv, super_block_tiles, None)
-        blocks = [-(-n // BLOCK) for n in LENGTHS]
+        blocks = [-(-n // BLOCK) for n in self.lengths]
         pool = sum(blocks) + 2
         perm = torch.randperm(pool, device=dev).to(torch.int32)
-        self.table = torch.full((len(LENGTHS), max(blocks)), -1, dtype=torch.int32, device=dev)
+        self.table = torch.full((len(self.lengths), max(blocks)), -1, dtype=torch.int32, device=dev)
         shape = (pool, BLOCK, h_kv, head_dim)
         k_cache = torch.randn(shape, device=dev, dtype=torch.bfloat16)
         v_cache = torch.randn(shape, device=dev, dtype=torch.bfloat16)
         self.q, self.ref = [], []
         used = 0
-        for b, n in enumerate(LENGTHS):
+        for b, n in enumerate(self.lengths):
             ids = perm[used : used + blocks[b]]
             used += blocks[b]
             self.table[b, : blocks[b]] = ids
@@ -73,7 +74,7 @@ class _Case:
         for r in rows:
             cu.append(cu[-1] + r.shape[0])
         cu = torch.tensor(cu, dtype=torch.int32, device="cuda")
-        seqused = torch.tensor(LENGTHS, dtype=torch.int32, device="cuda")
+        seqused = torch.tensor(self.lengths, dtype=torch.int32, device="cuda")
         out = self.attn.prefill_paged(
             torch.cat(rows).contiguous(), self.k, self.v, cu, seqused, self.pages
         )
@@ -87,7 +88,7 @@ class _Case:
     def tail(self, n):
         q = torch.stack([q[-n:] for q in self.q]).contiguous()
         ref = torch.stack([r[-n:] for r in self.ref])
-        return q, ref, torch.tensor(LENGTHS, dtype=torch.int32, device="cuda")
+        return q, ref, torch.tensor(self.lengths, dtype=torch.int32, device="cuda")
 
 
 def _bits(t):
@@ -153,3 +154,16 @@ class TestPPAttentionInference:
             q, ref, seqused = case.tail(n)
             out = decoder.verify(q, case.k, case.v, case.pages, seqused)
             assert torch.equal(_bits(out), _bits(ref))
+
+
+@gpu
+@pytest.mark.parametrize("super_block_tiles", [1, 8])
+def test_prefill_writes_every_row(monkeypatch, super_block_tiles):
+    """Paged prefill must write every output row, whatever the fresh buffer holds."""
+    case = _Case(128, 4, 2, super_block_tiles, lengths=(300, 129, 517, 64))
+    empty_like = torch.empty_like
+    monkeypatch.setattr(
+        torch, "empty_like", lambda *a, **k: empty_like(*a, **k).fill_(float("nan"))
+    )
+    for out, ref in zip(case.prefill([0] * 4), case.ref):
+        assert torch.equal(_bits(out), _bits(ref))
