@@ -381,12 +381,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         else:
             tmp_config = self.config
         core_attention_cls = submodules.core_attention
-        if self.config.attention_backend == AttnBackend.exact:
-            from megatron.core.transformer.exact_attention.dot_product_attention import (
-                ExactDotProductAttention,
-            )
+        if self.config.attention_backend == AttnBackend.pp:
+            from megatron.core.transformer.pp.dot_product_attention import PPDotProductAttention
 
-            core_attention_cls = ExactDotProductAttention
+            core_attention_cls = PPDotProductAttention
         self.core_attention = core_attention_cls(
             config=tmp_config,
             layer_number=self.layer_number,

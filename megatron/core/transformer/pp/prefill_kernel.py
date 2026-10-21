@@ -36,7 +36,7 @@ _TUNE_HD256_CAUSAL = {
 }
 
 
-class ExactAttentionForward:
+class PPAttentionForward:
     """Forward kernel for prefill, chunked paged prefill and split mode."""
 
     def __init__(

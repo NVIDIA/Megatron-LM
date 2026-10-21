@@ -41,7 +41,7 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 | Mamba/SSM Triton ops | `megatron/core/tuning` (config selection), `megatron/core/ssm/ops/common/determinism.py` (workspaces) | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
 | Mamba/GDP causal conv1d | `megatron/core/ssm/causal_conv1d.py` | causal_conv1d >= 1.6.0 — per-block workspace for the weight and bias gradients, reduced with an ordered `sum` | `atomicAdd` accumulation (order varies per launch) |
 | Transformer Engine attention | `megatron/core/extensions/transformer_engine.py` | requires `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, under which TE selects only backends that support deterministic execution (including deterministic FlashAttention backward) | TE picks freely, including atomic-accumulation attention backward |
-| Exact attention (`attention_backend=exact`) | `megatron/core/transformer/exact_attention/` | always: forward folds key tiles in a fixed order; backward is FlashAttention-4 with `deterministic=True` at head dim 128 and the head-dim-256 kernel, which has no atomic reductions | same as the deterministic path |
+| PP attention (`attention_backend=pp`) | `megatron/core/transformer/pp/` | always: forward folds key tiles in a fixed order; backward is FlashAttention-4 with `deterministic=True` at head dim 128 and the head-dim-256 kernel, which has no atomic reductions | same as the deterministic path |
 | Inference DP scheduling and RL rollout order | `megatron/core/inference/engines/dynamic_engine.py`, `megatron/rl/rl_utils.py` | sort by stable key | completion order |
 
 The two conv rows are different kernels. Mamba and GDP call Dao-AILab's

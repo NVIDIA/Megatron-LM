@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Host API of the exact attention forward kernel (BF16, causal, head dim 128 or 256)."""
+"""Host API of the PP attention forward kernel (BF16, causal, head dim 128 or 256)."""
 
 import math
 from typing import Optional
@@ -12,18 +12,18 @@ try:
     from cutlass.cute.typing import Float32, Int32
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
-    from .prefill_kernel import ExactAttentionForward
+    from .prefill_kernel import PPAttentionForward
 
-    HAVE_EXACT_ATTENTION = True
+    HAVE_PP_ATTENTION = True
 except ImportError:
-    HAVE_EXACT_ATTENTION = False
+    HAVE_PP_ATTENTION = False
 
 TILE_KEYS = 128
 MAX_ROWS = 256
 HEAD_DIMS = (128, 256)
 
 
-class ExactAttention:
+class PPAttention:
     """Causal attention whose output bytes do not depend on how the keys are split.
 
     Keys are visited in 128-key tiles grouped into super-blocks of
@@ -43,8 +43,8 @@ class ExactAttention:
         super_block_tiles: int = 8,
         softmax_scale: Optional[float] = None,
     ):
-        if not HAVE_EXACT_ATTENTION:
-            raise ImportError("exact attention needs nvidia-cutlass-dsl and flash-attn-4")
+        if not HAVE_PP_ATTENTION:
+            raise ImportError("PP attention needs nvidia-cutlass-dsl and flash-attn-4")
         if head_dim not in HEAD_DIMS:
             raise ValueError(f"head_dim must be one of {HEAD_DIMS}, got {head_dim}")
         if super_block_tiles < 1:
@@ -77,7 +77,7 @@ class ExactAttention:
 
     def _launch(self, key, q, k, v, out, cu, seqused, page_table, lse):
         if key not in self._compiled:
-            fwd = ExactAttentionForward(
+            fwd = PPAttentionForward(
                 self.head_dim,
                 self.head_dim,
                 qhead_per_kvhead=self.rows,
@@ -191,9 +191,7 @@ class ExactAttention:
 _INSTANCES = {}
 
 
-def get_exact_attention(
-    device, head_dim, num_q_heads, num_kv_heads, super_block_tiles, softmax_scale
-):
+def get_pp_attention(device, head_dim, num_q_heads, num_kv_heads, super_block_tiles, softmax_scale):
     """Shared instance per device and shape, so compiled kernels and scratch are reused."""
     key = (
         str(torch.device(device)),
@@ -204,7 +202,7 @@ def get_exact_attention(
         softmax_scale,
     )
     if key not in _INSTANCES:
-        _INSTANCES[key] = ExactAttention(
+        _INSTANCES[key] = PPAttention(
             device,
             head_dim=head_dim,
             num_q_heads=num_q_heads,

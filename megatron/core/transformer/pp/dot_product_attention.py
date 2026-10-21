@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Core attention module of the exact attention backend."""
+"""Core attention module of the PP attention backend."""
 
 import math
 from typing import Optional
@@ -15,17 +15,17 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
-from .api import get_exact_attention
+from .api import get_pp_attention
 from .autograd import a2a_attention, cp_all_gather_attention, dense_attention, varlen_attention
 
 CP_COMM_TYPES = ("all_gather", "a2a")
 
 
-class ExactDotProductAttention(MegatronModule):
+class PPDotProductAttention(MegatronModule):
     """Causal attention with the same bytes in training, prefill, decode and verify.
 
-    Takes the arguments of TEDotProductAttention. Forward is the exact kernel; backward
-    is FlashAttention-4 fed with the exact output and LSE.
+    Takes the arguments of TEDotProductAttention. Forward is the PP kernel; backward
+    is FlashAttention-4 fed with the PP output and LSE.
     """
 
     def __init__(
@@ -41,7 +41,7 @@ class ExactDotProductAttention(MegatronModule):
     ):
         super().__init__(config=config)
         if attn_mask_type not in (AttnMaskType.causal,):
-            raise ValueError(f"exact attention supports causal masks only, got {attn_mask_type}")
+            raise ValueError(f"PP attention supports causal masks only, got {attn_mask_type}")
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         tp_size = pg_collection.tp.size()
@@ -50,21 +50,21 @@ class ExactDotProductAttention(MegatronModule):
         self.cp_comm_type = cp_comm_type or "all_gather"
         if self.cp_size > 1 and self.cp_comm_type not in CP_COMM_TYPES:
             raise ValueError(
-                f"exact attention supports cp_comm_type in {CP_COMM_TYPES}, got {cp_comm_type!r}"
+                f"PP attention supports cp_comm_type in {CP_COMM_TYPES}, got {cp_comm_type!r}"
             )
         self.head_dim = config.kv_channels
         self.num_q_heads = divide(config.num_attention_heads, tp_size)
         self.num_kv_heads = divide(config.num_query_groups or config.num_attention_heads, tp_size)
         if self.cp_size > 1 and self.cp_comm_type == "a2a":
             if self.num_q_heads % self.cp_size or self.num_kv_heads % self.cp_size:
-                raise ValueError("exact attention a2a needs heads divisible by the cp size")
+                raise ValueError("PP attention a2a needs heads divisible by the cp size")
         self.softmax_scale = (
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(self.head_dim)
         )
-        self.super_block_tiles = config.exact_attention_super_block_tiles
+        self.super_block_tiles = config.pp_attention_super_block_tiles
 
     def _attn(self, device, heads_div=1):
-        return get_exact_attention(
+        return get_pp_attention(
             device,
             self.head_dim,
             self.num_q_heads // heads_div,
@@ -94,9 +94,9 @@ class ExactDotProductAttention(MegatronModule):
     ) -> Tensor:
         """Query/key/value are [s, b, h, d], or [t, h, d] with qkv_format 'thd'."""
         if attn_mask_type not in (None, AttnMaskType.causal):
-            raise ValueError(f"exact attention supports causal masks only, got {attn_mask_type}")
+            raise ValueError(f"PP attention supports causal masks only, got {attn_mask_type}")
         if attention_bias is not None:
-            raise ValueError("exact attention does not support attention_bias")
+            raise ValueError("PP attention does not support attention_bias")
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             cu = packed_seq_params.cu_seqlens_q_padded
             if cu is None:

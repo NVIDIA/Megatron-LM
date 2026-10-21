@@ -6,8 +6,8 @@ import pytest
 import torch
 
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.exact_attention.autograd import thd_paging, zigzag_positions
-from megatron.core.transformer.exact_attention.cp_plan import build_cp_plan
+from megatron.core.transformer.pp.autograd import thd_paging, zigzag_positions
+from megatron.core.transformer.pp.cp_plan import build_cp_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -18,7 +18,7 @@ def _config(**kw):
         num_attention_heads=8,
         num_query_groups=2,
         kv_channels=128,
-        attention_backend=AttnBackend.exact,
+        attention_backend=AttnBackend.pp,
         attention_dropout=0.0,
         bf16=True,
     )
@@ -26,9 +26,9 @@ def _config(**kw):
     return TransformerConfig(**base)
 
 
-class TestExactAttentionConfig:
+class TestPPAttentionConfig:
     def test_valid(self):
-        assert _config().exact_attention_super_block_tiles == 8
+        assert _config().pp_attention_super_block_tiles == 8
 
     @pytest.mark.parametrize(
         "kw",
@@ -38,7 +38,7 @@ class TestExactAttentionConfig:
             dict(window_size=(128, 0)),
             dict(attn_logit_softcapping=30.0),
             dict(softmax_type='learnable'),
-            dict(exact_attention_super_block_tiles=0),
+            dict(pp_attention_super_block_tiles=0),
             dict(context_parallel_size=2, cp_comm_type='p2p'),
             dict(context_parallel_size=2, cp_comm_type='a2a+p2p'),
         ],
@@ -52,7 +52,7 @@ class TestExactAttentionConfig:
         _config(context_parallel_size=2, cp_comm_type=comm)
 
 
-class TestExactAttentionLayouts:
+class TestPPAttentionLayouts:
     def test_thd_paging(self):
         cu = torch.tensor([0, 130, 130 + 256, 130 + 256 + 7], dtype=torch.int32)
         page_table, seqused, rows, num_pages, max_len = thd_paging(cu)
@@ -75,13 +75,15 @@ def _supported_gpu():
     if not torch.cuda.is_available():
         return False
     try:
-        from megatron.core.transformer.exact_attention.api import HAVE_EXACT_ATTENTION
+        from megatron.core.transformer.pp.api import HAVE_PP_ATTENTION
     except ImportError:
         return False
-    return HAVE_EXACT_ATTENTION and torch.cuda.get_device_capability()[0] == 10
+    return HAVE_PP_ATTENTION and torch.cuda.get_device_capability()[0] == 10
 
 
-gpu = pytest.mark.skipif(not _supported_gpu(), reason="needs a compute capability 10.x GPU, cutlass-dsl and flash-attn-4")
+gpu = pytest.mark.skipif(
+    not _supported_gpu(), reason="needs a compute capability 10.x GPU, cutlass-dsl and flash-attn-4"
+)
 HQ, HKV = 8, 2
 
 
@@ -109,11 +111,11 @@ def _ref_grads(q, k, v, w, scale):
 
 
 @gpu
-class TestExactAttentionGpu:
+class TestPPAttentionGpu:
     def _setup(self, d, g):
-        from megatron.core.transformer.exact_attention.api import ExactAttention
+        from megatron.core.transformer.pp.api import PPAttention
 
-        attn = ExactAttention(
+        attn = PPAttention(
             "cuda", head_dim=d, num_q_heads=HQ, num_kv_heads=HKV, super_block_tiles=g
         )
         gen = torch.Generator(device="cuda").manual_seed(1234)
@@ -126,7 +128,7 @@ class TestExactAttentionGpu:
     @pytest.mark.parametrize("d", [128, 256])
     @pytest.mark.parametrize("g", [8, 16])
     def test_dense_training(self, d, g):
-        from megatron.core.transformer.exact_attention.autograd import dense_attention
+        from megatron.core.transformer.pp.autograd import dense_attention
 
         attn, rand = self._setup(d, g)
         b, n = 2, 3 * 128 * g + 172
@@ -149,11 +151,7 @@ class TestExactAttentionGpu:
 
     @pytest.mark.parametrize("d", [128, 256])
     def test_varlen_and_cp(self, d):
-        from megatron.core.transformer.exact_attention.autograd import (
-            cp_backward,
-            cp_forward,
-            varlen_attention,
-        )
+        from megatron.core.transformer.pp.autograd import cp_backward, cp_forward, varlen_attention
 
         attn, rand = self._setup(d, 8)
         lens = [700, 2052, 1500]
@@ -195,11 +193,11 @@ class TestExactAttentionGpu:
 
     def test_heads_are_independent(self):
         """The a2a CP path runs a subset of heads; its bytes must equal the full-head run."""
-        from megatron.core.transformer.exact_attention.api import ExactAttention
-        from megatron.core.transformer.exact_attention.autograd import varlen_attention
+        from megatron.core.transformer.pp.api import PPAttention
+        from megatron.core.transformer.pp.autograd import varlen_attention
 
         attn, rand = self._setup(256, 8)
-        half = ExactAttention("cuda", head_dim=256, num_q_heads=HQ // 2, num_kv_heads=HKV // 2)
+        half = PPAttention("cuda", head_dim=256, num_q_heads=HQ // 2, num_kv_heads=HKV // 2)
         cu = torch.tensor([0, 900, 2000], dtype=torch.int32, device="cuda")
         q, k, v = rand(2000, HQ, 256), rand(2000, HKV, 256), rand(2000, HKV, 256)
         full = varlen_attention(q, k, v, attn, cu)
@@ -215,16 +213,14 @@ class TestExactAttentionGpu:
 
         from megatron.core.packed_seq_params import PackedSeqParams
         from megatron.core.transformer.enums import AttnMaskType
-        from megatron.core.transformer.exact_attention.dot_product_attention import (
-            ExactDotProductAttention,
-        )
+        from megatron.core.transformer.pp.dot_product_attention import PPDotProductAttention
 
         class _Group:
             def size(self):
                 return 1
 
         config = _config(kv_channels=256, hidden_size=2048)
-        module = ExactDotProductAttention(
+        module = PPDotProductAttention(
             config,
             1,
             AttnMaskType.causal,

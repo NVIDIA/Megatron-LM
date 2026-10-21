@@ -909,12 +909,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "tests/unit_tests/transformer/experimental_attention_variant/.",
     ),
     KernelEntry(
-        name="exact_attention",
+        name="pp_attention",
         sources=(
-            "megatron/core/transformer/exact_attention/prefill_kernel.py",
-            "megatron/core/transformer/exact_attention/autograd.py",
+            "megatron/core/transformer/pp/prefill_kernel.py",
+            "megatron/core/transformer/pp/autograd.py",
         ),
-        tests=("tests/unit_tests/transformer/test_exact_attention_training.py",),
+        tests=("tests/unit_tests/transformer/test_pp_attention_training.py",),
         kind="external-lib",
         notes="CuTe DSL forward with a fixed key-tile fold order; backward is FlashAttention-4 "
         "_flash_attn_bwd (deterministic=True at head dim 128). The tests assert bitwise forward "

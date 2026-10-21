@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Training entry points: exact forward, FlashAttention-4 backward on its out and lse."""
+"""Training entry points: PP forward, FlashAttention-4 backward on its out and lse."""
 
 import torch
 import torch.distributed as dist

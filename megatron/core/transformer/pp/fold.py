@@ -1,4 +1,4 @@
-"""Two-level softmax fold shared by the exact attention kernels."""
+"""Two-level softmax fold shared by the PP attention kernels."""
 
 import cutlass.cute as cute
 from cutlass._mlir.dialects import cute as _cute_ir
