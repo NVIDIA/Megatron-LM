@@ -275,7 +275,7 @@ def topk_routing_with_score_function(
                 num_groups=groups,
                 group_topk=groups_topk,
             )
-        return torch.topk(scores, k=k, dim=1)
+        return torch.topk(scores, k=k, dim=1, sorted=torch.is_grad_enabled())
 
     if score_function == "softmax":
         if use_pre_softmax:
