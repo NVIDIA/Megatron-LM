@@ -60,20 +60,26 @@ tokens that come from verify steps; `tau` is the number of tokens one verify ste
 (3.39 for a 4-row verify, solid; 1.93 for a 2-row verify, dotted). Right: training plus
 serving. Baselines: Megatron's default stack (FA4 `num_splits=0` to serve, TE cuDNN to
 train; bytes differ between phases), Megatron's deterministic stack (FA4 `num_splits=1` to
-serve, TE cuDNN to train) and trtllm-gen to serve with FA4 to train. Green ratios are PP over
-the fastest stack whose bytes differ; gray ratios are PP over the deterministic stack.*
+serve, TE cuDNN to train) and trtllm-gen to serve with FA4 to train. Training bars: FA4 with its
+default backward, FA4 with `deterministic=True`, TE cuDNN, and PP forward plus the FA4
+backward. Green ratios are PP over the fastest stack whose bytes differ; gray ratios are PP
+over the deterministic stack.*
 
-PP is slower than the fastest kernels in each single phase: its training step takes 2.10x
-(head dimension 128) and 1.68x (head dimension 256) the FA4 time. Its serving cost is
-1.05x-1.48x the fastest stack whose bytes differ. Against the deterministic stack, which is
-what keeps the bytes equal today, PP takes 0.10x-0.43x the serving cost and 0.18x-0.97x the
-training-plus-serving cost.
+PP trains with its forward plus the FA4 backward (deterministic at head dimension 128), so
+its training step takes 1.22x (head dimension 128) and 1.07x (head dimension 256) the FA4
+time at `B = 8`, `L = 16k`. Its serving cost is 1.05x-1.48x the fastest stack whose bytes
+differ, and its training-plus-serving cost 1.02x-1.29x. Against the deterministic stack,
+which is what keeps the bytes equal today, PP takes 0.10x-0.43x the serving cost and
+0.14x-0.69x the training-plus-serving cost.
 
 ![Prefill and training throughput](../../images/pp_attention/throughput.png)
 
 *Prefill (forward) and training forward+backward throughput at `B = 8` over context. FLOPs
 are `2 * B * L^2 * H_q * d` for the causal forward and 3.5x that for forward+backward. PP is
-shown at `G = 8` and `G = 16`.*
+shown at `G = 8` and `G = 16`; its training bars use the FA4 backward. Training shows FA4
+with the default (non-deterministic) backward and with `deterministic=True`; at head
+dimension 256 FA4 has one backward, which is deterministic, so the two bars are equal.
+Prefill shows FA4 once: `num_splits=1` and the default differ by under 2% at these shapes.*
 
 ## Backward
 
