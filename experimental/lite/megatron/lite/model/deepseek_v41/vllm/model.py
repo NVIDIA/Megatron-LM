@@ -47,7 +47,7 @@ class DeepseekV41Model(NativeModel):
     deployment_providers = {
         'attention': 'native BI SWA + ratio2 compressor/indexer + sparse FlashMLA; ratio2 parity pending',
         'engram': 'Lite frozen-host owner; native BI MXFP8 WKV and Triton post-WKV; parity pending',
-        'moe': 'R1 nonfused MegaMoE + Core native groups/owners/collectives',
+        'moe': 'fused MegaMoE forward, #260 EP all-gather decoded backward; Core owners',
         'mhc': 'native BI pre/post/collapse with owned VJPs',
         'head': 'native BI BF16 GEMM and native log-softmax; parity pending',
     }

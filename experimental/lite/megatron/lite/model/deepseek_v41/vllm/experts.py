@@ -127,14 +127,12 @@ class _Grouped(torch.autograd.Function):
             raise RuntimeError("Deployment grouped experts require CUDA")
         if len(counts) != len(weights) or sum(counts) != x.shape[0]:
             raise ValueError("One contiguous row count is required per native local expert")
-        codes, scale = encoded[:2]
+        codes, scale = encoded
         packed = [quantize_mxfp4(weight.detach()) for weight in weights]
         weight_codes = torch.stack([v[0] for v in packed])
         weight_scales = torch.stack([v[1] for v in packed])
         ctx.save_for_backward(codes, scale, weight_codes, weight_scales)
         ctx.counts, ctx.dtypes, ctx.input_dtype = counts, [w.dtype for w in weights], x.dtype
-        if len(encoded) == 3:  # Terminal primal is unused in the owned VJP replay.
-            return x.new_zeros((x.shape[0], weights[0].shape[0]), dtype=torch.bfloat16)
         return _grouped(codes, scale, weight_codes, weight_scales, counts)
 
     @staticmethod
@@ -193,12 +191,10 @@ class _Shared(torch.autograd.Function):
         deep_gemm = _import_deep_gemm()
         if deep_gemm is None:
             raise RuntimeError("Pinned DeepGEMM is required for shared MegaMoE numerics")
-        a, scale = encoded[:2]
+        a, scale = encoded
         codes, sf = quantize_block_fp8(weight, (32, 32), scale_format='e8m0')
         ctx.save_for_backward(a, scale, codes, sf)
         ctx.weight_dtype, ctx.input_shape, ctx.input_dtype = weight.dtype, x.shape, x.dtype
-        if len(encoded) == 3:
-            return x.new_zeros((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)
         output = x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)
         if x.shape[0]:
             rows = (sf.view(torch.uint8).repeat_interleave(32, 0).to(torch.int32) << 23).view(

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Shared-first, fixed-slot MoE arithmetic over actual routed Core A2A rows."""
+"""Fused inference MegaMoE with an owned decoded-operand backward; the shared-first,
+fixed-slot nonfused chain over routed Core A2A rows serves layers without shared experts."""
 import torch
 
 from megatron.core.tensor_parallel.mappings import all_to_all
@@ -63,46 +64,6 @@ def actual_rows(x, scores, indices, masters, limit, group, has_shared=True):
         live, masters[:local], masters[local : 2 * local], splits, weights, encoded, limit
     )
     return combine(return_rows(rows, indices, state, group), indices, shared)
-
-
-class _FusedMoE(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, scores, indices, options, *masters):
-        group, limit, buffer, packed = options
-        ctx.options = group, limit
-        ctx.save_for_backward(x, scores, indices, *masters)
-        return experts.launch(x, scores, indices, packed, buffer, limit, group.size())
-
-    @staticmethod
-    def backward(ctx, grad):
-        x, scores, indices, *masters = ctx.saved_tensors
-        group, limit = ctx.options
-        need = (*ctx.needs_input_grad[:2], *ctx.needs_input_grad[4:])
-        with torch.enable_grad():
-            leaves = [t.detach().requires_grad_(n) for t, n in zip((x, scores, *masters), need)]
-            x, scores, *m = leaves
-            local = len(m) // 2 - 1
-            codes, scale = experts.quantize_activation(x)
-            first = experts._Shared.apply(x, m[-2], (codes, scale))
-            hidden, encoded = experts.activation(first, x.new_ones(x.shape[0]), limit)
-            shared = experts._Shared.apply(hidden, m[-1], (*encoded, True))
-            live, weights, encoded, counts, state = dispatch_rows(
-                x, scores, indices, (codes, scale), local, group
-            )
-            first = experts._Grouped.apply(live, tuple(counts), encoded, *m[:local])
-            hidden, encoded = experts.activation(first, weights, limit)
-            routed = experts._Grouped.apply(
-                hidden, tuple(counts), (*encoded, True), *m[local : 2 * local]
-            )
-            position, inverse, sends, receives = state
-            # The combine is linear: route the incoming cotangent instead of
-            # materializing/sending an unused terminal primal and its gradient.
-            upstream = all_to_all(group, grad[position // indices.shape[1]], receives, sends)
-            upstream = upstream[torch.argsort(inverse)]
-            wanted = [t for t in leaves if t.requires_grad]
-            gradients = iter(torch.autograd.grad((routed, shared), wanted, (upstream, grad)))
-            result = [next(gradients) if n else None for n in need]
-        return result[0], result[1], None, None, *result[2:]
 
 
 def _mx(w):
@@ -172,9 +133,10 @@ def _reduce_scatter(x, group):
     return out
 
 
-class _DenseMoE(torch.autograd.Function):
-    """#260 MegaMoE backward: per-expert decoded VJP over EP-all-gathered rows, FP32
-    reduce-scatter back, expert dW straight into ``main_grad``. Same fused forward."""
+class _FusedMoE(torch.autograd.Function):
+    """Inference ``fp8_fp4_mega_moe`` forward; owned backward (#260 MegaMoE): per-expert
+    decoded VJP over EP-all-gathered rows, FP32 reduce-scatter back, expert dW straight
+    into ``main_grad``."""
 
     @staticmethod
     def forward(ctx, x, scores, indices, options, *masters):
@@ -266,10 +228,6 @@ class _DenseMoE(torch.autograd.Function):
 
 
 class MegaMoE(MoELayer):
-    # A/B of the fused-forward backward: "grouped" (variable-row EP A2A + grouped VJP)
-    # or "megamoe" (#260 dense EP all-gather + per-expert VJP).
-    backward_impl = 'grouped'
-
     def forward(self, hidden_states, input_ids=None, **kwargs):
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         group, rank = self.ep_group, self.ep_group.rank()
@@ -306,11 +264,10 @@ class MegaMoE(MoELayer):
             chunks = torch.tensor(max(1, (x.shape[0] + capacity - 1) // capacity), device=x.device)
             torch.distributed.all_reduce(chunks, torch.distributed.ReduceOp.MAX, group=group)
             outputs = []
-            fused = _DenseMoE if self.backward_impl == 'megamoe' else _FusedMoE
             for chunk in range(int(chunks)):
                 rows = slice(chunk * capacity, (chunk + 1) * capacity)
                 outputs.append(
-                    fused.apply(
+                    _FusedMoE.apply(
                         x[rows],
                         weights[rows],
                         indices[rows],
