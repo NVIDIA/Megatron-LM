@@ -69,7 +69,13 @@ def lm_head_can_emit(model_config: "TransformerConfig", dtype: torch.dtype) -> b
     # Deferred to avoid import loop.
     from megatron.core.extensions.transformer_engine import te_general_gemm
     from megatron.core.fp8_utils import is_mxfp8_output_proj_active
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+    )
 
+    # Batch-invariant mode guarantees logits bitwise-identical to the training forward.
+    if is_batch_invariant_mode_enabled():
+        return False
     return te_general_gemm is not None and not is_mxfp8_output_proj_active(model_config)
 
 
