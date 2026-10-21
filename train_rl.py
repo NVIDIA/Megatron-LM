@@ -422,7 +422,6 @@ if __name__ == "__main__":
         "--reset-attention-mask is not supported in RL training: "
         "the forward pass masks via PackedSeqParams and never consumes a dense attention mask."
     )
-    assert args.perform_rl_step, "train_rl.py requires --perform-rl-step."
     if args.batch_invariant_mode and args.rank == 0:
         print(
             "WARNING: batch-invariant mode is enabled, so logprobs are not computed vocab-parallel"
@@ -434,6 +433,7 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     rl_cfg = full_config.rl
+    assert rl_cfg.perform_rl_step, "train_rl.py requires --perform-rl-step."
     rl_model_provider = partial(model_provider, _model_builder)
 
     rl_setup = RLSetupCallback(
@@ -468,7 +468,7 @@ if __name__ == "__main__":
             forward_step,
             rl_model_provider,
             # Even with --skip-train, RL keeps its optimizer unless --no-load-optim is set.
-            skip_train_keeps_optimizer=not args.no_load_optim,
+            skip_train_keeps_optimizer=full_config.checkpoint.load_optim,
             next_train_iterator=next_train_iterator,
             run_eval=run_eval,
             # RL inference-only mode (--skip-train) still enters the loop to collect rollouts.

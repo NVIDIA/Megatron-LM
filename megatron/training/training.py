@@ -1641,7 +1641,9 @@ def pretrain(
         skip_train_keeps_optimizer: with --skip-train, still build the optimizer.
         next_train_iterator / run_eval: the loop's data and evaluation hooks (see `train`);
             default to the provider-built iterators and evaluate_and_print_results.
-            A caller-provided next_train_iterator skips the standard dataloaders entirely.
+            A caller-provided next_train_iterator replaces only the training dataloader;
+            validation/test dataloaders (and the default run_eval over them) are still
+            built when a dataset provider is given.
         run_train_loop_without_updates: also enter the training loop under --skip-train when
             there is training data (inference-only RL collection; no optimizer updates).
         suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop
@@ -1975,8 +1977,11 @@ def pretrain(
     # tracing systems are independent.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if next_train_iterator is None:
+    if next_train_iterator is None or train_valid_test_dataset_provider is not None:
         with _otel_managed_span('data_loading', 'megatron.startup.dataloader', is_goodput_span=True):
+            # A caller-provided next_train_iterator owns the training data;
+            # the provider's validation/test data (and the default run_eval over it) still works.
+            build_train = next_train_iterator is None
             if args.virtual_pipeline_model_parallel_size is not None:
                 train_data_iterator = []
                 valid_data_iterator = []
@@ -1990,24 +1995,32 @@ def pretrain(
                     if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                         vp_stage_train_valid_test_dataset_provider.is_distributed = True
                     iterators = build_train_valid_test_data_iterators(
-                        vp_stage_train_valid_test_dataset_provider
+                        vp_stage_train_valid_test_dataset_provider,
+                        build_train_dataloader=build_train,
                     )
                     train_data_iterator.append(iterators[0])
                     valid_data_iterator.append(iterators[1])
                     test_data_iterator.append(iterators[2])
             else:
                 train_data_iterator, valid_data_iterator, test_data_iterator = (
-                    build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+                    build_train_valid_test_data_iterators(
+                        train_valid_test_dataset_provider, build_train_dataloader=build_train
+                    )
                 )
+            if not build_train:
+                train_data_iterator = None
+            elif args.hybrid_context_parallel:
+                train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, model_cfg)
     else:
-        # Caller-managed training data (e.g. RL rollouts): no standard dataloaders.
-        # The data flags follow the dataloader rule: train when there are iterations,
-        # validate when there are eval iterations, never test.
+        # Caller-managed training data with no datasets at all (e.g. RL rollouts).
+        # The flags follow the hooks: train when there are iterations, validate only when
+        # the caller supplied run_eval (no data exists for the default one), never test.
         backfill_consumed_samples_from_iteration()
         train_data_iterator = valid_data_iterator = test_data_iterator = None
         broadcast_data_flags(
             do_train=(cfg_container.train.train_iters or 0) > 0,
-            do_valid=cfg_container.validation.full_validation or cfg_container.validation.eval_iters > 0,
+            do_valid=run_eval is not None
+            and (cfg_container.validation.full_validation or cfg_container.validation.eval_iters > 0),
             do_test=False,
         )
     timers('train/valid/test-data-iterators-setup').stop()
@@ -4606,9 +4619,6 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.hybrid_context_parallel:
-        train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
-
     if cfg.profiling.run_workload_inspector_server:
         try:
             import threading
@@ -5816,7 +5826,9 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(
+    build_train_valid_test_datasets_provider, *, build_train_dataloader=True
+):
     """Build pretraining data loaders."""
 
     args = get_args()
@@ -5847,7 +5859,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         # Build datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
         valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-        if cfg.validation.skip_train:
+        if cfg.validation.skip_train or not build_train_dataloader:
             train_dataloader = None
         else:
             train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
@@ -5864,7 +5876,12 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         if not cfg.validation.multiple_validation_sets:
             assert len(valid_dataloaders) == 1
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
-        do_train = train_dataloader is not None and (cfg.validation.skip_train or cfg.train.train_iters > 0)
+        if build_train_dataloader:
+            do_train = train_dataloader is not None and (
+                cfg.validation.skip_train or cfg.train.train_iters > 0
+            )
+        else:
+            do_train = (cfg.train.train_iters or 0) > 0
         do_valid = valid_dataloaders is not None and (cfg.validation.full_validation or cfg.validation.eval_iters > 0)
         do_test = test_dataloader is not None and (cfg.validation.full_validation or cfg.validation.eval_iters > 0)
     else:
@@ -5908,7 +5925,9 @@ def broadcast_data_flags(do_train, do_valid, do_test):
     train_state.do_test = train_state.do_test or flags[2].item()
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(
+    build_train_valid_test_datasets_provider, *, build_train_dataloader=True
+):
     """Build pretraining data iterators."""
 
     cfg = get_run_config()
@@ -5916,7 +5935,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider, build_train_dataloader=build_train_dataloader
     )
 
     # Build iterators.
