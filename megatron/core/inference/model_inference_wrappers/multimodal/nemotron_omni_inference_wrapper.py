@@ -183,9 +183,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         if not getattr(model, "dynamic_resolution", False):
             raise ValueError("NemotronOmniModel must have dynamic_resolution enabled.")
 
-        frame_embedding_counts = dynamic_media_embedding_counts(
-            imgs_sizes, patch_dim=model.patch_dim, pixel_shuffle=True
-        )
+        frame_embedding_counts = self._dynamic_frame_embedding_counts(model, imgs_sizes)
         placeholder_count = sum(
             token == image_token_index for sample_tokens in tokens for token in sample_tokens
         )
@@ -306,6 +304,19 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             image_masks.append(mask_sample)
 
         return expanded_tokens, image_masks
+
+    def _dynamic_frame_embedding_counts(self, model, imgs_sizes: torch.Tensor) -> list[int]:
+        """Per-image embedding counts (pixel-shuffled patch grids) of dynamic-resolution images."""
+        return dynamic_media_embedding_counts(
+            imgs_sizes, patch_dim=model.patch_dim, pixel_shuffle=True
+        )
+
+    def dynamic_image_embedding_counts(self, imgs_sizes: torch.Tensor) -> Optional[list[int]]:
+        """Per-image embedding counts for dynamic-resolution images; None if not supported."""
+        model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        if not getattr(model, "dynamic_resolution", False):
+            return None
+        return self._dynamic_frame_embedding_counts(model, imgs_sizes)
 
     def _forward_vision_encoder(
         self,

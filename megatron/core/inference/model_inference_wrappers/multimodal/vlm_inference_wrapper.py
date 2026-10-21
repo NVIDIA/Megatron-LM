@@ -223,21 +223,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         # Compute per-image embedding counts
         if imgs_sizes is not None and getattr(module, 'dynamic_resolution', False):
-            frame_embedding_counts = dynamic_media_embedding_counts(
-                imgs_sizes,
-                module.patch_dim,
-                pixel_shuffle=module._pixel_shuffle,
-                spatial_merge_size=2 if module._conv_merging else 1,
-            )
-            if not module._drop_vision_class_token:
-                class_token_len = int(getattr(module, "_class_token_len", 0))
-                if module._pixel_shuffle and class_token_len > 0:
-                    raise ValueError(
-                        "Dynamic-resolution pixel shuffle requires dropping " "vision class tokens."
-                    )
-                frame_embedding_counts = [
-                    count + class_token_len for count in frame_embedding_counts
-                ]
+            frame_embedding_counts = self._dynamic_frame_embedding_counts(module, imgs_sizes)
             placeholder_count = sum(
                 token == image_token_index for sample_tokens in tokens for token in sample_tokens
             )
@@ -351,6 +337,30 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 mask_list.append(mask_sample)
 
         return expanded_tokens_list, mask_list
+
+    def _dynamic_frame_embedding_counts(self, module, imgs_sizes) -> list[int]:
+        """Projected embedding count per dynamic-resolution frame, class tokens included."""
+        frame_embedding_counts = dynamic_media_embedding_counts(
+            imgs_sizes,
+            module.patch_dim,
+            pixel_shuffle=module._pixel_shuffle,
+            spatial_merge_size=2 if module._conv_merging else 1,
+        )
+        if not module._drop_vision_class_token:
+            class_token_len = int(getattr(module, "_class_token_len", 0))
+            if module._pixel_shuffle and class_token_len > 0:
+                raise ValueError(
+                    "Dynamic-resolution pixel shuffle requires dropping " "vision class tokens."
+                )
+            frame_embedding_counts = [count + class_token_len for count in frame_embedding_counts]
+        return frame_embedding_counts
+
+    def dynamic_image_embedding_counts(self, imgs_sizes: torch.Tensor) -> Optional[list[int]]:
+        """Per-image embedding counts for dynamic-resolution images; None for static tiling."""
+        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        if not getattr(module, 'dynamic_resolution', False):
+            return None
+        return self._dynamic_frame_embedding_counts(module, imgs_sizes)
 
     def _forward_vision_encoder(
         self, images, num_image_tiles=None, imgs_sizes=None, num_frames=None
