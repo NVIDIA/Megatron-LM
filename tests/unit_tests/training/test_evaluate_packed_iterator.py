@@ -38,18 +38,19 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
     monkeypatch.setattr(ft_integration, "_curr_eval_iter_idx", 0)
     monkeypatch.setattr(ft_integration, "_is_setup_section_open", False)
     args = SimpleNamespace(
-        eval_global_batch_size=1,
-        eval_micro_batch_size=1,
         data_parallel_size=1,
         gtp_weight_remat_size=1,
         cuda_graph_impl="none",
         moe_expert_rank_capacity_factor=None,
         seq_length=8,
         decoder_seq_length=None,
-        eval_iters=completed_steps + 2,
-        empty_unused_memory_level=0,
         consumed_valid_samples=0,
-        exit_duration_in_mins=None,
+    )
+    cfg = SimpleNamespace(
+        validation=SimpleNamespace(
+            eval_global_batch_size=1, eval_micro_batch_size=1, eval_iters=completed_steps + 2
+        ),
+        train=SimpleNamespace(empty_unused_memory_level=0, exit_duration_in_mins=None),
     )
     config = SimpleNamespace(sequence_packing_scheduler="dp_balanced")
     timers = mock.MagicMock()
@@ -58,6 +59,7 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
     forward_backward = mock.Mock(return_value=[])
     with (
         mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_run_config", return_value=cfg),
         mock.patch.object(training_mod, "get_train_state", return_value=TrainState()),
         mock.patch.object(training_mod, "get_timers", return_value=timers),
         mock.patch.object(training_mod, "get_rerun_state_machine", return_value=mock.Mock()),
