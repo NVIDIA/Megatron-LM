@@ -1,9 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Deployment MoE/mHC/head on the native Lite model lifecycle.
-
-Ratio-zero attention uses native BI projections and sparse FlashMLA. Compressed
-attention calls native producers with shared Lite owners.
-"""
+"""Native Lite lifecycle with deployment MoE, mHC, attention and head."""
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
@@ -94,12 +90,7 @@ class DeepseekV41Model(NativeModel):
         return output
 
     def _build_attention(self, config, index):
-        attention = build_attention(config, index, self.context)
-        modes = (
-            {'full'} if self.impl.recompute is True else set(str(self.impl.recompute).split(','))
-        )
-        attention.retain_sparse_stats = bool(modes & {'full', 'attn'})
-        return attention
+        return build_attention(config, index, self.context)
 
     def _build_mlp(self, config, release, index):
         spec = get_mlp_module_spec(

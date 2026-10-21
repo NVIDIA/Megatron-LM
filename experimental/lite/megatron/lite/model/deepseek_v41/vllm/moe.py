@@ -1,11 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Core-owned experts, groups and autograd collectives; R1's slot arithmetic.
-
-Core's dispatcher unpermutes by summing expert slots then adds the shared
-expert. MegaMoE starts from the shared expert and adds slots in slot order.
-Keep that arithmetic here, dispatching actual routed rows with Core A2A.
-Stable expert/source/token/slot order and copies preserve signed-zero bits.
-"""
+"""Shared-first, fixed-slot MoE arithmetic over actual routed Core A2A rows."""
 import torch
 
 from megatron.core.tensor_parallel.mappings import all_to_all
@@ -135,7 +129,6 @@ class MegaMoE(MoELayer):
                 self.shared_experts.linear_fc1.weight,
                 self.shared_experts.linear_fc2.weight,
             )
-            # Quantized operands are fresh on every call; only the symmetric buffer is cached.
             packed = experts.kernel_weights(fc1, fc2, *masters[-2:])
             capacity = 8192
             buffer = experts.symm_buffer(

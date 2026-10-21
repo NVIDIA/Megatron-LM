@@ -17,9 +17,7 @@ def _row_scales(scale, rows, inner):
 
 
 def tc_mm(a, b, out_dtype=None):
-    """``a @ b`` with BF16 operands on tensor cores and FP32 accumulation; the result is
-    BF16 unless ``out_dtype`` asks for the FP32 accumulator. CPU (derivative references
-    only): the same rounded operands in an FP32 GEMM."""
+    """BF16 tensor-core operands with optional FP32 output; CPU is a reference."""
     a, b = a.bfloat16(), b.bfloat16()
     if not a.is_cuda:
         out = a.float() @ b.float()

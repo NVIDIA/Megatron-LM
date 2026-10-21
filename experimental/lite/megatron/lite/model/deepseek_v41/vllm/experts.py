@@ -69,7 +69,6 @@ def activation(fc1, scores, limit):
         raise RuntimeError("Deployment expert activation requires CUDA")
     from vllm.model_executor.kernels.batch_invariant import swiglu_apply_weight_to_fp8
 
-    # Only the owned VJP uses this surrogate; native codes drive GEMM2.
     hidden = _Activation.apply(fc1, scores, limit)
     if not fc1.shape[0]:
         return hidden, (
@@ -146,8 +145,6 @@ class _Grouped(torch.autograd.Function):
             if codes.is_cuda and codes.numel() and grad.dtype == torch.bfloat16
             else dequantize_activation(codes, scale).to(grad.dtype)
         )
-        # Ragged M/K grouping is owned by Torch's grouped GEMM. Decode the
-        # stacked expert operand once; no per-expert CUDA launch sequence.
         ends = torch.tensor(ctx.counts, device=grad.device, dtype=torch.int32).cumsum(
             0, dtype=torch.int32
         )
@@ -166,7 +163,6 @@ class _Grouped(torch.autograd.Function):
                     empty = ends == torch.cat((ends.new_zeros(1), ends[:-1]))
                     dw.masked_fill_(empty[:, None, None], 0)
             else:
-                # CPU-only derivative controls have no grouped CUDA backend.
                 dw = torch.stack(
                     [
                         g.float().T @ a.float()
@@ -260,10 +256,7 @@ def _empty_weight(outer, n, k, values_per_element, device):
 
 @torch.no_grad()
 def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
-    """Masters -> ``(l1, l2, shared_l1, shared_l2)`` in the MegaMoE kernel layout.
-
-    ``fc1[e]`` is ``cat(w1, w3)`` [2I, H]; ``fc2[e]`` is ``w2`` [H, I].
-    """
+    """Pack fresh masters into native MegaMoE kernel layouts."""
     from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
     from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 

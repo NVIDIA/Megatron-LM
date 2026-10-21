@@ -1,9 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Caller-owned SWA using the pinned inference producers and sparse FlashMLA.
-
-No inference engine or persistent KV state is constructed. Each THD document
-owns its pages. Native checkpoint parameter names and owners remain unchanged.
-"""
+"""Caller-owned sparse FlashMLA with native parameter names and owners."""
 import torch
 
 from .linear import linear
@@ -108,7 +104,7 @@ class _SWAInsert(torch.autograd.Function):
 
 class _Sparse(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, sink, indices, lengths, scale, retain_stats=False):
+    def forward(ctx, q, kv, sink, indices, lengths, scale):
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
         heads = q.shape[1]
@@ -116,7 +112,7 @@ class _Sparse(torch.autograd.Function):
         query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
         bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
         output = torch.empty_like(query)
-        output, _, lse = flash_mla_sparse_fwd(
+        flash_mla_sparse_fwd(
             q=query,
             kv=kv[:, None].contiguous(),
             indices=indices[:, None],
@@ -125,15 +121,13 @@ class _Sparse(torch.autograd.Function):
             topk_length=lengths,
             out=output,
         )
-        # Retain exact FlashMLA statistics during checkpoint replay, as the
-        # reference FlashMLA core does. Without recompute, replay saves memory.
-        ctx.save_for_backward(q, kv, sink, indices, *((output, lse) if retain_stats else ()))
+        ctx.save_for_backward(q, kv, sink, indices)
         ctx.scale = scale
         return output[:, :heads]
 
     @staticmethod
     def backward(ctx, grad):
-        q, kv, sink, indices = ctx.saved_tensors[:4]
+        q, kv, sink, indices = ctx.saved_tensors
         if q.shape[0] == 0:
             return (
                 torch.zeros_like(q),
@@ -142,12 +136,9 @@ class _Sparse(torch.autograd.Function):
                 None,
                 None,
                 None,
-                None,
             )
         if not q.is_cuda or q.shape[-1] != 512:
-            # Small common-activation adjoint controls (the deployment forward
-            # accepts D512 only). This is a single batched reference, not a
-            # row-wise GPU replay implementation.
+            # CPU/small-width common-activation reference; production accepts D512.
             with torch.enable_grad():
                 query = q.detach().float().requires_grad_()
                 values = kv.detach().float().requires_grad_()
@@ -163,9 +154,8 @@ class _Sparse(torch.autograd.Function):
                 None,
                 None,
                 None,
-                None,
             )
-        # Exact saved/replayed FlashMLA statistics feed the whole-query cuDNN VJP.
+        # Replay exact FlashMLA statistics for the whole-query cuDNN adjoint.
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
@@ -176,19 +166,15 @@ class _Sparse(torch.autograd.Function):
         padded = 64 if heads <= 64 else 128
         query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
         bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
-        # Every unused slot is -1 in this caller's compact layout.
         lengths = None
-        if len(ctx.saved_tensors) == 6:
-            output, lse = ctx.saved_tensors[4:]
-        else:
-            output, _, lse = flash_mla_sparse_fwd(
-                q=query,
-                kv=kv[:, None].contiguous(),
-                indices=indices[:, None],
-                sm_scale=ctx.scale,
-                attn_sink=bias,
-                topk_length=lengths,
-            )
+        output, _, lse = flash_mla_sparse_fwd(
+            q=query,
+            kv=kv[:, None].contiguous(),
+            indices=indices[:, None],
+            sm_scale=ctx.scale,
+            attn_sink=bias,
+            topk_length=lengths,
+        )
         dout = torch.nn.functional.pad(grad, (0, 0, 0, padded - heads)).contiguous()
         sparse._ensure_dsa_namespace()
         result = sparse._DSA.sparse_attention_backward_wrapper(
@@ -217,7 +203,6 @@ class _Sparse(torch.autograd.Function):
             result["dq"][:, :heads],
             result["dkv"].to(kv.dtype),
             result["d_sink"][:heads].to(sink.dtype),
-            None,
             None,
             None,
             None,
@@ -256,11 +241,7 @@ class _InverseRoPE(torch.autograd.Function):
 
 
 def inverse_rope_bf16(x, positions, cache, groups):
-    """LoRA wo_a input: native BF16 inverse-RoPE before FP8 quantization.
-
-    This is independent of the base path's FP8 codes; callers opt in only when
-    a delta needs it. Never reconstruct this activation from dequantized FP8.
-    """
+    """LoRA input: native BF16 inverse-RoPE before the base path FP8 quantizer."""
     return _InverseRoPE.apply(x, positions, cache, groups)
 
 
@@ -314,7 +295,6 @@ class _FP8OutputProjection(torch.autograd.Function):
             to_release("layers.0.attn.wo_a.weight", weight.reshape(groups * rank, inner))
         )
         codes, descale = (tensors["layers.0.attn.wo_a.weight"], tensors["layers.0.attn.wo_a.scale"])
-        # Keep canonical packed bytes before the vendor layout transform.
         saved_codes, saved_scale = codes.clone(), descale.clone()
         codes, native_scale = deepgemm_post_process_fp8_weight_block(
             codes, descale, (32, 32), True, is_bmm=True, bmm_batch_size=groups
@@ -378,7 +358,6 @@ class _FP8OutputProjection(torch.autograd.Function):
 
             dx = bmm(g, w).permute(1, 0, 2).to(activation.dtype)
             dw = bmm(g.transpose(1, 2), a).to(ctx.weight_dtype)
-        # Inverse-RoPE's adjoint is the forward rotation; quantization is STE.
         return (
             _rotate(dx.reshape(ctx.shape), positions, cache),
             dw.reshape(ctx.weight_shape),
@@ -388,13 +367,9 @@ class _FP8OutputProjection(torch.autograd.Function):
         )
 
 
-def swa_forward(attention, hidden, positions, rope_cache, *, observe=None, source=None):
-    """One complete ratio-zero document, including native weight quantization."""
-    emit = observe or (lambda name, value: None)
-    x = hidden.reshape(-1, hidden.shape[-1])
+def _projections(attention, x):
     fused = torch.cat((attention.linear_q_down_proj.weight, attention.linear_kv_proj.weight))
     raw = linear(x, fused, fp8=True)
-    emit('qkv_projection', raw)
     from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
     from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
@@ -405,20 +380,61 @@ def swa_forward(attention, hidden, positions, rope_cache, *, observe=None, sourc
         attention.config.layernorm_epsilon,
     )
     qa = QuantizedActivation(codes, scales, qr.dtype, qr.shape, kMxfp8Dynamic)
-    emit('q_norm', qr)
-    emit('kv_norm', kv)
     q = linear(qr, attention.linear_q_up_proj.weight, fp8=True, activation=qa).bfloat16()
     q = q.reshape(-1, attention.num_attention_heads_per_partition, attention.q_head_dim)
-    emit('q_projection', q)
+    from .linear import _row_scales
+
+    return raw, qr, kv, q, qa, _row_scales(qa.scale, *qr.shape)
+
+
+def _projection_rows(projected, lo, hi):
+    from dataclasses import replace
+
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import swizzle_mxfp8_scale
+
+    raw, qr, kv, q, qa, scales = projected
+    sliced = replace(
+        qa,
+        data=qa.data[lo:hi],
+        scale=swizzle_mxfp8_scale(scales[lo:hi].contiguous(), hi - lo, qr.shape[-1]),
+        orig_shape=qr[lo:hi].shape,
+    )
+    return raw[lo:hi], qr[lo:hi], kv[lo:hi], q[lo:hi], sliced
+
+
+def swa_forward(
+    attention,
+    hidden,
+    positions,
+    rope_cache,
+    *,
+    observe=None,
+    source=None,
+    projected=None,
+    metadata=None,
+):
+    emit = observe or (lambda name, value: None)
+    x = hidden.reshape(-1, hidden.shape[-1])
+    raw, qr, kv, q, qa = _projections(attention, x)[:5] if projected is None else projected
+    for name, value in (
+        ('qkv_projection', raw),
+        ('q_norm', qr),
+        ('kv_norm', kv),
+        ('q_projection', q),
+    ):
+        emit(name, value)
     q, kv = _SWAInsert.apply(q, kv, positions, rope_cache, attention.config.layernorm_epsilon)
     emit('q_rope', q)
     emit('kv_cache_decoded', kv)
-    # Use the same native metadata producer, including padding and slot order.
     from vllm.models.deepseek_v41.common.ops import combine_topk_swa_indices
 
     rows = x.shape[0]
-    cu = torch.tensor([0, rows], device=x.device, dtype=torch.int32)
-    lengths = torch.tensor([rows], device=x.device, dtype=torch.int32)
+    if metadata is None:
+        metadata = (
+            torch.tensor([0, rows], device=x.device, dtype=torch.int32),
+            torch.tensor([rows], device=x.device, dtype=torch.int32),
+        )
+    cu, lengths = metadata
     ratio, offset = 0, 0
     topk = torch.empty((rows, 0), device=x.device, dtype=torch.int32)
     if source is not None:
@@ -438,15 +454,7 @@ def swa_forward(attention, hidden, positions, rope_cache, *, observe=None, sourc
     )
     emit('swa_indices', indices)
     sink = attention.core_attention.native.attn_sink
-    out = _Sparse.apply(
-        q,
-        kv,
-        sink,
-        indices,
-        lens,
-        attention.q_head_dim**-0.5,
-        getattr(attention, 'retain_sparse_stats', False),
-    )
+    out = _Sparse.apply(q, kv, sink, indices, lens, attention.q_head_dim**-0.5)
     emit('core_attn', out)
     weight = attention.linear_o_group_proj
     groups = attention.config.o_groups
@@ -530,11 +538,26 @@ class SWAAttention(DS41SelfAttention):
         cu = packed_seq_params.cu_seqlens_q_padded
         if cu is None:
             cu = packed_seq_params.cu_seqlens_q
-        boundaries = cu.tolist()
+        cached = getattr(packed_seq_params, '_deployment_documents', None)
+        if cached is None or cached[0] is not cu or cached[1] != cu._version:
+            boundaries = cu.tolist()
+            documents = [
+                (
+                    lo,
+                    hi,
+                    torch.arange(hi - lo, device=cu.device),
+                    (cu.new_tensor([0, hi - lo]), cu.new_tensor([hi - lo])),
+                )
+                for lo, hi in zip(boundaries, boundaries[1:])
+            ]
+            cached = (cu, cu._version, documents)
+            packed_seq_params._deployment_documents = cached
+        if hidden_states.shape[0] == 0:
+            return hidden_states * 0, None
+        projected = _projections(self, hidden_states.reshape(-1, hidden_states.shape[-1]))
         pieces = []
-        for document, (lo, hi) in enumerate(zip(boundaries, boundaries[1:])):
+        for document, (lo, hi, positions, metadata) in enumerate(cached[2]):
             if hi > lo:
-                positions = torch.arange(hi - lo, device=hidden_states.device, dtype=torch.int64)
 
                 def sources(x, qr, qa):
                     from .compressed import source
@@ -551,6 +574,8 @@ class SWAAttention(DS41SelfAttention):
                         positions,
                         self._deployment_rope,
                         source=sources if self._dsv4_compress_ratio else None,
+                        projected=_projection_rows(projected, lo, hi),
+                        metadata=metadata,
                     )
                 )
         return torch.cat(pieces, 0) if pieces else hidden_states * 0, None

@@ -120,32 +120,83 @@ def test_tensor_core_vjp_matches_fp32_control(kind, gradient_dtype, monkeypatch)
         check(dw, g.float().T @ x.float())
 
 
-def test_sparse_statistics_storage_does_not_change_forward_or_cpu_vjp(monkeypatch):
+def test_thd_projections_are_batched_and_metadata_tracks_boundary_changes(monkeypatch):
+    state = SimpleNamespace(
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1)),
+        _deployment_rope=torch.empty(0),
+        _dsv4_compress_ratio=0,
+    )
+    params = SimpleNamespace(qkv_format='thd', cu_seqlens_q_padded=torch.tensor([0, 3, 3, 9]))
+    calls, rows = [], []
+
+    def projections(module, x):
+        calls.append(x.shape[0])
+        return x
+
+    def document(module, hidden, positions, cache, *, projected, metadata, **kwargs):
+        raw_equal(hidden.flatten(1), projected)
+        raw_equal(positions, torch.arange(hidden.shape[0]))
+        raw_equal(metadata[0], torch.tensor([0, hidden.shape[0]]))
+        raw_equal(metadata[1], torch.tensor([hidden.shape[0]]))
+        rows.append(hidden.shape[0])
+        return hidden * 2
+
+    monkeypatch.setattr(attention, '_projections', projections)
+    monkeypatch.setattr(attention, '_projection_rows', lambda x, lo, hi: x[lo:hi])
+    monkeypatch.setattr(attention, 'swa_forward', document)
+    x = torch.randn(9, 1, 32, requires_grad=True)
+    for grad_enabled in (False, True):
+        with torch.set_grad_enabled(grad_enabled):
+            output, _ = attention.SWAAttention.forward(state, x, packed_seq_params=params)
+        raw_equal(output, x * 2)
+    assert calls == [9, 9] and rows == [3, 6, 3, 6]
+    cached = params._deployment_documents
+    assert params._deployment_documents is cached
+    params.cu_seqlens_q_padded[1] = 2
+    attention.SWAAttention.forward(state, x, packed_seq_params=params)
+    assert rows[-3:] == [2, 1, 6] and params._deployment_documents is not cached
+    output.sum().backward()
+    raw_equal(x.grad, torch.full_like(x, 2))
+    params.cu_seqlens_q_padded = torch.tensor([0, 0])
+    output, _ = attention.SWAAttention.forward(state, x[:0], packed_seq_params=params)
+    assert output.shape == x[:0].shape and calls == [9, 9, 9]
+
+
+def test_projection_rows_preserve_fp8_codes_and_scale_bytes(monkeypatch):
     import sys
-    from types import SimpleNamespace
+    from dataclasses import make_dataclass
 
-    from megatron.lite.model.deepseek_v41.vllm.attention import _Sparse
+    from megatron.lite.model.deepseek_v41.vllm.linear import _row_scales
 
-    def forward(**kwargs):
-        output = kwargs['out'].copy_(kwargs['q'])
-        return output, None, output.new_zeros(output.shape[:2], dtype=torch.float32)
+    def swizzle(sf, rows, width):
+        tiles, groups = (rows + 127) // 128, (width + 127) // 128
+        padded = torch.zeros(tiles * 128, groups * 4, dtype=torch.uint8)
+        padded[:rows, : width // 32] = sf
+        return padded.view(tiles, 4, 32, groups, 4).transpose(1, 3).contiguous().flatten()
 
+    qa_type = make_dataclass(
+        'Activation', ['data', 'scale', 'orig_dtype', 'orig_shape', 'quant_key']
+    )
+    qr = torch.randn(271, 160, requires_grad=True)
+    codes = torch.randn_like(qr).to(torch.float8_e4m3fn)
+    scales = torch.randint(100, 150, (271, 5), dtype=torch.uint8)
+    qa = qa_type(codes, swizzle(scales, 271, 160), qr.dtype, qr.shape, object())
+    packed = (qr, qr, qr, qr, qa, _row_scales(qa.scale, *qr.shape))
     with monkeypatch.context() as patch:
         patch.setitem(
             sys.modules,
-            'vllm.v1.attention.ops.flashmla',
-            SimpleNamespace(flash_mla_sparse_fwd=forward),
+            'vllm.model_executor.layers.quantization.utils.mxfp8_utils',
+            SimpleNamespace(swizzle_mxfp8_scale=swizzle),
         )
-        q = torch.randn(3, 2, 64, requires_grad=True)
-        kv = torch.randn(5, 64, requires_grad=True)
-        sink = torch.randn(2, requires_grad=True)
-        indices = torch.tensor([[0, 1, -1], [1, 2, 3], [2, 3, 4]], dtype=torch.int32)
-        outputs, gradients = [], []
-        for retained in (False, True):
-            output = _Sparse.apply(q, kv, sink, indices, None, 0.125, retained)
-            assert len(output.grad_fn.saved_tensors) == (6 if retained else 4)
-            outputs.append(output)
-            gradients.append(torch.autograd.grad(output.sum(), (q, kv, sink)))
-        assert torch.equal(outputs[0].view(torch.int32), outputs[1].view(torch.int32))
-        for before, after in zip(*gradients):
-            assert torch.equal(before, after)
+        for lo, hi in ((0, 3), (3, 3), (3, 130), (130, 271)):
+            result = attention._projection_rows(packed, lo, hi)
+            for tensor in result[:4]:
+                raw_equal(tensor, qr[lo:hi])
+            sliced = result[-1]
+            raw_equal(sliced.data, codes[lo:hi])
+            raw_equal(_row_scales(sliced.scale, hi - lo, 160), scales[lo:hi])
+            assert sliced.quant_key is qa.quant_key and sliced.orig_shape == qr[lo:hi].shape
+        attention._projection_rows(packed, 3, 130)[0].sum().backward()
+        expected = torch.zeros_like(qr)
+        expected[3:130] = 1
+        raw_equal(qr.grad, expected)
