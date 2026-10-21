@@ -58,6 +58,14 @@ def _module():
         {"moe_shared_expert_intermediate_size": 512},
         {"fp8": "e4m3", "fp8_recipe": "mxfp8", "fp8_param": True},
         {"fp8": "e4m3", "fp8_recipe": "mxfp8", "fp8_param": False},
+        {"cuda_graph_impl": "local", "cuda_graph_modules": []},
+        {
+            "fp8": "e4m3",
+            "fp8_recipe": "mxfp8",
+            "fp8_param": True,
+            "cuda_graph_impl": "local",
+            "cuda_graph_modules": [],
+        },
     ],
 )
 def test_supported_precision_and_shared_configs(kwargs):
@@ -76,6 +84,17 @@ def test_layer_precision_override_is_rejected_before_collectives():
         _config(fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True, first_last_layers_bf16=True)
 
 
+def test_mxfp8_graph_requires_fp8_primary_parameters():
+    with pytest.raises(ValueError, match="MXFP8 CUDA graphs require fp8_param=True"):
+        _config(
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            fp8_param=False,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[],
+        )
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -84,6 +103,7 @@ def test_layer_precision_override_is_rejected_before_collectives():
         {"activation_func_clamp_value": 4.0},
         {"activation_func_clamp_value": 0.0},
         {"cuda_graph_impl": "full_iteration"},
+        {"cuda_graph_impl": "local", "cuda_graph_modules": ["moe_router"]},
         {"moe_token_dispatcher_type": "flex"},
         {"add_bias_linear": True},
         {"moe_megakernel_backend_config": {"unknown_option": 1}},
@@ -170,7 +190,8 @@ def test_completion_reuses_buffers_and_rejects_live_storage_changes():
         module._complete(module.owners)
 
 
-def test_shared_expert_runs_once_and_adds_to_routed_output():
+@pytest.mark.parametrize("overlap", [False, True])
+def test_shared_expert_runs_once_and_adds_to_routed_output(overlap):
     from megatron.core.transformer.moe import moe_layer
     from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
@@ -183,12 +204,20 @@ def test_shared_expert_runs_once_and_adds_to_routed_output():
     )
     layer.attn_tp_group = SimpleNamespace(size=lambda: 1)
     layer.moe_layer_recompute = False
+    layer.use_shared_expert = True
+    layer.shared_expert_overlap = overlap
     layer.route = Mock(return_value=(torch.ones(4, 8), torch.ones(4, 8, dtype=torch.bool)))
     hidden = torch.ones(4, 1, 256, device="cuda", requires_grad=True)
     layer.megakernel_experts = torch.nn.Identity()
     layer.megakernel_experts.handles_shared_expert = False
     layer.megakernel_experts.forward = Mock(side_effect=lambda x, *_: x * 2)
     layer.shared_experts_compute = Mock(side_effect=lambda x: x * 3)
+    layer.shared_experts = torch.nn.Module()
+    layer.shared_experts.stream = torch.cuda.Stream()
+    layer.shared_experts.wait_current_stream = lambda: layer.shared_experts.stream.wait_stream(
+        torch.cuda.current_stream()
+    )
+    layer.shared_experts.forward = layer.shared_experts_compute
     output, bias = layer(hidden)
     torch.testing.assert_close(output, hidden * 5)
     assert bias is None
@@ -203,6 +232,82 @@ def test_shared_expert_runs_once_and_adds_to_routed_output():
     )
     torch.testing.assert_close(grads["in[0]"], torch.full_like(hidden, 5))
     assert layer.shared_experts_compute.call_count == 4
+
+
+def test_graph_runtime_pins_storage_and_checks_replay_ownership(monkeypatch):
+    from megatron.core.transformer.cuda_graphs import (
+        _CudagraphGlobalRecord,
+        _CudaGraphRunner,
+        delete_cuda_graphs,
+    )
+
+    _, module = _module()
+    module.cuda()
+    for owner in module.owners:
+        owner.main_grad = torch.zeros_like(owner, dtype=torch.float32)
+    module.context = object()
+    module._gradient_binding = tuple(runtime.storage_signature(p.main_grad) for p in module.owners)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    module.cuda_graph_capture_prepare()
+    with pytest.raises(RuntimeError, match="delete_cuda_graphs"):
+        module.load_state_dict({})
+    module.cuda_graph_prepare_replay(True, True)
+    with pytest.raises(RuntimeError, match="unfinished backward"):
+        module.cuda_graph_release()
+    module.cuda_graph_finish_replay()
+    with torch.no_grad():
+        module.owners[0].add_(1)
+    module.cuda_graph_prepare_replay(True, True)
+    module.cuda_graph_finish_replay()
+    runner = _CudaGraphRunner.__new__(_CudaGraphRunner)
+    torch.nn.Module.__init__(runner)
+    runner.megakernel_backends = (module,)
+    runner.grad_enabled = True
+    with torch.no_grad(), pytest.raises(RuntimeError, match="no_grad"):
+        runner.replay_graph_capture(False, (), {})
+    assert not module._live
+    module.cuda_graph_prepare_replay(True, True)
+    module.cuda_graph_finish_replay()
+    runner.cudagraph_created = True
+    runner.fwd_graph = runner.bwd_graph = object()
+    # Training capture clears its schedule; deletion must still find its runner.
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_inference_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "created_runners", {runner})
+    delete_cuda_graphs()
+    assert runner.fwd_graph is None and not runner.cudagraph_created
+    assert not module._graph_bound
+    # Teardown also visits a runner that was only recorded, or already released.
+    module.cuda_graph_release()
+
+
+@pytest.mark.parametrize("mutation", ["weight", "main_grad"])
+def test_graph_backward_rejects_changed_storage_before_gpu_work(mutation):
+    from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode, _GraphStatus
+
+    _, module = _module()
+    for owner in module.owners:
+        owner.main_grad = torch.zeros_like(owner, dtype=torch.float32)
+    module._gradient_binding = tuple(runtime.storage_signature(p.main_grad) for p in module.owners)
+    module._weight_binding = module._weight_signature()
+    module._live = True
+    grad_output, graph = Mock(), Mock()
+    runner = SimpleNamespace(
+        megakernel_backends=(module,),
+        bwd_graph=graph,
+        status=_GraphStatus.BWD_READY,
+        static_grad_outputs=(grad_output,),
+    )
+    with torch.no_grad():
+        if mutation == "weight":
+            module.owners[0].data = torch.ones_like(module.owners[0])
+        else:
+            module.owners[0].main_grad = torch.zeros_like(module.owners[0].main_grad)
+    with pytest.raises(RuntimeError, match="storage"):
+        _CudagraphReplayNode.backward(SimpleNamespace(runner=runner), torch.zeros(1))
+    grad_output.copy_.assert_not_called()
+    graph.replay.assert_not_called()
+    assert module._live
 
 
 def test_bf16_grouped_view_aliases_native_storage():

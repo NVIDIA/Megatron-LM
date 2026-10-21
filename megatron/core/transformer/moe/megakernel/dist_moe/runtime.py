@@ -50,7 +50,6 @@ def validate_config(config):
         "moe_pad_expert_input_to_capacity",
         "glu_linear_offset",
         "overlap_moe_expert_parallel_comm",
-        "moe_shared_expert_overlap",
         "moe_shortcut_connection",
         "delay_wgrad_compute",
         "overlap_dispatch_backward_with_experts_wgrad",
@@ -78,8 +77,10 @@ def validate_config(config):
     ):
         if getattr(config, name) != 1:
             raise ValueError(f"dist_moe requires {name}=1")
-    if config.cuda_graph_impl != "none":
-        raise ValueError("dist_moe does not support CUDA graphs")
+    if config.cuda_graph_impl not in ("none", "local") or (
+        config.cuda_graph_impl == "local" and config.cuda_graph_modules
+    ):
+        raise ValueError("dist_moe supports only local whole-layer CUDA graphs")
     if config.transformer_impl == "inference_optimized":
         raise ValueError("dist_moe requires training modules")
     if config.moe_token_dispatcher_type == "flex":
@@ -90,6 +91,8 @@ def validate_config(config):
         raise ValueError("dist_moe supports BF16 or E4M3 TE MXFP8 compute")
     if config.fp8_param and config.fp8 is None:
         raise ValueError("dist_moe FP8 parameters require MXFP8 compute")
+    if config.cuda_graph_impl == "local" and config.fp8 is not None and not config.fp8_param:
+        raise ValueError("dist_moe MXFP8 CUDA graphs require fp8_param=True")
     DistMoEBackendOptions(**(config.moe_megakernel_backend_config or {}))
 
 
@@ -213,6 +216,8 @@ def close_dist_moe_runtime(model_chunks=None):
             continue
         if any(module._live for module in modules):
             raise RuntimeError("cannot close dist_moe with an unfinished backward")
+        if any(module._graph_bound for module in modules):
+            raise RuntimeError("delete_cuda_graphs before closing the dist_moe runtime")
         torch.cuda.synchronize(modules[0].owners[0].device)
         context.close()
         for module in modules:
@@ -230,14 +235,18 @@ def dist_moe_runtime_lifecycle(function):
         try:
             return function(*args, **kwargs)
         finally:
-            if sys.exc_info()[0] is None:
+            training_failed = sys.exc_info()[0] is not None
+            try:
+                if any(module._graph_bound for _, modules in _CONTEXTS for module in modules):
+                    from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+
+                    delete_cuda_graphs()
                 close_dist_moe_runtime()
-            else:
+            except RuntimeError as error:
+                if not training_failed:
+                    raise
                 # Do not mask the training failure or retry a potentially failed
                 # GPU invocation. Its process owns teardown of the live context.
-                try:
-                    close_dist_moe_runtime()
-                except RuntimeError as error:
-                    warnings.warn(f"dist_moe cleanup after training failure: {error}")
+                warnings.warn(f"dist_moe cleanup after training failure: {error}")
 
     return wrapped

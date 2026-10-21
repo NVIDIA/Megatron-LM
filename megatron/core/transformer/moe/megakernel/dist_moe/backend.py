@@ -21,6 +21,8 @@ from .weights import prepare_weight
 class DistMoEMegakernel(MegakernelBackend):
     """Replace routed compute; routing and optional shared experts remain native."""
 
+    supports_cuda_graphs = True
+
     def __init__(self, config, ep_group, routed_experts, shared_experts, num_local_experts):
         super().__init__()
         del shared_experts
@@ -57,6 +59,8 @@ class DistMoEMegakernel(MegakernelBackend):
         self._weight_cache = None
         self._weight_binding = None
         self._prepared = None
+        self._graph_bound = False
+        self._graph_binding = None
         self.is_first_microbatch = True
         routed_experts.register_load_state_dict_pre_hook(self._before_expert_load)
 
@@ -88,35 +92,22 @@ class DistMoEMegakernel(MegakernelBackend):
             for param in self.owners
         )
 
-    def _complete(self, owners):
-        if any(actual is not expected for actual, expected in zip(owners, self.owners)):
-            raise RuntimeError("dist_moe gradient owner changed during backward")
+    def _check_backward_bindings(self):
         if self._weight_signature() != self._weight_binding:
             raise RuntimeError("dist_moe parameter storage/version changed during backward")
         self._grads()
+
+    def _complete(self, owners):
+        if any(actual is not expected for actual, expected in zip(owners, self.owners)):
+            raise RuntimeError("dist_moe gradient owner changed during backward")
+        self._check_backward_bindings()
         result = tuple(finish_weight_gradient(param) for param in owners)
         self._live = False
         return result
 
-    def forward(self, hidden_states, probs, routing_map):
-        """Execute with borrowed payloads and direct optimizer-visible accumulation."""
-        if self.context is None:
-            raise RuntimeError("call initialize_dist_moe_runtime after wrapping the model in DDP")
-        import dist_moe
-
-        if self._live:
-            raise RuntimeError("dist_moe requires each microbatch backward before its next forward")
-        if torch.cuda.current_stream(hidden_states.device).cuda_stream != self._stream:
-            raise RuntimeError("dist_moe must execute on the stream used to initialize its runtime")
-        shape = hidden_states.shape
-        x = hidden_states.reshape(-1, shape[-1]).contiguous()
-        if not 1 <= x.shape[0] <= self.context.config.max_num_local_input_tokens:
-            raise ValueError("dist_moe input exceeds its initialized physical-token bound")
-        scores, ids = routing_map_to_indices(
-            probs.reshape(x.shape[0], -1), routing_map.reshape(x.shape[0], -1), self.topk
-        )
+    def _prepare_weights(self, first_microbatch=False):
         binding = self._weight_signature()
-        if self._prepared is None or self.is_first_microbatch or binding != self._weight_binding:
+        if self._prepared is None or first_microbatch or binding != self._weight_binding:
             cached = (None, None) if self._weight_cache is None else self._weight_cache
             prepared = [
                 prepare_weight(param, use_mxfp8=self.use_mxfp8, cached=cache)
@@ -126,8 +117,90 @@ class DistMoEMegakernel(MegakernelBackend):
             self._weight_cache = tuple(item[1] for item in prepared)
             self._weight_binding = binding
         self.is_first_microbatch = False
+
+    def _graph_storage_binding(self):
+        operands = []
+        for weight in self._prepared:
+            if self.use_mxfp8:
+                operands.extend(
+                    (weight.fprop_data, weight.fprop_scale, weight.dgrad_data, weight.dgrad_scale)
+                )
+            else:
+                operands.append(weight)
+        return (
+            tuple(id(owner) for owner in self.owners),
+            tuple(storage_signature(tensor) for tensor in (*operands, *self._grads())),
+        )
+
+    def cuda_graph_capture_prepare(self):
+        """Materialize stable operands before the local runner begins capture."""
+        if self.context is None or self._live:
+            raise RuntimeError("dist_moe capture requires an initialized, idle runtime")
+        self._prepare_weights(first_microbatch=True)
+        binding = self._graph_storage_binding()
+        if self._graph_bound and binding != self._graph_binding:
+            raise RuntimeError("dist_moe CUDA graph storage changed; delete and recapture graphs")
+        self._graph_binding = binding
+        self._graph_bound = True
+
+    def cuda_graph_prepare_replay(self, is_first_microbatch, grad_enabled):
+        """Refresh scales after native DDP gathering, outside the captured graph."""
+        if not self._graph_bound or self.context is None or self._live:
+            raise RuntimeError("dist_moe replay requires an idle captured runtime")
+        self._prepare_weights(first_microbatch=is_first_microbatch)
+        if self._graph_storage_binding() != self._graph_binding:
+            raise RuntimeError("dist_moe CUDA graph storage changed; delete and recapture graphs")
+        self._live = grad_enabled
+
+    def cuda_graph_prepare_backward(self):
+        """Reject stale graph operands before the GPU can read or write them."""
+        if not self._live:
+            raise RuntimeError("dist_moe backward replay requires a live forward")
+        self._check_backward_bindings()
+
+    def cuda_graph_finish_replay(self):
+        """Release this frame; the local runner completes native DDP owner edges."""
+        self._live = False
+
+    def cuda_graph_release(self):
+        """Release borrowed graph storage before runtime or model teardown."""
+        if not self._graph_bound:
+            return
+        if self._live:
+            raise RuntimeError("cannot delete dist_moe graphs with an unfinished backward")
+        torch.cuda.synchronize(self.owners[0].device)
+        self._graph_bound = False
+        self._graph_binding = None
+
+    def forward(self, hidden_states, probs, routing_map):
+        """Execute with borrowed payloads and direct optimizer-visible accumulation."""
+        if self.context is None:
+            raise RuntimeError("call initialize_dist_moe_runtime after wrapping the model in DDP")
+        import dist_moe
+
+        if self._live:
+            raise RuntimeError("dist_moe requires each microbatch backward before its next forward")
+        capturing = torch.cuda.is_current_stream_capturing()
+        if torch.cuda.current_stream(hidden_states.device).cuda_stream != self._stream and not (
+            capturing and self._graph_bound
+        ):
+            raise RuntimeError("dist_moe must execute on the stream used to initialize its runtime")
+        shape = hidden_states.shape
+        x = hidden_states.reshape(-1, shape[-1]).contiguous()
+        if not 1 <= x.shape[0] <= self.context.config.max_num_local_input_tokens:
+            raise ValueError("dist_moe input exceeds its initialized physical-token bound")
+        scores, ids = routing_map_to_indices(
+            probs.reshape(x.shape[0], -1), routing_map.reshape(x.shape[0], -1), self.topk
+        )
+        if not capturing:
+            self._prepare_weights(first_microbatch=self.is_first_microbatch)
+        elif not self._graph_bound or self._graph_storage_binding() != self._graph_binding:
+            raise RuntimeError("dist_moe capture requires stable, prepared graph operands")
         integration = dist_moe.WgradIntegration(
-            owners=self.owners, destinations=self._grads(), completion_fn=self._complete
+            owners=self.owners,
+            destinations=self._grads(),
+            completion_fn=self._complete,
+            graph_runner=self._graph_bound,
         )
         self._live = torch.is_grad_enabled()
         output = dist_moe.routed_experts(
@@ -148,13 +221,17 @@ class DistMoEMegakernel(MegakernelBackend):
         pass
 
     def _invalidate_weights(self):
+        if self._graph_bound:
+            raise RuntimeError("delete_cuda_graphs before invalidating dist_moe weights")
         self._weight_cache = self._prepared = self._weight_binding = None
         self.is_first_microbatch = True
 
     def _before_expert_load(self, module, state_dict, prefix, local_metadata, *args):
         # Guard the native owner before its FC1/FC2 children can copy or replace
         # parameters. In-place loads retain DDP buffers and the idle context.
-        if self._live:
+        if self._live or self._graph_bound:
+            if self._graph_bound:
+                raise RuntimeError("delete_cuda_graphs before loading dist_moe weights")
             raise RuntimeError("cannot load dist_moe weights with an unfinished backward")
         if local_metadata.get("assign_to_params_buffers", False):
             raise RuntimeError("dist_moe requires load_state_dict(assign=False) to preserve owners")

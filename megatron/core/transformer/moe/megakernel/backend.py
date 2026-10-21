@@ -13,6 +13,27 @@ class MegakernelBackend(nn.Module, ABC):
     """Backend-neutral interface for replacing an MCore MoE layer."""
 
     handles_shared_expert: bool = False
+    supports_cuda_graphs: bool = False
+
+    def cuda_graph_capture_prepare(self):
+        """Bind stable runtime storage before a local runner captures this module."""
+        raise NotImplementedError
+
+    def cuda_graph_prepare_replay(self, is_first_microbatch, grad_enabled):
+        """Prepare an invocation after the runner's native DDP pre-forward hooks."""
+        raise NotImplementedError
+
+    def cuda_graph_prepare_backward(self):
+        """Validate borrowed operands before any captured backward work launches."""
+        raise NotImplementedError
+
+    def cuda_graph_finish_replay(self):
+        """Complete runtime ownership after the runner joins backward execution."""
+        raise NotImplementedError
+
+    def cuda_graph_release(self):
+        """Release the runner's runtime binding when its graphs are deleted."""
+        raise NotImplementedError
 
     @abstractmethod
     def forward(
