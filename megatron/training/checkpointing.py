@@ -686,6 +686,7 @@ def save_checkpoint(
             save, as a finalize function of an asynchronous one.
     """
     start_ckpt = time()
+    cfg = get_run_config()
     args = get_args()
 
     if args.async_save and not is_empty_async_queue():

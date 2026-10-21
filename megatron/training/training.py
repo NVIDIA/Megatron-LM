@@ -2798,6 +2798,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
         if hasattr(args, f.name):
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
+    # Resolve dtypes and derived flags (e.g. use_precision_aware_optimizer_no_fp8_or_ds_fp8)
+    # that the optimizer reads; this config is built from args, not from the finalized run config.
+    config.finalize_optimizer_config()
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
@@ -2810,6 +2813,7 @@ def get_megatron_ddp_config(
 ) -> DistributedDataParallelConfig:
     """Return an MCore DDPConfig from the argparse arguments."""
 
+    cfg = get_run_config()
     if use_torch_fsdp2:
         reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
         return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
