@@ -3424,8 +3424,10 @@ class TestMultiTokenPrediction:
 
         torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0]))
 
-    def test_roll_tensor_local_packed_gradients_with_trailing_slots(self):
-        tensor = torch.arange(20, dtype=torch.float32).reshape(2, 10).requires_grad_()
+    @pytest.mark.parametrize("dims", [-1, 0])
+    def test_roll_tensor_local_packed_gradients_with_trailing_slots(self, dims):
+        tensor = torch.arange(20, dtype=torch.float32).reshape(2, 10).movedim(-1, dims)
+        tensor.requires_grad_()
         logical = torch.tensor([0, 3], dtype=torch.int32)
         physical = torch.tensor([0, 8], dtype=torch.int32)
         packed = PackedSeqParams(
@@ -3437,14 +3439,16 @@ class TestMultiTokenPrediction:
         )
         weights = torch.arange(1, 21, dtype=torch.float32).reshape_as(tensor)
 
-        rolled, rolled_sum = roll_tensor(tensor, packed_seq_params=packed, return_sum=False)
+        rolled, rolled_sum = roll_tensor(
+            tensor, dims=dims, packed_seq_params=packed, return_sum=False
+        )
         assert rolled_sum is None
         (rolled * weights).sum().backward()
 
         expected_grad = torch.zeros_like(tensor)
-        expected_grad[:, 1] = weights[:, 0]
-        expected_grad[:, 2] = weights[:, 1]
-        expected_grad[:, 9] = weights[:, 8]
+        expected_grad.select(dims, 1).copy_(weights.select(dims, 0))
+        expected_grad.select(dims, 2).copy_(weights.select(dims, 1))
+        expected_grad.select(dims, 9).copy_(weights.select(dims, 8))
         torch.testing.assert_close(tensor.grad, expected_grad)
 
     def test_roll_tensor_with_no_packed_documents_rolls_trailing_slots(self):
@@ -4735,14 +4739,24 @@ class TestRollTensorWithCPSubgroup:
         assert seen_groups, "CP boundary exchange must go through batch_isend_irecv"
         assert all(group is cp_group for group in seen_groups)
 
-    def test_roll_tensor_packed_seq_cp_boundary_exchange(self):
+    @pytest.mark.parametrize("dims", [-1, 0])
+    def test_roll_tensor_packed_seq_cp_boundary_exchange(self, monkeypatch, dims):
         cp_group = get_context_parallel_group()
         cp_size = cp_group.size()
         cp_rank = torch.distributed.get_rank(group=cp_group)
 
+        seen_batches = []
+        real_batch_isend_irecv = torch.distributed.batch_isend_irecv
+
+        def spy_batch_isend_irecv(ops):
+            seen_batches.append([op.group for op in ops])
+            return real_batch_isend_irecv(ops)
+
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", spy_batch_isend_irecv)
+
         seq_lengths = [8, 16]  # each divisible by 2 * cp_size
         cu_seqlens = torch.tensor([0, 8, 24], dtype=torch.int32, device="cuda")
-        full = torch.arange(1 * 24, dtype=torch.float32, device="cuda").reshape(1, 24)
+        full = torch.arange(2 * 24, dtype=torch.float32, device="cuda").reshape(2, 24)
 
         packed_seq_params = PackedSeqParams(cu_seqlens_q=cu_seqlens)
         # Oracle: single-rank packed semantics (per-sequence roll) on the full tensor.
@@ -4759,14 +4773,17 @@ class TestRollTensorWithCPSubgroup:
                 start += length
             return torch.cat(pieces, dim=-1)
 
-        expected_local = shard_packed(expected_full)
-        local = shard_packed(full).contiguous()
+        expected_local = shard_packed(expected_full).movedim(-1, dims)
+        local = shard_packed(full).movedim(-1, dims).contiguous()
         rolled, rolled_sum = roll_tensor(
-            local, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            local, shifts=-1, dims=dims, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
         assert torch.equal(rolled, expected_local)
         assert rolled_sum == expected_local.sum()
+        assert len(seen_batches) == 1, "All packed documents must share one boundary exchange"
+        assert seen_batches[0]
+        assert all(group is cp_group for group in seen_batches[0])
 
 
 class TestLearnedOutputContract:
