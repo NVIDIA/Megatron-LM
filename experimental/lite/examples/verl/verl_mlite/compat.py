@@ -1491,6 +1491,274 @@ def _patch_verl_padding_helpers() -> bool:
     return True
 
 
+def _load_vllm_flashmla_first() -> bool:
+    """Load vLLM's FlashMLA before Megatron Core imports pip ``flash_mla``.
+
+    The two extensions share kernel symbols and the first loaded serves both;
+    see ``megatron.lite.model.deepseek_v41.vllm.load_vllm_flashmla``.
+    """
+    if os.environ.get("DSV41_ATTENTION_CORE") != "flashmla" or not _vllm_importable():
+        return False
+    importlib.import_module("vllm.v1.attention.ops.flashmla")
+    return True
+
+
+def _patch_verl_val_max_tokens() -> bool:
+    """Cap validation responses at ``VERL_MLITE_VAL_MAX_TOKENS`` tokens.
+
+    VERL validates with the rollout ``response_length``; the AIME output budget is fixed
+    separately (4096) and must not grow with the training response length.
+    """
+    limit = os.environ.get("VERL_MLITE_VAL_MAX_TOKENS")
+    if not limit:
+        return False
+    try:
+        mod = importlib.import_module("verl.experimental.agent_loop.agent_loop")
+    except Exception:
+        return False
+    worker_cls = getattr(mod, "AgentLoopWorker", None)
+    if worker_cls is None or getattr(worker_cls._run_agent_loop, "_verl_mlite_val_cap", False):
+        return worker_cls is not None
+    orig = worker_cls._run_agent_loop
+    cap = int(limit)
+
+    async def _run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
+        if trajectory.get("validate"):
+            sampling_params = {**sampling_params, "max_tokens": cap}
+        return await orig(self, sampling_params, trajectory, *args, **kwargs)
+
+    _run_agent_loop._verl_mlite_val_cap = True
+    worker_cls._run_agent_loop = _run_agent_loop
+    return True
+
+
+def _weights_pool_gaps(worker, exclude_named: bool = False):
+    """Byte ranges of the CuMem ``weights`` pool not covered by target-model parameter storage.
+
+    Level-2 sleep discards the whole pool, but only the target parameters are rewritten by the
+    per-step sync; everything else there (drafter weights, ``bias_vl``-style untrained params,
+    rope caches, index maps, packed tables, speculator state allocated during load) must be kept.
+    """
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    pool = sorted(
+        (int(d.handle[2]), int(d.handle[1]))
+        for d in CuMemAllocator.get_instance().pointer_to_data.values()
+        if d.tag == "weights"
+    )
+    model = worker.model_runner.model
+    tensors = [t for n, t in model.named_parameters() if exclude_named or not n.endswith("bias_vl")]
+    if exclude_named:
+        # vLLM itself keeps buffers and sleep_preserve_parameter_names matches (drafter, bias_vl).
+        draft = worker.get_draft_model()
+        tensors += list(model.buffers())
+        if draft is not None:
+            tensors += list(draft.parameters()) + list(draft.buffers())
+    synced = []
+    for t in tensors:
+        if t.is_cuda:
+            st = t.untyped_storage()
+            if st.nbytes():
+                synced.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+    synced.sort()
+    gaps, i = [], 0
+    for base, size in pool:
+        cur, end = base, base + size
+        while i < len(synced) and synced[i][1] <= cur:
+            i += 1
+        j = i
+        while j < len(synced) and synced[j][0] < end:
+            lo, hi = synced[j]
+            if lo > cur:
+                gaps.append((cur, lo - cur))
+            cur = max(cur, hi)
+            j += 1
+        if cur < end:
+            gaps.append((cur, end - cur))
+    return gaps
+
+
+def _attr_tensor_ranges(worker, pattern: str = ""):
+    """Storage ranges of plain CUDA tensor attributes (not params/buffers) of target and drafter
+    modules whose ``<module>.@<attr>`` name contains ``pattern``."""
+    import torch
+
+    ranges = []
+    draft = worker.get_draft_model()
+    for prefix, root in (("", worker.model_runner.model), ("draft.", draft)):
+        if root is None:
+            continue
+        for mname, mod in root.named_modules():
+            for k, v in vars(mod).items():
+                if k in ("_parameters", "_buffers") or not isinstance(v, torch.Tensor):
+                    continue
+                if v.is_cuda and pattern in f"{prefix}{mname}.@{k}":
+                    st = v.untyped_storage()
+                    if st.nbytes():
+                        ranges.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+    return sorted(ranges)
+
+
+def _clip_ranges(gaps, ranges, inside: bool):
+    """``gaps`` (ptr, size) intersected with (``inside``) or minus ``ranges`` (lo, hi)."""
+    out = []
+    for ptr, size in gaps:
+        cur, end = ptr, ptr + size
+        for lo, hi in ranges:
+            if hi <= cur or lo >= end:
+                continue
+            lo, hi = max(lo, cur), min(hi, end)
+            if inside:
+                out.append((lo, hi - lo))
+            elif lo > cur:
+                out.append((cur, lo - cur))
+            cur = max(cur, hi)
+        if not inside and cur < end:
+            out.append((cur, end - cur))
+    merged = []
+    for ptr, size in sorted(set(out)):
+        if merged and ptr < merged[-1][0] + merged[-1][1]:
+            last = merged[-1]
+            merged[-1] = (last[0], max(last[0] + last[1], ptr + size) - last[0])
+        else:
+            merged.append((ptr, size))
+    return merged
+
+
+def _patch_vllm_sleep_level2_retention() -> bool:
+    """Level-2 sleep keeps every weights-pool byte that the actor sync does not rewrite.
+
+    vLLM saves only named buffers and ``sleep_preserve_parameter_names`` matches; DS4.1's
+    drafter, untrained gate bias and plain tensor attributes came back uninitialized (illegal
+    address in the dspark proposer). Copies the gaps to host before suspend, back after the
+    weights wake (before the sync reload). ``VERL_MLITE_L2_RETENTION``: ``0`` (default)
+    disables; ``unnamed`` keeps only bytes no parameter or buffer owns; ``1`` keeps every
+    unsynced byte; ``attrs[:<pattern>]`` / ``ownerless`` split ``unnamed`` into plain tensor
+    attributes (optionally by ``<module>.@<attr>`` substring) and the rest. Off by default: vLLM keeps buffers and the ``sleep_preserve_parameter_names``
+    matches (drafter, bias_vl), and the one ownerless state the reload read (mega-attn wq_b/wo_a
+    load permutations) is host-resident since vLLM 00474aeec6.
+    """
+    mode = os.environ.get("VERL_MLITE_L2_RETENTION", "0")
+    known_mode = mode in ("1", "unnamed", "ownerless") or mode.startswith("attrs")
+    if not known_mode or not _vllm_importable():
+        return False
+    exclude_named = mode != "1"
+    try:
+        worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
+    except Exception:
+        return False
+    worker_cls = getattr(worker_mod, "Worker", None)
+    if worker_cls is None:
+        return False
+    if getattr(worker_cls.sleep, "_verl_mlite_l2_retention", False):
+        return True
+    import ctypes
+
+    import torch
+
+    orig_sleep, orig_wake = worker_cls.sleep, worker_cls.wake_up
+
+    def _cuda():
+        return ctypes.CDLL("libcuda.so.1")
+
+    def sleep(self, level: int = 1) -> None:
+        if level == 2:
+            torch.cuda.synchronize()
+            cu, saved, total = _cuda(), [], 0
+            gaps = _weights_pool_gaps(self, exclude_named)
+            if mode == "ownerless" or mode.startswith("attrs"):
+                pattern = mode.partition(":")[2]
+                gaps = _clip_ranges(gaps, _attr_tensor_ranges(self, pattern), mode != "ownerless")
+            for ptr, size in gaps:
+                # Exact-size page-locked copy (pin_memory() rounds each block up to a power of 2).
+                host = torch.empty(size, dtype=torch.uint8)
+                torch.cuda.check_error(
+                    torch.cuda.cudart().cudaHostRegister(host.data_ptr(), size, 0)
+                )
+                rc = cu.cuMemcpyDtoH_v2(
+                    ctypes.c_void_p(host.data_ptr()), ctypes.c_uint64(ptr), ctypes.c_size_t(size)
+                )
+                if rc != 0:
+                    raise RuntimeError(
+                        f"level-2 retention copy-out failed ({rc}) at {hex(ptr)}+{size}"
+                    )
+                saved.append((ptr, host))
+                total += size
+            self._verl_mlite_l2_saved = saved
+            print(
+                f"verl_mlite: level-2 sleep keeps {len(saved)} weights-pool ranges, {total / 2**30:.2f} GiB",
+                flush=True,
+            )
+        return orig_sleep(self, level)
+
+    def wake_up(self, tags=None) -> None:
+        orig_wake(self, tags)
+        saved = getattr(self, "_verl_mlite_l2_saved", None)
+        if saved and (tags is None or "weights" in tags):
+            cu = _cuda()
+            for ptr, host in saved:
+                rc = cu.cuMemcpyHtoD_v2(
+                    ctypes.c_uint64(ptr),
+                    ctypes.c_void_p(host.data_ptr()),
+                    ctypes.c_size_t(host.numel()),
+                )
+                if rc != 0:
+                    raise RuntimeError(f"level-2 retention copy-in failed ({rc}) at {hex(ptr)}")
+            torch.cuda.synchronize()
+            for _, host in saved:
+                torch.cuda.cudart().cudaHostUnregister(host.data_ptr())
+            self._verl_mlite_l2_saved = None
+
+    sleep._verl_mlite_l2_retention = True
+    worker_cls.sleep, worker_cls.wake_up = sleep, wake_up
+    return True
+
+
+def _patch_vllm_sleep_fingerprint() -> bool:
+    """Diagnostics: fingerprint target and drafter state at every level-2 sleep.
+
+    Enabled by ``VERL_MLITE_SLEEP_FP_DIR``. Sleep 1 sees the freshly loaded model, later sleeps
+    see the state after sync and rollout, so any byte the sleep cycle lost shows up as a diff.
+    """
+    out_dir = os.environ.get("VERL_MLITE_SLEEP_FP_DIR")
+    if not out_dir or not _vllm_importable():
+        return False
+    try:
+        worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
+    except Exception:
+        return False
+    worker_cls = getattr(worker_mod, "Worker", None)
+    if worker_cls is None or getattr(worker_cls.sleep, "_verl_mlite_sleep_fp", False):
+        return worker_cls is not None
+    orig_sleep = worker_cls.sleep
+
+    def sleep(self, level: int = 1) -> None:
+        if level == 2:
+            import json
+            import socket
+
+            from verl_mlite.c8_fingerprint import fingerprint_model
+
+            n = getattr(self, "_verl_mlite_sleep_n", 0) + 1
+            self._verl_mlite_sleep_n = n
+            draft = self.get_draft_model()
+            rank = self.vllm_config.parallel_config.data_parallel_rank
+            os.makedirs(out_dir, exist_ok=True)
+            with open(f"{out_dir}/{socket.gethostname()}_dp{rank}_sleep{n}.json", "w") as f:
+                json.dump(
+                    {
+                        "target": fingerprint_model(self.model_runner.model),
+                        "draft": {} if draft is None else fingerprint_model(draft),
+                    },
+                    f,
+                )
+        return orig_sleep(self, level)
+
+    sleep._verl_mlite_sleep_fp = True
+    worker_cls.sleep = sleep
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_verl_padding_helpers()
@@ -1503,6 +1771,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("03.vllm_thin_finder", result)
     result = _install_vllm_triton_kernels_alias()
     _trace_runtime_patch("04.vllm_triton_kernels_alias", result)
+    result = _load_vllm_flashmla_first()
+    _trace_runtime_patch("04b.vllm_flashmla_first", result)
     result = _patch_verl_vllm_device_uuid()
     _trace_runtime_patch("05.verl_vllm_device_uuid", result)
     # Importing VERL's vLLM utilities can rebuild Transformers' lazy top-level
@@ -1525,6 +1795,12 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08e.vllm_rollout_sleep_level", result)
     result = _patch_verl_vllm_headless_api_server_count()
     _trace_runtime_patch("08f.headless_api_server_count", result)
+    result = _patch_vllm_sleep_level2_retention()
+    _trace_runtime_patch("08g.vllm_sleep_level2_retention", result)
+    result = _patch_vllm_sleep_fingerprint()
+    _trace_runtime_patch("08h.vllm_sleep_fingerprint", result)
+    result = _patch_verl_val_max_tokens()
+    _trace_runtime_patch("08i.verl_val_max_tokens", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")

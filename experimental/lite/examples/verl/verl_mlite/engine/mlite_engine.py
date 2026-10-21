@@ -282,6 +282,13 @@ class MegatronLiteEngine(BaseEngine):
     def is_optimizer_offload_enabled(self) -> bool:
         return self.engine_config.optimizer_offload
 
+    @property
+    def _release_grads(self) -> bool:
+        return (
+            bool(getattr(self.engine_config, "grad_offload", False))
+            and not self.is_param_offload_enabled
+        )
+
     def initialize(self):
         if self.engine_config.full_determinism:
             from verl.workers.engine.utils import enable_full_determinism
@@ -308,7 +315,7 @@ class MegatronLiteEngine(BaseEngine):
             device="cpu",
             model=self.is_param_offload_enabled,
             optimizer=self.is_optimizer_offload_enabled,
-            grad=self.is_param_offload_enabled,
+            grad=self.is_param_offload_enabled or self._release_grads,
         )
 
     def train_mode(self, **kwargs):
@@ -439,6 +446,9 @@ class MegatronLiteEngine(BaseEngine):
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         self._require_initialized()
+        if self._release_grads and not model:
+            # VERL marks the training boundary with optimizer=True when params stay resident.
+            grad = grad or optimizer
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
@@ -499,6 +509,7 @@ class MegatronLiteEngine(BaseEngine):
         finally:
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+            aggressive_empty_cache(force_sync=True)
 
     def _save_hf_checkpoint(self, local_path: str) -> None:
         proto = self.handle._extras.get("protocol")

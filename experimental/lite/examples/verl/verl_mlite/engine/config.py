@@ -35,6 +35,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     resync_format: str | None = None
     resync_config: dict[str, Any] = field(default_factory=dict)
     router_replay_mode: str = "disabled"
+    grad_offload: bool = False
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
@@ -49,11 +50,7 @@ class MegatronLiteEngineConfig(EngineConfig):
         if self.resync_format is not None:
             from megatron.lite.runtime.contracts.weights import ResyncFormat
 
-            object.__setattr__(
-                self,
-                "resync_format",
-                ResyncFormat.parse(self.resync_format).value,
-            )
+            object.__setattr__(self, "resync_format", ResyncFormat.parse(self.resync_format).value)
         if not isinstance(self.resync_config, Mapping):
             raise TypeError("resync_config must be a mapping")
         object.__setattr__(self, "resync_config", dict(self.resync_config))
@@ -63,9 +60,7 @@ class MegatronLiteEngineConfig(EngineConfig):
         if self.resync_config and self.resync_format is None:
             raise ValueError("resync_config requires resync_format")
         if self.qat.get("enable", False) and self.resync_format is not None:
-            raise ValueError(
-                "qat online export and native resync_format are mutually exclusive"
-            )
+            raise ValueError("qat online export and native resync_format are mutually exclusive")
         if self.router_replay_mode not in ("disabled", "R3"):
             raise ValueError(
                 "MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', "

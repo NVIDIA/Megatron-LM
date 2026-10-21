@@ -145,7 +145,67 @@ def test_sparse_recipe_forwards_contract_to_existing_ray(tmp_path):
             arg.startswith('++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_BI_' + name + '=')
             for arg in argv
         )
-    assert not any('MEGA_ATTN' in arg or 'grad_offload=' in arg for arg in argv)
-    env['ROLLOUT_SLEEP_LEVEL'] = '2'
+    assert 'actor_rollout_ref.actor.engine.grad_offload=False' in argv
+    assert '++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_BI_MEGA_ATTN="0"' in argv
+    env.update(
+        ROLLOUT_SPEC='True',
+        ROLLOUT_SLEEP_LEVEL='2',
+        GRAD_OFFLOAD='True',
+        DSV41_ATTENTION_CORE='mega',
+        DSV41_HEAD_DTYPE='bfloat16',
+    )
+    argv = shlex.split(subprocess.check_output(['bash', str(script)], env=env, text=True))
+    assert 'actor_rollout_ref.actor.engine.grad_offload=True' in argv
+    assert '+actor_rollout_ref.actor.engine.impl_cfg.attention_core=mega' in argv
+    assert '+actor_rollout_ref.actor.engine.impl_cfg.head_dtype=bfloat16' in argv
+    assert (
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides={head_dtype:bfloat16}' in argv
+    )
+    assert (
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHMLA_MEGA_ATTN_DSV41'
+        in argv
+    )
+    assert any('speculative_config={method:dspark,' in a for a in argv)
+    assert any(
+        'sleep_preserve_parameter_names=' in a and 'draft.*' in a and '*.bias_vl' in a for a in argv
+    )
+    assert '++ray_kwargs.ray_init.runtime_env.env_vars.VLLM_USE_V2_MODEL_RUNNER="1"' in argv
+    assert '++ray_kwargs.ray_init.runtime_env.env_vars.VERL_MLITE_ROLLOUT_SLEEP_LEVEL="2"' in argv
+    env['ROLLOUT_SLEEP_LEVEL'] = '3'
     rejected = subprocess.run(['bash', str(script)], env=env, capture_output=True, text=True)
-    assert rejected.returncode != 0 and 'level-2 reload not admitted' in rejected.stderr
+    assert rejected.returncode != 0 and 'must be 1 or 2' in rejected.stderr
+
+
+def test_retention_range_bisection_is_byte_exact():
+    gaps = [(100, 100), (300, 100)]
+    owners = [(90, 120), (110, 130), (150, 170), (180, 250), (340, 360)]
+    inside = compat._clip_ranges(gaps, owners, True)
+    outside = compat._clip_ranges(gaps, owners, False)
+
+    def bytes_of(ranges):
+        return {i for start, size in ranges for i in range(start, start + size)}
+
+    original = bytes_of(gaps)
+    assert bytes_of(inside) | bytes_of(outside) == original
+    assert not bytes_of(inside) & bytes_of(outside)
+    assert bytes_of(inside) == original & {i for lo, hi in owners for i in range(lo, hi)}
+
+
+def test_fingerprint_detects_mutation_and_shared_storage():
+    from verl_mlite.c8_fingerprint import fingerprint_model
+
+    model = torch.nn.Linear(3, 2)
+    model.register_buffer('shared', model.weight.detach())
+    before = fingerprint_model(model)
+    assert before['.shared'] == ['alias']
+    with torch.no_grad():
+        model.weight[0, 0] += 1
+    assert before['.weight'] != fingerprint_model(model)['.weight']
+
+
+def test_level2_retention_is_opt_in(monkeypatch):
+    monkeypatch.delenv('VERL_MLITE_L2_RETENTION', raising=False)
+    monkeypatch.setattr(
+        compat, '_vllm_importable', lambda: pytest.fail('default must not import vllm')
+    )
+    assert not compat._patch_vllm_sleep_level2_retention()

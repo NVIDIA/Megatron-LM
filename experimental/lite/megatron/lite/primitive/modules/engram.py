@@ -103,6 +103,9 @@ class Engram(nn.Module):
 class ShardedFrozenTable(nn.Module):
     """Frozen row-sharded FP8 table (E4M3 rows, E8M0 scale per 32) in pinned host memory."""
 
+    # Resume retains the immutable table loaded from the release checkpoint.
+    restored_from_release = True
+
     def __init__(self, rows, width, group, *, block=32, initialize=True):
         super().__init__()
         if width % block:

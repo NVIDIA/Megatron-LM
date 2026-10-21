@@ -11,11 +11,17 @@ def local_tensors(module):
 
 
 def _sharded_state(module, prefix, offsets, ps, metadata):
-    """Core sharded state for the Row-sharded tree."""
+    """Core sharded state for the Row-sharded tree.
+
+    Modules marked ``restored_from_release`` (frozen tables) are left out: resume keeps
+    the bytes loaded from the release.
+    """
     from megatron.core.dist_checkpointing.mapping import ShardedTensor
     from megatron.core.transformer.module import MegatronModule
     from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+    if getattr(module, "restored_from_release", False):
+        return {}
     lookup = getattr(module, "lookup", None)
     if getattr(lookup, "group", None) is not None:
         size, rank = lookup.group.size(), lookup.group.rank()

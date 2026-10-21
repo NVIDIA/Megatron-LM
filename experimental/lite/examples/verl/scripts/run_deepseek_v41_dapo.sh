@@ -38,22 +38,26 @@ MAX_SEQ_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 OVERLONG_BUFFER_LEN="${OVERLONG_BUFFER_LEN:-4096}"
 # Each Ray worker imports vLLM via the verl_mlite sitecustomize (~50 s); cap the prestarted pool.
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-null}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.70}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.65}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-64}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}"
 # DSpark speculative decoding (drafter frozen at the release; target-only sync).
-ROLLOUT_SPEC="${ROLLOUT_SPEC:-False}"
-if [[ "$ROLLOUT_SPEC" =~ ^(True|true|1)$ ]]; then
-  echo "DSpark is outside the admitted two-step DS4.1 recipe" >&2; exit 2
-fi
-# Level 1 is the validated-lifecycle target. Level 2 is disabled until native
-# reload preserves all ownerless layout tensors; no retention-by-address fallback.
-ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-1}"
+ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
+# Level 2 uses native vLLM preservation for frozen drafter/router state; requires
+# vLLM 00474aeec6 or newer (reload permutations stay on host).
+ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
+ROLLOUT_FULL_DETERMINISM="${ROLLOUT_FULL_DETERMINISM:-True}"
+PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-5120}"
+LOG_PROB_MAX_TOKEN_LEN="${LOG_PROB_MAX_TOKEN_LEN:-${MAX_SEQ_LEN}}"
+export DSV41_ATTENTION_CORE="${DSV41_ATTENTION_CORE:-flashmla}"
+export DSV41_HEAD_DTYPE="${DSV41_HEAD_DTYPE:-float32}"
+INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
+INDEXER_SPARSE_LOGITS="${INDEXER_SPARSE_LOGITS:-false}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
 
-# Keep model/gradient buffers resident; offload only optimizer state in chunks.
-# Independent gradient storage release remains disabled pending its GPU RCA.
+# Parameters stay resident; optimizer states offload in chunks. Independent gradient
+# release is opt-in until its separate RL gate passes.
 OPTIMIZER_STATE_CHUNK_MB="${OPTIMIZER_STATE_CHUNK_MB:-2048}"
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-False}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
@@ -90,9 +94,19 @@ export VERL_MLITE_VAL_MAX_TOKENS="${VAL_MAX_TOKENS}"
 export VLLM_BATCH_INVARIANT=1 VERL_FULL_DETERMINISM=1
 export VLLM_BI_MXFP8_GEMM=tensor_core VLLM_BI_BF16_GEMM=tensor_core
 export VLLM_BI_MXFP8_PREQUANT=1 VLLM_BI_MHC_OVERLAP=1
-unset VLLM_BI_MEGA_ATTN VLLM_BI_MEGA_GATE VLLM_BI_MEGA_MHC
-[[ "$ROLLOUT_SLEEP_LEVEL" == 1 ]] || { echo "DS4.1 level-2 reload not admitted; use level 1" >&2; exit 2; }
-[[ "$GRAD_OFFLOAD" =~ ^(False|false|0)$ ]] || { echo "Independent grad release is not admitted" >&2; exit 2; }
+case "$DSV41_ATTENTION_CORE" in
+  flashmla) ATTENTION_BACKEND=FLASHMLA_SPARSE_DSV41; export VLLM_BI_MEGA_ATTN=0 ;;
+  mega) ATTENTION_BACKEND=FLASHMLA_MEGA_ATTN_DSV41; export VLLM_BI_MEGA_ATTN=1 ;;
+  *) echo "DSV41_ATTENTION_CORE must be flashmla or mega" >&2; exit 2 ;;
+esac
+case "$DSV41_HEAD_DTYPE" in
+  float32|bfloat16) ;;
+  *) echo "DSV41_HEAD_DTYPE must be float32 or bfloat16" >&2; exit 2 ;;
+esac
+[[ "$ROLLOUT_SLEEP_LEVEL" =~ ^[12]$ ]] || { echo "ROLLOUT_SLEEP_LEVEL must be 1 or 2" >&2; exit 2; }
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_BI_MEGA_GATE="${VLLM_BI_MEGA_GATE:-0}" VLLM_BI_MEGA_MHC="${VLLM_BI_MEGA_MHC:-0}"
+export MCORE_DIST_CKPT_STREAM_D2H=0  # Use the unmodified Core checkpoint writer.
 export VLLM_BI_REPLAY_STAGE_LAYERS=2
 export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}" NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 export VERL_MLITE_SKIP_RUNTIME_PATCHES=0
@@ -106,7 +120,8 @@ CHAT_TEMPLATE="$(<"${SCRIPT_DIR}/deepseek_v41_${PROMPT_MODE}_template.jinja")"
 
 case "${ROLLOUT_SPEC,,}" in
   true|1) SPEC_ARGS=("+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config={method:dspark,num_speculative_tokens:5,draft_sample_method:probabilistic,rejection_sample_method:block,enable_adaptive_verification:false}") ;;
-  *) SPEC_ARGS=() ;;
+  false|0) SPEC_ARGS=() ;;
+  *) echo 'ROLLOUT_SPEC must be true or false' >&2; exit 2 ;;
 esac
 SLEEP_PRESERVE="'*.bias_vl'"
 [[ ${#SPEC_ARGS[@]} -gt 0 ]] && SLEEP_PRESERVE+=",'draft.*'"
@@ -139,7 +154,13 @@ names = ('VLLM_BATCH_INVARIANT', 'VLLM_BI_MXFP8_GEMM', 'VLLM_BI_BF16_GEMM',
          'VLLM_BI_MXFP8_PREQUANT', 'VLLM_BI_MHC_OVERLAP', 'VLLM_BI_REPLAY_STAGE_LAYERS',
          'VERL_MLITE_SKIP_RUNTIME_PATCHES', 'VERL_MLITE_HF_CONFIG_MODEL_TYPE',
          'VERL_MLITE_ROLLOUT_SLEEP_LEVEL', 'VERL_FULL_DETERMINISM',
-         'VLLM_BATCH_INVARIANT_KERNEL_LIB', 'CUBLAS_WORKSPACE_CONFIG')
+         'VLLM_BATCH_INVARIANT_KERNEL_LIB', 'CUBLAS_WORKSPACE_CONFIG',
+         'VLLM_USE_V2_MODEL_RUNNER', 'VLLM_BI_MEGA_ATTN', 'VLLM_BI_MEGA_GATE', 'VLLM_BI_MEGA_MHC',
+         'DSV41_ATTENTION_CORE', 'DSV41_HEAD_DTYPE', 'DSV41_MEGAMOE_MAX_TOKENS',
+         'DS41_MEGA_ATTN_DETERMINISTIC', 'DS41_MEGA_ATTN_BWD_KERNEL',
+         'VERL_MLITE_VAL_MAX_TOKENS', 'VERL_MLITE_L2_RETENTION', 'VERL_MLITE_SLEEP_FP_DIR',
+         'MLITE_DISTOPT_SHARDING_TYPE', 'MCORE_DIST_CKPT_STREAM_D2H',
+         )
 for name in names:
     if name in os.environ:
         print('++ray_kwargs.ray_init.runtime_env.env_vars.' + name + '=' + json.dumps(os.environ[name]))
@@ -186,7 +207,7 @@ COMMAND=(
   "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
   "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.actor.use_dynamic_bsz=True"
-  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}"
   "actor_rollout_ref.actor.use_kl_loss=False"
   "actor_rollout_ref.actor.kl_loss_coef=0.0"
   "actor_rollout_ref.actor.entropy_coeff=0"
@@ -206,6 +227,7 @@ COMMAND=(
   "actor_rollout_ref.actor.engine.etp=1"
   "actor_rollout_ref.actor.engine.param_offload=${PARAM_OFFLOAD}"
   "actor_rollout_ref.actor.engine.optimizer_offload=${OPTIMIZER_OFFLOAD}"
+  "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}"
   "actor_rollout_ref.actor.engine.attention_backend_override=null"
   "actor_rollout_ref.actor.engine.load_hf_weights=True"
   "actor_rollout_ref.actor.engine.export_dtype=null"
@@ -215,6 +237,8 @@ COMMAND=(
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=adam"
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=${RECOMPUTE:-full}"
   "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=True"
+  "+actor_rollout_ref.actor.engine.impl_cfg.attention_core=${DSV41_ATTENTION_CORE}"
+  "+actor_rollout_ref.actor.engine.impl_cfg.head_dtype=${DSV41_HEAD_DTYPE}"
   # rollout: resident vLLM, BI=1 sparse arm, DEP per node
   "actor_rollout_ref.rollout.name=vllm"
   "actor_rollout_ref.rollout.mode=async"
@@ -226,7 +250,7 @@ COMMAND=(
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
   "actor_rollout_ref.rollout.calculate_log_probs=True"
   "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True"
-  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${LOG_PROB_MAX_TOKEN_LEN}"
   "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.rollout.logprobs_mode=raw_logprobs"
   "actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}"
@@ -246,12 +270,12 @@ COMMAND=(
   "actor_rollout_ref.rollout.load_format=auto"
   "actor_rollout_ref.rollout.enable_rollout_routing_replay=False"
   "actor_rollout_ref.rollout.enforce_eager=False"
-  "actor_rollout_ref.rollout.full_determinism=True"
+  "actor_rollout_ref.rollout.full_determinism=${ROLLOUT_FULL_DETERMINISM}"
   "+${VLLM}.compilation_config={mode:0,cudagraph_mode:FULL_AND_PIECEWISE,cudagraph_capture_sizes:${CAPTURE},decoder_replay_cudagraph_capture_sizes:${REPLAY}}"
   "+${VLLM}.max_cudagraph_capture_size=${MAX_CAPTURE_SIZE:-16}"
-  "+${VLLM}.attention_backend=FLASHMLA_SPARSE_DSV41"
-  "+${VLLM}.attention_config={indexer_kv_dtype:mxfp4,indexer_sparse_logits:false}"
-  "+${VLLM}.hf_overrides={head_dtype:float32}"
+  "+${VLLM}.attention_backend=${ATTENTION_BACKEND}"
+  "+${VLLM}.attention_config={indexer_kv_dtype:${INDEXER_KV_DTYPE},indexer_sparse_logits:${INDEXER_SPARSE_LOGITS}}"
+  "+${VLLM}.hf_overrides={head_dtype:${DSV41_HEAD_DTYPE}}"
   "+${VLLM}.kv_cache_dtype=nvfp4_ds_mla"
   "+${VLLM}.all2all_backend=allgather_reducescatter"
   "+${VLLM}.kernel_config={enable_flashinfer_autotune:true,moe_backend:deep_gemm_mega_moe}"

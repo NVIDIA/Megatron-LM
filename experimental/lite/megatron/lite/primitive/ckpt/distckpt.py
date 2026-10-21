@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import replace
@@ -22,8 +23,13 @@ from megatron.lite.primitive.protocols import (
     default_placement_fn,
 )
 
+# dp_reshardable writes each rank's DistOpt shard straight from the existing (host-offloaded)
+# state tensors. fully_reshardable all-gathers every DP shard into fresh CPU buffers on every
+# rank, i.e. DP copies of the optimizer state per process, which OOMs the host at DS4.1 scale.
+# Resuming therefore needs the same TP/PP/EP layout; DP may change.
+_SHARDING_TYPE_ENV = "MLITE_DISTOPT_SHARDING_TYPE"
 _DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
+    "distrib_optim_sharding_type": "dp_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
@@ -104,7 +110,9 @@ def load_dist_opt_checkpoint(
 ) -> int:
     """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer."""
 
-    metadata = _dist_opt_checkpoint_metadata(optimizer)
+    metadata = _dist_opt_checkpoint_metadata(
+        optimizer, _saved_sharding_type(checkpoint_dir) if load_optimizer else None
+    )
     model_sd = _model_sharded_state_dict(model) if load_model or load_optimizer else {}
     load_sd: dict[str, Any] = {"step": 0}
     if load_model:
@@ -117,22 +125,10 @@ def load_dist_opt_checkpoint(
             )
         finally:
             _restore_state_dict_patches(patches)
-    # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
-    # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
-    # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
-    _orig_torch_load = torch.load
-
-    def _trusted_torch_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        return _orig_torch_load(*args, **kwargs)
-
-    torch.load = _trusted_torch_load
-    try:
+    with _trusted_torch_load():
         state_dict = dist_checkpointing.load(
             load_sd, checkpoint_dir, validate_access_integrity=False
         )
-    finally:
-        torch.load = _orig_torch_load
     if load_model:
         _load_model_state_dict(model, state_dict)
     if load_optimizer and optimizer is not None and "optimizer" in state_dict:
@@ -265,13 +261,43 @@ def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
     yield from visit(optimizer)
 
 
-def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
+def _dist_opt_checkpoint_metadata(
+    optimizer: Any, sharding_type: str | None = None
+) -> dict[str, Any]:
     dist_opts = tuple(_iter_distributed_optimizers(optimizer))
+    sharding_type = sharding_type or os.environ.get(
+        _SHARDING_TYPE_ENV, _DISTOPT_METADATA["distrib_optim_sharding_type"]
+    )
     return {
         **_DISTOPT_METADATA,
+        "distrib_optim_sharding_type": sharding_type,
         "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts)
         and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
     }
+
+
+@contextlib.contextmanager
+def _trusted_torch_load():
+    # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
+    # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
+    # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
+    orig_torch_load = torch.load
+
+    def trusted_torch_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return orig_torch_load(*args, **kwargs)
+
+    torch.load = trusted_torch_load
+    try:
+        yield
+    finally:
+        torch.load = orig_torch_load
+
+
+def _saved_sharding_type(checkpoint_dir: str) -> str | None:
+    with _trusted_torch_load():
+        saved = dist_checkpointing.load_content_metadata(checkpoint_dir) or {}
+    return saved.get("distrib_optim_sharding_type")
 
 
 def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:
@@ -371,7 +397,10 @@ def _module_sharded_state_dict(
     sharded_offsets: tuple[tuple[int, int, int], ...] = (),
 ) -> dict[str, ShardedTensor]:
     state: dict[str, ShardedTensor] = {}
+    from_release = _release_restored_tensor_ids(module)
     for name, param in module.named_parameters():
+        if id(param) in from_release:
+            continue
         state[f"{prefix}{name}"] = _make_sharded_tensor(
             f"{prefix}{name}",
             param,
@@ -381,6 +410,8 @@ def _module_sharded_state_dict(
             sharded_offsets=sharded_offsets,
         )
     for name, buffer in module.named_buffers():
+        if id(buffer) in from_release:
+            continue
         state[f"{prefix}{name}"] = _make_sharded_tensor(
             f"{prefix}{name}",
             buffer,
@@ -390,6 +421,16 @@ def _module_sharded_state_dict(
             sharded_offsets=sharded_offsets,
         )
     return state
+
+
+def _release_restored_tensor_ids(module: nn.Module) -> set[int]:
+    """Tensors of modules marked ``restored_from_release`` (frozen tables reloaded at init)."""
+    ids: set[int] = set()
+    for sub in module.modules():
+        if getattr(sub, "restored_from_release", False):
+            ids.update(id(t) for t in sub.parameters())
+            ids.update(id(t) for t in sub.buffers())
+    return ids
 
 
 def _make_sharded_tensor(
