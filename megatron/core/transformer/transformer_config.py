@@ -4225,6 +4225,11 @@ class TransformerConfig(ModelParallelConfig):
                         "moe_token_dispatcher_type='alltoall'."
                     )
                     if self.batch_invariant_backend == "te_native":
+                        # Import lazily: the TE extension imports TransformerConfig.
+                        from megatron.core.extensions.transformer_engine import (
+                            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+                        )
+
                         assert (
                             not self.use_transformer_engine_op_fuser
                         ), "Batch-invariant training does not support TE op fuser."
@@ -4233,7 +4238,8 @@ class TransformerConfig(ModelParallelConfig):
                         ), (
                             "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
                             "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
-                            "padding uses the required 256-row alignment."
+                            "padding uses the required "
+                            f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
                         )
                 mxfp8_params_enabled = (
                     bool(self.fp8)
