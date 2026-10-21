@@ -20,7 +20,6 @@ from megatron.core.tensor_parallel.gtp_api import (
     classify_gtp_remat_chains,
     wait_for_gtp_grad_reduction_on_current_stream,
 )
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
@@ -168,7 +167,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
     def run_step(layers, x):
         with fp8_autocast(enabled=False):
             for layer in layers:
-                x, _ = layer(hidden_states=x, aux_inputs=LayerAuxInputs(attention_mask=None))
+                x, _ = layer(x, attention_mask=None)
         return x.mean()
 
     def reset_grad_state(layers):

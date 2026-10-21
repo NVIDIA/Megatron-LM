@@ -10,8 +10,6 @@ from torch import nn
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.layer_interface import LayerAuxInputs, bind_layer_interface
-from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -58,24 +56,22 @@ def _process_groups() -> ProcessGroupCollection:
     return ProcessGroupCollection()
 
 
-class _ActiveBranch(MegatronModule):
+class _ActiveBranch(nn.Module):
     def __init__(self, *args, **kwargs):
-        super().__init__(config=None)
+        super().__init__()
         del args, kwargs
 
-    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return hidden_states
 
 
-class _AdditiveAttention(MegatronModule):
+class _AdditiveAttention(nn.Module):
     def __init__(self, *args, **kwargs):
-        super().__init__(config=None)
+        super().__init__()
         del args, kwargs
         self.last_hidden_size = None
 
-    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         self.last_hidden_size = hidden_states.shape[-1]
@@ -85,38 +81,35 @@ class _AdditiveAttention(MegatronModule):
         return 2.0 * hidden_states, bias
 
 
-class _AdditiveMLP(MegatronModule):
+class _AdditiveMLP(nn.Module):
     def __init__(self, *args, **kwargs):
-        super().__init__(config=None)
+        super().__init__()
         del args, kwargs
         self.last_hidden_size = None
 
-    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         self.last_hidden_size = hidden_states.shape[-1]
         return 3.0 * hidden_states, None
 
 
-class _ParameterizedAttention(MegatronModule):
+class _ParameterizedAttention(nn.Module):
     def __init__(self, *args, **kwargs):
-        super().__init__(config=None)
+        super().__init__()
         del args, kwargs
         self.scale = nn.Parameter(torch.randn(()))
 
-    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return self.scale * hidden_states, None
 
 
-class _ParameterizedMLP(MegatronModule):
+class _ParameterizedMLP(nn.Module):
     def __init__(self, *args, **kwargs):
-        super().__init__(config=None)
+        super().__init__()
         del args, kwargs
         self.scale = nn.Parameter(torch.randn(()))
 
-    @bind_layer_interface
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return self.scale * hidden_states, None
@@ -768,9 +761,7 @@ class TestWideResidualLayerIntegration:
         )
         hidden_states = torch.randn(2, 3, config.hidden_size, requires_grad=True)
 
-        output, context = layer(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
-        )
+        output, context = layer(hidden_states=hidden_states, attention_mask=None)
 
         assert context is None
         assert type(layer) is TransformerLayer
@@ -857,9 +848,7 @@ class TestWideResidualLayerIntegration:
         base = torch.randn(2, 3, config.hidden_size, requires_grad=True)
         residual_stream = expand_wide_residual_stream(base, 3)
 
-        output, context = layer(
-            hidden_states=residual_stream, aux_inputs=LayerAuxInputs(attention_mask=None)
-        )
+        output, context = layer(hidden_states=residual_stream, attention_mask=None)
 
         expected = expand_wide_residual_stream(12.0 * base + 4.0, 3)
         assert context is None
@@ -931,10 +920,7 @@ class TestWideResidualLayerIntegration:
         layer.residual_connection_mlp.register_forward_pre_hook(record_operation, with_kwargs=True)
         base = torch.randn(2, 3, config.hidden_size)
 
-        layer(
-            hidden_states=expand_wide_residual_stream(base, 3),
-            aux_inputs=LayerAuxInputs(attention_mask=None),
-        )
+        layer(hidden_states=expand_wide_residual_stream(base, 3), attention_mask=None)
 
         assert operations == [
             ("self_attention", "read"),

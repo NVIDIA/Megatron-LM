@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import contextmanager
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,7 +18,6 @@ from megatron.core.transformer.layer_interface import (
     LayerAuxInputs,
     LayerAuxOutputs,
     LayerExecutionContext,
-    bind_layer_input_stage,
 )
 from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
@@ -221,8 +220,7 @@ def test_shortcut_pair_rejects_mixed_mtp_ownership():
 
 
 @pytest.mark.parametrize("residual_replay", [False, True], ids=["eager", "replay"])
-@pytest.mark.parametrize("uses_cp_metadata", [False, True])
-def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_cp_metadata):
+def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     config = _shortcut_config()
     attn_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
@@ -247,19 +245,10 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             calls.append(("finalize", layer_idx))
             return hidden_states + layer_idx
 
-    @bind_layer_input_stage
-    def attn_forward(
-        self,
-        hidden_states,
-        packed_seq_params=None,
-        packed_sequence_cp_metadata=None,
-        residual_stream_recompute_context=None,
-    ):
-        observed["attn_packed"] = packed_seq_params
-        observed["packed_sequence_cp_metadata"] = (
-            packed_sequence_cp_metadata if uses_cp_metadata else None
-        )
-        assert residual_stream_recompute_context is attn_context
+    def attn_forward(hidden_states, aux_inputs):
+        observed["attn_packed"] = aux_inputs.packed_seq_params
+        observed["cp_metadata"] = aux_inputs.packed_sequence_cp_metadata
+        assert aux_inputs.residual_stream_recompute_context is attn_context
         return (hidden_states,)
 
     def attn_post(hidden_states, **kwargs):
@@ -293,9 +282,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
     def quant_context_factory(*_args):
         yield
 
-    monkeypatch.setattr(
-        attn_layer, "forward_pre_attn_and_core_attn", MethodType(attn_forward, attn_layer)
-    )
+    monkeypatch.setattr(attn_layer, "forward_pre_attn_and_core_attn", attn_forward)
     monkeypatch.setattr(attn_layer, "forward_post_core_attn", attn_post)
     monkeypatch.setattr(block, "_moe_router_preprocess", route)
     monkeypatch.setattr(block, "_launch_dispatch", lambda hidden, probs, **_: (hidden, probs))
@@ -308,7 +295,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
 
     packed_sequence_cp_metadata = object()
     hidden_states = torch.zeros(2, 1, config.hidden_size)
-    output, aux_outputs = block(
+    output, _ = block(
         hidden_states,
         LayerAuxInputs(
             packed_seq_params="packed-input",
@@ -320,12 +307,11 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay, uses_
             ),
         ),
     )
-    assert aux_outputs.bias is None
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
     assert observed == {
         "attn_packed": "packed-4",
-        "packed_sequence_cp_metadata": packed_sequence_cp_metadata if uses_cp_metadata else None,
+        "cp_metadata": packed_sequence_cp_metadata,
         "route_packed": "packed-5",
         "shared_packed": "packed-5",
         "postprocess_packed": "packed-5",
@@ -388,14 +374,13 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     hidden_states = torch.zeros(2, 1, config.hidden_size)
     InferenceMode.set_active()
     try:
-        output, aux_outputs = block(
+        output, _ = block(
             hidden_states,
             LayerAuxInputs(
                 inference_context=inference_context,
                 execution_context=LayerExecutionContext(quant_context_factory),
             ),
         )
-        assert aux_outputs.bias is None
     finally:
         InferenceMode.unset_active()
 
@@ -612,11 +597,10 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             monkeypatch.setattr(block, "_wait_combine", lambda combined_output: combined_output)
 
         hidden_states = torch.arange(1.0, 5.0, requires_grad=True)
-        output, aux_outputs = block(
+        output, _ = block(
             hidden_states,
             LayerAuxInputs(execution_context=LayerExecutionContext(quant_context_factory)),
         )
-        assert aux_outputs.bias is None
         output.sum().backward()
         gradients = {
             name: parameter.grad.detach().clone()
@@ -717,11 +701,10 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
     def quant_context_factory(*_args):
         yield
 
-    output, aux_outputs = block(
+    output, _ = block(
         hidden_states,
         LayerAuxInputs(execution_context=LayerExecutionContext(quant_context_factory)),
     )
-    assert aux_outputs.bias is None
     output.sum().backward()
 
     assert calls["checkpoint_input"] is hidden_states

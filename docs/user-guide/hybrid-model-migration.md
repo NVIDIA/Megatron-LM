@@ -624,7 +624,14 @@ Hooks see the ordinary forward arguments and the forward's result; output bindin
 happens after execution or graph replay. TransformerLayer's forward returns
 `(hidden_states, LayerAuxOutputs())` when `aux_inputs` is present, including an explicit
 `aux_inputs=` call, and its legacy `(hidden_states, context)` otherwise. The outer
-binding preserves an already-bound result. Direct `.forward(...)` calls also accept
+binding preserves an already-bound result. Graph replay hooks make the same distinction
+for completed calls. The split-stage completion returns only hidden states, which
+`@bind_layer_output_stage` wraps in the standard output format;
+TransformerLayer does not override `bind_layer_outputs`. HyperConnectionTransformerLayer
+extracts its per-call recompute manager in `__call__` before binding and forwards an
+auxiliary-input snapshot with that field cleared. It does not override
+`bind_layer_inputs` or `forward`.
+Direct `.forward(...)` calls also accept
 the container, but bypass module hooks and graph selection as usual. Graphable
 modules use `_call_with_bound_args` only to dispatch already-bound calls to the local
 or TE graph hooks, or ordinary execution. TransformerLayer has no dispatch override;
@@ -636,8 +643,9 @@ dispatch override. Its TE capture hook constructs auxiliary inputs from TE's fla
 tensor signature; replay exposes only consumed execution state, retaining the
 non-tensor-input validation. Transformer retains its local graph input filtering.
 TE capture uses explicit tensor arguments and preserves its flat
-intermediate outputs. TE replay completes the layer and returns its natural hidden-state/context pair; the shared binding does not inspect graph dispatch or
-interpret capture intermediates. EP-overlap replay retains its scheduler-specific
+intermediate outputs. TE replay returns named outputs for completed packed calls and
+the natural hidden-state/context pair for legacy calls. The shared binding does not
+inspect graph dispatch or interpret capture intermediates. EP-overlap replay retains its scheduler-specific
 intermediate outputs. The vision graph wrapper is unchanged.
 
 ### Validate before scaling up

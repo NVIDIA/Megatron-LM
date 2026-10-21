@@ -31,6 +31,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.typed_torch import copy_signature
 
 
 class RecordingTransformerLayer(TransformerLayer):
@@ -49,14 +50,14 @@ class RecordingTransformerLayer(TransformerLayer):
             self.cuda_graphs = [object()]
 
     @bind_layer_interface
-    def forward(self, hidden_states, aux_inputs):
-        self.calls.append(vars(aux_inputs))
-        return hidden_states, LayerAuxOutputs()
+    @copy_signature(TransformerLayer.forward)
+    def forward(self, hidden_states, **kwargs):
+        self.calls.append(kwargs)
+        return hidden_states, None
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         self.used_cuda_graph = True
-        hidden_states = kwargs.pop("hidden_states") if not args else args[0]
-        return self.forward(hidden_states=hidden_states, aux_inputs=LayerAuxInputs(**kwargs))
+        return self.forward(*args, **kwargs)
 
     def _run_local_cuda_graph(self, module, args, kwargs):
         assert module is self

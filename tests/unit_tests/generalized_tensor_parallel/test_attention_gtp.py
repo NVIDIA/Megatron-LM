@@ -14,7 +14,6 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
@@ -107,7 +106,7 @@ def _worker_attention_gtp_correctness(rank, world_size, port):
     def run_step(layers, x):
         with fp8_autocast(enabled=False):
             for layer in layers:
-                x, _ = layer(hidden_states=x, aux_inputs=LayerAuxInputs(attention_mask=None))
+                x, _ = layer(x, attention_mask=None)
         return x.mean()
 
     # -------------------------------------------------------------------------

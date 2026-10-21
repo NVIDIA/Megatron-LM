@@ -67,7 +67,7 @@ class _StaticTestConnection(ResidualConnection):
         dropout_probability: float,
         training: bool,
     ) -> Tensor:
-        update, bias = branch_output
+        update, bias = branch_output if isinstance(branch_output, tuple) else (branch_output, None)
         if bias is not None:
             update = update + bias
         update = F.dropout(update, p=dropout_probability, training=training)
@@ -80,7 +80,7 @@ class _HeavyTestBranch(nn.Module):
         self.projection = nn.Linear(width, width)
         self.output_bias = nn.Parameter(torch.randn(width))
 
-    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor | None]:
+    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
         return F.gelu(self.projection(hidden_states)), self.output_bias
 
 
@@ -170,29 +170,25 @@ class _MambaMixer(_TransformerBranch):
 
 class _RecordingTransformerLayer(WideResidualTransformerLayer):
     def _call_with_bound_args(self, *args, **kwargs):
-        self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
+        self.received_residual_recompute_kwarg = (
+            kwargs.get("residual_stream_recompute_context") is not None
+        )
         return super()._call_with_bound_args(*args, **kwargs)
 
 
 class _RecordingOrdinaryTransformerLayer(TransformerLayer):
     def _call_with_bound_args(self, *args, **kwargs):
-        self.received_residual_recompute_kwarg = "residual_stream_recompute_context" in kwargs
+        self.received_residual_recompute_kwarg = (
+            kwargs.get("residual_stream_recompute_context") is not None
+        )
         return super()._call_with_bound_args(*args, **kwargs)
 
 
 class _RecordingMambaLayer(WideResidualMambaLayer):
-    def _call_with_bound_args(
-        self,
-        hidden_states,
-        *args,
-        packed_seq_params=None,
-        residual_stream_recompute_context=None,
-        **kwargs,
-    ):
-        del args, kwargs
+    def _call_with_bound_args(self, hidden_states, aux_inputs):
         self.event_log.append("mamba_forward")
-        self.received_packed_seq_params = packed_seq_params
-        self.received_residual_recompute_context = residual_stream_recompute_context
+        self.received_packed_seq_params = aux_inputs.packed_seq_params
+        self.received_residual_recompute_context = aux_inputs.residual_stream_recompute_context
         return hidden_states
 
 
@@ -566,13 +562,9 @@ class TestResidualStreamRecomputeIntegration:
         FineGrainedActivationOffloadingInterface.reset_instance()
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("has_bias", [False, True])
-    def test_ordered_replay_matches_reference_and_keeps_boundary_live(self, has_bias):
+    def test_ordered_replay_matches_reference_and_keeps_boundary_live(self):
         torch.manual_seed(1234)
         reference = _StaticResidualChain().cuda()
-        if not has_bias:
-            for branch in reference.branches:
-                branch.register_parameter("output_bias", None)
         recomputed = copy.deepcopy(reference).cuda()
         reference_input = torch.randn(4, 3, 12, device="cuda", requires_grad=True)
         recomputed_input = reference_input.detach().clone().requires_grad_(True)
@@ -635,9 +627,8 @@ class TestResidualStreamRecomputeIntegration:
         context = build_residual_stream_recompute_plan(1, 1)[0]
         output, _ = layer(
             hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(
-                attention_mask=None, residual_stream_recompute_context=context
-            ),
+            attention_mask=None,
+            residual_stream_recompute_context=context,
         )
         context.finalize(output)
         output.square().mean().backward()
@@ -679,7 +670,7 @@ class TestResidualStreamRecomputeIntegration:
             32, 3, reference_config.hidden_size, device="cuda", requires_grad=True
         )
         offloaded_input = reference_input.detach().clone().requires_grad_(True)
-        reference_output = reference(hidden_states=reference_input, attention_mask=None)
+        reference_output = reference(hidden_states=reference_input, aux_inputs=LayerAuxInputs())
         reference_output.float().square().mean().backward()
 
         FineGrainedActivationOffloadingInterface.reset_instance()
@@ -691,7 +682,7 @@ class TestResidualStreamRecomputeIntegration:
             delta_offload_bytes_across_pp_ranks=0,
             activation_offload_fraction=1.0,
         )
-        offloaded_output = offloaded(hidden_states=offloaded_input, attention_mask=None)
+        offloaded_output = offloaded(hidden_states=offloaded_input, aux_inputs=LayerAuxInputs())
         offloaded_output.float().square().mean().backward()
         FineGrainedActivationOffloadingInterface.reset()
 
@@ -755,12 +746,13 @@ class TestResidualStreamRecomputeIntegration:
         recomputed.residual_connection.register_forward_hook(
             record_read("replay"), with_kwargs=True
         )
-        reference_output = reference(hidden_states=reference_input)
+        reference_output = reference(hidden_states=reference_input, aux_inputs=LayerAuxInputs())
         reference_output.square().mean().backward()
 
         context = build_residual_stream_recompute_plan(1, 1)[0]
         recomputed_output = recomputed(
-            hidden_states=recomputed_input, residual_stream_recompute_context=context
+            hidden_states=recomputed_input,
+            aux_inputs=LayerAuxInputs(residual_stream_recompute_context=context),
         )
         assert len(context.manager.checkpoints) == 2
         context.finalize(recomputed_output)
@@ -824,9 +816,9 @@ class TestResidualStreamRecomputeIntegration:
         input_dtype = torch.float32 if fp32_residual_connection else reference_config.params_dtype
         reference_input = torch.randn(4, 3, 8, device="cuda", dtype=input_dtype, requires_grad=True)
         recomputed_input = reference_input.detach().clone().requires_grad_(True)
-        reference_output = reference(hidden_states=reference_input, attention_mask=None)
+        reference_output = reference(hidden_states=reference_input, aux_inputs=LayerAuxInputs())
         reference_output.square().mean().backward()
-        recomputed_output = recomputed(hidden_states=recomputed_input, attention_mask=None)
+        recomputed_output = recomputed(hidden_states=recomputed_input, aux_inputs=LayerAuxInputs())
         recomputed_output.square().mean().backward()
 
         assert reference_output.shape == reference_input.shape

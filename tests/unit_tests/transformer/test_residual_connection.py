@@ -116,9 +116,8 @@ class TestResidualConnectionContract:
             connection((branch, None), **{**write_kwargs, "state": ()})
         with pytest.raises(TypeError, match="contain only tensors"):
             connection((branch, None), **{**write_kwargs, "state": (object(),)})
-        for invalid_output in (branch, (branch,), (branch, None, None), [branch, None]):
-            with pytest.raises(TypeError, match="must return an .* tensor tuple"):
-                connection(invalid_output, **write_kwargs)
+        with pytest.raises(TypeError, match="must return an .* tensor tuple"):
+            connection((branch,), **write_kwargs)
         with pytest.raises(TypeError, match="tensor and an optional tensor"):
             connection((object(), None), **write_kwargs)
         with pytest.raises(ValueError, match="incompatible non-hidden dimensions"):

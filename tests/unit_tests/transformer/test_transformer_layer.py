@@ -29,7 +29,6 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -172,7 +171,7 @@ class TestParallelTransformerLayer:
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
         output, context = parallel_transformer_layer(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
+            hidden_states=hidden_states, attention_mask=attention_mask
         )
         assert not parallel_transformer_layer.supports_two_stage_attention()
         assert context is None
@@ -220,16 +219,15 @@ class TestParallelTransformerLayer:
             with InferenceMode.active():
                 for mlp_chunks_for_prefill in [1, 4]:
                     transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
-                    hidden_states, aux_outputs = parallel_transformer_layer(
+                    hidden_states, context = parallel_transformer_layer(
                         hidden_states=input_hidden_states,
-                        aux_inputs=LayerAuxInputs(
-                            attention_mask=attention_mask, inference_context=inference_context
-                        ),
+                        attention_mask=attention_mask,
+                        inference_context=inference_context,
                     )
                     assert hidden_states.shape[0] == sequence_length
                     assert hidden_states.shape[1] == micro_batch_size
                     assert hidden_states.shape[2] == hidden_size
-                    outputs[mlp_chunks_for_prefill] = (hidden_states, aux_outputs)
+                    outputs[mlp_chunks_for_prefill] = (hidden_states, context)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
@@ -238,16 +236,15 @@ class TestParallelTransformerLayer:
             outputs = {}
             for mlp_chunks_for_training in [1, 4]:
                 transformer_config.mlp_chunks_for_training = mlp_chunks_for_training
-                hidden_states, aux_outputs = parallel_transformer_layer(
+                hidden_states, context = parallel_transformer_layer(
                     hidden_states=input_hidden_states,
-                    aux_inputs=LayerAuxInputs(
-                        attention_mask=attention_mask, inference_context=None
-                    ),
+                    attention_mask=attention_mask,
+                    inference_context=None,
                 )
                 assert hidden_states.shape[0] == sequence_length
                 assert hidden_states.shape[1] == micro_batch_size
                 assert hidden_states.shape[2] == hidden_size
-                outputs[mlp_chunks_for_training] = (hidden_states, aux_outputs)
+                outputs[mlp_chunks_for_training] = (hidden_states, context)
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
@@ -259,7 +256,8 @@ class TestParallelTransformerLayer:
             parallel_transformer_layer.zero_grad()
             hidden_states, _ = parallel_transformer_layer(
                 hidden_states=input_hidden_states,
-                aux_inputs=LayerAuxInputs(attention_mask=attention_mask, inference_context=None),
+                attention_mask=attention_mask,
+                inference_context=None,
             )
             loss = hidden_states.sum()
             loss.backward()
@@ -557,15 +555,11 @@ class TestTransformerLayerCudaGraphManagers:
             param.main_grad = torch.zeros_like(param)
 
         hidden_states = torch.randn(8, 2, 32, device="cuda", requires_grad=True)
-        eager_output, _ = eager_layer(
-            hidden_states=hidden_states.clone(), aux_inputs=LayerAuxInputs(attention_mask=None)
-        )
+        eager_output, _ = eager_layer(hidden_states.clone(), attention_mask=None)
         eager_output = eager_output.detach().clone()
 
         # The first forward/backward records the real router and postprocess graph boundaries.
-        recorded_output, _ = partial_cg_layer(
-            hidden_states=hidden_states.clone(), aux_inputs=LayerAuxInputs(attention_mask=None)
-        )
+        recorded_output, _ = partial_cg_layer(hidden_states.clone(), attention_mask=None)
         recorded_output.sum().backward()
         create_cudagraphs()
 
@@ -579,9 +573,7 @@ class TestTransformerLayerCudaGraphManagers:
             assert manager.cudagraph_runners[0].fwd_graph is not None
 
         partial_cg_layer.zero_grad(set_to_none=True)
-        partial_cg_output, _ = partial_cg_layer(
-            hidden_states=hidden_states.clone(), aux_inputs=LayerAuxInputs(attention_mask=None)
-        )
+        partial_cg_output, _ = partial_cg_layer(hidden_states.clone(), attention_mask=None)
         partial_cg_output = partial_cg_output.detach().clone()
 
         # All-gather routing metadata stays on CUDA, so replay must not create a host-wait event.
@@ -670,7 +662,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         manager.is_last_layer_in_recompute_block = True
         output, context = layer(
             hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(attention_mask=attention_mask, mhc_recompute_manager=manager),
+            attention_mask=attention_mask,
+            mhc_recompute_manager=manager,
         )
 
         # Verify output shape
@@ -716,7 +709,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         manager.is_last_layer_in_recompute_block = False
         output, context = layer(
             hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(attention_mask=attention_mask, mhc_recompute_manager=manager),
+            attention_mask=attention_mask,
+            mhc_recompute_manager=manager,
         )
 
         # Verify output shape
@@ -769,10 +763,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             is_last = i == num_layers - 1
             manager.is_last_layer_in_recompute_block = is_last
             h, _ = layer(
-                hidden_states=h,
-                aux_inputs=LayerAuxInputs(
-                    attention_mask=attention_mask, mhc_recompute_manager=manager
-                ),
+                hidden_states=h, attention_mask=attention_mask, mhc_recompute_manager=manager
             )
             if is_last:
                 manager.discard_all_outputs_and_register_unified_recompute(h)
@@ -818,9 +809,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         layer = layer.cuda()
         hidden_states = torch.randn(8, 2, 128, device="cuda", requires_grad=True)
         attention_mask = torch.zeros((1, 1, 8, 8), dtype=bool, device="cuda")
-        output, _ = layer(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        output, _ = layer(hidden_states=hidden_states, attention_mask=attention_mask)
         output.float().sum().backward()
 
         assert output.shape == hidden_states.shape
@@ -912,10 +901,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
         with pytest.raises(ValueError, match=norm_attr):
-            layer(
-                hidden_states=hidden_states,
-                aux_inputs=LayerAuxInputs(attention_mask=attention_mask),
-            )
+            layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
 
 class TestMHCRecomputeMemorySaving:
@@ -979,12 +965,7 @@ class TestMHCRecomputeMemorySaving:
             if manager is not None:
                 manager.is_last_layer_in_recompute_block = is_last_in_block
                 kwargs['mhc_recompute_manager'] = manager
-            h, _ = layer(
-                h,
-                LayerAuxInputs(
-                    **{name: value for name, value in kwargs.items() if name != "hidden_states"}
-                ),
-            )
+            h, _ = layer(**kwargs)
             if manager is not None and is_last_in_block:
                 manager.discard_all_outputs_and_register_unified_recompute(h)
                 if i < num_layers - 1:
@@ -1151,10 +1132,7 @@ class TestMHCWithCudaGraph:
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                out, _ = layer(
-                    hidden_states=static_input,
-                    aux_inputs=LayerAuxInputs(attention_mask=attention_mask),
-                )
+                out, _ = layer(hidden_states=static_input, attention_mask=attention_mask)
                 out.sum().backward()
         torch.cuda.current_stream().wait_stream(s)
 
@@ -1165,9 +1143,7 @@ class TestMHCWithCudaGraph:
 
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            output, _ = layer(
-                hidden_states=static_input, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-            )
+            output, _ = layer(hidden_states=static_input, attention_mask=attention_mask)
             output.sum().backward()
 
         # Replay with new input data.
@@ -1200,9 +1176,7 @@ class TestMHCWithCudaGraph:
         graph_grad = static_input.grad.detach().clone()
 
         eager_input = test_data.clone().requires_grad_(True)
-        eager_output, _ = layer(
-            hidden_states=eager_input, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        eager_output, _ = layer(hidden_states=eager_input, attention_mask=attention_mask)
         eager_output.sum().backward()
 
         assert torch.allclose(graph_out, eager_output.detach(), atol=1e-5), (
@@ -1244,9 +1218,8 @@ class TestMHCWithCudaGraph:
                 mgr.is_last_layer_in_recompute_block = True
                 out, _ = layer(
                     hidden_states=static_input,
-                    aux_inputs=LayerAuxInputs(
-                        attention_mask=attention_mask, mhc_recompute_manager=mgr
-                    ),
+                    attention_mask=attention_mask,
+                    mhc_recompute_manager=mgr,
                 )
                 mgr.discard_all_outputs_and_register_unified_recompute(out)
                 out.sum().backward()
@@ -1262,9 +1235,8 @@ class TestMHCWithCudaGraph:
         with torch.cuda.graph(g):
             output, _ = layer(
                 hidden_states=static_input,
-                aux_inputs=LayerAuxInputs(
-                    attention_mask=attention_mask, mhc_recompute_manager=capture_mgr
-                ),
+                attention_mask=attention_mask,
+                mhc_recompute_manager=capture_mgr,
             )
             capture_mgr.discard_all_outputs_and_register_unified_recompute(output)
             output.sum().backward()
@@ -1299,9 +1271,8 @@ class TestMHCWithCudaGraph:
         eager_input = test_data.clone().requires_grad_(True)
         eager_output, _ = layer(
             hidden_states=eager_input,
-            aux_inputs=LayerAuxInputs(
-                attention_mask=attention_mask, mhc_recompute_manager=eager_mgr
-            ),
+            attention_mask=attention_mask,
+            mhc_recompute_manager=eager_mgr,
         )
         eager_mgr.discard_all_outputs_and_register_unified_recompute(eager_output)
         eager_output.sum().backward()
@@ -1318,9 +1289,9 @@ class TestMHCWithCudaGraph:
     def test_mcore_cudagraph_manager_with_mhc_recompute_manager(self):
         """MCore CudaGraphManager must not crash on mhc_recompute_manager kwarg.
 
-        After input binding, HyperConnectionTransformerLayer._call_with_bound_args
-        pops mhc_recompute_manager off kwargs before graph dispatch reaches
-        CudaGraphManager.__call__,
+        When cuda_graph_impl="local" is set, HyperConnectionTransformerLayer.__call__
+        runs first and pops mhc_recompute_manager off kwargs before
+        super().__call__ → MegatronModule.__call__ → CudaGraphManager.__call__,
         which iterates over all kwargs to check supported types.
         CheckpointWithoutOutputManager (used by mhc_recompute_manager) is not a
         CUDA-graph-supported type.
@@ -1349,8 +1320,7 @@ class TestMHCWithCudaGraph:
         mgr.is_last_layer_in_recompute_block = True
 
         output, context = layer(
-            hidden_states=hidden_states,
-            aux_inputs=LayerAuxInputs(attention_mask=attention_mask, mhc_recompute_manager=mgr),
+            hidden_states=hidden_states, attention_mask=attention_mask, mhc_recompute_manager=mgr
         )
 
         assert output.shape == (seq_len, batch_size, n_channels)
@@ -1369,9 +1339,7 @@ class TestMHCWithCudaGraph:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        output, context = layer(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (seq_len, batch_size, n_channels)
 
@@ -1436,9 +1404,7 @@ class TestMHCWithOffloading:
             pp_rank=0, vp_size=1, vp_stage=0, min_offloaded_tensor_size=0
         )
 
-        output, context = layer(
-            hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        output, context = layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
         assert output.shape == (
             seq_len,
@@ -1486,9 +1452,7 @@ class TestMHCWithOffloading:
         layer_no_offload.train()
 
         h1 = input_data.clone().detach().requires_grad_(True)
-        out1, _ = layer_no_offload(
-            hidden_states=h1, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        out1, _ = layer_no_offload(hidden_states=h1, attention_mask=attention_mask)
         out1.sum().backward()
         grad_no_offload = h1.grad.clone()
         out1_detached = out1.detach().clone()
@@ -1512,9 +1476,7 @@ class TestMHCWithOffloading:
         )
 
         h2 = input_data.clone().detach().requires_grad_(True)
-        out2, _ = layer_offload(
-            hidden_states=h2, aux_inputs=LayerAuxInputs(attention_mask=attention_mask)
-        )
+        out2, _ = layer_offload(hidden_states=h2, attention_mask=attention_mask)
         out2.sum().backward()
         grad_offload = h2.grad.clone()
 

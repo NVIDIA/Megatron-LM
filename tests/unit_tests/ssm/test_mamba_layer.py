@@ -107,11 +107,8 @@ class TestMambaLayer:
             ((inference_context, padding_mask), {}),
             ((), dict(inference_context=inference_context, padding_mask=padding_mask)),
         ):
-            output, aux_outputs = self.layer.forward_post_core_attn(
-                ssm_output, residual, *args, **kwargs
-            )
+            output, _ = self.layer.forward_post_core_attn(ssm_output, residual, *args, **kwargs)
             assert output is projected
-            assert aux_outputs.bias is None
             project.assert_called_with(ssm_output)
             write.assert_called_with(mixer_output, residual)
 
@@ -165,8 +162,7 @@ class TestMambaLayer:
         split_input = hidden_states.detach().clone().requires_grad_(True)
         stage_state = layer.forward_pre_attn_and_core_attn(split_input)
         assert len(stage_state) == 3
-        split_output, aux_outputs = layer.forward_post_core_attn(*stage_state)
-        assert aux_outputs.bias is None
+        split_output, _ = layer.forward_post_core_attn(*stage_state)
         split_output.float().square().mean().backward()
         split_grads = {
             name: param.grad for name, param in layer.named_parameters() if param.grad is not None
@@ -184,11 +180,10 @@ class TestMambaLayer:
         write = Mock(return_value=split_output)
         monkeypatch.setattr(layer, "_apply_mixer_update", write)
         recompute_context = object()
-        output, aux_outputs = layer.forward_post_core_attn(
+        output, _ = layer.forward_post_core_attn(
             *stage_state, residual_stream_recompute_context=recompute_context
         )
         assert output is split_output
-        assert aux_outputs.bias is None
         assert write.call_args.args[1] is stage_state[1]
         assert write.call_args.args[2] is stage_state[2]
         assert write.call_args.kwargs["recompute_context"] is recompute_context
@@ -205,8 +200,7 @@ class TestMambaLayer:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         )
         attention_mask = attention_mask.cuda()
-        output, aux_outputs = layer(hidden_states, LayerAuxInputs(attention_mask=attention_mask))
-        assert aux_outputs.bias is None
+        output, _ = layer(hidden_states, LayerAuxInputs(attention_mask=attention_mask))
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == layer.config.hidden_size

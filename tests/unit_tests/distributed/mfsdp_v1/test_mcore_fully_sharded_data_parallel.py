@@ -1365,9 +1365,7 @@ class TestFsdpNonUnitBucketPreservation:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(
-                    hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
-                )
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
                 return self.mamba_layer(hidden_states=h, aux_inputs=LayerAuxInputs())
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
@@ -1473,9 +1471,7 @@ class TestFsdpMambaConvParamGather:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(
-                    hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
-                )
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
                 return self.mamba_layer(hidden_states=h, aux_inputs=LayerAuxInputs())
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
@@ -1577,9 +1573,7 @@ class TestFsdpHybridModelDoubleBuffer:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.attn_layer(
-                    hidden_states=hidden_states, aux_inputs=LayerAuxInputs(attention_mask=None)
-                )
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
                 return self.mamba_layer(hidden_states=h, aux_inputs=LayerAuxInputs())
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])

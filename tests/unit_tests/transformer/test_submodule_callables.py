@@ -7,7 +7,6 @@ from megatron.core.models.common.fine_grained_callables import build_layer_calla
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
@@ -40,7 +39,7 @@ def run_model_ref_with_capture(model, input_tensors, iterations):
 
     output_tensors = []
     for i in range(iterations):
-        output = model(hidden_states=input_tensors[i].clone(), aux_inputs=LayerAuxInputs())[0]
+        output = model(input_tensors[i].clone())[0]
         output_tensors.append(output)
         output.backward(torch.ones_like(output))
 

@@ -468,6 +468,15 @@ class TestHybridModel:
 
         self.model.cuda()
         decoder = self.model.decoder
+        received_inputs = []
+        for layer in decoder.layers:
+            original_bind = layer.bind_layer_inputs
+
+            def record_inputs(hidden_states, aux_inputs, *, original_bind=original_bind, **kwargs):
+                received_inputs.append(aux_inputs)
+                return original_bind(hidden_states, aux_inputs, **kwargs)
+
+            monkeypatch.setattr(layer, "bind_layer_inputs", record_inputs)
         if recompute_method is not None:
             decoder.config.recompute_granularity = "full"
             decoder.config.recompute_method = recompute_method
@@ -519,6 +528,13 @@ class TestHybridModel:
 
         for hook in hooks:
             hook.remove()
+
+        if recompute_method is None and not convert_cp_layout:
+            assert len(received_inputs) == 3
+            assert all(inputs is received_inputs[0] for inputs in received_inputs)
+            assert received_inputs[0].attention_mask is attention_mask
+            assert received_inputs[0].embedding is None
+            assert received_inputs[0].execution_context is None
 
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length

@@ -927,7 +927,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         attention_output_with_bias = self.self_attention.forward_post_core_attn(
             attention_intermediate
         )
-        return self.attention_bda_and_cross_attention(
+        hidden_states, _context = self.attention_bda_and_cross_attention(
             attention_output_with_bias,
             residual,
             context=context,
@@ -935,6 +935,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             attn_state=attn_state,
             residual_stream_recompute_context=residual_stream_recompute_context,
         )
+        return hidden_states
 
     def _get_self_attention_residual_connection(self):
         """Return an optional architecture-owned self-attention connection."""
@@ -1135,13 +1136,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return hidden_states, context
 
-    def bind_layer_outputs(self, result):
-        """Bind the natural result; cross-attention context remains an input."""
-        if isinstance(result, Tensor) or isinstance(result[1], LayerAuxOutputs):
-            return super().bind_layer_outputs(result)
-        hidden_states, _context = result
-        return hidden_states, LayerAuxOutputs()
-
     # Transitional Hybrid plumbing: preserve the packed inputs at core calls while
     # keeping GPT, overlap, and graph execution on their existing argument APIs.
     # A future PR will have HybridModel call the underlying layers' bound forwards
@@ -1184,8 +1178,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _local_cuda_graph(self, *args, **kwargs):
         # Binding already exposed the consumed fields; keep unrelated Hybrid state out.
-        kwargs.pop("aux_inputs", None)
-        return super()._local_cuda_graph(*args, **kwargs)
+        aux_inputs = kwargs.pop("aux_inputs", None)
+        result = super()._local_cuda_graph(*args, **kwargs)
+        return (result[0], LayerAuxOutputs()) if aux_inputs is not None else result
 
     def _forward_pre_mlp_layernorm(
         self,
@@ -1909,7 +1904,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
-        
+
         if kwargs['aux_inputs'] is not None:
             kwargs.pop("aux_inputs", None)
             kwargs = {name: value for name, value in kwargs.items() if value is not None}
@@ -1976,7 +1971,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
         # Binding has already exposed the flat inputs used by TE and eager stages.
-        kwargs.pop("aux_inputs", None)
+        aux_inputs = kwargs.pop("aux_inputs", None)
         context = None
         if (
             self.config.cuda_graph_modules
@@ -2004,7 +1999,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             self.off_interface.enter_replay()
 
         try:
-            return self._te_cuda_graph_replay_impl(args, kwargs, context)
+            result = self._te_cuda_graph_replay_impl(args, kwargs, context)
+            if aux_inputs is not None and not self.config.overlap_moe_expert_parallel_comm:
+                return result[0], LayerAuxOutputs()
+            return result
         finally:
             if self.config.delay_offload_until_cuda_graph:
                 self.off_interface.exit_replay()
@@ -2389,26 +2387,27 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
 
-        # Set per-call after input binding so forward can read it without re-piping
+        # Set per-call before input binding so forward can read it without re-piping
         # the manager through the CUDA-graph kwarg path (CheckpointWithoutOutputManager
         # is not a CUDA-graph-supported type and gets stripped during capture). Read by
         # _run_input_layernorm, _apply_self_attn_bda_step, _pre_mlp_layernorm_and_residual, and
         # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
-    def bind_layer_inputs(self, hidden_states, aux_inputs, *, forward=None):
-        """Set per-call mHC state without passing its manager into the graph."""
-        self._mhc_recompute_manager = aux_inputs.mhc_recompute_manager
-        return super().bind_layer_inputs(hidden_states, aux_inputs, forward=forward)
-
     def __call__(self, *args, **kwargs):
-        # Pull the manager off kwargs before input binding hands them to the
-        # CUDA-graph machinery (which can't handle a CheckpointWithoutOutputManager).
-        # forward() reads the value back from self.
-        inputs = kwargs.get("aux_inputs")
+        # Keep the per-call manager on the layer, outside the inputs sent to graphs.
+        positional_inputs = len(args) > 1 and isinstance(args[1], LayerAuxInputs)
+        input_key = "inputs" if "inputs" in kwargs else "aux_inputs"
+        inputs = args[1] if positional_inputs else kwargs.get(input_key)
         self._mhc_recompute_manager = kwargs.pop(
             "mhc_recompute_manager", inputs.mhc_recompute_manager if inputs is not None else None
         )
+        if inputs is not None:
+            inputs = inputs.update(mhc_recompute_manager=None)
+            if positional_inputs:
+                args = (args[0], inputs, *args[2:])
+            else:
+                kwargs[input_key] = inputs
         return super().__call__(*args, **kwargs)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):

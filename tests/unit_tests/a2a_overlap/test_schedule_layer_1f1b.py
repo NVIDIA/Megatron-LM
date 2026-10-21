@@ -14,7 +14,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
-from megatron.core.transformer.layer_interface import LayerAuxInputs
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyState,
@@ -50,9 +49,7 @@ def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
     transformer_layer = model.decoder.layers[0]
     output_tensors = []
     for i in range(iterations):
-        output = transformer_layer(
-            hidden_states=input_tensors[i].clone(), aux_inputs=LayerAuxInputs()
-        )[0]
+        output = transformer_layer(input_tensors[i].clone())[0]
         output_tensors.append(output)
         output.backward(torch.ones_like(output))
 
