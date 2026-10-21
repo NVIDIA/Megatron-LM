@@ -133,8 +133,110 @@ def _reduce_scatter(x, group):
     return out
 
 
+def _native_grouped_mm(left, right, counts, out_dtype=None):
+    """Lite TE GroupedLinear's grouped TN/NN/NT kernels on decoded operands.
+
+    Only tensor views are split by expert; one native grouped call issues all GEMMs.
+    """
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+    dtype = out_dtype or torch.bfloat16
+    if right.ndim == 3:
+        transposed = right.stride(-1) != 1
+        weights = right.transpose(-1, -2) if transposed else right
+        a = list(weights.bfloat16().unbind(0))
+        b = list(left.bfloat16().split(counts))
+        result = torch.empty((left.shape[0], right.shape[-1]), device=left.device, dtype=dtype)
+        output, layout, single = [result], 'TN' if transposed else 'NN', True
+    else:
+        a = list(right.bfloat16().split(counts))
+        b = list(left.T.contiguous().bfloat16().split(counts))
+        result = torch.empty(
+            (len(counts), left.shape[0], right.shape[1]), device=left.device, dtype=dtype
+        )
+        output, layout, single = list(result.unbind(0)), 'NT', False
+    general_grouped_gemm(
+        a,
+        b,
+        output,
+        [None] * len(counts),
+        dtype,
+        layout=layout,
+        m_splits=counts,
+        single_output=single,
+        grad=True,
+    )
+    return result
+
+
+def _grouped_mlp_grads(a, score, grad, w1, w2, ends, limit, need):
+    """One grouped GEMM per FC replay/dX/dW, over stable expert-major rows."""
+
+    counts = ends.diff(prepend=ends.new_zeros(1)).cpu().tolist()
+
+    def mm(left, right, out_dtype=None):
+        return _native_grouped_mm(left, right, counts, out_dtype)
+
+    need_a, need_s, need_w1, need_w2 = need
+    if not a.shape[0]:
+        return (
+            torch.zeros_like(a, dtype=torch.float32) if need_a else None,
+            torch.zeros_like(score, dtype=torch.float32) if need_s else None,
+            torch.zeros_like(w1, dtype=torch.float32) if need_w1 else None,
+            torch.zeros_like(w2, dtype=torch.float32) if need_w2 else None,
+        )
+    h = mm(a, w1.transpose(-1, -2)).float()
+    with torch.enable_grad():
+        h = h.requires_grad_(need_a or need_w1)
+        scores = score.detach().float().requires_grad_(need_s)
+        gate, up = h.chunk(2, -1)
+        if limit is not None:
+            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+        activation = torch.nn.functional.silu(gate) * up * scores[:, None]
+    dw2 = mm(grad.T, _requant_l2(activation), torch.float32) if need_w2 else None
+    wanted = [t for t in (h, scores) if t.requires_grad]
+    dh = ds = None
+    if wanted:
+        grads = iter(torch.autograd.grad(activation, wanted, mm(grad, w2, torch.float32)))
+        dh = next(grads) if h.requires_grad else None
+        ds = next(grads) if scores.requires_grad else None
+    da = mm(dh, w1, torch.float32) if need_a else None
+    dw1 = mm(dh.T, a, torch.float32) if need_w1 else None
+    empty = ends == torch.cat((ends.new_zeros(1), ends[:-1]))
+    for gradient in (dw1, dw2):
+        if gradient is not None:
+            gradient.masked_fill_(empty[:, None, None], 0)
+    return da, ds, dw1, dw2
+
+
+def _expert_weight_grads(owners, gradient, needed):
+    """Batch FP32 DDP accumulation; owner iteration only sets metadata/views."""
+    if gradient is None:
+        return (None,) * len(owners)
+    selected = [(p, g) for p, g, use in zip(owners, gradient.unbind(0), needed) if use]
+    if selected and all(
+        getattr(p, 'main_grad', None) is not None and p.main_grad.dtype == torch.float32
+        for p, _ in selected
+    ):
+        from megatron.lite.primitive.parallel.linear import _dummy_wgrad
+
+        torch._foreach_add_([p.main_grad for p, _ in selected], [g for _, g in selected])
+        for p, _ in selected:
+            p.grad_added_to_main_grad = True
+        return tuple(_dummy_wgrad(p) if use else None for p, use in zip(owners, needed))
+    rounded = gradient.to(owners[0].dtype)
+    return tuple(g if use else None for g, use in zip(rounded.unbind(0), needed))
+
+
+def _sum_routes(gradient, position, rows, topk):
+    # Each segment follows original token/slot order; no atomic index_add.
+    order = torch.argsort(position, stable=True)
+    counts = torch.bincount(position // topk, minlength=rows)
+    return torch.segment_reduce(gradient[order], 'sum', lengths=counts, unsafe=True)
+
+
 class _FusedMoE(torch.autograd.Function):
-    """Inference ``fp8_fp4_mega_moe`` forward; owned backward (#260 MegaMoE): per-expert
+    """Inference ``fp8_fp4_mega_moe`` forward; owned backward: native TE grouped
     decoded VJP over EP-all-gathered rows, FP32 reduce-scatter back, expert dW straight
     into ``main_grad``."""
 
@@ -184,32 +286,31 @@ class _FusedMoE(torch.autograd.Function):
                 ids_all = _all_gather(padded(ids, -1), group)
             else:
                 a_all, g_all, w_all, ids_all = a, grad, weights.float(), ids
-            da_all = torch.zeros(a_all.shape, dtype=torch.float32, device=a_all.device)
-            dw_all = torch.zeros_like(w_all)
             flat = ids_all.flatten()
-            dfc1, dfc2 = [None] * local, [None] * local
-            for e in range(local):
-                pos = (flat == rank * local + e).nonzero().flatten()
-                if not pos.numel():
-                    dfc1[e] = torch.zeros_like(fc1[e]) if need_m[e] else None
-                    dfc2[e] = torch.zeros_like(fc2[e]) if need_m[local + e] else None
-                    continue
-                token = pos // k
-                da, dsc, d1, d2 = _mlp_grads(
-                    a_all[token],
-                    w_all.flatten()[pos],
-                    g_all[token],
-                    _mx(fc1[e]),
-                    _mx(fc2[e]),
-                    limit,
-                    (need_x, need_w, need_m[e], need_m[local + e]),
-                )
-                if da is not None:
-                    da_all.index_add_(0, token, da)
-                if dsc is not None:
-                    dw_all.view(-1)[pos] = dsc
-                dfc1[e] = None if d1 is None else accumulate_wgrad((fc1[e],), d1, fc1[e])
-                dfc2[e] = None if d2 is None else accumulate_wgrad((fc2[e],), d2, fc2[e])
+            valid = ((flat >= rank * local) & (flat < (rank + 1) * local)).nonzero().flatten()
+            position = valid[torch.argsort(flat[valid], stable=True)]
+            token = position // k
+            counts = torch.bincount(flat[position] - rank * local, minlength=local)
+            ends = counts.cumsum(0, dtype=torch.int32)
+            first, second = _mx(torch.stack(fc1)), _mx(torch.stack(fc2))
+            da, ds, d1, d2 = _grouped_mlp_grads(
+                a_all[token],
+                w_all.flatten()[position],
+                g_all[token],
+                first,
+                second,
+                ends,
+                limit,
+                (need_x, need_w, any(need_m[:local]), any(need_m[local : 2 * local])),
+            )
+            da_all = (
+                _sum_routes(da, position, a_all.shape[0], k) if need_x else torch.zeros_like(a_all)
+            )
+            dw_all = torch.zeros_like(w_all)
+            if ds is not None:
+                dw_all.view(-1).index_copy_(0, position, ds)
+            dfc1 = _expert_weight_grads(fc1, d1, need_m[:local])
+            dfc2 = _expert_weight_grads(fc2, d2, need_m[local : 2 * local])
             if world > 1:
                 da_all = _reduce_scatter(da_all, group)[:rows]
                 dw_all = _reduce_scatter(dw_all, group)[:rows]
