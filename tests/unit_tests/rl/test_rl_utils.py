@@ -99,6 +99,34 @@ def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
         pass
 
 
+def test_rl_inference_interface_shutdown_returns_and_clears_resources(monkeypatch):
+    """Teardown returns (no hard exit), closes rollouts before killing the interface, clears
+    the globals, and is a no-op when called again."""
+    events = []
+
+    async def close_rollouts():
+        events.append("close")
+
+    async def kill_interface():
+        events.append("kill")
+
+    loop = asyncio.new_event_loop()
+    monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", SimpleNamespace(aclose=close_rollouts))
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", object())
+    monkeypatch.setattr(rl_utils, "_INFERENCE_INTERFACE", SimpleNamespace(kill=kill_interface))
+    monkeypatch.setattr(rl_utils.os, "_exit", lambda code: pytest.fail("shutdown must return"))
+    try:
+        assert rl_utils.rl_inference_interface_shutdown() is None
+        assert rl_utils._ROLLOUT_GENERATOR is None
+        assert rl_utils._ROLLOUT_PIPELINE is None
+        assert rl_utils._INFERENCE_INTERFACE is None
+        assert rl_utils.rl_inference_interface_shutdown() is None
+        assert events == ["close", "kill"]
+    finally:
+        loop.close()
+
+
 class MockModel(LanguageModule):
     def __init__(self, batch=BATCH, seq=SEQ, vocab=VOCAB, dtype=torch.float32):
         self.batch = batch
