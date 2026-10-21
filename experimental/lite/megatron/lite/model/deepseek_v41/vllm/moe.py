@@ -86,9 +86,27 @@ class _FusedMoE(torch.autograd.Function):
         need = (*ctx.needs_input_grad[:2], *ctx.needs_input_grad[4:])
         with torch.enable_grad():
             leaves = [t.detach().requires_grad_(n) for t, n in zip((x, scores, *masters), need)]
-            out = actual_rows(leaves[0], leaves[1], indices, leaves[2:], limit, group)
+            x, scores, *m = leaves
+            local = len(m) // 2 - 1
+            codes, scale = experts.quantize_activation(x)
+            first = experts._Shared.apply(x, m[-2], (codes, scale))
+            hidden, encoded = experts.activation(first, x.new_ones(x.shape[0]), limit)
+            shared = experts._Shared.apply(hidden, m[-1], (*encoded, True))
+            live, weights, encoded, counts, state = dispatch_rows(
+                x, scores, indices, (codes, scale), local, group
+            )
+            first = experts._Grouped.apply(live, tuple(counts), encoded, *m[:local])
+            hidden, encoded = experts.activation(first, weights, limit)
+            routed = experts._Grouped.apply(
+                hidden, tuple(counts), (*encoded, True), *m[local : 2 * local]
+            )
+            position, inverse, sends, receives = state
+            # The combine is linear: route the incoming cotangent instead of
+            # materializing/sending an unused terminal primal and its gradient.
+            upstream = all_to_all(group, grad[position // indices.shape[1]], receives, sends)
+            upstream = upstream[torch.argsort(inverse)]
             wanted = [t for t in leaves if t.requires_grad]
-            gradients = iter(torch.autograd.grad(out, wanted, grad))
+            gradients = iter(torch.autograd.grad((routed, shared), wanted, (upstream, grad)))
             result = [next(gradients) if n else None for n in need]
         return result[0], result[1], None, None, *result[2:]
 
