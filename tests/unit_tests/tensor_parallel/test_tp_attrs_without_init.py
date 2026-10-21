@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -102,6 +103,7 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_metadata():
         projection_split_shapes=(256, 64, 64),
         per_head_split_shapes=(64, 64, 64, 64, 64, 64),
     )
+    source.muon_layout = MuonProjectionLayout((2, 2), (False, True))
     source.qkv_split_shapes = [2, 2]
     source.qkv_split_shapes_global = [2] * 4
     source.qkv_gtp_pad_length = 3
@@ -111,6 +113,7 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_metadata():
     copy_tensor_model_parallel_attributes(destination, source)
 
     assert destination.is_qkv is True
+    assert destination.muon_layout == source.muon_layout
     assert destination.qkv_layout == source.qkv_layout
     assert destination.qkv_split_shapes == source.qkv_split_shapes
     assert destination.qkv_split_shapes_global == source.qkv_split_shapes_global

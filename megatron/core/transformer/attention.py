@@ -147,11 +147,15 @@ class QKVLayout:
     ``per_head_split_shapes`` for every group and processes every resulting slice independently.
     For example, two MLA heads with content/positional widths ``(2, 2)`` produce two 4-row
     projection-level matrices, but four independent 2-row per-head matrices.
+
+    ``per_head_adamw`` optionally marks output/control slices for elementwise AdamW
+    when semantic per-head routing is enabled.
     """
 
     num_groups: int
     projection_split_shapes: tuple[int, ...]
     per_head_split_shapes: tuple[int, ...]
+    per_head_adamw: tuple[bool, ...] = ()
 
     @classmethod
     def from_transformer_config(cls, config: TransformerConfig) -> 'QKVLayout':
@@ -161,15 +165,19 @@ class QKVLayout:
         num_query_heads_per_group = config.num_attention_heads // config.num_query_groups
         projection_split_shapes = [num_query_heads_per_group * config.kv_channels]
         per_head_split_shapes = [config.kv_channels] * num_query_heads_per_group
+        per_head_adamw = [False] * num_query_heads_per_group
         if config.attention_output_gate:
             projection_split_shapes.append(num_query_heads_per_group * config.kv_channels)
             per_head_split_shapes += [config.kv_channels] * num_query_heads_per_group
+            per_head_adamw += [True] * num_query_heads_per_group
         projection_split_shapes += [config.kv_channels, config.kv_channels]
         per_head_split_shapes += [config.kv_channels, config.kv_channels]
+        per_head_adamw += [False, False]
         return cls(
             num_groups=config.num_query_groups,
             projection_split_shapes=tuple(projection_split_shapes),
             per_head_split_shapes=tuple(per_head_split_shapes),
+            per_head_adamw=tuple(per_head_adamw),
         )
 
     @classmethod

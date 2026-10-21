@@ -58,6 +58,11 @@ _SYRK_MIN_EO_VERSION = "0.4.0.dev0"
 _BATCHED_NS_MIN_EO_VERSION = "0.3.0"
 
 
+def _supports_batched_newton_schulz() -> bool:
+    """Use the shared Emerging-Optimizers version contract for semantic batching."""
+    return is_emerging_optimizers_min_version(_BATCHED_NS_MIN_EO_VERSION)
+
+
 def get_supported_coefficient_types() -> tuple[str, ...]:
     """Return the coefficient types supported by the installed emerging_optimizers.
 
@@ -328,6 +333,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        adamw_betas: tuple[float, float] = (0.9, 0.999),
+        adamw_eps: float = 1e-8,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -385,12 +392,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.qkv_split_shapes = qkv_split_shapes
         # For the tp_mode="auto" cost model (_resolve_tp_mode / _select_tp_mode).
         self.num_ns_steps = num_ns_steps
+        self.scale_mode = scale_mode
         self.use_syrk = use_syrk
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_qkv_split_disabled = False
         self._warned_distributed_qkv_fallback = False
+        self._semantic_plans: dict[torch.Tensor, tuple] = {}
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -407,6 +416,206 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+
+        for group in self.param_groups:
+            group.setdefault("adamw_betas", adamw_betas)
+            group.setdefault("adamw_eps", adamw_eps)
+            if split_qkv_per_head:
+                group.setdefault("muon_semantic_version", 3)
+                for p in group["params"]:
+                    layout = getattr(p, "muon_layout", None)
+                    if layout is not None:
+                        self._semantic_plan(p)
+                        if any(layout.adamw):
+                            if not use_decoupled_weight_decay:
+                                raise ValueError(
+                                    "Mixed Muon/AdamW projections require decoupled decay"
+                                )
+                            if isinstance(self, AdaptiveMuon):
+                                raise NotImplementedError(
+                                    "Mixed AdamW slices currently require plain Muon, "
+                                    "not AdaptiveMuon"
+                                )
+            beta1, beta2 = group["adamw_betas"]
+            if not (0 <= beta1 < 1 and 0 <= beta2 < 1 and group["adamw_eps"] > 0):
+                raise ValueError("Invalid AdamW betas or epsilon")
+
+    def _semantic_plan(self, p):
+        """Cache physical shard offsets and a collective schedule shared by all peers."""
+        if p.ndim != 2:
+            raise ValueError(
+                "Per-head Muon requires 2-D projection parameters; flattened optimizer "
+                "shards are unsupported. Use LayerWiseDistributedOptimizer for Muon "
+                "matrices, not the standard DistributedOptimizer."
+            )
+        if p in self._semantic_plans:
+            return self._semantic_plans[p]
+        layout = p.muon_layout
+        tp = None
+        if self.pg_collection:
+            tp = (
+                self.pg_collection.expt_tp
+                if getattr(p, 'expert_tp', False)
+                else self.pg_collection.tp
+            )
+        # Replicated MLA down projections must not be multiplied by TP size.
+        tp_sharded = (
+            bool(getattr(p, "tensor_model_parallel", False))
+            and getattr(p, "partition_dim", -1) == 0
+        )
+        tp_size = get_pg_size(tp) if tp_sharded else 1
+        tp_rank = get_pg_rank(tp) if tp_sharded else 0
+        gtp = self._get_gtp_remat_group(p) if getattr(p, 'is_gtp_weight_remat', False) else None
+        gtp_size, gtp_rank = get_pg_size(gtp), get_pg_rank(gtp)
+        padding = int(getattr(p, "pad_length", 0)) if gtp_size > 1 else 0
+        rows = p.shape[0]
+        tp_rows = rows * gtp_size - padding
+        expected = tp_rows if layout.tp_local else tp_rows * tp_size
+        if padding < 0 or tp_rows <= 0 or sum(layout.splits) != expected:
+            raise ValueError(
+                f"Invalid Muon semantic layout: shape={tuple(p.shape)}, splits={layout.splits}, "
+                f"tp={tp_size}, gtp={gtp_size}, padding={padding}. Refusing whole-matrix fallback."
+            )
+        start = gtp_rank * rows + (0 if layout.tp_local else tp_rank * tp_rows)
+        valid_rows = max(0, min(rows, tp_rows - gtp_rank * rows))
+        adamw_ranges = layout.adamw_ranges(start, valid_rows)
+        # Use local batched NS only when *every* peer has complete matrices.
+        # A rank-local decision here could deadlock peers that need all-gather.
+        if layout.tp_reorder_splits and any(n % tp_size for n in layout.tp_reorder_splits):
+            raise ValueError("Fused MLA projection blocks must divide evenly over TP")
+        local_ok = (
+            padding == 0
+            and not layout.tp_partitioned
+            and not (layout.tp_reorder_splits and tp_size > 1)
+        )
+        if local_ok:
+            for tr in range(1 if layout.tp_local else tp_size):
+                for gr in range(gtp_size):
+                    _, complete = layout.localize(tr * tp_rows + gr * rows, rows)
+                    local_ok &= complete
+        local_layout = layout.localize(start, rows)[0] if local_ok else layout
+        plan = (
+            local_layout,
+            adamw_ranges,
+            local_ok,
+            tp,
+            tp_size,
+            tp_rank,
+            gtp,
+            gtp_size,
+            gtp_rank,
+            padding,
+        )
+        self._semantic_plans[p] = plan
+        return plan
+
+    @torch.no_grad()
+    def _init_group(self, group, skip_non_grad_params=True):
+        """Keep Adam moments parameter-shaped for Megatron's sharded checkpoints."""
+        # Preserve AdaptiveMuon's second-moment initialization through the MRO.
+        super()._init_group(group, skip_non_grad_params)
+        if not self.split_qkv_per_head:
+            return
+        for p in group["params"]:
+            if skip_non_grad_params and p.grad is None:
+                continue
+            # Use Mcore's conventional per-parameter step checkpoint handling.
+            # A parameter without a gradient must not advance Adam bias correction.
+            self.state[p].setdefault("step", 0)
+            layout = getattr(p, "muon_layout", None)
+            if layout is not None and any(layout.adamw):
+                state = self.state[p]
+                if "gate_exp_avg" not in state:
+                    state["gate_exp_avg"] = torch.zeros_like(p)
+                    state["gate_exp_avg_sq"] = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Step fused tensors; AdamW slices use raw gradients, not Muon momentum."""
+        if closure is not None:
+            raise ValueError("closure is not supported")
+        if self.split_qkv_per_head:
+            for group in self.param_groups:
+                self._init_group(group)
+                for p in group["params"]:
+                    if p.grad is not None:
+                        self.state[p]["step"] += 1
+        return OrthogonalizedOptimizer.step(self)
+
+    def load_state_dict(self, state_dict):
+        """Reject old per-head state instead of silently reinterpreting gate momentum."""
+        if self.split_qkv_per_head and any(
+            getattr(p, "muon_layout", None) is not None
+            for g in self.param_groups
+            for p in g["params"]
+        ):
+            if any(g.get("muon_semantic_version") != 3 for g in state_dict["param_groups"]):
+                raise ValueError(
+                    "This checkpoint predates per-parameter semantic Muon/AdamW steps. "
+                    "Load model weights with a fresh optimizer (--no-load-optim); "
+                    "old gate state cannot determine per-parameter update counts."
+                )
+        self._semantic_plans.clear()
+        return super().load_state_dict(state_dict)
+
+    def _orthogonalize_semantic_projection(self, p, grad, group):
+        """Batched independent-matrix NS plus local elementwise AdamW slices."""
+        layout, ranges, local_ok, tp, tp_size, tp_rank, gtp, gtp_size, gtp_rank, padding = (
+            self._semantic_plan(p)
+        )
+        rows = grad.shape[0]
+        tp_rows = rows * gtp_size - padding
+        tp_slice = gtp_slice = None
+        if not local_ok:
+            grad, tp_slice, gtp_slice = self._gather_qkv_grad(
+                p, grad, tp if not layout.tp_local else None, sum(layout.splits), pad_length=padding
+            )
+            if layout.tp_reorder_splits and tp_size > 1:
+                rank_blocks = grad.reshape(tp_size, tp_rows, grad.shape[1])
+                blocks = rank_blocks.split([n // tp_size for n in layout.tp_reorder_splits], dim=1)
+                grad = torch.cat([b.reshape(-1, grad.shape[1]) for b in blocks], dim=0)
+        if sum(layout.splits) != grad.shape[0]:
+            raise RuntimeError("Muon physical layout changed after optimizer construction")
+        matrix_tp = layout.tp_partitioned and tp_size > 1 and self.tp_mode != "blockwise"
+        output = self._orthogonalize_split_qkv(
+            grad,
+            layout.splits,
+            lambda matrix: self.scaled_orthogonalize_fn(
+                matrix,
+                tp if matrix_tp else None,
+                0 if matrix_tp else None,
+                tp_mode_this_group=(
+                    self.tp_mode if matrix_tp and self.tp_mode != "auto" else "duplicated"
+                ),
+            ),
+            adamw=layout.adamw,
+            allow_batched=not matrix_tp,
+        )
+        if not local_ok:
+            if layout.tp_reorder_splits and tp_size > 1:
+                output = torch.cat(
+                    [
+                        block.reshape(tp_size, -1, output.shape[1])
+                        for block in output.split(layout.tp_reorder_splits, dim=0)
+                    ],
+                    dim=1,
+                ).reshape_as(output)
+            output = self._restore_local_qkv_grad(output, tp_slice, gtp_slice)
+        if ranges:
+            state = self.state[p]
+            beta1, beta2 = group["adamw_betas"]
+            step = state["step"]
+            if p.grad is None or step < 1:
+                raise RuntimeError("Mixed Muon/AdamW updates must be called via optimizer.step()")
+            # Coalesced slices keep GDN z/beta/alpha to one elementwise update.
+            for lo, hi in ranges:
+                raw = p.grad[lo:hi]
+                m, v = state["gate_exp_avg"][lo:hi], state["gate_exp_avg_sq"][lo:hi]
+                m.lerp_(raw, 1 - beta1)
+                v.mul_(beta2).addcmul_(raw, raw, value=1 - beta2)
+                denom = v.sqrt().div_((1 - beta2**step) ** 0.5).add_(group["adamw_eps"])
+                output[lo:hi].copy_(m).div_(1 - beta1**step).div_(denom)
+        return output
 
     @staticmethod
     def _all_gather_tensor(t, group, dim):
@@ -436,12 +645,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         )
         self._warned_distributed_qkv_fallback = True
 
-    def _gather_qkv_grad(self, p, grad, tp_group, expected_rows, gather_gtp=True):
+    def _gather_qkv_grad(
+        self, p, grad, tp_group, expected_rows, gather_gtp=True, *, pad_length=None
+    ):
         """Reconstruct a fused QKV gradient and record how to restore its local shard."""
         gathered_grad = grad
         gtp_slice = None
         gtp_remat_group = self._get_gtp_remat_group(p)
-        gtp_pad_length = int(getattr(p, "qkv_gtp_pad_length", 0))
+        gtp_pad_length = (
+            int(getattr(p, "qkv_gtp_pad_length", 0)) if pad_length is None else pad_length
+        )
         if gtp_pad_length < 0:
             raise RuntimeError(f"Muon QKV GTP padding must be non-negative: {gtp_pad_length}")
         if (
@@ -513,7 +726,92 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             ]
         return gathered_grad.contiguous()
 
-    def _orthogonalize_split_qkv(self, grad, split_shapes, orthogonalize_fn):
+    def _orthogonalize_matrices(
+        self, grad, split_shapes, orthogonalize_fn, adamw=None, allow_batched=True
+    ):
+        """Apply independent matrix updates; masked AdamW slices never enter NS."""
+        semantic = adamw is not None
+        if not semantic:
+            if len(set(split_shapes)) == 1 and allow_batched and not self.use_syrk:
+                # Preserve the dependency's batched arithmetic and version error.
+                if not _supports_batched_newton_schulz():
+                    raise ValueError(
+                        "Muon batched per-head Newton-Schulz requires emerging-optimizers >= "
+                        f"{_BATCHED_NS_MIN_EO_VERSION}, but "
+                        f"{get_emerging_optimizers_version()} is installed. Upgrade "
+                        "emerging-optimizers or disable --muon-split-qkv-per-head."
+                    )
+                batch = grad.reshape(len(split_shapes), split_shapes[0], grad.shape[-1])
+                return orthogonalize_fn(batch).reshape_as(grad)
+            # Nonuniform base layouts use only 2-D NS and need no batched-version check.
+            return torch.cat([orthogonalize_fn(piece) for piece in grad.split(split_shapes)])
+        adamw = tuple(adamw)
+        if len(adamw) != len(split_shapes):
+            raise ValueError("Every projection slice needs an optimizer assignment")
+        batched_available = (
+            allow_batched and not self.use_syrk and _supports_batched_newton_schulz()
+        )
+        pieces = torch.split(grad, split_shapes)
+        # AdamW ranges stay zero here and never enter NS, including 1-row gates.
+        output = torch.zeros_like(grad)
+        outputs = torch.split(output, split_shapes)
+        by_size = {}
+        for index, (size, use_adam) in enumerate(zip(split_shapes, adamw)):
+            if not use_adam:
+                by_size.setdefault(size, []).append(index)
+        # Small, unequal MLA down matrices otherwise need separate NS launches.
+        # Zero-row padding preserves each matrix's norm and Gram block exactly;
+        # the extra rows remain zero under every NS polynomial. Only use this
+        # when orientation and the scale of every *real* matrix are unchanged.
+        max_rows = max(split_shapes)
+        if (
+            len(by_size) > 1
+            and len(split_shapes) <= 3
+            and not any(adamw)
+            and batched_available
+            and max_rows <= min(512, grad.shape[1])
+            and max_rows * len(split_shapes) <= 2 * sum(split_shapes)
+            and len(
+                {get_muon_scale_factor(n, grad.shape[1], self.scale_mode) for n in split_shapes}
+            )
+            == 1
+        ):
+            batch = grad.new_zeros((len(pieces), max_rows, grad.shape[1]))
+            for index, piece in enumerate(pieces):
+                batch[index, : piece.shape[0]].copy_(piece)
+            updates = orthogonalize_fn(batch)
+            for index, target in enumerate(outputs):
+                target.copy_(updates[index, : target.shape[0]])
+            by_size = {}
+        if not batched_available:
+            by_size = {i: [i] for i, use_adam in enumerate(adamw) if not use_adam}
+        for indices in by_size.values():
+            if len(indices) > 1 and batched_available:
+                # Contiguous, equal-sized heads can use a view without a stack copy.
+                first, last = indices[0], indices[-1]
+                if indices == list(range(first, last + 1)):
+                    offset = sum(split_shapes[:first])
+                    batch = grad.narrow(0, offset, len(indices) * split_shapes[first]).reshape(
+                        len(indices), split_shapes[first], grad.shape[1]
+                    )
+                else:
+                    batch = torch.stack([pieces[i] for i in indices])
+                updates = orthogonalize_fn(batch)
+                if indices == list(range(first, last + 1)):
+                    output.narrow(0, offset, len(indices) * split_shapes[first]).copy_(
+                        updates.reshape(-1, grad.shape[1])
+                    )
+                else:
+                    for index, update in zip(indices, updates.unbind(0)):
+                        outputs[index].copy_(update)
+            else:
+                for index in indices:
+                    outputs[index].copy_(orthogonalize_fn(pieces[index]))
+        return output
+
+    def _orthogonalize_split_qkv(
+        self, grad, split_shapes, orthogonalize_fn, *, adamw=None, allow_batched=True
+    ):
         """Split and reconstruct Megatron's interleaved fused QKV update."""
         if grad.ndim != 2:
             raise RuntimeError(f"Muon QKV gradient must be 2D, got {grad.ndim}D")
@@ -526,19 +824,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     f"Muon per-head QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
                     f"split_shapes={split_shapes}"
                 )
-            if len(set(split_shapes)) == 1:
-                # A 3D input selects Emerging-Optimizers' batched Newton-Schulz path.
-                if not is_emerging_optimizers_min_version(_BATCHED_NS_MIN_EO_VERSION):
-                    raise ValueError(
-                        "Muon batched per-head Newton-Schulz requires emerging-optimizers >= "
-                        f"{_BATCHED_NS_MIN_EO_VERSION}, but "
-                        f"{get_emerging_optimizers_version()} is installed. Upgrade "
-                        "emerging-optimizers or disable --muon-split-qkv-per-head."
-                    )
-                head_rows = split_shapes[0]
-                return orthogonalize_fn(grad.view(len(split_shapes), head_rows, -1)).view_as(grad)
-            return torch.cat(
-                [orthogonalize_fn(head) for head in torch.split(grad, split_shapes, dim=0)], dim=0
+            return self._orthogonalize_matrices(
+                grad, split_shapes, orthogonalize_fn, adamw=adamw, allow_batched=allow_batched
             )
 
         if grad.shape[0] % split_width != 0:
@@ -900,6 +1187,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         Returns:
             The orthogonalized gradient tensor.
         """
+        if self.split_qkv_per_head and getattr(p, "muon_layout", None) is not None:
+            return self._orthogonalize_semantic_projection(p, grad, kwargs)
+
         # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (
@@ -1002,6 +1292,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        adamw_betas: tuple[float, float] = (0.9, 0.999),
+        adamw_eps: float = 1e-8,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -1026,6 +1318,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            adamw_betas=adamw_betas,
+            adamw_eps=adamw_eps,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
@@ -1088,6 +1382,8 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
         model_chunks[0].config, split_qkv_per_head=kwargs.get("split_qkv_per_head", False)
     )
     kwargs["pg_collection"] = pg_collection
+    kwargs["adamw_betas"] = (config.adam_beta1, config.adam_beta2)
+    kwargs["adamw_eps"] = config.adam_eps
     return kwargs
 
 
@@ -1102,6 +1398,9 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
     cls = _muon_config_to_cls(config)
     if cls is TensorParallelMuon:
         return kwargs
+    # Per-head routing is rejected by OptimizerConfig for this whole-matrix backend.
+    for key in ("adamw_betas", "adamw_eps"):
+        kwargs.pop(key)
     # LayerShardedMuon: its own muon-prefixed kwargs (ns_batch_size, concurrent_groups, ...).
     kwargs.update(_kwargs_from_config(cls, "muon", config))
     # 'layer_sharded' selected the class; it is not a TensorParallelMuon mode, so the

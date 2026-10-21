@@ -265,10 +265,11 @@ class OptimizerConfig:
     """Whether to split QKV parameters for Muon optimizer."""
 
     muon_split_qkv_per_head: bool = False
-    """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
-    ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
-    and require Emerging-Optimizers 0.3.0 or newer. By default, Muon orthogonalizes the
-    Q, gate, K, and V projection matrices separately."""
+    """Use per-head matrix Muon with semantic routing for fused projections.
+    Requires ``muon_split_qkv``. Attention output gates and GDN controls use AdamW;
+    dense SwiGLU gate/up and MLA down components use separate matrix updates.
+    Uniform all-Muon QKV heads require Emerging-Optimizers >= 0.3.0 for batched NS.
+    When disabled, retain projection-level QKV/MLA splitting from the base path."""
 
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
@@ -469,6 +470,12 @@ class OptimizerConfig:
             assert not math.isfinite(
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
+        if self.muon_split_qkv_per_head:
+            if not self.muon_split_qkv:
+                raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
+            if self.muon_tp_mode == "layer_sharded":
+                raise ValueError("Per-head Muon does not support muon_tp_mode='layer_sharded'")
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

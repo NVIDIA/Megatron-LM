@@ -26,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.muon_layout import MuonProjectionLayout
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -804,6 +805,9 @@ class MLASelfAttention(MultiLatentAttention):
         )
         self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_mla_head_components(
             self.config.num_attention_heads, (self.config.qk_head_dim, self.config.v_head_dim)
+        )
+        self.linear_kv_down_proj.weight.muon_layout = MuonProjectionLayout.matrices(
+            (self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim)
         )
 
         if self.config.q_lora_rank is not None:
@@ -1626,6 +1630,13 @@ class FusedMLASelfAttention(MLASelfAttention):
         )
         self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_mla_head_components(
             self.config.num_attention_heads, (self.config.qk_head_dim, self.config.v_head_dim)
+        )
+        self.linear_qkv_down_proj.weight.muon_layout = MuonProjectionLayout.matrices(
+            (self.config.q_lora_rank, self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim),
+            tp_reorder_splits=(
+                self.config.q_lora_rank,
+                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+            ),
         )
 
         self.q_layernorm = layer_classes["q_layernorm"](
