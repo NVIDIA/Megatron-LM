@@ -27,7 +27,7 @@ def test_page_view():
     table = torch.tensor([[3, 1], [0, -1]], dtype=torch.int32)
     k_pages, v_pages, pages = page_view(k, k.clone(), table)
     assert k_pages.shape == (8, 128, 1, 8) and v_pages.shape == k_pages.shape
-    assert pages.tolist() == [[6, 7, 2, 3], [0, 1, 0, 1]]
+    assert pages.tolist() == [[6, 7, 2, 3], [0, 1, -1, -1]]
     assert pages.dtype == torch.int32
 
 

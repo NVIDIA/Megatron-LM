@@ -219,5 +219,6 @@ def page_view(k_cache, v_cache, block_table):
     k_pages = k_cache.view(-1, TILE_KEYS, *k_cache.shape[2:])
     v_pages = v_cache.view(-1, TILE_KEYS, *v_cache.shape[2:])
     sub = torch.arange(per, device=block_table.device, dtype=block_table.dtype)
-    pages = block_table.clamp(min=0).unsqueeze(-1) * per + sub
+    pages = block_table.unsqueeze(-1) * per + sub
+    pages = torch.where(block_table.unsqueeze(-1) < 0, -1, pages)
     return k_pages, v_pages, pages.view(block_table.shape[0], -1).to(torch.int32)
