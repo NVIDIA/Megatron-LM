@@ -148,12 +148,12 @@ class _Grouped(torch.autograd.Function):
                 else torch.cat([g @ w for g, w in zip(grad.split(ctx.counts), weight.unbind(0))])
             )
             if grad.is_cuda:
-                from .backward_kernels import grouped_weight_vjp
-
-                dw = torch.empty(weight.shape, device=grad.device, dtype=torch.float32)
-                grouped_weight_vjp[
-                    (len(ctx.counts), (grad.shape[1] + 31) // 32, (x.shape[1] + 63) // 64)
-                ](grad.contiguous(), x.contiguous(), ends, dw, grad.shape[1], x.shape[1])
+                if not grad.shape[0]:
+                    dw = torch.zeros_like(weight, dtype=torch.float32)
+                else:
+                    dw = torch._grouped_mm(grad.contiguous().T, x.contiguous(), offs=ends).float()
+                    empty = ends == torch.cat((ends.new_zeros(1), ends[:-1]))
+                    dw.masked_fill_(empty[:, None, None], 0)
             else:
                 # CPU-only derivative controls have no grouped CUDA backend.
                 dw = torch.stack(
