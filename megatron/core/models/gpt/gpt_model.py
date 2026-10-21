@@ -14,7 +14,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference.utils import InferenceMode, lm_head_can_emit
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
@@ -854,12 +854,17 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+        inference = inference_context is not None
+        emit_fp32 = inference and lm_head_can_emit(self.config, torch.float32)
         logits, _ = self.output_layer(
             hidden_states,
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
-            output_dtype=self.inference_logits_dtype(inference_context),
+            output_dtype=torch.float32 if emit_fp32 else None,
         )
+        if inference:
+            logits = logits.float()
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)

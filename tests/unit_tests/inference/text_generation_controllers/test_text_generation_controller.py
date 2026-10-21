@@ -17,7 +17,6 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -4297,8 +4296,8 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
     def test_logits_are_fp32(self, pp_size):
         """Inference holds logits in fp32: the CUDA-graph buffer is allocated in it and at PP 2
         the first stage receives the broadcast in it. The bf16 head emits fp32 directly when TE
-        general_gemm is available and is upcast on the way in otherwise. Generation with and
-        without the buffer samples the same tokens (both run the same eager kernels here).
+        general_gemm is available and upcasts otherwise. Generation with and without the buffer
+        samples the same tokens (both run the same eager kernels here).
         """
         generated = {}
         for cuda_graph_impl in ("none", "local"):
@@ -4313,10 +4312,6 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 cuda_graph_impl=cuda_graph_impl,
             )
             controller = self.text_generation_controller
-            context = controller.inference_wrapped_model.inference_context
-            assert controller._language_model.inference_logits_dtype(context) is (
-                torch.float32 if te_general_gemm is not None else None
-            )
             generated[cuda_graph_impl] = self._generate_dynamic()
             assert controller._all_logits_cuda.dtype is torch.float32
         assert generated["none"] == generated["local"]
