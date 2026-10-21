@@ -9,7 +9,7 @@ import torch
 
 try:
     import cutlass.cute as cute
-    from cutlass.cute.typing import Float32, Int32
+    from cutlass.cute.typing import Float32
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
     from .prefill_kernel import PPAttentionForward
@@ -83,7 +83,6 @@ class PPAttention:
                 qhead_per_kvhead=self.rows,
                 is_causal=True,
                 super_block_tiles=self.G,
-                fold_worker=True,
                 num_regs_other=80,
             )
             opt = lambda t, **kw: to_cute_tensor(t, **kw) if t is not None else None
@@ -98,31 +97,12 @@ class PPAttention:
                 opt(seqused, assumed_align=4, leading_dim=0),
                 opt(page_table, assumed_align=4, leading_dim=1),
                 to_cute_tensor(self.scratch),
-                None,
-                None,
                 opt(lse, assumed_align=4),
-                None,
-                Int32(0),
-                Int32(self.h_kv),
                 self._fake_stream,
                 options="--enable-tvm-ffi",
             )
         self._compiled[key](
-            q,
-            k,
-            v,
-            out,
-            Float32(self.softmax_scale),
-            cu,
-            seqused,
-            page_table,
-            self.scratch,
-            None,
-            None,
-            lse,
-            None,
-            Int32(0),
-            Int32(self.h_kv),
+            q, k, v, out, Float32(self.softmax_scale), cu, seqused, page_table, self.scratch, lse
         )
 
     def prefill(self, q, k, v, return_lse: bool = False):

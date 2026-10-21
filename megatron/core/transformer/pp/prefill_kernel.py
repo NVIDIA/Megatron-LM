@@ -46,18 +46,11 @@ class PPAttentionForward:
         qhead_per_kvhead: int = 1,
         is_causal: bool = False,
         super_block_tiles: int = 8,
-        split_kv: bool = False,
         m_block_size: int = 128,
         n_block_size: int = 128,
-        cta_group_size: int = 2,
-        tokens_per_item: int = 1,
-        rows_per_item: Optional[int] = None,
-        fold_worker: bool = False,
         num_regs_other: int = 32,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        self.dump_pitch = 36
-        self.dump_bufs = 2 if (head_dim == 128 and cta_group_size == 1) else 1
         assert (
             head_dim in (128, 256) and head_dim_v == head_dim
         ), "kernel only supports head_dim = head_dim_v in (128, 256)"
@@ -66,33 +59,11 @@ class PPAttentionForward:
             m_block_size == 128 and n_block_size == 128
         ), "kernel only supports tile_m=128 and tile_n=128"
         assert super_block_tiles >= 1, "super_block_tiles must be >= 1"
-        if split_kv:
-            assert not is_causal, "split decode requires is_causal=False"
-            assert qhead_per_kvhead == 1, "split decode requires qhead_per_kvhead=1"
-        self.tokens = int(tokens_per_item)
-        assert self.tokens >= 1
-        if self.tokens > 1:
-            assert split_kv, "tokens_per_item > 1 is split decode only"
-            assert (
-                rows_per_item is not None and rows_per_item % self.tokens == 0
-            ), "rows_per_item must be a positive multiple of tokens_per_item"
-            assert (
-                rows_per_item <= m_block_size
-            ), f"rows_per_item {rows_per_item} exceeds the {m_block_size}-row tile"
-            self.rpt = rows_per_item // self.tokens
-        else:
-            self.rpt = 1
-        assert cta_group_size in (1, 2)
-        if cta_group_size == 1:
-            assert split_kv, "1-CTA variant is split decode only"
-        self.cta_group_size = cta_group_size
-        self.separate_kv_pipelines = split_kv
+        self.cta_group_size = 2
         self.G = super_block_tiles
-        self.split_kv = split_kv
         self.fold_chunks = (head_dim // 128) * 4
         self.fold_chunk_bytes = 32 * 128 * 4
         self.fold_barrier_id = 2
-        self.fold_worker = bool(fold_worker) and not split_kv
         self.fold_worker_barrier_id = 3
         self.fold_worker_threads = 64
         self.fold_args_len = 2 * 128 + 2
@@ -107,19 +78,19 @@ class PPAttentionForward:
         assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
         self.cta_tiler = (mma_tiler[0], mma_tiler[1], mma_tiler[2])
         self.qk_mma_tiler = (
-            cta_group_size * mma_tiler[0],
+            self.cta_group_size * mma_tiler[0],
             mma_tiler[1],
             min(self.cta_tiler[2], 128),
         )
         self.pv_mma_tiler = self.qk_mma_tiler
         self.pv_block_tiler = (
-            self.pv_mma_tiler[0] // cta_group_size,
+            self.pv_mma_tiler[0] // self.cta_group_size,
             self.pv_mma_tiler[1],
             self.pv_mma_tiler[2],
         )
         self.iterations_qk = self.cta_tiler[2] // self.qk_mma_tiler[2]
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
-        self.cluster_shape_mn = (cta_group_size, 1)
+        self.cluster_shape_mn = (self.cta_group_size, 1)
         self.tmem_warp_shape_mn = (4, 1)
         self.is_persistent = False
         self.is_causal = is_causal
@@ -165,10 +136,7 @@ class PPAttentionForward:
 
     def _setup_attributes(self):
         self.q_stage = self.iterations_qk
-        if not self.split_kv:
-            self.kv_stage = 4
-        else:
-            self.kv_stage = 5 if self.cta_group_size == 2 else 2
+        self.kv_stage = 4
         self.qk_acc_stage = 2
         self.mma_corr_stage = 1
 
@@ -184,22 +152,13 @@ class PPAttentionForward:
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
         mScratch: Optional[cute.Tensor] = None,
-        mOPartial: Optional[cute.Tensor] = None,
-        mMLPartial: Optional[cute.Tensor] = None,
         mLSE: Optional[cute.Tensor] = None,
-        mOutRes: Optional[cute.Tensor] = None,
-        splits: Int32 = Int32(0),
-        h_kv: Int32 = Int32(1),
         stream: cuda.CUstream = None,
     ):
-        if cutlass.const_expr(self.split_kv):
-            assert mOPartial is not None and mMLPartial is not None
-            assert mPageTable is not None and mSeqUsedK is not None
-        else:
-            assert mScratch is not None
+        assert mScratch is not None
 
         q_tensor, k_tensor, v_tensor = mQ, mK, mV
-        o_tensor = mO if cutlass.const_expr(not self.split_kv) else mOPartial
+        o_tensor = mO
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = None
@@ -209,8 +168,6 @@ class PPAttentionForward:
 
         q_rank = len(mQ.shape)
         k_rank = len(mK.shape)
-        q_nested = self.split_kv and self.tokens > 1 and q_rank == 5
-        self.q_nested = q_nested
         if cutlass.const_expr(cum_seqlen_q is not None):
             if cutlass.const_expr(q_rank == 5):
                 s_q = mQ.shape[1]
@@ -223,11 +180,7 @@ class PPAttentionForward:
             else:
                 raise RuntimeError(f"hd256 forward varlen expects q rank 3 or 5, got rank {q_rank}")
         else:
-            if cutlass.const_expr(q_nested):
-                s_q = mQ.shape[2] * mQ.shape[3]
-                h_q = Int32(1)
-                d = mQ.shape[4]
-            elif cutlass.const_expr(q_rank == 5):
+            if cutlass.const_expr(q_rank == 5):
                 s_q = mQ.shape[1]
                 h_q = mQ.shape[2] * mQ.shape[3]
                 d = mQ.shape[4]
@@ -262,8 +215,6 @@ class PPAttentionForward:
                 )
         if cutlass.const_expr(cum_seqlen_q is not None):
             b = mCuSeqlensQ.shape[0] - 1
-        elif cutlass.const_expr(q_nested):
-            b = mQ.shape[0] * mQ.shape[1]
         else:
             b = mQ.shape[0]
 
@@ -271,11 +222,7 @@ class PPAttentionForward:
         scale_softmax_log2 = softmax_scale * math.log2(math.exp(1.0))
         scale_output = 1.0
         s_lse = s_q
-        if cutlass.const_expr(self.split_kv):
-            h_k = Int32(1)
-            h_r = Int32(1)
-        else:
-            h_r = h_q // h_k
+        h_r = h_q // h_k
         s_q64 = Int64(s_q)
         s_k64 = Int64(s_k)
         s_lse64 = Int64(s_lse)
@@ -296,36 +243,19 @@ class PPAttentionForward:
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
         varlen_q = cum_seqlen_q is not None
         varlen_k = cum_seqlen_k is not None
-        if cutlass.const_expr(q_nested):
-            q = cute.make_tensor(
-                q_tensor.iterator,
-                cute.make_layout(
-                    (
-                        (self.rpt, q_tensor.shape[2]),
-                        d,
-                        ((h_r, h_k), (q_tensor.shape[1], q_tensor.shape[0])),
-                    ),
-                    stride=(
-                        (q_tensor.stride[3], q_tensor.stride[2]),
-                        q_tensor.stride[4],
-                        ((0, 0), (q_tensor.stride[1], q_tensor.stride[0])),
-                    ),
-                ),
-            )
-        else:
-            q_norm = as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
+        q_norm = as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
 
-            q = cute.make_tensor(
-                q_norm.iterator,
-                cute.make_layout(
-                    (s_q_total, d, ((h_r, h_k), b)),
-                    stride=(
-                        q_norm.stride[1],
-                        q_norm.stride[4],
-                        ((q_norm.stride[3], q_norm.stride[2]), q_norm.stride[0]),
-                    ),
+        q = cute.make_tensor(
+            q_norm.iterator,
+            cute.make_layout(
+                (s_q_total, d, ((h_r, h_k), b)),
+                stride=(
+                    q_norm.stride[1],
+                    q_norm.stride[4],
+                    ((q_norm.stride[3], q_norm.stride[2]), q_norm.stride[0]),
                 ),
-            )
+            ),
+        )
         if cutlass.const_expr(mPageTable is not None):
             page_size = k_tensor.shape[1]
             max_seqlen_k_paged = Int32(mPageTable.shape[1] * page_size)
@@ -365,50 +295,19 @@ class PPAttentionForward:
             )
             page_table = None
             max_seqlen_k_paged = None
-        if cutlass.const_expr(self.split_kv):
-            o = cute.make_tensor(
-                o_tensor.iterator,
-                cute.make_layout(
-                    (s_q_total, d, ((o_tensor.shape[1], 1), b)),
-                    stride=(
-                        cute.assume(o_tensor.stride[2], divby=4),
-                        o_tensor.stride[3],
-                        (
-                            (cute.assume(o_tensor.stride[1], divby=4), 0),
-                            cute.assume(o_tensor.stride[0], divby=4),
-                        ),
-                    ),
+        o_norm = as_bshkrd_tensor(o_tensor, h_k, h_r, varlen_q)
+        o = cute.make_tensor(
+            o_norm.iterator,
+            cute.make_layout(
+                (s_q_total, d, ((h_r, h_k), b)),
+                stride=(
+                    o_norm.stride[1],
+                    o_norm.stride[4],
+                    ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
                 ),
-            )
-        else:
-            o_norm = as_bshkrd_tensor(o_tensor, h_k, h_r, varlen_q)
-            o = cute.make_tensor(
-                o_norm.iterator,
-                cute.make_layout(
-                    (s_q_total, d, ((h_r, h_k), b)),
-                    stride=(
-                        o_norm.stride[1],
-                        o_norm.stride[4],
-                        ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
-                    ),
-                ),
-            )
-        if cutlass.const_expr(mOutRes is not None):
-            assert not self.split_kv
-            o_res_norm = as_bshkrd_tensor(mOutRes, h_k, h_r, varlen_q)
-            o_res = cute.make_tensor(
-                o_res_norm.iterator,
-                cute.make_layout(
-                    (s_q_total, d, ((h_r, h_k), b)),
-                    stride=(
-                        o_res_norm.stride[1],
-                        o_res_norm.stride[4],
-                        ((o_res_norm.stride[3], o_res_norm.stride[2]), o_res_norm.stride[0]),
-                    ),
-                ),
-            )
-        else:
-            o_res = None
+            ),
+        )
+        o_res = None
         if cutlass.const_expr(lse_tensor is not None):
             lse_layout = cute.make_layout(
                 (s_lse64, ((h_r, h_k), b_lse)),
@@ -424,33 +323,18 @@ class PPAttentionForward:
         self.o_dtype = o.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
-        if cutlass.const_expr(self.split_kv):
+        o_shape = (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape
+        if cutlass.const_expr(self.is_persistent):
+            m_cta = cute.ceil_div(cute.size(o_shape[0]), self.cta_tiler[0])
+            m_pad = m_cta + m_cta % 2
             self.tile_sched_params = FmhaStaticTileSchedulerParams(
-                False,
-                (
-                    Int32(self.cta_group_size)
-                    * cute.ceil_div(s_q, self.cta_group_size * self.cta_tiler[0]),
-                    splits,
-                    b,
-                ),
+                True, (m_pad, cute.size(o_shape[2][0]), cute.size(o_shape[2][1]))
             )
             grid = FmhaStaticTileScheduler.get_grid_shape(self.tile_sched_params)
         else:
-            o_shape = (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape
-            if cutlass.const_expr(self.is_persistent):
-                m_cta = cute.ceil_div(cute.size(o_shape[0]), self.cta_tiler[0])
-                m_pad = m_cta + m_cta % 2
-                self.tile_sched_params = FmhaStaticTileSchedulerParams(
-                    True, (m_pad, cute.size(o_shape[2][0]), cute.size(o_shape[2][1]))
-                )
-                grid = FmhaStaticTileScheduler.get_grid_shape(self.tile_sched_params)
-            else:
-                self.tile_sched_params, grid = compute_grid(o_shape, self.cta_tiler, False)
+            self.tile_sched_params, grid = compute_grid(o_shape, self.cta_tiler, False)
 
-        if cutlass.const_expr(q_nested):
-            self.q_major_mode = tcgen05.OperandMajorMode.K
-        else:
-            self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.o_layout = utils.LayoutEnum.from_tensor(o)
@@ -468,7 +352,7 @@ class PPAttentionForward:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
 
-        cta_group = tcgen05.CtaGroup.TWO if self.cta_group_size == 2 else tcgen05.CtaGroup.ONE
+        cta_group = tcgen05.CtaGroup.TWO
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -590,9 +474,6 @@ class PPAttentionForward:
             window_size_left,
             window_size_right,
             mScratch,
-            mMLPartial,
-            h_kv,
-            splits,
             self.cluster_layout_vmnk,
             q_smem_layout_staged,
             k_smem_layout_staged,
@@ -634,9 +515,6 @@ class PPAttentionForward:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         mScratch: Optional[cute.Tensor],
-        mMLPartial: Optional[cute.Tensor],
-        h_kv: Int32,
-        splits: Int32,
         cluster_layout_vmnk: cute.Layout,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
@@ -675,15 +553,6 @@ class PPAttentionForward:
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             tx_count=self.tma_copy_kv_bytes,
             barrier_storage=storage.load_kv_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        load_v_producer, load_v_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.kv_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_kv_bytes,
-            barrier_storage=storage.load_kv_mbar_ptr.data_ptr() + self.kv_stage * 2,
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         ).make_participants()
@@ -740,18 +609,16 @@ class PPAttentionForward:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         ).make_participants()
-        if cutlass.const_expr(not self.split_kv):
-            if warp_idx == self.correction_warp_ids[0]:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_init(storage.fold_mbar_ptr.data_ptr(), 1)
-                    if cutlass.const_expr(self.fold_worker):
-                        cute.arch.mbarrier_init(
-                            storage.fold_req_mbar_ptr.data_ptr(),
-                            len(self.correction_warp_ids) * self.threads_per_warp,
-                        )
-                        cute.arch.mbarrier_init(
-                            storage.fold_done_mbar_ptr.data_ptr(), self.fold_worker_threads
-                        )
+        if warp_idx == self.correction_warp_ids[0]:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(storage.fold_mbar_ptr.data_ptr(), 1)
+                cute.arch.mbarrier_init(
+                    storage.fold_req_mbar_ptr.data_ptr(),
+                    len(self.correction_warp_ids) * self.threads_per_warp,
+                )
+                cute.arch.mbarrier_init(
+                    storage.fold_done_mbar_ptr.data_ptr(), self.fold_worker_threads
+                )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
@@ -794,15 +661,12 @@ class PPAttentionForward:
             layout=cute.make_layout(len(self.softmax_warp_ids) * self.threads_per_warp),
             byte_alignment=128,
         )
-        sDump = None
-        sFoldObar = sFoldPart = None
-        if cutlass.const_expr(not self.split_kv):
-            sFoldObar = smem.allocate_tensor(
-                element_type=cutlass.Float32, layout=cute.make_layout(32 * 128), byte_alignment=1024
-            )
-            sFoldPart = smem.allocate_tensor(
-                element_type=cutlass.Float32, layout=cute.make_layout(32 * 128), byte_alignment=1024
-            )
+        sFoldObar = smem.allocate_tensor(
+            element_type=cutlass.Float32, layout=cute.make_layout(32 * 128), byte_alignment=1024
+        )
+        sFoldPart = smem.allocate_tensor(
+            element_type=cutlass.Float32, layout=cute.make_layout(32 * 128), byte_alignment=1024
+        )
         qk_thr_mma = qk_tiled_mma.get_slice(mma_tile_coord_v)
         pv_thr_mma = pv_tiled_mma.get_slice(mma_tile_coord_v)
         tSrQ = qk_thr_mma.make_fragment_A(sQ)
@@ -833,33 +697,31 @@ class PPAttentionForward:
 
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        if cutlass.const_expr(self.fold_worker):
-            if warp_idx == self.empty_warp_id[0] or warp_idx == self.empty_warp_id[1]:
-                self._fold_worker_loop(
-                    mScratch,
-                    sFoldObar,
-                    sFoldPart,
-                    storage.fold_mbar_ptr.data_ptr(),
-                    storage.fold_req_mbar_ptr.data_ptr(),
-                    storage.fold_done_mbar_ptr.data_ptr(),
-                    cute.make_tensor(
-                        storage.fold_args.data_ptr(), cute.make_layout(self.fold_args_len)
-                    ),
-                )
+        if warp_idx == self.empty_warp_id[0] or warp_idx == self.empty_warp_id[1]:
+            self._fold_worker_loop(
+                mScratch,
+                sFoldObar,
+                sFoldPart,
+                storage.fold_mbar_ptr.data_ptr(),
+                storage.fold_req_mbar_ptr.data_ptr(),
+                storage.fold_done_mbar_ptr.data_ptr(),
+                cute.make_tensor(
+                    storage.fold_args.data_ptr(), cute.make_layout(self.fold_args_len)
+                ),
+            )
 
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
-                if cutlass.const_expr(not self.split_kv):
-                    _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
-                    _pair = curr_block_coord[0] // self.cta_group_size
-                    _rank = curr_block_coord[0] % self.cta_group_size
-                    curr_block_coord = (
-                        (_npairs - 1 - _pair) * self.cta_group_size + _rank,
-                        curr_block_coord[1],
-                        curr_block_coord[2],
-                    )
+                _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
+                _pair = curr_block_coord[0] // self.cta_group_size
+                _rank = curr_block_coord[0] % self.cta_group_size
+                curr_block_coord = (
+                    (_npairs - 1 - _pair) * self.cta_group_size + _rank,
+                    curr_block_coord[1],
+                    curr_block_coord[2],
+                )
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -867,13 +729,6 @@ class PPAttentionForward:
                 )
                 continue_cond = False
                 batch_coord = curr_block_coord[2][1]
-                flat_coord = curr_block_coord[2][1]
-                split_idx = Int32(0)
-                kv_head_coord = Int32(0)
-                if cutlass.const_expr(self.split_kv):
-                    batch_coord = batch_coord // h_kv
-                    kv_head_coord = flat_coord - batch_coord * h_kv
-                    split_idx = curr_block_coord[2][0]
                 seqlen_q = cute.size(mQ_qdl.shape[0])
                 seqlen_k = (
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
@@ -903,23 +758,6 @@ class PPAttentionForward:
                     )
                 if cutlass.const_expr(mSeqUsedK is not None):
                     seqlen_k = mSeqUsedK[batch_coord]
-                if cutlass.const_expr(self.split_kv):
-                    n_tiles_k = cute.ceil_div(seqlen_k, self.qk_mma_tiler[1])
-                    s_b = cute.ceil_div(n_tiles_k, self.G)
-                    per_item = cute.ceil_div(s_b, splits)
-                    s0 = split_idx * per_item
-                    s1 = cutlass.min(s_b, s0 + per_item)
-                    split_tile_start = s0 * self.G
-                    split_tile_steps = cutlass.max(
-                        Int32(0), cutlass.min(s1 * self.G, n_tiles_k) - split_tile_start
-                    )
-                    continue_cond = (
-                        continue_cond
-                        or split_tile_steps <= 0
-                        or not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                        )
-                    )
                 if not continue_cond:
                     mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
                     q_cta_layout = cute.make_layout(
@@ -969,11 +807,7 @@ class PPAttentionForward:
                         tKgK = tKgK_kdl[None, None, None, mma_block_coord[2]]
                         tVgV = tVgV_dkl[None, None, None, mma_block_coord[2]]
                     else:
-                        head_kv_coord = (
-                            kv_head_coord
-                            if cutlass.const_expr(self.split_kv)
-                            else curr_block_coord[2][0] // self.qhead_per_kvhead
-                        )
+                        head_kv_coord = curr_block_coord[2][0] // self.qhead_per_kvhead
                         mK_kdl_ = mK_kdl[None, None, head_kv_coord, None]
                         mV_dkl_ = mV_dkl[None, None, head_kv_coord, None]
                         gK_kdl = cute.flat_divide(
@@ -1000,30 +834,21 @@ class PPAttentionForward:
                         )
                         tKgK = tKgK_kdl
                         tVgV = tVgV_dkl
-                    if cutlass.const_expr(self.split_kv and self.q_nested):
-                        q_hb_coord = (Int32(0), (kv_head_coord, batch_coord))
-                    elif cutlass.const_expr(self.split_kv):
-                        q_hb_coord = (Int32(0), flat_coord)
-                    else:
-                        q_hb_coord = mma_block_coord[2]
+                    q_hb_coord = mma_block_coord[2]
                     tQgQ = tQgQ_qdl[None, mma_block_coord[0], None, q_hb_coord]
 
-                    if cutlass.const_expr(self.split_kv):
-                        seqlen_kv_loop_start = split_tile_start
-                        seqlen_kv_loop_steps = split_tile_steps
-                    else:
-                        seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                            FusedMask.get_trip_start_count_via_block_info(
-                                mma_block_coord,
-                                self.qk_mma_tiler,
-                                seqlen_q,
-                                seqlen_k,
-                                self.is_causal,
-                                self.is_local,
-                                window_size_left,
-                                window_size_right,
-                            )
+                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                        FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
                         )
+                    )
                     seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
                     for iter in cutlass.range(self.iterations_qk, unroll=1):
                         q_handle = load_q_producer.acquire_and_advance()
@@ -1074,10 +899,7 @@ class PPAttentionForward:
                                 tma_bar_ptr=k_handle.barrier,
                             )
                         for iter in cutlass.range(self.iterations_pv, unroll=1):
-                            if cutlass.const_expr(self.separate_kv_pipelines):
-                                v_handle = load_v_producer.acquire_and_advance()
-                            else:
-                                v_handle = load_kv_producer.acquire_and_advance()
+                            v_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
                                 tma_atom_v,
                                 (
@@ -1096,10 +918,7 @@ class PPAttentionForward:
                             if kv_coord < seqlen_kv_loop_end:
                                 k_page_idx = mPageTable[batch_coord, kv_coord]
                     for iter in cutlass.range(self.iterations_pv, unroll=1):
-                        if cutlass.const_expr(self.separate_kv_pipelines):
-                            v_handle = load_v_producer.acquire_and_advance()
-                        else:
-                            v_handle = load_kv_producer.acquire_and_advance()
+                        v_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_v,
                             (
@@ -1113,8 +932,6 @@ class PPAttentionForward:
 
                 work_tile = tile_sched.advance_to_next_work()
             load_kv_producer.tail()
-            if cutlass.const_expr(self.separate_kv_pipelines):
-                load_v_producer.tail()
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
@@ -1123,15 +940,14 @@ class PPAttentionForward:
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
-                if cutlass.const_expr(not self.split_kv):
-                    _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
-                    _pair = curr_block_coord[0] // self.cta_group_size
-                    _rank = curr_block_coord[0] % self.cta_group_size
-                    curr_block_coord = (
-                        (_npairs - 1 - _pair) * self.cta_group_size + _rank,
-                        curr_block_coord[1],
-                        curr_block_coord[2],
-                    )
+                _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
+                _pair = curr_block_coord[0] // self.cta_group_size
+                _rank = curr_block_coord[0] % self.cta_group_size
+                curr_block_coord = (
+                    (_npairs - 1 - _pair) * self.cta_group_size + _rank,
+                    curr_block_coord[1],
+                    curr_block_coord[2],
+                )
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1143,10 +959,6 @@ class PPAttentionForward:
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
                 )
                 batch_coord = curr_block_coord[2][1]
-                split_idx = Int32(0)
-                if cutlass.const_expr(self.split_kv):
-                    batch_coord = batch_coord // h_kv
-                    split_idx = curr_block_coord[2][0]
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
@@ -1158,25 +970,6 @@ class PPAttentionForward:
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
                     )
-                if cutlass.const_expr(self.split_kv):
-                    if cutlass.const_expr(mSeqUsedK is not None):
-                        seqlen_k = mSeqUsedK[batch_coord]
-                    n_tiles_k = cute.ceil_div(seqlen_k, self.qk_mma_tiler[1])
-                    s_b = cute.ceil_div(n_tiles_k, self.G)
-                    per_item = cute.ceil_div(s_b, splits)
-                    s0 = split_idx * per_item
-                    s1 = cutlass.min(s_b, s0 + per_item)
-                    split_tile_start = s0 * self.G
-                    split_tile_steps = cutlass.max(
-                        Int32(0), cutlass.min(s1 * self.G, n_tiles_k) - split_tile_start
-                    )
-                    continue_cond = (
-                        continue_cond
-                        or split_tile_steps <= 0
-                        or not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                        )
-                    )
 
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
@@ -1185,22 +978,18 @@ class PPAttentionForward:
                     if cutlass.const_expr(mSeqUsedK is not None):
                         seqlen_k = mSeqUsedK[batch_coord]
 
-                    if cutlass.const_expr(self.split_kv):
-                        seqlen_kv_loop_start = split_tile_start
-                        seqlen_kv_loop_steps = split_tile_steps
-                    else:
-                        seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                            FusedMask.get_trip_start_count_via_block_info(
-                                mma_block_coord,
-                                self.qk_mma_tiler,
-                                seqlen_q,
-                                seqlen_k,
-                                self.is_causal,
-                                self.is_local,
-                                window_size_left,
-                                window_size_right,
-                            )
+                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                        FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
                         )
+                    )
                     seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
 
                     load_q_releaser = load_q_consumer.clone()
@@ -1256,10 +1045,7 @@ class PPAttentionForward:
                                 pv_tile_idx = seqlen_kv_loop_start + i - 1
                                 pv_whether_acc = pv_tile_idx % self.G != 0
                                 for iter in cutlass.range(self.iterations_pv, unroll=1):
-                                    if cutlass.const_expr(self.separate_kv_pipelines):
-                                        v_handle = load_v_consumer.wait_and_advance()
-                                    else:
-                                        v_handle = load_kv_consumer.wait_and_advance()
+                                    v_handle = load_kv_consumer.wait_and_advance()
                                     pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
                                     tOtO_slice = tOtO_staged[None, None, None, iter]
                                     tStS_slice = tStS[None, None, None, p_handle.index]
@@ -1314,10 +1100,7 @@ class PPAttentionForward:
                             o_handle = mma_corr_producer.acquire_and_advance()
                             pv_whether_acc = (seqlen_kv_loop_end - 2) % self.G != 0
                             for iter in cutlass.range(self.iterations_pv, unroll=1):
-                                if cutlass.const_expr(self.separate_kv_pipelines):
-                                    v_handle = load_v_consumer.wait_and_advance()
-                                else:
-                                    v_handle = load_kv_consumer.wait_and_advance()
+                                v_handle = load_kv_consumer.wait_and_advance()
                                 pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
                                 tOtO_slice = tOtO_staged[None, None, None, iter]
                                 tStS_slice = tStS[None, None, None, p_handle.index]
@@ -1375,10 +1158,7 @@ class PPAttentionForward:
                         o_handle = mma_corr_producer.acquire_and_advance()
                         pv_whether_acc = (seqlen_kv_loop_end - 1) % self.G != 0
                         for iter in cutlass.range(self.iterations_pv, unroll=1):
-                            if cutlass.const_expr(self.separate_kv_pipelines):
-                                v_handle = load_v_consumer.wait_and_advance()
-                            else:
-                                v_handle = load_kv_consumer.wait_and_advance()
+                            v_handle = load_kv_consumer.wait_and_advance()
                             pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, pv_whether_acc)
                             tOtO_slice = tOtO_staged[None, None, None, iter]
                             tStS_slice = tStS[None, None, None, p_handle.index]
@@ -1412,26 +1192,21 @@ class PPAttentionForward:
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
-                if cutlass.const_expr(not self.split_kv):
-                    _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
-                    _pair = curr_block_coord[0] // self.cta_group_size
-                    _rank = curr_block_coord[0] % self.cta_group_size
-                    curr_block_coord = (
-                        (_npairs - 1 - _pair) * self.cta_group_size + _rank,
-                        curr_block_coord[1],
-                        curr_block_coord[2],
-                    )
+                _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
+                _pair = curr_block_coord[0] // self.cta_group_size
+                _rank = curr_block_coord[0] % self.cta_group_size
+                curr_block_coord = (
+                    (_npairs - 1 - _pair) * self.cta_group_size + _rank,
+                    curr_block_coord[1],
+                    curr_block_coord[2],
+                )
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                split_idx = Int32(0)
                 continue_cond = False
-                if cutlass.const_expr(self.split_kv):
-                    batch_coord = batch_coord // h_kv
-                    split_idx = curr_block_coord[2][0]
                 seqlen_q = cute.size(mQ_qdl.shape[0])
                 seqlen_k = (
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
@@ -1448,25 +1223,6 @@ class PPAttentionForward:
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
                     )
-                if cutlass.const_expr(self.split_kv):
-                    if cutlass.const_expr(mSeqUsedK is not None):
-                        seqlen_k = mSeqUsedK[batch_coord]
-                    n_tiles_k = cute.ceil_div(seqlen_k, self.qk_mma_tiler[1])
-                    s_b = cute.ceil_div(n_tiles_k, self.G)
-                    per_item = cute.ceil_div(s_b, splits)
-                    s0 = split_idx * per_item
-                    s1 = cutlass.min(s_b, s0 + per_item)
-                    split_tile_start = s0 * self.G
-                    split_tile_steps = cutlass.max(
-                        Int32(0), cutlass.min(s1 * self.G, n_tiles_k) - split_tile_start
-                    )
-                    continue_cond = (
-                        continue_cond
-                        or split_tile_steps <= 0
-                        or not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                        )
-                    )
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
@@ -1478,20 +1234,16 @@ class PPAttentionForward:
                     row_max_prev = -Float32.inf
                     row_sum = 0.0
 
-                    if cutlass.const_expr(self.split_kv):
-                        start_count = split_tile_start
-                        trip_count = split_tile_steps
-                    else:
-                        start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
+                    start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
+                        mma_block_coord,
+                        self.qk_mma_tiler,
+                        seqlen_q,
+                        seqlen_k,
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left,
+                        window_size_right,
+                    )
                     end_count = start_count + trip_count
                     if end_count <= start_count:
                         start_count = 0
@@ -1518,13 +1270,7 @@ class PPAttentionForward:
                     for step in cutlass.range(start_count, end_count, 1, unroll=1):
                         cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
                         tScS_iter = qk_thr_mma.partition_C(cS_iter)
-                        if cutlass.const_expr(self.split_kv and self.tokens > 1):
-                            need_apply_mask = (step + 1) * self.qk_mma_tiler[
-                                1
-                            ] > seqlen_k - self.tokens
-                        elif cutlass.const_expr(self.split_kv):
-                            need_apply_mask = step == n_tiles_k - 1
-                        elif cutlass.const_expr(self.use_semantic_trip_range):
+                        if cutlass.const_expr(self.use_semantic_trip_range):
                             need_apply_mask = (
                                 step >= n_block_min_causal_local_mask
                                 or step < n_block_min_before_local_mask
@@ -1569,44 +1315,33 @@ class PPAttentionForward:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
 
             fold_phase = Int32(0)
-            bulk_atom_fold = None
-            fold_mbar = None
-            bulk_atom_dump = None
-            if cutlass.const_expr(not self.split_kv):
-                bulk_atom_fold = cute.make_copy_atom(cute.nvgpu.cpasync.CopyBulkG2SOp(), Float32)
-                fold_mbar = storage.fold_mbar_ptr.data_ptr()
+            bulk_atom_fold = cute.make_copy_atom(cute.nvgpu.cpasync.CopyBulkG2SOp(), Float32)
+            fold_mbar = storage.fold_mbar_ptr.data_ptr()
             fold_worker_args = ()
-            if cutlass.const_expr(self.fold_worker):
-                fold_worker_args = (
-                    storage.fold_req_mbar_ptr.data_ptr(),
-                    storage.fold_done_mbar_ptr.data_ptr(),
-                    cute.make_tensor(
-                        storage.fold_args.data_ptr(), cute.make_layout(self.fold_args_len)
-                    ),
-                )
+            fold_worker_args = (
+                storage.fold_req_mbar_ptr.data_ptr(),
+                storage.fold_done_mbar_ptr.data_ptr(),
+                cute.make_tensor(
+                    storage.fold_args.data_ptr(), cute.make_layout(self.fold_args_len)
+                ),
+            )
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
-                if cutlass.const_expr(not self.split_kv):
-                    _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
-                    _pair = curr_block_coord[0] // self.cta_group_size
-                    _rank = curr_block_coord[0] % self.cta_group_size
-                    curr_block_coord = (
-                        (_npairs - 1 - _pair) * self.cta_group_size + _rank,
-                        curr_block_coord[1],
-                        curr_block_coord[2],
-                    )
+                _npairs = cute.ceil_div(mQ_qdl.shape[0], self.qk_mma_tiler[0])
+                _pair = curr_block_coord[0] // self.cta_group_size
+                _rank = curr_block_coord[0] % self.cta_group_size
+                curr_block_coord = (
+                    (_npairs - 1 - _pair) * self.cta_group_size + _rank,
+                    curr_block_coord[1],
+                    curr_block_coord[2],
+                )
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                flat_coord = curr_block_coord[2][1]
-                split_idx = Int32(0)
-                if cutlass.const_expr(self.split_kv):
-                    batch_coord = flat_coord // h_kv
-                    split_idx = curr_block_coord[2][0]
                 seqlen_q = cute.size(mQ_qdl.shape[0])
                 seqlen_k = (
                     mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
@@ -1623,25 +1358,6 @@ class PPAttentionForward:
                     seqlen_q = mSeqUsedQ[batch_coord]
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                    )
-                if cutlass.const_expr(self.split_kv):
-                    if cutlass.const_expr(mSeqUsedK is not None):
-                        seqlen_k = mSeqUsedK[batch_coord]
-                    n_tiles_k = cute.ceil_div(seqlen_k, self.qk_mma_tiler[1])
-                    s_b = cute.ceil_div(n_tiles_k, self.G)
-                    per_item = cute.ceil_div(s_b, splits)
-                    s0 = split_idx * per_item
-                    s1 = cutlass.min(s_b, s0 + per_item)
-                    split_tile_start = s0 * self.G
-                    split_tile_steps = cutlass.max(
-                        Int32(0), cutlass.min(s1 * self.G, n_tiles_k) - split_tile_start
-                    )
-                    continue_cond = (
-                        continue_cond
-                        or split_tile_steps <= 0
-                        or not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                        )
                     )
 
                 if not continue_cond:
@@ -1671,28 +1387,19 @@ class PPAttentionForward:
                         cute.select(self.pv_block_tiler, mode=[0, 1]),
                     )
 
-                    if cutlass.const_expr(self.split_kv):
-                        seqlen_kv_loop_start = split_tile_start
-                        seqlen_kv_loop_steps = split_tile_steps
-                    else:
-                        seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                            FusedMask.get_trip_start_count_via_block_info(
-                                mma_block_coord,
-                                self.qk_mma_tiler,
-                                seqlen_q,
-                                seqlen_k,
-                                self.is_causal,
-                                self.is_local,
-                                window_size_left,
-                                window_size_right,
-                            )
+                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                        FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
                         )
+                    )
                     o_l_coord = curr_block_coord[2]
-                    if cutlass.const_expr(self.split_kv):
-                        o_l_coord = (
-                            (split_tile_start + split_tile_steps - 1) // self.G,
-                            flat_coord,
-                        )
                     gO_staged = gO_qdl[None, None, curr_block_coord[0], None, o_l_coord]
                     gRes_staged = None
                     if cutlass.const_expr(mRes_qdl is not None):
@@ -1723,17 +1430,6 @@ class PPAttentionForward:
                     stats_handle.release()
                     for step in cutlass.range(1, seqlen_kv_loop_steps, 1, unroll=1):
                         is_sb_boundary = (seqlen_kv_loop_start + step) % self.G == 0
-                        split_dump_args = ()
-                        if cutlass.const_expr(self.split_kv):
-                            split_dump_args = (
-                                gO_qdl,
-                                mMLPartial,
-                                flat_coord,
-                                seqlen_q,
-                                curr_block_coord[0],
-                                sDump,
-                                bulk_atom_dump,
-                            )
                         (
                             fold_M,
                             fold_L,
@@ -1766,71 +1462,41 @@ class PPAttentionForward:
                             mScratch,
                             scratch_smid,
                             curr_block_coord[0] * self.pv_block_tiler[0],
-                            seqlen_kv_loop_start + step,
                             (sFoldObar, sFoldPart, fold_mbar, bulk_atom_fold) + fold_worker_args,
-                            split_dump_args,
                         )
-                    if cutlass.const_expr(self.split_kv):
-                        mma_corr_consumer, sum_consumer = self.correction_epilog_split(
-                            (seqlen_q, scale_output),
-                            (sum_consumer, sSum, sMax),
+                    mma_corr_consumer, sum_consumer, fold_phase = self.correction_epilog(
+                        (seqlen_q, scale_output),
+                        (sum_consumer, sSum, sMax),
+                        (has_fold, fold_M, fold_L, fold_a, fold_b, fold_next, staged, fold_phase),
+                        (mma_corr_consumer, gO_staged, cO_staged, tOtO_staged),
+                        self.epi_tile,
+                        scale_softmax_log2,
+                        mScratch,
+                        scratch_smid,
+                        curr_block_coord[0] * self.pv_block_tiler[0],
+                        obar_slot,
+                        (sFoldObar, sFoldPart, fold_mbar) + fold_worker_args[1:2],
+                        (
                             (
-                                mma_corr_consumer,
-                                gO_staged,
-                                cO_staged,
-                                tOtO_staged,
-                                mMLPartial,
-                                flat_coord,
-                                (split_tile_start + split_tile_steps - 1) // self.G,
-                                sDump,
-                                bulk_atom_dump,
-                            ),
-                            self.epi_tile,
-                        )
-                    else:
-                        mma_corr_consumer, sum_consumer, fold_phase = self.correction_epilog(
-                            (seqlen_q, scale_output),
-                            (sum_consumer, sSum, sMax),
-                            (
-                                has_fold,
-                                fold_M,
-                                fold_L,
-                                fold_a,
-                                fold_b,
-                                fold_next,
-                                staged,
-                                fold_phase,
-                            ),
-                            (mma_corr_consumer, gO_staged, cO_staged, tOtO_staged),
-                            self.epi_tile,
-                            scale_softmax_log2,
-                            mScratch,
-                            scratch_smid,
-                            curr_block_coord[0] * self.pv_block_tiler[0],
-                            obar_slot,
-                            (sFoldObar, sFoldPart, fold_mbar) + fold_worker_args[1:2],
-                            (
+                                mLSE,
                                 (
-                                    mLSE,
-                                    (
-                                        (curr_block_coord[2][0], Int32(0))
-                                        if cutlass.const_expr(cum_seqlen_q is not None)
-                                        else curr_block_coord[2]
-                                    ),
-                                    cuseqlen_q,
-                                    scale_softmax,
-                                )
-                                if cutlass.const_expr(mLSE is not None)
-                                else ()
-                            ),
-                            ((gRes_staged,) if cutlass.const_expr(mRes_qdl is not None) else ()),
-                        )
+                                    (curr_block_coord[2][0], Int32(0))
+                                    if cutlass.const_expr(cum_seqlen_q is not None)
+                                    else curr_block_coord[2]
+                                ),
+                                cuseqlen_q,
+                                scale_softmax,
+                            )
+                            if cutlass.const_expr(mLSE is not None)
+                            else ()
+                        ),
+                        ((gRes_staged,) if cutlass.const_expr(mRes_qdl is not None) else ()),
+                    )
                 work_tile = tile_sched.advance_to_next_work()
-            if cutlass.const_expr(self.fold_worker):
-                if warp_idx == self.correction_warp_ids[0]:
-                    with cute.arch.elect_one():
-                        fold_worker_args[2][257] = Float32(1.0)
-                cute.arch.mbarrier_arrive(fold_worker_args[0])
+            if warp_idx == self.correction_warp_ids[0]:
+                with cute.arch.elect_one():
+                    fold_worker_args[2][257] = Float32(1.0)
+            cute.arch.mbarrier_arrive(fold_worker_args[0])
 
         if warp_idx > self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
@@ -1875,24 +1541,17 @@ class PPAttentionForward:
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
         if need_apply_mask:
-            if cutlass.const_expr(self.tokens > 1):
-                for i in cutlass.range_constexpr(cute.size(tTMEM_LOADrS), unroll_full=True):
-                    index_q, index_k = tTMEM_LOADcS[i]
-                    key_limit = seqlen_k - self.tokens + 1 + index_q // self.rpt
-                    if index_k >= key_limit or index_q >= seqlen_q:
-                        tTMEM_LOADrS[i] = -Float32.inf
-            else:
-                FusedMask.apply_mask_via_causal_local(
-                    tTMEM_LOADrS,
-                    tTMEM_LOADcS,
-                    seqlen_q,
-                    seqlen_k,
-                    self.use_semantic_trip_range,
-                    self.is_causal,
-                    self.is_local,
-                    window_size_left,
-                    window_size_right,
-                )
+            FusedMask.apply_mask_via_causal_local(
+                tTMEM_LOADrS,
+                tTMEM_LOADcS,
+                seqlen_q,
+                seqlen_k,
+                self.use_semantic_trip_range,
+                self.is_causal,
+                self.is_local,
+                window_size_left,
+                window_size_right,
+            )
         old_row_max = row_max
         row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
         row_max_safe = row_max
@@ -2026,9 +1685,7 @@ class PPAttentionForward:
         mScratch: Optional[cute.Tensor],
         scratch_smid: Int32,
         tile_q_base: Int32,
-        tile_idx: Int32 = Int32(0),
         pf_args: Tuple = (),
-        split_args: Tuple = (),
     ):
         """One correction step: either the FA4 online rescale, or (at a super-block boundary)
         Phase 1
@@ -2037,25 +1694,7 @@ class PPAttentionForward:
         whose operands are prefetched one step ahead.
         """
         has_fold, fold_M, fold_L, fold_a, fold_b, obar_slot, fold_next, staged, phase = fold_state
-        sFoldObar, sFoldPart, fold_mbar, bulk_atom = (None, None, None, None)
-        fold_req_mbar, fold_done_mbar, sFoldArgs = (None, None, None)
-        if cutlass.const_expr(not self.split_kv):
-            sFoldObar, sFoldPart, fold_mbar, bulk_atom = pf_args[:4]
-            if cutlass.const_expr(self.fold_worker):
-                fold_req_mbar, fold_done_mbar, sFoldArgs = pf_args[4:]
-        gO_qdl, mMLPartial, flat_coord, seqlen_q_eff, q_tile_coord, sDump, bulk_atom_dump = (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        if cutlass.const_expr(self.split_kv):
-            gO_qdl, mMLPartial, flat_coord, seqlen_q_eff, q_tile_coord, sDump, bulk_atom_dump = (
-                split_args
-            )
+        fold_req_mbar, fold_done_mbar, sFoldArgs = pf_args[4:]
         s_corr_consumer, tStS, tScS = stats_args
         mma_o_consumer, tOtO_staged, cO_staged = o_args
         tidx, _, _ = cute.arch.thread_idx()
@@ -2088,140 +1727,69 @@ class PPAttentionForward:
         o_handle = mma_o_consumer.wait_and_advance()
 
         if is_boundary:
-            if cutlass.const_expr(self.split_kv):
-                s_done = tile_idx // self.G - 1
-                gO_dyn = gO_qdl[None, None, q_tile_coord, None, (s_done, flat_coord)]
-                for iter in cutlass.range(self.iterations_pv, unroll_full=True):
-                    gO = gO_dyn[None, None, iter]
-                    cO = cO_staged[None, None, iter]
-                    tOtO = tOtO_staged[(None, None), 0, 0, iter]
-                    tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
-                    cO_epi = cute.zipped_divide(cO, epi_tile)
-                    gO_epi = cute.zipped_divide(gO, epi_tile)
-                    tmem_load_atom = cute.make_copy_atom(
-                        tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), self.pv_acc_dtype
-                    )
-                    tmem_tiled_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_epi)
-                    thr_load = tmem_tiled_load.get_slice(thread_idx)
-                    tTMEM_LOADtO = thr_load.partition_S(tOtO_epi)
-                    tTMEM_LOADcO = thr_load.partition_D(cO_epi)
-                    tTMEM_LOADgO = thr_load.partition_D(gO_epi)
-                    for i in cutlass.range(cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True):
-                        tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
-                        tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
-                        tTMEM_LOADgO_i = tTMEM_LOADgO[None, i, 0]
-                        tTMrO = cute.make_rmem_tensor(tTMEM_LOADcO_i.shape, self.pv_acc_dtype)
-                        cute.copy(tmem_tiled_load, tTMEM_LOADtO_i, tTMrO)
-                        row_valid = cute.elem_less(tTMEM_LOADcO_i[0][0], seqlen_q_eff)
-                        if row_valid:
-                            cute.autovec_copy(tTMrO, tTMEM_LOADgO_i)
-                        if row_valid and iter == 0 and i == 0:
-                            row = tTMEM_LOADcO_i[0][0] - tile_q_base
-                            mMLPartial[flat_coord, s_done, row, 0] = stat0
-                            mMLPartial[flat_coord, s_done, row, 1] = stat1
-            else:
-                if cutlass.const_expr(self.fold_worker):
-                    staged, phase = self._fold_worker_wait(staged, phase, fold_done_mbar)
-                else:
-                    fold_next, staged, phase = self._fold_drain(
-                        fold_next,
-                        staged,
-                        phase,
-                        fold_a,
-                        fold_b,
-                        obar_slot,
-                        (tOtO_staged, cO_staged),
-                        epi_tile,
-                        mScratch,
-                        scratch_smid,
-                        tile_q_base,
-                        thread_idx,
-                        sFoldObar,
-                        sFoldPart,
-                        fold_mbar,
-                    )
-                dump_slot = obar_slot
-                if has_fold:
-                    dump_slot = Int32(1) - obar_slot
-                for iter in cutlass.range(self.iterations_pv, unroll_full=True):
-                    tOtO = tOtO_staged[(None, None), 0, 0, iter]
-                    cO = cO_staged[None, None, iter]
-                    tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
-                    cO_epi = cute.zipped_divide(cO, epi_tile)
-                    tmem_load_atom = cute.make_copy_atom(
-                        tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), self.pv_acc_dtype
-                    )
-                    tmem_tiled_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_epi)
-                    thr_load = tmem_tiled_load.get_slice(thread_idx)
-                    tTMEM_LOADtO = thr_load.partition_S(tOtO_epi)
-                    tTMEM_LOADcO = thr_load.partition_D(cO_epi)
-                    n_chunks = cute.size(tTMEM_LOADtO, mode=[1])
-                    frag_shape = tTMEM_LOADcO[None, 0, 0].shape
-                    tTMrO = cute.make_rmem_tensor_like(
-                        cute.append(
-                            cute.make_layout(frag_shape),
-                            cute.make_layout(2, stride=cute.size(frag_shape)),
-                        ),
-                        self.pv_acc_dtype,
-                    )
-                    cute.copy(tmem_tiled_load, tTMEM_LOADtO[None, 0, 0], tTMrO[None, 0])
-                    for i in cutlass.range(1, n_chunks, unroll_full=True):
-                        cute.copy(tmem_tiled_load, tTMEM_LOADtO[None, i, 0], tTMrO[None, i % 2])
-                        self._dump_frag(
-                            tTMrO[None, (i - 1) % 2],
-                            tTMEM_LOADcO[None, i - 1, 0],
-                            mScratch,
-                            scratch_smid,
-                            dump_slot,
-                            tile_q_base,
-                        )
+            staged, phase = self._fold_worker_wait(staged, phase, fold_done_mbar)
+            dump_slot = obar_slot
+            if has_fold:
+                dump_slot = Int32(1) - obar_slot
+            for iter in cutlass.range(self.iterations_pv, unroll_full=True):
+                tOtO = tOtO_staged[(None, None), 0, 0, iter]
+                cO = cO_staged[None, None, iter]
+                tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
+                cO_epi = cute.zipped_divide(cO, epi_tile)
+                tmem_load_atom = cute.make_copy_atom(
+                    tcgen05.Ld32x32bOp(tcgen05.Repetition(32)), self.pv_acc_dtype
+                )
+                tmem_tiled_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_epi)
+                thr_load = tmem_tiled_load.get_slice(thread_idx)
+                tTMEM_LOADtO = thr_load.partition_S(tOtO_epi)
+                tTMEM_LOADcO = thr_load.partition_D(cO_epi)
+                n_chunks = cute.size(tTMEM_LOADtO, mode=[1])
+                frag_shape = tTMEM_LOADcO[None, 0, 0].shape
+                tTMrO = cute.make_rmem_tensor_like(
+                    cute.append(
+                        cute.make_layout(frag_shape),
+                        cute.make_layout(2, stride=cute.size(frag_shape)),
+                    ),
+                    self.pv_acc_dtype,
+                )
+                cute.copy(tmem_tiled_load, tTMEM_LOADtO[None, 0, 0], tTMrO[None, 0])
+                for i in cutlass.range(1, n_chunks, unroll_full=True):
+                    cute.copy(tmem_tiled_load, tTMEM_LOADtO[None, i, 0], tTMrO[None, i % 2])
                     self._dump_frag(
-                        tTMrO[None, (n_chunks - 1) % 2],
-                        tTMEM_LOADcO[None, n_chunks - 1, 0],
+                        tTMrO[None, (i - 1) % 2],
+                        tTMEM_LOADcO[None, i - 1, 0],
                         mScratch,
                         scratch_smid,
                         dump_slot,
                         tile_q_base,
                     )
-                if has_fold:
-                    fold_M, fold_L, fold_a, fold_b = fold_stats(
-                        fold_M, fold_L, stat0, stat1, scale_softmax_log2
-                    )
-                    if cutlass.const_expr(self.fold_worker):
-                        sFoldArgs[thread_idx] = fold_a
-                        sFoldArgs[128 + thread_idx] = fold_b
-                        if thread_idx == 0:
-                            slot_f = Float32(0.0)
-                            if obar_slot != 0:
-                                slot_f = Float32(1.0)
-                            sFoldArgs[256] = slot_f
-                            sFoldArgs[257] = Float32(0.0)
-                        cute.arch.fence_proxy("async")
-                        cute.arch.mbarrier_arrive(fold_req_mbar)
-                        staged = Int32(1)
-                    else:
-                        fold_next = Int32(0)
-                        cute.arch.fence_proxy("async")
-                        cute.arch.barrier(
-                            barrier_id=self.fold_barrier_id,
-                            number_of_threads=len(self.correction_warp_ids) * self.threads_per_warp,
-                        )
-                        self._fold_stage_issue(
-                            Int32(0),
-                            obar_slot,
-                            dump_slot,
-                            bulk_atom,
-                            mScratch,
-                            scratch_smid,
-                            sFoldObar,
-                            sFoldPart,
-                            fold_mbar,
-                        )
-                        staged = Int32(0)
-                else:
-                    fold_M = stat0
-                    fold_L = stat1
-                    has_fold = cutlass.Boolean(True)
+                self._dump_frag(
+                    tTMrO[None, (n_chunks - 1) % 2],
+                    tTMEM_LOADcO[None, n_chunks - 1, 0],
+                    mScratch,
+                    scratch_smid,
+                    dump_slot,
+                    tile_q_base,
+                )
+            if has_fold:
+                fold_M, fold_L, fold_a, fold_b = fold_stats(
+                    fold_M, fold_L, stat0, stat1, scale_softmax_log2
+                )
+                sFoldArgs[thread_idx] = fold_a
+                sFoldArgs[128 + thread_idx] = fold_b
+                if thread_idx == 0:
+                    slot_f = Float32(0.0)
+                    if obar_slot != 0:
+                        slot_f = Float32(1.0)
+                    sFoldArgs[256] = slot_f
+                    sFoldArgs[257] = Float32(0.0)
+                cute.arch.fence_proxy("async")
+                cute.arch.mbarrier_arrive(fold_req_mbar)
+                staged = Int32(1)
+            else:
+                fold_M = stat0
+                fold_L = stat1
+                has_fold = cutlass.Boolean(True)
         else:
             scale = scale_softmax_log2 * (stat0 - stat1)
             scale = cute.math.exp2(scale, fastmath=True)
@@ -2280,26 +1848,6 @@ class PPAttentionForward:
             cute.arch.fence_view_async_tmem_store()
         cute.arch.fence_view_async_tmem_load()
         o_handle.release()
-        if cutlass.const_expr(not self.split_kv and not self.fold_worker):
-            if not is_boundary:
-                fold_next, staged, phase = self._fold_consume(
-                    fold_next,
-                    staged,
-                    phase,
-                    fold_a,
-                    fold_b,
-                    obar_slot,
-                    bulk_atom,
-                    (tOtO_staged, cO_staged),
-                    epi_tile,
-                    mScratch,
-                    scratch_smid,
-                    tile_q_base,
-                    thread_idx,
-                    sFoldObar,
-                    sFoldPart,
-                    fold_mbar,
-                )
         return (
             fold_M,
             fold_L,
@@ -2690,31 +2238,11 @@ class PPAttentionForward:
         """Correction epilog."""
         seqlen_q, _ = value_args
         sum_consumer, sSum, sMax = sum_args
-        has_fold, fold_M, fold_L, fold_a, fold_b, fold_next, staged, phase = fold_state
-        sFoldObar, sFoldPart, fold_mbar = pf_args[:3]
+        has_fold, fold_M, fold_L, fold_a, fold_b, _, staged, phase = fold_state
         mma_o_consumer, gO_staged, cO_staged, tOtO_staged = o_args
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
-        if cutlass.const_expr(self.fold_worker):
-            staged, phase = self._fold_worker_wait(staged, phase, pf_args[3])
-        else:
-            fold_next, staged, phase = self._fold_drain(
-                fold_next,
-                staged,
-                phase,
-                fold_a,
-                fold_b,
-                obar_slot,
-                (tOtO_staged, cO_staged),
-                epi_tile,
-                mScratch,
-                scratch_smid,
-                tile_q_base,
-                thread_idx,
-                sFoldObar,
-                sFoldPart,
-                fold_mbar,
-            )
+        staged, phase = self._fold_worker_wait(staged, phase, pf_args[3])
         sum_handle = sum_consumer.wait_and_advance()
         row_sum = sSum[thread_idx]
         row_max_last = sMax[thread_idx]
@@ -2799,65 +2327,6 @@ class PPAttentionForward:
                         cute.autovec_copy(tSMrRes, tTMEM_LOADgRes[None, i, 0])
         o_handle.release()
         return mma_o_consumer, sum_consumer, phase
-
-    @cute.jit
-    def correction_epilog_split(
-        self, value_args: Tuple, sum_args: Tuple, o_args: Tuple, epi_tile: cute.Tile
-    ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        """Split-decode epilogue: write the unnormalized FP32 partial and the (m, l) stats for this
-        split's rows (< seqlen_q) to the partial workspaces.
-        """
-        seqlen_q, _ = value_args
-        sum_consumer, sSum, sMax = sum_args
-        (
-            mma_o_consumer,
-            gO_staged,
-            cO_staged,
-            tOtO_staged,
-            mMLPartial,
-            flat_coord,
-            split_idx,
-            sDump,
-            bulk_atom_dump,
-        ) = o_args
-        tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
-        sum_handle = sum_consumer.wait_and_advance()
-        row_sum = sSum[thread_idx]
-        row_max = sMax[thread_idx]
-        cute.arch.fence_view_async_shared()
-        sum_handle.release()
-        o_handle = mma_o_consumer.wait_and_advance()
-        for iter in cutlass.range(self.iterations_pv):
-            gO = gO_staged[None, None, iter]
-            cO = cO_staged[None, None, iter]
-            tOtO = tOtO_staged[(None, None), 0, 0, iter]
-            tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
-            cO_epi = cute.zipped_divide(cO, epi_tile)
-            gO_epi = cute.zipped_divide(gO, epi_tile)
-            tmem_copy_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.pv_acc_dtype
-            )
-            tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_epi)
-            thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
-            tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_epi)
-            tTMEM_LOADgO = thr_tmem_load.partition_D(gO_epi)
-            tTMEM_LOADcO = thr_tmem_load.partition_D(cO_epi)
-            for i in cutlass.range(cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True):
-                tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
-                tTMEM_LOADgO_i = tTMEM_LOADgO[None, i, 0]
-                tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
-                tTMrO = cute.make_rmem_tensor(tTMEM_LOADcO[None, 0, i].shape, self.pv_acc_dtype)
-                cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
-                row_valid = cute.elem_less(tTMEM_LOADcO_i[0][0], seqlen_q)
-                if row_valid:
-                    cute.autovec_copy(tTMrO, tTMEM_LOADgO_i)
-                if row_valid and iter == 0 and i == 0:
-                    row = tTMEM_LOADcO_i[0][0]
-                    mMLPartial[flat_coord, split_idx, row, 0] = row_max
-                    mMLPartial[flat_coord, split_idx, row, 1] = row_sum
-        o_handle.release()
-        return mma_o_consumer, sum_consumer
 
     @cute.jit
     def store_sum_max(
