@@ -12,6 +12,7 @@ Chunk ``c``'s compute is left of the ``||``::
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import chain
 
@@ -26,8 +27,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.tensor_parallel.gtp_api import is_gtp_param
 from megatron.core.transformer.transformer_config import TransformerConfig
-
-from .transport import DispatchedChunk, MoEEPTransport, MoEEPTransportType, make_ep_transport
 
 EXPERT_ALIGNMENT_TO_GROUPED_GEMM = 256
 
@@ -91,11 +90,28 @@ class _MoEEPChunkOverlapConfig:
 
 
 @dataclass(frozen=True)
+class DispatchedChunk:
+    """One dispatch's receive, and the autograd node that produced it."""
+
+    recv_x: torch.Tensor
+    recv_probs: torch.Tensor
+    #: Alignment-padded received rows per LOCAL expert, straight from the dispatch manager.
+    split_sizes: torch.Tensor
+    #: ``(inputs, outputs)`` of the dispatch node. Differentiating it IS the combine adjoint,
+    #: so this path never spells one out: it is whatever the flex backend's own backward does.
+    graph: tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]
+
+
+@dataclass
 class CachedForwardChunkActivation:
     dispatched_tokens: torch.Tensor
     routing_probs: torch.Tensor
     fc2_output: torch.Tensor
-    dispatch_handle: object
+    #: The dispatch node, carried from the forward; see :class:`DispatchedChunk`.
+    dispatch_graph: tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]
+    #: ``(input, output)`` of the combine node, filled once the combine has run.
+    #: Differentiating it is the dispatch adjoint.
+    combine_graph: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def ensure_expert_parameters_ready(experts: torch.nn.Module) -> None:
@@ -220,12 +236,14 @@ def build_expert_ops(
     return te_ops.Sequential(fc1_op, activation_op, fc2_op), fc1_op, fc2_op
 
 
-def expert_row_counts(cumulative_recv_tokens: torch.Tensor) -> torch.Tensor:
-    """Derive TE's per-expert split sizes from the transport's cumulative receive counts."""
-    alignment = EXPERT_ALIGNMENT_TO_GROUPED_GEMM
-    ends = ((cumulative_recv_tokens.to(torch.int64) + (alignment - 1)) // alignment) * alignment
-    starts = torch.cat([ends.new_zeros(1), ends[:-1]])
-    return ends - starts
+def check_dispatch_capacity(payload: torch.Tensor, capacity: int) -> torch.Tensor:
+    """Hold the dispatch width fixed: a varying one is what a CUDA-graph capture cannot serve."""
+    if payload.shape[0] != capacity:
+        raise RuntimeError(
+            f"a dispatch returned {payload.shape[0]} expanded rows, not the {capacity} the "
+            "expert GEMMs are compiled for: the pinned permuted-token count has drifted"
+        )
+    return payload
 
 
 def autocast_recipe() -> object:
@@ -293,10 +311,7 @@ def _attach_wgrad_accumulator(op, index: int, param) -> None:
 def run_expert_forward(
     runtime: MoEEPChunkOverlapRuntime,
     *,
-    recv_x: torch.Tensor,
-    received_topk_weights: torch.Tensor,
-    cumulative_recv_tokens: torch.Tensor,
-    dispatch_handle: object,
+    dispatched: DispatchedChunk,
     stream: torch.cuda.Stream,
     offload: bool,
 ) -> tuple[torch.Tensor, CachedForwardChunkActivation]:
@@ -304,9 +319,9 @@ def run_expert_forward(
     from transformer_engine.pytorch import autocast
 
     ops = runtime.expert_ops()
-    split_sizes = expert_row_counts(cumulative_recv_tokens)
-    dispatched_tokens = recv_x.detach().requires_grad_(True)
-    routing_probs = received_topk_weights.detach().reshape(-1).requires_grad_(True)
+    split_sizes = dispatched.split_sizes
+    dispatched_tokens = dispatched.recv_x.detach().requires_grad_(True)
+    routing_probs = dispatched.recv_probs.detach().reshape(-1).requires_grad_(True)
     offload_group = off_interface(offload, dispatched_tokens, "fused_group_mlp")
 
     with (
@@ -322,7 +337,7 @@ def run_expert_forward(
         dispatched_tokens=dispatched_tokens,
         routing_probs=routing_probs,
         fc2_output=fc2_output,
-        dispatch_handle=dispatch_handle,
+        dispatch_graph=dispatched.graph,
     )
 
 
@@ -351,15 +366,15 @@ class _MoEEPChunkOverlapFunction(torch.autograd.Function):
     def forward(
         ctx,
         hidden_states: torch.Tensor,
-        topk_indices: torch.Tensor,
-        topk_weights: torch.Tensor,
+        routing_map: torch.Tensor,
+        dense_probs: torch.Tensor,
         runtime: "MoEEPChunkOverlapRuntime",
         *expert_weights: torch.Tensor,
     ) -> torch.Tensor:
         output, saved_fwd = runtime.moe_forward(
             hidden_states,
-            topk_indices,
-            topk_weights,
+            routing_map,
+            dense_probs,
             offload=runtime._experts.offload_fused_group_mlp,
         )
         ctx.runtime = runtime
@@ -378,10 +393,10 @@ class _MoEEPChunkOverlapFunction(torch.autograd.Function):
         ctx.runtime = None
         ctx.saved_fwd = None
 
-        grad_hidden_states, grad_topk_weights, wgrad_placeholders = runtime.moe_backward(
+        grad_hidden_states, grad_dense_probs, wgrad_placeholders = runtime.moe_backward(
             saved_fwd, grad_output
         )
-        return (grad_hidden_states, None, grad_topk_weights, None) + wgrad_placeholders
+        return (grad_hidden_states, None, grad_dense_probs, None) + wgrad_placeholders
 
 
 class MoEEPChunkOverlapRuntime:
@@ -399,7 +414,7 @@ class MoEEPChunkOverlapRuntime:
         experts: torch.nn.Module,
         tp_ep_group: torch.distributed.ProcessGroup,
         num_local_experts: int,
-        transport_type: MoEEPTransportType = MoEEPTransportType.HYBRID_EP,
+        managers: Sequence[object],
     ) -> None:
         if tp_ep_group is None:
             raise ValueError("moe_ep_chunk_overlap requires pg_collection.tp_ep, but it is None")
@@ -414,12 +429,17 @@ class MoEEPChunkOverlapRuntime:
         self._ffn_hidden_size: int = ffn_hidden_size
         self._num_chunks: int = num_chunks
         self._num_comm_SMs: int | None = num_comm_SMs
-        self._transport_type: MoEEPTransportType = transport_type
+        if len(managers) != num_chunks:
+            raise ValueError(
+                f"moe_ep_chunk_overlap needs one dispatch manager per token chunk, got "
+                f"{len(managers)} for {num_chunks} chunks; chunk c\'s combine runs while "
+                "c+1\'s dispatch is still in flight, so they cannot share staging"
+            )
+        self._managers: tuple[object, ...] = tuple(managers)
 
         self.config: _MoEEPChunkOverlapConfig | None = None
         self.device: torch.device | None = None
         self.expert_params: tuple[torch.nn.Parameter, ...] | None = None
-        self._transport: MoEEPTransport | None = None
         self.comm_stream: torch.cuda.Stream | None = None
 
         self._ops: torch.nn.Module | None = None
@@ -427,24 +447,25 @@ class MoEEPChunkOverlapRuntime:
         self._fc2_op: torch.nn.Module | None = None
 
     def forward(
-        self, hidden_states: torch.Tensor, dense_probs: torch.Tensor
+        self, hidden_states: torch.Tensor, dense_probs: torch.Tensor, routing_map: torch.Tensor
     ) -> tuple[torch.Tensor, None]:
         input_shape = hidden_states.shape
         flat_hidden = hidden_states.view(-1, self._hidden_size)
-
-        topk_weights, topk_indices = torch.topk(
-            dense_probs, k=self._router_topk, dim=-1, sorted=True
-        )
+        num_tokens = flat_hidden.shape[0]
 
         self._ensure_built(flat_hidden)
         flat_output = _MoEEPChunkOverlapFunction.apply(
-            flat_hidden, topk_indices, topk_weights, self, *self.expert_params
+            flat_hidden,
+            routing_map.view(num_tokens, -1),
+            dense_probs.view(num_tokens, -1),
+            self,
+            *self.expert_params,
         )
         return flat_output.view(input_shape), None
 
     def _ensure_built(self, flat_hidden: torch.Tensor) -> None:
         """Bind the device-side state to this batch on the first forward; a later one returns."""
-        if self._transport is not None:
+        if self.comm_stream is not None:
             return
 
         world_size = torch.distributed.get_world_size(self._tp_ep_group)
@@ -465,9 +486,6 @@ class MoEEPChunkOverlapRuntime:
         self.expert_params = expert_weight_parameters(
             self._experts, overlap_config.num_local_experts
         )
-        self._transport = make_ep_transport(
-            overlap_config, self._tp_ep_group, transport_type=self._transport_type
-        )
         self.comm_stream = torch.cuda.Stream(device=self.device)
 
     def expert_ops(self) -> torch.nn.Module:
@@ -476,11 +494,8 @@ class MoEEPChunkOverlapRuntime:
         return self._ops
 
     def destroy(self) -> None:
-        """Release the transport's collective resources."""
-        if self._transport is None:
-            return
-        self._transport.destroy_buffers()
-        self._transport = None
+        """Drop the dispatch managers, and with them whatever staging they own."""
+        self._managers = ()
 
     def quantize_expert_weights(self) -> None:
         """Quantize every expert weight ONCE per forward, not per chunk"""
@@ -544,30 +559,23 @@ class MoEEPChunkOverlapRuntime:
         """Run one chunk's expert compute on the ambient stream; return its rows and saved state."""
         stream = torch.cuda.current_stream(self.device)
 
+        # The three tensors that cross from the comm stream to this one. Everything else the
+        # dispatch allocated is read back on the comm stream, by the combine or by its own
+        # backward, so it never changes streams.
         dispatched.recv_x.record_stream(stream)
-        dispatched.received_topk_weights.record_stream(stream)
-        self._transport.record_handle_stream(dispatched.dispatch_handle, stream)
+        dispatched.recv_probs.record_stream(stream)
+        dispatched.split_sizes.record_stream(stream)
 
-        return run_expert_forward(
-            self,
-            recv_x=dispatched.recv_x,
-            received_topk_weights=dispatched.received_topk_weights,
-            cumulative_recv_tokens=dispatched.dispatch_handle.psum_num_recv_tokens_per_expert,
-            dispatch_handle=dispatched.dispatch_handle,
-            stream=stream,
-            offload=offload,
-        )
+        return run_expert_forward(self, dispatched=dispatched, stream=stream, offload=offload)
 
     def routed_experts_compute_backward(
-        self, saved: CachedForwardChunkActivation, dispatched: DispatchedChunk
+        self, saved: CachedForwardChunkActivation, grad_recv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one chunk's dgrad pair on the ambient stream; the wgrads stay parked in TE FIFOs."""
         stream = torch.cuda.current_stream(self.device)
-        dispatched.recv_x.record_stream(stream)
+        grad_recv.record_stream(stream)
 
-        grad_input, grad_probs = run_expert_backward(
-            recv_x=dispatched.recv_x, saved=saved, stream=stream
-        )
+        grad_input, grad_probs = run_expert_backward(recv_x=grad_recv, saved=saved, stream=stream)
         grad_probs = grad_probs.reshape(-1)
         return grad_input, grad_probs
 
@@ -627,13 +635,13 @@ class MoEEPChunkOverlapRuntime:
     def moe_forward(
         self,
         hidden_states: torch.Tensor,
-        topk_indices: torch.Tensor,
-        topk_weights: torch.Tensor,
+        routing_map: torch.Tensor,
+        dense_probs: torch.Tensor,
         *,
         offload: bool,
     ) -> tuple[torch.Tensor, tuple[CachedForwardChunkActivation, ...]]:
         config = self.config
-        transport = self._transport
+        capacity = config.max_num_expanded_tokens_per_chunk
 
         ensure_expert_parameters_ready(self._experts)
         self.quantize_expert_weights()
@@ -658,9 +666,27 @@ class MoEEPChunkOverlapRuntime:
         def issue_dispatch(c: int) -> None:
             """Enqueue one chunk's forward dispatch on the comm stream."""
             rows = slice(offsets[c], offsets[c + 1])
-            dispatched[c] = transport.dispatch_forward(
-                hidden_states[rows], topk_indices[rows], topk_weights[rows], comm_stream
-            )
+            manager = self._managers[c]
+            with torch.cuda.stream(comm_stream):
+                # The NODE is kept, not just its result: differentiating it in the backward is
+                # how this path gets the combine adjoint, so the adjoint is always the backend's
+                # own and cannot drift from the one the trunk dispatcher runs.
+                with torch.enable_grad():
+                    chunk_hidden = hidden_states[rows].detach().requires_grad_(True)
+                    chunk_probs = dense_probs[rows].detach().requires_grad_(True)
+                    manager.setup_metadata(routing_map[rows], chunk_probs)
+                    # Pin the permuted-token count. Left unset, the backend reads it back out
+                    # of pinned memory -- the host read a graph capture cannot serve -- and it
+                    # reaches the backward too, through the combine node's saved context.
+                    manager.num_permuted_tokens = capacity
+                    recv_x = manager.dispatch(chunk_hidden)
+                    recv_probs = manager.dispatched_probs
+                dispatched[c] = DispatchedChunk(
+                    recv_x=check_dispatch_capacity(recv_x, capacity),
+                    recv_probs=recv_probs,
+                    split_sizes=manager.get_number_of_tokens_per_expert(),
+                    graph=((chunk_hidden, chunk_probs), (recv_x, recv_probs)),
+                )
             dispatch_ready[c].record(comm_stream)
 
         issue_dispatch(0)
@@ -677,15 +703,17 @@ class MoEEPChunkOverlapRuntime:
             expert_ready[c].record(compute_stream)
 
             comm_stream.wait_event(expert_ready[c])
-            handle = saved_chunks[c].dispatch_handle
-            chunk_output = transport.combine_forward(fc2_output, handle, comm_stream)
             with torch.cuda.stream(comm_stream):
+                fc2_output.record_stream(comm_stream)
+                with torch.enable_grad():
+                    combine_input = fc2_output.detach().requires_grad_(True)
+                    chunk_output = self._managers[c].combine(combine_input)
+                saved_chunks[c].combine_graph = (combine_input, chunk_output)
                 if output is None:
                     output = chunk_output.new_empty((offsets[-1], *chunk_output.shape[1:]))
-                output[offsets[c] : offsets[c + 1]] = chunk_output
+                # Detached: the layer output carries no graph, the saved nodes carry it all.
+                output[offsets[c] : offsets[c + 1]] = chunk_output.detach()
 
-            fc2_output.record_stream(comm_stream)
-            transport.record_handle_stream(handle, comm_stream)
             combine_done.record(comm_stream)
 
         compute_stream.wait_event(combine_done)
@@ -696,8 +724,9 @@ class MoEEPChunkOverlapRuntime:
     def moe_backward(
         self, saved_fwd: tuple[CachedForwardChunkActivation, ...], grad_output: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor | None, ...]]:
-        offsets = self.config.chunk_offsets
-        transport = self._transport
+        config = self.config
+        offsets = config.chunk_offsets
+        capacity = config.max_num_expanded_tokens_per_chunk
         self.begin_wgrad_accumulation()
         num_chunks = len(saved_fwd)
 
@@ -707,7 +736,7 @@ class MoEEPChunkOverlapRuntime:
         expert_ready = [torch.cuda.Event() for _ in range(num_chunks)]
         combine_done = torch.cuda.Event()
 
-        dispatched: list[DispatchedChunk | None] = [None] * num_chunks
+        received: list[torch.Tensor | None] = [None] * num_chunks
         grad_hidden: torch.Tensor | None = None
         grad_probs: torch.Tensor | None = None
 
@@ -716,10 +745,18 @@ class MoEEPChunkOverlapRuntime:
         comm_stream.wait_event(inputs_ready)
 
         def issue_dispatch(c: int) -> None:
-            """Enqueue one chunk's backward dispatch on the comm stream."""
-            dispatched[c] = transport.dispatch_backward(
-                grad_output[offsets[c] : offsets[c + 1]], saved_fwd[c].dispatch_handle, comm_stream
-            )
+            """Differentiate one chunk's combine on the comm stream: the backward dispatch."""
+            combine_input, combine_output = saved_fwd[c].combine_graph
+            chunk_grad = grad_output[offsets[c] : offsets[c + 1]]
+            with torch.cuda.stream(comm_stream):
+                chunk_grad.record_stream(comm_stream)
+                (grad_recv,) = torch.autograd.grad(
+                    outputs=(combine_output,),
+                    inputs=(combine_input,),
+                    grad_outputs=(chunk_grad,),
+                    retain_graph=False,
+                )
+                received[c] = check_dispatch_capacity(grad_recv, capacity)
             dispatch_ready[c].record(comm_stream)
 
         issue_dispatch(num_chunks - 1)
@@ -730,17 +767,24 @@ class MoEEPChunkOverlapRuntime:
             saved_chunk = saved_fwd[c]
             compute_stream.wait_event(dispatch_ready[c])
             grad_permuted, grad_probs_permuted = self.routed_experts_compute_backward(
-                saved_chunk, dispatched[c]
+                saved_chunk, received[c]
             )
-            dispatched[c] = None
+            received[c] = None
             expert_ready[c].record(compute_stream)
 
             comm_stream.wait_event(expert_ready[c])
-            handle = saved_chunk.dispatch_handle
-            chunk_hidden, chunk_probs = transport.combine_backward(
-                grad_permuted, grad_probs_permuted, handle, comm_stream
-            )
+            dispatch_in, dispatch_out = saved_chunk.dispatch_graph
             with torch.cuda.stream(comm_stream):
+                grad_permuted.record_stream(comm_stream)
+                grad_probs_permuted.record_stream(comm_stream)
+                # The dispatch node's own backward: the dispatch adjoint, crossed legs and
+                # all, exactly as the trunk dispatcher would run it.
+                chunk_hidden, chunk_probs = torch.autograd.grad(
+                    outputs=dispatch_out,
+                    inputs=dispatch_in,
+                    grad_outputs=(grad_permuted, grad_probs_permuted.view_as(dispatch_out[1])),
+                    retain_graph=False,
+                )
                 if grad_hidden is None:
                     grad_hidden = chunk_hidden.new_empty((offsets[-1], *chunk_hidden.shape[1:]))
                     grad_probs = chunk_probs.new_empty((offsets[-1], *chunk_probs.shape[1:]))
@@ -748,9 +792,6 @@ class MoEEPChunkOverlapRuntime:
                 grad_hidden[rows] = chunk_hidden
                 grad_probs[rows] = chunk_probs
 
-            grad_permuted.record_stream(comm_stream)
-            grad_probs_permuted.record_stream(comm_stream)
-            transport.record_handle_stream(handle, comm_stream)
             combine_done.record(comm_stream)
 
             self.run_chunk_wgrad(stream=compute_stream)
