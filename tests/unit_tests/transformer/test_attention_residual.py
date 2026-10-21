@@ -599,7 +599,11 @@ class TestAttnResConfigValidation:
         """The scheduler enables variable_seq_lengths later in config validation."""
         from megatron.core.transformer.transformer_config import TransformerConfig
 
-        config = TransformerConfig(**self._base_kwargs(sequence_packing_scheduler="dp_balanced"))
+        config = TransformerConfig(
+            **self._base_kwargs(
+                sequence_packing_scheduler="dp_balanced", max_seqlen_per_dp_cp_rank=64
+            )
+        )
         assert config.variable_seq_lengths
 
     def test_sequence_packing_with_pipeline_parallelism_rejected(self):
@@ -610,6 +614,7 @@ class TestAttnResConfigValidation:
             TransformerConfig(
                 **self._base_kwargs(
                     sequence_packing_scheduler="dp_balanced",
+                    max_seqlen_per_dp_cp_rank=64,
                     pipeline_model_parallel_size=2,
                     pipeline_dtype=torch.float32,
                 )
@@ -705,6 +710,19 @@ class TestAttnResConfigValidation:
         with pytest.raises(ValueError, match="mutually"):
             TransformerConfig(**self._base_kwargs(enable_hyper_connections=True))
 
+    def test_mutually_exclusive_with_mhc_alias(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="mutually"):
+            TransformerConfig(**self._base_kwargs(enable_mhc_connections=True))
+
+    def test_mutually_exclusive_with_wide_residual(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        from megatron.core.transformer.wide_residual_config import WideResidualConfig
+
+        with pytest.raises(ValueError, match="wide_residual"):
+            TransformerConfig(**self._base_kwargs(wide_residual=WideResidualConfig(num_streams=2)))
+
     @pytest.mark.parametrize(
         "overrides,match",
         [
@@ -718,6 +736,19 @@ class TestAttnResConfigValidation:
             (dict(fp32_residual_connection=True), "fp32_residual_connection"),
             (dict(cpu_offloading=True, cpu_offloading_num_layers=1), "cpu_offloading"),
             (dict(heterogeneous_block_specs=True), "heterogeneous"),
+            (dict(enable_cuda_graph=True), "enable_cuda_graph"),
+            (dict(mtp_num_layers=2, mtp_hsm=True), "mtp_hsm"),
+            (dict(moe_shortcut_connection=True, num_moe_experts=4), "moe_shortcut_connection"),
+            (dict(deterministic_mode=True, attn_res_impl="fla"), "deterministic_mode"),
+            (dict(batch_invariant_mode=True, attn_res_impl="fla"), "batch_invariant_mode"),
+            (
+                dict(
+                    context_parallel_size=2,
+                    linear_cp_layout="contiguous",
+                    attention_cp_layout="zigzag",
+                ),
+                "layout conversion",
+            ),
         ],
     )
     def test_unsupported_combinations_rejected(self, overrides, match):
@@ -725,6 +756,12 @@ class TestAttnResConfigValidation:
 
         with pytest.raises(ValueError, match=match):
             TransformerConfig(**self._base_kwargs(**overrides))
+
+    @pytest.mark.parametrize("attn_res_impl", ["eager", "compile"])
+    def test_deterministic_mode_accepts_replay_certified_impls(self, attn_res_impl):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        TransformerConfig(**self._base_kwargs(deterministic_mode=True, attn_res_impl=attn_res_impl))
 
 
 class TestAttnResHybridSchedule:
@@ -1164,3 +1201,88 @@ class TestAttnResVppConfigValidation:
             TransformerConfig(
                 **self._kwargs(is_hybrid_model=True, hybrid_layer_pattern="M-M*|M-M*")
             )
+
+    def test_hybrid_empty_segment_rejected(self):
+        """A zero-layer virtual chunk would not drain the cached sources' gradients."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="empty hybrid pipe segments"):
+            TransformerConfig(
+                **self._kwargs(is_hybrid_model=True, hybrid_layer_pattern="M-M*M-M*||M-M*|M-M*")
+            )
+
+
+class _RecordingDecoder:
+    def __init__(self, input_tensor, pp_layer_offset):
+        self.input_tensor = input_tensor
+        self.pp_layer_offset = pp_layer_offset
+        self.kwargs = None
+
+    def __call__(self, **kwargs):
+        self.kwargs = kwargs
+        return kwargs["hidden_states"]
+
+
+@pytest.mark.parametrize("enable_attention_residuals", [False, True])
+def test_hybrid_model_later_stage_sp_mask_uses_local_seq_len(
+    monkeypatch, enable_attention_residuals
+):
+    """Later SP stages align the padding mask to S/TP, not to the AttnRes payload width.
+
+    With TP=2 and a 2-slice payload (embedding source + partial sum), the received
+    payload is 2 * S/2 = S rows long, the same as the full-length mask.
+    """
+    import types
+
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    tp_group = object()
+
+    def fake_scatter(tensor, group):
+        assert group is tp_group
+        return tensor[: tensor.shape[0] // 2].contiguous()
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel."
+        "scatter_to_sequence_parallel_region",
+        fake_scatter,
+    )
+    seq_len, batch, hidden, block_layers = 4, 2, 8, 8
+    num_slices = attn_res_num_payload_slices(4, block_layers) if enable_attention_residuals else 1
+    assert num_slices in (1, 2)
+    local_seq_len = seq_len // 2
+    received = torch.randn(num_slices * local_seq_len, batch, hidden)
+    model = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=True,
+            freeze_base_model_for_mtp=False,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_block_layers=block_layers,
+            virtual_pipeline_model_parallel_size=None,
+        ),
+        decoder=_RecordingDecoder(received, pp_layer_offset=4),
+        position_embedding_type="none",
+        pre_process=False,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        pg_collection=types.SimpleNamespace(tp=tp_group),
+    )
+    model._attn_res_input_payload_slices = types.MethodType(
+        HybridModel._attn_res_input_payload_slices, model
+    )
+    padding_mask = torch.tensor([[False, True, False, True], [True, False, True, False]])
+
+    HybridModel.forward(
+        model,
+        input_ids=None,
+        position_ids=None,
+        attention_mask=None,
+        decoder_input=None,
+        padding_mask=padding_mask,
+    )
+
+    assert torch.equal(model.decoder.kwargs["padding_mask"], padding_mask[:, :local_seq_len])

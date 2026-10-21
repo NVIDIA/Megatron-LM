@@ -503,6 +503,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+    def _attn_res_input_payload_slices(self) -> int:
+        """Slice count of the AttnRes pipeline payload received by this decoder chunk."""
+        from megatron.core.transformer.attention_residual import (
+            attn_res_num_payload_slices,
+            attn_res_uniform_payload_slices,
+        )
+
+        if self.config.virtual_pipeline_model_parallel_size is not None:
+            # Interleaved VPP pads every boundary payload to one uniform width.
+            return attn_res_uniform_payload_slices(self.config)
+        return attn_res_num_payload_slices(
+            self.decoder.pp_layer_offset, self.config.attn_res_block_layers
+        )
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -705,11 +719,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and decoder_reference is None
         ):
             decoder_reference = self.decoder.input_tensor
+        decoder_reference_len = (
+            decoder_reference.shape[0] if decoder_reference is not None else None
+        )
+        if (
+            decoder_reference_len is not None
+            and decoder_reference is not decoder_input
+            and getattr(self.config, "enable_attention_residuals", False)
+        ):
+            # AttnRes later stages receive a seq-concatenated depth-source payload;
+            # divide the slice count out to recover the local sequence length.
+            decoder_reference_len //= self._attn_res_input_payload_slices()
         if (
             decoder_padding_mask is not None
             and self.config.sequence_parallel
-            and decoder_reference is not None
-            and decoder_padding_mask.shape[1] != decoder_reference.shape[0]
+            and decoder_reference_len is not None
+            and decoder_padding_mask.shape[1] != decoder_reference_len
         ):
             decoder_padding_mask = (
                 tensor_parallel.scatter_to_sequence_parallel_region(

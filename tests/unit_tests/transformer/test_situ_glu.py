@@ -122,10 +122,9 @@ def test_transformer_config_accepts_pytorch_situ_glu_fallback():
     assert config.activation_func is situlu
 
 
-@pytest.mark.parametrize("frontend", ["legacy", "config_container"])
 @pytest.mark.parametrize("use_te_activation", [False, True])
-def test_situ_glu_cli_preserves_activation_backend(monkeypatch, frontend, use_te_activation):
-    """Both CLI bridges preserve the requested native/TE SiTU implementation."""
+def test_situ_glu_cli_preserves_activation_backend(monkeypatch, use_te_activation):
+    """The CLI config bridge preserves the requested native/TE SiTU implementation."""
     from megatron.training import argument_utils, arguments
 
     argv = [
@@ -154,8 +153,12 @@ def test_situ_glu_cli_preserves_activation_backend(monkeypatch, frontend, use_te
     args = arguments.validate_args(arguments.parse_args())
     # Normally populated when the tokenizer is built, after validation.
     args.padded_vocab_size = 128
-    bridge = arguments if frontend == "legacy" else argument_utils
-    config = bridge.core_transformer_config_from_args(args)
+    # arguments.py re-exports the single argument_utils bridge after the main-to-dev sync.
+    assert (
+        arguments.core_transformer_config_from_args
+        is argument_utils.core_transformer_config_from_args
+    )
+    config = argument_utils.core_transformer_config_from_args(args)
 
     assert config.activation_func is situlu
     assert config.gated_linear_unit

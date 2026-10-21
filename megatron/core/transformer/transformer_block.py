@@ -869,9 +869,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.enable_attention_residuals:
             current_microbatch = None
             if self.config.virtual_pipeline_model_parallel_size is not None:
-                current_microbatch = (
-                    getattr(self.layers[0], 'current_microbatch', None) if self.layers else None
-                )
+                # set_current_microbatch() stamps the decoder itself as well as its
+                # layers; fall back to the first layer for callers that stamp only those.
+                current_microbatch = getattr(self, 'current_microbatch', None)
+                if current_microbatch is None and len(self.layers) > 0:
+                    current_microbatch = getattr(self.layers[0], 'current_microbatch', None)
             attn_res_state, hidden_states = AttnResStageSources.enter(
                 self.config,
                 hidden_states,
@@ -983,10 +985,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     )
 
                     attn_res_kwargs = {}
+                    attn_res_block_start = False
                     if attn_res_state is not None:
-                        if is_attn_res_block_start(
+                        attn_res_block_start = is_attn_res_block_start(
                             layer.layer_number, self.config.attn_res_block_layers
-                        ):
+                        )
+                        if attn_res_block_start:
                             # Block boundary: the completed partial sum becomes a
                             # depth source; the layer starts a fresh partial sum.
                             attn_res_state.append_block_start(hidden_states)
@@ -1011,7 +1015,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             **extra_layer_kwargs,
                             **attn_res_kwargs,
                         )
-                    observe_layer_residuals(layer, residual_accumulator, hidden_states)
+                    # An AttnRes block-start layer starts a fresh partial sum, so the
+                    # incoming hidden state is not its residual input.
+                    if not attn_res_block_start:
+                        observe_layer_residuals(layer, residual_accumulator, hidden_states)
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,

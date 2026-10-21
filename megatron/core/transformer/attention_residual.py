@@ -721,7 +721,8 @@ class AttentionResidual(MegatronModule):
         if self.impl == 'fla' and self._fla_fused_attnres is None:
             raise ImportError(
                 "attn_res_impl='fla' requires FLA with fused AttnRes support. "
-                "Install it with `pip install flash-linear-attention==0.5.1`."
+                "Install the `ssm` extra (`pip install megatron-core[ssm]`), which pins "
+                "flash-linear-attention[tilelang]==0.5.1."
             )
         # Zero init is mandatory: uniform initial attention weights.
         self.pseudo_query = mark_keep_in_fp32(nn.Parameter(torch.zeros(config.hidden_size)))

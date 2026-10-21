@@ -1653,7 +1653,7 @@ class TransformerConfig(ModelParallelConfig):
     depth-block sums, and the running intra-block partial sum). Each self-attention and MLP
     sublayer aggregates the sources with its own zero-initialized pseudo-query, and the final
     output head aggregates all sources before the final layernorm. Mutually exclusive with
-    enable_hyper_connections."""
+    enable_mhc_connections (enable_hyper_connections) and wide_residual."""
 
     attn_res_block_layers: Optional[int] = None
     """Block AttnRes: number of transformer layers per depth block for GPT stacks (the paper's
@@ -2155,10 +2155,16 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
             return
 
-        if self.enable_hyper_connections:
+        if self.enable_hyper_connections or self.enable_mhc_connections:
             raise ValueError(
-                "enable_attention_residuals and enable_hyper_connections are mutually "
-                "exclusive residual-stream generalizations."
+                "enable_attention_residuals and enable_mhc_connections "
+                "(enable_hyper_connections) are mutually exclusive residual-stream "
+                "generalizations."
+            )
+        if self.wide_residual is not None:
+            raise ValueError(
+                "enable_attention_residuals and wide_residual are mutually exclusive "
+                "residual-stream generalizations."
             )
         if (
             not isinstance(self.attn_res_block_layers, int)
@@ -2197,6 +2203,19 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.cuda_graph_impl != "none":
             unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
+        elif self.enable_cuda_graph or self.external_cuda_graph:
+            # The deprecated flags are migrated to cuda_graph_impl only later in
+            # __post_init__, after this validation runs.
+            unsupported.append("enable_cuda_graph/external_cuda_graph")
+        if (self.deterministic_mode or self.batch_invariant_mode) and self.attn_res_impl == "fla":
+            # FLA's fused AttnRes kernels pick their tiles (and so the depth- and
+            # token-axis summation order) by timed Triton autotuning outside the
+            # pinned megatron.core.tuning scope; the determinism replay
+            # (test_attention_residual_kernels.py) covers only eager/compile.
+            unsupported.append(
+                "deterministic_mode/batch_invariant_mode with attn_res_impl='fla' "
+                "(use 'eager' or 'compile')"
+            )
         if self.recompute_granularity == "full":
             unsupported.append("recompute_granularity='full'")
         if self.overlap_moe_expert_parallel_comm:
@@ -2222,6 +2241,24 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.heterogeneous_block_specs:
             unsupported.append("heterogeneous_block_specs")
+        if self.moe_shortcut_connection:
+            # ShortcutMoEBlock drives its layers through the two-stage attention
+            # entry points, which bypass the AttnRes depth aggregation.
+            unsupported.append("moe_shortcut_connection")
+        if self.mtp_hsm:
+            # Hidden-state mixing rolls older MTP depth outputs per token, while
+            # every MTP depth reuses the un-rolled trunk depth sources.
+            unsupported.append("mtp_hsm")
+        if (
+            (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+            and self._linear_cp_layout_explicit
+            and self.linear_cp_layout != self.attention_cp_layout
+        ):
+            # Per-layer CP layout conversion permutes the carried partial sum but
+            # not the depth sources (nor the MTP trunk source tuple).
+            unsupported.append(
+                "context-parallel layout conversion (linear_cp_layout != attention_cp_layout)"
+            )
         if self.pipeline_model_parallel_layout is not None:
             unsupported.append("pipeline_model_parallel_layout (incl. standalone MTP stages)")
         if (
@@ -2261,6 +2298,16 @@ class TransformerConfig(ModelParallelConfig):
                             f"hybrid pattern with {num_segments} pipe segments != "
                             f"pipeline_model_parallel_size x virtual_pipeline_model_parallel_size "
                             f"= {expected_segments}"
+                        )
+                    if self.virtual_pipeline_model_parallel_size is not None and any(
+                        len(segment) == 0 for segment in main_pattern.split('|')
+                    ):
+                        # A zero-layer virtual chunk aggregates none of the depth sources
+                        # it taps and caches for the rank's later chunks, so their
+                        # cache-leaf gradients would never drain back through it.
+                        unsupported.append(
+                            "interleaved VPP with empty hybrid pipe segments "
+                            "(zero-layer virtual chunks)"
                         )
         if unsupported:
             raise ValueError(

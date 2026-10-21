@@ -267,6 +267,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "L2Norm._norm (row reduction).",
     ),
     KernelEntry(
+        name="attention_residual_aggregation",
+        sources=("megatron/core/transformer/attention_residual.py",),
+        tests=(K + "test_attention_residual_kernels.py",),
+        kind="torch.compile",
+        notes="AttnRes depth aggregation: eager custom autograd Function and the torch.compile "
+        "(AOTAutograd) variant. attn_res_impl='fla' dispatches FLA's fused AttnRes kernels "
+        "(timing-autotuned, not certified by this replay); TransformerConfig rejects it with "
+        "deterministic_mode/batch_invariant_mode.",
+    ),
+    KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
         tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),

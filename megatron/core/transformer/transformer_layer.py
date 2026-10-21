@@ -742,9 +742,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return attention_output_with_bias, self.attn_norm_manager, residual
 
     def supports_two_stage_attention(self) -> bool:
-        """Return whether this is an attention-only layer that supports two-stage execution."""
+        """Return whether this is an attention-only layer that supports two-stage execution.
+
+        Attention residuals aggregate the depth sources around ``forward``; the two-stage
+        entry points would bypass that aggregation, so AttnRes layers never expose them.
+        """
         return (
-            isinstance(self.self_attention, TwoStageAttentionLayer)
+            not self.config.enable_attention_residuals
+            and isinstance(self.self_attention, TwoStageAttentionLayer)
             and self.self_attention.supports_two_stage_attention()
             and isinstance(self.cross_attention, IdentityOp)
             and isinstance(self.mlp, IdentityOp)
@@ -1685,6 +1690,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # DeprecationWarning. `mlp_state` is dropped — the legacy contract didn't
         # have it. The override is resolved once in __init__ so this hot path stays
         # a single attribute check. To be removed in a future release.
+        if _return_layer_delta and self._legacy_forward_post_mlp is not None:
+            raise RuntimeError(
+                "Hybrid AttnRes layer deltas are not supported with a legacy "
+                "_forward_post_mlp override."
+            )
         if self._legacy_forward_post_mlp is not None:
             warnings.warn(
                 "TransformerLayer._forward_post_mlp has been renamed to "
@@ -1701,6 +1711,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
 
         residual_connection = self._get_mlp_residual_connection()
+        if _return_layer_delta and (
+            using_fused_tp_inference_kernel or residual_connection is not None
+        ):
+            raise NotImplementedError(
+                "Hybrid AttnRes layer deltas support only the plain bias-dropout-add path "
+                "(no fused TP inference kernel or wide-residual connection)."
+            )
         recompute_context = (
             residual_stream_recompute_context if residual_connection is not None else None
         )
@@ -3989,17 +4006,21 @@ class AttnResTransformerLayer(TransformerLayer):
             f"sources, got {len(attn_res_sources)}; block-boundary bookkeeping is broken"
         )
 
-        hidden_states, context = self._forward_attention(
-            *args, attn_res_sources=attn_res_sources, **kwargs
-        )
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-            input_ids=kwargs.get("input_ids", None),
-            packed_seq_params=kwargs.get("packed_seq_params", None),
-            attn_res_sources=attn_res_sources,
-        )
+        with _otel_managed_span(
+            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        ):
+            hidden_states, context = self._forward_attention(
+                *args, attn_res_sources=attn_res_sources, **kwargs
+            )
+            with _otel_managed_span('layer', 'megatron.layer.mlp'):
+                output = self._forward_mlp(
+                    hidden_states,
+                    kwargs.get("inference_context", None),
+                    padding_mask=kwargs.get("padding_mask", None),
+                    input_ids=kwargs.get("input_ids", None),
+                    packed_seq_params=kwargs.get("packed_seq_params", None),
+                    attn_res_sources=attn_res_sources,
+                )
         return output, context
 
     def _forward_attention(
@@ -4018,6 +4039,7 @@ class AttnResTransformerLayer(TransformerLayer):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         attn_res_sources: Tuple[Tensor, ...] = (),
         inference_params: Optional[Any] = None,
@@ -4028,6 +4050,10 @@ class AttnResTransformerLayer(TransformerLayer):
         depth sources by the caller, so there is no partial sum: the sublayer
         output starts a new one (plain bias + dropout, no residual add).
         """
+        if residual_stream_recompute_context is not None:
+            raise NotImplementedError(
+                "Attention residuals do not support 'residual_stream' recomputation."
+            )
         # At non-block-start layers the incoming hidden state IS the partial sum.
         partial = None if self.attn_res_is_block_start else hidden_states
         values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
@@ -4083,8 +4109,9 @@ class AttnResTransformerLayer(TransformerLayer):
         hidden_states: Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         padding_mask: Optional[Tensor] = None,
-        input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        input_ids: Optional[Tensor] = None,
+        residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         attn_res_sources: Tuple[Tensor, ...] = (),
     ):
@@ -4093,6 +4120,10 @@ class AttnResTransformerLayer(TransformerLayer):
         The incoming hidden state is always the (non-empty) partial sum here:
         block boundaries only fall on attention sublayers.
         """
+        if residual_stream_recompute_context is not None:
+            raise NotImplementedError(
+                "Attention residuals do not support 'residual_stream' recomputation."
+            )
         partial = hidden_states
         values = [*attn_res_sources, partial]
 

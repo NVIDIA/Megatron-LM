@@ -158,6 +158,7 @@ class AttnResHybridLayer(MegatronModule):
         input_ids: Optional[Tensor] = None,
         *,
         attn_res_sources: Optional[Tuple[Tensor, ...]] = None,
+        packed_sequence_cp_metadata=None,
     ) -> Tensor:
         """Aggregate depth sources, run the inner entry, and update the partial sum."""
         if attn_res_sources is None:
@@ -195,11 +196,16 @@ class AttnResHybridLayer(MegatronModule):
         else:
             # Non-transformer entries (e.g. MambaLayer) accept only the common
             # arguments — same contract as HyperConnectionHybridLayer's inner call.
+            inner_kwargs = {}
+            if packed_sequence_cp_metadata is not None:
+                # Chunkwise linear CP (MambaLayer) needs the packed-sequence metadata.
+                inner_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
             output = self.inner_layer(
                 hidden_states=aggregated,
                 attention_mask=attention_mask,
                 inference_context=None,
                 packed_seq_params=packed_seq_params,
+                **inner_kwargs,
             )
         if isinstance(output, tuple):
             output = output[0]
@@ -844,9 +850,11 @@ class HybridStack(MegatronModule):
                 )
                 current_microbatch = None
                 if self.config.virtual_pipeline_model_parallel_size is not None:
-                    current_microbatch = (
-                        getattr(self.layers[0], 'current_microbatch', None) if self.layers else None
-                    )
+                    # set_current_microbatch() stamps the decoder itself as well as its
+                    # layers; fall back to the first layer for callers that stamp only those.
+                    current_microbatch = getattr(self, 'current_microbatch', None)
+                    if current_microbatch is None and len(self.layers) > 0:
+                        current_microbatch = getattr(self.layers[0], 'current_microbatch', None)
                 attn_res_state, hidden_states = AttnResStageSources.enter(
                     self.config,
                     hidden_states,
@@ -1037,6 +1045,7 @@ class HybridStack(MegatronModule):
                                         input_ids if self._uses_hash_routing(layer) else None
                                     ),
                                     attn_res_sources=layer_attn_res_sources,
+                                    packed_sequence_cp_metadata=layer_cp_metadata,
                                 )
                             elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -1128,7 +1137,12 @@ class HybridStack(MegatronModule):
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
-                        observe_layer_residuals(layer, residual_accumulator, hidden_states)
+                        # An AttnRes block-start entry starts a fresh partial sum, so the
+                        # incoming hidden state is not its residual input.
+                        if not (
+                            isinstance(layer, AttnResHybridLayer) and layer.attn_res_is_block_start
+                        ):
+                            observe_layer_residuals(layer, residual_accumulator, hidden_states)
                         if isinstance(layer, HyperConnectionHybridLayer) and not observe_residuals:
                             grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()
                         if cp_layout_state is not None:
