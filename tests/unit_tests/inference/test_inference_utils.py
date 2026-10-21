@@ -5,8 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.inference.utils import Counter, detokenize_tokens, get_language_model
-from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.inference.utils import (
+    Counter,
+    detokenize_tokens,
+    get_language_model,
+    lm_head_can_emit,
+)
 
 
 class _Wrapper(torch.nn.Module):
@@ -78,17 +82,15 @@ class TestInferenceUtils:
     @pytest.mark.parametrize(
         "params_dtype, mxfp8, general_gemm, expected",
         [
-            (torch.bfloat16, False, True, torch.float32),  # general_gemm emits fp32 from bf16
-            (torch.float32, False, False, torch.float32),  # an fp32 head needs nothing
-            (torch.bfloat16, False, False, None),  # no general_gemm: the head keeps bf16
-            (torch.bfloat16, True, True, None),  # the MXFP8 output projection emits its input dtype
+            (torch.bfloat16, False, True, True),  # general_gemm emits fp32 from bf16
+            (torch.float32, False, False, True),  # an fp32 head needs nothing
+            (torch.bfloat16, False, False, False),  # no general_gemm
+            (torch.bfloat16, True, True, False),  # the MXFP8 head emits its input dtype
         ],
     )
-    def test_language_module_inference_logits_dtype(
-        self, monkeypatch, params_dtype, mxfp8, general_gemm, expected
-    ):
-        """Under an inference context the head asks its output layer for fp32 exactly when it can
-        emit it (`lm_head_can_emit`); outside inference it asks for nothing."""
+    def test_lm_head_can_emit_fp32(self, monkeypatch, params_dtype, mxfp8, general_gemm, expected):
+        """The GEMM input dtype is always available; fp32 from a half-precision head needs TE
+        general_gemm and is beyond the MXFP8 output projection."""
         monkeypatch.setattr(
             "megatron.core.fp8_utils.is_mxfp8_output_proj_active", lambda config: mxfp8
         )
@@ -96,7 +98,6 @@ class TestInferenceUtils:
             "megatron.core.extensions.transformer_engine.te_general_gemm",
             object() if general_gemm else None,
         )
-        head = object.__new__(LanguageModule)
-        object.__setattr__(head, "config", SimpleNamespace(params_dtype=params_dtype))
-        assert head.inference_logits_dtype(SimpleNamespace()) is expected
-        assert head.inference_logits_dtype(None) is None
+        config = SimpleNamespace(params_dtype=params_dtype)
+        assert lm_head_can_emit(config, torch.float32) is expected
+        assert lm_head_can_emit(config, params_dtype) is True

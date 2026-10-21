@@ -632,7 +632,7 @@ class MTPControllerMixin:
                 mtp_logits = mtp_logits[:active_request_count]
 
                 # mtp_logits: [active_request_count, 1, vocab_size]
-                mtp_logits_2d = mtp_logits.squeeze(1).float()  # [active_request_count, vocab]
+                mtp_logits_2d = mtp_logits.squeeze(1)  # [active_request_count, vocab_size]
 
             # Broadcast MTP logits across pipeline stages.
             if self.model_is_pipeline_parallel:
@@ -769,7 +769,7 @@ class MTPControllerMixin:
                     )
                     if mtp_context_kwarg:
                         context.mtp_metadata.advance_decode_step()
-                    mtp_logits_2d = mtp_logits.squeeze(1).float()  # [padded_count, vocab_size]
+                    mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
                 # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
                 if self.model_is_pipeline_parallel:
