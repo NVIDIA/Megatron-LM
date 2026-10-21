@@ -176,10 +176,20 @@ class TestCoreAttentionRecompute:
         dependencies = {}
         events = []
         checkpoint = tensor_parallel.CheckpointWithoutOutput.checkpoint
-        recompute = tensor_parallel.CheckpointWithoutOutput._recompute
 
-        def record_checkpoint(instance, *args, **kwargs):
-            result = checkpoint(instance, *args, **kwargs)
+        def record_checkpoint(instance, run_function, *args, **kwargs):
+            def record_recompute(*inputs):
+                if torch.is_grad_enabled() and instance in dependencies:
+                    graph, stage = dependencies[instance]
+                    if stage in ("up", "core"):
+                        assert norm_outputs[graph].untyped_storage().nbytes() > 0
+                        assert (graph, "norm") in events
+                    if stage == "core":
+                        assert (graph, "up") in events
+                    events.append((graph, stage))
+                return run_function(*inputs)
+
+            result = checkpoint(instance, record_recompute, *args, **kwargs)
             if instance is getattr(candidate, "input_layernorm_checkpoint", None):
                 normalized = result[0] if isinstance(result, tuple) else result
                 norm_outputs.append(normalized)
@@ -192,17 +202,6 @@ class TestCoreAttentionRecompute:
                 dependencies[instance] = (len(norm_outputs) - 1, "core")
                 saved_outputs.extend(instance.outputs)
             return result
-
-        def check_recompute(instance, grad):
-            if instance.ctx is not None and instance in dependencies:
-                graph, stage = dependencies[instance]
-                if stage in ("up", "core"):
-                    assert norm_outputs[graph].untyped_storage().nbytes() > 0
-                    assert (graph, "norm") in events
-                if stage == "core":
-                    assert (graph, "up") in events
-                events.append((graph, stage))
-            return recompute(instance, grad)
 
         def run(layer):
             xs = [x.detach().clone().requires_grad_() for x in inputs]
@@ -223,13 +222,8 @@ class TestCoreAttentionRecompute:
             return outputs, [x.grad for x in xs]
 
         expected_outputs, expected_grads = run(reference)
-        with (
-            mock.patch.object(
-                tensor_parallel.CheckpointWithoutOutput, "checkpoint", record_checkpoint
-            ),
-            mock.patch.object(
-                tensor_parallel.CheckpointWithoutOutput, "_recompute", check_recompute
-            ),
+        with mock.patch.object(
+            tensor_parallel.CheckpointWithoutOutput, "checkpoint", record_checkpoint
         ):
             actual_outputs, actual_grads = run(candidate)
         assert all(t.untyped_storage().nbytes() > 0 for t in saved_outputs)

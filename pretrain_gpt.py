@@ -58,14 +58,16 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
 from model_provider import model_provider
 
 try:
@@ -202,7 +204,12 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+    logprobs_dir,
+    decode_threads,
+    msc_prefetch_depth,
+    kd_loss_alpha,
+    ignore_errors,
+    ignore_hash,
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -214,10 +221,10 @@ def _build_cached_logits_loss_func(
     return LossFuncCallable(
         logprobs_dir=logprobs_dir,
         decode_threads=decode_threads,
-        prefetch_factor=prefetch_factor,
         msc_prefetch_depth=msc_prefetch_depth,
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
+        ignore_hash=ignore_hash,
     )
 
 
@@ -244,10 +251,10 @@ def loss_func(
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
             decode_threads=args.logits_load_decode_threads,
-            prefetch_factor=args.logits_load_prefetch_factor,
             msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
@@ -311,6 +318,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         batch = get_batch(data_iterator, vp_stage)
 
+        # Only populated by the has_cu_seqlens (--sft) 10-tuple branch below;
+        # stays None for the 6-/7-tuple (unpacked) batch shapes.
+        cu_seqlens = None
+        cu_seqlens_padded = None
+
         if len(batch) == 7:
             (
                 tokens,
@@ -365,6 +377,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     tokens_per_sample=args.seq_length,
                 )
 
+        # Offline logits KD: record this microbatch's global (un-CP-sharded)
+        # document boundaries so the saver can persist them alongside the
+        # logits _forward_hook is about to capture -- required for
+        # document-aware CP reassembly of packed (--sft) sequences.
+        from megatron.training.distillation.logits_saver import get_logits_saver
+
+        saver = get_logits_saver()
+        if saver is not None:
+            saver.set_current_cu_seqlens(
+                cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+            )
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -415,6 +439,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     """Build the GPT (or FIM) dataset config from parsed CLI args."""
+    cfg = get_run_config()
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -428,13 +453,13 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             sequences_per_dataset = json.load(f)
 
     data_args = {
-        "random_seed": args.seed,
+        "random_seed": cfg.rng.seed,
         "sequence_length": args.seq_length,
         "blend": blend,
         "blend_per_split": blend_per_split,
         "split": args.split,
-        "multiple_validation_sets": args.multiple_validation_sets,
-        "full_validation": args.full_validation,
+        "multiple_validation_sets": cfg.validation.multiple_validation_sets,
+        "full_validation": cfg.validation.full_validation,
         "num_dataset_builder_threads": args.num_dataset_builder_threads,
         "path_to_cache": args.data_cache_path,
         "mmap_bin_files": args.mmap_bin_files,
@@ -579,8 +604,6 @@ if __name__ == "__main__":
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    initialize_runtime_services(args)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
