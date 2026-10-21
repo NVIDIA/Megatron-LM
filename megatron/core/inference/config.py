@@ -62,8 +62,8 @@ class MambaInferenceStateConfig:
     slice start."""
 
     gdp_num_householder: int = 0
-    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
-    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    """Number of Householder copies of the Gated Delta Product layers, 1 for GDN,
+    or 0 for other mixers. Sizes the chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
     def __post_init__(self):

@@ -287,11 +287,11 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
-def _gdp_case():
+def _gdp_case(M=2):
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 
     seeded()
-    T, H, K, V, M = 4096, 16, 128, 128, 2
+    T, H, K, V = 4096, 16, 128, 128
     bounds = [0, 1000, 2500, 4096]
     q = torch.randn(1, T, H, K, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, T * M, H, K, device="cuda", dtype=torch.bfloat16)
@@ -341,10 +341,11 @@ def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
     "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
     "model owners; not gated until root-caused.",
 )
-def test_chunk_gated_delta_product_varlen_replays():
-    fn, args = _gdp_case()
+@pytest.mark.parametrize("M", [1, 2])  # M=1 is GDN's dynamic-inference prefill
+def test_chunk_gated_delta_product_varlen_replays(M):
+    fn, args = _gdp_case(M)
     assert_replays_bit_exact(
-        fn, args, replays=4, backward=False, what="chunk_gated_delta_product_varlen"
+        fn, args, replays=4, backward=False, what=f"chunk_gated_delta_product_varlen (M={M})"
     )
 
 
