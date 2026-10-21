@@ -54,6 +54,45 @@ def return_rows(rows, indices, state, group):
     return slots.index_copy(0, position, returned).reshape(*indices.shape, rows.shape[-1])
 
 
+def actual_rows(x, scores, indices, masters, limit, group, has_shared=True):
+    local = len(masters) // 2 - int(has_shared)
+    codes, scale = experts.quantize_activation(x)
+    shared = x * 0
+    if has_shared:
+        first = experts._Shared.apply(x, masters[-2], (codes, scale))
+        hidden, encoded = experts.activation(first, x.new_ones(x.shape[0]), limit)
+        shared = experts._Shared.apply(hidden, masters[-1], encoded)
+    live, weights, encoded, splits, state = dispatch_rows(
+        x, scores, indices, (codes, scale), local, group
+    )
+    rows = experts.expert_rows(
+        live, masters[:local], masters[local : 2 * local], splits, weights, encoded, limit
+    )
+    return combine(return_rows(rows, indices, state, group), indices, shared)
+
+
+class _FusedMoE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scores, indices, options, *masters):
+        group, limit, buffer, packed = options
+        ctx.options = group, limit
+        ctx.save_for_backward(x, scores, indices, *masters)
+        return experts.launch(x, scores, indices, packed, buffer, limit, group.size())
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, scores, indices, *masters = ctx.saved_tensors
+        group, limit = ctx.options
+        need = (*ctx.needs_input_grad[:2], *ctx.needs_input_grad[4:])
+        with torch.enable_grad():
+            leaves = [t.detach().requires_grad_(n) for t, n in zip((x, scores, *masters), need)]
+            out = actual_rows(leaves[0], leaves[1], indices, leaves[2:], limit, group)
+            wanted = [t for t in leaves if t.requires_grad]
+            gradients = iter(torch.autograd.grad(out, wanted, grad))
+            result = [next(gradients) if n else None for n in need]
+        return result[0], result[1], None, None, *result[2:]
+
+
 class MegaMoE(MoELayer):
     def forward(self, hidden_states, input_ids=None, **kwargs):
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -63,23 +102,45 @@ class MegaMoE(MoELayer):
             raise ValueError('MegaMoE requires the Core contiguous global expert ownership map')
         logits = linear(x, self.router.weight, fp8=False)
         weights, indices = route(logits, self.router, input_ids)
-        codes, scale = experts.quantize_activation(x)
         limit = self.config.activation_func_clamp_value
-        shared = (
-            experts.shared_rows(x, self.shared_experts, (codes, scale), limit)
-            if self.shared_experts is not None
-            else x * 0
-        )
-
-        live, scores, encoded, splits, dispatch = dispatch_rows(
-            x, weights, indices, (codes, scale), self.num_local_experts, group
-        )
         fc1 = [
             getattr(self.experts.linear_fc1, f'weight{i}') for i in range(self.num_local_experts)
         ]
         fc2 = [
             getattr(self.experts.linear_fc2, f'weight{i}') for i in range(self.num_local_experts)
         ]
-        rows = experts.expert_rows(live, fc1, fc2, splits, scores, encoded, limit)
-        selected = return_rows(rows, indices, dispatch, group)
-        return combine(selected, indices, shared).reshape_as(hidden_states), None
+        masters = (*fc1, *fc2)
+        if self.shared_experts is None:
+            out = actual_rows(x, weights, indices, masters, limit, group, False)
+        else:
+            masters += (
+                self.shared_experts.linear_fc1.weight,
+                self.shared_experts.linear_fc2.weight,
+            )
+            # Quantized operands are fresh on every call; only the symmetric buffer is cached.
+            packed = experts.kernel_weights(fc1, fc2, *masters[-2:])
+            capacity = 8192
+            buffer = experts.symm_buffer(
+                group,
+                len(fc1) * group.size(),
+                capacity,
+                indices.shape[1],
+                x.shape[1],
+                fc1[0].shape[0] // 2,
+            )
+            chunks = torch.tensor(max(1, (x.shape[0] + capacity - 1) // capacity), device=x.device)
+            torch.distributed.all_reduce(chunks, torch.distributed.ReduceOp.MAX, group=group)
+            outputs = []
+            for chunk in range(int(chunks)):
+                rows = slice(chunk * capacity, (chunk + 1) * capacity)
+                outputs.append(
+                    _FusedMoE.apply(
+                        x[rows],
+                        weights[rows],
+                        indices[rows],
+                        (group, limit, buffer, packed),
+                        *masters,
+                    )
+                )
+            out = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+        return out.reshape_as(hidden_states), None

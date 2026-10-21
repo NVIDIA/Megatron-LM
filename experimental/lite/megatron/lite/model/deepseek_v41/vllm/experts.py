@@ -220,3 +220,136 @@ def shared_rows(x, module, encoded, limit):
     first = _Shared.apply(x, module.linear_fc1.weight, encoded)
     hidden, encoded = activation(first, x.new_ones(x.shape[0]), limit)
     return _Shared.apply(hidden, module.linear_fc2.weight, encoded)
+
+
+_BUFFERS = {}
+
+
+def _layout():
+    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import DeepGemmMegaMoEExperts
+
+    return DeepGemmMegaMoEExperts
+
+
+def _write(dst, src, shard, is_scale):
+    layout = _layout()
+    rows = dst.shape[0] // (1 if shard == "w2" else 2)
+    src = layout._pack_scale(src, rows, dst.shape[1] * 4) if is_scale else src.view(dst.dtype)
+    dst, src = layout._kernel_layout_shard(dst, src, shard, is_scale)
+    dst.copy_(src)
+
+
+def _empty_weight(outer, n, k, values_per_element, device):
+    weight = torch.zeros(
+        *outer,
+        n,
+        k // values_per_element,
+        dtype=torch.int8 if values_per_element == 2 else torch.float8_e4m3fn,
+        device=device,
+    )
+    scale = torch.zeros(*outer, k // 128, n, dtype=torch.int32, device=device).transpose(-1, -2)
+    return weight, scale
+
+
+@torch.no_grad()
+def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
+    """Masters -> ``(l1, l2, shared_l1, shared_l2)`` in the MegaMoE kernel layout.
+
+    ``fc1[e]`` is ``cat(w1, w3)`` [2I, H]; ``fc2[e]`` is ``w2`` [H, I].
+    """
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
+
+    device = fc1[0].device
+    inter, hidden = fc1[0].shape[0] // 2, fc1[0].shape[1]
+    w13, s13 = _empty_weight((len(fc1),), 2 * inter, hidden, 2, device)
+    w2, s2 = _empty_weight((len(fc2),), hidden, inter, 2, device)
+    for e, (a, b) in enumerate(zip(fc1, fc2)):
+        for shard, part in (("w1", a[:inter]), ("w3", a[inter:])):
+            codes, scale = quantize_mxfp4(part.detach())
+            _write(w13[e], codes, shard, False)
+            _write(s13[e], scale, shard, True)
+        codes, scale = quantize_mxfp4(b.detach())
+        _write(w2[e], codes, "w2", False)
+        _write(s2[e], scale, "w2", True)
+    shared = []
+    s_inter = shared_fc1.shape[0] // 2
+    l1, l1s = _empty_weight((), 2 * s_inter, hidden, 1, device)
+    l2, l2s = _empty_weight((), hidden, s_inter, 1, device)
+    for shard, part, (w, s) in (
+        ("w1", shared_fc1[:s_inter], (l1, l1s)),
+        ("w3", shared_fc1[s_inter:], (l1, l1s)),
+        ("w2", shared_fc2, (l2, l2s)),
+    ):
+        codes, scale = quantize_block_fp8(part.detach(), (32, 32), scale_format="e8m0")
+        _write(w, codes, shard, False)
+        _write(s, scale, shard, True)
+    shared = ((l1, l1s), (l2, l2s))
+    return (w13, s13), (w2, s2), shared[0], shared[1]
+
+
+def symm_buffer(group, num_experts, max_tokens, top_k, hidden, inter, shared_experts=1):
+    from vllm.utils.deep_gemm import _import_deep_gemm
+
+    deep_gemm = _import_deep_gemm()
+    key = (id(group), torch.cuda.current_device(), num_experts, max_tokens, top_k, hidden, inter)
+    if key not in _BUFFERS:
+        torch.cuda.empty_cache()
+        _BUFFERS[key] = deep_gemm.get_symm_buffer_for_mega_moe(
+            group,
+            num_experts,
+            max_tokens,
+            top_k,
+            hidden,
+            inter,
+            num_shared_experts=shared_experts,
+            mma_type="fp8xfp4",
+            activation="swiglu",
+        )
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=group)
+    return _BUFFERS[key]
+
+
+def launch(x, weights, ids, packed, buffer, limit, ep_size):
+    """The inference launch over prepacked kernel weights. Returns bf16 [T, H]."""
+    from vllm.model_executor.layers.fused_moe.prepare_megamoe import prepare_megamoe_inputs
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
+    from vllm.utils.deep_gemm import _import_deep_gemm
+
+    deep_gemm = _import_deep_gemm()
+    tokens = x.shape[0]
+    if tokens > buffer.num_max_tokens_per_rank:
+        raise ValueError(
+            f"MegaMoE buffer holds {buffer.num_max_tokens_per_rank} tokens, got {tokens}"
+        )
+    l1, l2, shared_l1, shared_l2 = packed
+    num_experts = l1[0].shape[0] * ep_size
+    block_m = deep_gemm.get_block_m_for_mega_moe(
+        ep_size, num_experts, buffer.num_max_tokens_per_rank, tokens, ids.shape[1], "fp8xfp4"
+    )
+    prepare_megamoe_inputs(
+        x.contiguous(),
+        weights.contiguous(),
+        ids.contiguous(),
+        buffer.x[:tokens],
+        buffer.x_sf[:tokens],
+        buffer.topk_idx[:tokens],
+        buffer.topk_weights[:tokens],
+        is_padding=None,
+        shared_x_sf=buffer.shared_l1_acts_sf,
+        shared_block_m=block_m,
+        hidden_quant=kMxfp8Dynamic,
+    )
+    y = torch.empty_like(x, dtype=torch.bfloat16)
+    deep_gemm.fp8_fp4_mega_moe(
+        y,
+        l1,
+        l2,
+        buffer,
+        fast_math=True,
+        activation_clamp=limit,
+        shared_l1_weights=shared_l1,
+        shared_l2_weights=shared_l2,
+    )
+    return y
