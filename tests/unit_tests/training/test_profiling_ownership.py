@@ -57,6 +57,8 @@ def inline_profiler(monkeypatch, run_config):
     remove_profiling_args(args)
     train_state = TrainState()
     args.train_iters = 10
+    run_config.train.train_iters = 10
+    run_config.train.micro_batch_size = 1
     args.train_sync_interval = 0
     args.gpu_sniff_test_interval = args.check_weight_hash_across_dp_replicas_interval = None
     args.log_straggler = args.manual_gc = False
@@ -432,6 +434,8 @@ def test_training_log_memory_snapshot_without_profiling_args(
     args.data_parallel_size = args.world_size = args.gtp_weight_remat_size = 1
     train_state = TrainState()
     args.train_iters = 1
+    run_config.train.train_iters = 1
+    run_config.train.micro_batch_size = 1
     timers = Mock()
     timers.return_value.elapsed.return_value = 1.0
     monkeypatch.setattr(training, "get_args", lambda: args)
