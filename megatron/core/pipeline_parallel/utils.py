@@ -22,6 +22,11 @@ try:
 except ImportError:
     is_symm_backed = None
 
+try:
+    from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+except ImportError:
+    GroupedTensor = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -178,6 +183,31 @@ class NoopScheduleNode:
         return outgrads
 
 
+def _grouped_tensor_buffers(tensor) -> Optional[list]:
+    """The buffers of a Transformer Engine GroupedTensor, or None for any other object.
+
+    With MXFP8 token dispatch (``moe_dispatch_fwd_dtype="mxfp8"``) the expert input, and with
+    ``moe_combine_bwd_dtype="mxfp8"`` the expert-output gradient, is a per-expert GroupedTensor.
+    Its ``__torch_dispatch__`` cannot run ``record_stream`` and has no storage of its own when
+    the experts receive different token counts, so stream bookkeeping uses its buffers instead.
+    """
+    if GroupedTensor is None or not isinstance(tensor, GroupedTensor):
+        return None
+    return [buffer for buffer in tensor.get_data_tensors() if isinstance(buffer, torch.Tensor)]
+
+
+def _release_grouped_tensor(tensor) -> None:
+    """Drop a GroupedTensor's references to its data and scaling-factor buffers.
+
+    The expert op saves the quantized buffers for backward, so they stay alive through the
+    autograd graph; this only frees what nothing else references. Resizing the storages, as
+    done for plain tensors, would also clobber the saved buffers.
+    """
+    for name in ("rowwise_data", "columnwise_data", "scale_inv", "columnwise_scale_inv"):
+        if getattr(tensor, name, None) is not None:
+            setattr(tensor, name, None)
+
+
 class ScheduleNode:
     """Base node for fine-grained scheduling.
 
@@ -264,8 +294,14 @@ class ScheduleNode:
         # Immediately frees input tensors after they are used for nodes
         # where inputs are no longer needed after computation.
         if self.free_input:
-            for input in inputs:
-                if input is not None:
+            for i, input in enumerate(inputs):
+                buffers = _grouped_tensor_buffers(input)
+                if buffers is not None:
+                    for buffer in buffers:
+                        buffer.record_stream(self.stream)
+                    _release_grouped_tensor(input)
+                    _release_grouped_tensor(self.inputs[i])
+                elif input is not None:
                     input.record_stream(self.stream)
                     # Skip symmetric-memory (zero-copy EP) buffers
                     if not (
@@ -304,7 +340,11 @@ class ScheduleNode:
         # output_grad maybe from another stream
         if output_grad:
             for g in output_grad:
-                if g is not None:
+                buffers = _grouped_tensor_buffers(g)
+                if buffers is not None:
+                    for buffer in buffers:
+                        buffer.record_stream(self.stream)
+                elif g is not None:
                     g.record_stream(self.stream)
 
         grads = self.get_grad()
