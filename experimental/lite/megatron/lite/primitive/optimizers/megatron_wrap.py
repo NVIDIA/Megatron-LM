@@ -208,22 +208,7 @@ def build_dist_opt_stack(
         optimizer._dist_opt_pg_collection = (
             pg_collection  # pyright: ignore[reportAttributeAccessIssue]
         )
-    _rebuild_param_group_order(optimizer)
     return wrapped_chunks, optimizer
-
-
-def _rebuild_param_group_order(optimizer) -> None:
-    """Point group_order at the installed [fp32, fp32-from-float16] order; mcore 0.19 lacks this."""
-    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-
-    for opt in getattr(optimizer, "chained_optimizers", [optimizer]):
-        if not isinstance(opt, DistributedOptimizer):
-            continue
-        for group_index, (fp32_params, float16_params) in enumerate(
-            zip(opt.model_fp32_groups, opt.model_float16_groups)
-        ):
-            for group_order, param in enumerate([*fp32_params, *float16_params]):
-                opt.model_param_group_index_map[param] = (group_index, group_order)
 
 
 def build_dist_opt_training_optimizer(
