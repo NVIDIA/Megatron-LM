@@ -362,16 +362,22 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
-def test_warmup_fraction_counts_only_eligible_groups_and_keeps_view_metadata():
+def test_warmup_fraction_counts_every_group_per_module_and_keeps_view_metadata():
     base = torch.ones(64, 96, device="cuda")
     opt_out = torch.ones(16, device="cuda")
     opt_out._do_not_offload = True
     tensors_by_group = [
+        ("qkv_linear", [torch.ones(16, device="cuda")]),
         ("core_attn", [torch.ones(16, device="cuda")]),
-        ("empty", []),
-        ("ineligible", [torch.ones(16), torch.ones(1, device="cuda"), opt_out]),
-        ("expert_fc1", [base[:, :80].detach(), base[:, 16:], base[::8, ::8]]),
         ("attn_proj", [torch.ones(16, device="cuda")]),
+        ("qkv_linear", []),
+        ("core_attn", [torch.ones(16), torch.ones(1, device="cuda"), opt_out]),
+        ("attn_proj", [torch.ones(16, device="cuda")]),
+        ("qkv_linear", [torch.ones(16, device="cuda")]),
+        ("core_attn", [torch.ones(16, device="cuda")]),
+        ("attn_proj", [torch.ones(16, device="cuda")]),
+        ("expert_fc1", []),
+        ("expert_fc1", [base[:, :80].detach(), base[:, 16:], base[::8, ::8]]),
     ]
     groups = []
     for group_index, (name, tensors) in enumerate(tensors_by_group):
@@ -387,18 +393,18 @@ def test_warmup_fraction_counts_only_eligible_groups_and_keeps_view_metadata():
         for group in groups:
             chunk.bulk_offload(group._name, [])
         torch.cuda.synchronize()
-        # Empty/ineligible groups do not advance the quota, and module names do
-        # not get independent quotas: only the first and third candidates copy.
+        # Each module selects occurrences 1 and 3. The empty QKV and ineligible
+        # attention groups in occurrence 2 must not shift the next selection.
         assert [
             i
             for i, group in enumerate(groups)
             if any(isinstance(state, tuple) for state in group._tensors.values())
-        ] == [0, 4]
-        assert groups[1].total_offload_bytes == groups[2].total_offload_bytes == 0
-        assert chunk.cpu_tensor_pool._stats["allocation_requests"] == 2
+        ] == [0, 1, 2, 6, 7, 8]
+        assert groups[3].total_offload_bytes == groups[4].total_offload_bytes == 0
+        assert chunk.cpu_tensor_pool._stats["allocation_requests"] == 6
         # The skipped MoE group has no CPU pool, but its storage-sized copies,
         # logical gather, and redundant storage still have complete metadata.
-        skipped = groups[3]
+        skipped = groups[10]
         storage_bytes = base.untyped_storage().nbytes()
         gather_bytes = base[::8, ::8].numel() * base.element_size()
         assert not skipped.use_cpu_pool
@@ -634,6 +640,7 @@ def _build_gpt_model(
     min_offloaded_tensor_size: int,
     is_mla: bool,
     activation_offload_fraction: float = 1.0,
+    attention_backend: AttnBackend = AttnBackend.unfused,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
@@ -644,7 +651,7 @@ def _build_gpt_model(
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
         use_cpu_initialization=True,
-        attention_backend=AttnBackend.unfused,
+        attention_backend=attention_backend,
         bf16=True,
         # Recompute
         recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
@@ -736,6 +743,66 @@ def _run_one_iter_and_capture(
         grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
 
     return logits.detach().float().cpu(), grads, peak_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("attention_backend", [AttnBackend.fused, AttnBackend.flash])
+def test_partial_offload_warmup_preserves_attention_output(monkeypatch, attention_backend):
+    """Projection must not free the output retained by fused/FlashAttention backward."""
+    for name in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
+        monkeypatch.delenv(name, raising=False)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    try:
+        inputs = dict(
+            zip(
+                ("input_ids", "position_ids", "attention_mask"),
+                _make_gpt_inputs(seq_length=128, micro_batch_size=1, device=torch.device("cuda")),
+            )
+        )
+        model_args = dict(
+            seed=123,
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            vocab_size=1024,
+            seq_length=128,
+            num_experts=None,
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            attention_backend=attention_backend,
+        )
+        baseline = _build_gpt_model(
+            **model_args, fine_grained_activation_offloading=False, offload_modules=None
+        ).cuda()
+        params = _capture_params(baseline)
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        expected_output, expected_grads, _ = _run_one_iter_and_capture(
+            baseline, **inputs, enable_offload_reset=False
+        )
+        del baseline
+        model = _build_gpt_model(
+            **model_args,
+            fine_grained_activation_offloading=True,
+            offload_modules=["qkv_linear", "core_attn", "attn_proj"],
+            activation_offload_fraction=0.5,
+        ).cuda()
+        _restore_params(model, params)
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        output, grads, _ = _run_one_iter_and_capture(model, **inputs, enable_offload_reset=True)
+        torch.testing.assert_close(output, expected_output, rtol=1e-3, atol=1e-3)
+        assert grads.keys() == expected_grads.keys()
+        for name, expected_grad in expected_grads.items():
+            if expected_grad is None:
+                assert grads[name] is None
+            else:
+                torch.testing.assert_close(grads[name], expected_grad, rtol=1e-3, atol=1e-3)
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")

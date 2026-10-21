@@ -989,7 +989,7 @@ class ChunkOffloadHandler:
         self.cpu_tensor_pool = cpu_tensor_pool
         self.is_warmup = True
         self._activation_offload_fraction = activation_offload_fraction
-        self._warmup_eligible_groups = 0
+        self._warmup_groups_by_name: Dict[str, int] = defaultdict(int)
         # Max per-group-name inflight offloads not yet joined on the main stream (None = off).
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
@@ -1226,21 +1226,17 @@ class ChunkOffloadHandler:
         assert group in self._groups_to_offload, f"Group {group} is not pending offload"
         debug_rank(f"should_bulk_offload {self.is_warmup} {group.offload}")
         if self.is_warmup:
-            # The final eligible group count is unknown until warmup finishes.
-            # Each increase in ceil(k * fraction) grants one copy. Empty/ineligible
-            # groups do not consume quota, and group.offload remains unchanged so
-            # post_warmup_callback can apply margin, PP delta, and its prefix policy.
+            # Count every occurrence separately for each module name, including
+            # empty/ineligible groups. This keeps corresponding core_attn and
+            # attn_proj occurrences aligned instead of splitting their shared
+            # storage dependency with a quota across all module names.
+            previous_count = self._warmup_groups_by_name[group._name]
+            self._warmup_groups_by_name[group._name] += 1
+            selected = math.ceil(
+                (previous_count + 1) * self._activation_offload_fraction
+            ) > math.ceil(previous_count * self._activation_offload_fraction)
             self._collect_offload_info(group)
-            if group.total_offload_bytes == 0:
-                return False
-            previous_quota = math.ceil(
-                self._warmup_eligible_groups * self._activation_offload_fraction
-            )
-            self._warmup_eligible_groups += 1
-            return (
-                math.ceil(self._warmup_eligible_groups * self._activation_offload_fraction)
-                > previous_quota
-            )
+            return selected and group.total_offload_bytes > 0
         # Don't offload if the group is marked as not offloadable
         if not group.offload:
             return False

@@ -75,8 +75,9 @@ With full-iteration CUDA graphs (local graph impl, `full_iteration` in `cuda_gra
 `--activation-offload-fraction` (`TransformerConfig.activation_offload_fraction`) is a fraction
 over eligible offload groups, not a byte fraction and not a selector for which module names are
 enabled. It is used together with `--offload-modules`: all module names listed in
-`--offload-modules` still register their offload groups, and the fraction is applied once across
-the combined eligible groups from all configured modules.
+`--offload-modules` still register their offload groups, and the steady-state fraction is applied once across
+the combined eligible groups from all configured modules. Warmup uses the per-module policy
+described in [Warmup and Adaptive Offloading](#warmup-and-adaptive-offloading).
 
 The manager keeps the first N% of eligible groups in forward execution order and leaves the later
 groups on GPU. For example, with
@@ -190,11 +191,15 @@ preserves the reload cadence for partial offloading without reloading earlier gr
 
 The first training iteration serves as a **warmup phase** where the manager records tensor groups,
 their candidate transfer sizes, and the execution order without requiring a CPU copy for every group.
-Because the final eligible group count is not yet known, each chunk uses an online quota:
-the kth group containing eligible tensors is offloaded only when `ceil(k * activation_offload_fraction)`
-increases. For example, fraction 0.5 offloads groups 0, 2, 4, ... during warmup. Empty groups and groups
-with no eligible tensors do not consume quota. Fraction 0 performs no activation offload copies;
-fraction 1 offloads every eligible warmup group. Rounding up favors GPU memory headroom.
+Because the final group count is not yet known, each chunk uses a separate online quota for each
+module name. Its kth occurrence is selected when `ceil(k * activation_offload_fraction)` increases.
+For example, fraction 0.5 selects occurrences 1, 3, 5, ... of each configured module. Every group
+advances its module's counter, including empty groups and groups with no eligible tensors; those
+groups perform no copy and do not shift the selection of later occurrences. This keeps corresponding
+`core_attn` and `attn_proj` groups aligned when both occur once per layer, so projection offload does
+not release an output still held on GPU for attention backward. Fraction 0 performs no copies;
+fraction 1 offloads every eligible warmup group. Each module rounds up independently, favoring GPU
+memory headroom; the sum can exceed a single quota rounded over all modules together.
 
 This temporary warmup selection does not change the groups' eligibility for later iterations. It
 also does not add explicit cache eviction. After warmup, `post_warmup_callback` computes the normal
