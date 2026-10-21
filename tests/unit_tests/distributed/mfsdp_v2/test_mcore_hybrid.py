@@ -28,10 +28,13 @@ from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_para
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.usefixtures("_adapter_setup")
 class TestMcoreHybrid:
     """Exercise MFSDP v2 over a hybrid data-parallel domain (an outer DP axis)."""
 
-    def teardown_method(self):
+    @pytest.fixture
+    def _adapter_setup(self, distributed_setup):
+        yield
         destroy_model_parallel()
 
     @staticmethod

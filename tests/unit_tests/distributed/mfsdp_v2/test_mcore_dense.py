@@ -42,15 +42,17 @@ def _build_layer(config: TransformerConfig) -> TransformerLayer:
     )
 
 
+@pytest.mark.usefixtures("_adapter_setup")
 class TestMcoreDense:
     """Exercise a dense MCore transformer block over two data-parallel ranks."""
 
-    def setup_method(self):
+    @pytest.fixture
+    def _adapter_setup(self, distributed_setup):
         Utils.initialize_model_parallel(1, 1)
         self.process_group_collection = ProcessGroupCollection.use_mpu_process_groups()
         model_parallel_cuda_manual_seed(1234)
 
-    def teardown_method(self):
+        yield
         destroy_model_parallel()
 
     @pytest.mark.launch_on_gb200

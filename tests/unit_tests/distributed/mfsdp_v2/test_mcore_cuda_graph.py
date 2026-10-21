@@ -25,10 +25,14 @@ from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_para
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.usefixtures("_adapter_setup")
 class TestMcoreCudaGraph:
     """Exercise MFSDP v2 full-iteration and optimizer CUDA graphs together."""
 
-    def teardown_method(self):
+    @pytest.fixture
+    def _adapter_setup(self, distributed_setup):
+        yield
+        # Release captured graphs before distributed_setup destroys process groups.
         # The wrappers store capture state globally. Reset it so the next test captures its
         # own work instead of replaying this test's graph.
         OptimizerCudaGraphWrapper.curr_iteration = 0

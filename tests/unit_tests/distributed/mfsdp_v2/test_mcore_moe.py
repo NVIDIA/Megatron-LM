@@ -30,10 +30,12 @@ from tests.unit_tests.test_utilities import Utils
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.usefixtures("_adapter_setup")
 class TestMcoreMoE:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
 
-    def setup_method(self):
+    @pytest.fixture
+    def _adapter_setup(self, distributed_setup):
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if self.world_size < 2 or self.world_size % 2:
             pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
@@ -61,7 +63,7 @@ class TestMcoreMoE:
         )
         model_parallel_cuda_manual_seed(1234)
 
-    def teardown_method(self):
+        yield
         destroy_model_parallel()
 
     def test_build_train_step_and_clip(self):
