@@ -914,14 +914,14 @@ def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, run_config
 ):
     """Test override_opt_param_scheduler behavior during checkpoint load."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = False
     args.use_dist_ckpt = ckpt_format != "torch"
-    args.override_opt_param_scheduler = True
+    run_config.scheduler.override_opt_param_scheduler = True
     args.lr = 1.0
     args.min_lr = 0.1
     args.decoupled_lr = 0.5
