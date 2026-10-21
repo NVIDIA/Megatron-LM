@@ -160,6 +160,30 @@ Megatron-FSDP is deeply integrated into Megatron-Core. To enable FSDP (where opt
 
 Complete Llama-8B and DeepSeek-V3 training scripts using Megatron-FSDP with recommended settings can be found in [Megatron-LM/examples/megatron_fsdp](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/megatron_fsdp).
 
+#### Muon with MFSDP v2
+
+With Emerging Optimizers installed, enable Muon using:
+
+```bash
+--use-megatron-fsdp
+--megatron-fsdp-version 2
+--data-parallel-sharding-strategy optim_grads_params
+--optimizer muon
+--muon-no-split-qkv
+--ckpt-format fsdp_dtensor
+```
+
+MCore sends eligible 2-D weights to `FsdpMuon` and uses Adam for embeddings,
+output projections, non-matrix parameters, and parameters with `use_muon=False`.
+These optimizers own disjoint parameters, share one gradient-clipping norm, and
+save their momentum and Adam states together. Dense and expert Muon parameters
+use separate optimizers on their respective data-parallel meshes.
+
+This path supports FP32 and BF16 with one-dimensional DP meshes. Tensor
+parallelism, hybrid DP meshes, split-QKV updates, and the precision-aware Adam
+option are not supported. Omit `--use-distributed-optimizer`; MFSDP v2 manages
+optimizer sharding itself.
+
 #### Recommended Configuration for Megatron-LM
 
 Frequently-used options use with Megatron-FSDP include:
