@@ -12,7 +12,6 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cute.typing import Float32, Int32, Int64
 from flash_attn.cute.mask import Sm100FusedMask as FusedMask
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
@@ -894,11 +893,10 @@ class PPAttentionForward:
                                 )
                                 if is_leader_load:
                                     cute.arch.mbarrier_wait(v_tail_mbar, tail_phase)
+                                    cute.arch.fence_acq_rel_cluster()
                                     with cute.arch.elect_one():
                                         cute.arch.mbarrier_arrive(
-                                            v_tail_mbar + 1,
-                                            peer_cta_rank_in_cluster=load_peer_rank,
-                                            scope=_nvvm.MemScopeKind.CLUSTER,
+                                            v_tail_mbar + 1, peer_cta_rank_in_cluster=load_peer_rank
                                         )
                                 else:
                                     cute.arch.mbarrier_wait(v_tail_mbar + 1, tail_phase)
@@ -912,6 +910,7 @@ class PPAttentionForward:
                                     64,
                                 )
                                 cute.arch.fence_proxy("async.shared", space="cluster")
+                                cute.arch.fence_acq_rel_cluster()
                                 cute.arch.sync_warp()
                                 with cute.arch.elect_one():
                                     if is_leader_load:
@@ -920,7 +919,6 @@ class PPAttentionForward:
                                         cute.arch.mbarrier_arrive(
                                             v_handle.barrier,
                                             peer_cta_rank_in_cluster=load_peer_rank,
-                                            scope=_nvvm.MemScopeKind.CLUSTER,
                                         )
                             else:
                                 cute.copy(
