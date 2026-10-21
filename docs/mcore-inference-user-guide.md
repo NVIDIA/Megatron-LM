@@ -505,6 +505,17 @@ default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
 `torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
 `window_size` for sliding-window attention.
 
+#### Tanh-clamped squared ReLU with FlashInfer
+
+On SM10x GPUs, BF16 and MXFP8 experts support the activation `(L * tanh(relu(x) / L)) ** 2` with
+`inference_grouped_gemm_backend="flashinfer"`, `activation_func=squared_relu`,
+`activation_func_tanh_clamp_scale=L`, `gated_linear_unit=False`,
+and `add_bias_linear=False`. 
+
+Requires FlashInfer >= 0.7.2, with `ActivationType.ClampedRelu2` and
+`clamped_relu2_limit` support. This path does not support
+`inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`.
+
 ### Reading Results
 
 `generate` returns `DynamicInferenceRequest` objects. The most commonly used fields are:
