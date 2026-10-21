@@ -37,27 +37,18 @@ _TUNE_HD256_CAUSAL = {
 
 
 class PPAttentionForward:
-    """Forward kernel for prefill, chunked paged prefill and split mode."""
+    """Forward kernel for prefill and chunked paged prefill."""
 
     def __init__(
         self,
         head_dim: int,
-        head_dim_v: Optional[int] = None,
         qhead_per_kvhead: int = 1,
         is_causal: bool = False,
         super_block_tiles: int = 8,
-        m_block_size: int = 128,
-        n_block_size: int = 128,
         num_regs_other: int = 32,
     ):
-        head_dim_v = head_dim if head_dim_v is None else head_dim_v
-        assert (
-            head_dim in (128, 256) and head_dim_v == head_dim
-        ), "kernel only supports head_dim = head_dim_v in (128, 256)"
+        assert head_dim in (128, 256), "kernel only supports head_dim 128 or 256"
         self.head_dim = head_dim
-        assert (
-            m_block_size == 128 and n_block_size == 128
-        ), "kernel only supports tile_m=128 and tile_n=128"
         assert super_block_tiles >= 1, "super_block_tiles must be >= 1"
         self.cta_group_size = 2
         self.G = super_block_tiles
@@ -92,9 +83,7 @@ class PPAttentionForward:
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
         self.cluster_shape_mn = (self.cta_group_size, 1)
         self.tmem_warp_shape_mn = (4, 1)
-        self.is_persistent = False
         self.is_causal = is_causal
-        self.is_local = False
         self.use_semantic_trip_range = is_causal
 
         self.softmax_warp_ids = (0, 1, 2, 3)
@@ -161,58 +150,29 @@ class PPAttentionForward:
         o_tensor = mO
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
-        cum_seqlen_k = None
-        mSeqUsedQ = None
-        window_size_left = None
-        window_size_right = None
 
         q_rank = len(mQ.shape)
         k_rank = len(mK.shape)
         if cutlass.const_expr(cum_seqlen_q is not None):
-            if cutlass.const_expr(q_rank == 5):
-                s_q = mQ.shape[1]
-                h_q = mQ.shape[2] * mQ.shape[3]
-                d = mQ.shape[4]
-            elif cutlass.const_expr(q_rank == 3):
+            if cutlass.const_expr(q_rank == 3):
                 s_q = mQ.shape[0]
                 h_q = mQ.shape[1]
                 d = mQ.shape[2]
             else:
-                raise RuntimeError(f"hd256 forward varlen expects q rank 3 or 5, got rank {q_rank}")
+                raise RuntimeError(f"hd256 forward varlen expects q rank 3, got rank {q_rank}")
         else:
-            if cutlass.const_expr(q_rank == 5):
-                s_q = mQ.shape[1]
-                h_q = mQ.shape[2] * mQ.shape[3]
-                d = mQ.shape[4]
-            elif cutlass.const_expr(q_rank == 4):
+            if cutlass.const_expr(q_rank == 4):
                 s_q = mQ.shape[1]
                 h_q = mQ.shape[2]
                 d = mQ.shape[3]
             else:
-                raise RuntimeError(
-                    f"hd256 forward non-varlen expects q rank 4 or 5, got rank {q_rank}"
-                )
+                raise RuntimeError(f"hd256 forward non-varlen expects q rank 4, got rank {q_rank}")
 
-        if cutlass.const_expr(cum_seqlen_k is not None):
-            if cutlass.const_expr(k_rank == 5):
-                s_k = mK.shape[1]
-                h_k = mK.shape[2]
-            elif cutlass.const_expr(k_rank == 3):
-                s_k = mK.shape[0]
-                h_k = mK.shape[1]
-            else:
-                raise RuntimeError(f"hd256 forward varlen expects k rank 3 or 5, got rank {k_rank}")
+        if cutlass.const_expr(k_rank == 4):
+            s_k = mK.shape[1]
+            h_k = mK.shape[2]
         else:
-            if cutlass.const_expr(k_rank == 5):
-                s_k = mK.shape[1]
-                h_k = mK.shape[2]
-            elif cutlass.const_expr(k_rank == 4):
-                s_k = mK.shape[1]
-                h_k = mK.shape[2]
-            else:
-                raise RuntimeError(
-                    f"hd256 forward non-varlen expects k rank 4 or 5, got rank {k_rank}"
-                )
+            raise RuntimeError(f"hd256 forward expects k rank 4, got rank {k_rank}")
         if cutlass.const_expr(cum_seqlen_q is not None):
             b = mCuSeqlensQ.shape[0] - 1
         else:
@@ -229,20 +189,11 @@ class PPAttentionForward:
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
-        s_q_total = (
-            q_tensor.shape[1]
-            if cum_seqlen_q is not None and q_rank == 5
-            else (q_tensor.shape[0] if cum_seqlen_q is not None else s_q64)
-        )
-        s_k_total = (
-            k_tensor.shape[1]
-            if cum_seqlen_k is not None and k_rank == 5
-            else (k_tensor.shape[0] if cum_seqlen_k is not None else s_k64)
-        )
+        s_q_total = q_tensor.shape[0] if cum_seqlen_q is not None else s_q64
+        s_k_total = s_k64
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
         varlen_q = cum_seqlen_q is not None
-        varlen_k = cum_seqlen_k is not None
         q_norm = as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
 
         q = cute.make_tensor(
@@ -269,8 +220,8 @@ class PPAttentionForward:
                 ),
             )
         else:
-            k_norm = as_bshkrd_tensor(k_tensor, h_k, 1, varlen_k)
-            v_norm = as_bshkrd_tensor(v_tensor, h_k, 1, varlen_k)
+            k_norm = as_bshkrd_tensor(k_tensor, h_k, 1, False)
+            v_norm = as_bshkrd_tensor(v_tensor, h_k, 1, False)
             k = cute.make_tensor(
                 k_norm.iterator,
                 cute.make_layout(
@@ -324,15 +275,7 @@ class PPAttentionForward:
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
         o_shape = (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape
-        if cutlass.const_expr(self.is_persistent):
-            m_cta = cute.ceil_div(cute.size(o_shape[0]), self.cta_tiler[0])
-            m_pad = m_cta + m_cta % 2
-            self.tile_sched_params = FmhaStaticTileSchedulerParams(
-                True, (m_pad, cute.size(o_shape[2][0]), cute.size(o_shape[2][1]))
-            )
-            grid = FmhaStaticTileScheduler.get_grid_shape(self.tile_sched_params)
-        else:
-            self.tile_sched_params, grid = compute_grid(o_shape, self.cta_tiler, False)
+        self.tile_sched_params, grid = compute_grid(o_shape, self.cta_tiler, False)
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
@@ -462,8 +405,6 @@ class PPAttentionForward:
             o,
             o_res,
             cum_seqlen_q,
-            cum_seqlen_k,
-            mSeqUsedQ,
             mSeqUsedK,
             lse,
             scale_softmax_log2,
@@ -471,8 +412,6 @@ class PPAttentionForward:
             scale_output,
             page_table,
             max_seqlen_k_paged,
-            window_size_left,
-            window_size_right,
             mScratch,
             self.cluster_layout_vmnk,
             q_smem_layout_staged,
@@ -503,8 +442,6 @@ class PPAttentionForward:
         mO_qdl: cute.Tensor,
         mRes_qdl: Optional[cute.Tensor],
         cum_seqlen_q: Optional[cute.Tensor],
-        cum_seqlen_k: Optional[cute.Tensor],
-        mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
@@ -512,8 +449,6 @@ class PPAttentionForward:
         scale_output: Float32,
         mPageTable: Optional[cute.Tensor],
         max_seqlen_k: Optional[Int32],
-        window_size_left: Optional[Int32],
-        window_size_right: Optional[Int32],
         mScratch: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         q_smem_layout_staged: cute.ComposedLayout,
@@ -739,20 +674,12 @@ class PPAttentionForward:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                     block_offset = (
                         cuseqlen_q,
                         cuseqlen_k,
                         Int32(0),
                         ((Int32(0), Int32(0)), Int32(0)),
                     )
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                    )
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
                     )
@@ -844,9 +771,9 @@ class PPAttentionForward:
                             seqlen_q,
                             seqlen_k,
                             self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
+                            False,
+                            None,
+                            None,
                         )
                     )
                     seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
@@ -965,16 +892,8 @@ class PPAttentionForward:
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
                     )
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                    )
 
                 if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                     if cutlass.const_expr(mSeqUsedK is not None):
                         seqlen_k = mSeqUsedK[batch_coord]
 
@@ -985,9 +904,9 @@ class PPAttentionForward:
                             seqlen_q,
                             seqlen_k,
                             self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
+                            False,
+                            None,
+                            None,
                         )
                     )
                     seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
@@ -1218,15 +1137,7 @@ class PPAttentionForward:
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
                     )
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                    )
                 if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                     if cutlass.const_expr(mSeqUsedK is not None):
                         seqlen_k = mSeqUsedK[batch_coord]
 
@@ -1240,9 +1151,9 @@ class PPAttentionForward:
                         seqlen_q,
                         seqlen_k,
                         self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
+                        False,
+                        None,
+                        None,
                     )
                     end_count = start_count + trip_count
                     if end_count <= start_count:
@@ -1256,9 +1167,9 @@ class PPAttentionForward:
                                 seqlen_q,
                                 seqlen_k,
                                 self.is_causal,
-                                self.is_local,
-                                window_size_left,
-                                window_size_right,
+                                False,
+                                None,
+                                None,
                             )
                         )
                     cS_base = cute.make_identity_tensor(
@@ -1286,7 +1197,7 @@ class PPAttentionForward:
                             row_sum = 0.0
                         row_max, row_sum, mma_s_consumer, p_mma_producer, s_corr_producer = (
                             self.softmax_step(
-                                (need_apply_mask, window_size_left, window_size_right),
+                                need_apply_mask,
                                 (row_max_prev, row_sum, seqlen_q, seqlen_k, scale_softmax_log2),
                                 (is_sb_boundary, fold_m, fold_l),
                                 (tStS, tScS_iter),
@@ -1354,16 +1265,8 @@ class PPAttentionForward:
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
                     )
-                if cutlass.const_expr(mSeqUsedQ is not None):
-                    seqlen_q = mSeqUsedQ[batch_coord]
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0], mma_block_coord[0], seqlen_q
-                    )
 
                 if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                     if cutlass.const_expr(mSeqUsedK is not None):
                         seqlen_k = mSeqUsedK[batch_coord]
 
@@ -1394,9 +1297,9 @@ class PPAttentionForward:
                             seqlen_q,
                             seqlen_k,
                             self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
+                            False,
+                            None,
+                            None,
                         )
                     )
                     o_l_coord = curr_block_coord[2]
@@ -1511,14 +1414,13 @@ class PPAttentionForward:
     @cute.jit
     def softmax_step(
         self,
-        mask_args: Tuple,
+        need_apply_mask: cutlass.Boolean,
         value_args: Tuple,
         fold_args: Tuple,
         tensor_args: Tuple,
         pipeline_args: Tuple,
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         """Softmax over one key tile."""
-        need_apply_mask, window_size_left, window_size_right = mask_args
         row_max, row_sum, seqlen_q, seqlen_k, scale_softmax_log2 = value_args
         is_sb_boundary, fold_m, fold_l = fold_args
         tStS, tScS = tensor_args
@@ -1548,9 +1450,9 @@ class PPAttentionForward:
                 seqlen_k,
                 self.use_semantic_trip_range,
                 self.is_causal,
-                self.is_local,
-                window_size_left,
-                window_size_right,
+                False,
+                None,
+                None,
             )
         old_row_max = row_max
         row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)

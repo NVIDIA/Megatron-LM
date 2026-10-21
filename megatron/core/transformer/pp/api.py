@@ -79,7 +79,6 @@ class PPAttention:
         if key not in self._compiled:
             fwd = PPAttentionForward(
                 self.head_dim,
-                self.head_dim,
                 qhead_per_kvhead=self.rows,
                 is_causal=True,
                 super_block_tiles=self.G,
