@@ -123,6 +123,30 @@ class HybridModelConfig(ModelConfig):
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
 
+        # AttnRes derives its pipeline payload widths from TransformerConfig.is_hybrid_model
+        # and TransformerConfig.hybrid_layer_pattern. The model-level pattern is not proxied
+        # into the TransformerConfig (see __setattr__), so keep the two in sync.
+        transformer = self.transformer
+        if (
+            getattr(transformer, "enable_attention_residuals", False) is True
+            and self.hybrid_layer_pattern is not None
+        ):
+            if transformer.hybrid_layer_pattern is None:
+                transformer.hybrid_layer_pattern = self.hybrid_layer_pattern
+            elif transformer.hybrid_layer_pattern != self.hybrid_layer_pattern:
+                raise ValueError(
+                    "Attention residuals require TransformerConfig.hybrid_layer_pattern "
+                    f"({transformer.hybrid_layer_pattern!r}) to match "
+                    f"HybridModelConfig.hybrid_layer_pattern ({self.hybrid_layer_pattern!r})."
+                )
+            if transformer.pipeline_model_parallel_size > 1 and not transformer.is_hybrid_model:
+                # Set at construction so __post_init__ runs the hybrid pipe-segment checks.
+                raise ValueError(
+                    "Attention residuals with pipeline parallelism in a HybridModelConfig "
+                    "require transformer.is_hybrid_model=True (the pipeline payload widths "
+                    "follow the hybrid pattern's '|' segments only then)."
+                )
+
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""

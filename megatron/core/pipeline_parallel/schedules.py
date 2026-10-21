@@ -766,10 +766,10 @@ def forward_backward_no_pipelining(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
-        if getattr(config, 'enable_attention_residuals', False):
-            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+    if getattr(config, 'enable_attention_residuals', False):
+        from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
 
-            attn_res_source_cache_reset()
+        attn_res_source_cache_reset()
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -1200,10 +1200,10 @@ def forward_backward_pipelining_with_interleaving(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
-        if getattr(config, 'enable_attention_residuals', False):
-            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+    if getattr(config, 'enable_attention_residuals', False):
+        from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
 
-            attn_res_source_cache_reset()
+        attn_res_source_cache_reset()
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -2467,10 +2467,10 @@ def forward_backward_pipelining_without_interleaving(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
-        if getattr(config, 'enable_attention_residuals', False):
-            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+    if getattr(config, 'enable_attention_residuals', False):
+        from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
 
-            attn_res_source_cache_reset()
+        attn_res_source_cache_reset()
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

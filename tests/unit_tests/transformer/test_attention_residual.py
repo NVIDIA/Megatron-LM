@@ -1286,3 +1286,29 @@ def test_hybrid_model_later_stage_sp_mask_uses_local_seq_len(
     )
 
     assert torch.equal(model.decoder.kwargs["padding_mask"], padding_mask[:, :local_seq_len])
+
+
+def test_gpt_experimental_attention_variant_spec_rejects_attention_residuals():
+    """The GPT experimental-attention specs build layers that do not aggregate depth sources."""
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_transformer_layer_with_experimental_attention_variant_spec,
+    )
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=64,
+        num_attention_heads=4,
+        enable_attention_residuals=True,
+        attn_res_block_layers=2,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=2,
+        linear_num_value_heads=4,
+        linear_num_key_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        gdn_kernel_backend="torch",
+    )
+    with pytest.raises(NotImplementedError, match="experimental_attention_variant"):
+        get_transformer_layer_with_experimental_attention_variant_spec(config)

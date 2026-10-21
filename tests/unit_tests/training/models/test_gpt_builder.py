@@ -65,6 +65,7 @@ def _make_dispatch_config(**transformer_kwargs):
     transformer.kitchen_attention_backend = None
     transformer.use_te_activation_func = False
     transformer.enable_hyper_connections = False
+    transformer.enable_attention_residuals = False
     transformer.mla_down_proj_fusion = False
     for k, v in transformer_kwargs.items():
         setattr(transformer, k, v)
@@ -244,6 +245,7 @@ class TestDefaultLayerSpecDispatch:
             use_kitchen_attention=config.transformer.use_kitchen_attention,
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
             enable_hyper_connection=config.transformer.enable_hyper_connections,
+            enable_attention_residual=config.transformer.enable_attention_residuals,
         )
         assert result is spec
 
@@ -947,6 +949,25 @@ def test_te_or_local_layer_spec_preserves_hyper_connections(transformer_impl, fa
         default_layer_spec(config, vp_stage=None)
 
     assert get_spec.call_args.kwargs["enable_hyper_connection"] is True
+
+
+@pytest.mark.parametrize(
+    "transformer_impl,factory_name",
+    [
+        ("transformer_engine", "get_gpt_layer_with_transformer_engine_spec"),
+        ("local", "get_gpt_layer_local_spec"),
+    ],
+)
+def test_te_or_local_layer_spec_forwards_attention_residuals(transformer_impl, factory_name):
+    config = _make_dispatch_config(enable_attention_residuals=True)
+    config.transformer.transformer_impl = transformer_impl
+
+    with patch(f"megatron.training.models.gpt.{factory_name}") as get_spec:
+        get_spec.__signature__ = inspect.Signature()
+        get_spec.return_value = Mock(spec=ModuleSpec)
+        default_layer_spec(config, vp_stage=None)
+
+    assert get_spec.call_args.kwargs["enable_attention_residual"] is True
 
 
 @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")

@@ -2519,6 +2519,10 @@ class MultiTokenPredictionLayer(MegatronModule):
     https://arxiv.org/pdf/2412.19437.pdf
     """
 
+    # Set from ``config.enable_attention_residuals`` in ``__init__``; the class default keeps
+    # partially constructed layers (e.g. tests built via ``__new__``) on the non-AttnRes path.
+    attn_res_enabled: bool = False
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -3415,7 +3419,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
-                attn_res_sources=attn_res_sources,
+                **({"attn_res_sources": attn_res_sources} if self.attn_res_enabled else {}),
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
