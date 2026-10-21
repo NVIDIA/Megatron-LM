@@ -2121,16 +2121,26 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         The indexer scores rows in blocks of consecutive rows of one request, so a prefill
         chunk's rows share each key tile. Padding rows and blocks are empty. Built on the CPU
         in initialize_attention_state() and copied with the bookkeeping, so CUDA graphs read
-        static buffers.
+        static buffers. The fused top-k selection filters prefill rows in larger blocks, so
+        those are built too.
         """
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_filter_kernels import (
+            PREFILL_ROW_BLOCK,
+        )
         from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
             SCORE_ROW_BLOCK,
         )
 
         self.dsa_score_row_block = SCORE_ROW_BLOCK
+        self.dsa_filter_row_block = PREFILL_ROW_BLOCK
         # A request with q query tokens takes ceil(q / block) <= q / block + 1 blocks.
         self.dsa_max_score_blocks = self.max_requests + -(-self.max_tokens // SCORE_ROW_BLOCK)
-        sizes = [self.max_tokens, self.max_tokens] + [self.dsa_max_score_blocks] * 3
+        self.dsa_max_filter_blocks = self.max_requests + -(-self.max_tokens // PREFILL_ROW_BLOCK)
+        sizes = (
+            [self.max_tokens, self.max_tokens]
+            + [self.dsa_max_score_blocks] * 3
+            + [self.dsa_max_filter_blocks] * 3
+        )
         self._cpu_dsa_row_buf = torch.zeros(sum(sizes), dtype=torch.int32, pin_memory=True)
         self._gpu_dsa_row_buf = torch.zeros(
             sum(sizes), dtype=torch.int32, device=torch.cuda.current_device()
@@ -2146,6 +2156,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._cpu_dsa_block_starts,
             self._cpu_dsa_block_rows,
             self._cpu_dsa_block_requests,
+            *self._cpu_dsa_filter_blocks,
         ) = cpu_views
         (
             self.dsa_row_requests,
@@ -2153,8 +2164,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.dsa_block_starts,
             self.dsa_block_rows,
             self.dsa_block_requests,
+            *self.dsa_filter_blocks_buf,
         ) = gpu_views
         self.dsa_num_score_blocks = 0
+        self.dsa_num_filter_blocks = 0
 
     def _fill_dsa_row_metadata(
         self, real_bs: int, padded_bs: int, query_lengths: Tensor, kv_lengths: Tensor
@@ -2183,6 +2196,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._cpu_dsa_block_starts[num_blocks : self.dsa_num_score_blocks] = 0
         self._cpu_dsa_block_rows[num_blocks : self.dsa_num_score_blocks] = 0
         self._cpu_dsa_block_requests[num_blocks : self.dsa_num_score_blocks] = 0
+        filter_blocks = build_row_metadata(
+            query_lengths[:real_bs], kv_lengths[:real_bs], self.dsa_filter_row_block
+        )[2:]
+        num_filter_blocks = filter_blocks[0].numel()
+        self.dsa_num_filter_blocks = padded_bs + -(-padded_tokens // self.dsa_filter_row_block)
+        assert num_filter_blocks <= self.dsa_num_filter_blocks <= self.dsa_max_filter_blocks
+        for buffer, values in zip(self._cpu_dsa_filter_blocks, filter_blocks):
+            buffer[:num_filter_blocks] = values
+            buffer[num_filter_blocks : self.dsa_num_filter_blocks] = 0
 
     def dsa_row_metadata(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int]:
         """This step's DSA rows and score blocks (see _allocate_dsa_row_metadata).
@@ -2202,6 +2224,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.dsa_block_requests[:blocks],
             blocks,
         )
+
+    def dsa_filter_blocks(self) -> Tuple[Tensor, Tensor, Tensor]:
+        """This step's blocks of up to ``dsa_filter_row_block`` rows, ``(starts, rows,
+        requests)``, for the fused top-k selection's prefill filter."""
+        assert self.cache_dsa_indexer_keys, "DSA row metadata is not enabled."
+        return tuple(buffer[: self.dsa_num_filter_blocks] for buffer in self.dsa_filter_blocks_buf)
 
     def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
         """Append learned simplified-indexer keys to their paged cache."""

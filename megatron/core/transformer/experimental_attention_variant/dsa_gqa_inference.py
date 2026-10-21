@@ -35,6 +35,11 @@ def _log_decode_topk_backend(use_deep_select: bool) -> None:
         )
 
 
+@cache
+def _log_fused_topk() -> None:
+    logger.info("DSA selects its top-k with the fused selection (no score buffer).")
+
+
 def _deep_select_decode_supported(device: torch.device, index_topk: int) -> bool:
     """DeepSelect's CUDA build has SM100a/SM103a kernels for top-k up to 4096."""
     return (
@@ -76,6 +81,8 @@ def _sparse_attention_rows(
     max_context_length: int,
     index_topk: int,
     softmax_scale: float,
+    filter_blocks: Optional[tuple] = None,
+    decode_only: bool = False,
 ) -> torch.Tensor:
     """Route every row to its top-k cached keys and attend to them.
 
@@ -86,15 +93,83 @@ def _sparse_attention_rows(
     ``torch.topk`` reads whole rows, so the indexer fills positions past each length with
     negative infinity.
 
+    Given ``filter_blocks`` (``DynamicInferenceContext.dsa_filter_blocks``), contexts bounded
+    by at least ``FUSED_MIN_CONTEXT`` keys take the fused selection of
+    ``dsa_gqa_fused_select`` where the device supports it, which never materializes the
+    scores; ``decode_only`` says every row is its request's only query token this step.
+
     Returns:
         Attention output ``[rows,Hq,Dv]``.
     """
-    from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference_kernels
+    from megatron.core.transformer.experimental_attention_variant import (
+        dsa_gqa_fused_select,
+        dsa_gqa_inference_kernels,
+    )
 
     row_requests, row_lengths, block_starts, block_rows, block_requests, _ = row_metadata
     num_rows, num_query_heads, _ = query.shape
     block_table = block_table.to(torch.int32).contiguous()
-    use_deep_select = _deep_select_decode_supported(query.device, index_topk)
+    index_query = index_query.contiguous()
+    use_fused = (
+        filter_blocks is not None
+        and max_context_length >= dsa_gqa_fused_select.FUSED_MIN_CONTEXT
+        and dsa_gqa_fused_select.fused_select_supported(
+            query.device, index_topk, index_query.size(-1), index_key_cache.size(1)
+        )
+    )
+    if use_fused:
+        _log_fused_topk()
+        topk_indices = dsa_gqa_fused_select.fused_select_topk(
+            index_query,
+            index_key_cache,
+            block_table,
+            row_requests,
+            row_lengths,
+            (block_starts, block_rows, block_requests),
+            filter_blocks,
+            width=max_context_length,
+            index_topk=index_topk,
+            decode_only=decode_only,
+        )
+    else:
+        topk_indices = _materialized_topk(
+            index_query=index_query,
+            index_key_cache=index_key_cache,
+            block_table=block_table,
+            row_metadata=row_metadata,
+            max_context_length=max_context_length,
+            index_topk=index_topk,
+        )
+    output = query.new_empty((num_rows, num_query_heads, value_cache.size(-1)))
+    dsa_gqa_inference_kernels.dsa_gqa_sparse_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        row_requests,
+        row_lengths,
+        topk_indices,
+        softmax_scale,
+        out=output,
+    )
+    return output
+
+
+def _materialized_topk(
+    *,
+    index_query: torch.Tensor,
+    index_key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_metadata: tuple,
+    max_context_length: int,
+    index_topk: int,
+) -> torch.Tensor:
+    """Each row's top-k by scoring its keys into a buffer and selecting from it."""
+    from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference_kernels
+
+    row_requests, row_lengths, block_starts, block_rows, block_requests, _ = row_metadata
+    num_rows = row_requests.numel()
+    use_deep_select = _deep_select_decode_supported(index_query.device, index_topk)
     _log_decode_topk_backend(use_deep_select)
     width = max_context_length
     if use_deep_select:
@@ -105,9 +180,8 @@ def _sparse_attention_rows(
     # Score and select in windows of rows so the score buffer stays bounded at long context;
     # the window count depends only on the padded rows and the width (CUDA-graph safe).
     window = max(1, min(num_rows, SCORE_BUFFER_BYTES // (width * torch.float32.itemsize)))
-    scores = torch.empty((window, width), dtype=torch.float32, device=query.device)
-    topk_indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device=query.device)
-    index_query = index_query.contiguous()
+    scores = torch.empty((window, width), dtype=torch.float32, device=index_query.device)
+    topk_indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device=index_query.device)
     for start in range(0, num_rows, window):
         stop = min(start + window, num_rows)
         window_scores = scores[: stop - start]
@@ -126,19 +200,7 @@ def _sparse_attention_rows(
         topk_indices[start:stop] = _select_topk(
             window_scores, row_lengths[start:stop], index_topk, use_deep_select
         )
-    output = query.new_empty((num_rows, num_query_heads, value_cache.size(-1)))
-    dsa_gqa_inference_kernels.dsa_gqa_sparse_attention(
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        row_requests,
-        row_lengths,
-        topk_indices,
-        softmax_scale,
-        out=output,
-    )
-    return output
+    return topk_indices
 
 
 @torch.no_grad()
@@ -204,6 +266,8 @@ def dynamic_sparse_attention(
         max_context_length=max_context_length,
         index_topk=index_topk,
         softmax_scale=softmax_scale,
+        filter_blocks=inference_context.dsa_filter_blocks(),
+        decode_only=inference_context.is_decode_only(),
     )
     return output.view(num_tokens, 1, num_query_heads * value_cache.size(-1))
 
