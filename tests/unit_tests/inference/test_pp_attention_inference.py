@@ -40,12 +40,12 @@ def test_page_view_rejects_block_size():
 class _Case:
     """Random prompts in a shuffled 256-key block cache, plus dense reference outputs."""
 
-    def __init__(self, head_dim, h_q, h_kv):
+    def __init__(self, head_dim, h_q, h_kv, super_block_tiles=8):
         from megatron.core.transformer.pp.api import get_pp_attention
 
         torch.manual_seed(0)
         dev = torch.device("cuda")
-        self.attn = get_pp_attention(dev, head_dim, h_q, h_kv, 8, None)
+        self.attn = get_pp_attention(dev, head_dim, h_q, h_kv, super_block_tiles, None)
         blocks = [-(-n // BLOCK) for n in LENGTHS]
         pool = sum(blocks) + 2
         perm = torch.randperm(pool, device=dev).to(torch.int32)
@@ -137,3 +137,19 @@ class TestPPAttentionInference:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(_bits(out), _bits(ref))
+
+    @pytest.mark.parametrize("super_block_tiles", [1, 8])
+    def test_poisoned_workspaces(self, head_dim, h_q, h_kv, super_block_tiles):
+        """Every workspace byte a kernel reads must be written by that launch."""
+        case = _Case(head_dim, h_q, h_kv, super_block_tiles)
+        decoder = case.decoder()
+        for store in (case.attn.scratch, decoder._o_store, decoder._ml_store):
+            store.view(torch.float32).fill_(float("nan"))
+        starts = [n // 2 for n in LENGTHS]
+        for b, out in enumerate(case.prefill(starts)):
+            assert torch.equal(_bits(out), _bits(case.ref[b][starts[b] :]))
+        for n in (1, 3):
+            case.attn.scratch.view(torch.float32).fill_(float("nan"))
+            q, ref, seqused = case.tail(n)
+            out = decoder.verify(q, case.k, case.v, case.pages, seqused)
+            assert torch.equal(_bits(out), _bits(ref))
