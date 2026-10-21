@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import Mock, patch
 
@@ -231,3 +231,20 @@ class TestCopyTensorsToQuantizedParams:
     def test_empty_input(self):
         """No params is a no-op rather than an error."""
         fp8_utils.copy_tensors_to_quantized_params([], [])
+
+
+def test_stage_param_to_bf16_rejects_cpu_master():
+    """fp8 param-gather staging must fail loudly on a CPU-bound (offloaded) fp32 master.
+
+    Chunked optimizer-state offload rebinds selected masters to pinned CPU buffers whose
+    D2H copies may still be in flight; silently staging from them gathers stale weights.
+    """
+    param = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.bfloat16), requires_grad=False)
+    param.main_param = torch.zeros(4, 4, dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="CPU-resident fp32 master"):
+        fp8_utils._stage_param_to_bf16(param)
+    if torch.cuda.is_available():
+        param.main_param = torch.ones(4, 4, dtype=torch.float32, device="cuda")
+        staged = fp8_utils._stage_param_to_bf16(param)
+        assert staged.dtype == torch.bfloat16 and staged.is_cuda
+        assert torch.equal(staged, torch.ones_like(staged))

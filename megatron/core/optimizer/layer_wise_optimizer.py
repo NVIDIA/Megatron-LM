@@ -1485,6 +1485,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
         post-all-gather processing (and MXFP8 copy) still runs.
         """
+        # A forced pre-forward sync under chunked optimizer-state offload is the last gather
+        # that may read the fp32 masters before they move to CPU: pin those buckets so the
+        # regular DDP dispatch (e.g. the aligned VPP schedule) does not re-gather them until
+        # the next dispatch-state reset.
+        # getattr: duck-typed callers (unit tests) may not carry the offload query.
+        requires_pre_forward_sync = getattr(
+            self, "optimizer_state_offload_requires_pre_forward_param_sync", None
+        )
+        pin = force_sync and requires_pre_forward_sync is not None and requires_pre_forward_sync()
         for model_chunk in self.model_chunks:
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
@@ -1493,6 +1502,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     bucket_group.buckets[0]
                 ):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
+                    if pin:
+                        bucket_group.param_gather_pinned_before_master_offload = True
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
