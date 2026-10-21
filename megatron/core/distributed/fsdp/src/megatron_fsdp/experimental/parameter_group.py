@@ -28,16 +28,16 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from ..utils import HAVE_TE
+from . import layout_builder
 from .dbuffer import DBuffer
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
+from .placement import BlockAtomic, RowAtomic, TensorAtomic
 
 if HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
 else:
-
-    class QuantizedDBuffer:
-        """Fallback for parameter grouping when Transformer Engine is unavailable."""
+    QuantizedDBuffer = DBuffer
 
     def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
         """Without TE, all parameters use their native storage dtype."""
@@ -47,14 +47,15 @@ else:
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 
-def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
-    """Return the FSDP parameter group that owns ``parameter``, if any."""
-    # This parameter-owned backedge must be weak; otherwise it forms a reference
-    # cycle with the parameter group and delays releasing its CUDA storage.
-    parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
-    if parameter_group_ref is None:
-        return None
-    return parameter_group_ref()
+def _contains_any_placement_type(
+    *placement_groups: tuple[Placement, ...], placement_types: type | tuple[type, ...]
+) -> bool:
+    """Return whether any placement in ``placement_groups`` matches ``placement_types``."""
+    for placements in placement_groups:
+        for placement in placements:
+            if isinstance(placement, placement_types):
+                return True
+    return False
 
 
 def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
@@ -95,9 +96,9 @@ class FsdpParameterGroup:
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
-    model_weight: "DBuffer | QuantizedDBuffer"
+    model_weight: DBuffer | QuantizedDBuffer
     # Optimizer-layout representation of model_weight after an optimizer step.
-    post_optimizer_model_weight: "DBuffer | QuantizedDBuffer"
+    post_optimizer_model_weight: DBuffer | QuantizedDBuffer
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
@@ -109,9 +110,12 @@ class FsdpParameterGroup:
     # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
     # storage is stale and must be cleared before the next accumulation begins.
     _main_grad_is_stale: bool
-    _unsharded_model_weight: "DBuffer | QuantizedDBuffer"
+    # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
+    # or main_grad's dtype when unset.
+    grad_comm_dtype: torch.dtype
+    _unsharded_model_weight: DBuffer | QuantizedDBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
-    grad_divisor: int
+    grad_scale: float
 
     def __init__(
         self,
@@ -122,14 +126,17 @@ class FsdpParameterGroup:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        grad_divisor: int = 1,
+        grad_scale: float = 1.0,
         use_symmetric_memory: bool = False,
+        # TODO: Revisit passing owner assignments into the group constructor in a future PR.
+        parameter_to_owner: dict[nn.Parameter, int] | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
-            fqn_to_parameter: Root-module-relative FQNs and their parameters.
+            fqn_to_parameter: Root-module-relative FQNs and their parameters, in logical
+                tensor order. Tied parameters count once.
             mesh: Parent device mesh containing the data-parallel axes.
             model_weight_placements: Compute-weight buffer placements.
             main_grad_placements: Main-gradient buffer placements.
@@ -137,19 +144,30 @@ class FsdpParameterGroup:
             mixed_precision_policy: Precision policy for main weights and gradients.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
-            grad_divisor: Additional divisor applied on top of the mesh-size
-                averaging. See ``fully_shard``.
+            grad_scale: Multiplier applied after the mesh-size averaging.
+                See ``fully_shard``.
+            parameter_to_owner: Construction-time mapping from original parameters to
+                owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
+                entries for other parameters and non-TensorAtomic groups are ignored.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
         )
         self._owning_module = ref(owning_module)
         self.mesh = mesh
-        self.grad_divisor = grad_divisor
+        self.grad_scale = grad_scale
         parameters = tuple(parameter_to_fqns)
 
+        if parameter_to_owner is not None and _contains_any_placement_type(
+            model_weight_placements,
+            main_grad_placements,
+            main_weight_placements,
+            placement_types=TensorAtomic,
+        ):
+            self._validate_parameter_to_owner(parameter_to_fqns, parameter_to_owner)
         self._initialize_buffers(
             parameters,
+            parameter_to_owner,
             model_weight_placements,
             main_grad_placements,
             main_weight_placements,
@@ -192,25 +210,67 @@ class FsdpParameterGroup:
                 )
         return parameter_to_fqns, dtype, requires_grad
 
+    @staticmethod
+    def _validate_parameter_to_owner(
+        parameter_to_fqns: dict[nn.Parameter, list[str]],
+        parameter_to_owner: dict[nn.Parameter, int],
+    ) -> None:
+        """Report by FQN the first parameter that has no owner assignment."""
+        for parameter, fqns in parameter_to_fqns.items():
+            if parameter not in parameter_to_owner:
+                raise ValueError(f"parameter_to_owner is missing entries for parameters {fqns!r}.")
+
+    def _build_layout(
+        self,
+        parameters: tuple[nn.Parameter, ...],
+        parameter_to_owner: dict[nn.Parameter, int] | None,
+        *placement_groups: tuple[Placement, ...],
+    ) -> GlobalLayout:
+        """Build the global layout shared by this group's buffers."""
+        shapes = (parameter.shape for parameter in parameters)
+        if not _contains_any_placement_type(*placement_groups, placement_types=TensorAtomic):
+            # MXFP8 groups keep 32-row blocks on one rank; other dtypes pack rows.
+            return layout_builder.build_for_row_atomic(
+                shapes, dp_size=self.mesh.size(), block_size=32 if self.dtype == torch.uint8 else 1
+            )
+        if _contains_any_placement_type(
+            *placement_groups, placement_types=(RowAtomic, BlockAtomic)
+        ):
+            raise ValueError(
+                "TensorAtomic cannot be mixed with RowAtomic or BlockAtomic placements."
+            )
+        if self.mesh.ndim != 1:
+            raise ValueError("TensorAtomic requires a 1-D data-parallel mesh.")
+        if parameter_to_owner is None:
+            raise ValueError("TensorAtomic placements require parameter_to_owner.")
+        return layout_builder.build_for_tensor_atomic(
+            shapes,
+            dp_size=self.mesh.size(),
+            tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
+        )
+
     def _initialize_buffers(
         self,
         parameters: tuple[nn.Parameter, ...],
+        parameter_to_owner: dict[nn.Parameter, int] | None,
         model_weight_placements: tuple[Placement, ...],
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symmetric_memory: bool,
     ) -> None:
-        """Allocate weight and gradient buffers in their required dependency order."""
+        """Build the shared layout and allocate weight and gradient buffers."""
+        layout = self._build_layout(
+            parameters,
+            parameter_to_owner,
+            model_weight_placements,
+            main_grad_placements,
+            main_weight_placements,
+        )
+
         if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
-        # All weight and gradient buffers share the same packing and padding.
-        layout = GlobalLayout.build_for_row_atomic(
-            (parameter.shape for parameter in parameters),
-            dp_size=self.mesh.size(),
-            block_size=32 if self.dtype == torch.uint8 else 1,
-        )
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
 
         self.main_weight = DBuffer(
@@ -281,10 +341,11 @@ class FsdpParameterGroup:
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
+        grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
+        self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
         if not self.requires_grad:
             return
 
-        grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
         # Keep main_grad persistent for the initial implementation. For micro-batch
         # size 1, this allocation could be delayed until post_backward and then
         # eagerly deallocated right after optimizer.step(), avoiding main_grad
@@ -444,7 +505,7 @@ class FsdpParameterGroup:
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
-                dtype=grads[0].dtype,
+                dtype=self.grad_comm_dtype,
                 device=grads[0].device,
             )
 
@@ -503,8 +564,8 @@ class FsdpParameterGroup:
 
         # Scale this backward's contribution before accumulating it so repeated
         # backwards do not repeatedly scale the running total.
-        if self.grad_divisor != 1:
-            reduced_grad.local_buffer.div_(self.grad_divisor)
+        if self.grad_scale != 1:
+            reduced_grad.local_buffer.mul_(self.grad_scale)
 
         if reduced_grad is not self.main_grad:
             if has_sharded_grads:
@@ -530,3 +591,13 @@ class FsdpParameterGroup:
             # sharded.grad is only read by the optimizer. However, for consistency and
             # debugging, keep sharded.grad valid even between microbatches.
             install_sharded_grads(self.main_grad)
+
+
+def get_containing_parameter_group(parameter: nn.Parameter) -> FsdpParameterGroup | None:
+    """Return the FSDP parameter group that owns ``parameter``, if any."""
+    # This parameter-owned backedge must be weak; otherwise it forms a reference
+    # cycle with the parameter group and delays releasing its CUDA storage.
+    parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
+    if parameter_group_ref is None:
+        return None
+    return parameter_group_ref()

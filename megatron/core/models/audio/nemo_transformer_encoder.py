@@ -8,7 +8,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 from torch import nn
@@ -728,49 +728,177 @@ class DepthwiseConvSubsampling(nn.Module):
         return x, length
 
 
-class NGPTStackingSubsampling(torch.nn.Module):
-    """Stacking subsampling which simply stacks consecutive frames to reduce the sampling rate
+class StackingSubsampling(torch.nn.Module):
+    """Stack consecutive audio frames and project them to the encoder dimension.
+
     Args:
-        subsampling_factor (int): The subsampling factor
-        feat_in (int): size of the input features
-        feat_out (int): size of the output features
+        subsampling_factor: Number of adjacent frames in each stack.
+        feat_in: Input feature dimension.
+        feat_out: Output encoder dimension.
+        use_bias: Whether the output projection has a bias.
+        pad_mode: How missing frames in a partial final stack are represented.
+            ``"learned"`` preserves the legacy NGPT behavior and checkpoint
+            layout; ``"zeros"`` matches NeMo's ``FeatureStacking``.
     """
 
     def __init__(
-        self, subsampling_factor: int, feat_in: int, feat_out: int, use_bias: bool = False
+        self,
+        subsampling_factor: int,
+        feat_in: int,
+        feat_out: int,
+        use_bias: bool = False,
+        *,
+        pad_mode: Literal["learned", "zeros"] = "learned",
     ):
         super().__init__()
+        if pad_mode not in ("learned", "zeros"):
+            raise ValueError(
+                f"Unsupported stacking pad_mode={pad_mode!r}; expected 'learned' or 'zeros'"
+            )
         self.subsampling_factor = subsampling_factor
-        self.proj_out = torch.nn.Linear(subsampling_factor * feat_in, feat_out, bias=use_bias)
-        self.pad_frame = nn.Parameter(torch.ones(feat_in, dtype=torch.float32))
+        self.pad_mode = pad_mode
+        projection = torch.nn.Linear(subsampling_factor * feat_in, feat_out, bias=use_bias)
+        self.proj_out: torch.nn.Linear | None = None
+        self.proj: torch.nn.Linear | None = None
+        if pad_mode == "learned":
+            # Preserve the legacy state-dict layout: ``proj_out`` plus a
+            # trainable padding frame.
+            self.proj_out = projection
+            self.pad_frame = nn.Parameter(torch.ones(feat_in, dtype=torch.float32))
+        else:
+            # Preserve NeMo FeatureStacking's ``proj`` key and lack of a
+            # trainable padding parameter.
+            self.proj = projection
+            self.register_parameter("pad_frame", None)
 
-    def forward(self, x, length):
-        """
+    def _projection(self) -> torch.nn.Linear:
+        projection = self.proj_out if self.pad_mode == "learned" else self.proj
+        assert projection is not None
+        return projection
+
+    def _replace_zero_frames(self, x: torch.Tensor) -> torch.Tensor:
+        if self.pad_mode != "learned":
+            return x
+        assert self.pad_frame is not None
+        zero_frames = (x == 0).all(dim=-1, keepdim=True)
+        return torch.where(zero_frames, self.pad_frame.view(1, -1), x)
+
+    def _pad_partial_stack(self, x: torch.Tensor, pad_size: int) -> torch.Tensor:
+        if not pad_size:
+            return x
+        if self.pad_mode == "learned":
+            assert self.pad_frame is not None
+            padding = self.pad_frame.view(1, -1).expand(pad_size, -1)
+            return torch.cat((x, padding), dim=0)
+        return torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+
+    def forward(self, x: torch.Tensor, length: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stack and project a dense batch of padded audio features.
+
         Args:
-            x (torch.Tensor): (B, C, T)
-            length (torch.Tensor): (B,)
+            x: Audio features with shape ``[batch, features, time]``.
+            length: Valid input frame count for each sample.
+
         Returns:
-            x (torch.Tensor): (B, T', D_model)
-            length (torch.Tensor): (B,)
+            Projected features with shape ``[batch, time', feat_out]`` and
+            the corresponding per-sample lengths.
         """
         x = x.transpose(1, 2)  # BxCxT -> BxTxC
         b, t, h = x.size()
-        pad_size = (
-            self.subsampling_factor - (t % self.subsampling_factor)
-        ) % self.subsampling_factor
+        pad_size = (-t) % self.subsampling_factor
         length = torch.div(
             length + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode='floor'
         )
 
-        # Pad and fill padding frames (all-zero) with a learnable padding 'embedding'
-        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
-        x[(x == 0).all(dim=-1)] = self.pad_frame
+        if pad_size:
+            x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+        x = self._replace_zero_frames(x)
 
         _, t, _ = x.size()
         x = torch.reshape(x, (b, t // self.subsampling_factor, h * self.subsampling_factor))
-        x = self.proj_out(x)
+        x = self._projection()(x)
 
         return x, length
+
+    def forward_packed(
+        self, x: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stack only valid frames and return contiguous per-audio token runs.
+
+        ``x`` may be a padded ``[B, F, T]`` batch or already-packed
+        ``[Ttotal, F]`` features. Each sample is padded only through its final
+        partial stack, avoiding projection work on suffix padding.
+        """
+        if x.ndim == 2:
+            features = x.shape[1]
+            lengths = lengths.to(dtype=torch.int64, device=x.device).reshape(-1)
+            if int(lengths.sum().item()) != x.shape[0]:
+                raise ValueError(
+                    f"Packed features have {x.shape[0]} frames but "
+                    f"sum(lengths)={int(lengths.sum().item())}"
+                )
+            padded_lengths = (
+                torch.div(
+                    lengths + self.subsampling_factor - 1,
+                    self.subsampling_factor,
+                    rounding_mode="floor",
+                )
+                * self.subsampling_factor
+            )
+            output_lengths = padded_lengths // self.subsampling_factor
+            if x.shape[0] == 0:
+                return x.new_zeros((0, self._projection().out_features)), output_lengths
+
+            source_starts = lengths.cumsum(0) - lengths
+            destination_starts = padded_lengths.cumsum(0) - padded_lengths
+            frame_ids = torch.arange(x.shape[0], device=x.device)
+            within_clip = frame_ids - torch.repeat_interleave(source_starts, lengths)
+            destination = torch.repeat_interleave(destination_starts, lengths) + within_clip
+            if self.pad_mode == "learned":
+                assert self.pad_frame is not None
+                canvas = (
+                    self.pad_frame.view(1, -1).expand(int(padded_lengths.sum().item()), -1).clone()
+                )
+                x = self._replace_zero_frames(x)
+            else:
+                canvas = x.new_zeros((int(padded_lengths.sum().item()), features))
+            canvas[destination] = x
+            stacked = canvas.reshape(-1, features * self.subsampling_factor)
+            return self._projection()(stacked), output_lengths
+
+        if x.ndim != 3:
+            raise ValueError(
+                f"Expected [B, F, T] or packed [Ttotal, F] audio features, got {tuple(x.shape)}"
+            )
+        batch, features, max_time = x.shape
+        if lengths.numel() != batch:
+            raise ValueError(f"Expected {batch} input lengths, got {lengths.numel()}")
+
+        x_btf = x.transpose(1, 2)
+        lengths = lengths.to(dtype=torch.int64, device=x.device)
+        output_lengths = torch.div(
+            lengths + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode="floor"
+        )
+        stacked_chunks = []
+        for index, frame_count in enumerate(lengths.tolist()):
+            if frame_count < 0 or frame_count > max_time:
+                raise ValueError(
+                    f"Invalid input length {frame_count} for audio with {max_time} frames"
+                )
+            if frame_count == 0:
+                continue
+            sample = self._replace_zero_frames(x_btf[index, :frame_count])
+            pad_size = (-frame_count) % self.subsampling_factor
+            sample = self._pad_partial_stack(sample, pad_size)
+            stacked_chunks.append(sample.reshape(-1, features * self.subsampling_factor))
+        if stacked_chunks:
+            stacked = torch.cat(stacked_chunks, dim=0)
+            return self._projection()(stacked), output_lengths
+        return x.new_zeros((0, self._projection().out_features)), output_lengths
+
+
+# Backward-compatible import name for users of the vendored legacy encoder.
+NGPTStackingSubsampling = StackingSubsampling
 
 
 class TransformerEncoder(nn.Module):
@@ -789,6 +917,7 @@ class TransformerEncoder(nn.Module):
         nan_debug: bool = True,
         qk_norm: bool = False,
         subsampling_factor: int = 4,
+        stacking_pad_mode: Literal["learned", "zeros"] = "learned",
         attn_impl: str = "auto",
         recompute_layers: bool = False,
         left_context: Optional[int] = None,
@@ -805,8 +934,11 @@ class TransformerEncoder(nn.Module):
         elif pre_encode == "depth_conv":
             self.pre_encode = DepthwiseConvSubsampling(n_mels, d_model)
         elif pre_encode == "stacking":
-            self.pre_encode = NGPTStackingSubsampling(
-                subsampling_factor=subsampling_factor, feat_in=n_mels, feat_out=d_model
+            self.pre_encode = StackingSubsampling(
+                subsampling_factor=subsampling_factor,
+                feat_in=n_mels,
+                feat_out=d_model,
+                pad_mode=stacking_pad_mode,
             )
         else:
             raise ValueError(

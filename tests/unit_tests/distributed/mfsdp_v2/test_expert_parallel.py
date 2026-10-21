@@ -227,7 +227,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
                 )
 
     # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
-    # Experts additionally need grad_divisor=ep_size; see fully_shard.
+    # Experts additionally need grad_scale=1 / ep_size; see fully_shard.
     with fully_shard_context(device=device):
         for decoder_layer in model.decoder.layers:
             if isinstance(decoder_layer, MoETransformerLayer):
@@ -235,7 +235,7 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
                     decoder_layer.mlp.experts,
                     mesh=moe_mesh["edp"],
                     placements=moe_placements,
-                    grad_divisor=ep_size,
+                    grad_scale=1.0 / ep_size,
                 )
         fully_shard(model, mesh=world_mesh, placements=dense_placements)
 
@@ -260,10 +260,3 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
         torch.stack(reference_losses),
         msg="EP=4 mFSDP model did not reproduce full-batch EP=1 training.",
     )
-
-    # Destroy the groups this test created; leave the default (world) group for later tests.
-    # A mesh dim that spans every rank is backed by the default group rather than a fresh one
-    # (e.g. "ep" here when edp_size == 1).
-    for group in (one, ep_group, expert_dp_group):
-        if group is not dist.group.WORLD:
-            dist.destroy_process_group(group)

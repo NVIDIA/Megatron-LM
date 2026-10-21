@@ -4,6 +4,7 @@ import ast
 import builtins
 import dataclasses
 import enum
+import importlib
 import inspect
 import itertools
 import types
@@ -19,6 +20,7 @@ import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
+from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -28,6 +30,7 @@ from megatron.training.config import (
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
+    RLConfig,
     RNGConfig,
     SchedulerConfig,
     StragglerDetectionConfig,
@@ -86,12 +89,22 @@ class ArgumentGroupFactory:
             argument generation. Useful for omitting internal fields, computed properties,
             or attributes that should be configured through other means. If None, all 
             dataclass fields will be converted to command-line arguments. Default: None.
+        prefix: Optional prefix for every argument name and destination, for dataclasses
+            whose attribute names are only unique within the dataclass. For example, the
+            prefix 'triton_autotune' turns attribute `mode` into `--triton-autotune-mode`
+            with destination `triton_autotune_mode`. Default: None.
     """
 
-    def __init__(self, src_cfg_class: type, exclude: Optional[list[str]] = None) -> None:
+    def __init__(
+        self,
+        src_cfg_class: type,
+        exclude: Optional[list[str]] = None,
+        prefix: Optional[str] = None,
+    ) -> None:
         self.src_cfg_class = src_cfg_class
         self.field_docstrings = self._get_field_docstrings(src_cfg_class)
         self.exclude = set(exclude) if exclude is not None else set()
+        self.prefix = prefix
 
     def _format_arg_name(self, config_attr_name: str, prefix: Optional[str] = None) -> str:
         """Convert dataclass name into appropriate argparse flag name.
@@ -135,11 +148,11 @@ class ArgumentGroupFactory:
             return {"type": config_type}
 
         if origin in [types.UnionType, typing.Union]:
-            # Handle Optional and Union
-            if type_tuple[1] == type(None): # Optional type. First element is value inside Optional[]
-                return self._extract_type(type_tuple[0])
-            else:
-                raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
+            # Optional may place None anywhere; multiple value types need CLI metadata.
+            value_types = [value_type for value_type in type_tuple if value_type is not type(None)]
+            if len(value_types) == 1:
+                return self._extract_type(value_types[0])
+            raise TypeInferenceError(f"Unions not supported by argparse: {config_type}")
 
         elif origin is list:
             if len(type_tuple) == 1:
@@ -148,6 +161,12 @@ class ArgumentGroupFactory:
                 return kwargs
             else:
                 raise TypeInferenceError(f"Multi-type lists not supported by argparse: {config_type}")
+
+        elif origin is tuple and len(type_tuple) == 2 and type_tuple[1] is Ellipsis:
+            # Variable-length tuple of one type, such as tuple[str, ...]
+            kwargs = self._extract_type(type_tuple[0])
+            kwargs["nargs"] = "+"
+            return kwargs
 
         elif origin is typing.Literal:
             choices_types = [type(choice) for choice in type_tuple]
@@ -165,8 +184,9 @@ class ArgumentGroupFactory:
             attribute: dataclass attribute
         """
         argparse_kwargs = {}
-        argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name)]
-        argparse_kwargs["dest"] = attribute.name
+        name = attribute.name if self.prefix is None else f"{self.prefix}_{attribute.name}"
+        argparse_kwargs["arg_names"] = [self._format_arg_name(name)]
+        argparse_kwargs["dest"] = name
         argparse_kwargs["help"] = self.field_docstrings[attribute.name] if attribute.name in self.field_docstrings else ""
 
         # dataclasses specifies that both should not be set
@@ -194,17 +214,17 @@ class ArgumentGroupFactory:
 
                 # add '--no-*' and '--disable-*' prefix if this is a store_false argument
                 if argparse_kwargs["action"] == "store_false":
-                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+                    argparse_kwargs["arg_names"] = [self._format_arg_name(name, prefix="no"), self._format_arg_name(name, prefix="disable")] 
         except TypeInferenceError as e:
-            if attr_argparse_meta is not None:
+            if attr_argparse_meta is None:
+                raise e
+            if "type" not in attr_argparse_meta:
                 print(
                     f"WARNING: Inferring the appropriate argparse argument type from {self.src_cfg_class} "
                     f"failed for {attribute.name}: {attribute.type}.\n"
                     "Deferring to attribute metadata. If the metadata is incomplete, 'parser.add_argument()' may fail.\n"
                     f"Original failure: {e}"
                 )
-            else:
-                raise e
 
         # metadata provided by field takes precedence 
         if attr_argparse_meta is not None:
@@ -324,6 +344,39 @@ def _wide_residual_config_from_args(args: Namespace) -> WideResidualConfig | Non
     )
 
 
+def _triton_autotune_config_from_args(args: Namespace) -> AutotunePolicy:
+    """Build the Triton autotune policy from the ``--triton-autotune-*`` arguments.
+
+    A ``--yaml-cfg`` configuration replaces those arguments and sets the same fields in
+    an optional top-level ``triton_autotune`` section.
+    """
+    if args.yaml_cfg is None:
+        return _default_config_from_args(AutotunePolicy, args, prefix='triton_autotune')
+    # A YAML namespace only has the sections that the file sets.
+    section = getattr(args, 'triton_autotune', None)
+    if section is None:
+        return AutotunePolicy()
+    if isinstance(section, types.SimpleNamespace):
+        section = vars(section)
+    if not isinstance(section, dict):
+        raise TypeError('The triton_autotune YAML section must be a mapping.')
+    section = dict(section)
+    if isinstance(section.get('block_sizes'), types.SimpleNamespace):
+        section['block_sizes'] = vars(section['block_sizes'])
+    # Null YAML values fall back to defaults, and unknown or mistyped keys raise.
+    return AutotunePolicy.from_mapping(section)
+
+
+def _model_rng_config(args: Namespace) -> RNGConfig:
+    """Use parsed RNG inputs only during bootstrap, before a run config exists."""
+    from megatron.training.global_vars import get_run_config, is_run_config_initialized
+
+    if is_run_config_initialized():
+        cfg = get_run_config()
+        return cfg.rng
+    return _default_config_from_args(RNGConfig, args)
+
+
 def core_transformer_config_from_args(args, config_class=None):
     """Build a transformer config from normalized arguments."""
     from megatron.core.activations import squared_relu
@@ -436,6 +489,7 @@ def core_transformer_config_from_args(args, config_class=None):
     if wide_residual is not None or 'wide_residual' not in kw_args:
         kw_args['wide_residual'] = wide_residual
 
+
     if args.te_precision_config_file:
         assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
         # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
@@ -450,6 +504,7 @@ def core_transformer_config_from_args(args, config_class=None):
     config = config_class(**kw_args)
 
     _apply_yarn_config_from_args(config, args)
+    _model_rng_config(args).finalize_model_config(config)
 
     # Return config.
     return config
@@ -487,16 +542,20 @@ def _apply_yarn_config_from_args(config, args) -> None:
     _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
 
 
-def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
+def _default_config_from_args(
+    cls: type, args: Namespace, return_instance: bool = True, prefix: Optional[str] = None
+) -> Any:
     """Create a config dataclass from the appropriate values in the `args` Namespace.
 
     This is generic, i.e. it will work if dataclass attribute names map 1-to-1 with
-    names in `args`. Some classes might require additional logic.
+    names in `args`. Some classes might require additional logic. `prefix` matches
+    arguments added by an `ArgumentGroupFactory` with the same prefix.
     """
     kwargs = {}
     for f in fields(cls):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
+        name = f.name if prefix is None else f"{prefix}_{f.name}"
+        if f.init and hasattr(args, name):
+            kwargs[f.name] = getattr(args, name)
 
     if return_instance:
         return cls(**kwargs)
@@ -504,11 +563,13 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
-def resolve_tokenizer_vocab_size(cfg: PretrainConfigContainer, padded_vocab_size: int | None) -> None:
+def resolve_tokenizer_vocab_size(
+    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
+) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
 
     Args:
-        cfg: Previously constructed training configuration. Explicit model
+        cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
         padded_vocab_size: Final size resolved by tokenizer initialization,
             including any CLI/checkpoint override. None is valid only when the
@@ -558,6 +619,7 @@ def gpt_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
 
@@ -592,6 +654,33 @@ def gpt_config_from_args(
     return model_config_cls(**kwargs)
 
 
+def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> ModuleSpec | None:
+    """Return the inference_optimized counterpart of a HybridStack training --spec.
+
+    Checkpoints record their training spec, which --use-checkpoint-args restores; its inference
+    sibling keeps the layer types, e.g. gated_delta_product_stack_spec ->
+    wide_residual_gated_delta_product_inference_stack_spec (GDP rather than Mamba). Aliases such
+    as gdp_stack_spec resolve through the spec object they name. Returns None if the module
+    defines no counterpart.
+    """
+    if len(spec) != 2:
+        raise ValueError(f"--spec must name a module and a spec, got {spec}.")
+    base_path, name = spec
+    training_spec = import_module((base_path, name))
+    module_specs = vars(importlib.import_module(base_path))
+    aliases = sorted({alias for alias, value in module_specs.items() if value is training_spec})
+    for alias in aliases or [name]:
+        stem = alias.removeprefix("wide_residual_").replace("_inference_", "_")
+        if not stem.endswith("_stack_spec"):
+            continue
+        candidate = stem.removesuffix("_stack_spec") + "_inference_stack_spec"
+        if wide_residual:
+            candidate = "wide_residual_" + candidate
+        if isinstance(module_specs.get(candidate), ModuleSpec):
+            return module_specs[candidate]
+    return None
+
+
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
@@ -619,10 +708,22 @@ def hybrid_config_from_args(
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
 
+    kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if transformer_cfg.transformer_impl == "inference_optimized":
         assert (
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
+        if args.spec is not None:
+            hybrid_stack_spec = _hybrid_inference_stack_spec(
+                args.spec, wide_residual=transformer_cfg.wide_residual is not None
+            )
+            if hybrid_stack_spec is None:
+                warnings.warn(
+                    f"No inference_optimized counterpart of --spec {args.spec}; using the "
+                    "default hybrid inference stack spec."
+                )
+            else:
+                kwargs["hybrid_stack_spec"] = hybrid_stack_spec
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
@@ -693,7 +794,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
     optim_cfg, _ = get_megatron_optimizer_config(args)
-    ddp_config = get_megatron_ddp_config(args)
+    ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
         train=_default_config_from_args(TrainingConfig, args),
@@ -702,12 +803,13 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         optimizer=optim_cfg,
         scheduler=_default_config_from_args(SchedulerConfig, args),
         ddp=ddp_config,
-        dist=_default_config_from_args(DistributedInitConfig, args),
+        dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         profiling=profiling_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
+        rl=_default_config_from_args(RLConfig, args),
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
@@ -753,21 +855,23 @@ def inference_cfg_container_from_args(
             model_cfg = gpt_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
-    ckpt_kwargs["save_rng"] = not args.no_save_rng
-    ckpt_kwargs["load_optim"] = not args.no_load_optim
-    ckpt_kwargs["load_rng"] = not args.no_load_rng
-    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
-    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+    # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.
+    # Preserve canonical config values or defaults when an alias is absent.
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        if hasattr(args, f"no_{name}"):
+            ckpt_kwargs[name] = not getattr(args, f"no_{name}")
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        if hasattr(args, f"ckpt_{name}"):
+            ckpt_kwargs[name] = getattr(args, f"ckpt_{name}")
 
     cfg = InferenceConfigContainer(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         inference=inference_cfg_from_args(args),
-        dist=_default_config_from_args(DistributedInitConfig, args),
+        dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
-        logger=_default_config_from_args(LoggerConfig, args),
+        logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
         profiling=profiling_config_from_args(args),
     )
 

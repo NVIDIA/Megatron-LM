@@ -25,7 +25,10 @@ from examples.mimo.utils.hetero import get_grid_dim_size
 from megatron.core.activations import squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    mamba_stack_spec,
+    wide_residual_hybrid_stack_spec,
+)
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -131,6 +134,7 @@ def nemotron_language_config(
 ) -> TransformerConfig:
     """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
     config = deepcopy(_base_config(args))
+    gtp_remat_num_sequence_shards = config.gtp_remat_num_sequence_shards
     # Code-only fields + hetero parallelism pins.
     config.variable_seq_lengths = True
     config.expert_model_parallel_size = ep_size
@@ -155,6 +159,7 @@ def nemotron_language_config(
         )
     )
     config.sequence_parallel = tp_size > 1
+    config.tensor_parallel_num_sequence_shards = tp_size * gtp_remat_num_sequence_shards
     config.position_embedding_type = "none"
     return config
 
@@ -199,6 +204,7 @@ def nemotron_projection_config(
     if base_config is None:
         _disable_gtp(config)
     config.sequence_parallel = False
+    config.tensor_parallel_num_sequence_shards = None
     return config
 
 
@@ -240,12 +246,15 @@ def language_model_spec(
         pp_rank = 0
         pp_size = get_grid_dim_size(llm_grid, "pp")
         tp_size = get_grid_dim_size(llm_grid, "tp")
-        cp_size = get_grid_dim_size(llm_grid, "cp")
+        cp_size = get_grid_dim_size(llm_grid, "cp") * get_grid_dim_size(
+            llm_grid, "gtp_remat_sequence_shards"
+        )
         ep_size = getattr(args, "mimo_llm_ep", 1)
         expt_tp_size = getattr(args, "mimo_llm_expt_tp", None) or 1
     else:
         assert all(
-            getattr(pg_collection, name, None) is not None for name in ("pp", "tp", "cp", "ep", "expt_tp")
+            getattr(pg_collection, name, None) is not None
+            for name in ("pp", "tp", "cp", "ep", "expt_tp")
         ), "language pg_collection is missing a required pp/tp/cp/ep/expt_tp group"
         pp_rank = get_pg_rank(pg_collection.pp)
         pp_size = get_pg_size(pg_collection.pp)
@@ -258,11 +267,16 @@ def language_model_spec(
         args, tp_size, pp_size, ep_size, expt_tp_size, cp_size=cp_size
     )
     require_per_token_loss(config)
+    stack_spec = (
+        wide_residual_hybrid_stack_spec
+        if getattr(config, "wide_residual", None) is not None
+        else mamba_stack_spec
+    )
     return ModuleSpec(
         module=MambaModel,
         params={
             "config": config,
-            "mamba_stack_spec": mamba_stack_spec,
+            "mamba_stack_spec": stack_spec,
             "vocab_size": _vocab_size(args),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,

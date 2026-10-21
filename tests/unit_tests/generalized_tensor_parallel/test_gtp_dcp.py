@@ -66,6 +66,7 @@ from megatron.core.utils import (  # noqa: E402
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
     _requires_mxfp8,
     _torchrun_dist_init,
+    reset_gtp_globals,
 )
 
 

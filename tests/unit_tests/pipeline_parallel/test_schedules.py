@@ -27,9 +27,16 @@ from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
     get_overlap_moe_expert_parallel_comm_order,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.fixture(autouse=True)
+def reset_dsa_loss_scale():
+    yield
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
 
 def test_reset_activation_offload_uses_language_model_group(mocker):

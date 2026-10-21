@@ -9,7 +9,7 @@ are reconstructed in forward order during backward.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -24,6 +24,11 @@ from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
     ResidualConnection,
     ResidualConnectionState,
+)
+from megatron.core.transformer.residual_recompute_plan import (
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
+    finalize_recompute_block,
 )
 from megatron.core.typed_torch import apply_module
 
@@ -50,8 +55,7 @@ class ResidualStreamRecomputeContext:
     def finalize(self, hidden_states: Tensor) -> None:
         """Discard this block's registered outputs once its live boundary exists."""
 
-        if self.is_block_end:
-            self.manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        finalize_recompute_block(self.manager, hidden_states, self.is_block_end)
 
 
 def residual_stream_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
@@ -67,30 +71,36 @@ def residual_stream_recompute_enabled(config: TransformerConfig, training: bool)
 
 
 def build_residual_stream_recompute_plan(
-    num_layers: int, block_size: int | None
+    num_layers: int, block_size: int | None, *, atomic_layer_pairs: Sequence[tuple[int, int]] = ()
 ) -> list[ResidualStreamRecomputeContext]:
-    """Partition local layers into independent ordered replay blocks."""
+    """Partition local physical layers into independent ordered replay blocks.
 
-    if num_layers < 0:
-        raise ValueError("Residual recompute plan requires a non-negative layer count.")
-    if num_layers == 0:
-        return []
-    if block_size is not None and (
-        isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1
-    ):
-        raise ValueError("Residual recompute block size must be a positive integer or None.")
+    Shortcut MoE's predecessor (e.g. attention or Mamba) and paired MoE layer share
+    replay-owned intermediates, so a replay block must not end between them.
 
-    effective_block_size = block_size or num_layers
-    contexts = []
-    manager = CheckpointWithoutOutputManager()
-    for layer_index in range(num_layers):
-        is_block_end = (layer_index + 1) % effective_block_size == 0 or (
-            layer_index + 1 == num_layers
-        )
-        contexts.append(ResidualStreamRecomputeContext(manager=manager, is_block_end=is_block_end))
-        if is_block_end and layer_index + 1 < num_layers:
-            manager = CheckpointWithoutOutputManager()
-    return contexts
+    Args:
+        num_layers: Local physical layer count, before shortcut wrapper grouping.
+        block_size: Target maximum physical layers per block; None uses the entire local stack.
+            A pair stays intact even when block_size=1, forming a two-layer block.
+        atomic_layer_pairs: Disjoint adjacent pairs of zero-based local physical layer indices
+            that must share one replay manager.
+
+    Returns:
+        One context per physical layer, sharing a manager within each block. Only the block's
+        final layer has is_block_end=True.
+
+    For example, four layers with block_size=3 and pairs (0, 1), (2, 3) form blocks
+    [0, 1] and [2, 3], not [0, 1, 2] and [3].
+    """
+
+    block_ends = build_recompute_block_end_plan(
+        num_layers, block_size, atomic_layer_pairs=atomic_layer_pairs
+    )
+    managers = build_recompute_layer_managers(block_ends)
+    return [
+        ResidualStreamRecomputeContext(manager=manager, is_block_end=is_block_end)
+        for manager, is_block_end in zip(managers, block_ends)
+    ]
 
 
 def checkpoint_residual_read(
@@ -109,10 +119,7 @@ def checkpoint_residual_read(
 
     def run_read(stream: Tensor) -> tuple[Tensor, ...]:
         branch_input, state = apply_module(connection)(
-            stream,
-            operation="read",
-            fp32_residual_connection=False,
-            branch_input_dtype=branch_input_dtype,
+            stream, fp32_residual_connection=False, branch_input_dtype=branch_input_dtype
         )
         if state[0].shape != stream.shape:
             raise ValueError("Residual connection read returned an incompatible carried stream.")
@@ -157,7 +164,6 @@ def checkpoint_residual_write(
         value = (branch_update, branch_bias) if return_tuple else branch_update
         return apply_module(connection)(
             value,
-            operation="write",
             state=connection_state,
             dropout_probability=dropout_probability,
             training=training,

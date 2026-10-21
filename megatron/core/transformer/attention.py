@@ -756,6 +756,24 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         is "self-attn" or "cross-attn".
         """
 
+    def get_softmax_scale(
+        self, query_tensor: torch.Tensor, head_dim_index: int = -1
+    ) -> float | None:
+        """Return the softmax scaling value to use.
+
+        Tries, in order:
+        - `self.softmax_scale` (should only be assigned for MLA),
+        - `self.config.softmax_scale`, and if that is `None`, uses
+        - 1 / sqrt(Q head dim), as per `query_tensor` and `head_dim_index`.
+        """
+        if getattr(self, "softmax_scale", None) is not None:
+            softmax_scale = self.softmax_scale
+        elif getattr(self.config, "softmax_scale", None) is not None:
+            softmax_scale = self.config.softmax_scale
+        else:
+            softmax_scale = query_tensor.size(head_dim_index) ** -0.5
+        return softmax_scale
+
     def flash_decode(
         self,
         sequence_len_offset: Tensor,
@@ -802,6 +820,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             rotary_sin=rotary_sin,
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
+            softmax_scale=self.get_softmax_scale(q),
         )
         # This path bypasses self.core_attention and calls flash-attention directly, so the
         # configured cap has to be passed here too. Only when set, so runs without softcapping
@@ -1097,10 +1116,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
-            if getattr(self, "softmax_scale", None) is not None:
-                softmax_scale = self.softmax_scale
-            else:
-                softmax_scale = q.shape[-1] ** -0.5
+            softmax_scale = self.get_softmax_scale(q)
             softcap = self.config.attn_logit_softcapping
             softcap_kwargs = {} if softcap is None else {"softcap": softcap}
             if use_fa4:
@@ -1144,6 +1160,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 assert (
                     self.batch_invariant_mode is False
                 ), "Batch invariant mode is not supported for flash attention 2"
+                # FA2 treats max_seqlen_q == 1 as one query token per sequence and reshapes q
+                # accordingly under GQA, which requires total_q == num_seqs.
+                assert max_seqlen_q > 1 or q.shape[0] == cu_seqlens_q.shape[0] - 1, (
+                    f"FlashAttention-2 got max_seqlen_q={max_seqlen_q} with {q.shape[0]} query "
+                    f"rows for {cu_seqlens_q.shape[0] - 1} sequences"
+                )
                 fa2_ret = flash_attn_varlen_func(
                     q,
                     k,
@@ -1207,6 +1229,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
                 )
                 softmax_scale = self.softmax_scale
+                assert softmax_scale is not None
 
                 num_heads_k = 1  # Only a single head for MLA Flash
                 seq_len_q = tokens_per_request
@@ -1239,10 +1262,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     )
             else:
                 if use_fa4:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
+                    softmax_scale = self.get_softmax_scale(q)
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
                     decode_softcap = self.config.attn_logit_softcapping
@@ -1272,10 +1292,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         num_requests, tokens_per_request, *output_total.shape[1:]
                     )
                 else:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
+                    softmax_scale = self.get_softmax_scale(q)
                     flash_attn_args = {
                         "q": q,
                         "k_cache": k,
