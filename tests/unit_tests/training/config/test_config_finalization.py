@@ -2,11 +2,13 @@
 """Container validation is read-only; runtime initialization owns derivation."""
 
 import copy
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from megatron.core.transformer import TransformerConfig
+from megatron.training import global_vars
 from megatron.training.config import (
     CheckpointConfig,
     InferenceConfigContainer,
@@ -40,6 +42,7 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
         assert cfg.to_dict() == before
         assert not cfg._finalized
 
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
     rng_finalize = Mock(wraps=cfg.rng.finalize_model_config)
     monkeypatch.setattr(cfg.rng, "finalize_model_config", rng_finalize)
     cfg.finalize()
@@ -50,14 +53,15 @@ def test_validation_is_read_only_and_finalization_runs_once(monkeypatch, run_con
         assert cfg.ddp.grad_buffer_offload
     after = copy.deepcopy(cfg.to_dict())
     cfg.validate()
-    cfg.finalize()  # Initialization re-entry must not repeat derivations.
+    cfg.finalize()
     assert cfg.to_dict() == after
     rng_finalize.assert_called_once_with(model)
     assert "_finalized" not in after
     assert copy.deepcopy(cfg)._finalized
 
 
-def test_invalid_configuration_is_not_partially_finalized(run_config):
+def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
     transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
     transformer.cuda_graph_impl = "transformer_engine"
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
@@ -81,7 +85,9 @@ def test_invalid_configuration_is_not_partially_finalized(run_config):
     assert run_config.rng.te_rng_tracker
 
 
-def test_serialization_starts_a_new_lifecycle(run_config):
+def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    run_config.train.micro_batch_size = 1
     run_config.finalize()
     serialized = run_config.to_dict()
     assert "_finalized" not in serialized

@@ -14,6 +14,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
+from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     get_logprobs,
@@ -24,8 +25,7 @@ from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.global_vars import get_run_config, initialize_runtime_services, set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -428,12 +428,19 @@ if __name__ == "__main__":
         model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         None,  # we don't need to build any datasets for RL training
         ModelType.encoder_or_decoder,
         forward_step,
         partial(model_provider, _model_builder),
+        callbacks=[
+            RLLoggingCallback(
+                full_config.rl,
+                micro_batch_size=full_config.train.micro_batch_size,
+                global_batch_size=full_config.train.global_batch_size,
+                save_dir=full_config.checkpoint.save,
+            ),
+            RLCheckpointCallback(),
+        ],
     )

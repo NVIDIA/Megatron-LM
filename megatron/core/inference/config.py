@@ -62,8 +62,8 @@ class MambaInferenceStateConfig:
     slice start."""
 
     gdp_num_householder: int = 0
-    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
-    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    """Number of Householder copies of the Gated Delta Product layers, 1 for GDN,
+    or 0 for other mixers. Sizes the chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
     def __post_init__(self):
@@ -809,7 +809,13 @@ class InferenceConfig:
     ``AsyncScheduleMode.LEGACY`` to disable it."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
-    """Whether returned log-probs are modified by the sampling parameters or not."""
+    """Whether log-probs of engine-sampled tokens are modified by the sampling parameters.
+
+    `'processed_logprobs'` applies each request's temperature, top-k, and top-p to the
+    log-probs of tokens the engine sampled, including the top-N log-probs at those
+    positions. Prompt log-probs and prompt top-N log-probs score tokens the engine did
+    not sample, so they always use the raw distribution in both modes.
+    """
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
