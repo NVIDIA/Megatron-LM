@@ -30,6 +30,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -248,22 +249,24 @@ def cleanup_global_state():
     destroy_num_microbatches_calculator()
 
 
-# (dtype, chunk_tokens, sliced) cases shared by the in-process and spawned-TP2 parity runs.
+# (dtype, chunk_tokens, sliced, batch_invariant) cases shared by the in-process and spawned-TP2
+# parity runs.
 _VP_CASES = [
-    (dtype, chunk_tokens, sliced)
+    (dtype, chunk_tokens, sliced, batch_invariant)
     for dtype in (torch.float32, torch.bfloat16)
     for chunk_tokens in (None, 3)
     for sliced in (False, True)
+    for batch_invariant in (False, True)
 ]
 
 
-def _vp_inputs(dtype, sliced):
+def _vp_inputs(dtype, sliced, out_dtype):
     """Deterministic parity inputs; the spawned TP2 workers rebuild the identical tensors."""
     torch.manual_seed(0)
     batch, seq, vocab = 2, 17, 64
     logits = torch.randn(batch, seq, vocab, dtype=dtype)
     tokens = torch.randint(0, vocab, (batch, seq))
-    grad_out = torch.randn(batch, seq - 1 if sliced else seq, dtype=dtype)
+    grad_out = torch.randn(batch, seq - 1 if sliced else seq, dtype=out_dtype)
     return logits, tokens, grad_out
 
 
@@ -279,16 +282,30 @@ def _vp_tp2_worker(rank, world_size, store_path, result_queue):
         dist.init_process_group(backend="gloo", store=store, rank=rank, world_size=world_size)
         tp_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
         results = {}
-        for dtype, chunk_tokens, sliced in _VP_CASES:
-            logits, tokens, grad_out = _vp_inputs(dtype, sliced)
+        for dtype, chunk_tokens, sliced, batch_invariant in _VP_CASES:
+            out_dtype = torch.float32 if batch_invariant else dtype
+            logits, tokens, grad_out = _vp_inputs(dtype, sliced, out_dtype)
             partition = logits.size(-1) // world_size
             shard = slice(rank * partition, (rank + 1) * partition)
             local = logits[..., shard].clone().requires_grad_(True)
-            got = rl_utils.vocab_parallel_selective_log_softmax(
-                *_vp_view(local, tokens, sliced), tp_group=tp_group, chunk_tokens=chunk_tokens
-            )
+            with patch.object(
+                rl_utils, "is_batch_invariant_mode_enabled", return_value=batch_invariant
+            ):
+                got = rl_utils.vocab_parallel_selective_log_softmax(
+                    *_vp_view(local, tokens, sliced), tp_group=tp_group, chunk_tokens=chunk_tokens
+                )
+                with torch.no_grad():  # the first sequence alone, for the batch-invariance check
+                    prefix = rl_utils.vocab_parallel_selective_log_softmax(
+                        *_vp_view(local[:1], tokens[:1], sliced),
+                        tp_group=tp_group,
+                        chunk_tokens=chunk_tokens,
+                    )
             got.backward(grad_out)
-            results[(dtype, chunk_tokens, sliced)] = (got.detach(), local.grad)
+            results[(dtype, chunk_tokens, sliced, batch_invariant)] = (
+                got.detach(),
+                local.grad,
+                prefix,
+            )
         # Ship plain bytes: shared-memory tensor handles would dangle once this process exits.
         buffer = io.BytesIO()
         torch.save(results, buffer)
@@ -874,8 +891,8 @@ class TestRLUtils:
         self, initialize_model_parallel, use_sequence_packing, batch_invariant, monkeypatch
     ):
         """get_logprobs runs end to end and honors the output-dtype contract that
-        compute_logprobs_batch asserts: fp32 under --batch-invariant-mode (where it falls back to
-        the gathered path), the logits dtype otherwise."""
+        compute_logprobs_batch asserts: fp32 under --batch-invariant-mode, the logits dtype
+        otherwise."""
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
         monkeypatch.setattr(rl_utils, "is_batch_invariant_mode_enabled", lambda: batch_invariant)
 
@@ -896,8 +913,9 @@ class TestRLUtils:
             # Uniform logits: every token has logprob -log(VOCAB), whichever rank owns its id.
             torch.testing.assert_close(logprobs, torch.full_like(logprobs, -math.log(VOCAB)))
         else:
-            # Non-last stages return the model output as is: vocab-sharded unless gathered.
-            vocab = VOCAB if batch_invariant else VOCAB // get_pg_size(model.pg_collection.tp)
+            # Non-last stages return the model output as is: get_logprobs never gathers the
+            # logits, so they stay vocab-sharded in either mode.
+            vocab = VOCAB // get_pg_size(model.pg_collection.tp)
             assert logprobs.shape == (BATCH, SEQ, vocab)
 
     @pytest.mark.parametrize(
@@ -905,14 +923,14 @@ class TestRLUtils:
         [pytest.param((tp, 1), id=f"tp{tp}-pp1") for tp in [1, 2, 4] if tp <= Utils.world_size],
         indirect=["initialize_model_parallel"],
     )
-    def test_get_logprobs_mtp(self, initialize_model_parallel, monkeypatch):
-        """An MTP model trained through get_logprobs must give the same MTP loss, acceptance
-        counts and MTP-layer gradients whether the main logits stay vocab-parallel (the default
-        path) or are gathered (the --batch-invariant-mode fallback): process_mtp_loss keeps its
-        own logits vocab-sharded either way, so the vocab-parallel cross-entropy never sees a
-        TP-times larger vocabulary (loss +ln(TP), wrong gradients). RL derives the MTP labels
-        from the tokens, so the metrics must cover every position but the two rolled off the
-        end of the sequence."""
+    def test_get_logprobs_mtp(self, initialize_model_parallel):
+        """An MTP model trained through get_logprobs (main logits kept vocab-parallel) must give
+        the same logprobs, MTP loss, acceptance counts and MTP-layer gradients as the same
+        forward with the main logits gathered across TP: process_mtp_loss keeps its own logits
+        vocab-sharded either way, so the vocab-parallel cross-entropy never sees a TP-times
+        larger vocabulary (loss +ln(TP), wrong gradients). RL derives the MTP labels from the
+        tokens, so the metrics must cover every position but the two rolled off the end of the
+        sequence."""
         _, _, tp, _ = initialize_model_parallel
         self.create_test_args(tensor_model_parallel_size=tp, bf16=True)
 
@@ -948,25 +966,45 @@ class TestRLUtils:
         tokens = torch.randint(0, VOCAB, (batch_size, seq_length), dtype=torch.long).cuda()
         position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
 
-        results = {}
-        for batch_invariant in (False, True):
-            monkeypatch.setattr(
-                rl_utils, "is_batch_invariant_mode_enabled", lambda flag=batch_invariant: flag
+        def gathered_reference():
+            """The forward get_logprobs issues (one thd sequence, bf16 logits), but with the
+            logits gathered across TP and the logprobs read off the gathered rows."""
+            cu_seqlens = torch.tensor([0, seq_length], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seq_length,
+                max_seqlen_kv=seq_length,
+                pad_between_seqs=False,
             )
+            logits = model(
+                tokens,
+                position_ids,
+                None,
+                packed_seq_params=packed_seq_params,
+                runtime_gather_output=True,
+                fp32_output=False,
+            )
+            return rl_utils.selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+
+        def train_step(forward):
             model.zero_grad(set_to_none=True)
             MTPLossLoggingHelper.clean_metrics_in_tracker()
-            logprobs = rl_utils.get_logprobs(model, tokens, position_ids=position_ids)
+            logprobs = forward()
             logprobs.sum().backward()
             tracker = MTPLossLoggingHelper.tracker
             assert all(p.grad is not None for p in mtp_params.values())
-            results[batch_invariant] = (
+            return (
                 logprobs.detach().float(),
                 {k: tracker[k].clone() for k in ("loss_values", "correct_values", "total_values")},
                 {name: p.grad.clone() for name, p in mtp_params.items()},
             )
 
-        vp_logprobs, vp_metrics, vp_grads = results[False]
-        gathered_logprobs, gathered_metrics, gathered_grads = results[True]
+        vp_logprobs, vp_metrics, vp_grads = train_step(
+            lambda: rl_utils.get_logprobs(model, tokens, position_ids=position_ids)
+        )
+        gathered_logprobs, gathered_metrics, gathered_grads = train_step(gathered_reference)
         assert vp_logprobs.shape == (batch_size, seq_length - 1)
         # bf16 logits: the same tolerance as test_vocab_parallel_selective_log_softmax.
         torch.testing.assert_close(vp_logprobs, gathered_logprobs, atol=5e-2, rtol=5e-2)
@@ -979,25 +1017,28 @@ class TestRLUtils:
         for name, grad in vp_grads.items():
             torch.testing.assert_close(grad, gathered_grads[name], atol=1e-5, rtol=2e-2)
 
-    @pytest.mark.parametrize("dtype, chunk_tokens, sliced", _VP_CASES)
+    @pytest.mark.parametrize("dtype, chunk_tokens, sliced, batch_invariant", _VP_CASES)
     @pytest.mark.parametrize("tp_world", [1, 2])
     def test_vocab_parallel_selective_log_softmax(
-        self, dtype, chunk_tokens, sliced, tp_world, vp_tp2_results
+        self, dtype, chunk_tokens, sliced, batch_invariant, tp_world, vp_tp2_results, monkeypatch
     ):
-        """vocab_parallel_selective_log_softmax must be a numerically-safe drop-in for
-        selective_log_softmax: forward/backward parity with the gathered-path implementation,
-        in-process on full logits (tp_world=1) and on TP-sharded logits over a spawned gloo
-        group (tp_world=2: every rank must return the full-sequence logprobs and its own vocab
-        shard of the reference gradient), with and without chunking, on the non-contiguous
-        ``logits[:, :-1, :]`` view get_logprobs actually passes (whose sliced-away position must
-        receive no gradient), and without mutating the input."""
-        logits, tokens, grad_out = _vp_inputs(dtype, sliced)
-        # fp32 stats vs selective_log_softmax's native bf16 log_softmax diverge by more than
-        # reduction-order noise; vp is the more accurate one (see commit message).
-        atol = 1e-5 if dtype == torch.float32 else 5e-2
+        """Parity with selective_log_softmax (forward, backward, output dtype), in-process and
+        on TP-sharded logits over a spawned gloo pair, where both ranks must agree bitwise and
+        the first sequence alone must reproduce its rows bitwise (batch invariance). Covers
+        chunking, the sliced view get_logprobs passes and --batch-invariant-mode."""
+        monkeypatch.setattr(rl_utils, "is_batch_invariant_mode_enabled", lambda: batch_invariant)
+        out_dtype = torch.float32 if batch_invariant else dtype
+        logits, tokens, grad_out = _vp_inputs(dtype, sliced, out_dtype)
+        # Outputs: under batch-invariant mode both paths compute fp32 statistics and agree
+        # tightly; otherwise selective_log_softmax's native bf16 log_softmax diverges from the
+        # vp path's fp32 statistics by more than reduction-order noise (vp is the accurate one).
+        out_atol = 1e-5 if out_dtype == torch.float32 else 5e-2
+        # Grads land in the (bf16) input dtype on both sides, so they can differ by a bf16 ulp.
+        grad_atol = 1e-5 if dtype == torch.float32 else 5e-2
 
         reference = logits.clone().requires_grad_(True)
         want = rl_utils.selective_log_softmax(*_vp_view(reference, tokens, sliced))
+        assert want.dtype == out_dtype
         want.backward(grad_out)
 
         if tp_world == 1:
@@ -1005,19 +1046,30 @@ class TestRLUtils:
             got = rl_utils.vocab_parallel_selective_log_softmax(
                 *_vp_view(local, tokens, sliced), chunk_tokens=chunk_tokens
             )
+            with torch.no_grad():  # the first sequence alone, for the batch-invariance check
+                prefix = rl_utils.vocab_parallel_selective_log_softmax(
+                    *_vp_view(local[:1], tokens[:1], sliced), chunk_tokens=chunk_tokens
+                )
             got.backward(grad_out)
             torch.testing.assert_close(local.detach(), logits)  # forward must not mutate the input
-            shards = {0: (got.detach(), local.grad)}
+            shards = {0: (got.detach(), local.grad, prefix)}
         else:
-            case = (dtype, chunk_tokens, sliced)
+            case = (dtype, chunk_tokens, sliced, batch_invariant)
             shards = {rank: results[case] for rank, results in vp_tp2_results.items()}
+            # The cross-rank combine is deterministic and identical on every rank, so the ranks
+            # must agree bitwise, not merely within tolerance.
+            assert torch.equal(shards[0][0], shards[1][0])
 
         partition = logits.size(-1) // len(shards)
-        for rank, (got, grad) in shards.items():
-            assert got.dtype == dtype
-            torch.testing.assert_close(got.float(), want.float(), atol=atol, rtol=atol)
+        for rank, (got, grad, prefix) in shards.items():
+            # Batch invariance: a sequence's logprobs do not depend on what else is in the batch.
+            assert torch.equal(got[:1], prefix)
+            assert got.dtype == out_dtype
+            torch.testing.assert_close(got.float(), want.float(), atol=out_atol, rtol=out_atol)
             want_grad = reference.grad[..., rank * partition : (rank + 1) * partition]
-            torch.testing.assert_close(grad.float(), want_grad.float(), atol=atol, rtol=atol)
+            torch.testing.assert_close(
+                grad.float(), want_grad.float(), atol=grad_atol, rtol=grad_atol
+            )
             if sliced:
                 assert torch.all(grad[:, -1, :] == 0)
 
