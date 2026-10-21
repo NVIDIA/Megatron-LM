@@ -19,6 +19,7 @@ from torch import Tensor
 from megatron.core.quantization import indexer_quantization
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_deepgemm_scorer,
     dsa_deepselect_topk,
     dsa_indexer_loss,
     dsa_layout,
@@ -253,6 +254,20 @@ _MXFP8_SCORER_WRAPPER_PARAMETERS = (
 _MXFP8_SF_VEC_SIZE = 32
 # cuDNN's sparse indexer score recompute tiles the top-k by 128 keys.
 _SPARSE_INDEXER_RECOMPUTE_TOPK_ALIGNMENT = 128
+# Row granularity of DeepGEMM scorer chunks (see _deepgemm_row_chunks).
+_DEEPGEMM_CHUNK_ROW_ALIGNMENT = 128
+# Transformer Engine's MXFP8 cast launches one grid row (y block) per 64 rows of 128 elements,
+# and CUDA caps a grid's y dimension at 65535, so one cast takes at most 65535 * 64 such rows:
+# 65535 query rows with 64 indexer heads, 131070 with 32 (on GB300 a 65536-row x 64-head Q
+# raised "CUDA Error: invalid argument" in quantize_mxfp8.cuh). That is TE's generic cast
+# kernel, the one the GB300 container's TE 2.16.0.dev0 (01aef4fc) runs by default. Its
+# specialized rowwise cast-only kernel takes 4 rows per y block (at most 262140 rows of 128,
+# 8191 query rows with 32 heads, below one 1M-token K): that TE runs it only with
+# ENABLE_CAST_ONLY=1 and without a grid-fit check, so a run that sets it fails at such sizes
+# (newer TE checks the grid and keeps the generic kernel). Nothing in these paths sets it. The
+# cuDNN MXFP8 scorer, the DeepGEMM path's fallback, casts the whole Q of a call, so it takes at
+# most 131070 query rows with 32 heads (65535 with 64); the GLM-5.2 recipes have up to 16384.
+_TE_MXFP8_CAST_MAX_ROWS = 65535 * 64
 
 
 @dataclass(frozen=True)
@@ -275,11 +290,19 @@ class IndexerScorerOptions:
         topk_backend: Kernel of the non-deterministic top-k over the scores, ``'cudnn'`` or
             ``'deepselect'`` (``dsa_indexer_topk_backend``). DeepSelect runs only where
             :func:`dsa_deepselect_topk.fallback_reason` allows it; other calls use cuDNN.
+        scorer_backend: Kernel of the MXFP8 selection scorer, ``'cudnn'`` or ``'deepgemm'``
+            (``dsa_indexer_scorer_backend``; ``'deepgemm'`` needs ``precision='mxfp8'``).
+            ``'deepgemm'`` scores the general packed THD path with DeepGEMM's BF16 logits
+            where :func:`_deepgemm_scorer_fallback_reason` allows it, else with the cuDNN
+            MXFP8 scorer. It changes only which kernel selects: the selected scores returned
+            for the indexer loss follow ``precision`` (recomputed from the BF16 Q/K/weights
+            for ``'mxfp8'``, :func:`_selected_scores_for_indexer_loss`) whichever ran.
     """
 
     skip_masked_score_fill: bool = False
     precision: str = "bf16"
     topk_backend: str = "cudnn"
+    scorer_backend: str = "cudnn"
 
 
 def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> IndexerScorerOptions:
@@ -288,6 +311,7 @@ def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> Indexe
         skip_masked_score_fill=bool(getattr(config, "dsa_indexer_skip_masked_score_fill", False)),
         precision=str(getattr(config, "dsa_indexer_precision", "bf16")),
         topk_backend=getattr(config, "dsa_indexer_topk_backend", "cudnn") or "cudnn",
+        scorer_backend=getattr(config, "dsa_indexer_scorer_backend", "cudnn") or "cudnn",
     )
 
 
@@ -1461,6 +1485,12 @@ def _indexer_topk_packed_thd(
     (:func:`_selected_scores_for_indexer_loss`): the BF16 scorer's own values, or, for
     ``scorer_options.precision == 'mxfp8'``, the selected keys' scores recomputed in FP32
     from the BF16 inputs.
+
+    With ``scorer_options.scorer_backend == 'deepgemm'`` an eligible call
+    (:func:`_deepgemm_scorer_fallback_reason`) is scored by DeepGEMM instead
+    (:func:`_indexer_topk_packed_thd_deepgemm`), any other one by the cuDNN MXFP8 scorer
+    below. The backend decides only which kernel selects; the loss-score rule above does not
+    depend on it.
     """
     if scorer_options is None:
         scorer_options = IndexerScorerOptions()
@@ -1481,7 +1511,10 @@ def _indexer_topk_packed_thd(
         local_packed_cp_query_len=local_packed_cp_query_len,
     ):
         raise RuntimeError("general packed THD scorer received incompatible layout metadata")
-    topk_indices, selection_scores = _indexer_topk_packed_thd_cudnn(
+    max_score_k = _packed_thd_score_width(
+        cp_size=cp_size, cp_rank=cp_rank, packed_max_seqlen_k=packed_max_seqlen_k
+    )
+    common = dict(
         q_bshd=q_bshd,
         k_bshd=k_bshd,
         w_bsh=w_bsh,
@@ -1490,14 +1523,28 @@ def _indexer_topk_packed_thd(
         starts=starts,
         ends=ends,
         packed_cu_seqlens_q=packed_cu_seqlens_q,
-        packed_cu_seqlens_k=packed_cu_seqlens_k,
-        packed_max_seqlen_q=packed_max_seqlen_q,
-        packed_max_seqlen_k=packed_max_seqlen_k,
         cp_size=cp_size,
-        cp_rank=cp_rank,
-        deterministic=deterministic,
+        max_score_k=max_score_k,
         scorer_options=scorer_options,
     )
+    use_deepgemm = False
+    if scorer_options.scorer_backend == "deepgemm":
+        reason = _deepgemm_scorer_fallback_reason(
+            q_bshd, k_bshd, w_bsh, deterministic=deterministic
+        )
+        dsa_deepgemm_scorer.log_scorer_backend_once(reason)
+        use_deepgemm = reason is None
+    if use_deepgemm:
+        topk_indices, selection_scores = _indexer_topk_packed_thd_deepgemm(**common)
+    else:
+        topk_indices, selection_scores = _indexer_topk_packed_thd_cudnn(
+            **common,
+            packed_cu_seqlens_k=packed_cu_seqlens_k,
+            packed_max_seqlen_q=packed_max_seqlen_q,
+            packed_max_seqlen_k=packed_max_seqlen_k,
+            cp_rank=cp_rank,
+            deterministic=deterministic,
+        )
     topk_indices, topk_scores = _selected_scores_for_indexer_loss(
         topk_indices,
         selection_scores,
@@ -1511,6 +1558,18 @@ def _indexer_topk_packed_thd(
         precision=scorer_options.precision,
     )
     return _pad_topk_result(topk_indices, topk_scores, topk_k)
+
+
+def _packed_thd_score_width(*, cp_size: int, cp_rank: int, packed_max_seqlen_k: int) -> int:
+    """Host bound on every row's key range of the general packed THD scorer.
+
+    At CP1 the longest sequence. At CP>1 the longest segment prefix: the front segment of
+    rank ``r`` sees ``(r + 1) * half`` keys of its sequence, the back one ``L - r * half``.
+    """
+    if cp_size == 1:
+        return packed_max_seqlen_k
+    max_k_half = packed_max_seqlen_k // (2 * cp_size)
+    return max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
 
 
 def _indexer_topk_packed_thd_cudnn(
@@ -1528,6 +1587,7 @@ def _indexer_topk_packed_thd_cudnn(
     packed_max_seqlen_k: int,
     cp_size: int,
     cp_rank: int,
+    max_score_k: int,
     deterministic: bool,
     scorer_options: IndexerScorerOptions,
 ) -> Tuple[Tensor, Optional[Tensor]]:
@@ -1547,7 +1607,6 @@ def _indexer_topk_packed_thd_cudnn(
         score_cu_q = packed_cu_seqlens_q
         score_cu_k = packed_cu_seqlens_k
         max_score_q = packed_max_seqlen_q
-        max_score_k = packed_max_seqlen_k
     else:
         segment_divisor = 2 * cp_size
         layout = dsa_layout.build_packed_cp_indexer_layout(
@@ -1567,8 +1626,6 @@ def _indexer_topk_packed_thd_cudnn(
             (layout.segment_k_lengths - layout.segment_q_lengths).to(dtype=torch.int32).contiguous()
         )
         max_score_q = packed_max_seqlen_q // segment_divisor
-        max_k_half = packed_max_seqlen_k // segment_divisor
-        max_score_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
 
     skip_fill = scorer_options.skip_masked_score_fill and _supports_indexer_clean_logits()
     if scorer_options.skip_masked_score_fill and not skip_fill:
@@ -1778,6 +1835,250 @@ def _recompute_selected_indexer_log_probs(
     )["predict"][..., :n_selected]
     log_probs = torch.log(predict.float().clamp_min(_CLIP_PROB_MIN))
     return torch.where(topk_indices >= 0, log_probs, torch.full_like(log_probs, float("-inf")))
+
+
+def _packed_thd_row_lengths(
+    starts: Tensor,
+    ends: Tensor,
+    packed_cu_seqlens_q: Tensor,
+    *,
+    cp_size: int,
+    num_rows: int,
+    width: int,
+) -> Tensor:
+    """Per-row key count ``[starts, starts + length)`` the DeepGEMM scorer covers (int32).
+
+    Rows inside a packed segment get ``min(ends - starts, width)``: their causal key range,
+    which equals the cuDNN scorer's per-row column limit (front segment of CP rank ``r``:
+    offset ``r * half``; back segment: ``L - r * half - half``; both give the query's
+    position in its sequence plus one). Rows past the covered rows (``cu_q[-1]`` at CP1,
+    ``2 * sum(len // (2 * cp))`` at CP>1) belong to no segment and get 0, as on the
+    skip-fill cuDNN path; their ``ks = ke = starts`` (``cu_q[-1]``) can only widen the key
+    span of the one DeepGEMM query block that straddles the covered boundary. Device ops
+    only; ``width`` is a host bound.
+    """
+    cu_q = packed_cu_seqlens_q.to(device=starts.device, dtype=torch.int64)
+    if cp_size == 1:
+        covered = cu_q[-1]
+    else:
+        covered = 2 * torch.div(cu_q[1:] - cu_q[:-1], 2 * cp_size, rounding_mode="floor").sum()
+    rows = torch.arange(num_rows, dtype=torch.int64, device=starts.device)
+    lengths = (ends.to(torch.int64) - starts.to(torch.int64)).clamp(min=0, max=width)
+    return torch.where(rows < covered, lengths, torch.zeros_like(lengths)).to(torch.int32)
+
+
+def _deepgemm_scorer_fallback_reason(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, *, deterministic: bool
+) -> Optional[str]:
+    """Why this call cannot use the DeepGEMM scorer (``None`` if it can); host facts only.
+
+    Adds the runtime deterministic flag, the cuDNN frontend and the JIT state to
+    :func:`dsa_deepgemm_scorer.static_fallback_reason`. The frontend must have the radix
+    top-k out-of-bounds lane guard (>= 1.29), as for the skip-fill scorer: DeepGEMM leaves
+    the logits past each row's length unwritten, and a call DeepSelect does not take is read
+    by cuDNN's top-k. The rule holds for every call, so a run with dynamic CP never switches
+    scorers between batches. A cold specialization is warmed up here on the first eager call;
+    inside CUDA graph capture it raises instead, before any deep_gemm call. A device other
+    than the first one this process ran DeepGEMM on falls back (one DeepGEMM device per
+    process, :mod:`dsa_deepgemm_scorer`).
+    """
+    num_heads, head_dim = q_bshd.size(2), q_bshd.size(3)
+    reason = dsa_deepgemm_scorer.static_fallback_reason(
+        device=q_bshd.device,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        q_dtype=q_bshd.dtype,
+        k_dtype=k_bshd.dtype,
+        w_dtype=w_bsh.dtype,
+        deterministic=bool(deterministic or torch.are_deterministic_algorithms_enabled()),
+    )
+    if reason is None and not _cudnn_frontend_at_least(_TOPK_OOB_LANE_GUARD_FE_VERSION):
+        reason = (
+            f"cuDNN frontend {_cudnn_frontend_version()} is older than 1.29: its top-k lacks "
+            "the out-of-bounds lane guard that reading DeepGEMM's logits needs"
+        )
+    if reason is None:
+        reason = dsa_deepgemm_scorer.jit_problem(q_bshd.device, num_heads, head_dim)
+    return reason
+
+
+def _deepgemm_quantized_q(q_rows: Tensor) -> Tuple[Tensor, Tensor]:
+    """TE MXFP8 Q ``[rows, H, 128]`` with packed UE8M0 scales ``[rows, H]`` of one call's rows.
+
+    Quantized per DeepGEMM call (row chunk): one TE MXFP8 cast takes at most
+    :data:`_TE_MXFP8_CAST_MAX_ROWS` // H query rows, which every chunk of
+    :func:`_deepgemm_row_chunks` respects.
+    """
+    return indexer_quantization.quantize_indexer_mxfp8_packed_ue8m0(q_rows.contiguous())
+
+
+def _deepgemm_quantized_k(k_bshd: Tensor) -> Tuple[Tensor, Tensor]:
+    """TE MXFP8 K ``[sk, 128]`` with packed UE8M0 scales ``[sk]``, shared by every row chunk.
+
+    One cast, so at most :data:`_TE_MXFP8_CAST_MAX_ROWS` (4194240) keys; the 1M-token recipes
+    gather 1048576.
+    """
+    return indexer_quantization.quantize_indexer_mxfp8_packed_ue8m0(k_bshd[0, :, 0].contiguous())
+
+
+def _deepgemm_packed_thd_logits(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, ks: Tensor, ke: Tensor, width: int
+) -> Tensor:
+    """DeepGEMM BF16 logits ``[sq, width]`` of the packed THD rows over the original K.
+
+    One DeepGEMM call, so at most :func:`dsa_deepgemm_scorer.max_rows_per_call` rows.
+    """
+    q_fp8, q_scale = _deepgemm_quantized_q(q_bshd[0])
+    k_fp8, k_scale = _deepgemm_quantized_k(k_bshd)
+    return dsa_deepgemm_scorer.mqa_logits(
+        q_fp8, q_scale, k_fp8, k_scale, w_bsh[0].contiguous(), ks, ke, max_seqlen_k=width
+    )
+
+
+def _deepgemm_row_chunks(n_rows: int, num_heads: int) -> list[tuple[int, int]]:
+    """Row ranges of at most one DeepGEMM call and one TE MXFP8 cast of Q each.
+
+    DeepGEMM takes at most :func:`dsa_deepgemm_scorer.max_rows_per_call` rows per call
+    (116208 with 32 heads, 58104 with 64) and TE's cast at most
+    :data:`_TE_MXFP8_CAST_MAX_ROWS` // ``num_heads`` (131070, 65535); the smaller one bounds
+    a chunk. One range when the rows fit, else ranges starting at multiples of
+    :data:`_DEEPGEMM_CHUNK_ROW_ALIGNMENT`, which keeps every row slice of Q, its scales, the
+    weights and ``ks``/``ke`` 16-byte aligned for DeepGEMM's TMA descriptors.
+    """
+    limit = min(
+        dsa_deepgemm_scorer.max_rows_per_call(num_heads), _TE_MXFP8_CAST_MAX_ROWS // num_heads
+    )
+    if n_rows <= limit:
+        return [(0, n_rows)]
+    step = limit // _DEEPGEMM_CHUNK_ROW_ALIGNMENT * _DEEPGEMM_CHUNK_ROW_ALIGNMENT
+    return [(start, min(start + step, n_rows)) for start in range(0, n_rows, step)]
+
+
+def _deepgemm_logits_topk(
+    logits: Tensor, lengths: Tensor, topk_k: int, topk_backend: str
+) -> Tuple[Tensor, Tensor]:
+    """Local top-k indices (int32) and BF16 values of DeepGEMM logits ``[rows, width]``.
+
+    The backend is chosen once, on the tensor it will read. DeepSelect reads the logits in
+    place when :func:`dsa_deepselect_topk.fallback_reason` allows it. Otherwise cuDNN's BF16
+    radix top-k reads the compact full-row view (it is compiled for compact rows), and its
+    out-of-bounds lane guard (frontend >= 1.29, required by
+    :func:`_deepgemm_scorer_fallback_reason`) keeps it inside each row's length, so the
+    unwritten columns are never read. The values are always returned.
+    """
+    backend, scores = "cudnn", dsa_deepgemm_scorer.full_row_view(logits)
+    if topk_backend == "deepselect":
+        reason = dsa_deepselect_topk.fallback_reason(logits, lengths, topk_k, False)
+        if reason is None:
+            backend, scores = "deepselect", logits
+        else:
+            dsa_deepselect_topk.log_topk_backend_once(topk_backend, reason, logits.dtype)
+    result = _indexer_top_k_wrapper_chunked(
+        scores,
+        lengths,
+        topk_k=topk_k,
+        return_topk_scores=True,
+        deterministic=False,
+        topk_backend=backend,
+    )
+    if result["values"] is None:
+        raise RuntimeError("the DSA top-k did not return the selected values.")
+    return result["indices"], result["values"]
+
+
+def _indexer_topk_packed_thd_deepgemm(
+    *,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    w_bsh: Tensor,
+    topk_k: int,
+    return_topk_scores: bool,
+    starts: Tensor,
+    ends: Tensor,
+    packed_cu_seqlens_q: Tensor,
+    cp_size: int,
+    max_score_k: int,
+    scorer_options: IndexerScorerOptions,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """DeepGEMM MXFP8 scorer + BF16 top-k of :func:`_indexer_topk_packed_thd`.
+
+    Row ``r`` is scored over keys ``[ks, ke)`` = ``[starts, starts + length)`` of the
+    original K (:func:`_packed_thd_row_lengths`), so a selected column ``t`` restores to the
+    global key ``ks + t``, exactly what the cuDNN path returns (``topk_indices + starts``).
+    No duplicated-prefix K pool is built. The top-k always asks for the selected values, so
+    an indices-only call (a checkpoint's first call) and a call that keeps the scores (its
+    replay) run the identical top-k invocation on bitwise-identical logits; the values only
+    mark non-finite selections for the caller. Each call's top-k backend is chosen once
+    (:func:`_deepgemm_logits_topk`). Calls of more rows than one DeepGEMM call or one TE
+    MXFP8 cast of Q takes (:func:`_deepgemm_row_chunks`, never reached by the GLM-5.2
+    recipes' 4096 or 16384 rows per rank) are quantized, scored and selected in row chunks;
+    rows are independent in all three, so only the outputs are copied together. K is
+    quantized once for all chunks.
+
+    Returns global top-k indices ``(1, sq, min(topk_k, max_score_k))`` and, when
+    ``return_topk_scores``, the selected BF16 logits in the same slots (both unpadded).
+    """
+    sq = q_bshd.size(1)
+    sk = k_bshd.size(1)
+    device = q_bshd.device
+    width = max_score_k
+    lengths = _packed_thd_row_lengths(
+        starts, ends, packed_cu_seqlens_q, cp_size=cp_size, num_rows=sq, width=width
+    )
+    ks = starts.clamp(min=0, max=sk).to(torch.int32).contiguous()
+    ke = (ks + lengths).contiguous()
+    score_topk = min(topk_k, width)
+    every_key = score_topk == width
+    if every_key:
+        # Every in-row key is selected: no ranking. The logits are needed only to mark
+        # non-finite selections when the scores are kept.
+        columns = torch.arange(width, dtype=torch.int32, device=device).view(1, width)
+        every_key_indices = torch.where(
+            columns < lengths.view(sq, 1), columns + ks.view(sq, 1), torch.full_like(columns, -1)
+        ).view(1, sq, width)
+        if not return_topk_scores:
+            return every_key_indices, None
+
+    chunks = _deepgemm_row_chunks(sq, q_bshd.size(2))
+    k_fp8, k_scale = _deepgemm_quantized_k(k_bshd)
+    w = w_bsh[0].contiguous()
+    local_indices: Optional[Tensor] = None
+    values: Optional[Tensor] = None
+    if len(chunks) > 1:
+        values = torch.empty((sq, score_topk), dtype=torch.bfloat16, device=device)
+        if not every_key:
+            local_indices = torch.empty((sq, score_topk), dtype=torch.int32, device=device)
+    for row_start, row_end in chunks:
+        rows = slice(row_start, row_end)
+        q_fp8, q_scale = _deepgemm_quantized_q(q_bshd[0, rows])
+        logits = dsa_deepgemm_scorer.mqa_logits(
+            q_fp8, q_scale, k_fp8, k_scale, w[rows], ks[rows], ke[rows], max_seqlen_k=width
+        )
+        del q_fp8, q_scale
+        if every_key:
+            chunk_indices, chunk_values = None, logits
+        else:
+            chunk_indices, chunk_values = _deepgemm_logits_topk(
+                logits, lengths[rows], score_topk, scorer_options.topk_backend
+            )
+        del logits
+        if len(chunks) == 1:
+            local_indices, values = chunk_indices, chunk_values
+        else:
+            values[rows].copy_(chunk_values)
+            if chunk_indices is not None:
+                local_indices[rows].copy_(chunk_indices)
+        del chunk_indices, chunk_values
+
+    if every_key:
+        return every_key_indices, values.unsqueeze(0)
+    local_indices = local_indices.view(1, sq, score_topk)
+    topk_indices = torch.where(
+        local_indices >= 0, local_indices + ks.view(1, sq, 1), torch.full_like(local_indices, -1)
+    )
+    if not return_topk_scores:
+        return topk_indices, None
+    return topk_indices, values.view(1, sq, score_topk)
 
 
 # cuDNN's SM100 scorer binds a caller ``out`` directly only when its row width is a multiple of
@@ -2902,6 +3203,16 @@ def _check_scorer_precision_supported(
 ) -> None:
     """Reject a requested scorer precision that this call's scoring path cannot honour."""
     precision = scorer_options.precision
+    if scorer_options.scorer_backend not in dsa_deepgemm_scorer.SCORER_BACKENDS:
+        raise ValueError(
+            f"dsa_indexer_scorer_backend must be one of {dsa_deepgemm_scorer.SCORER_BACKENDS}, "
+            f"got {scorer_options.scorer_backend!r}"
+        )
+    if scorer_options.scorer_backend == "deepgemm" and precision != "mxfp8":
+        raise ValueError(
+            "dsa_indexer_scorer_backend='deepgemm' is the MXFP8 selection scorer; set "
+            f"dsa_indexer_precision='mxfp8', got {precision!r}"
+        )
     if precision == "bf16":
         return
     if precision != "mxfp8":
