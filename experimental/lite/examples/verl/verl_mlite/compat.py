@@ -1519,13 +1519,19 @@ def _patch_verl_val_max_tokens() -> bool:
     worker_cls = getattr(mod, "AgentLoopWorker", None)
     if worker_cls is None or getattr(worker_cls._run_agent_loop, "_verl_mlite_val_cap", False):
         return worker_cls is not None
-    orig = worker_cls._run_agent_loop
+    # Ray serializes patched worker methods. Capturing the replaced method in a
+    # closure serializes its globals by value, including the driver's empty agent
+    # registry. Resolve the original from the worker's canonical module instead.
+    mod._verl_mlite_uncapped_run_agent_loop = worker_cls._run_agent_loop
     cap = int(limit)
 
     async def _run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
         if trajectory.get("validate"):
             sampling_params = {**sampling_params, "max_tokens": cap}
-        return await orig(self, sampling_params, trajectory, *args, **kwargs)
+        module = importlib.import_module("verl.experimental.agent_loop.agent_loop")
+        return await module._verl_mlite_uncapped_run_agent_loop(
+            self, sampling_params, trajectory, *args, **kwargs
+        )
 
     _run_agent_loop._verl_mlite_val_cap = True
     worker_cls._run_agent_loop = _run_agent_loop
