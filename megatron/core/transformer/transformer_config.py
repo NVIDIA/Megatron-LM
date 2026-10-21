@@ -2438,12 +2438,8 @@ class TransformerConfig(ModelParallelConfig):
                     "use_transformer_engine_op_fuser=True or moe_use_grouped_tensor=True."
                 )
             if self.moe_pad_expert_input_to_capacity:
-                # Two capacity mechanisms over one dispatch. Pad-to-capacity fixes the
-                # per-expert counts at capacity in setup_metadata, while the rank budget asks
-                # the backend for the counts it actually received, and the dispatch then has
-                # two answers for tokens_per_expert with nothing choosing between them. RAISE
-                # rather than assert: picking the wrong one mis-sizes the expert GEMM segments,
-                # which is silent, and PYTHONOPTIMIZE=1 strips asserts.
+                # RAISE, not assert: the two give tokens_per_expert two answers, and picking
+                # the wrong one mis-sizes the GEMM segments silently. PYTHONOPTIMIZE strips asserts.
                 raise ValueError(
                     "moe_expert_rank_capacity_factor and moe_pad_expert_input_to_capacity are "
                     "two capacity mechanisms for the same dispatch and cannot be combined: the "
@@ -2602,11 +2598,8 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
-        # moe_ep_chunk_overlap refusals that are decidable from the config alone. Deliberately
-        # AFTER the moe_layer_recompute normalization above, which appends 'moe' to
-        # recompute_modules, so that route into the refused state is covered too. RAISE rather
-        # than assert: each of these guards the chunked wgrad FIFO, whose misordering is silent,
-        # and PYTHONOPTIMIZE=1 strips asserts.
+        # moe_ep_chunk_overlap refusals from the config alone, AFTER the recompute_modules
+        # normalization so that route in is covered. RAISE: silent failures, and -O strips asserts.
         if self.moe_ep_chunk_overlap:
             if self.recompute_granularity == 'full':
                 raise ValueError(
@@ -2623,6 +2616,16 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_paged_stash:
                 raise ValueError("moe_ep_chunk_overlap does not support moe_paged_stash.")
+            # The runtime takes router_topk and num_experts unscaled while the dispatch manager
+            # scales both by ETP, so the capacity would be short and the pin would hide it.
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "moe_ep_chunk_overlap does not support expert_tensor_parallel_size > 1, got "
+                    f"{self.expert_tensor_parallel_size}: the chunk capacity is derived from an "
+                    "unscaled moe_router_topk while the dispatch manager scales it by the "
+                    "expert-tensor-parallel size, so the dispatch would be sized short and the "
+                    "pinned permuted-token count would stop check_dispatch_capacity seeing it."
+                )
 
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:

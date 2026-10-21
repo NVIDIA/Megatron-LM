@@ -654,7 +654,7 @@ class MoELayer(BaseMoELayer):
             else:
                 shared_expert_output = apply_module(self.shared_experts)(hidden_states)
         elif self.use_shared_expert and self._ep_chunk_overlap_active():
-            # The dispatcher that normally drives these five steps is never entered here,.
+            # The dispatcher that normally drives these five steps is never entered here.
             self.shared_experts.pre_forward_comm(hidden_states)
             self.shared_experts.linear_fc1_forward_and_act()
             self.shared_experts.linear_fc2_forward()
@@ -864,7 +864,9 @@ class MoELayer(BaseMoELayer):
         if routed_experts:
             if self.moe_ep_chunk_overlap is not None:
                 raise NotImplementedError(
-                    "MoELayer.backward_dw() is not supported with moe_ep_chunk_overlap: "
+                    "MoELayer.backward_dw() is not supported with moe_ep_chunk_overlap: the "
+                    "chunked schedule drains the expert weight gradients itself, in FIFO order, "
+                    "through run_chunk_wgrad, and a second drain here would reorder them."
                 )
             self.experts.backward_dw()
             if self.config.moe_latent_size and self.config.overlap_moe_expert_parallel_comm:
