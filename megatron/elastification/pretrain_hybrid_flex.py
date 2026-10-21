@@ -61,6 +61,8 @@ from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_l
 
 # modelopt distillation
 try:
+    import modelopt.torch.distill.plugins.megatron as _modelopt_megatron  # noqa: F401
+
     from megatron.elastification.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.model_config import (

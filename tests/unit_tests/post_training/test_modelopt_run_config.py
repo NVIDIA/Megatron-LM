@@ -9,6 +9,7 @@ from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
 from megatron.post_training import utils as modelopt_utils
 from megatron.training.argument_utils import (
+    inference_cfg_container_from_args,
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
@@ -205,6 +206,43 @@ def test_inference_uses_config_without_cli_enable_flag():
     legacy_builder.assert_not_called()
     build.assert_called_once_with(cfg)
     assert loaded == [[stage]]
+
+
+@pytest.mark.parametrize(
+    "hybrid,builder_cls", [(False, GPTModelBuilder), (True, HybridModelBuilder)]
+)
+def test_checkpoint_detected_inference_defaults_unregistered_modelopt_options(hybrid, builder_cls):
+    """Checkpoint detection works for callers that did not register ModelOpt CLI flags."""
+    from megatron.inference import utils
+
+    args = make_modelopt_test_args(hybrid_layer_pattern="M*" if hybrid else None)
+    args.load = "/modelopt-checkpoint"
+    for name in (
+        "export_offline_model",
+        "freeze_base_for_mtp",
+        "export_default_te_spec",
+        "export_force_local_attention",
+        "export_real_quant_cfg",
+    ):
+        delattr(args, name)
+    original_args = vars(args).copy()
+    cfg = inference_cfg_container_from_args(args, model_cfg=None, build_model_config=False)
+    stage = Mock()
+
+    with (
+        patch.object(utils, "get_args", return_value=args),
+        patch("megatron.training.global_vars.get_run_config", return_value=cfg),
+        patch("megatron.training.global_vars.is_run_config_initialized", return_value=True),
+        patch.object(utils, "should_use_modelopt_config", return_value=True),
+        patch.object(mc, "build_inference_models", return_value=[stage]) as build,
+        patch.object(utils, "load_checkpoint"),
+    ):
+        assert utils.get_model_for_inference() is stage
+
+    assert cfg.model.get_builder_cls() is builder_cls
+    assert cfg.model.transformations == mc.ModelTransformConfig()
+    assert vars(args) == original_args
+    build.assert_called_once_with(cfg)
 
 
 def test_inference_rejects_custom_pg_collection_for_checkpoint_detected_modelopt():

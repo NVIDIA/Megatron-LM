@@ -173,6 +173,9 @@ def modelopt_model_config_from_args(
         disable_moe_grouped_gemm: See ``apply_modelopt_model_config``.
         vocab_size_from_tokenizer: See ``gpt_config_from_args``.
     """
+    # Reject this before the stock translators try to import a spec that ModelOpt cannot use.
+    if args.spec is not None:
+        raise ValueError("ModelOpt integration does not support custom args.spec.")
     config_from_args = hybrid_config_from_args if _is_hybrid_from_args(args) else gpt_config_from_args
     model_config = config_from_args(args, vocab_size_from_tokenizer=vocab_size_from_tokenizer)
     return apply_modelopt_model_config(
@@ -207,7 +210,9 @@ def apply_modelopt_model_config(
         raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
     _check_model_type(model_config, args)
 
-    if not isinstance(model_config, HybridModelConfig) and args.export_offline_model:
+    if not isinstance(model_config, HybridModelConfig) and getattr(
+        args, "export_offline_model", False
+    ):
         transformer_config = model_config.transformer
         # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
         transformer_config.original_num_layers = transformer_config.num_layers
@@ -217,7 +222,7 @@ def apply_modelopt_model_config(
         # TODO: DSR1 MTP may require SP
         transformer_config.sequence_parallel = False
     qad_train_target = getattr(args, 'qad_train_target', None)
-    if args.freeze_base_for_mtp:
+    if getattr(args, "freeze_base_for_mtp", False):
         if qad_train_target not in (None, 'mtp'):
             raise ValueError(
                 "--freeze-base-for-mtp is an alias for --qad-train-target mtp and "
@@ -225,9 +230,9 @@ def apply_modelopt_model_config(
             )
         qad_train_target = 'mtp'
     model_config.transformations = ModelTransformConfig(
-        default_te_spec=args.export_default_te_spec,
-        force_local_attention=args.export_force_local_attention,
-        real_quant_cfg=args.export_real_quant_cfg,
+        default_te_spec=getattr(args, "export_default_te_spec", False),
+        force_local_attention=getattr(args, "export_force_local_attention", False),
+        real_quant_cfg=getattr(args, "export_real_quant_cfg", "None"),
         moe_grouped_gemm=not disable_moe_grouped_gemm,
         qad_train_target=qad_train_target,
         lsq_scale_lr=getattr(args, "lsq_scale_lr", None),
