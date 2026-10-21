@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model and data parallel groups."""
 
@@ -2792,6 +2792,9 @@ def destroy_model_parallel():
 
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None
+
+    global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
     global _DYNAMIC_DP_CP_GROUPS
     _DYNAMIC_DP_CP_GROUPS = {}
