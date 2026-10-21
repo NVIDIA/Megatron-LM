@@ -179,6 +179,12 @@ class TestTraining:
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
 
+    def test_build_train_valid_test_data_iterators_with_explicit_container(self, run_config):
+        train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
+            mock_train_valid_test_datasets_provider, cfg_container=run_config
+        )
+        assert (next(train_iter), next(valid_iter), next(test_iter)) == (1, 2, 3)
+
     def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
         args = SimpleNamespace(
             log_params_norm=True, log_interval=20, tensorboard_dir=None, tensorboard_log_interval=1

@@ -4,6 +4,7 @@
 mirrors the container writes, the lifecycle and the serialization."""
 
 import copy
+import functools
 import json
 from argparse import ArgumentParser, Namespace
 from types import SimpleNamespace
@@ -615,3 +616,79 @@ def test_runtime_services_prepare_a_finalized_dataset_config(
     assert not unbound.data.dataset.is_prepared
     with pytest.raises(RuntimeError, match="not prepared"):
         unbound.data.dataset_build()
+
+
+# The data builders hand the data section to providers that declare it (and only to those).
+
+
+def _recording_providers():
+    calls = []
+
+    def plain(train_valid_test_num_samples):
+        calls.append(("plain", train_valid_test_num_samples, {}))
+        return (1, 2, 3)
+
+    def declared(train_valid_test_num_samples, vp_stage=None, *, data_config=None):
+        calls.append(
+            (
+                "declared",
+                train_valid_test_num_samples,
+                dict(vp_stage=vp_stage, data_config=data_config),
+            )
+        )
+        return (1, 2, 3)
+
+    def kwargs_only(train_valid_test_num_samples, **kwargs):
+        calls.append(("kwargs", train_valid_test_num_samples, kwargs))
+        return (1, 2, 3)
+
+    return calls, plain, declared, kwargs_only
+
+
+def test_declared_provider_keywords():
+    from megatron.training.training import _declared_provider_keywords as declared_keywords
+
+    _, plain, declared, kwargs_only = _recording_providers()
+    names = ("data_config",)
+    assert declared_keywords(plain, names) == ()
+    assert declared_keywords(kwargs_only, names) == ()
+    assert declared_keywords(declared, names) == names
+    assert declared_keywords(functools.partial(declared, vp_stage=1), names) == names
+    assert declared_keywords(functools.partial(declared, data_config="bound"), names) == ()
+
+    def positional_or_keyword(train_valid_test_num_samples, data_config=None):
+        return None
+
+    def positional_only(train_valid_test_num_samples, data_config=None, /):
+        return None
+
+    assert declared_keywords(positional_or_keyword, names) == names
+    assert declared_keywords(positional_only, names) == ()
+    assert declared_keywords(42, names) == ()
+
+
+def test_builders_pass_the_data_section_only_to_providers_that_declare_it(monkeypatch, run_config):
+    from megatron.training.training import build_train_valid_test_datasets
+
+    calls, plain, declared, kwargs_only = _recording_providers()
+    counts = (10, 20, 30)
+    for provider in (plain, kwargs_only, declared):
+        assert build_train_valid_test_datasets(provider, counts, cfg_container=run_config) == (
+            1,
+            2,
+            3,
+        )
+    assert calls[0] == ("plain", counts, {})
+    assert calls[1] == ("kwargs", counts, {})
+    assert calls[2] == ("declared", counts, dict(vp_stage=None, data_config=run_config.data))
+    assert calls[2][2]["data_config"] is run_config.data
+    # A partial keeps what it bound.
+    bound = functools.partial(declared, vp_stage=3, data_config="bound")
+    build_train_valid_test_datasets(bound, counts, cfg_container=run_config)
+    assert calls[3][2] == dict(vp_stage=3, data_config="bound")
+    # Without an explicit container the run config is used; without either, nothing is injected.
+    build_train_valid_test_datasets(declared, counts)
+    assert calls[4][2]["data_config"] is run_config.data
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    build_train_valid_test_datasets(declared, counts)
+    assert calls[5][2] == dict(vp_stage=None, data_config=None)
