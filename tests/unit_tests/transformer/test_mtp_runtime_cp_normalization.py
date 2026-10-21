@@ -26,6 +26,7 @@ def _config(num_layers=1, per_token=True):
         calculate_per_token_loss=per_token,
         mtp_detach_heads=False,
         context_parallel_size=1,
+        attention_cp_layout="zigzag",
     )
 
 
@@ -74,7 +75,6 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
         loss_mask=torch.ones(1, 4),
         output_layer=lambda value, **kwargs: (value, None),
         output_weight=None,
-        runtime_gather_output=True,
         is_training=True,
         compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
         config=_config(per_token=per_token),
@@ -175,7 +175,6 @@ def _backward(cp_group, static_group, mask, input_mask, num_layers, derive_label
         mtp_input_mask=input_mask[:, indices] if input_mask is not None else None,
         output_layer=lambda value, **kwargs: (F.linear(value, head), None),
         output_weight=None,
-        runtime_gather_output=True,
         is_training=False,
         compute_language_model_loss=lambda labels, logits: F.cross_entropy(
             logits.transpose(0, 1).reshape(-1, 5), labels.reshape(-1), reduction="none"
