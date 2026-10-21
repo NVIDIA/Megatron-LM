@@ -39,6 +39,7 @@ _SENTINEL = dsa_deepselect_topk.NAN_ROW_SENTINEL
 _DEFAULT_WIDTHS = dict(dsa_deepselect_topk.MIN_SCORE_WIDTH)
 _DEVICE_SUPPORTED = dsa_deepselect_topk._device_supported
 _DEFAULT_MANY_ROWS = dict(dsa_deepselect_topk.MANY_ROWS_MIN_SCORE_WIDTH)
+_DEFAULT_BF16_TABLES = dsa_deepselect_topk.SCORE_WIDTH_TABLES_BY_DTYPE[torch.bfloat16]
 
 
 class _FakeSelect:
@@ -104,25 +105,38 @@ class _FakeSelect:
 
 
 class FakeDsTune(_FakeSelect):
-    """CPU model of the ``ds_tune`` package (configs: FP32 max_topk 2048 and 4096)."""
+    """CPU model of the ``ds_tune`` package.
+
+    Configs: FP32 max_topk 2048 and 4096 (ids 0 and 1), then BF16 max_topk 2048 and 4096.
+    """
 
     __version__ = "0.1.0+fake"
+    _DTYPES = {torch.float32: "fp32", torch.bfloat16: "bf16"}
 
-    def __init__(self, input_align=1024, output_align=32, seed=0, max_topks=(2048, 4096)):
+    def __init__(
+        self,
+        input_align=1024,
+        output_align=32,
+        seed=0,
+        max_topks=(2048, 4096),
+        bf16_max_topks=(2048, 4096),
+    ):
         super().__init__(input_align, output_align, seed)
         self.INPUT_STRIDE_ALIGNMENT_BYTES = input_align
         self.OUTPUT_STRIDE_ALIGNMENT_BYTES = output_align
         self.CONFIGS = [
-            {"id": cfg_id, "dtype": "fp32", "max_topk": max_topk}
-            for cfg_id, max_topk in enumerate(max_topks)
+            {"dtype": dtype, "max_topk": max_topk}
+            for dtype, max_topks_of_dtype in (("fp32", max_topks), ("bf16", bf16_max_topks))
+            for max_topk in max_topks_of_dtype
         ]
+        for cfg_id, config in enumerate(self.CONFIGS):
+            config["id"] = cfg_id
 
     def config_for(self, dtype, k):
-        if dtype != torch.float32:
-            raise ValueError("fp32 only in this fake")
-        fits = [c for c in self.CONFIGS if 0 < k <= c["max_topk"]]
+        name = self._DTYPES.get(dtype)
+        fits = [c for c in self.CONFIGS if c["dtype"] == name and 0 < k <= c["max_topk"]]
         if not fits:
-            raise ValueError(f"no config for k={k}")
+            raise ValueError(f"no {name} config for k={k}")
         return min(fits, key=lambda c: c["max_topk"])
 
     def topk(
@@ -139,7 +153,9 @@ class FakeDsTune(_FakeSelect):
         abort_when_nan_found=False,
     ):
         assert k <= self.CONFIGS[cfg_id]["max_topk"]
+        assert self.CONFIGS[cfg_id]["dtype"] == self._DTYPES[x.dtype], "config of another dtype"
         assert out_val is not None and out_idx is not None and out_idx.dtype == torch.int32
+        assert out_val.dtype == x.dtype
         self._select(
             x,
             k,
@@ -228,6 +244,10 @@ def deepselect(monkeypatch):
         monkeypatch.setattr(dsa_deepselect_topk, "_LOGGED_REASONS", set())
         monkeypatch.setattr(dsa_deepselect_topk, "MIN_SCORE_WIDTH", _widths(64))
         monkeypatch.setattr(dsa_deepselect_topk, "MANY_ROWS_MIN_SCORE_WIDTH", {})
+        # Small test rows: BF16 follows the patched FP32 tables unless a test restores its own.
+        monkeypatch.setattr(
+            dsa_deepselect_topk, "SCORE_WIDTH_TABLES_BY_DTYPE", {torch.bfloat16: None}
+        )
         monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
         return fake
 
@@ -238,9 +258,48 @@ def _no_build(monkeypatch, error="no DeepSelect build: cannot import ds_tune: x"
     monkeypatch.setattr(dsa_deepselect_topk, "_IMPORT_STATE", {"provider": None, "error": error})
 
 
+class AnyDtypeRadixTopK(RadixTopK):
+    """``RadixTopK`` for FP32 and BF16 scores (FE accepts fp32/fp16/bf16).
+
+    BF16 to FP32 is exact and keeps the order, signed zeros and NaN signs, so ranking the FP32
+    copy ranks the BF16 radix keys; the values are gathered from the BF16 input. Like the
+    frontend kernel, it takes only compact row-major scores.
+    """
+
+    def indexer_top_k_wrapper(
+        self,
+        input_values,
+        seq_lens,
+        top_k,
+        next_n=1,
+        return_val=True,
+        num_copy_bits=256,
+        stream=None,
+        tie_break=0,
+    ):
+        assert input_values.is_contiguous(), "the cuDNN top-k is compiled for compact rows"
+        result = super().indexer_top_k_wrapper(
+            input_values.float(),
+            seq_lens,
+            top_k,
+            next_n,
+            return_val,
+            num_copy_bits,
+            stream,
+            tie_break,
+        )
+        if return_val:
+            indices = result["indices"]
+            values = torch.gather(input_values, 1, indices.clamp(min=0).long())
+            result["values"] = torch.where(
+                indices >= 0, values, torch.full_like(values, float("-inf"))
+            )
+        return result
+
+
 @pytest.fixture
 def cudnn_topk(monkeypatch):
-    fake = RadixTopK(seed=3)
+    fake = AnyDtypeRadixTopK(seed=3)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", fake)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_frontend_version", lambda: (1, 31))
     return fake
@@ -274,7 +333,7 @@ def _call(scores, seq_lens, topk_k, return_topk_scores, backend="deepselect", **
 
 
 def _bits(values):
-    return values.contiguous().view(torch.int32)
+    return values.contiguous().view(torch.int16 if values.element_size() == 2 else torch.int32)
 
 
 # --------------------------------------------------------------------------------- eligibility
@@ -303,7 +362,8 @@ def test_static_eligibility_covers_every_requirement(deepselect, monkeypatch, pr
     assert "below 65536" in _static(width=65535)
     assert "below 2**23" in _static(width=2**23)
     assert "no rows" in _static(n_rows=0)
-    assert "FP32" in _static(dtype=torch.bfloat16)
+    assert _static(dtype=torch.bfloat16) is None
+    assert "must be FP32 or BF16" in _static(dtype=torch.float16)
     assert "multiple of 8" in _static(topk_k=2044)
     monkeypatch.setattr(dsa_deepselect_topk, "MIN_SCORE_WIDTH", _widths(64))
     assert "whole row" in _static(width=1024, topk_k=1024)
@@ -658,12 +718,12 @@ def test_nan_repair_torch_fallback_rewrites_only_flagged_rows():
     dsa_deepselect_topk.repair_nan_rows(indices, None, lengths)
 
 
-def _nan_repair_case(seed):
+def _nan_repair_case(seed, dtype=torch.float32):
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randint(0, 1000, (64, 24), generator=generator, dtype=torch.int32)
     flagged = torch.rand((64,), generator=generator) < 0.3
     indices[flagged, 0] = _SENTINEL
-    values = torch.randn((64, 32), generator=generator)[:, :24]
+    values = torch.randn((64, 32), generator=generator).to(dtype)[:, :24]
     lengths = torch.randint(0, 50, (64,), generator=generator, dtype=torch.int32)
     return indices, values, lengths
 
@@ -686,16 +746,24 @@ def test_triton_nan_repair_matches_torch_in_the_interpreter(tmp_path):
                 test_dsa_deepselect_topk as cases,
             )
 
-            for seed in range(3):
-                for with_values in (True, False):
-                    indices, values, lengths = cases._nan_repair_case(seed)
-                    want_i, want_v = indices.clone(), values.clone()
-                    ds._repair_nan_rows_torch(want_i, want_v if with_values else None, lengths)
-                    ds._repair_nan_rows_triton(indices, values if with_values else None, lengths)
-                    assert torch.equal(indices, want_i), seed
-                    if with_values:
-                        assert torch.equal(values.isnan(), want_v.isnan()), seed
-                        assert torch.equal(values.nan_to_num(), want_v.nan_to_num()), seed
+            for dtype in (torch.float32, torch.bfloat16):
+                for seed in range(3):
+                    for with_values in (True, False):
+                        indices, values, lengths = cases._nan_repair_case(seed, dtype)
+                        want_i, want_v = indices.clone(), values.clone()
+                        ds._repair_nan_rows_torch(
+                            want_i, want_v if with_values else None, lengths
+                        )
+                        ds._repair_nan_rows_triton(
+                            indices, values if with_values else None, lengths
+                        )
+                        assert torch.equal(indices, want_i), (dtype, seed)
+                        if with_values:
+                            assert values.dtype == dtype, (dtype, seed)
+                            assert torch.equal(values.isnan(), want_v.isnan()), (dtype, seed)
+                            assert torch.equal(
+                                values.nan_to_num(), want_v.nan_to_num()
+                            ), (dtype, seed)
             print("TRITON_INTERPRETER_OK")
             """))
     python_path = os.pathsep.join(filter(None, (str(_REPO_ROOT), os.environ.get("PYTHONPATH"))))
@@ -995,3 +1063,301 @@ def test_config_validates_the_top_k_backend(monkeypatch):
     )
     config = _dsa_config(dsa_indexer_topk_backend="deepselect", dsa_kernel_backend="cudnn")
     assert config.dsa_indexer_topk_backend == "deepselect"
+
+
+# ---------------------------------------------------------------------------------- BF16 scores
+_BF16 = torch.bfloat16
+
+
+def _bf16_rows(seed, n_rows=24, width=512, kind="gauss"):
+    """BF16 rows; 512 BF16 columns are the fakes' 1024-byte input alignment."""
+    scores, seq_lens = _rows(seed, n_rows, width, kind)
+    # 7.0e30 poison past the row end stays a large finite BF16 value.
+    return scores.to(_BF16), seq_lens
+
+
+def test_bf16_scores_use_the_bf16_config(deepselect, cudnn_topk):
+    fake = deepselect("ds_tune")
+    assert _static(dtype=_BF16) is None
+    scores, seq_lens = _bf16_rows(21, n_rows=16)
+
+    result = _call(scores, seq_lens, 16, True)
+
+    (call,) = fake.calls
+    assert fake.CONFIGS[call["cfg_id"]]["dtype"] == "bf16" and call["topk"] == 16
+    assert call["data_ptr"] == scores.data_ptr() and cudnn_topk.calls == []
+    assert result["values"].dtype == _BF16 and result["indices"].dtype == torch.int32
+
+
+def test_bf16_without_a_compiled_config_keeps_cudnn(deepselect, cudnn_topk, caplog):
+    fake = deepselect("ds_tune", bf16_max_topks=())
+    assert _static() is None
+    reason = _static(dtype=_BF16)
+    assert reason == "ds_tune has no compiled config for top-k 2048 with BF16 scores"
+    scores, seq_lens = _bf16_rows(22, n_rows=8)
+    with caplog.at_level(logging.INFO, logger=dsa_deepselect_topk.__name__):
+        result = _call(scores, seq_lens, 16, True)
+    assert fake.calls == [] and len(cudnn_topk.calls) == 1
+    assert result["values"].dtype == _BF16
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert "on BF16 scores" in caplog.records[0].getMessage()
+
+
+def _production_widths(monkeypatch):
+    """The module's FP32 and BF16 width tables, as shipped."""
+    monkeypatch.setattr(dsa_deepselect_topk, "MIN_SCORE_WIDTH", _DEFAULT_WIDTHS)
+    monkeypatch.setattr(dsa_deepselect_topk, "MANY_ROWS_MIN_SCORE_WIDTH", _DEFAULT_MANY_ROWS)
+    monkeypatch.setitem(
+        dsa_deepselect_topk.SCORE_WIDTH_TABLES_BY_DTYPE, _BF16, _DEFAULT_BF16_TABLES
+    )
+
+
+def test_bf16_has_its_own_width_table():
+    """Slurm job 317672 bench B1 (GB300): ds_tune BF16 beat cuDNN's BF16 radix top-k at every
+    width 16384..131072 and row count 2048..16384; deep_select was not in the sweep."""
+    min_widths, many_rows = _DEFAULT_BF16_TABLES
+    assert min_widths == {"ds_tune": 16384, "deep_select": _DEFAULT_WIDTHS["deep_select"]}
+    assert many_rows == {}
+    assert _DEFAULT_WIDTHS == {"ds_tune": 65536, "deep_select": 524288}
+    assert _DEFAULT_MANY_ROWS == {"ds_tune": (4096, 81920)}
+
+
+@pytest.mark.parametrize(
+    "kind,n_rows,width,eligible,fp32_eligible",
+    [
+        ("ds_tune", 2048, 16383, False, False),
+        ("ds_tune", 2048, 16384, True, False),
+        ("ds_tune", 4096, 16384, True, False),
+        ("ds_tune", 16384, 16384, True, False),
+        ("ds_tune", 4096, 65535, True, False),
+        ("ds_tune", 4097, 81919, True, False),
+        ("ds_tune", 16384, 81920, True, True),
+        ("ds_tune", 16384, 532480, True, True),
+        ("deep_select", 16384, 524287, False, False),
+        ("deep_select", 16384, 532480, True, True),
+        ("deep_select", 4096, 131072, False, False),
+    ],
+)
+def test_bf16_uses_its_measured_width_table(
+    deepselect, monkeypatch, kind, n_rows, width, eligible, fp32_eligible
+):
+    """ds_tune takes BF16 rows from 16384 columns at every row count (no many-rows step); FP32
+    keeps its own thresholds."""
+    deepselect(kind)
+    _production_widths(monkeypatch)
+    reason = _static(n_rows=n_rows, width=width, dtype=_BF16)
+    assert (reason is None) is eligible, reason
+    assert (dsa_deepselect_topk.min_score_width(kind, n_rows, _BF16) <= width) is eligible
+    assert (_static(n_rows=n_rows, width=width) is None) is fp32_eligible
+    if not eligible:
+        # ds_tune's BF16 threshold is measured (nothing below it was timed); deep_select was
+        # never timed on BF16 scores and keeps its FP32 threshold.
+        note = (
+            "(deep_select not timed on BF16, its FP32 threshold is kept)"
+            if kind == "deep_select"
+            else "(not measured below it for BF16, cuDNN is kept)"
+        )
+        assert reason.startswith("score width below") and reason.endswith(note), reason
+
+
+def test_narrow_reasons_name_the_dtype_evidence(deepselect, monkeypatch):
+    """Below its table FP32 is measured slower than cuDNN; BF16 is not measured there, and
+    deep_select (never timed on BF16) keeps its FP32 threshold for BF16."""
+    deepselect("ds_tune")
+    _production_widths(monkeypatch)
+    assert _static(width=16383, dtype=_BF16) == (
+        "score width below 16384 (not measured below it for BF16, cuDNN is kept)"
+    )
+    assert _static(width=16383) == "score width below 65536 (cuDNN is faster there)"
+    assert _static(n_rows=16384, width=65536) == (
+        "score width below 81920 for ds_tune with more than 4096 rows (cuDNN is faster there)"
+    )
+    deepselect("deep_select")
+    _production_widths(monkeypatch)
+    assert _static(width=65536, dtype=_BF16) == (
+        "score width below 524288 for deep_select (deep_select not timed on BF16, its FP32 "
+        "threshold is kept)"
+    )
+    assert _static(width=16383, dtype=_BF16) == (
+        "score width below 16384 (not measured below it for BF16, cuDNN is kept)"
+    )
+    assert _static(width=65536) == (
+        "score width below 524288 for deep_select (cuDNN is faster there)"
+    )
+
+
+@pytest.mark.parametrize("n_rows", [2048, 4096, 8192, 16384])
+@pytest.mark.parametrize("width", [16384, 24576, 32768, 49152, 65536, 81920, 98304, 131072])
+def test_every_measured_bf16_sweep_shape_uses_ds_tune(deepselect, monkeypatch, n_rows, width):
+    """Each shape of bench B1 (CP-balanced and Gaussian row lengths, ds_tune 1.70-2.69x
+    faster than cuDNN's BF16 radix top-k) runs ds_tune."""
+    deepselect("ds_tune")
+    _production_widths(monkeypatch)
+    assert _static(n_rows=n_rows, width=width, dtype=_BF16) is None
+
+
+@pytest.mark.parametrize(
+    "n_rows,width",
+    [(4096, max((r + 1) * 2048, 131072 - r * 2048)) for r in (0, 15, 31)]
+    + [(16384, max((r + 1) * 8192, 1048576 - r * 8192)) for r in (0, 31, 63)],
+    ids=["128k-r0", "128k-r15", "128k-r31", "1m-r0", "1m-r31", "1m-r63"],
+)
+def test_every_measured_glm_bf16_shape_uses_ds_tune(deepselect, monkeypatch, n_rows, width):
+    """The DeepGEMM study timed DS BF16 at 128K CP32 and 1M CP64; all their ranks run it."""
+    deepselect("ds_tune")
+    _production_widths(monkeypatch)
+    assert _static(n_rows=n_rows, width=width, dtype=_BF16) is None
+
+
+def test_a_dtype_table_overrides_only_its_dtype(deepselect, monkeypatch):
+    deepselect("ds_tune")
+    monkeypatch.setattr(dsa_deepselect_topk, "MIN_SCORE_WIDTH", _DEFAULT_WIDTHS)
+    monkeypatch.setattr(dsa_deepselect_topk, "MANY_ROWS_MIN_SCORE_WIDTH", _DEFAULT_MANY_ROWS)
+    monkeypatch.setitem(
+        dsa_deepselect_topk.SCORE_WIDTH_TABLES_BY_DTYPE,
+        _BF16,
+        ({"ds_tune": 32768, "deep_select": 262144}, {"ds_tune": (8192, 49152)}),
+    )
+    assert dsa_deepselect_topk.min_score_width("ds_tune", 4096, _BF16) == 32768
+    assert dsa_deepselect_topk.min_score_width("ds_tune", 16384, _BF16) == 49152
+    assert dsa_deepselect_topk.min_score_width("ds_tune", 16384) == 81920
+    assert _static(n_rows=4096, width=40960, dtype=_BF16) is None
+    assert _static(n_rows=4096, width=40960).startswith("score width below 65536")
+    assert _static(n_rows=4096, width=16384, dtype=_BF16).startswith("score width below 32768")
+
+
+@pytest.mark.parametrize("kind", ["gauss", "ties", "zeros_inf"])
+def test_bf16_contract_matches_the_cudnn_path(deepselect, cudnn_topk, provider_kind, kind):
+    """BF16 has far more equal scores at the cutoff; only their members may differ."""
+    fake = deepselect(provider_kind, seed=61)
+    topk_k = 16
+    scores, seq_lens = _bf16_rows(31, n_rows=48, kind=kind)
+
+    got = _call(scores, seq_lens, topk_k, True)
+    want = _call(scores, seq_lens, topk_k, True, backend="cudnn")
+
+    assert len(fake.calls) == 1 and len(cudnn_topk.calls) == 1
+
+    assert got["values"].dtype == _BF16 and want["values"].dtype == _BF16
+    lengths = seq_lens.long()
+    short = lengths <= topk_k
+    assert torch.equal(got["indices"][short], want["indices"][short])
+    assert torch.equal(_bits(got["values"])[short], _bits(want["values"])[short])
+    long_idx = got["indices"][~short].long()
+    assert bool((long_idx >= 0).all()) and bool((long_idx < lengths[~short].view(-1, 1)).all())
+    assert all(len(set(_TOLIST(row))) == topk_k for row in long_idx)
+    gathered = torch.gather(scores[~short], 1, long_idx)
+    assert torch.equal(_bits(gathered), _bits(got["values"][~short]))
+    assert torch.equal(
+        torch.sort(got["values"][~short].float(), dim=1).values,
+        torch.sort(want["values"][~short].float(), dim=1).values,
+    )
+
+
+def test_bf16_indices_only_call_matches_the_value_call(deepselect, cudnn_topk, provider_kind):
+    scores, seq_lens = _bf16_rows(32, n_rows=32, kind="ties")
+    fake = deepselect(provider_kind, seed=9)
+    with_values = _call(scores, seq_lens, 16, True)
+    assert len(fake.calls) == 1 and cudnn_topk.calls == []
+    deepselect(provider_kind, seed=9)
+    indices_only = _call(scores, seq_lens, 16, False)
+    assert indices_only["values"] is None
+    assert torch.equal(indices_only["indices"], with_values["indices"])
+
+
+def test_bf16_nan_rows_are_repaired_with_bf16_nan(deepselect, cudnn_topk, provider_kind):
+    deepselect(provider_kind)
+    width, topk_k = 512, 16
+    scores, seq_lens = _bf16_rows(33, n_rows=8, width=width)
+    scores, seq_lens = scores[:4].clone(), seq_lens[:4].clone()
+    seq_lens[:] = torch.tensor([width, 200, 12, 100], dtype=torch.int32)
+    scores[0, 3] = float("nan")
+    scores[1, 150] = float("nan")
+    scores[3, 100] = float("nan")  # past the end
+
+    result = _call(scores, seq_lens, topk_k, True)
+
+    assert cudnn_topk.calls == [] and result["values"].dtype == _BF16
+    for row in (0, 1):
+        assert _TOLIST(result["indices"][row]) == list(range(topk_k))
+        assert bool(torch.isnan(result["values"][row]).all())
+    assert not bool(torch.isnan(result["values"][3]).any())
+
+
+def test_nan_repair_torch_fallback_writes_bf16_nan():
+    indices = torch.arange(16, dtype=torch.int32).view(2, 8).clone()
+    indices[1, 0] = _SENTINEL
+    values = torch.ones((2, 8), dtype=_BF16)
+    dsa_deepselect_topk.repair_nan_rows(indices, values, torch.tensor([100, 5], dtype=torch.int32))
+    assert values.dtype == _BF16
+    assert _TOLIST(indices[1]) == [0, 1, 2, 3, 4, -1, -1, -1]
+    assert bool(torch.isnan(values[1]).all()) and bool((values[0] == 1).all())
+
+
+def test_bf16_values_need_top_k_a_multiple_of_16(deepselect, cudnn_topk):
+    """The BF16 values output is [rows, K] contiguous too: 32-byte rows need K % 16 == 0."""
+    fake = deepselect()
+    assert _static(topk_k=24) is None
+    assert (
+        _static(topk_k=24, dtype=_BF16) == "top-k must be a multiple of 16 for contiguous outputs"
+    )
+    assert _static(topk_k=32, dtype=_BF16) is None
+    scores, seq_lens = _bf16_rows(36, n_rows=8)
+    result = _call(scores, seq_lens, 24, True)
+    assert fake.calls == [] and len(cudnn_topk.calls) == 1 and result["values"].shape == (8, 24)
+
+
+def test_score_row_stride_is_per_dtype(deepselect):
+    deepselect()
+    assert dsa_deepselect_topk.score_row_stride(257) == 512
+    assert dsa_deepselect_topk.score_row_stride(257, torch.float32) == 512
+    assert dsa_deepselect_topk.score_row_stride(257, _BF16) == 512
+    assert dsa_deepselect_topk.score_row_stride(513, _BF16) == 1024
+    assert dsa_deepselect_topk.score_row_stride(513, torch.float32) == 768
+    assert dsa_deepselect_topk.score_row_stride(1048576, _BF16) == 1048576
+
+
+def test_bf16_call_eligibility_checks_the_byte_stride(deepselect):
+    """1024 bytes are 512 BF16 elements: a 256-element BF16 row stride is not enough."""
+    deepselect()
+    lens = torch.full((4,), 100, dtype=torch.int32)
+    padded = torch.zeros((4, 512), dtype=_BF16)
+    assert dsa_deepselect_topk.fallback_reason(padded[:, :300], lens, 16, False) is None
+    assert "stride" in dsa_deepselect_topk.fallback_reason(
+        torch.zeros((4, 256), dtype=_BF16), lens, 16, False
+    )
+
+
+def test_bf16_path_does_not_synchronize_with_the_host(deepselect, monkeypatch):
+    deepselect()
+    scores, seq_lens = _bf16_rows(34, n_rows=16, width=512)
+    scores[0, 0] = float("nan")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("host synchronization in the BF16 DeepSelect top-k path")
+
+    for name in ("item", "tolist", "__bool__", "__int__", "nonzero"):
+        monkeypatch.setattr(torch.Tensor, name, forbidden)
+    monkeypatch.setattr(torch, "nonzero", forbidden)
+
+    result = _call(scores, seq_lens, 16, True)
+
+    assert result["indices"].shape == (16, 16) and result["values"].dtype == _BF16
+
+
+def test_backend_choice_is_logged_once_per_reason_and_dtype(deepselect, cudnn_topk, caplog):
+    deepselect()
+    fp32, fp32_lens = _rows(35, n_rows=8, width=512)
+    bf16, bf16_lens = _bf16_rows(35, n_rows=8, width=512)
+    narrow, narrow_lens = _rows(35, n_rows=8, width=32)
+    with caplog.at_level(logging.INFO, logger=dsa_deepselect_topk.__name__):
+        for _ in range(3):
+            _call(fp32, fp32_lens, 16, True)
+            _call(bf16, bf16_lens, 16, True)
+            _call(narrow, narrow_lens, 8, True)
+            _call(narrow.to(_BF16), narrow_lens, 8, True)
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("uses DeepSelect (" in m for m in messages) == 1
+    assert sum("uses DeepSelect on BF16 scores" in m for m in messages) == 1
+    assert sum("below 64" in m and "BF16" not in m for m in messages) == 1
+    assert sum("below 64" in m and "on BF16 scores" in m for m in messages) == 1

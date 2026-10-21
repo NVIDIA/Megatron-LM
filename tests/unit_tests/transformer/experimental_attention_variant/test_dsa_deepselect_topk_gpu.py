@@ -23,7 +23,14 @@ Needs a DeepSelect build for the device (the GLM-5.2 ``ds_tune`` package or upst
   and the graph pool holds no top-k scratch (cuDNN reserves its 8 GiB budget);
 * strided scores: a row-padded score view is read in place, and the cuDNN scorer binds a
   row-padded ``out`` directly (no staging copy) with and without ``clean_logits``;
-* the GLM-5.2 1M CP64 rank-0 packed THD call end to end against the cuDNN backend.
+* the GLM-5.2 1M CP64 rank-0 packed THD call end to end against the cuDNN backend;
+* BF16 scores (``ds_tune`` config ``h_t256_o2_b2_2k_d3``, the DeepGEMM scorer's logits):
+  tie-aware exactness against ``torch.topk`` at 128K and 1M widths, and from the BF16 table's
+  minimum width (16384..65536, which bench B1 only timed) on DeepGEMM-shaped rows (padded row
+  stride, poisoned unwritten tails) with a bitwise repeat, NaN repair with BF16 NaN,
+  bitwise repeats, batch independence and an indices-only call equal to the value call (the
+  DeepGEMM path's first call and checkpoint replay), graph replay after a data swap, and the
+  eligibility of every GLM-5.2 128K CP32 and 1M CP64 rank width.
 
 Lines starting with ``[deepselect-gpu]`` report timings and memory for the validation log.
 """
@@ -525,3 +532,224 @@ def test_glm_1m_cp64_rank0_packed_thd_call_matches_cudnn():
     )
     # Only exact FP32 ties at the cutoff may pick other members.
     assert differing <= sq // 100 and attention_differing <= sq // 100
+
+
+# ---------------------------------------------------------------------------------- BF16 scores
+def _bits_any(values: torch.Tensor) -> torch.Tensor:
+    return values.contiguous().view(torch.int16 if values.element_size() == 2 else torch.int32)
+
+
+def _make_bf16_rows(kind, n_rows, width, seed, buffer=None):
+    """BF16 scores written 512 rows at a time (the FP32 staging stays small) and lengths."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    seq_lens = torch.randint(_K + 1, width + 1, (n_rows,), generator=generator, device="cuda")
+    seq_lens[:6] = torch.tensor([0, 1, _K - 1, _K, _K + 1, width], device="cuda")
+    seq_lens = seq_lens.to(torch.int32)
+    if buffer is None:
+        buffer = torch.empty((n_rows, width), dtype=torch.bfloat16, device="cuda")
+    for start in range(0, n_rows, 512):
+        staging = torch.randn((min(512, n_rows - start), width), generator=generator, device="cuda")
+        _fill_rows(kind, staging, seq_lens[start : start + 512], generator)
+        buffer[start : start + 512].copy_(staging)
+    return buffer, seq_lens
+
+
+def _check_bf16_exact(result, scores, seq_lens, label):
+    """Tie-aware exactness: every row's selected values are the K largest in-row values."""
+    lengths = seq_lens.long()
+    indices, values = result["indices"].long(), result["values"]
+    assert values.dtype == torch.bfloat16, label
+    short = lengths <= _K
+    slots = torch.arange(_K, device="cuda").view(1, -1)
+    want_short = torch.where(slots < lengths.view(-1, 1), slots, -1)
+    assert torch.equal(indices[short], want_short[short]), f"{label}: short rows"
+    long_rows = torch.nonzero(~short).flatten().tolist()
+    differing_members = 0
+    for start in range(0, len(long_rows), 64):
+        rows = torch.tensor(long_rows[start : start + 64], device="cuda")
+        row_indices, row_values = indices[rows], values[rows]
+        row_lengths = lengths[rows].view(-1, 1)
+        assert bool((row_indices >= 0).all()) and bool((row_indices < row_lengths).all()), label
+        ordered = torch.sort(row_indices, dim=1).values
+        assert bool((ordered[:, 1:] != ordered[:, :-1]).all()), f"{label}: duplicate members"
+        gathered = torch.gather(scores[rows], 1, row_indices)
+        assert torch.equal(_bits_any(gathered), _bits_any(row_values)), f"{label}: payload"
+        columns = torch.arange(scores.size(1), device="cuda").view(1, -1)
+        masked = torch.where(columns < row_lengths, scores[rows].float(), float("-inf"))
+        reference = torch.topk(masked, _K, dim=1)
+        assert torch.equal(
+            torch.sort(row_values.float(), dim=1).values, torch.sort(reference.values, dim=1).values
+        ), f"{label}: selected values are not the top-{_K}"
+        differing_members += int(
+            (ordered != torch.sort(reference.indices, dim=1).values).any(dim=1).sum()
+        )
+    return differing_members
+
+
+@pytest.mark.parametrize("kind", ["gauss", "ties"])
+@pytest.mark.parametrize("n_rows,width", [(512, 131072), (64, 1048576)], ids=["128k", "1m"])
+def test_bf16_selection_is_an_exact_top_k(kind, n_rows, width):
+    _require_deepselect()
+    scores, seq_lens = _make_bf16_rows(kind, n_rows, width, seed=width % 983 + len(kind))
+    _require_eligible(scores, seq_lens)
+
+    result = _topk(scores, seq_lens, "deepselect")
+
+    differing = _check_bf16_exact(result, scores, seq_lens, f"bf16 {kind} {n_rows}x{width}")
+    _report(f"bf16 exact {kind} {n_rows}x{width}: rows with other tied members={differing}")
+
+
+def _deepgemm_shaped_bf16_rows(kind, n_rows, width, seed):
+    """A ``[rows, width]`` BF16 view laid out as DeepGEMM's logits (bench B1's layout).
+
+    The row stride is ``align(align(width, 384), 512)`` elements and the columns past each
+    row's length are left unwritten by DeepGEMM: here they hold +inf, NaN and 3e38 in turn, so
+    a read past a row's length either selects a poisoned column or flags the row as NaN, and
+    both fail the exactness check.
+    """
+    stride = -(-width // 384) * 384
+    stride = -(-stride // 512) * 512
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    seq_lens = torch.randint(_K + 1, width + 1, (n_rows,), generator=generator, device="cuda")
+    seq_lens[:6] = torch.tensor([0, 1, _K - 1, _K, _K + 1, width], device="cuda")
+    seq_lens = seq_lens.to(torch.int32)
+    full = torch.empty((n_rows, stride), dtype=torch.bfloat16, device="cuda")
+    columns = torch.arange(stride, device="cuda").view(1, -1)
+    poison = torch.tensor([float("inf"), float("nan"), 3.0e38], device="cuda")[columns % 3]
+    for start in range(0, n_rows, 512):
+        rows = slice(start, start + 512)
+        staging = torch.randn((full[rows].size(0), stride), generator=generator, device="cuda")
+        if kind == "ties":
+            staging.mul_(4).round_().div_(64)
+        tail = columns >= seq_lens[rows].view(-1, 1).long()
+        full[rows].copy_(torch.where(tail, poison, staging))
+    return full[:, :width], seq_lens
+
+
+@pytest.mark.parametrize("kind", ["gauss", "ties"])
+@pytest.mark.parametrize(
+    "n_rows,width",
+    [(2048, 16384), (16384, 16384), (4096, 32768), (8192, 65536)],
+    ids=["2k-16k", "16k-16k", "4k-32k", "8k-64k"],
+)
+def test_bf16_selection_is_an_exact_top_k_from_the_bf16_minimum_width(kind, n_rows, width):
+    """The widths the BF16 table opens to ds_tune (16384 at every row count, where FP32 starts
+    at 65536, 81920 above 4096 rows). Bench B1 (Slurm job 317672) only timed them and checked
+    that nothing past a row's length was selected: here the selection is an exact top-K
+    (tie-aware against ``torch.topk``) on DeepGEMM-shaped rows, and a repeat is bitwise."""
+    _require_deepselect()
+    scores, seq_lens = _deepgemm_shaped_bf16_rows(
+        kind, n_rows, width, seed=width % 977 + n_rows + len(kind)
+    )
+    assert scores.stride(0) > width
+    _require_eligible(scores, seq_lens)
+
+    result = _topk(scores, seq_lens, "deepselect")
+
+    label = f"bf16 deepgemm-shaped {kind} {n_rows}x{width}"
+    differing = _check_bf16_exact(result, scores, seq_lens, label)
+    again = _topk(scores, seq_lens, "deepselect")
+    assert torch.equal(again["indices"], result["indices"]), f"{label}: repeat"
+    assert torch.equal(_bits_any(again["values"]), _bits_any(result["values"])), label
+    _report(f"{label}: exact, repeat bitwise, rows with other tied members={differing}")
+
+
+def test_bf16_nan_rows_are_repaired_with_bf16_nan():
+    _require_deepselect()
+    n_rows, width = 64, 1048576
+    scores, seq_lens = _make_bf16_rows("gauss", n_rows, width, seed=17)
+    seq_lens[8:12] = torch.tensor([width, width - 3, 600000, 300000], device="cuda").to(torch.int32)
+    columns = torch.arange(width, device="cuda").view(1, -1)
+    fresh = torch.randn((4, width), device="cuda").to(torch.bfloat16)
+    scores[8:12] = torch.where(columns < seq_lens[8:12].view(-1, 1).long(), fresh, float("nan"))
+    clean = {name: value.clone() for name, value in _topk(scores, seq_lens, "deepselect").items()}
+    scores[8, 1000] = float("nan")
+    scores[9, width - 4] = float("nan")
+    scores[10, 600001] = float("nan")  # past the end: not part of the row
+    scores[11, 0] = float("nan")
+
+    result = _topk(scores, seq_lens, "deepselect")
+
+    arange = torch.arange(_K, dtype=torch.int32, device="cuda")
+    for row in (8, 9, 11):
+        assert torch.equal(result["indices"][row], arange), row
+        assert bool(torch.isnan(result["values"][row]).all()), row
+    untouched = [row for row in range(n_rows) if row not in (8, 9, 11)]
+    assert torch.equal(result["indices"][untouched], clean["indices"][untouched])
+    assert torch.equal(
+        _bits_any(result["values"][untouched]), _bits_any(clean["values"][untouched])
+    )
+
+
+def test_bf16_selection_is_bitwise_repeatable_and_batch_independent():
+    """Determinism of BF16 config 1 (the head-to-head proved it for the FP32 config only):
+    repeats, a row subset, and the indices-only call against the value call, which the
+    DeepGEMM path relies on between a checkpoint's first call and its replay."""
+    _require_deepselect()
+    scores, seq_lens = _make_bf16_rows("ties", 256, 1048576, seed=19)
+    _require_eligible(scores, seq_lens)
+    first = {name: value.clone() for name, value in _topk(scores, seq_lens, "deepselect").items()}
+    for _ in range(3):
+        again = _topk(scores, seq_lens, "deepselect")
+        assert torch.equal(again["indices"], first["indices"])
+        assert torch.equal(_bits_any(again["values"]), _bits_any(first["values"]))
+        indices_only = _topk(scores, seq_lens, "deepselect", return_topk_scores=False)
+        assert torch.equal(indices_only["indices"], first["indices"])
+    subset = slice(64, 128)
+    part = _topk(scores[subset], seq_lens[subset], "deepselect")
+    assert torch.equal(part["indices"], first["indices"][subset])
+
+
+@pytest.mark.parametrize("n_rows,width", [(4096, 131072), (16384, 1048576)], ids=["128k", "1m"])
+def test_bf16_graph_replay_after_a_data_swap_matches_eager(n_rows, width):
+    _require_deepselect()
+    free, _ = torch.cuda.mem_get_info()
+    if free < n_rows * width * 2 * 1.5 + 10 * _GIB:
+        pytest.skip("not enough device memory")
+    scores, seq_lens = _make_bf16_rows("gauss", n_rows, width, seed=23)
+    _require_eligible(scores, seq_lens)
+    static_lens = seq_lens.clone()
+
+    def call():
+        return _topk(scores, static_lens, "deepselect")
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            call()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = call()
+    torch.cuda.synchronize()
+    _, new_lens = _make_bf16_rows("ties", n_rows, width, seed=24, buffer=scores)
+    static_lens.copy_(new_lens.flip(0))
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = call()
+    assert torch.equal(captured["indices"], eager["indices"])
+    assert torch.equal(_bits_any(captured["values"]), _bits_any(eager["values"]))
+    _report(f"bf16 graph {n_rows}x{width}: replay equals eager")
+
+
+def test_every_glm_rank_width_is_eligible_for_bf16_scores():
+    """128K CP32 (4096 rows, 67584..131072) and 1M CP64 (16384 rows, 532480..1048576)."""
+    _require_deepselect()
+    provider = dsa_deepselect_topk._load_provider()
+    shapes = [(4096, max((r + 1) * 2048, 131072 - r * 2048)) for r in range(32)]
+    shapes += [(16384, max((r + 1) * 8192, 1048576 - r * 8192)) for r in range(64)]
+    for n_rows, width in shapes:
+        reason = dsa_deepselect_topk.static_fallback_reason(
+            n_rows=n_rows,
+            width=width,
+            topk_k=_K,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda"),
+            deterministic=False,
+        )
+        if provider.kind == "deep_select" and n_rows == 4096:
+            assert reason is not None and reason.startswith("score width below")
+        else:
+            assert reason is None, (n_rows, width, reason)

@@ -991,13 +991,18 @@ def _indexer_top_k_wrapper_chunked(
     With ``topk_backend='deepselect'`` an eligible non-deterministic call
     (:func:`dsa_deepselect_topk.fallback_reason`) runs one DeepSelect launch over all rows
     instead, with the same output contract and no scratch; any other call runs cuDNN. Which
-    one ran is logged once per reason.
+    one ran is logged once per reason and score dtype.
+
+    Scores may be FP32 or BF16; the selected values come back in the scores' dtype from either
+    backend. The cuDNN radix top-k is compiled for a compact row-major ``[rows, cols]``
+    tensor, so callers hand it contiguous scores, and its scratch is sized by the FP32 budget
+    below, which over-estimates BF16 (one int32 buffer instead of two).
     """
     n_rows, sk = scores_flat.shape
     deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
     if topk_backend == "deepselect":
         reason = dsa_deepselect_topk.fallback_reason(scores_flat, seq_lens, topk_k, deterministic)
-        dsa_deepselect_topk.log_topk_backend_once(topk_backend, reason)
+        dsa_deepselect_topk.log_topk_backend_once(topk_backend, reason, scores_flat.dtype)
         if reason is None:
             return dsa_deepselect_topk.deepselect_topk(
                 scores_flat, seq_lens, topk_k, return_topk_scores
@@ -1819,7 +1824,7 @@ def _deepselect_score_out_kwargs(
         is not None
     ):
         return {}
-    row_stride = dsa_deepselect_topk.score_row_stride(width)
+    row_stride = dsa_deepselect_topk.score_row_stride(width, torch.float32)
     if (
         row_stride == width
         or width % _CUDNN_SCORE_OUT_WIDTH_ALIGNMENT

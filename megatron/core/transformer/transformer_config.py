@@ -518,11 +518,18 @@ class TransformerConfig(ModelParallelConfig):
     0.43 ms against 0.57 ms at 128K, ``deep_select`` 7.94 ms at 1M; both are slower than
     cuDNN on narrow rows. It applies only where DeepSelect is installed, validated and fast
     (SM 10.3: the sm_100a kernels for GB200 have not run on a GPU, so SM 10.0 keeps cuDNN with
-    a warning; FP32 scores starting 16-byte aligned with a row stride that is a multiple of
-    1024 bytes, row width from 65536 for ``ds_tune`` (81920 for calls of more than 4096 rows)
-    or 524288 for ``deep_select`` to below 2**23, a compiled config for top-k <= 4096 and
-    top-k a multiple of 8); every other call, and deterministic mode, keeps the cuDNN top-k,
-    and the choice is logged once per reason.
+    a warning; FP32 or BF16 scores starting 16-byte aligned with a row stride that is a
+    multiple of 1024 bytes, row width to below 2**23 and from 65536 for FP32 ``ds_tune``
+    (81920 for calls of more than 4096 rows), 16384 for BF16 ``ds_tune`` or 524288 for
+    ``deep_select``, a compiled config for the score dtype and top-k <= 4096 and top-k a
+    multiple of 8, of 16 for BF16); every other call, and deterministic mode, keeps the cuDNN
+    top-k, and the choice is logged once per reason and score dtype.
+    BF16 scores (``ds_tune`` config ``h_t256_o2_b2_2k_d3``: 4.20 against 6.08 ms for FP32 at
+    1M, 0.337 against 0.469 ms at 128K) have their own width threshold: on GB300 ``ds_tune``
+    BF16 was 1.70-2.69x faster than cuDNN's BF16 radix top-k at every measured width
+    16384..131072 and row count 2048..16384 (top-k 2048; the threshold is applied to every row
+    count and top-k), narrower BF16 rows (not measured) keep cuDNN, and ``deep_select`` (not
+    timed on BF16) keeps 524288; selected values keep the scores' dtype.
     ``ds_tune`` is built against one torch version and does not import under another, which
     also falls back with one warning: check for the "DSA indexer top-k uses DeepSelect" log
     line. Selected sets equal cuDNN's except for which equal scores fill the last slots. A
