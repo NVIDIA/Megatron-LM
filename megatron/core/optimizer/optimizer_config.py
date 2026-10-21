@@ -201,18 +201,18 @@ class OptimizerConfig:
     store_param_remainders: Optional[bool] = None
     """If true, the optimizer state keeps only the 16 low bits of each FP32 master weight, the
         int16 remainder of the 16 bits the BF16 parameter holds. This lowers GPU memory usage, and
-        the optimizer checkpoint then holds int16 remainders instead of FP32 master weights.
+        the optimizer checkpoint then holds int16 remainders instead of FP32 master weights. 
+        Requires use_precision_aware_optimizer.
 
         None (default) defaults to False when:
             - FP32 main params and
             - a non-delayed FP8 recipe
         and True in all other cases.
 
-        This keeps checkpoints compatible with legacy ones of that configuration, which hold
-        MCore-managed FP32 main weights. Explicitly setting this flag to True saves memory, but
+        This keeps checkpoints compatible with legacy ones with this configuration, which hold
+        MCore-managed FP32 main weights. Explicitly setting this flag to True
         makes those legacy optimizer checkpoints incompatible.
         Only takes effect with BF16 model params, FP32 main params and no optimizer_cpu_offload.
-        The value in effect is the resolved_store_param_remainders property.
     """
 
     main_grads_dtype: torch.dtype = torch.float32
@@ -444,8 +444,6 @@ class OptimizerConfig:
 
     @property
     def fp8_param_gather(self) -> Optional[bool]:
-        """Whether model parameters are stored (and all-gathered) as FP8 tensors, as resolved from
-        the DDP config by resolve_fp8_param_gather. None until then (possibly quantized)."""
         return self._fp8_param_gather
 
     def _te_fused_adam_main_weight_and_decoupled_grad(
@@ -475,10 +473,15 @@ class OptimizerConfig:
     def _use_te_precision_aware_optimizer_legacy(self) -> bool:
         """The precision-aware optimizer gate before BF16 model weights could use it.
 
-        It did not distinguish BF16 from FP8 model weights, and treated both like FP8 ones. So with
-        BF16 model weights, quantized compute (e.g. MXFP8, NVFP4) and FP32 main weights, the
-        optimizer state held MCore-managed FP32 main weights, which the legacy checkpoints of that
-        configuration therefore hold."""
+
+        The goal is to ensure we remain compatible with checkpoints produced by previous versions
+        of Megatron. Such versions did not allow precision-aware optimizer with
+        BF16 model weights + FP8 (non-delayed) recipes. Checkpoints produced with that code
+        stored MCore-managed FP32 main weights despite the store_param_remainders=True default,
+        since precision-aware optimizer is required.
+        This case is now supported, but we ensure we don't silently load FP32 main weights using
+        the store_param_remainders=True format.
+        """
         return self._te_fused_adam_main_weight_and_decoupled_grad(fp8_param_gather=True)
 
     def _param_remainders_supported(self) -> bool:
@@ -504,11 +507,7 @@ class OptimizerConfig:
         return requested and self._param_remainders_supported() and not self.optimizer_cuda_graph
 
     def resolve_fp8_param_gather(self, ddp_fp8_param_gather: bool) -> "OptimizerConfig":
-        """Return a copy of this config with fp8_param_gather taken from the model's DDP config.
-
-        A copy, so that a config shared between models is not modified. The derived flags are
-        properties, so they follow the new value.
-        """
+        """Return a copy of this config with fp8_param_gather taken from the model's DDP config."""
         resolved = copy.copy(self)
         resolved._fp8_param_gather = ddp_fp8_param_gather
         return resolved

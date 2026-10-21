@@ -826,8 +826,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Megatron-FSDP will manage optimizer weights and gradients.
             return
 
-        # The config decides who owns the master weights from fp8_param_gather, so it must have
-        # been resolved for this model (or not at all, which conservatively means quantized).
+        # Whether TE FusedAdam or MCore owns the master weights depends on fp8_param_gather, so the
+        # config must either be resolved for this model's DDP config, or unresolved (None), in which
+        # case the params are assumed to be quantized (the stricter condition for TE ownership).
         assert config.fp8_param_gather in (None, self.ddp_config.fp8_param_gather), (
             f"OptimizerConfig resolved with fp8_param_gather={config.fp8_param_gather} for a "
             f"model whose ddp_config.fp8_param_gather is {self.ddp_config.fp8_param_gather}"
@@ -1262,18 +1263,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return tensors
 
     def get_main_param_shard(self, model_param: torch.nn.Parameter) -> Optional[torch.Tensor]:
-        """Return the FP32 main param shard held by this rank for the input model_param.
+        """FP32 main param shard this rank holds for model_param, or None if it holds none.
 
-        This is the one place that knows where main params live: in the inner optimizer's param
-        groups by default, or inside the precision-aware optimizer's state when it owns the
-        masters. Returns None if this rank holds no shard of model_param (it belongs to another DP
-        rank or optimizer), which is distinct from the main param being held by the optimizer.
-
-        Unlike _get_main_param_and_optimizer_states, the returned tensor is always the FP32 value
-        (never packed remainders) and is meant for read-only use, e.g. computing the param norm.
+        Read-only (e.g. for the param norm). Param remainders are reassembled into FP32.
         """
-        # Stub optimizers (no params on this rank) and Megatron-FSDP, which manages its own main
-        # params, return from __init__ before building model_param_group_index_map.
+
         if self.is_stub_optimizer or self.ddp_config.use_megatron_fsdp:
             return None
         if model_param not in self.model_param_group_index_map:

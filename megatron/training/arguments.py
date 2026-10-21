@@ -3642,16 +3642,12 @@ def _add_experimental_args(parser):
                        'fp16, bf16 and fp8.')
     group.add_argument('--store-param-remainders', action=argparse.BooleanOptionalAction,
                        default=None,
-                       help='With --use-precision-aware-optimizer, BF16 params and FP32 main '
-                       'params, store only the low 16 bits of each FP32 master weight (the BF16 '
-                       'param holds the high 16 bits). This saves memory, and the optimizer '
-                       'checkpoint then holds int16 remainders instead of FP32 master weights. '
-                       'On by default, except with a non-delayed --fp8-recipe and FP32 main '
-                       'params: there it is off by default, to stay compatible with existing '
-                       'checkpoints of that configuration, which hold FP32 master weights. No '
-                       'effect with --fp8-param-gather and a non-delayed --fp8-recipe, or with '
-                       '--optimizer-cpu-offload. Disabled with --optimizer-cuda-graph. Ignored by '
-                       'Megatron-FSDP.')
+                       help='Store only the low 16 bits of each FP32 master weight (the BF16 param holds the '
+                        'rest), saving memory. Needs --use-precision-aware-optimizer, BF16 params and FP32 main '
+                        'params. Default on, except with a non-delayed --fp8-recipe and FP32 main params, for '
+                        'compatibility with existing checkpoints. No effect with --fp8-param-gather and a '
+                        'non-delayed --fp8-recipe. Disabled with --optimizer-cpu-offload, --optimizer-cuda-graph '
+                        'and Megatron-FSDP.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
                        help='Dtype of main grads when enabling precision-aware-optimizer.')
     group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
