@@ -8,40 +8,34 @@ from .linear import linear
 
 
 def metadata(lengths, ratio, device):
-    """Packed THD documents (an int is one document) as independent vLLM requests.
-
-    Each document's compressed rows are contiguous and in document order, so
-    every request reads exactly the rows it would own alone."""
+    """Packed compression metadata computed without per-document CUDA launches."""
     if ratio not in (1, 2):
         raise NotImplementedError('Deployment compression requires literal ratio one or two')
-    lengths = [lengths] if isinstance(lengths, int) else [int(n) for n in lengths]
-    counts = [n // ratio for n in lengths]
-    starts = [sum(counts[:d]) for d in range(len(counts))]
-    total = sum(counts)
-    p = torch.cat(
-        [torch.zeros(0, dtype=torch.int64)] + [torch.arange(n, dtype=torch.int64) for n in lengths]
-    ).to(device)
-    doc = torch.cat(
-        [torch.zeros(0, dtype=torch.int32)]
-        + [torch.full((n,), d, dtype=torch.int32) for d, n in enumerate(lengths)]
-    ).to(device)
-    closing = (p + 1).remainder(ratio) == 0
-    first = torch.tensor(starts + [0], dtype=torch.int64, device=device)[doc.long()]
-    cu = [0]
-    for n in lengths:
-        cu.append(cu[-1] + n)
+    n = torch.as_tensor(
+        [lengths] if isinstance(lengths, int) else lengths, dtype=torch.int64, device='cpu'
+    )
+    counts = n // ratio
+    starts = torch.cat((n.new_zeros(1), counts.cumsum(0)))[:-1]
+    cu = torch.cat((n.new_zeros(1), n.cumsum(0)))
+    rows, total = int(cu[-1]), int(counts.sum())
+    doc = torch.repeat_interleave(torch.arange(n.numel()), n, output_size=rows)
+    pos = torch.arange(rows) - cu[doc]
+    closing = (pos + 1).remainder(ratio) == 0
     return SimpleNamespace(
-        positions=p,
-        cu=torch.tensor(cu, device=device, dtype=torch.int32),
-        requests=doc,
-        ring_slots=doc.long() * ratio + p.remainder(ratio),
-        slots=torch.where(closing, first + p // ratio, -1),
-        closers=closing.nonzero().flatten(),
-        lengths=torch.tensor([total], device=device, dtype=torch.int32),
-        table=torch.arange((total + 63) // 64, device=device, dtype=torch.int32)[None],
-        documents=len(lengths),
-        counts=counts,
-        starts=starts,
+        positions=pos.to(device),
+        cu=cu.to(device=device, dtype=torch.int32),
+        requests=doc.to(device=device, dtype=torch.int32),
+        ring_slots=(doc * ratio + pos.remainder(ratio)).to(device),
+        slots=torch.where(closing, starts[doc] + pos // ratio, -1).to(device),
+        closers=closing.nonzero().flatten().to(device),
+        lengths=torch.tensor([total], dtype=torch.int32, device=device),
+        table=torch.arange((total + 63) // 64, dtype=torch.int32, device=device)[None],
+        documents=n.numel(),
+        counts=counts.tolist(),
+        starts=starts.tolist(),
+        key_starts=starts.to(device=device, dtype=torch.int32),
+        query_positions=pos.to(device),
+        query_requests=doc.to(device),
     )
 
 
@@ -134,16 +128,17 @@ def index_keys(latent, wk, norm, rope, ratio, eps, m):
     return values, scales
 
 
-def index_topk(q, w, keys, rope, ratio, emit, candidates=None):
-    """One document's indexer top-k from its projected rows (``q``/``w`` are row-wise
-    GEMM outputs, so slices of a batched projection are the document's own bits)."""
+def index_topk(q, w, keys, rope, ratio, emit, candidates=None, *, m=None):
+    """One batched MQA/top-k call; per-row key starts retain document-local columns."""
     from vllm.model_executor.kernels.batch_invariant import top_k_per_row_prefill_index_order
     from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
     from vllm.models.deepseek_v41.common.ops import fused_indexer_q_rope_quant
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits, mqa_logits_mx_inputs
 
     rows = q.shape[0]
-    positions = torch.arange(rows, device=q.device, dtype=torch.int64)
+    positions = (
+        torch.arange(rows, device=q.device, dtype=torch.int64) if m is None else m.query_positions
+    )
     emit('indexer_q_projection', q)
     emit('indexer_weights_projection', w)
     quant, w = fused_indexer_q_rope_quant(
@@ -155,8 +150,13 @@ def index_topk(q, w, keys, rope, ratio, emit, candidates=None):
     values, scales = keys
     qscales, w = mqa_logits_mx_inputs(qvalues.view(torch.int8), qscales, w)
     emit('indexer_scoring_weights', w)
-    starts = torch.zeros(rows, device=q.device, dtype=torch.int32)
-    ends = ((positions + 1) // ratio).int()
+    starts = (
+        torch.zeros(rows, device=q.device, dtype=torch.int32)
+        if m is None
+        else m.key_starts[m.query_requests]
+    )
+    row_ends = ((positions + 1) // ratio).int()
+    ends = starts + row_ends
     logits = as_fp32_logits(
         fp8_fp4_mqa_logits(
             (qvalues.view(torch.int8), qscales),
@@ -164,19 +164,20 @@ def index_topk(q, w, keys, rope, ratio, emit, candidates=None):
             w,
             starts,
             ends,
-            values.shape[0],
+            values.shape[0] if m is None else max(m.counts, default=0),
         ),
-        ends,
+        row_ends,
     )
     emit(
         'indexer_logits_valid',
-        logits[torch.arange(logits.shape[1], device=q.device)[None] < ends[:, None]],
+        logits[torch.arange(logits.shape[1], device=q.device)[None] < row_ends[:, None]],
     )
+    starts = torch.zeros_like(row_ends)
     if candidates is not None:
-        candidates(logits, starts, ends)
+        candidates(logits, starts, row_ends)
     topk = torch.full((rows, 512), -1, device=q.device, dtype=torch.int32)
     top_k_per_row_prefill_index_order(
-        logits, starts, ends, topk, rows, logits.stride(0), logits.stride(1), 512
+        logits, starts, row_ends, topk, rows, logits.stride(0), logits.stride(1), 512
     )
     return topk
 
@@ -184,8 +185,8 @@ def index_topk(q, w, keys, rope, ratio, emit, candidates=None):
 def source(attention, x, qr, qa, rope, documents, emit):
     """Compressed KV and indexer top-k of all packed documents at once.
 
-    ``documents``: ``[(lo, hi), ...]`` THD row ranges. Returns the decoded compressed
-    rows of every document in order and document-local top-k per row. Reuses Lite's
+    ``documents`` is cached global THD metadata with a local query span. Returns
+    globally ordered compressed rows and document-local top-k per query. Reuses Lite's
     source-state lifetime and native parameter ownership."""
     core = attention.core_attention
     context, policy = core.context, core.policy
@@ -194,9 +195,17 @@ def source(attention, x, qr, qa, rope, documents, emit):
     ratio, eps = core.ratio, attention.config.layernorm_epsilon
     if ratio not in (1, 2):
         raise NotImplementedError('Deployment compression requires literal ratio one or two')
-    lengths = tuple(hi - lo for lo, hi in documents)
-    geometry = (lengths, tuple(x.shape), x.device, x.dtype, state.grad_mode)
-    m = metadata(lengths, ratio, x.device)
+    from .parallel import gather_rows
+
+    layout = documents
+    lengths = tuple(layout.lengths)
+    geometry = (lengths, tuple(x.shape), x.device, x.dtype, state.grad_mode, layout.offset)
+    if ratio not in layout.compression:
+        m = metadata(lengths, ratio, x.device)
+        span = slice(layout.offset, layout.offset + x.shape[0])
+        m.query_positions, m.query_requests = m.positions[span], m.requests[span].long()
+        layout.compression[ratio] = m
+    m = layout.compression[ratio]
 
     def produce():
         if ratio == 1:
@@ -208,7 +217,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
             norm = compressor.norm.weight
             key = native.indexer.compressor
             wk, knorm = key.wk.weight, key.norm.weight
-        raw = linear(x, weight, fp8=False)
+        raw = gather_rows(linear(x, weight, fp8=False), layout.cp_group)
         emit('compressor_projection', raw)
         latent = _Pool.apply(raw, norm, ratio, eps, m)
         emit('compressor_latent', latent[m.closers])
@@ -221,7 +230,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
 
     decoded, keys = state.resolve(layer, policy.kv, ('vllm_kv', geometry), produce)
 
-    def candidates(document, rows):
+    def candidates(rows):
         release = context.release
         owner = release.candidate_source_layer_id
         if owner < 0 or layer < owner:
@@ -246,7 +255,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
                 )
                 return out
 
-            key = ('vllm_candidate', (document, rows) + geometry)
+            key = ('vllm_candidate', (rows,) + geometry)
             blocks = state.resolve(layer, owner, key, publish)
             if layer != owner:
                 apply_candidate_mask(logits, starts, ends, blocks, release.candidate_block_size)
@@ -265,23 +274,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
             q = q.reshape(-1, 32, 128)
             w = linear(x.detach(), weights[1], fp8=False).bfloat16()
             values, scales = keys
-            pieces = [torch.full((0, 512), -1, dtype=torch.int32, device=x.device)]
-            for document, (lo, hi) in enumerate(documents):
-                if hi > lo:
-                    a, b = m.starts[document], m.starts[document] + m.counts[document]
-                    pieces.append(
-                        index_topk(
-                            q[lo:hi],
-                            w[lo:hi],
-                            # DeepGEMM needs 16-byte aligned operands; copy the slice.
-                            (values[a:b].clone(), scales[a:b].clone()),
-                            rope,
-                            ratio,
-                            emit,
-                            candidates(document, hi - lo),
-                        )
-                    )
-            return torch.cat(pieces)
+            return index_topk(q, w, keys, rope, ratio, emit, candidates(x.shape[0]), m=m)
 
     topk = state.resolve(layer, policy.index, ('vllm_index', geometry), select)
     emit('compressed_kv_decoded', decoded)

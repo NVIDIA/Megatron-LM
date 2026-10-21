@@ -140,7 +140,7 @@ def test_thd_projections_are_batched_and_metadata_tracks_boundary_changes(monkey
         raw_equal(positions, torch.cat([torch.arange(n) for n in layout.lengths]))
         raw_equal(layout.cu, torch.tensor([lo for lo, _ in layout.documents] + [9]).int())
         raw_equal(layout.seq, torch.tensor(layout.lengths).int())
-        layouts.append(layout.documents)
+        layouts.append([tuple(pair) for pair in layout.documents.tolist()])
         return hidden * 2
 
     monkeypatch.setattr(attention, '_projections', projections)
@@ -287,3 +287,77 @@ def test_owner_weight_gradients_accumulate_into_fp32_main_grad(monkeypatch):
     g = torch.randn(3, 2).bfloat16()
     linear._BF16Linear.backward(ctx, g)
     raw_equal(b.main_grad, before + linear.tc_mm(g.T, ctx.saved_tensors[0], torch.float32))
+
+
+@pytest.mark.parametrize('world', [2, 4])
+def test_contiguous_cp_metadata_keeps_empty_documents_and_query_offsets(world):
+    from megatron.lite.model.deepseek_v41.vllm.compressed import metadata
+
+    cu = torch.tensor([0, 3, 3, 13, 32])
+    full = attention._documents(cu, 'cpu')
+    seen = []
+    for rank in range(world):
+        layout = attention._documents(cu, 'cpu', local_rows=32 // world, rank=rank, world=world)
+        seen.append(layout.positions)
+        assert int(layout.query_cu[-1]) == 32 // world
+        for doc in range(4):
+            begin = max(int(cu[doc]), layout.offset)
+            end = min(int(cu[doc + 1]), layout.offset + layout.local_rows)
+            assert int(layout.query_cu[doc + 1] - layout.query_cu[doc]) == max(end - begin, 0)
+        for ratio in (1, 2):
+            m = metadata(layout.lengths, ratio, 'cpu')
+            assert m.counts == [n // ratio for n in layout.lengths]
+            assert torch.equal(m.positions, full.positions)
+    raw_equal(torch.cat(seen), full.positions)
+
+
+@pytest.mark.parametrize('ratio', [1, 2])
+def test_indexer_submits_all_documents_once_with_global_key_ranges(monkeypatch, ratio):
+    import sys
+
+    from megatron.lite.model.deepseek_v41.vllm import compressed
+
+    m = compressed.metadata([3, 0, 10, 19], ratio, 'cpu')
+    calls = []
+
+    def quant(positions, q, rope, weights, *args, **kwargs):
+        assert torch.equal(positions, m.query_positions)
+        return (q.to(torch.int8), torch.ones(q.shape[0], 1)), weights
+
+    def logits(query, keys, weights, starts, ends, width):
+        calls.append((starts.clone(), ends.clone(), width))
+        assert torch.equal(starts, m.key_starts[m.query_requests])
+        assert torch.equal(ends - starts, (m.query_positions + 1) // ratio)
+        return torch.arange(width).float().expand(32, -1).clone()
+
+    def topk(logits, starts, ends, output, *args):
+        assert torch.equal(starts, torch.zeros_like(starts))
+        assert torch.equal(ends, (m.query_positions + 1) // ratio)
+        output[:, : logits.shape[1]] = torch.arange(logits.shape[1])
+
+    modules = {
+        'vllm.model_executor.kernels.batch_invariant': SimpleNamespace(
+            top_k_per_row_prefill_index_order=topk
+        ),
+        'vllm.model_executor.layers.sparse_attn_indexer': SimpleNamespace(
+            as_fp32_logits=lambda x, ends: x
+        ),
+        'vllm.models.deepseek_v41.common.ops': SimpleNamespace(fused_indexer_q_rope_quant=quant),
+        'vllm.utils.deep_gemm': SimpleNamespace(
+            fp8_fp4_mqa_logits=logits, mqa_logits_mx_inputs=lambda q, sf, w: (sf, w)
+        ),
+    }
+    for name, value in modules.items():
+        monkeypatch.setitem(sys.modules, name, value)
+    total = sum(m.counts)
+    result = compressed.index_topk(
+        torch.zeros(32, 32, 64),
+        torch.ones(32, 32),
+        (torch.zeros(total, 64, dtype=torch.int8), torch.zeros(total, 4, dtype=torch.uint8)),
+        torch.empty(1),
+        ratio,
+        lambda *args: None,
+        m=m,
+    )
+    assert len(calls) == 1 and calls[0][2] == max(m.counts)
+    assert result.shape == (32, 512)

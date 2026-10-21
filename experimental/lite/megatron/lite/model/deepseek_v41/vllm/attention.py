@@ -408,39 +408,62 @@ def _projection_rows(projected, lo, hi):
     return raw[lo:hi], qr[lo:hi], kv[lo:hi], q[lo:hi], sliced
 
 
-def _documents(documents, device):
-    """THD document row ranges as vLLM requests: per-document positions, query start
-    locations and lengths, plus per-ratio index remaps (see :func:`swa_forward`)."""
+def _documents(documents, device, *, local_rows=None, rank=0, world=1):
+    """Vectorized request metadata; CPU planning once per packed batch, no doc loop."""
     from types import SimpleNamespace
 
-    lengths = [hi - lo for lo, hi in documents]
-    starts = [lo for lo, _ in documents] + [documents[-1][1] if documents else 0]
+    values = torch.as_tensor(documents, dtype=torch.int64, device='cpu')
+    cu = values if values.ndim == 1 else torch.cat((values[:, 0], values[-1:, 1]))
+    lengths = cu[1:] - cu[:-1]
+    total = int(cu[-1])
+    if (
+        cu[0] != 0
+        or (lengths < 0).any()
+        or (local_rows is not None and total != local_rows * world)
+    ):
+        raise ValueError('Contiguous CP document tiling must cover all physical rows exactly')
+    local_rows = total if local_rows is None else local_rows
+    offset = rank * local_rows
+    owner = torch.repeat_interleave(torch.arange(len(lengths)), lengths, output_size=total)
+    positions = torch.arange(total) - cu[owner]
+    lo, hi = cu[:-1].clamp_min(offset), cu[1:].clamp_max(offset + local_rows)
+    queries = (hi - lo).clamp_min(0)
+    prefix = (cu[1:].clamp_max(offset + local_rows) - cu[:-1]).clamp_min(0)
     return SimpleNamespace(
-        documents=documents,
-        lengths=lengths,
-        positions=torch.cat(
-            [torch.zeros(0, dtype=torch.int64)] + [torch.arange(n) for n in lengths]
-        ).to(device),
-        cu=torch.tensor(starts, dtype=torch.int32, device=device),
-        seq=torch.tensor(lengths, dtype=torch.int32, device=device),
+        documents=torch.stack((cu[:-1], cu[1:]), 1),
+        lengths=lengths.tolist(),
+        host_cu=cu,
+        positions=positions[offset : offset + local_rows].to(device),
+        global_positions=positions,
+        requests=owner,
+        cu=cu.to(device=device, dtype=torch.int32),
+        query_cu=torch.cat((cu.new_zeros(1), queries.cumsum(0))).to(
+            device=device, dtype=torch.int32
+        ),
+        seq=lengths.to(device=device, dtype=torch.int32),
+        query_seq=prefix.to(device=device, dtype=torch.int32),
+        max_length=int(lengths.max()) if lengths.numel() else 0,
+        offset=offset,
+        total=total,
+        local_rows=local_rows,
         remap={},
+        compression={},
+        cp_group=None,
     )
 
 
 def _remap(layout, ratio, width, total, device):
-    """``combine_topk_swa_indices`` addresses request ``b``'s workspace as
-    ``M*b + [compressed (N rows) | SWA rows]``. Map that to the packed KV
-    ``[every document's compressed rows | every THD row]`` actually passed."""
     if ratio not in layout.remap:
-        counts = [n // ratio if ratio else 0 for n in layout.lengths]
-        first = [sum(counts[:d]) for d in range(len(counts))]
-        rows = [lo for lo, _ in layout.documents]
-        stride = width + max(layout.lengths, default=0)
+        lengths = layout.host_cu[1:] - layout.host_cu[:-1]
+        counts = lengths // ratio if ratio else torch.zeros_like(lengths)
+        first = torch.cat((counts.new_zeros(1), counts.cumsum(0)))[:-1].to(device)
+        starts = layout.host_cu[:-1].to(device)
+        stride = width + layout.max_length
         v = torch.arange(len(counts) * stride, device=device)
-        b, r = v // stride, v % stride
-        compressed = torch.tensor(first, dtype=torch.int64, device=device)[b] + r
-        swa = total + torch.tensor(rows, dtype=torch.int64, device=device)[b] + r - width
-        layout.remap[ratio] = stride, torch.where(r < width, compressed, swa).int()
+        request, row = v // stride, v % stride
+        compressed = first[request] + row
+        swa = total + starts[request] + row - width
+        layout.remap[ratio] = stride, torch.where(row < width, compressed, swa).int()
     return layout.remap[ratio]
 
 
@@ -476,19 +499,22 @@ def swa_forward(
     rows = x.shape[0]
     if layout is None:
         layout = _documents([(0, rows)], x.device)
+    from .parallel import gather_rows
+
+    kv = gather_rows(kv, layout.cp_group)
     ratio, width, total = 0, 0, 0
     topk = torch.empty((rows, 0), device=x.device, dtype=torch.int32)
     if source is not None:
         compressed, topk, ratio = source(x, qr, qa)
-        width = max((n // ratio for n in layout.lengths), default=0)
+        width = layout.max_length // ratio
         total = compressed.shape[0]
         kv = torch.cat((compressed, kv), 0)
     stride, table = _remap(layout, ratio, width, total, x.device)
     indices, lens = combine_topk_swa_indices(
         topk,
-        layout.cu,
-        layout.seq,
-        layout.seq,
+        layout.query_cu,
+        layout.query_seq,
+        layout.query_seq,
         attention.config.csa_window_size,
         ratio,
         topk.shape[1],
@@ -558,8 +584,6 @@ from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfA
 
 class SWAAttention(DS41SelfAttention):
     def forward(self, hidden_states, attention_mask=None, *, packed_seq_params=None, **kwargs):
-        if self.pg_collection.cp.size() != 1:
-            raise NotImplementedError('Deployment SWA CP exchange is not yet validated')
         if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
             raise ValueError('Deployment SWA requires native packed THD metadata')
         if not hasattr(self, '_deployment_rope'):
@@ -593,10 +617,16 @@ class SWAAttention(DS41SelfAttention):
             cu = packed_seq_params.cu_seqlens_q
         cached = getattr(packed_seq_params, '_deployment_documents', None)
         if cached is None or cached[0] is not cu or cached[1] != cu._version:
-            boundaries = cu.tolist()
-            if boundaries[0] != 0 or boundaries[-1] != hidden_states.shape[0]:
-                raise ValueError('Deployment SWA requires THD documents tiling all rows')
-            documents = _documents(list(zip(boundaries, boundaries[1:])), cu.device)
+            group = self.pg_collection.cp
+            world = group.size()
+            documents = _documents(
+                cu.cpu(),
+                cu.device,
+                local_rows=hidden_states.shape[0],
+                rank=group.rank() if world > 1 else 0,
+                world=world,
+            )
+            documents.cp_group = group if world > 1 else None
             cached = (cu, cu._version, documents)
             packed_seq_params._deployment_documents = cached
         if hidden_states.shape[0] == 0:
@@ -606,9 +636,7 @@ class SWAAttention(DS41SelfAttention):
         def sources(x, qr, qa):
             from .compressed import source
 
-            decoded, topk = source(
-                self, x, qr, qa, self._deployment_rope, layout.documents, lambda *_: None
-            )
+            decoded, topk = source(self, x, qr, qa, self._deployment_rope, layout, lambda *_: None)
             return decoded, topk, self._dsv4_compress_ratio
 
         out = swa_forward(
