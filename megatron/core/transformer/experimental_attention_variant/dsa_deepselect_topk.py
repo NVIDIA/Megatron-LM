@@ -6,7 +6,7 @@ DeepSelect (https://github.com/deepseek-ai/DeepSelect) selects the top-k of ever
 launch with no scratch buffer. Two builds are accepted, the first one that imports wins:
 
 * ``ds_tune``: DeepSelect bfa4507 with the GLM-5.2 patches (a ``max_topk`` 2048 tier, config
-  ``f_t512_b2_2k_d3`` for FP32).
+  ``f_t512_b2_2k_d3`` for FP32 and ``h_t256_o2_b2_2k_d3`` for BF16).
 * ``deep_select``: upstream DeepSelect.
 
 Through :func:`dsa_cudnn_kernels._indexer_top_k_wrapper_chunked` on GB300 (CUDA graph, K=2048,
@@ -24,19 +24,43 @@ or below 1.0 from about 67K columns (the narrowest 128K CP32 rank is 67584 wide)
 against 0.564 ms at 128K. So each build is used only from :func:`min_score_width` columns
 (:data:`MIN_SCORE_WIDTH`, :data:`MANY_ROWS_MIN_SCORE_WIDTH`).
 
+BF16 scores are accepted as well (for example the logits of a DeepGEMM MXFP8 scorer).
+``ds_tune`` runs them with config ``h_t256_o2_b2_2k_d3``: 4.20 against 6.08 ms for FP32 at the
+1M CP64 rank-0 call, 4.97 against 7.00 ms at rank 63 and 0.337 against 0.469 ms at 128K CP32
+rank 0 (GB300, CUDA graph, K 2048, deepgemm-vs-fe study). cuDNN's radix top-k on BF16 scores
+was timed against its FP32 path only (GB300, CUDA graph, K 2048; cuDNN frontend develop
+``4f175f3f`` with the 1.31 binary): 0.43 against 0.36 ms at 4096 x 32768 Gaussian scores,
+0.80 against 0.62 at 4096 x 65536, 0.89 against 1.08 at 4096 x 131072, 0.69 against 0.60 at
+the 128K CP32 rank-0 call and 22.75 against 14.44 ms at the 1M CP64 rank-0 call. A BF16
+width sweep of the two (GB300, Slurm job 317672 bench B1: CUDA graph p50 of 20 replays, K
+2048, cuDNN frontend 1.31 with this module's 8 GiB chunking, DeepGEMM-shaped rows with
+unwritten tails, CP-balanced and Gaussian row lengths) found ``ds_tune`` BF16 1.70-2.69x
+faster than cuDNN's BF16 radix top-k at every point, widths 16384..131072 by 2048..16384 rows
+(64 points, none selecting past a row's length), e.g. 0.054 against 0.099 ms at 2048 x 16384
+and 1.62 against 3.19 ms at 16384 x 131072. So BF16 has its own width table
+(:data:`SCORE_WIDTH_TABLES_BY_DTYPE`): ``ds_tune`` from 16384 columns at every row count, with
+no many-rows step; narrower BF16 rows were not measured and keep cuDNN, and ``deep_select``
+(not in the sweep, never timed on BF16 scores) keeps its FP32 threshold. The sweep timed 2048
+to 16384 rows at K 2048 only: the table applies the same threshold to fewer rows and to other
+top-k values, which is an extrapolation. B1 timed the selections and checked that none lay
+past a row's length; ``test_dsa_deepselect_topk_gpu.py`` checks BF16 exactness against
+``torch.topk`` at the widths the table opens (16384..65536, DeepGEMM-shaped poisoned tails) as
+well as at 128K and 1M. Correctness does not depend on these thresholds.
+
 :func:`deepselect_topk` keeps the cuDNN ``indexer_top_k_wrapper`` output contract of
 :func:`dsa_cudnn_kernels._indexer_top_k_wrapper_chunked` in non-deterministic mode: int32
-``[rows, K]`` indices in unspecified slot order, the selected FP32 scores (or ``None``), rows
-no longer than K gathered at the front of the row and padded with index ``-1`` and value
-``-inf``. Only the choice among equal scores at the cutoff may differ from cuDNN's, which is
-itself unspecified there. DeepSelect is deterministic run to run and does not depend on the
+``[rows, K]`` indices in unspecified slot order, the selected scores in the scores' dtype (or
+``None``), rows no longer than K gathered at the front of the row and padded with index ``-1``
+and value ``-inf``. Only the choice among equal scores at the cutoff may differ from cuDNN's, which
+is itself unspecified there. DeepSelect is deterministic run to run and does not depend on the
 other rows of the batch, but it does not keep the lowest-index ties, so deterministic mode
 never uses it.
 
 NaN: DeepSelect checks rows longer than K for NaN. Instead of trapping
 (``abort_when_nan_found=False``) it writes ``NAN_ROW_SENTINEL`` into slot 0 of such a row and
 leaves the rest of the row unspecified. :func:`repair_nan_rows` rewrites those rows to the
-first ``K`` in-row columns with NaN values, so they stay in range and unique. This reaches the
+first ``K`` in-row columns with NaN values (of the scores' dtype), so they stay in range and
+unique. This reaches the
 sparse attention, not only the indexer loss: with ``return_topk_scores=True``,
 ``_indexer_topk_bshd`` keeps only in-bounds, finite selections, so a flagged row ends with
 ``topk_length == 0`` and attends to no key; with ``return_topk_scores=False`` it attends to the
@@ -48,11 +72,13 @@ this difference is documented rather than matched.
 
 Requirements, checked by :func:`fallback_reason` without host synchronization: a build imports
 and exposes the arguments used here, a CUDA device in :data:`SUPPORTED_SM` (SM 10.3; the builds
-also ship sm_100a kernels, :data:`COMPILED_SM`, but those have not run on a GB200 yet), FP32
-scores with unit column stride, a 16-byte-aligned start (the TMA descriptor's global address)
-and a row stride that is a multiple of the build's input alignment (1024 bytes),
-``min_score_width(build, rows) <= width < 2**23``, a compiled config for K (K <= 4096) and K a
-multiple of the output alignment (8 int32), so the preallocated outputs are contiguous.
+also ship sm_100a kernels, :data:`COMPILED_SM`, but those have not run on a GB200 yet), FP32 or
+BF16 scores (:data:`SUPPORTED_DTYPES`) with unit column stride, a 16-byte-aligned start (the
+TMA descriptor's global address) and a row stride that is a multiple of the build's input
+alignment (1024 bytes), ``min_score_width(build, rows, dtype) <= width < 2**23``, a compiled
+config for the dtype and K (K <= 4096) and K a multiple of the output alignment (8 for FP32
+scores, 16 for BF16: int32 indices and values of the scores' dtype), so the preallocated
+outputs are contiguous.
 """
 
 from __future__ import annotations
@@ -88,6 +114,24 @@ NAN_ROW_SENTINEL = 0x3F3F3F3F
 # deep_select's.
 MIN_SCORE_WIDTH = {"ds_tune": 65536, "deep_select": 524288}
 MANY_ROWS_MIN_SCORE_WIDTH = {"ds_tune": (4096, 81920)}
+# Score dtypes DeepSelect takes, and their width tables: ``None`` means the FP32 tables above
+# (MIN_SCORE_WIDTH, MANY_ROWS_MIN_SCORE_WIDTH), a tuple is a dtype's own (min width per build,
+# many-rows rule per build). BF16 has its own (module docstring, GB300 Slurm job 317672 bench
+# B1): ds_tune beat cuDNN's BF16 radix top-k 1.70-2.69x at every measured width 16384..131072
+# and row count 2048..16384 (K 2048), so it starts at 16384 for every row count and top-k (fewer
+# rows and other K extrapolated); narrower widths were not measured. deep_select was not in that
+# sweep (never timed on BF16 scores) and keeps its FP32 threshold.
+SUPPORTED_DTYPES = (torch.float32, torch.bfloat16)
+SCORE_WIDTH_TABLES_BY_DTYPE: dict = {
+    torch.bfloat16: ({"ds_tune": 16384, "deep_select": MIN_SCORE_WIDTH["deep_select"]}, {})
+}
+# Why a width below a dtype's table keeps cuDNN: measured for FP32, not measured for BF16; a
+# build whose BF16 threshold is its FP32 one names that instead.
+_BELOW_TABLE_NOTE = {torch.bfloat16: "not measured below it for BF16, cuDNN is kept"}
+_BELOW_BUILD_TABLE_NOTE = {
+    (torch.bfloat16, "deep_select"): "deep_select not timed on BF16, its FP32 threshold is kept"
+}
+_DTYPE_NAMES = {torch.float32: "FP32", torch.bfloat16: "BF16"}
 MAX_TOPK = 4096
 MAX_SCORE_WIDTH_EXCLUSIVE = 2**23
 # Devices the builds ship kernels for (sm_100a, sm_103a), and the ones the backend runs on: only
@@ -263,10 +307,22 @@ def _unsupported_device_reason(device: torch.device) -> str:
     return f"DeepSelect needs a CUDA device of SM {sorted(SUPPORTED_SM)}"
 
 
-def min_score_width(kind: str, n_rows: int) -> int:
+def _width_tables(dtype: torch.dtype) -> tuple:
+    """``(min width per build, many-rows rule per build)`` for scores of ``dtype``."""
+    tables = SCORE_WIDTH_TABLES_BY_DTYPE.get(dtype)
+    return (MIN_SCORE_WIDTH, MANY_ROWS_MIN_SCORE_WIDTH) if tables is None else tables
+
+
+def dtype_name(dtype: torch.dtype) -> str:
+    """Short name of a score dtype for reasons and log lines (``FP32``, ``BF16``)."""
+    return _DTYPE_NAMES.get(dtype, str(dtype))
+
+
+def min_score_width(kind: str, n_rows: int, dtype: torch.dtype = torch.float32) -> int:
     """Narrowest score row from which build ``kind`` is used for a call of ``n_rows`` rows."""
-    width = MIN_SCORE_WIDTH[kind]
-    many_rows = MANY_ROWS_MIN_SCORE_WIDTH.get(kind)
+    min_widths, many_rows_widths = _width_tables(dtype)
+    width = min_widths[kind]
+    many_rows = many_rows_widths.get(kind)
     if many_rows is not None and n_rows > many_rows[0]:
         width = max(width, many_rows[1])
     return width
@@ -285,42 +341,51 @@ def static_fallback_reason(
 
     Covers everything but the score buffer's strides, so a caller can size the buffer before
     it exists (:func:`score_row_stride`). The reason strings are stable per cause, so they
-    double as the log-once key.
+    double as the log-once key; :func:`log_topk_backend_once` also keys on the dtype, so FP32
+    and BF16 calls log separately.
     """
     if deterministic:
         return "deterministic mode keeps the cuDNN tie_break=1 top-k"
     if not 0 < topk_k <= MAX_TOPK:
         return f"top-k must be in [1, {MAX_TOPK}]"
-    if width < min(MIN_SCORE_WIDTH.values()):
-        return f"score width below {min(MIN_SCORE_WIDTH.values())} (cuDNN is faster there)"
+    if dtype not in SUPPORTED_DTYPES:
+        return f"scores must be FP32 or BF16, got {dtype}"
+    min_widths, many_rows_widths = _width_tables(dtype)
+    below_note = _BELOW_TABLE_NOTE.get(dtype, "cuDNN is faster there")
+    if width < min(min_widths.values()):
+        return f"score width below {min(min_widths.values())} ({below_note})"
     if width >= MAX_SCORE_WIDTH_EXCLUSIVE:
         return "score width must be below 2**23"
     if topk_k >= width:
         return "top-k covers the whole row"
     if n_rows <= 0:
         return "no rows"
-    if dtype != torch.float32:
-        return "scores must be FP32"
     if not _device_supported(device):
         return _unsupported_device_reason(device)
     provider = _load_provider()
     if provider is None:
         return _IMPORT_STATE["error"]
-    if width < MIN_SCORE_WIDTH[provider.kind]:
-        return (
-            f"score width below {MIN_SCORE_WIDTH[provider.kind]} for {provider.kind} "
-            "(cuDNN is faster there)"
-        )
-    if width < min_score_width(provider.kind, n_rows):
-        row_limit, row_width = MANY_ROWS_MIN_SCORE_WIDTH[provider.kind]
+    if width < min_widths[provider.kind]:
+        note = _BELOW_BUILD_TABLE_NOTE.get((dtype, provider.kind), below_note)
+        return f"score width below {min_widths[provider.kind]} for {provider.kind} ({note})"
+    if width < min_score_width(provider.kind, n_rows, dtype):
+        row_limit, row_width = many_rows_widths[provider.kind]
         return (
             f"score width below {row_width} for {provider.kind} with more than {row_limit} rows "
             "(cuDNN is faster there)"
         )
     if provider.config_id(dtype, topk_k) is None:
-        return f"{provider.kind} has no compiled config for top-k {topk_k}"
-    if (topk_k * torch.iinfo(torch.int32).bits // 8) % provider.output_align:
-        return f"top-k must be a multiple of {provider.output_align // 4} for contiguous outputs"
+        dtype_note = "" if dtype == torch.float32 else f" with {dtype_name(dtype)} scores"
+        return f"{provider.kind} has no compiled config for top-k {topk_k}{dtype_note}"
+    # The int32 indices and the values (scores' dtype) are both [rows, K] contiguous outputs
+    # whose row stride must be output-aligned: the narrower element sets the multiple of K
+    # (8 for FP32 scores, 16 for BF16 with 32-byte alignment).
+    element_size = min(torch.iinfo(torch.int32).bits, torch.finfo(dtype).bits) // 8
+    if (topk_k * element_size) % provider.output_align:
+        return (
+            f"top-k must be a multiple of {provider.output_align // element_size} for "
+            "contiguous outputs"
+        )
     return None
 
 
@@ -351,12 +416,12 @@ def fallback_reason(
     return None
 
 
-def score_row_stride(width: int) -> int:
-    """Smallest FP32 row stride (elements) of at least ``width`` that DeepSelect accepts.
+def score_row_stride(width: int, dtype: torch.dtype = torch.float32) -> int:
+    """Smallest row stride (elements of ``dtype``) of at least ``width`` DeepSelect accepts.
 
     Call only after :func:`static_fallback_reason` returned ``None`` (a build is loaded).
     """
-    align = max(1, _load_provider().input_align // (torch.finfo(torch.float32).bits // 8))
+    align = max(1, _load_provider().input_align // (torch.finfo(dtype).bits // 8))
     return -(-width // align) * align
 
 
@@ -366,20 +431,28 @@ def _is_unavailable(reason: str) -> bool:
     )
 
 
-def log_topk_backend_once(requested: str, reason: Optional[str]) -> None:
-    """Log once per outcome which backend a ``dsa_indexer_topk_backend='deepselect'`` run uses."""
-    key = (requested, reason)
+def log_topk_backend_once(
+    requested: str, reason: Optional[str], dtype: torch.dtype = torch.float32
+) -> None:
+    """Log once per outcome and score dtype which backend a ``'deepselect'`` run uses."""
+    key = (requested, reason, dtype)
     if key in _LOGGED_REASONS:
         return
     _LOGGED_REASONS.add(key)
+    # FP32 lines keep their wording; other dtypes name themselves.
+    scores = "" if dtype == torch.float32 else f" on {dtype_name(dtype)} scores"
     if reason is None:
-        logger.info("DSA indexer top-k uses DeepSelect (%s).", _load_provider().description)
+        logger.info(
+            "DSA indexer top-k uses DeepSelect%s (%s).", scores, _load_provider().description
+        )
     elif _is_unavailable(reason):
         logger.warning(
-            "dsa_indexer_topk_backend='deepselect' is unavailable, the cuDNN top-k runs: %s", reason
+            "dsa_indexer_topk_backend='deepselect' is unavailable%s, the cuDNN top-k runs: %s",
+            scores,
+            reason,
         )
     else:
-        logger.info("DSA indexer top-k uses cuDNN for some calls: %s.", reason)
+        logger.info("DSA indexer top-k uses cuDNN for some calls%s: %s.", scores, reason)
 
 
 if HAVE_TRITON:
@@ -414,7 +487,8 @@ def repair_nan_rows(indices: Tensor, values: Optional[Tensor], lengths: Tensor) 
     """Rewrite rows flagged with :data:`NAN_ROW_SENTINEL` in place (no host synchronization).
 
     A flagged row becomes columns ``0 .. min(len, K) - 1`` (index ``-1`` after that) with NaN
-    values. Rows without the flag are unchanged. On CUDA a Triton kernel reads only slot 0 of
+    values of the values' dtype (the Triton store casts to the pointer type). Rows without the
+    flag are unchanged. On CUDA a Triton kernel reads only slot 0 of
     unflagged rows; elsewhere (and without Triton) a fixed-shape PyTorch version runs. The
     module docstring says what such a row does to the sparse attention.
     """
