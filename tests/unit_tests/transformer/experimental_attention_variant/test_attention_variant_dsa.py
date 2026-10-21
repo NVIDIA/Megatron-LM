@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -347,9 +348,13 @@ def test_dsa_runtime_cp_groups_are_forward_local():
         index_n_heads=2,
         index_head_dim=4,
         softmax_scale=0.5,
+        use_rope=True,
+        index_kpool=1,
+        index_kpool_compress_gate=None,
         linear_wq_b=lambda value: (value.new_zeros(3, 1, 8), None),
         linear_wk=lambda value: (value.new_zeros(3, 1, 4), None),
-        linear_weights_proj=lambda value: (value.new_zeros(3, 1, 2), None),
+        _project_indexer_weights=lambda value: value.new_zeros(3, 1, 2),
+        _projection_quantization_context=nullcontext,
         k_norm=lambda value: value,
     )
     indexer.rotary_pos_emb = lambda *args, **kwargs: torch.empty(3, 1, 1, 4)
