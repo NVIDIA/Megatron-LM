@@ -16,6 +16,17 @@ def _row_scales(scale, rows, inner):
     )
 
 
+def tc_mm(a, b, out_dtype=None):
+    """``a @ b`` with BF16 operands on tensor cores and FP32 accumulation; the result is
+    BF16 unless ``out_dtype`` asks for the FP32 accumulator. CPU (derivative references
+    only): the same rounded operands in an FP32 GEMM."""
+    a, b = a.bfloat16(), b.bfloat16()
+    if not a.is_cuda:
+        out = a.float() @ b.float()
+        return out.bfloat16() if out_dtype is None else out.to(out_dtype)
+    return a @ b if out_dtype is None else torch.mm(a, b, out_dtype=out_dtype)
+
+
 class _MXFP8Linear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, activation):
@@ -75,10 +86,10 @@ class _MXFP8Linear(torch.autograd.Function):
 
 
 def linear_vjp(ctx, grad, activation, weight):
-    flat_grad = grad.reshape(-1, weight.shape[0]).float()
+    flat_grad = grad.reshape(-1, weight.shape[0])
     with torch.autocast(device_type=grad.device.type, enabled=False):
-        dx = (flat_grad @ weight.float()).reshape(ctx.input_shape).to(activation.dtype)
-        dw = (flat_grad.T @ activation.float()).to(ctx.weight_dtype)
+        dx = tc_mm(flat_grad, weight).reshape(ctx.input_shape).to(activation.dtype)
+        dw = tc_mm(flat_grad.T, activation, torch.float32).to(ctx.weight_dtype)
     return dx, dw, None
 
 
@@ -100,12 +111,10 @@ class _BF16Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         x, compute = ctx.saved_tensors
+        flat_grad = grad.reshape(-1, compute.shape[0])
         with torch.autocast(device_type=grad.device.type, enabled=False):
-            dx = (grad.float() @ compute.float()).to(x.dtype)
-            dw = (
-                grad.reshape(-1, compute.shape[0]).float().T
-                @ x.reshape(-1, compute.shape[1]).float()
-            )
+            dx = tc_mm(flat_grad, compute).reshape(x.shape).to(x.dtype)
+            dw = tc_mm(flat_grad.T, x.reshape(-1, compute.shape[1]), torch.float32)
         return dx, dw.to(ctx.weight_dtype)
 
 

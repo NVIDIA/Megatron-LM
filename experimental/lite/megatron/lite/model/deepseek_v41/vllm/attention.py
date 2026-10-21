@@ -359,9 +359,19 @@ class _FP8OutputProjection(torch.autograd.Function):
         else:
             activation, weight, positions, cache = ctx.saved_tensors
         with torch.autocast(device_type=grad.device.type, enabled=False):
-            g = grad.float()
-            dx = torch.einsum('tgd,gdk->tgk', g, weight.float()).to(activation.dtype)
-            dw = torch.einsum('tgd,tgk->gdk', g, activation.float()).to(ctx.weight_dtype)
+            g = grad.permute(1, 0, 2).bfloat16()
+            a = activation.permute(1, 0, 2).bfloat16()
+            w = weight.bfloat16()
+
+            def bmm(left, right):
+                return (
+                    torch.bmm(left, right, out_dtype=torch.float32)
+                    if left.is_cuda
+                    else torch.bmm(left.float(), right.float())
+                )
+
+            dx = bmm(g, w).permute(1, 0, 2).to(activation.dtype)
+            dw = bmm(g.transpose(1, 2), a).to(ctx.weight_dtype)
         # Inverse-RoPE's adjoint is the forward rotation; quantization is STE.
         return (
             _rotate(dx.reshape(ctx.shape), positions, cache),

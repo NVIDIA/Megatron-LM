@@ -82,3 +82,39 @@ def test_wo_a_packed_context_preserves_pre_rotation_vjp(monkeypatch):
     ctx.saved_tensors = (codes, packed_scale, packed, sf, position, cache)
     for a, b in zip(expected[:2], attention._FP8OutputProjection.backward(ctx, grad)[:2]):
         raw_equal(a, b)
+
+
+@pytest.mark.parametrize('kind', ['bf16', 'mxfp8', 'wo_a'])
+@pytest.mark.parametrize('gradient_dtype', [torch.bfloat16, torch.float32])
+def test_tensor_core_vjp_matches_fp32_control(kind, gradient_dtype, monkeypatch):
+    torch.manual_seed(45)
+
+    def check(a, b):
+        a, b = a.double().flatten(), b.double().flatten()
+        cosine = torch.nn.functional.cosine_similarity(a, b, dim=0)
+        assert cosine >= 0.9999
+        assert (a - b).norm() / b.norm() <= 1e-2
+        assert -cosine < 0.9999
+
+    if kind == 'wo_a':
+        monkeypatch.setattr(attention, '_rotate', lambda x, *_: x)
+        x, w = torch.randn(7, 2, 128).bfloat16(), torch.randn(2, 32, 128).bfloat16()
+        g = torch.randn(7, 2, 32).to(gradient_dtype)
+        ctx = SimpleNamespace(
+            saved_tensors=(x, w, torch.arange(7), torch.empty(0)),
+            shape=(7, 4, 64),
+            weight_shape=(64, 128),
+            weight_dtype=torch.float32,
+        )
+        dx, dw, *_ = attention._FP8OutputProjection.backward(ctx, g)
+        check(dx, torch.einsum('tgd,gdk->tgk', g.float(), w.float()).bfloat16().reshape_as(dx))
+        check(dw, torch.einsum('tgd,tgk->gdk', g.float(), x.float()).reshape_as(dw))
+    else:
+        x, w = torch.randn(7, 128).bfloat16(), torch.randn(64, 128).bfloat16()
+        g = torch.randn(7, 64).to(gradient_dtype)
+        ctx = SimpleNamespace(saved_tensors=(x, w), input_shape=x.shape, weight_dtype=torch.float32)
+        dx, dw, *_ = (linear._BF16Linear if kind == 'bf16' else linear._MXFP8Linear).backward(
+            ctx, g
+        )
+        check(dx, (g.float() @ w.float()).bfloat16())
+        check(dw, g.float().T @ x.float())
