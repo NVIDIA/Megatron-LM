@@ -273,7 +273,8 @@ def source(attention, x, qr, qa, rope, documents, emit):
                         index_topk(
                             q[lo:hi],
                             w[lo:hi],
-                            (values[a:b], scales[a:b]),
+                            # DeepGEMM needs 16-byte aligned operands; copy the slice.
+                            (values[a:b].clone(), scales[a:b].clone()),
                             rope,
                             ratio,
                             emit,
