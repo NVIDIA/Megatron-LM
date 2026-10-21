@@ -20,6 +20,10 @@ from torch import Tensor, nn
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import (  # for backward compatibility; pylint: disable=unused-import
+    _apply_rotary_pos_emb_bshd,
+    _apply_rotary_pos_emb_thd,
+    _rotate_half,
+    apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
 from megatron.core.utils import deprecate_inference_params, internal_api
