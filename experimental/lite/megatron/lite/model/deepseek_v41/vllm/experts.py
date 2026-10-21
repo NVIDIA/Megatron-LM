@@ -114,17 +114,39 @@ class _Grouped(torch.autograd.Function):
     def backward(ctx, grad):
         codes, scale, weight_codes, weight_scales = ctx.saved_tensors
         x = dequantize_activation(codes, scale).to(grad.dtype)
-        dx, dw, start = torch.empty_like(x), [], 0
+        # Ragged M/K grouping is owned by Torch's grouped GEMM. Decode the
+        # stacked expert operand once; no per-expert CUDA launch sequence.
+        ends = torch.tensor(ctx.counts, device=grad.device, dtype=torch.int32).cumsum(
+            0, dtype=torch.int32
+        )
+        weight = dequantize_mxfp4(weight_codes, weight_scales).to(grad.dtype)
         with torch.autocast(device_type=grad.device.type, enabled=False):
-            for index, count in enumerate(ctx.counts):
-                stop = start + count
-                weight = dequantize_mxfp4(weight_codes[index], weight_scales[index])
-                dx[start:stop] = grad[start:stop] @ weight.to(grad.dtype)
-                dw.append(
-                    (grad[start:stop].float().T @ x[start:stop].float()).to(ctx.dtypes[index])
+            dx = (
+                torch._grouped_mm(grad.contiguous(), weight, offs=ends)
+                if grad.is_cuda
+                else torch.cat([g @ w for g, w in zip(grad.split(ctx.counts), weight.unbind(0))])
+            )
+            if grad.is_cuda:
+                from .backward_kernels import grouped_weight_vjp
+
+                dw = torch.empty(weight.shape, device=grad.device, dtype=torch.float32)
+                grouped_weight_vjp[
+                    (len(ctx.counts), (grad.shape[1] + 31) // 32, (x.shape[1] + 63) // 64)
+                ](grad.contiguous(), x.contiguous(), ends, dw, grad.shape[1], x.shape[1])
+            else:
+                # CPU-only derivative controls have no grouped CUDA backend.
+                dw = torch.stack(
+                    [
+                        g.float().T @ a.float()
+                        for g, a in zip(grad.split(ctx.counts), x.split(ctx.counts))
+                    ]
                 )
-                start = stop
-        return dx.to(ctx.input_dtype), None, None, *dw
+        return (
+            dx.to(ctx.input_dtype),
+            None,
+            None,
+            *(value.to(dtype) for value, dtype in zip(dw.unbind(0), ctx.dtypes)),
+        )
 
 
 def expert_rows(x, fc1, fc2, counts, scores, encoded, limit):
