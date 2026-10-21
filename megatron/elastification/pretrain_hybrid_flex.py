@@ -559,8 +559,8 @@ if __name__ == "__main__":
 
     _orig_get_opt_cfg = _mtt.get_megatron_optimizer_config
 
-    def _patched_get_opt_cfg(args):
-        config, config_overrides = _orig_get_opt_cfg(args)
+    def _patched_get_opt_cfg(args, *, config=None):
+        config, config_overrides = _orig_get_opt_cfg(args, config=config)
         lr_mult = getattr(args, 'lr_mult_router', 1.0)
         if lr_mult != 1.0:
             router_key = ParamKey(
@@ -570,8 +570,8 @@ if __name__ == "__main__":
                 )
             )
             router_override = ParamGroupOverride(
-                max_lr=args.lr * lr_mult,
-                min_lr=args.min_lr * lr_mult,
+                max_lr=config.lr * lr_mult,
+                min_lr=config.min_lr * lr_mult,
             )
             config_overrides = {**(config_overrides or {}), router_key: router_override}
         return config, config_overrides

@@ -409,9 +409,17 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
+    from megatron.training.config import PretrainConfigContainer
+    from megatron.training.global_vars import get_run_config, is_run_config_initialized
+
+    cfg = get_run_config() if is_run_config_initialized() else None
     rng = _model_rng_config(args)
     # Read the distributed-init args before the rebind below hides them.
-    disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
+    disable_pipeline_output_dealloc = (
+        cfg.ddp.use_megatron_fsdp and cfg.ddp.megatron_fsdp_version == 2
+        if isinstance(cfg, PretrainConfigContainer)
+        else _mfsdp_v2_disables_pipeline_output_dealloc(args)
+    )
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
     # Translate args to core transformer configuration
@@ -419,6 +427,9 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     # Hardcoded 
     kw_args['deallocate_pipeline_outputs'] = not disable_pipeline_output_dealloc
+    if isinstance(cfg, PretrainConfigContainer):
+        kw_args['fp8_param'] = cfg.ddp.fp8_param_gather
+        kw_args['fp4_param'] = cfg.ddp.fp4_param_gather
     kw_args['pipeline_dtype'] = kw_args['params_dtype']
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm 
     
@@ -448,6 +459,8 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     else:
         config = TransformerConfig(**kw_args)
     rng.finalize_model_config(config)
+    if isinstance(cfg, PretrainConfigContainer):
+        cfg.finalize_transformer_config(config)
     return config
 
 def load_yaml(yaml_path):

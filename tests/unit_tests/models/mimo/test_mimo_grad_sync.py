@@ -38,6 +38,8 @@ def test_token_normalization_scale(num_tokens, expected):
 
 
 def test_configure_grad_sync_installs_production_overlap_hooks(run_config):
+    run_config.ddp.overlap_grad_reduce = True
+
     def no_sync():
         return None
 
@@ -55,9 +57,7 @@ def test_configure_grad_sync_installs_production_overlap_hooks(run_config):
     language_grid = SimpleNamespace(get_rank_enum=lambda _name: [[0]])
     topology = SimpleNamespace(grids={MIMO_LANGUAGE_MODULE_KEY: language_grid}, module_pgs={})
 
-    configure_grad_sync(
-        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=True), model, topology
-    )
+    configure_grad_sync(SimpleNamespace(align_grad_reduce=True), model, topology)
 
     assert config.no_sync_func is no_sync
     assert config.grad_sync_func is start_grad_sync

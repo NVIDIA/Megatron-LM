@@ -17,7 +17,12 @@ from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
-from megatron.training.training import get_model
+from megatron.training.global_vars import get_run_config
+from megatron.training.training import (
+    get_megatron_ddp_config,
+    get_megatron_optimizer_config,
+    get_model,
+)
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -201,6 +206,11 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.enable_ft_package = False
     args.use_torch_fsdp2 = False
     args.init_model_with_meta_device = False
+    # These adapters skip validate_args(), which normally resolves CLI dtype strings.
+    args.main_grads_dtype = torch.float32
+    args.main_params_dtype = torch.float32
+    args.exp_avg_dtype = torch.float32
+    args.exp_avg_sq_dtype = torch.float32
     return args
 
 
@@ -317,6 +327,9 @@ def setup_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        cfg = get_run_config()
+        cfg.ddp = get_megatron_ddp_config(mock_args)
+        cfg.optimizer, _ = get_megatron_optimizer_config(mock_args)
         model = get_model(
             partial(
                 initialize_fn,
@@ -452,6 +465,9 @@ def setup_moe_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        cfg = get_run_config()
+        cfg.ddp = get_megatron_ddp_config(mock_args)
+        cfg.optimizer, _ = get_megatron_optimizer_config(mock_args)
         model = get_model(
             partial(
                 initialize_fn,

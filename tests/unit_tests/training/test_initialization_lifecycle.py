@@ -702,6 +702,211 @@ def test_vocabulary_resolution_neither_reads_globals_nor_initializes_services(mo
     initialize.assert_not_called()
 
 
+@pytest.mark.parametrize("model_kind", ["gpt", "hybrid"])
+@pytest.mark.parametrize("fsdp_version", [None, 1, 2])
+def test_wrapper_finalization_uses_config_owners(monkeypatch, run_config, model_kind, fsdp_version):
+    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.training.models import GPTModelConfig, HybridModelConfig
+
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    # Batch topology is the only remaining args input to container finalization.
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=1))
+    run_config.train.micro_batch_size = 1
+    transformer = TransformerConfig(
+        num_layers=2, hidden_size=32, num_attention_heads=4, fp8="hybrid"
+    )
+    model_cls = GPTModelConfig if model_kind == "gpt" else HybridModelConfig
+    run_config.model = model_cls(transformer=transformer, vocab_size=128)
+    run_config.ddp = DistributedDataParallelConfig(
+        overlap_grad_reduce=True,
+        fp8_param_gather=True,
+        use_megatron_fsdp=fsdp_version is not None,
+        megatron_fsdp_version=fsdp_version or 1,
+        grad_reduce_in_fp32=True,
+        reduce_scatter_with_fp32_accumulation=True,
+        gtp_remat_reduce_scatter_with_fp32_accumulation=True,
+    )
+    run_config.optimizer.use_distributed_optimizer = fsdp_version != 2
+    run_config.optimizer.overlap_param_gather = True
+    if fsdp_version is not None:
+        run_config.checkpoint.ckpt_format = "fsdp_dtensor"
+
+    for _ in range(2):
+        run_config.validate()
+        run_config.finalize()
+        assert transformer.fp8_param is True
+        assert run_config.ddp.overlap_param_gather is True
+        assert run_config.ddp.use_distributed_optimizer is (fsdp_version != 2)
+        assert run_config.ddp.reduce_scatter_with_fp32_accumulation is False
+        assert run_config.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation is False
+        if fsdp_version == 2:
+            assert transformer.deallocate_pipeline_outputs is False
+
+
+@pytest.mark.parametrize("torch_fsdp", [False, True])
+def test_wrapper_cli_adapter_preserves_backend_schema(torch_fsdp):
+    from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+    from megatron.training.training import get_megatron_ddp_config
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    options = (
+        ["--use-torch-fsdp2", "--torch-fsdp2-no-reshard-after-forward"]
+        if torch_fsdp
+        else ["--overlap-grad-reduce", "--ddp-num-buckets", "3", "--create-all-gather-group"]
+    )
+    args = parser.parse_args(options)
+    cfg = get_megatron_ddp_config(args, use_torch_fsdp2=args.use_torch_fsdp2)
+    assert cfg.use_torch_fsdp2 is torch_fsdp
+    if torch_fsdp:
+        assert isinstance(cfg, TorchFullyShardedDataParallelConfig)
+        assert cfg.reshard_after_forward is False
+    else:
+        assert cfg.num_buckets == 3
+        assert cfg.bucket_size is None
+        assert cfg.overlap_grad_reduce is True
+        assert cfg.create_all_gather_group is True
+
+
+@pytest.mark.parametrize("num_buckets", [None, 2])
+def test_legacy_model_wrapper_uses_registered_ddp_config(monkeypatch, run_config, num_buckets):
+    from contextlib import nullcontext
+
+    from megatron.training import training
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.virtual_pipeline_model_parallel_size = None
+    for name in ("use_megatron_fsdp", "ddp_bucket_size", "overlap_grad_reduce"):
+        delattr(args, name)
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "correct_amax_history_if_needed", Mock())
+    monkeypatch.setattr(training, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(training, "get_pg_size", lambda group: 1)
+    monkeypatch.setattr(training, "is_pp_first_stage", lambda group: True)
+    monkeypatch.setattr(training, "is_pp_last_stage", lambda group: True)
+    monkeypatch.setattr(training.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(training.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(training.torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(
+        training, "get_megatron_ddp_config", Mock(side_effect=AssertionError("args rebuild"))
+    )
+    transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
+    model = Mock(config=transformer)
+    model.parameters.return_value = []
+    wrapped = Mock(return_value=[model])
+    monkeypatch.setattr(training, "wrap_model_chunks_with_ddp", wrapped)
+    run_config.ddp.overlap_grad_reduce = True
+    run_config.ddp.bucket_size = 4096 if num_buckets is None else None
+    run_config.ddp.num_buckets = num_buckets
+    original_ddp = deepcopy(run_config.ddp)
+    groups = SimpleNamespace(
+        pp=Mock(), dp=Mock(), cp=Mock(), tp=Mock(), gtp_remat=Mock(), dp_cp=Mock()
+    )
+    result = training.get_model(Mock(return_value=model), pg_collection=groups)
+    assert result == [model]
+    assert wrapped.call_args.args[2] is not run_config.ddp
+    assert wrapped.call_args.args[2].overlap_grad_reduce is True
+    assert wrapped.call_args.kwargs["bucket_sizes"] == [4096 if num_buckets is None else 0]
+    assert run_config.ddp == original_ddp
+    restored = type(run_config).from_dict(run_config.to_dict())
+    assert restored.to_dict()["ddp"] == run_config.to_dict()["ddp"]
+
+
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+def test_wrapper_validation_rejects_quantized_gather_without_compute(run_config, precision):
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        vocab_size=128,
+    )
+    setattr(run_config.ddp, f"{precision}_param_gather", True)
+    with pytest.raises(ValueError, match="parameter gathering requires"):
+        run_config.validate()
+
+
+@pytest.mark.parametrize(
+    "optimizer_options",
+    [["--optimizer", "dist_muon"], ["--optimizer", "muon", "--use-distributed-optimizer"]],
+)
+def test_wrapper_validation_accepts_normalized_muon_overlap(
+    monkeypatch, run_config, optimizer_options
+):
+    from megatron.training.argument_utils import pretrain_cfg_container_from_args
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args(
+        [
+            "--num-layers",
+            "2",
+            "--hidden-size",
+            "32",
+            "--num-attention-heads",
+            "4",
+            "--seq-length",
+            "32",
+            "--max-position-embeddings",
+            "32",
+            "--micro-batch-size",
+            "1",
+            "--overlap-grad-reduce",
+            "--overlap-param-gather",
+            *optimizer_options,
+        ]
+    )
+    args.rank, args.world_size = 0, 1
+    args = arguments.validate_args(args)
+    cfg = pretrain_cfg_container_from_args(args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    cfg.validate()
+    cfg.finalize()
+    assert cfg.optimizer.optimizer == "muon"
+    assert cfg.optimizer.use_layer_wise_distributed_optimizer is True
+    assert cfg.ddp.overlap_param_gather is True
+
+
+def test_optimizer_consumes_the_owner_used_for_wrapper_derivation(monkeypatch, run_config):
+    from megatron.training import training
+    from megatron.training.state import TrainState
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.batch_parallel_size = 1
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_TRAIN_STATE", TrainState())
+    run_config.optimizer.use_distributed_optimizer = True
+    run_config.optimizer.overlap_param_gather = True
+    run_config.ddp.overlap_grad_reduce = True
+    run_config.finalize()
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "get_model", Mock(return_value=[]))
+    monkeypatch.setattr(training, "unwrap_model", lambda model: model)
+
+    class OptimizerReached(Exception):
+        pass
+
+    def build_optimizer(config, model, **kwargs):
+        assert config is not run_config.optimizer
+        assert run_config.optimizer.timers is None
+        assert config.use_distributed_optimizer is run_config.ddp.use_distributed_optimizer is True
+        assert config.overlap_param_gather is run_config.ddp.overlap_param_gather is True
+        assert args.use_distributed_optimizer is args.overlap_param_gather is False
+        raise OptimizerReached
+
+    monkeypatch.setattr(training, "get_megatron_optimizer", build_optimizer)
+    with pytest.raises(OptimizerReached):
+        training.setup_model_and_optimizer(None, model_provider_func=Mock())
+
+
 @pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize("vocabulary", ["tokenizer", "checkpoint", "explicit", "custom"])
 def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(

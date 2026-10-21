@@ -30,6 +30,15 @@ class DistributedDataParallelConfig:
     PP stage will independently launch as needed.
     """
 
+    create_all_gather_group: bool = False
+    """Create separate data-parallel process groups for parameter all-gathers."""
+
+    use_layer_wise_param_layout: bool = True
+    """Use shard-aligned parameter layouts with the layer-wise distributed optimizer."""
+
+    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+    """Accumulate the GTP weight-rematerialization reduce-scatter in FP32."""
+
     use_distributed_optimizer: bool = False
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
        originally allocated model parameters, otherwise issue all-reduce collectives.
@@ -90,6 +99,9 @@ class DistributedDataParallelConfig:
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+
+    use_torch_fsdp2: bool = False
+    """Use Torch FSDP2 with TorchFullyShardedDataParallelConfig, instead of Megatron DDP/FSDP."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""

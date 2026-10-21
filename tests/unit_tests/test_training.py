@@ -92,7 +92,6 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
         use_torch_fsdp2=not fsdp2,
         use_megatron_fsdp=not megatron_fsdp,
     )
-    run_config.dist.use_torch_fsdp2 = fsdp2
     run_config.ddp = (
         training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
         if fsdp2
@@ -117,7 +116,8 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
     with pytest.raises(ReachedBuilder):
         training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
     kwargs = builder.build_distributed_models.call_args.kwargs
-    assert kwargs["ddp_config"] is run_config.ddp
+    assert kwargs["ddp_config"] is not run_config.ddp
+    assert kwargs["ddp_config"] == run_config.ddp
     assert kwargs["use_torch_fsdp2"] is fsdp2
     # Forward both flags unchanged, including the pair rejected by the builder.
     assert kwargs["use_megatron_fsdp"] is megatron_fsdp
