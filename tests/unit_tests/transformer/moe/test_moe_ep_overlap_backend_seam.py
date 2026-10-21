@@ -144,7 +144,7 @@ class _FakeExpertCompute:
         #: a FRESH flat tensor per call, so no later chunk holds a reference that can overwrite it.
         self.dprob_returns: list = []
 
-    def run_expert_forward(self, runtime, *, dispatched, stream, offload):
+    def run_expert_forward(self, runtime, *, dispatched, stream):
         """Record the call and return one row of nothing per received row.
 
         The chunk arrives as one ``DispatchedChunk`` now that the schedule keeps the dispatch
@@ -161,7 +161,6 @@ class _FakeExpertCompute:
                 recv_probs=dispatched.recv_probs,
                 split_sizes=dispatched.split_sizes,
                 stream=stream,
-                offload=offload,
             )
         )
         self.saved_returns.append(_make_saved(dispatch_graph=dispatched.graph))
@@ -271,6 +270,13 @@ def _make_runtime(seam: _Seam, monkeypatch) -> MoEEPChunkOverlapRuntime:
     return _StubbedRuntime(_make_config(), seam)
 
 
+def _runtime_over(experts: torch.nn.Module) -> MoEEPChunkOverlapRuntime:
+    """A stubbed runtime over one particular experts module, with nothing else substituted."""
+    seam = _Seam()
+    seam.experts = experts
+    return _StubbedRuntime(_make_config(), seam)
+
+
 def _make_dispatched(seam: _Seam) -> DispatchedChunk:
     """One chunk's receive, with payload tensors that record the runtime's allocator claims.
 
@@ -324,8 +330,8 @@ class _RecordingConstruction:
 
 
 class _FakeGroupedLinear(torch.nn.Module):
-    """One linear's per-expert ``weight{i}`` parameters and the geometry ``build_expert_ops``
-    hands TE, which is all the package resolves."""
+    """One linear's per-expert ``weight{i}`` parameters and the geometry ``_make_fused_ops``
+    hands TE, which is all of a linear either of them resolves."""
 
     def __init__(self, out_features: int, in_features: int) -> None:
         super().__init__()
@@ -339,7 +345,15 @@ class _FakeGroupedLinear(torch.nn.Module):
 
 
 class _DuckTypedExperts(torch.nn.Module):
-    """Everything the package READS off ``experts``, on a module that is not a ``TEGroupedMLP``."""
+    """Everything the package READS off ``experts``, on a module that is not a ``TEGroupedMLP``.
+
+    The package builds no TransformerEngine ops of its own any more: it BORROWS the experts' own
+    sequence and CALLS the experts' own forward. So this stand-in has to be callable and has to
+    carry ``_fused_ops`` / ``_make_fused_ops``, and the construction below mirrors
+    ``TEGroupedMLP._make_fused_ops`` (experts.py:548-720) -- TE's and the trunk's behaviour, not
+    the package's. That construction moving in here is a real cost: nothing in this file now
+    pins WHICH activation op the production path picks, only that it checks whatever it got.
+    """
 
     def __init__(self, *, gated: bool = False, activation_recompute: bool = False) -> None:
         # `torch.nn.Module.__init__`, never `super()`: `_FakeExperts` below mixes this with
@@ -349,8 +363,8 @@ class _DuckTypedExperts(torch.nn.Module):
         fc1_out = 2 * _FFN_HIDDEN_SIZE if gated else _FFN_HIDDEN_SIZE
         self.linear_fc1 = _FakeGroupedLinear(fc1_out, _HIDDEN_SIZE)
         self.linear_fc2 = _FakeGroupedLinear(_HIDDEN_SIZE, _FFN_HIDDEN_SIZE)
-        # The trunk's own 'moe_act' predicate, derived on the experts (experts.py:275-278) and read
-        # by `build_expert_ops`; the four config fields below are `build_activation_op`'s.
+        # The trunk's own 'moe_act' predicate, derived on the experts (experts.py:275-278) and
+        # read back by ``_make_fused_ops`` at experts.py:637.
         self.activation_recompute = activation_recompute
         self.config = SimpleNamespace(
             activation_func=F.silu if gated else squared_relu,
@@ -358,6 +372,79 @@ class _DuckTypedExperts(torch.nn.Module):
             activation_func_clamp_value=None,
             moe_mlp_glu_interleave_size=None,
         )
+        # In a TUPLE and None until the first build, exactly as experts.py:351 leaves it: a bare
+        # module here registers the op shells as submodules and doubles every expert parameter.
+        self._fused_ops: tuple | None = None
+        #: One entry per ``_make_fused_ops`` call, so a second shell is counted, not inferred.
+        self.make_fused_ops_calls = 0
+        #: What the package asked the builder for, so the two overrides can be asserted on.
+        self.fused_ops_overrides: tuple | None = None
+        #: Per ``forward``: ``(hidden, tokens_per_expert, probs, the sequence already existed)``.
+        self.forward_calls: list = []
+        #: ``forward``'s second return value; a non-None one is what the seam has to refuse.
+        self.fc2_bias: torch.Tensor | None = None
+
+    def _make_activation_op(self, te_ops) -> torch.nn.Module:
+        """The activation ``TEGroupedMLP`` picks for this config (experts.py:637-708)."""
+        recompute = {"activation_recompute_in_mlp": self.activation_recompute}
+        if self.config.gated_linear_unit and self.config.activation_func is F.silu:
+            return te_ops.ScaledSwiGLU(
+                glu_interleave_size=self.config.moe_mlp_glu_interleave_size, **recompute
+            )
+        if not self.config.gated_linear_unit and self.config.activation_func is squared_relu:
+            return te_ops.ScaledSReLU(**recompute)
+        raise RuntimeError("_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu")
+
+    def make_fused_ops(
+        self, *, delay_wgrad_compute=None, accumulate_into_main_grad=None
+    ) -> torch.nn.Module:
+        """``TEGroupedMLP``'s public builder, which is the seam the package borrows through.
+
+        The overrides are recorded rather than applied: what the package must prove is that it
+        asks for both, since neither global config flag is required of the model any more.
+        """
+        self.fused_ops_overrides = (delay_wgrad_compute, accumulate_into_main_grad)
+        return self._make_fused_ops()
+
+    def _make_fused_ops(self) -> torch.nn.Module:
+        """TE's FC1/activation/FC2 container, carrying the experts' REAL weight parameters.
+
+        ``register_grouped_linear_params`` (experts.py:554-573) puts each linear's own
+        ``weight{i}`` onto the meta op shell, which is what makes a shadow written into that
+        shell's ``__dict__`` hide a live parameter rather than a copy of one.
+        """
+        from transformer_engine.pytorch import ops as te_ops
+
+        self.make_fused_ops_calls += 1
+        linear_ops = []
+        for linear in (self.linear_fc1, self.linear_fc2):
+            weights = [linear.get_parameter(f"weight{i}") for i in range(linear.num_gemms)]
+            op = te_ops.GroupedLinear(
+                linear.num_gemms,
+                linear.in_features,
+                linear.out_features,
+                bias=False,
+                device="meta",
+                dtype=weights[0].dtype,
+                accumulate_into_main_grad=True,
+                delay_wgrad_compute=True,
+            )
+            for index, weight in enumerate(weights):
+                op.register_parameter(f"weight{index}", weight)
+            linear_ops.append(op)
+        return te_ops.Sequential(linear_ops[0], self._make_activation_op(te_ops), linear_ops[1])
+
+    def forward(self, hidden_states, tokens_per_expert, permuted_probs):
+        """``TEGroupedMLP.forward``'s shape: record the call, return ``(output, bias)``."""
+        self.forward_calls.append(
+            (hidden_states, tokens_per_expert, permuted_probs, self._fused_ops is not None)
+        )
+        output = torch.zeros((hidden_states.shape[0], _HIDDEN_SIZE), requires_grad=True)
+        return output, self.fc2_bias
+
+    #: ``TEGroupedMLP`` resolves this at construction; the schedule refuses to borrow unless it
+    #: is True, because the unfused forward defers no weight gradient for it to drain.
+    _with_fused_impl = True
 
     def _ensure_main_grad_for_fused_impl(self) -> None:
         """``TEGroupedMLP``'s own lazy ``main_grad`` hook, fired through the seam."""
@@ -473,11 +560,26 @@ class _StubGroupedLinear(torch.nn.Module):
 
 
 class _StubSequential(torch.nn.Module):
-    """TE's op container; ``ops`` is how the tests below reach the activation that was built."""
+    """TE's op container, modelled on ``transformer_engine/pytorch/ops/sequential.py:82-107``.
+
+    The ops are real submodules keyed by position, exactly as TE's ``append`` registers them, so
+    ``children()`` yields the triple itself rather than a wrapper holding it -- which is how the
+    package reaches FC1, the activation and FC2 off a sequence it did not build.
+    """
 
     def __init__(self, *ops: torch.nn.Module) -> None:
         super().__init__()
-        self.ops = ops
+        for index, op in enumerate(ops):
+            self.add_module(str(index), op)
+
+    def __len__(self) -> int:
+        return len(self._modules)
+
+    def __iter__(self):
+        return iter(self._modules.values())
+
+    def __getitem__(self, index: int) -> torch.nn.Module:
+        return list(self._modules.values())[index]
 
 
 class _StubFusedGLU:
@@ -562,20 +664,22 @@ def _install_fake_transformer_engine(monkeypatch) -> list:
 
 
 class TestActivationRecomputeReachesTransformerEngine:
-    """What ``'moe_act'`` in ``--recompute-modules`` does to the triple this path hands TE.
+    """What ``'moe_act'`` in ``--recompute-modules`` does to the triple this path RUNS.
 
     TE honours ``activation_recompute_in_mlp`` on ``ScaledSReLU`` only
     (``grouped_mlp.py:1753-1758``). On TE 2.18 the two gated ops take the keyword and their fused
     backward SILENTLY drops it, saving the FC2 input anyway; on te220 they raise instead
-    (``swiglu.py:473-477``) -- later, and TE's refusal rather than this package's. So
-    ``build_activation_op`` sets the flag on all three and ``check_fused_grouped_mlp`` raises on
-    the two TE would ignore: ACCEPTED-AND-IGNORED is the failure this pair prevents, and it is
-    invisible from the gradients, which are identical either way. The stubs model the 2.18
-    acceptance, so what is under test is the package's own rule.
+    (``swiglu.py:473-477``) -- later, and TE's refusal rather than this package's.
 
-    ``build_expert_ops`` runs for real here over a shadowed TE, which also keeps
-    ``_DuckTypedExperts`` honest: every attribute the package reads off ``experts`` is resolved
-    for real, so one dropped from the stand-in is an ``AttributeError`` in this class.
+    The package no longer BUILDS that triple: ``TEGroupedMLP._make_fused_ops`` does and the
+    runtime borrows it. What is left to the package, and what these four pin, is the CHECK --
+    ``expert_ops`` runs ``check_fused_grouped_mlp`` over the sequence it borrowed and refuses the
+    combinations TE accepts and ignores. ACCEPTED-AND-IGNORED is invisible from the gradients,
+    which are identical either way, so a borrowed-but-unchecked sequence would be silent.
+
+    ``expert_ops`` runs for real here over a shadowed TE, which also keeps ``_DuckTypedExperts``
+    honest: every attribute the package reads off ``experts`` is resolved for real, so one
+    dropped from the stand-in is an ``AttributeError`` in this class.
     """
 
     @pytest.fixture(autouse=True)
@@ -583,39 +687,39 @@ class TestActivationRecomputeReachesTransformerEngine:
         _install_fake_transformer_engine(monkeypatch)
 
     def test_the_flag_is_carried_onto_the_op_te_honours_it_on(self):
-        """The ungated squared-ReLU triple: the request reaches TE, and is built exactly once."""
-        sequential, fc1_op, fc2_op = ep_chunk_overlap.build_expert_ops(
-            _make_config(), _DuckTypedExperts(activation_recompute=True)
-        )
+        """The ungated squared-ReLU triple: accepted, and cached as the ops the drain reads."""
+        runtime = _runtime_over(_DuckTypedExperts(activation_recompute=True))
 
-        fc1, activation, fc2 = sequential.ops
-        assert (fc1, fc2) == (fc1_op, fc2_op), "the checked triple must be the one TE runs"
+        sequential = runtime.expert_ops()
+
+        fc1, activation, fc2 = list(sequential.children())
+        assert (runtime._fc1_op, runtime._fc2_op) == (fc1, fc2), "the checked triple is TE's own"
+        assert sequential is runtime._experts._fused_ops[0], "borrowed, never a second shell"
         assert isinstance(activation, _StubScaledSReLU)
         assert activation.activation_recompute_in_mlp is True
 
     def test_without_moe_act_the_same_triple_asks_te_for_nothing(self):
         """The negative arm: ``activation_recompute=False`` must not set the flag at all."""
-        sequential, _, _ = ep_chunk_overlap.build_expert_ops(
-            _make_config(), _DuckTypedExperts(activation_recompute=False)
-        )
+        runtime = _runtime_over(_DuckTypedExperts(activation_recompute=False))
 
-        assert sequential.ops[1].activation_recompute_in_mlp is False
+        activation = list(runtime.expert_ops().children())[1]
+        assert activation.activation_recompute_in_mlp is False
 
     def test_a_gated_activation_with_moe_act_is_refused(self):
-        """On 2.18 ``ScaledSwiGLU`` takes the flag and ignores it, so the package refuses first."""
+        """On 2.18 ``ScaledSwiGLU`` takes the flag and ignores it, so the package refuses first --
+        over a sequence it did not build, which is the whole of what it still owns here."""
+        runtime = _runtime_over(_DuckTypedExperts(gated=True, activation_recompute=True))
+
         with pytest.raises(RuntimeError, match=r"'moe_act' in recompute_modules"):
-            ep_chunk_overlap.build_expert_ops(
-                _make_config(), _DuckTypedExperts(gated=True, activation_recompute=True)
-            )
+            runtime.expert_ops()
 
     def test_the_same_gated_triple_is_built_when_moe_act_is_not_asked_for(self):
         """The refusal is about the REQUEST, not the gated activation: same shape, no raise."""
-        sequential, _, _ = ep_chunk_overlap.build_expert_ops(
-            _make_config(), _DuckTypedExperts(gated=True, activation_recompute=False)
-        )
+        runtime = _runtime_over(_DuckTypedExperts(gated=True, activation_recompute=False))
 
-        assert isinstance(sequential.ops[1], _StubScaledSwiGLU)
-        assert sequential.ops[1].activation_recompute_in_mlp is False
+        activation = list(runtime.expert_ops().children())[1]
+        assert isinstance(activation, _StubScaledSwiGLU)
+        assert activation.activation_recompute_in_mlp is False
 
 
 class TestQuantizedWeightShadow:
@@ -683,121 +787,89 @@ class TestQuantizedWeightShadow:
         assert _te_do_not_offload(SimpleNamespace(get_data_tensors=lambda: (plain,))) is False
 
 
-class _FakeOffloadGroup:
-    """The offload interface's lifecycle, recorded, with a DISTINCT tensor at each step: against
-    the real identity-when-off interface, a dropped ``__enter__`` return or commit is invisible."""
+class TestTheChunkRunsThroughTheExpertsOwnForward:
+    """One chunk is handed to the EXPERTS module, not to a sequence this package assembled.
 
-    def __init__(self, offload: bool, tensor: torch.Tensor, name: str) -> None:
-        self.args = (offload, tensor, name)
-        self.log: list = []
-        self.group_input = torch.zeros_like(tensor)
-        self.committed: torch.Tensor | None = None
-        self.commit_output: torch.Tensor | None = None
-
-    def __enter__(self) -> torch.Tensor:
-        """Open the group and hand back the tensor the start node produced."""
-        self.log.append("enter")
-        return self.group_input
-
-    def __exit__(self, *args) -> None:
-        """Close the saved-tensor hooks; the commit is deliberately OUTSIDE this scope."""
-        self.log.append("exit")
-
-    def group_offload(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Commit the group on ``tensor`` and hand back the root the backward starts from."""
-        self.log.append("commit")
-        self.committed = tensor
-        self.commit_output = torch.zeros_like(tensor).requires_grad_(True)
-        return self.commit_output
-
-
-class _RecordingFusedOps:
-    """TE's fused triple: records its positional arguments and returns one row per received row."""
-
-    def __init__(self) -> None:
-        self.calls: list = []
-        self.output: torch.Tensor | None = None
-
-    def __call__(self, *args) -> torch.Tensor:
-        """Stand in for the fused grouped MLP; the arguments are what the tests read."""
-        self.calls.append(args)
-        self.output = torch.zeros((args[0].shape[0], _HIDDEN_SIZE), requires_grad=True)
-        return self.output
-
-
-class TestPerChunkOffloadGroup:
-    """ONE group per chunk, opened around the fused call and committed on its output. Every way
-    this breaks leaves the numbers right and the offload silently doing nothing."""
+    What stood here was the per-chunk offload group this package opened itself. That group, the
+    quantization padding and the NCCL-EP ``op_kwargs`` all live in ``TEGroupedMLP._fused_forward``
+    (experts.py:792-920) now, which is why the schedule calls the module rather than the op
+    Sequential. HAZARD (silent): calling the Sequential directly skips every one of them and
+    leaves the numbers right, with the offload doing nothing -- the same shape of failure the
+    deleted tests were written against, one level up.
+    """
 
     @pytest.fixture(autouse=True)
-    def _shadow_transformer_engine_and_the_offload_interface(self, monkeypatch):
+    def _shadow_transformer_engine(self, monkeypatch):
         _install_fake_transformer_engine(monkeypatch)
         # Outside the code under test, as `torch.cuda.current_stream` already is: there is no
         # CUDA context here and the stream the schedule passes is a sentinel.
         monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
-        self.groups: list = []
+        self.seam = _Seam()
+        self.runtime = _StubbedRuntime(_make_config(), self.seam)
+        self.dispatched = None
 
-        def build_group(offload, tensor, name):
-            self.groups.append(_FakeOffloadGroup(offload, tensor, name))
-            return self.groups[-1]
-
-        # By NAME on the schedule's module, which is where it is looked up: `monkeypatch.setattr`
-        # raises if the package stops importing the offload interface under this name.
-        monkeypatch.setattr(ep_chunk_overlap, "off_interface", build_group)
-        self.ops = _RecordingFusedOps()
-        self.runtime = _StubbedRuntime(_make_config(), _Seam())
-        self.runtime._ops = self.ops
-
-    def _run(self, *, offload: bool):
+    def _run(self):
         """One chunk through the production ``run_expert_forward``."""
+        self.dispatched = DispatchedChunk(
+            recv_x=torch.zeros((_CAPACITY, _HIDDEN_SIZE)),
+            recv_probs=torch.zeros((_CAPACITY,)),
+            split_sizes=torch.tensor([_CAPACITY // 2, _CAPACITY // 2]),
+            graph=_Opaque("dispatch graph"),
+        )
         return ep_chunk_overlap.run_expert_forward(
-            self.runtime,
-            dispatched=DispatchedChunk(
-                recv_x=torch.zeros((_CAPACITY, _HIDDEN_SIZE)),
-                recv_probs=torch.zeros((_CAPACITY,)),
-                split_sizes=torch.tensor([_CAPACITY // 2, _CAPACITY // 2]),
-                graph=_Opaque("dispatch graph"),
-            ),
-            stream=_AmbientStream(),
-            offload=offload,
+            self.runtime, dispatched=self.dispatched, stream=_AmbientStream()
         )
 
-    def test_one_group_is_opened_per_chunk_around_the_fused_call(self):
-        """The group is built from this chunk's own leaf, and the fused op runs on the tensor the
-        group start produced -- dropping that return leaves the start node off the graph."""
-        _, saved = self._run(offload=True)
+    def test_the_module_itself_runs_the_chunk_with_the_counts_undigested(self):
+        """``TEGroupedMLP.forward``'s three positional arguments, in its order and once per chunk.
 
-        assert len(self.groups) == 1, "one group per chunk, not one per region"
-        group = self.groups[0]
-        offload_flag, group_tensor, group_name = group.args
-        assert offload_flag is True
-        assert group_tensor is saved.dispatched_tokens
-        assert group_name == "fused_group_mlp"
-        assert group.log == ["enter", "exit", "commit"], "the commit is outside the hook scope"
-        assert self.ops.calls[0][0] is group.group_input
+        The leaf it gets is this chunk's own detached ``recv_x``, which is what the dgrad later
+        differentiates; handing it the receive itself would differentiate into the transport.
+        """
+        _combine_input, saved = self._run()
 
-    def test_the_saved_root_is_the_commit_and_the_combine_gets_its_detach(self):
-        """The backward starts at the commit, which is what waits for this chunk's reload; saving
-        the fused output instead would skip that wait and read tensors still in flight."""
-        combine_input, saved = self._run(offload=True)
+        assert len(self.seam.experts.forward_calls) == 1, "one expert call per chunk"
+        hidden, split_sizes, probs, _built = self.seam.experts.forward_calls[0]
+        assert hidden is saved.dispatched_tokens and hidden.requires_grad is True
+        assert hidden is not self.dispatched.recv_x
+        # Row layout is TE's business: it gets the manager's per-expert counts, undigested.
+        assert split_sizes is self.dispatched.split_sizes
+        assert probs is saved.routing_probs and probs.shape == (_CAPACITY,)
+        assert saved.dispatch_graph is self.dispatched.graph
 
-        group = self.groups[0]
-        assert group.committed is self.ops.output
-        assert saved.fc2_output is group.commit_output
+    def test_the_fused_sequence_exists_before_the_experts_are_called(self):
+        """``expert_ops`` is FORCED first. The quantization and EGTP steps write into the ops'
+        weight slots and run before any forward, so a sequence the forward built lazily would be
+        a second one, carrying neither the shadows nor the accumulators."""
+        self._run()
+
+        assert self.seam.experts.forward_calls[0][3] is True
+        assert self.runtime._ops is self.seam.experts._fused_ops[0]
+
+    def test_the_combine_gets_a_detach_and_the_saved_root_keeps_the_graph(self):
+        """The transport reads a detached view; the saved root is what the dgrad starts from.
+        Handing the graph-bearing tensor to the combine would make the collective part of it."""
+        combine_input, saved = self._run()
+
+        assert saved.fc2_output.requires_grad is True
         assert combine_input is not saved.fc2_output
         assert combine_input.requires_grad is False
 
-    def test_the_gate_is_handed_to_the_interface_rather_than_branched_on(self):
-        """offload=False still builds the interface: being the identity is the interface's job,
-        so a branch here would be a second implementation of it that nothing tests."""
-        _, saved = self._run(offload=False)
+    def test_the_package_opens_no_offload_group_of_its_own(self):
+        """Statically: the group is the experts'. One opened here too would wrap a forward that
+        already opened one, offloading each chunk's activations twice and reloading them once."""
+        source = inspect.getsource(ep_chunk_overlap)
 
-        assert len(self.groups) == 1
-        offload_flag, group_tensor, group_name = self.groups[0].args
-        assert offload_flag is False
-        assert group_tensor is saved.dispatched_tokens
-        assert group_name == "fused_group_mlp"
-        assert self.groups[0].log == ["enter", "exit", "commit"]
+        for name in ("off_interface", "fine_grained_activation_offload", "group_offload"):
+            assert name not in source
+
+    def test_an_expert_bias_is_refused(self):
+        """``_fused_forward`` returns ``bias=None``; anything else means the UNFUSED path ran,
+        whose bias this schedule has nowhere to put and would drop on the floor."""
+        self.seam.experts.fc2_bias = torch.zeros(_HIDDEN_SIZE)
+
+        with pytest.raises(RuntimeError, match="does not support an expert FC2 bias"):
+            self._run()
 
 
 class TestOpShellIsBuiltOnce:
@@ -807,12 +879,20 @@ class TestOpShellIsBuiltOnce:
     (``ops/fuser.py:548``) while the fused forward re-reads weights live
     (``ops/fused/grouped_mlp.py:1211``, ``:1248``), so re-registering the expert parameters on a
     ``Sequential`` that has already run computes with the NEW weight and attributes the gradient
-    to the OLD tensor -- measured: the optimizer sees no update and nothing raises. Two tests,
-    because the guarantee has two halves: one place may build a shell, and it builds at most one.
+    to the OLD tensor -- measured: the optimizer sees no update and nothing raises.
+
+    The sequence is the EXPERTS' now, which adds a THIRD way to end up with two of them: build
+    one here while ``TEGroupedMLP._fused_forward`` lazily builds its own on the trunk's next
+    forward. Hence three tests -- one place may build, it builds at most once, and one that
+    already exists is borrowed rather than replaced.
     """
 
+    @pytest.fixture(autouse=True)
+    def _shadow_transformer_engine(self, monkeypatch):
+        _install_fake_transformer_engine(monkeypatch)
+
     def test_only_expert_ops_ever_builds_a_shell(self):
-        """Statically: ``build_expert_ops`` has exactly one call site, inside ``expert_ops``.
+        """Statically: ``make_fused_ops`` has exactly one call site, inside ``expert_ops``.
 
         A second call site anywhere -- a convenience rebuild, a reset path, a promoted test
         helper -- would re-register the real parameters on a fresh fuser and lose every later
@@ -823,8 +903,8 @@ class TestOpShellIsBuiltOnce:
             node
             for node in ast.walk(module)
             if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "build_expert_ops"
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "make_fused_ops"
         ]
         assert len(call_sites) == 1
 
@@ -837,32 +917,62 @@ class TestOpShellIsBuiltOnce:
         ]
         assert len(accessor) == 1, "the runtime's one op-shell accessor"
         assert call_sites[0] in list(ast.walk(accessor[0])), "the one call site is that accessor's"
-        # And it is guarded, not unconditional: the guard is the whole of what makes it once.
+        # Every step is guarded, not unconditional: the guards are the whole of what refuses an
+        # unfused experts module, builds the sequence once, and caches this layer's view once.
         guards = [node for node in accessor[0].body if isinstance(node, ast.If)]
-        assert len(guards) == 1 and call_sites[0] in list(ast.walk(guards[0]))
+        assert len(guards) == 3, "one refuses the unfused forward, one builds, one caches"
+        assert call_sites[0] in list(ast.walk(guards[1]))
+
+        stores = [
+            node
+            for node in ast.walk(accessor[0])
+            if isinstance(node, ast.Attribute)
+            and node.attr == "_ops"
+            and isinstance(node.ctx, ast.Store)
+        ]
+        assert len(stores) == 1 and stores[0] in list(ast.walk(guards[2]))
+
+    def test_both_wgrad_modes_are_asked_for_rather_than_required_of_the_model(self):
+        """The override is the whole reason neither wgrad flag is a model-wide requirement.
+
+        Dropping either one is silent: without the delay there is nothing for run_chunk_wgrad to
+        drain, and without the accumulate the wgrad lands in ``.grad`` while the EGTP flush reads
+        a ``main_grad`` nobody wrote. Both are invisible from the loss.
+        """
+        experts = _DuckTypedExperts()
+        runtime = _runtime_over(experts)
+
+        runtime.expert_ops()
+
+        assert experts.fused_ops_overrides == (True, True)
 
     def test_expert_ops_builds_on_the_first_call_and_caches_it(self, monkeypatch):
         """Behaviourally: the second call returns the first shell without building another."""
         seam = _Seam()
         runtime = _make_runtime(seam, monkeypatch)
-        shell, fc1, fc2 = _Opaque("shell"), _Opaque("fc1"), _Opaque("fc2")
-        builds: list = []
-
-        def build_expert_ops(config, experts):
-            builds.append((config, experts))
-            return shell, fc1, fc2
-
-        monkeypatch.setattr(ep_chunk_overlap, "build_expert_ops", build_expert_ops)
 
         first = runtime.expert_ops()
         second = runtime.expert_ops()
 
-        assert first is shell and second is shell
-        assert len(builds) == 1, "a rebuilt shell computes with the new weight and grads the old"
-        # From the runtime's own config and experts -- the same two the constructor validated.
-        assert builds == [(runtime.config, seam.experts)]
+        assert first is second
+        assert seam.experts.make_fused_ops_calls == 1, "a rebuilt shell grads the OLD tensor"
+        assert first is seam.experts._fused_ops[0], "and it is the EXPERTS', not a private one"
         # The two per-linear ops the wgrad drain reads are cached by that same one call.
-        assert (runtime._fc1_op, runtime._fc2_op) == (fc1, fc2)
+        fc1_op, _activation_op, fc2_op = list(first.children())
+        assert (runtime._fc1_op, runtime._fc2_op) == (fc1_op, fc2_op)
+
+    def test_a_sequence_the_experts_already_built_is_borrowed_untouched(self, monkeypatch):
+        """``_fused_forward`` builds one lazily, so by the time a layer runs BOTH paths there may
+        already be one. Building a second here would leave the weight shadows and the EGTP
+        accumulators on a shell TransformerEngine never runs, losing every expert gradient."""
+        seam = _Seam()
+        runtime = _make_runtime(seam, monkeypatch)
+        already_built = seam.experts._make_fused_ops()
+        seam.experts._fused_ops = (already_built,)
+        builds_before = seam.experts.make_fused_ops_calls
+
+        assert runtime.expert_ops() is already_built
+        assert seam.experts.make_fused_ops_calls == builds_before
 
 
 class TestExpertComputeSeam:
@@ -886,9 +996,7 @@ class TestExpertComputeSeam:
         runtime = _make_runtime(seam, monkeypatch)
         dispatched = _make_dispatched(seam)
 
-        fc2_output, saved = runtime.routed_experts_compute_forward(
-            dispatched=dispatched, offload=False
-        )
+        fc2_output, saved = runtime.routed_experts_compute_forward(dispatched=dispatched)
 
         prologue, delegated = seam.log[:-1], seam.log[-1]
         assert delegated == "run_expert_forward", "the prologue must precede the GEMMs, not follow"
@@ -976,9 +1084,7 @@ class TestExpertComputeSeam:
         forward_dispatch = _make_dispatched(seam)
         backward_grad = _make_grad_recv(seam)
 
-        fc2_output, _ = runtime.routed_experts_compute_forward(
-            dispatched=forward_dispatch, offload=False
-        )
+        fc2_output, _ = runtime.routed_experts_compute_forward(dispatched=forward_dispatch)
         grad_input, _ = runtime.routed_experts_compute_backward(
             saved=_make_saved(), grad_recv=backward_grad
         )
@@ -1018,9 +1124,7 @@ class TestExpertComputeSeam:
         runtime = _make_runtime(seam, monkeypatch)
         dispatched = _make_dispatched(seam)
 
-        _output, saved = runtime.routed_experts_compute_forward(
-            dispatched=dispatched, offload=False
-        )
+        _output, saved = runtime.routed_experts_compute_forward(dispatched=dispatched)
         assert saved is seam.expert_compute.saved_returns[-1]
         assert saved.dispatch_graph is dispatched.graph
 

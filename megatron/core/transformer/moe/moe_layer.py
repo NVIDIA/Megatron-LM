@@ -540,8 +540,18 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     def _ep_chunk_overlap_active(self) -> bool:
-        """Whether this forward is served by the EP chunk overlap path."""
-        return self.moe_ep_chunk_overlap is not None and not torch.is_inference_mode_enabled()
+        """Whether this forward is served by the EP chunk overlap path.
+
+        Grad mode is part of the test: the schedule exists to overlap a chunked BACKWARD, and its
+        forward installs quantized shadows on the experts' ops that only the backward pops. A
+        forward with no backward would leave them there for the next one -- including a trunk
+        forward, which now shares those ops -- so without grad this falls back to the trunk.
+        """
+        return (
+            self.moe_ep_chunk_overlap is not None
+            and not torch.is_inference_mode_enabled()
+            and torch.is_grad_enabled()
+        )
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(

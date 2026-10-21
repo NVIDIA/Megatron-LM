@@ -2616,6 +2616,38 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_paged_stash:
                 raise ValueError("moe_ep_chunk_overlap does not support moe_paged_stash.")
+            # The schedule runs the experts' OWN fused forward, so the flags that path is built
+            # on are requirements here, not options; each is silent or fatal if missing.
+            for flag, why in (
+                ("use_transformer_engine_op_fuser", "the fused grouped MLP is the compute"),
+                ("moe_grouped_gemm", "it is what force-sets moe_use_grouped_tensor above"),
+            ):
+                if not getattr(self, flag):
+                    raise ValueError(f"moe_ep_chunk_overlap requires {flag}=True: {why}.")
+            # Every weight step here indexes weight0..weightN; the single-grouped layout packs
+            # them into one `weight` and leaves those slots None, so each step silently no-ops.
+            if self.moe_single_grouped_weight:
+                raise ValueError(
+                    "moe_ep_chunk_overlap does not support moe_single_grouped_weight: the "
+                    "schedule quantizes, shadows and drains one weight{i} slot per expert, and "
+                    "the single-grouped layout carries one packed weight instead."
+                )
+            # skip_routed_expert_padding() must hold, or _fused_forward re-pads rows the transport
+            # already aligned AND does a tokens_per_expert.tolist() a graph capture cannot serve.
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep")
+            ):
+                raise ValueError(
+                    "moe_ep_chunk_overlap requires moe_token_dispatcher_type='flex' with "
+                    "moe_flex_dispatcher_backend in ('hybridep', 'ncclep'), got "
+                    f"{self.moe_token_dispatcher_type!r}/{self.moe_flex_dispatcher_backend!r}: "
+                    "only those make skip_routed_expert_padding() true, and without it the "
+                    "experts' fused forward pads the already-aligned rows a second time and "
+                    "reads tokens_per_expert back to the host, which CUDA-graph capture cannot "
+                    "serve. Those are also the only backends that can stage one dispatch per "
+                    "chunk."
+                )
             # The runtime takes router_topk and num_experts unscaled while the dispatch manager
             # scales both by ETP, so the capacity would be short and the pin would hide it.
             if self.expert_tensor_parallel_size > 1:

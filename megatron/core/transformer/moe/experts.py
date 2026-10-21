@@ -545,7 +545,37 @@ class TEGroupedMLP(MegatronModule):
         # NVTE_CUTEDSL_FUSED_GROUPED_MLP does not disable the basic op-fuser path.
         return True
 
-    def _make_fused_ops(self) -> torch.nn.Module:
+    def make_fused_ops(
+        self,
+        *,
+        delay_wgrad_compute: Optional[bool] = None,
+        accumulate_into_main_grad: Optional[bool] = None,
+    ) -> torch.nn.Module:
+        """The fused FC1 / activation / FC2 sequence this module would run, for a caller that
+        drives the experts itself.
+
+        The returned ``te_ops.Sequential`` is indexable, so a caller needing the two
+        ``GroupedLinear`` ops -- to drain their delayed weight gradients in its own order, say --
+        reads them back as ``ops[0]`` and ``ops[2]``.
+
+        Args:
+            delay_wgrad_compute (bool, optional): Override the wrapper's delay-wgrad mode. A
+                schedule that drains the weight gradients itself has to pass True; leaving it
+                None reads the mode off the GroupedLinear wrappers, as the in-module path does.
+            accumulate_into_main_grad (bool, optional): Override gradient-accumulation fusion;
+                None reads ``fuse_wgrad_accumulation`` off the wrappers.
+        """
+        return self._make_fused_ops(
+            delay_wgrad_compute=delay_wgrad_compute,
+            accumulate_into_main_grad=accumulate_into_main_grad,
+        )
+
+    def _make_fused_ops(
+        self,
+        *,
+        delay_wgrad_compute: Optional[bool] = None,
+        accumulate_into_main_grad: Optional[bool] = None,
+    ) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
@@ -600,8 +630,29 @@ class TEGroupedMLP(MegatronModule):
         # config.overlap_dispatch_backward_with_experts_wgrad) — see TEGroupedLinear.__init__.
         # Using config.delay_wgrad_compute alone would silently drop the overlap optimization
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
-        fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
-        fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
+
+        # An override is what a caller driving the experts itself passes; None keeps the
+        # wrapper's own mode, which is what the in-module path has always used.
+        fc1_delay_wgrad_compute = (
+            self.linear_fc1.delay_wgrad_compute
+            if delay_wgrad_compute is None
+            else delay_wgrad_compute
+        )
+        fc2_delay_wgrad_compute = (
+            self.linear_fc2.delay_wgrad_compute
+            if delay_wgrad_compute is None
+            else delay_wgrad_compute
+        )
+        fc1_accumulate_into_main_grad = (
+            self.linear_fc1.fuse_wgrad_accumulation
+            if accumulate_into_main_grad is None
+            else accumulate_into_main_grad
+        )
+        fc2_accumulate_into_main_grad = (
+            self.linear_fc2.fuse_wgrad_accumulation
+            if accumulate_into_main_grad is None
+            else accumulate_into_main_grad
+        )
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
@@ -612,7 +663,7 @@ class TEGroupedMLP(MegatronModule):
             bias=self.linear_fc1.use_bias,
             device="meta",
             dtype=fc1_weight_dtype,
-            accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+            accumulate_into_main_grad=fc1_accumulate_into_main_grad,
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
@@ -719,7 +770,7 @@ class TEGroupedMLP(MegatronModule):
             bias=self.linear_fc2.use_bias,
             device="meta",
             dtype=fc2_weight_dtype,
-            accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+            accumulate_into_main_grad=fc2_accumulate_into_main_grad,
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,

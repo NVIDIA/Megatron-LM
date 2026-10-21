@@ -15,6 +15,7 @@ from types import ModuleType
 import pytest
 import torch
 
+from megatron.core.activations import squared_relu
 from megatron.core.extensions.transformer_engine import cpu_offload
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -198,10 +199,10 @@ class _AutogradRuntime(MoEEPChunkOverlapRuntime):
         """
         self.wgrad_log.append("flush")
 
-    def routed_experts_compute_forward(self, dispatched, *, offload):
-        # RECORDED, not asserted: the per-chunk offload group lives in the stage this fake
-        # replaces, so the gate arriving once per chunk is all of offloading this class can see.
-        self.offload_log.append(offload)
+    def routed_experts_compute_forward(self, dispatched):
+        # The gate no longer rides this call: the experts' own fused forward owns the group, so
+        # the fake reads the flag off the experts module, which is where production reads it.
+        self.offload_log.append(self._experts.offload_fused_group_mlp)
         # The WHOLE capacity window, as the real compute takes it: its dX must come back at
         # capacity. Padded rows carry zero probabilities, so they contribute and take nothing.
         hidden = dispatched.recv_x.detach().float().requires_grad_(True)
@@ -288,6 +289,25 @@ def _make_config(**overrides) -> TransformerConfig:
         moe_flex_dispatcher_backend="hybridep",
     )
     kwargs.update(overrides)
+    if kwargs.get("moe_ep_chunk_overlap"):
+        # The schedule now runs the experts' OWN fused forward, so __post_init__ requires all of
+        # these, plus the dispatcher pair that makes skip_routed_expert_padding() true.
+        required = dict(
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            # TEGroupedMLP asserts _is_fused_impl_supported() under the op fuser, and only the
+            # three scaled TE activations qualify; the default GELU does not.
+            activation_func=squared_relu,
+            use_fused_weighted_squared_relu=True,
+            gated_linear_unit=False,
+            use_transformer_engine_op_fuser=True,
+            moe_use_grouped_tensor=True,
+            gradient_accumulation_fusion=True,
+            overlap_dispatch_backward_with_experts_wgrad=True,
+        )
+        required.update(overrides)
+        kwargs.update(required)
     return TransformerConfig(**kwargs)
 
 
@@ -656,7 +676,7 @@ class TestOverlapBackendSelection:
         test's expert-parallel size of 1 cannot satisfy."""
         config = _make_config(moe_ep_chunk_overlap=True, moe_flex_dispatcher_backend="hybridep")
 
-        layer = _make_layer(config)
+        layer = _make_grouped_layer(config)
 
         managers = layer.moe_ep_chunk_overlap._managers  # noqa: SLF001
         assert all(isinstance(manager, _HybridEPManager) for manager in managers)
@@ -671,7 +691,7 @@ class TestOverlapBackendSelection:
             moe_ep_chunk_overlap_num_chunks=3,
         )
 
-        layer = _make_layer(config)
+        layer = _make_grouped_layer(config)
 
         managers = layer.moe_ep_chunk_overlap._managers  # noqa: SLF001
         assert len(managers) == 3
@@ -699,7 +719,7 @@ class TestOverlapBackendSelection:
         config.moe_flex_dispatcher_backend = "not-a-backend"
 
         with pytest.raises(ValueError, match="Invalid backend"):
-            _make_layer(config)
+            _make_grouped_layer(config)
 
 
 def _make_grouped_layer(config: TransformerConfig) -> MoELayer:
@@ -1013,7 +1033,8 @@ class _OffloadingRuntime(_AutogradRuntime):
     """``_AutogradRuntime`` whose compute stage opens the REAL per-chunk offload group, as
     ``run_expert_forward`` does: on the ambient stream, under ``enable_grad``, in the Function."""
 
-    def routed_experts_compute_forward(self, dispatched, *, offload):
+    def routed_experts_compute_forward(self, dispatched):
+        offload = self._experts.offload_fused_group_mlp
         self.offload_log.append(offload)
         dispatched_tokens = dispatched.recv_x.detach().float().requires_grad_(True)
         routing_probs = dispatched.recv_probs.detach().float().requires_grad_(True)

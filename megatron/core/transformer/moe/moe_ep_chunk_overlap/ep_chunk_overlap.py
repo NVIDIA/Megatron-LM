@@ -17,16 +17,9 @@ from dataclasses import dataclass
 from itertools import chain
 
 import torch
-import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
-from megatron.core.activations import squared_relu
-from megatron.core.fusions.fused_bias_geglu import quick_gelu
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.tensor_parallel.gtp_api import is_gtp_param
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 EXPERT_ALIGNMENT_TO_GROUPED_GEMM = 256
 
@@ -180,70 +173,6 @@ def check_fused_grouped_mlp(fc1_op, activation_op, fc2_op) -> None:
         )
 
 
-def build_activation_op(
-    config: TransformerConfig, *, activation_recompute: bool
-) -> torch.nn.Module:
-    """The TE activation this config asks for; only these three take the routing probability."""
-    from transformer_engine.pytorch import ops as te_ops
-
-    glu = {"glu_interleave_size": config.moe_mlp_glu_interleave_size}
-    clamp = config.activation_func_clamp_value
-
-    recompute = {"activation_recompute_in_mlp": activation_recompute}
-    if config.gated_linear_unit and config.activation_func == F.silu:
-        if clamp is None:
-            return te_ops.ScaledSwiGLU(**glu, **recompute)
-        return te_ops.ScaledClampedQGeGLU(
-            **glu, **recompute, alpha=1.0, limit=clamp, glu_linear_offset=0.0
-        )
-    if config.gated_linear_unit and config.activation_func == quick_gelu:
-        return te_ops.ScaledClampedQGeGLU(
-            **glu, **recompute, **({} if clamp is None else {"limit": clamp})
-        )
-    if not config.gated_linear_unit and config.activation_func == squared_relu:
-        return te_ops.ScaledSReLU(**recompute)
-    raise RuntimeError(
-        f"cannot fold the routing probability into {config.activation_func} "
-        f"(gated={config.gated_linear_unit}): only ScaledSwiGLU/ScaledClampedQGeGLU/ScaledSReLU"
-    )
-
-
-def build_expert_ops(
-    config: _MoEEPChunkOverlapConfig, experts: torch.nn.Module
-) -> tuple[torch.nn.Module, torch.nn.Module, torch.nn.Module]:
-    """Build the fused expert op sequence, and return it with its two GroupedLinear ops."""
-    from transformer_engine.pytorch import ops as te_ops
-
-    num_local_experts = config.num_local_experts
-    params = expert_weight_parameters(experts, num_local_experts)
-    ops = []
-
-    for weights, linear in (
-        (params[:num_local_experts], experts.linear_fc1),
-        (params[num_local_experts:], experts.linear_fc2),
-    ):
-        op = te_ops.GroupedLinear(
-            linear.num_gemms,
-            linear.in_features,
-            linear.out_features,
-            bias=False,
-            device="meta",
-            dtype=weights[0].dtype,
-            accumulate_into_main_grad=True,
-            delay_wgrad_compute=True,
-        )
-        for index, weight in enumerate(weights):
-            op.register_parameter(f"weight{index}", weight)
-        ops.append(op)
-    fc1_op, fc2_op = ops
-
-    activation_op = build_activation_op(
-        experts.config, activation_recompute=experts.activation_recompute
-    )
-    check_fused_grouped_mlp(fc1_op, activation_op, fc2_op)
-    return te_ops.Sequential(fc1_op, activation_op, fc2_op), fc1_op, fc2_op
-
-
 def check_dispatch_capacity(payload: torch.Tensor, capacity: int) -> torch.Tensor:
     """Hold the dispatch width fixed: a varying one is what a CUDA-graph capture cannot serve."""
     if payload.shape[0] != capacity:
@@ -318,29 +247,26 @@ def _attach_wgrad_accumulator(op, index: int, param) -> None:
 
 
 def run_expert_forward(
-    runtime: MoEEPChunkOverlapRuntime,
-    *,
-    dispatched: DispatchedChunk,
-    stream: torch.cuda.Stream,
-    offload: bool,
+    runtime: MoEEPChunkOverlapRuntime, *, dispatched: DispatchedChunk, stream: torch.cuda.Stream
 ) -> tuple[torch.Tensor, CachedForwardChunkActivation]:
-    """Run FC1, the weighted squared ReLU and FC2 as one fused op, inside its own offload group."""
+    """Run one chunk through the experts' OWN fused FC1 / activation / FC2."""
     from transformer_engine.pytorch import autocast
 
-    ops = runtime.expert_ops()
+    runtime.expert_ops()
     split_sizes = dispatched.split_sizes
     dispatched_tokens = dispatched.recv_x.detach().requires_grad_(True)
     routing_probs = dispatched.recv_probs.detach().reshape(-1).requires_grad_(True)
-    offload_group = off_interface(offload, dispatched_tokens, "fused_group_mlp")
 
+    # The EXPERTS run the chunk, exactly as the trunk runs a whole microbatch: their
+    # `_fused_forward` owns the offload group, the padding decision and the op_kwargs.
     with (
         torch.cuda.stream(stream),
         torch.enable_grad(),
         autocast(enabled=True, recipe=autocast_recipe()),
     ):
-        with offload_group as group_input:
-            fc2_output = ops(group_input, split_sizes, routing_probs, split_sizes)
-        fc2_output = offload_group.group_offload(fc2_output)
+        fc2_output, fc2_bias = runtime._experts(dispatched_tokens, split_sizes, routing_probs)
+        if fc2_bias is not None:
+            raise RuntimeError("moe_ep_chunk_overlap does not support an expert FC2 bias")
         transport_output = fc2_output.detach()
     return transport_output, CachedForwardChunkActivation(
         dispatched_tokens=dispatched_tokens,
@@ -381,12 +307,7 @@ class _MoEEPChunkOverlapFunction(torch.autograd.Function):
         *expert_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Run the chunked forward, saving each chunk's activation for the backward."""
-        output, saved_fwd = runtime.moe_forward(
-            hidden_states,
-            routing_map,
-            dense_probs,
-            offload=runtime._experts.offload_fused_group_mlp,
-        )
+        output, saved_fwd = runtime.moe_forward(hidden_states, routing_map, dense_probs)
         ctx.runtime = runtime
         ctx.saved_fwd = saved_fwd
         ctx.num_expert_weights = len(expert_weights)
@@ -501,9 +422,33 @@ class MoEEPChunkOverlapRuntime:
         self.comm_stream = torch.cuda.Stream(device=self.device)
 
     def expert_ops(self) -> torch.nn.Module:
-        """The fused expert op sequence, built on first use."""
+        """The EXPERTS' own fused sequence, forced into existence before the first forward.
+
+        ``_fused_forward`` builds it lazily, but the quantization and EGTP steps write into the
+        ops' weight slots and run BEFORE any forward, so it has to exist by then.
+        """
+        experts = self._experts
+        # Without this the module's forward takes its UNFUSED branch, which the schedule never
+        # drains: run_chunk_wgrad would find an empty store, return early and lose every wgrad.
+        if not experts._with_fused_impl:
+            raise RuntimeError(
+                "the experts resolved to their unfused forward, so this schedule would run a "
+                "sequence it validated but TE never executes, and drain weight gradients that "
+                "were never deferred. _with_fused_impl is use_transformer_engine_op_fuser AND "
+                "both expert linears' will_execute_quantized(); the config gate cannot see the "
+                "second half, which is decided per linear at construction"
+            )
+        if experts._fused_ops is None:
+            # The two wgrad modes are overridden rather than required of the whole model: this
+            # schedule drains per chunk, which is not what either global flag means.
+            experts._fused_ops = (
+                experts.make_fused_ops(delay_wgrad_compute=True, accumulate_into_main_grad=True),
+            )
+        (ops,) = experts._fused_ops
         if self._ops is None:
-            self._ops, self._fc1_op, self._fc2_op = build_expert_ops(self.config, self._experts)
+            fc1_op, activation_op, fc2_op = list(ops.children())[:3]
+            check_fused_grouped_mlp(fc1_op, activation_op, fc2_op)
+            self._ops, self._fc1_op, self._fc2_op = ops, fc1_op, fc2_op
         return self._ops
 
     def destroy(self) -> None:
@@ -567,7 +512,7 @@ class MoEEPChunkOverlapRuntime:
                 op.__dict__.pop(f"weight{index}", None)
 
     def routed_experts_compute_forward(
-        self, dispatched: DispatchedChunk, *, offload: bool
+        self, dispatched: DispatchedChunk
     ) -> tuple[torch.Tensor, CachedForwardChunkActivation]:
         """Run one chunk's expert compute on the ambient stream; return its rows and saved state."""
         stream = torch.cuda.current_stream(self.device)
@@ -578,7 +523,7 @@ class MoEEPChunkOverlapRuntime:
         dispatched.recv_probs.record_stream(stream)
         dispatched.split_sizes.record_stream(stream)
 
-        return run_expert_forward(self, dispatched=dispatched, stream=stream, offload=offload)
+        return run_expert_forward(self, dispatched=dispatched, stream=stream)
 
     def routed_experts_compute_backward(
         self, saved: CachedForwardChunkActivation, grad_recv: torch.Tensor
@@ -646,12 +591,7 @@ class MoEEPChunkOverlapRuntime:
             op.__dict__.pop("_egtp_bwd_weight_group", None)
 
     def moe_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        dense_probs: torch.Tensor,
-        *,
-        offload: bool,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, dense_probs: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[CachedForwardChunkActivation, ...]]:
         """Forward the layer chunk by chunk, each dispatch overlapping the previous GEMM."""
         config = self.config
@@ -707,9 +647,7 @@ class MoEEPChunkOverlapRuntime:
                 issue_dispatch(c + 1)
 
             compute_stream.wait_event(dispatch_ready[c])
-            fc2_output, saved_chunks[c] = self.routed_experts_compute_forward(
-                dispatched[c], offload=offload
-            )
+            fc2_output, saved_chunks[c] = self.routed_experts_compute_forward(dispatched[c])
             # The receive buffer stays alive because fc2_output is a view of it.
             dispatched[c] = None
             expert_ready[c].record(compute_stream)
