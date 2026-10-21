@@ -48,32 +48,25 @@ class PPAttentionDecoder:
         multi_max = self.max_batch * h_kv
         slots = self.s_max * max(multi_max * self.rows_max, self.flat_max * rows)
         dev = attn.device
-        o_store = torch.empty(slots, d, dtype=torch.float32, device=dev)
-        ml_store = torch.empty(slots, 2, dtype=torch.float32, device=dev)
-        self._views = {}
-        for items, r in ((self.flat_max, rows), (multi_max, self.rows_max)):
-            n = items * self.s_max * r
-            self._views[r] = (
-                o_store[:n].view(items, self.s_max, r, d),
-                ml_store[:n].view(items, self.s_max, r, 2),
-            )
+        self._o_store = torch.empty(slots, d, dtype=torch.float32, device=dev)
+        self._ml_store = torch.empty(slots, 2, dtype=torch.float32, device=dev)
         self.sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
         self._compiled = {}
 
-    def _split(self, q_view, k_cache, v_cache, seqused, page_table, out_view, flat, **kw):
-        tokens, qlens = kw.get("tokens", 1), kw.get("qlens")
+    def _split(self, q_view, k_cache, v_cache, seqused, page_table, out_view, flat, tokens):
         attn = self.attn
-        rows = q_view.shape[1]
-        o_all, ml_all = self._views[attn.rows if rows == attn.rows else self.rows_max]
-        if rows > o_all.shape[2] or flat > o_all.shape[0]:
+        rows, d = q_view.shape[1], attn.head_dim
+        n = flat * self.s_max * rows
+        if n > self._o_store.shape[0]:
             raise ValueError(f"{flat} items of {rows} rows exceed the decode workspace")
         splits = min(self.s_max, _ceil_div(page_table.shape[1], attn.G))
         num_ctas = min(flat * splits, self.sm_count)
-        o_view, ml_view = o_all[:flat, :splits, :rows], ml_all[:flat, :splits, :rows]
+        o_view = self._o_store[:n].view(flat, self.s_max, rows, d)[:, :splits]
+        ml_view = self._ml_store[:n].view(flat, self.s_max, rows, 2)[:, :splits]
         if out_view.ndim == 3:
             out_view = out_view.view(out_view.shape[0], 1, 1, *out_view.shape[1:])
         scale = Float32(attn.softmax_scale)
-        key = ("split", rows, tokens, qlens is not None)
+        key = ("split", rows, tokens)
         if key not in self._compiled:
             fwd = PPAttentionDecode(
                 super_block_tiles=attn.G,
@@ -86,22 +79,14 @@ class PPAttentionDecoder:
                 to_cute_tensor(q_view),
                 to_cute_tensor(k_cache),
                 to_cute_tensor(v_cache),
-                to_cute_tensor(o_view),
                 scale,
-                None,
                 to_cute_tensor(seqused, assumed_align=4, leading_dim=0),
                 to_cute_tensor(page_table, assumed_align=4, leading_dim=1),
-                None,
                 to_cute_tensor(o_view),
                 to_cute_tensor(ml_view),
                 Int32(splits),
                 Int32(attn.h_kv),
                 Int32(num_ctas),
-                (
-                    to_cute_tensor(qlens, assumed_align=4, leading_dim=0)
-                    if qlens is not None
-                    else None
-                ),
                 attn._fake_stream,
                 options="--enable-tvm-ffi",
             )
@@ -109,18 +94,14 @@ class PPAttentionDecoder:
             q_view,
             k_cache,
             v_cache,
-            o_view,
             scale,
-            None,
             seqused,
             page_table,
-            None,
             o_view,
             ml_view,
             Int32(splits),
             Int32(attn.h_kv),
             Int32(num_ctas),
-            qlens,
         )
         key_c = ("combine", rows)
         if key_c not in self._compiled:
@@ -152,12 +133,6 @@ class PPAttentionDecoder:
         if page_table.dtype != torch.int32 or seqused_k.dtype != torch.int32:
             raise ValueError("page_table and seqused_k must be int32")
 
-    def decode(
-        self, q, k_cache, v_cache, page_table, seqused_k, out: Optional[torch.Tensor] = None
-    ):
-        """One new token per request. q [B, 1, H_q, D]; seqused_k counts keys incl. the token."""
-        return self.verify(q, k_cache, v_cache, page_table, seqused_k, out)
-
     def verify(
         self, q, k_cache, v_cache, page_table, seqused_k, out: Optional[torch.Tensor] = None
     ):
@@ -178,7 +153,7 @@ class PPAttentionDecoder:
                 page_table[:batch],
                 out.view(batch, n, a.h_kv, a.rows, d),
                 batch * a.h_kv,
-                tokens=n,
+                n,
             )
             return out
         j = torch.arange(n, device=q.device, dtype=torch.int32).repeat(batch)
@@ -193,6 +168,7 @@ class PPAttentionDecoder:
             pt_v,
             out.view(flat, a.rows, d),
             flat,
+            1,
         )
         return out
 

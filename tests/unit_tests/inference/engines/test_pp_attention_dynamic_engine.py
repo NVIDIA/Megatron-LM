@@ -24,10 +24,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.pp.api import PPAttention
+from megatron.core.transformer.pp.decode_api import PPAttentionDecoder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -148,20 +149,17 @@ class TestPPAttentionDynamicEngine:
         gen = torch.Generator().manual_seed(0)
         lengths = [300, 129, 517, 64]
         prompts = [torch.randint(0, VOCAB - 1, (n,), generator=gen).tolist() for n in lengths]
-        steps = []
-        pp_fn = Attention.pp_decode_and_prefill
-
-        def spy(self, context, *args, **kwargs):
-            steps.append(args[-1])
-            return pp_fn(self, context, *args, **kwargs)
-
+        spy = lambda cls, name: mock.patch.object(
+            cls, name, autospec=True, side_effect=getattr(cls, name)
+        )
         with (
             set_batch_invariant_mode(True, backend="triton"),
-            mock.patch.object(Attention, "pp_decode_and_prefill", spy),
+            spy(PPAttention, "prefill_paged") as prefill,
+            spy(PPAttentionDecoder, "verify") as decode,
         ):
             done = _serve(model, prompts, chunked, spec_tokens)
             assert len(done) == len(prompts)
-            assert True in steps and False in steps, "PP decode and prefill must both run"
+            assert prefill.called and decode.called, "PP decode and prefill must both run"
             for req in done:
                 tokens = req.prompt_tokens.tolist() + list(req.generated_tokens)
                 ref = _train_logprobs(model, torch.tensor([tokens], device="cuda"))

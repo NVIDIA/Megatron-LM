@@ -5,7 +5,6 @@ import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import partial
 from typing import Callable, Optional, Protocol, Tuple, Union
 
 import torch
@@ -1059,56 +1058,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # Auto: prefer the newest available generation.
         return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
 
-    def pp_decode_and_prefill(
-        self,
-        context: BaseInferenceContext,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        max_seqlen_q,
-        max_seqlen_k,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqlens_k,
-        block_table,
-        is_decode_only,
-        softmax_offset: Optional[Tensor] = None,
-    ) -> Tensor:
-        """PP attention over the paged KV cache, with the bytes of the training forward.
-
-        Mixed batches run the varlen prefill kernel; decode-only batches run split decode
-        (one token per request) or verify (several tokens per request).
-        """
-        from megatron.core.transformer.pp.decode_api import get_pp_decoder, page_view
-
-        assert not self.training
-        if softmax_offset is not None:
-            raise ValueError("PP attention does not support a softmax offset")
-        attn = self.core_attention.kernel(q.device)
-        k_pages, v_pages, page_table = page_view(k, v, block_table)
-        seqused_k = seqlens_k.to(torch.int32)
-        if not is_decode_only:
-            if context.using_cuda_graph_this_step():
-                raise ValueError("PP attention does not support CUDA graphs for prefill steps")
-            out = attn.prefill_paged(
-                q.squeeze(1), k_pages, v_pages, cu_seqlens_q.to(torch.int32), seqused_k, page_table
-            )
-            return out.unsqueeze(1)
-        num_requests = seqlens_k.shape[0]
-        tokens = context.num_speculative_tokens + 1
-        rows = num_requests * tokens
-        decoder = get_pp_decoder(attn, context.max_requests, context.max_sequence_length, tokens)
-        out = q.new_zeros(q.shape) if rows < q.shape[0] else torch.empty_like(q)
-        decoder.verify(
-            q[:rows].reshape(num_requests, tokens, q.shape[2], q.shape[3]),
-            k_pages,
-            v_pages,
-            page_table,
-            seqused_k,
-            out=out[:rows].view(num_requests, tokens, q.shape[2], q.shape[3]),
-        )
-        return out
-
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -1465,13 +1414,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if (
-            inference_context
-            and inference_context.is_dynamic_batching()
-            and self.config.attention_backend != AttnBackend.pp
+            self.config.attention_backend == AttnBackend.pp
+            and inference_context
+            and inference_context.is_static_batching()
         ):
-            assert (
-                HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
-            ), "flash attn verion v2.7.3 and above is required for dynamic batching."
+            raise ValueError("PP attention needs the dynamic inference engine")
 
         # hidden_states: [sq, b, h]
         is_inference_mode = InferenceMode.is_active()
@@ -1724,22 +1671,27 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                flash_fn = self.flash_decode_and_prefill
                 if self.config.attention_backend == AttnBackend.pp:
-                    flash_fn = partial(self.pp_decode_and_prefill, inference_context)
-                core_attn_out = flash_fn(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                    softmax_offset=self._get_inference_softmax_offset(),
-                )
+                    core_attn_out = self.core_attention.decode_and_prefill(
+                        inference_context, q, k, v, cu_query_lengths, kv_lengths, block_table
+                    )
+                else:
+                    assert (
+                        HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
+                    ), "flash attn verion v2.7.3 and above is required for dynamic batching."
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                        softmax_offset=self._get_inference_softmax_offset(),
+                    )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
                 # Clear the outputs for padding tokens when using quantization scales

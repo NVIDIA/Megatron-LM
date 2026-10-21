@@ -9,10 +9,9 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass.cute.typing import Float32, Int32
 
+from .api import TILE_KEYS
 from .fold import fold_pair, fold_stats, normalize_scale
 
-TILE_KEYS = 128
-SMAX = 1024
 BATCH = 16
 
 
@@ -23,7 +22,7 @@ class PPAttentionCombine:
     NTHREADS = 32 * WARPS
     COLS = 4
 
-    def __init__(self, super_block_tiles: int, head_dim: int = 256, smax: int = SMAX):
+    def __init__(self, super_block_tiles: int, head_dim: int, smax: int):
         assert head_dim % 128 == 0, "combine needs head_dim as whole 128-column groups"
         assert smax >= BATCH and smax % 32 == 0, "smax must be a multiple of 32"
         self.G = super_block_tiles
@@ -140,71 +139,51 @@ class PPAttentionCombine:
             obar[q] = Float32(0.0)
         if s_b > 0:
             L = Float32(0.0)
-            if s_b <= self.smax:
-                for i in cutlass.range(tid, s_b, 32, unroll=1):
-                    cute.autovec_copy(
-                        cute.make_tensor(mMLPartial[flat, i, row, None].iterator, ml_vec),
-                        sML[i, None],
-                    )
+            for i in cutlass.range(tid, s_b, 32, unroll=1):
                 cute.autovec_copy(
-                    cute.make_tensor(mOPartial[flat, 0, row, None].iterator + c, vec), obar
+                    cute.make_tensor(mMLPartial[flat, i, row, None].iterator, ml_vec), sML[i, None]
                 )
-                rN = cute.make_rmem_tensor(
-                    cute.make_layout((BATCH, self.COLS), stride=(self.COLS, 1)), Float32
+            cute.autovec_copy(
+                cute.make_tensor(mOPartial[flat, 0, row, None].iterator + c, vec), obar
+            )
+            rN = cute.make_rmem_tensor(
+                cute.make_layout((BATCH, self.COLS), stride=(self.COLS, 1)), Float32
+            )
+            for u in cutlass.range_constexpr(BATCH):
+                s_clamped = cutlass.min(1 + u, s_b - 1)
+                cute.autovec_copy(
+                    cute.make_tensor(mOPartial[flat, s_clamped, row, None].iterator + c, vec),
+                    rN[u, None],
                 )
-                for u in cutlass.range_constexpr(BATCH):
-                    s_clamped = cutlass.min(1 + u, s_b - 1)
-                    cute.autovec_copy(
-                        cute.make_tensor(mOPartial[flat, s_clamped, row, None].iterator + c, vec),
-                        rN[u, None],
-                    )
-                cute.arch.sync_warp()
-                M = sML[0, 0]
-                L = sML[0, 1]
-                for s in cutlass.range(1, s_b, 1, unroll=1):
-                    M, L, a, b_scale = fold_stats(M, L, sML[s, 0], sML[s, 1], scale_log2)
-                    if tid == 0:
-                        sAB[s, 0] = a
-                        sAB[s, 1] = b_scale
-                cute.arch.sync_warp()
-                for s0 in cutlass.range(1, s_b, BATCH, unroll=1):
-                    if s0 > 1:
-                        for u in cutlass.range_constexpr(BATCH):
-                            s_clamped = cutlass.min(s0 + u, s_b - 1)
-                            cute.autovec_copy(
-                                cute.make_tensor(
-                                    mOPartial[flat, s_clamped, row, None].iterator + c, vec
-                                ),
-                                rN[u, None],
-                            )
+            cute.arch.sync_warp()
+            M = sML[0, 0]
+            L = sML[0, 1]
+            for s in cutlass.range(1, s_b, 1, unroll=1):
+                M, L, a, b_scale = fold_stats(M, L, sML[s, 0], sML[s, 1], scale_log2)
+                if tid == 0:
+                    sAB[s, 0] = a
+                    sAB[s, 1] = b_scale
+            cute.arch.sync_warp()
+            for s0 in cutlass.range(1, s_b, BATCH, unroll=1):
+                if s0 > 1:
                     for u in cutlass.range_constexpr(BATCH):
-                        if s0 + u < s_b:
-                            a = sAB[s0 + u, 0]
-                            b_scale = sAB[s0 + u, 1]
-                            for q in cutlass.range_constexpr(0, self.COLS, 2):
-                                o0, o1 = fold_pair(
-                                    (obar[q], obar[q + 1]), (rN[u, q], rN[u, q + 1]), a, b_scale
-                                )
-                                obar[q] = o0
-                                obar[q + 1] = o1
-            else:
-                M = mMLPartial[flat, 0, row, 0]
-                L = mMLPartial[flat, 0, row, 1]
-                cute.autovec_copy(
-                    cute.make_tensor(mOPartial[flat, 0, row, None].iterator + c, vec), obar
-                )
-                rS = cute.make_rmem_tensor(vec, Float32)
-                for s in cutlass.range(1, s_b, 1, unroll=1):
-                    m_s = mMLPartial[flat, s, row, 0]
-                    l_s = mMLPartial[flat, s, row, 1]
-                    M, L, a, b_scale = fold_stats(M, L, m_s, l_s, scale_log2)
-                    cute.autovec_copy(
-                        cute.make_tensor(mOPartial[flat, s, row, None].iterator + c, vec), rS
-                    )
-                    for q in cutlass.range_constexpr(0, self.COLS, 2):
-                        o0, o1 = fold_pair((obar[q], obar[q + 1]), (rS[q], rS[q + 1]), a, b_scale)
-                        obar[q] = o0
-                        obar[q + 1] = o1
+                        s_clamped = cutlass.min(s0 + u, s_b - 1)
+                        cute.autovec_copy(
+                            cute.make_tensor(
+                                mOPartial[flat, s_clamped, row, None].iterator + c, vec
+                            ),
+                            rN[u, None],
+                        )
+                for u in cutlass.range_constexpr(BATCH):
+                    if s0 + u < s_b:
+                        a = sAB[s0 + u, 0]
+                        b_scale = sAB[s0 + u, 1]
+                        for q in cutlass.range_constexpr(0, self.COLS, 2):
+                            o0, o1 = fold_pair(
+                                (obar[q], obar[q + 1]), (rN[u, q], rN[u, q + 1]), a, b_scale
+                            )
+                            obar[q] = o0
+                            obar[q + 1] = o1
             inv = normalize_scale(L)
             frg = cute.make_rmem_tensor(vec, Float32)
             for q in cutlass.range_constexpr(0, self.COLS, 2):

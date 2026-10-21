@@ -94,7 +94,7 @@ def _bits(t):
     return t.contiguous().view(torch.int16)
 
 
-CASES = [(128, 8, 2), (256, 8, 2), (256, 16, 1)]
+CASES = [(128, 8, 2), (256, 8, 2), (256, 16, 1), (128, 48, 1)]
 
 
 @gpu
@@ -114,7 +114,7 @@ class TestPPAttentionInference:
     def test_decode(self, head_dim, h_q, h_kv):
         case = _Case(head_dim, h_q, h_kv)
         q, ref, seqused = case.tail(1)
-        out = case.decoder().decode(q, case.k, case.v, case.pages, seqused)
+        out = case.decoder().verify(q, case.k, case.v, case.pages, seqused)
         assert torch.equal(_bits(out), _bits(ref))
 
     @pytest.mark.parametrize("n", [3, 8])

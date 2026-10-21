@@ -124,18 +124,14 @@ class PPAttentionDecode:
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
-        mO,
         softmax_scale: Float32,
-        mCuSeqlensQ,
         mSeqUsedK: cute.Tensor,
         mPageTable: cute.Tensor,
-        mScratch,
         mOPartial: cute.Tensor,
         mMLPartial: cute.Tensor,
         splits: Int32,
         h_kv: Int32,
         num_ctas: Int32,
-        mQLens=None,
         stream: cuda.CUstream = None,
     ):
         cta_group = tcgen05.CtaGroup.ONE
@@ -263,7 +259,6 @@ class PPAttentionDecode:
             mOPartial,
             mMLPartial,
             mSeqUsedK,
-            mQLens,
             page_table,
             max_seqlen_k,
             scale_softmax_log2,
@@ -299,7 +294,6 @@ class PPAttentionDecode:
         mOPartial: cute.Tensor,
         mMLPartial: cute.Tensor,
         mSeqUsedK: cute.Tensor,
-        mQLens,
         mPageTable: cute.Tensor,
         max_seqlen_k: Int32,
         scale_softmax_log2: Float32,
@@ -553,7 +547,7 @@ class PPAttentionDecode:
                     loop_start,
                     loop_steps,
                     loop_end,
-                ) = self._work_item(item, splits, h_kv, mSeqUsedK, mQLens)
+                ) = self._work_item(item, splits, h_kv, mSeqUsedK)
                 iloc = (item - cta_id) // grid_x
                 if loop_steps > 0:
                     for half in cutlass.range_constexpr(self.iterations_qk):
@@ -625,7 +619,7 @@ class PPAttentionDecode:
                     loop_start,
                     loop_steps,
                     loop_end,
-                ) = self._work_item(item, splits, h_kv, mSeqUsedK, mQLens)
+                ) = self._work_item(item, splits, h_kv, mSeqUsedK)
                 iloc = (item - cta_id) // grid_x
                 load_q_releaser = load_q_consumer.clone()
                 if loop_steps > 0:
@@ -831,7 +825,7 @@ class PPAttentionDecode:
                         loop_start,
                         loop_steps,
                         loop_end,
-                    ) = self._work_item(item, splits, h_kv, mSeqUsedK, mQLens)
+                    ) = self._work_item(item, splits, h_kv, mSeqUsedK)
                     iloc = (item - cta_id) // grid_x
                     if loop_steps > 0:
                         for j in cutlass.range(0, loop_steps, 1, unroll=1):
@@ -895,7 +889,7 @@ class PPAttentionDecode:
                     loop_start,
                     loop_steps,
                     loop_end,
-                ) = self._work_item(item, splits, h_kv, mSeqUsedK, mQLens)
+                ) = self._work_item(item, splits, h_kv, mSeqUsedK)
                 iloc = (item - cta_id) // grid_x
                 if loop_steps > 0:
                     row_st = cute.make_rmem_tensor(cute.make_layout((1, 3)), Float32)
@@ -976,7 +970,7 @@ class PPAttentionDecode:
                     loop_start,
                     loop_steps,
                     loop_end,
-                ) = self._work_item(item, splits, h_kv, mSeqUsedK, mQLens)
+                ) = self._work_item(item, splits, h_kv, mSeqUsedK)
                 iloc = (item - cta_id) // grid_x
                 if loop_steps > 0:
                     stats_handle = s_corr_consumer.wait_and_advance()
@@ -1020,17 +1014,14 @@ class PPAttentionDecode:
         tmem.free(tmem_ptr)
 
     @cute.jit
-    def _work_item(self, item: Int32, splits: Int32, h_kv: Int32, mSeqUsedK: cute.Tensor, mQLens):
+    def _work_item(self, item: Int32, splits: Int32, h_kv: Int32, mSeqUsedK: cute.Tensor):
         """Map persistent item id -> (flat, s) and that item's tile range."""
         flat_coord = item // splits
         s_idx = item - flat_coord * splits
         batch_coord = flat_coord // h_kv
         kv_head_coord = flat_coord - batch_coord * h_kv
         seqlen_k = mSeqUsedK[batch_coord]
-        if cutlass.const_expr(mQLens is None):
-            qlen = Int32(self.tokens)
-        else:
-            qlen = mQLens[batch_coord]
+        qlen = Int32(self.tokens)
         n_tiles_k = (seqlen_k + 127) // 128
         loop_start = s_idx * self.G
         loop_end = cutlass.min(loop_start + self.G, n_tiles_k)
