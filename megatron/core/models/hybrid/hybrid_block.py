@@ -101,6 +101,7 @@ class HybridStackSubmodules:
     window_layer: ModuleSpec | type | None = None
     mla_layer: Union[ModuleSpec, type] = IdentityOp
     mla_fused_down_proj_layer: ModuleSpec | None = None
+    mla_latent_cp_layer: ModuleSpec | None = None
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -346,16 +347,27 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
-                    mla_layer_spec = (
-                        submodules.mla_fused_down_proj_layer
-                        if getattr(layer_config, "mla_down_proj_fusion", False)
-                        else submodules.mla_layer
-                    )
+                    # The variants are pre-built specs selected here (mla_latent_cp excludes
+                    # mla_down_proj_fusion in TransformerConfig.__post_init__).
+                    if getattr(layer_config, "mla_latent_cp", False):
+                        mla_layer_spec = submodules.mla_latent_cp_layer
+                        missing_slot = "`mla_latent_cp=True`", "latent-CP", "mla_latent_cp_layer"
+                    elif getattr(layer_config, "mla_down_proj_fusion", False):
+                        mla_layer_spec = submodules.mla_fused_down_proj_layer
+                        missing_slot = (
+                            "`mla_down_proj_fusion=True`",
+                            "fused",
+                            "mla_fused_down_proj_layer",
+                        )
+                    else:
+                        mla_layer_spec = submodules.mla_layer
+                        missing_slot = None
                     # Only error if we actually try to use the MLA layer spec.
                     if mla_layer_spec is None:
+                        flag, kind, slot = missing_slot
                         raise ValueError(
-                            "`mla_down_proj_fusion=True` requires the hybrid stack spec to provide "
-                            "the fused MLA layer spec under `mla_fused_down_proj_layer`."
+                            f"{flag} requires the hybrid stack spec to provide "
+                            f"the {kind} MLA layer spec under `{slot}`."
                         )
                     layer = build_module(
                         mla_layer_spec,

@@ -461,6 +461,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "attn_res_block_layers": None,
     "attn_res_norm_fusion": False,
     "hybrid_layer_pattern": "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME",
+    "mla_latent_cp": False,
+    "mla_latent_cp_fwd_backend": None,
+    "mla_latent_cp_bwd_backend": None,
+    "mla_latent_cp_two_stream": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
