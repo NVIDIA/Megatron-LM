@@ -54,6 +54,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
+    # DTensor replication must be counted by this wrapper even when chained
+    # optimizers share the same final reduction group.
+    requires_individual_grad_stats = True
+
     @override
     def __init__(
         self,
@@ -62,6 +66,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         grad_scaler: Optional[MegatronGradScaler],
         init_state_fn: Callable,
         model_chunks: List[MegatronModule],
+        *,
+        parameters: Optional[List[torch.nn.Parameter]] = None,
     ) -> None:
         """Initialize the MFSDP optimizer wrapper.
 
@@ -72,6 +78,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 but accepted to match the MCore optimizer construction contract.
             init_state_fn: Function used to initialize optimizer state.
             model_chunks: MFSDP v2 model chunks optimized by this wrapper.
+            parameters: This optimizer's parameters before filtering empty local shards.
         """
         FullyShardedOptimizer._validate_config(config, model_chunks)
         if has_config_logger_enabled(config):
@@ -92,14 +99,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         # is the direction the checkpoint path resolves, and because the optimizer names each
         # parameter once: a tied parameter is one ``nn.Parameter`` with one state entry, and
         # its several FQNs are the model state dict's business, not this map's.
-        parameters = self.get_parameters()
-        if not is_te_min_version("2.18.0"):
-            # Include the empty local shards filtered out of older TE optimizers.
-            parameters = []
-            for model_chunk in self.model_chunks:
-                for param in model_chunk.parameters():
-                    if param.requires_grad:
-                        parameters.append(param)
+        if parameters is None:
+            parameters = self.get_parameters()
         self._param_to_fqn: dict[torch.nn.Parameter, str] = {
             param: get_global_unique_param_name(self.model_chunks, param) for param in parameters
         }
@@ -153,6 +154,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         (TE FusedAdam) tracks ``step`` per group rather than per parameter, so ``step``
         round-trips here rather than in the per-parameter state.
         """
+        if self.is_stub_optimizer:
+            return {}
         return {
             self._param_to_fqn[param]: {
                 key: value for key, value in group.items() if key != "params"
@@ -249,12 +252,17 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         to the current parameters, mirroring the Megatron-FSDP branch of
         :meth:`DistributedOptimizer.load_state_dict`.
         """
+        if self.is_stub_optimizer:
+            return
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
-        state = state_dict["state"]
-        if not is_te_min_version("2.18.0"):
-            # Empty-shard placeholders are not owned by the older TE optimizer.
-            owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
-            state = {fqn: param_state for fqn, param_state in state.items() if fqn in owned_fqns}
+        # A chain shares one FQN-keyed checkpoint across Muon and Adam. Select this
+        # optimizer's parameters, also excluding empty shards omitted by older TE.
+        owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
+        state = {
+            fqn: param_state
+            for fqn, param_state in state_dict["state"].items()
+            if fqn in owned_fqns
+        }
         self.optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 
     @override
@@ -288,12 +296,17 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         Returns:
             The optimizer state dict, in the ``fsdp_dtensor`` format described above.
         """
-        if is_loading:
-            init_optimizer_state(self.optimizer)
+        if is_loading and not self.is_stub_optimizer:
+            if self.init_state_fn is None:
+                init_optimizer_state(self.optimizer)
+            else:
+                self.init_state_fn(self.optimizer, self.config)
 
         state_by_fqn = {
             self._param_to_fqn[param]: param_state
-            for param, param_state in self.optimizer.state.items()
+            for param, param_state in (
+                {} if self.is_stub_optimizer else self.optimizer.state
+            ).items()
         }
         if not is_te_min_version("2.18.0"):
             self._add_empty_shard_state(state_by_fqn)
@@ -388,9 +401,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.zero_grad(set_to_none=set_to_none)
 
         if not is_te_min_version("2.18.0"):
-            # Older TE omits empty local shards, so clear their gradients through the model.
-            for model_chunk in self.model_chunks:
-                model_chunk.zero_grad(set_to_none=set_to_none)
+            # Only clear this optimizer's omitted shards; another optimizer may own
+            # other parameters in the same FSDP buffer.
+            for parameter in self._param_to_fqn:
+                if parameter.to_local().numel() == 0 and parameter.grad is not None:
+                    if set_to_none:
+                        parameter.grad = None
+                    else:
+                        parameter.grad.zero_()
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""

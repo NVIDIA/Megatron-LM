@@ -29,6 +29,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -868,14 +869,19 @@ class TestMcoreAdapterExpertParallel:
             dp_cp=self.reference_group,
             embd=None,
             pos_embd=None,
+            mp=self.reference_group,
+            tp_ep_pp=self.reference_group,
         )
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
         _destroy_model_parallel()
 
-    def test_build_train_step_and_clip(self):
+    @pytest.mark.parametrize("optimizer_name", ["adam", "muon"])
+    def test_build_train_step_and_clip(self, optimizer_name):
         """Shard experts over expert-DP and clip their combined gradients."""
+        if optimizer_name == "muon":
+            pytest.importorskip("emerging_optimizers")
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
         # initialization instead uses the globally configured EP=2 rank in its RNG seed.
         config = TransformerConfig(
@@ -950,11 +956,43 @@ class TestMcoreAdapterExpertParallel:
         assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
 
         optimizer_config = OptimizerConfig(
-            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
+            optimizer=optimizer_name,
+            lr=1.0e-3,
+            weight_decay=0.0,
+            use_distributed_optimizer=False,
+            clip_grad=1.0e-4,
+            muon_split_qkv=False,
         )
-        reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-        optimizer = get_megatron_optimizer(optimizer_config, [model])
-        assert isinstance(optimizer, FullyShardedOptimizer)
+        reference_optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [reference_model],
+            pg_collection=self.reference_pg_collection,
+            use_gloo_process_groups=False,
+        )
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            pg_collection=self.pg_collection,
+            use_gloo_process_groups=False,
+        )
+        if optimizer_name == "muon":
+            assert isinstance(optimizer, ChainedOptimizer)
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
+
+            muon_optimizers = [
+                opt.optimizer
+                for opt in optimizer.chained_optimizers
+                if isinstance(opt.optimizer, FsdpMuon)
+            ]
+            meshes = {
+                param.device_mesh
+                for opt in muon_optimizers
+                for group in opt.param_groups
+                for param in group["params"]
+            }
+            assert sorted(mesh.size() for mesh in meshes) == [self.world_size // 2, self.world_size]
+        else:
+            assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
 
         local_batch_size = 2
@@ -974,6 +1012,7 @@ class TestMcoreAdapterExpertParallel:
             return torch.nn.functional.mse_loss(output, targets)
 
         reference_losses = []
+        reference_norms = []
         for _ in range(5):
             reference_optimizer.zero_grad(set_to_none=True)
             (reference_loss,) = run_forward_backward_on_microbatches(
@@ -985,6 +1024,7 @@ class TestMcoreAdapterExpertParallel:
                 reference_pre_clip_norm > optimizer_config.clip_grad
             ), "Reference gradients must exceed the clipping threshold to exercise clipping."
             reference_losses.append(reference_loss)
+            reference_norms.append(float(reference_pre_clip_norm))
 
         def forward():
             output = model(
@@ -995,13 +1035,15 @@ class TestMcoreAdapterExpertParallel:
             return torch.nn.functional.mse_loss(output, targets[input_slice])
 
         losses = []
+        norms = []
         for _ in range(5):
             optimizer.zero_grad(set_to_none=True)
             (loss,) = run_forward_backward_on_microbatches(model, forward)
-            success, _, _ = optimizer.step()
+            success, norm, _ = optimizer.step()
             assert success
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
             losses.append(loss)
+            norms.append(float(norm))
 
         losses = torch.stack(losses)
         reference_losses = torch.stack(reference_losses)
@@ -1011,7 +1053,10 @@ class TestMcoreAdapterExpertParallel:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         assert losses[-1] < losses[0]
-        torch.testing.assert_close(losses, reference_losses)
+        # Muon's Newton-Schulz matmuls use BF16 with the default "medium" precision.
+        tolerances = {"rtol": 1e-3, "atol": 1e-6} if optimizer_name == "muon" else {}
+        torch.testing.assert_close(losses, reference_losses, **tolerances)
+        torch.testing.assert_close(torch.tensor(norms), torch.tensor(reference_norms), **tolerances)
 
 
 class TestMcoreAdapterHybrid:
