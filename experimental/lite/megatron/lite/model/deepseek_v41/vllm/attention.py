@@ -132,26 +132,90 @@ class _Sparse(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         q, kv, sink, indices = ctx.saved_tensors
-        # Fixed-slot VJP: FP32 accumulated shared K/V gradients, rounded once.
-        dq = torch.empty_like(q)
-        dkv = torch.zeros_like(kv, dtype=torch.float32)
-        dsink = torch.zeros_like(sink, dtype=torch.float32)
-        with torch.enable_grad():
-            values = kv.detach().float().requires_grad_()
-            bias = sink.detach().float().requires_grad_()
-            for lo in range(0, q.shape[0], 32):
-                hi = min(lo + 32, q.shape[0])
-                query = q[lo:hi].detach().float().requires_grad_()
-                selected = indices[lo:hi]
-                gathered = values[selected.clamp_min(0).long()]
-                logits = torch.einsum('shd,std->sht', query, gathered) * ctx.scale
-                logits = logits.masked_fill((selected < 0)[:, None], -torch.inf)
-                logits = torch.cat((logits, bias[None, :, None].expand(hi - lo, -1, 1)), -1)
-                prob = logits.softmax(-1)[..., :-1]
-                out = torch.einsum('sht,std->shd', prob, gathered)
-                a, b, c = torch.autograd.grad(out, (query, values, bias), grad[lo:hi].float())
-                dq[lo:hi], dkv, dsink = a, dkv + b, dsink + c
-        return dq, dkv.to(kv.dtype), dsink.to(sink.dtype), None, None, None
+        if q.shape[0] == 0:
+            return (
+                torch.zeros_like(q),
+                torch.zeros_like(kv),
+                torch.zeros_like(sink),
+                None,
+                None,
+                None,
+            )
+        if not q.is_cuda or q.shape[-1] != 512:
+            # Small common-activation adjoint controls (the deployment forward
+            # accepts D512 only). This is a single batched reference, not a
+            # row-wise GPU replay implementation.
+            with torch.enable_grad():
+                query = q.detach().float().requires_grad_()
+                values = kv.detach().float().requires_grad_()
+                bias = sink.detach().float().requires_grad_()
+                gathered = values[indices.clamp_min(0).long()]
+                logits = (query @ gathered.transpose(-1, -2)) * ctx.scale
+                logits = logits.masked_fill((indices < 0)[:, None], -torch.inf)
+                logits = torch.cat((logits, bias[None, :, None].expand(q.shape[0], -1, 1)), -1)
+                out = logits.softmax(-1)[..., :-1] @ gathered
+                grads = torch.autograd.grad(out, (query, values, bias), grad.float())
+            return (
+                *(value.to(source.dtype) for value, source in zip(grads, (q, kv, sink))),
+                None,
+                None,
+                None,
+            )
+        # Recompute only the pinned forward's saved statistics; the public
+        # forward above and its output bits remain unchanged. cuDNN owns the
+        # full-query batched VJP rather than Python's 32-row autograd loop.
+        from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            fused_sparse_attention as sparse,
+        )
+
+        heads = q.shape[1]
+        padded = 64 if heads <= 64 else 128
+        query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
+        bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
+        # Every unused slot is -1 in this caller's compact layout.
+        lengths = None
+        output, _, lse = flash_mla_sparse_fwd(
+            q=query,
+            kv=kv[:, None].contiguous(),
+            indices=indices[:, None],
+            sm_scale=ctx.scale,
+            attn_sink=bias,
+            topk_length=lengths,
+        )
+        dout = torch.nn.functional.pad(grad, (0, 0, 0, padded - heads)).contiguous()
+        sparse._ensure_dsa_namespace()
+        result = sparse._DSA.sparse_attention_backward_wrapper(
+            query,
+            kv,
+            output,
+            dout,
+            lse,
+            bias,
+            indices,
+            softmax_scale=ctx.scale,
+            topk_length=lengths,
+            **sparse._deterministic_sparse_bwd_kwargs(
+                query,
+                kv,
+                output,
+                lse,
+                bias,
+                indices,
+                lengths,
+                ctx.scale,
+                requested=torch.are_deterministic_algorithms_enabled(),
+            ),
+        )
+        return (
+            result["dq"][:, :heads],
+            result["dkv"].to(kv.dtype),
+            result["d_sink"][:heads].to(sink.dtype),
+            None,
+            None,
+            None,
+        )
 
 
 class _InverseRoPE(torch.autograd.Function):
