@@ -183,7 +183,7 @@ class TransformerConfig(ModelParallelConfig):
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
     """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and
        and learnable offset."""
 
     attn_logit_softcapping: Optional[float] = None
@@ -2436,6 +2436,19 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor with the 'hybridep' backend requires "
                     "use_transformer_engine_op_fuser=True or moe_use_grouped_tensor=True."
+                )
+            if self.moe_pad_expert_input_to_capacity:
+                # Two capacity mechanisms over one dispatch. Pad-to-capacity fixes the
+                # per-expert counts at capacity in setup_metadata, while the rank budget asks
+                # the backend for the counts it actually received, and the dispatch then has
+                # two answers for tokens_per_expert with nothing choosing between them. RAISE
+                # rather than assert: picking the wrong one mis-sizes the expert GEMM segments,
+                # which is silent, and PYTHONOPTIMIZE=1 strips asserts.
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor and moe_pad_expert_input_to_capacity are "
+                    "two capacity mechanisms for the same dispatch and cannot be combined: the "
+                    "first drops tokens over a per-rank budget, the second pads every expert to "
+                    "moe_expert_capacity_factor. Set exactly one."
                 )
 
         if self.cpu_offloading and (
