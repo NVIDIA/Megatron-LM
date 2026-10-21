@@ -11,6 +11,7 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
+from megatron.core.fusions import fused_bias_geglu
 from megatron.core.fusions.fused_bias_geglu import weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive import transformer_engine as te
@@ -38,17 +39,51 @@ def _expert_nvtx_range(name: str):
         torch.cuda.nvtx.range_pop()
 
 
+# Core compiles weighted_quick_geglu_back; which compiled variant a call hits depends on the
+# process's shape history, so bitwise-reproducible runs take the eager original in backward.
+_eager_weighted_quick_geglu_back = getattr(
+    fused_bias_geglu.weighted_quick_geglu_back,
+    "_torchdynamo_orig_callable",
+    fused_bias_geglu.weighted_quick_geglu_back,
+)
+
+
+class _EagerBackWeightedQuickGeGLU(fused_bias_geglu.WeightedQuickGeGLUFunction):
+    @staticmethod
+    def backward(ctx, grad_output):
+        y, weights, linear_offset = ctx.saved_tensors
+        if ctx.fp8_input_store:
+            y = y.to(ctx.ori_input_dtype)
+        y_grad, w_grad = _eager_weighted_quick_geglu_back(grad_output, y, weights, linear_offset)
+        return y_grad, w_grad, None, None
+
+
+def _quick_geglu_eager_back(y, weights, linear_offset, clamp_value):
+    """``weighted_bias_quick_geglu_impl`` (bias=None) with the eager backward."""
+    shape = y.shape
+    if clamp_value is not None:
+        y_glu, y_lin = y.chunk(2, -1)
+        y = torch.cat((y_glu.clamp(max=clamp_value), y_lin.clamp(-clamp_value, clamp_value)), -1)
+    y = y.view(-1, shape[-1])
+    offset = torch.tensor(linear_offset, dtype=y.dtype, device=y.device)
+    out = _EagerBackWeightedQuickGeGLU.apply(y, weights, False, offset)
+    return out if len(shape) == 2 else out.view(shape[0], shape[1], -1)
+
+
 def swiglu_with_probs(
     y: torch.Tensor,
     probs: torch.Tensor | None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 1.0,
     swiglu_up_offset: float = 0.0,
+    eager_back: bool = False,
 ) -> torch.Tensor:
     """SwiGLU (alpha=1) or quick-GEGLU (alpha=1.702) with optional expert probability scaling."""
     clamp_value = swiglu_limit if swiglu_limit > 0 else None
     if swiglu_alpha == 1.702:  # Core quick_gelu
         weights = probs if probs is not None else y.new_ones(y.numel() // y.shape[-1], 1)
+        if eager_back:
+            return _quick_geglu_eager_back(y, weights, swiglu_up_offset, clamp_value)
         return weighted_bias_quick_geglu_impl(
             y, None, weights, linear_offset=swiglu_up_offset, clamp_value=clamp_value
         )
@@ -83,11 +118,13 @@ class Experts(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        eager_geglu_back: bool = False,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
+        self.eager_geglu_back = eager_geglu_back
         # ETP is untested and its backward disagrees with lora.py's; refuse it.
         if ps.etp_size > 1:
             raise NotImplementedError(f"etp_size={ps.etp_size} unsupported; use 1.")
@@ -201,6 +238,7 @@ class Experts(nn.Module):
                     self.swiglu_limit,
                     self.swiglu_alpha,
                     self.swiglu_up_offset,
+                    self.eager_geglu_back,
                 )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
@@ -211,7 +249,12 @@ class Experts(nn.Module):
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
                 h = swiglu_with_probs(
-                    fc1_out, probs, self.swiglu_limit, self.swiglu_alpha, self.swiglu_up_offset
+                    fc1_out,
+                    probs,
+                    self.swiglu_limit,
+                    self.swiglu_alpha,
+                    self.swiglu_up_offset,
+                    self.eager_geglu_back,
                 )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:

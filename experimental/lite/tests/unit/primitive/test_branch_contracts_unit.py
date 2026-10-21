@@ -173,6 +173,24 @@ def test_quick_geglu_is_bitwise_core_fused_kernel(with_probs: bool) -> None:
 
 
 @pytest.mark.gpus(1)
+def test_quick_geglu_eager_back_keeps_fused_forward() -> None:
+    """``eager_back`` keeps Core's fused forward bitwise and only swaps the backward for the eager kernel."""
+    y = (torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.bfloat16) * 8).requires_grad_()
+    probs = torch.rand(TOKENS, 1, device="cuda", dtype=torch.float32).requires_grad_()
+    y_ref = y.detach().clone().requires_grad_()
+    probs_ref = probs.detach().clone().requires_grad_()
+
+    actual = swiglu_with_probs(y, probs, 7.0, 1.702, 1.0, eager_back=True)
+    expected = swiglu_with_probs(y_ref, probs_ref, 7.0, 1.702, 1.0)
+    assert torch.equal(actual, expected)
+    g = torch.randn_like(actual)
+    actual.backward(g)
+    expected.backward(g)
+    torch.testing.assert_close(y.grad, y_ref.grad)
+    torch.testing.assert_close(probs.grad, probs_ref.grad)
+
+
+@pytest.mark.gpus(1)
 def test_quick_geglu_matches_hf_swigluoai_reference() -> None:
     """Same numbers as the HF MiniMax-M3 ``_apply_gate`` expression (bf16 eager), within bf16 rounding."""
     y = torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.bfloat16) * 8

@@ -28,18 +28,7 @@ def set_deterministic(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    eager_geglu_back()
     _is_deterministic = True
-
-
-def eager_geglu_back() -> None:
-    """Run mcore's compiled ``weighted_quick_geglu_back`` eagerly; its compiled variant depends on shape history."""
-    try:
-        from megatron.core.fusions import fused_bias_geglu
-    except ModuleNotFoundError:
-        return
-    fn = fused_bias_geglu.weighted_quick_geglu_back
-    fused_bias_geglu.weighted_quick_geglu_back = getattr(fn, "_torchdynamo_orig_callable", fn)
 
 
 def is_deterministic() -> bool:
