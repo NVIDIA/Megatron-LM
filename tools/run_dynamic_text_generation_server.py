@@ -47,7 +47,6 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     start_text_gen_server,
     stop_text_gen_server,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
 from megatron.core.utils import (  # noqa: E402
     configure_nvtx_profiling,
     get_pg_size,
@@ -62,7 +61,7 @@ from megatron.post_training.arguments import add_modelopt_args  # noqa: E402
 from megatron.training import get_args  # noqa: E402
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
 from megatron.training.initialize import initialize_megatron  # noqa: E402
 
 
@@ -203,7 +202,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     if not is_vlm:
         return get_dynamic_inference_engine()
 
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
     model = get_vlm_model(is_vlm=True)
     inference_config = get_inference_config_from_model_and_args(model, args)
 

@@ -35,7 +35,6 @@ from megatron.core.parallel_state import (
     get_hybrid_data_context_parallel_groups,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -66,6 +65,7 @@ from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from megatron.training.global_vars import (
     get_run_config,
+    get_tokenizer,
     set_run_config,
 )
 from model_provider import model_provider
@@ -381,7 +381,7 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     """Build the GPT dataset config from parsed CLI args."""
     cfg = get_run_config()
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]

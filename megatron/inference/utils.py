@@ -6,6 +6,7 @@ from argparse import ArgumentParser, Namespace
 from copy import copy
 from typing import Literal, Optional
 
+from megatron.training.global_vars import get_tokenizer
 import torch
 
 from megatron.core import dist_checkpointing
@@ -19,7 +20,6 @@ from megatron.core.inference.quantization.utils import (
     resolve_mxfp8_backend,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
 from megatron.training import get_args
@@ -475,7 +475,7 @@ def get_dynamic_inference_engine(
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     inference_config = get_inference_config_from_model_and_args(model, args)
     return build_dynamic_inference_engine(
