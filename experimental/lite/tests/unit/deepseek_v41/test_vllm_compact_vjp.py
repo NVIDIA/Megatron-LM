@@ -123,7 +123,7 @@ def test_tensor_core_vjp_matches_fp32_control(kind, gradient_dtype, monkeypatch)
 def test_thd_projections_are_batched_and_metadata_tracks_boundary_changes(monkeypatch):
     state = SimpleNamespace(
         pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1)),
-        _deployment_rope=torch.empty(0),
+        _deployment_rope=torch.empty(6, 64),
         _dsv4_compress_ratio=0,
     )
     params = SimpleNamespace(qkv_format='thd', cu_seqlens_q_padded=torch.tensor([0, 3, 3, 9]))
@@ -154,6 +154,11 @@ def test_thd_projections_are_batched_and_metadata_tracks_boundary_changes(monkey
     cached = params._deployment_documents
     assert params._deployment_documents is cached
     params.cu_seqlens_q_padded[1] = 2
+    state._deployment_rope = torch.empty(5, 64)
+    with pytest.raises(ValueError, match="Document length 6 exceeds RoPE cache capacity 5"):
+        attention.SWAAttention.forward(state, x, packed_seq_params=params)
+    assert calls == [9, 9]  # Reject before projections or native kernels.
+    state._deployment_rope = torch.empty(6, 64)
     attention.SWAAttention.forward(state, x, packed_seq_params=params)
     assert layouts[-1] == [(0, 2), (2, 3), (3, 9)] and params._deployment_documents is not cached
     output.sum().backward()

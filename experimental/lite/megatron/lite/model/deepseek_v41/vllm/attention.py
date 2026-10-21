@@ -632,6 +632,10 @@ class SWAAttention(DS41SelfAttention):
         if hidden_states.shape[0] == 0:
             return hidden_states * 0, None
         layout = cached[2]
+        if layout.max_length > self._deployment_rope.shape[0]:
+            raise ValueError(
+                f"Document length {layout.max_length} exceeds RoPE cache capacity {self._deployment_rope.shape[0]}"
+            )
 
         def sources(x, qr, qa):
             from .compressed import source
