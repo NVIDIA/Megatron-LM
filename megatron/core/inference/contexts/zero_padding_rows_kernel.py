@@ -29,8 +29,10 @@ except ImportError:
     HAVE_TRITON = False
 
 
+# Coverage.py cannot trace Triton device bodies after they are JIT-compiled. Eager,
+# CUDA-graph replay, and determinism behavior are exercised by dedicated CUDA tests.
 @triton.jit
-def _zero_padding_rows_kernel(
+def _zero_padding_rows_kernel(  # pragma: no cover
     x_ptr,  # [num_rows, row_numel], contiguous
     real_token_count_ptr,  # int32* [1]
     num_rows,

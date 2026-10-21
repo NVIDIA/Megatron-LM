@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+import importlib.util
 import math
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +13,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.contexts import zero_padding_rows_kernel
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -130,6 +133,33 @@ def _token_major_activations(num_rows: int, contiguous: bool = True) -> torch.Te
 
 
 CONTIGUITY = pytest.mark.parametrize("contiguous", [True, False], ids=["kernel", "fallback"])
+
+
+def test_zero_padding_rows_module_supports_missing_triton(monkeypatch):
+    """The torch fallback remains importable and functional without Triton installed."""
+    module_name = f"{zero_padding_rows_kernel.__name__}_without_triton"
+    spec = importlib.util.spec_from_file_location(module_name, zero_padding_rows_kernel.__file__)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "triton", None)
+    spec.loader.exec_module(module)
+
+    activations = torch.ones((3, 2))
+    module.zero_padding_rows(activations, torch.tensor([1], dtype=torch.int32))
+
+    assert module.HAVE_TRITON is False
+    assert torch.equal(activations[0], torch.ones(2))
+    assert torch.count_nonzero(activations[1:]) == 0
+
+
+def test_zero_padding_tokens_accepts_empty_activation():
+    """An empty token dimension returns before deriving the Triton launch grid."""
+    context = _context_with_real_token_count(0)
+    activations = torch.empty((0, 1, 8), device="cuda")
+
+    context.zero_padding_tokens(activations)
+
+    assert activations.numel() == 0
 
 
 @CONTIGUITY
