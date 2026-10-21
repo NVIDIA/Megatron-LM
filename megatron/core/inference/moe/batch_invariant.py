@@ -428,7 +428,9 @@ def _unpermute_tokens_in_expert_order_kernel(
     """Token-local batch-invariant unpermute.
 
     Each program owns one output token and one hidden tile. Contributions are
-    accumulated in fp32 by increasing local expert id, avoiding atomic-add order.
+    accumulated by increasing local expert id, avoiding atomic-add order, in fp64
+    and rounded once to the fp32 rank partial, as training's batch-invariant
+    unpermute does. An fp32 accumulator drops small contributions next to a large one.
     """
     tok = tl.program_id(0)
     block_h = tl.program_id(1)
@@ -436,7 +438,7 @@ def _unpermute_tokens_in_expert_order_kernel(
     offsets = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offsets < hidden_dim
 
-    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H], dtype=tl.float64)
     if tok < valid_tokens:
         tok_i64 = tok.to(tl.int64)
         for lid in tl.range(0, num_local_experts):
@@ -444,10 +446,10 @@ def _unpermute_tokens_in_expert_order_kernel(
             if pos >= 0:
                 pos_i64 = pos.to(tl.int64)
                 vals = tl.load(expert_out_ptr + pos_i64 * hidden_dim + offsets, mask=mask_h).to(
-                    tl.float32
+                    tl.float64
                 )
                 acc += vals
-        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc, mask=mask_h)
+        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
 
 
 def unpermute_tokens_in_expert_order(

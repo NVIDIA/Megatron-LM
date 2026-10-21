@@ -2,11 +2,6 @@
 
 """Coverage for recording MFSDP demand-unshard order."""
 
-from contextlib import nullcontext
-from types import SimpleNamespace
-from unittest.mock import Mock
-
-import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -18,60 +13,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.indexed_order import IndexedOrder
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-
-
-@pytest.mark.parametrize('budget', [None, 0, 2])
-def test_prefetch_replays_occurrences(budget):
-    """A reused module prefetches different successors at each recorded position."""
-    modules, prefetched = [], []
-    for _ in range(3):
-        module = object.__new__(FsdpModule)
-        parameter = SimpleNamespace(unsharded=torch.empty(1))
-        module._parameter_groups = (SimpleNamespace(fsdp_parameters=[parameter]),)
-        module._unshard_parameter_groups = Mock(
-            side_effect=lambda target=module: prefetched.append(target)
-        )
-        modules.append(module)
-    first, second, third = modules
-    sequence = [first, second, first, third]
-    order = IndexedOrder(sequence)
-    expected = [[second], [first], [third], []]
-    if budget == 0:
-        expected = [[], [], [], []]
-    elif budget == 2:
-        expected = [[second, first], [first, third], [third], []]
-    for _ in range(2):
-        for module, targets in zip(sequence, expected):
-            prefetched.clear()
-            module._prefetch_parameter_groups(order, budget)
-            assert prefetched == targets
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(third)
-    order.advance(first)
-    assert list(order.lookahead(first)) == [second, first, third]
-
-
-@pytest.mark.parametrize('recorded', [False, True])
-def test_lookahead_preserves_execution_progress(recorded):
-    """Static and recorded lookahead preserve demand progress and occurrence order."""
-    first, second, third = nn.Module(), nn.Module(), nn.Module()
-    sequence = [first, second, first, third] if recorded else [first, second, third]
-    if recorded:
-        order = IndexedOrder(sequence)
-    else:
-        order = IndexedOrder()
-        for module in sequence:
-            order.append(module)
-    for _ in range(2):
-        for index, module in enumerate(sequence):
-            order.advance(module)
-            assert list(order.lookahead(module)) == sequence[index + 1 :]
-            assert list(order.lookahead(module)) == sequence[index + 1 :]
-            assert list(order) == sequence
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    iteration as iteration_scope,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import microbatch
 
 
 def test_shared_module_recording_matches_dense_training(distributed_setup):
@@ -109,8 +55,7 @@ def test_shared_module_recording_matches_dense_training(distributed_setup):
     for iteration in range(2):
         dense_optimizer.zero_grad(set_to_none=True)
         optimizer.zero_grad(set_to_none=True)
-        recording = context.record_prefetch_order() if iteration == 0 else nullcontext()
-        with recording:
+        with iteration_scope(context):
             for index in range(num_microbatches):
                 inputs = base_inputs + 0.1 * distributed_setup.rank + 0.02 * (iteration + index)
                 expected = dense(inputs)
@@ -120,14 +65,19 @@ def test_shared_module_recording_matches_dense_training(distributed_setup):
                     (actual.square().mean() / num_microbatches).backward()
                 torch.testing.assert_close(actual, expected)
             context.finish_grad_sync()
-        assert (
-            list(context.forward_order)
-            == [model, model.first, model.second, model.second] * num_microbatches
-        )
-        assert (
-            list(context.backward_order)
-            == [model, model.second, model.second, model.first] * num_microbatches
-        )
+        demands = context.iteration_order._orders["default"]
+        assert [module_ref() for module_ref, phase in demands if phase == "forward"] == [
+            model,
+            model.first,
+            model.second,
+            model.second,
+        ] * num_microbatches
+        assert [module_ref() for module_ref, phase in demands if phase == "backward"] == [
+            model,
+            model.second,
+            model.second,
+            model.first,
+        ] * num_microbatches
         for reference in dense.parameters():
             dist.all_reduce(reference.grad, group=mesh.get_group())
             reference.grad.div_(distributed_setup.world_size)

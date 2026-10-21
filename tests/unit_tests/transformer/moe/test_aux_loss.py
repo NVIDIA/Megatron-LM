@@ -275,6 +275,8 @@ class TestRouterAuxLoss:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
@@ -383,6 +385,8 @@ class TestRouterAuxLoss:
         torch.testing.assert_close(aux_loss, seq_aux_loss)
         torch.testing.assert_close(grad1, grad2)
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("with_padding", [False, True])
@@ -517,6 +521,8 @@ class TestRouterAuxLoss:
         torch.testing.assert_close(aux_loss_ref, aux_loss_fused)
         torch.testing.assert_close(grad_ref, grad_fused)
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
@@ -599,6 +605,8 @@ class TestRouterAuxLoss:
         assert router.ga_steps == 0
         assert torch.all(router.global_tokens_per_expert == 0)
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
@@ -655,18 +663,12 @@ class TestRouterAuxLoss:
         assert router.get_aux_loss_coeff("global_aux_loss") == 2.0
         assert router.get_aux_loss_coeff("non_existent_type") == 0.0
 
+    # Intermittent Gloo timeout: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
-        "tp_size,ep_size,cp_size",
-        [
-            # Intermittent Gloo timeout: https://github.com/NVIDIA/Megatron-LM/issues/7745
-            pytest.param(8, 1, 1, marks=pytest.mark.flaky_in_dev),
-            (4, 2, 1),
-            (1, 1, 8),
-            (2, 1, 4),
-            (2, 2, 2),
-        ],
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
     def test_force_balanced_aux_loss(self, tp_size, ep_size, cp_size):
         """Test if aux loss is 1.0 when using uniform routing"""

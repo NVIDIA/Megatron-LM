@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -1017,6 +1018,7 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
+@with_mfsdp_iteration
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
