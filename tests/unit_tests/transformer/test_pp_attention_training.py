@@ -6,8 +6,10 @@ import pytest
 import torch
 
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.pp.autograd import thd_paging, zigzag_positions
-from megatron.core.transformer.pp.cp_plan import build_cp_plan
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_local_positions,
+)
+from megatron.core.transformer.pp.cp_plan import paged_layout
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -41,6 +43,7 @@ class TestPPAttentionConfig:
             dict(pp_attention_super_block_tiles=0),
             dict(context_parallel_size=2, cp_comm_type='p2p'),
             dict(context_parallel_size=2, cp_comm_type='a2a+p2p'),
+            dict(context_parallel_size=4, cp_comm_type='a2a'),
         ],
     )
     def test_rejected(self, kw):
@@ -53,22 +56,27 @@ class TestPPAttentionConfig:
 
 
 class TestPPAttentionLayouts:
-    def test_thd_paging(self):
+    def test_varlen_layout(self):
         cu = torch.tensor([0, 130, 130 + 256, 130 + 256 + 7], dtype=torch.int32)
-        page_table, seqused, rows, num_pages, max_len = thd_paging(cu)
-        assert seqused.tolist() == [130, 256, 7]
-        assert num_pages == 2 + 2 + 1 and max_len == 256
-        assert page_table[0, :2].tolist() == [0, 1] and page_table[2, 0].item() == 4
+        layout = paged_layout(cu)
+        assert layout.seqused_k.tolist() == [130, 256, 7]
+        assert layout.num_pages == 2 + 2 + 1 and layout.max_seqlen_k == 256
+        assert layout.page_table.tolist() == [[0, 1], [2, 3], [4, 0]]
+        rows = layout.paged_scatter_idx
         assert rows.unique().numel() == rows.numel() == 393
         assert rows[129].item() == 128 + 1 and rows[130].item() == 2 * 128
+        assert layout.bwd_k_gather_idx is None and layout.kv_reorder_idx is None
 
     @pytest.mark.parametrize("cp", [2, 4])
-    def test_zigzag_positions_match_plan(self, cp):
+    def test_cp_layout(self, cp):
         cu = torch.tensor([0, 64, 64 + 128, 64 + 128 + 192], dtype=torch.int32)
-        pos = zigzag_positions(cu, cp)
-        plans = [build_cp_plan(cu, cp, r, 2, "cpu") for r in range(cp)]
-        assert torch.equal(pos, torch.cat([p.local_positions for p in plans]))
+        layout = paged_layout(cu, cp, 1)
+        pos = layout.gathered_positions
         assert torch.equal(pos.sort().values, torch.arange(int(cu[-1])))
+        assert torch.equal(pos.index_select(0, layout.kv_reorder_idx), torch.arange(int(cu[-1])))
+        h = [64 // (2 * cp), 128 // (2 * cp), 192 // (2 * cp)]
+        assert layout.seqused_k.tolist()[:2] == [2 * h[0], 64 - h[0]]
+        assert layout.bwd_cu_seqlens_k[-1].item() == layout.bwd_k_gather_idx.numel()
 
 
 def _supported_gpu():
@@ -151,7 +159,11 @@ class TestPPAttentionGpu:
 
     @pytest.mark.parametrize("d", [128, 256])
     def test_varlen_and_cp(self, d):
-        from megatron.core.transformer.pp.autograd import cp_backward, cp_forward, varlen_attention
+        from megatron.core.transformer.pp.autograd import (
+            paged_backward,
+            paged_forward,
+            varlen_attention,
+        )
 
         attn, rand = self._setup(d, 8)
         lens = [700, 2052, 1500]
@@ -179,12 +191,12 @@ class TestPPAttentionGpu:
         dk = torch.zeros(t, HKV, d, device="cuda")
         dv = torch.zeros_like(dk)
         for r in range(cp):
-            plan = build_cp_plan(cu, cp, r, HKV, q.device)
-            lp = plan.local_positions
+            layout = paged_layout(cu, cp, r)
+            lp = build_packed_allgather_cp_local_positions(cu, cp, r, q.device)
             q_l = q.index_select(0, lp).contiguous()
-            o_l, lse_l = cp_forward(q_l, k, v, attn, plan)
+            o_l, lse_l = paged_forward(q_l, k, v, attn, layout)
             assert torch.equal(_bits(o_l), _bits(out.detach().index_select(0, lp)))
-            gq, gk, gv = cp_backward(q_l, k, v, o_l, w.index_select(0, lp), lse_l, attn, plan)
+            gq, gk, gv = paged_backward(q_l, k, v, o_l, w.index_select(0, lp), lse_l, attn, layout)
             dq.index_copy_(0, lp, gq.float())
             dk += gk
             dv += gv

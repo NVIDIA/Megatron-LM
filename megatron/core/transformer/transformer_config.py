@@ -1667,6 +1667,12 @@ class TransformerConfig(ModelParallelConfig):
                     "PP attention supports cp_comm_type 'all_gather' or 'a2a', "
                     f"got {self.cp_comm_type!r}"
                 )
+            heads = (self.num_attention_heads, self.num_query_groups or self.num_attention_heads)
+            per_rank = self.tensor_model_parallel_size * self.context_parallel_size
+            if "a2a" in types and any(n % per_rank for n in heads):
+                raise ValueError(
+                    "PP attention a2a needs heads per TP rank divisible by the cp size"
+                )
 
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""

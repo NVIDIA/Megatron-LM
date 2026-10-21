@@ -18,8 +18,6 @@ from megatron.core.utils import divide
 from .api import get_pp_attention
 from .autograd import a2a_attention, cp_all_gather_attention, dense_attention, varlen_attention
 
-CP_COMM_TYPES = ("all_gather", "a2a")
-
 
 class PPDotProductAttention(MegatronModule):
     """Causal attention with the same bytes in training, prefill, decode and verify.
@@ -47,17 +45,10 @@ class PPDotProductAttention(MegatronModule):
         tp_size = pg_collection.tp.size()
         self.cp_group = getattr(pg_collection, 'cp', None)
         self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
-        self.cp_comm_type = cp_comm_type or "all_gather"
-        if self.cp_size > 1 and self.cp_comm_type not in CP_COMM_TYPES:
-            raise ValueError(
-                f"PP attention supports cp_comm_type in {CP_COMM_TYPES}, got {cp_comm_type!r}"
-            )
+        self.cp_comm_type = cp_comm_type
         self.head_dim = config.kv_channels
         self.num_q_heads = divide(config.num_attention_heads, tp_size)
         self.num_kv_heads = divide(config.num_query_groups or config.num_attention_heads, tp_size)
-        if self.cp_size > 1 and self.cp_comm_type == "a2a":
-            if self.num_q_heads % self.cp_size or self.num_kv_heads % self.cp_size:
-                raise ValueError("PP attention a2a needs heads divisible by the cp size")
         self.softmax_scale = (
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(self.head_dim)
         )
@@ -93,8 +84,6 @@ class PPDotProductAttention(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         """Query/key/value are [s, b, h, d], or [t, h, d] with qkv_format 'thd'."""
-        if attn_mask_type not in (None, AttnMaskType.causal):
-            raise ValueError(f"PP attention supports causal masks only, got {attn_mask_type}")
         if attention_bias is not None:
             raise ValueError("PP attention does not support attention_bias")
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
