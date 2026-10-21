@@ -1651,6 +1651,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
                 },
+                daemon=True,
             )
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
