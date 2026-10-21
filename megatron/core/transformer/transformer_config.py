@@ -1931,6 +1931,16 @@ class TransformerConfig(ModelParallelConfig):
 
     def _normalize_sync_compatibility_fields(self) -> None:
         """Normalize branch-compatible names before validating the shared configuration."""
+        # __post_init__ can run again on the same object, for example when a caller edits fields
+        # and finalizes the config a second time. Put back the linear-CP fields an earlier pass
+        # filled in (unless the caller has changed them since) so this pass sees the same inputs
+        # as the first and does not mistake those defaults for explicit user choices.
+        for name, derived_value in getattr(self, "_linear_cp_derived_defaults", {}).items():
+            if getattr(self, name) == derived_value:
+                setattr(self, name, None)
+        unset_linear_cp_fields = [
+            name for name in ("linear_cp_mode", "linear_cp_layout") if getattr(self, name) is None
+        ]
         if self.linear_attention_type is not None:
             warnings.warn(
                 "linear_attention_type is deprecated, "
@@ -2018,6 +2028,9 @@ class TransformerConfig(ModelParallelConfig):
             self._linear_cp_layout_explicit = False
         if self.linear_cp_layout is None:
             self.linear_cp_layout = "zigzag"
+        self._linear_cp_derived_defaults = {
+            name: getattr(self, name) for name in unset_linear_cp_fields
+        }
         if hasattr(self, "o_groups"):
             for legacy, canonical, default in (
                 ("o_groups", "output_projection_groups", 8),
