@@ -1097,12 +1097,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         num_requests = seqlens_k.shape[0]
         tokens = context.num_speculative_tokens + 1
         rows = num_requests * tokens
-        decoder = get_pp_decoder(
-            attn,
-            context.max_requests,
-            context.max_sequence_length,
-            context.num_speculative_tokens + 1,
-        )
+        decoder = get_pp_decoder(attn, context.max_requests, context.max_sequence_length, tokens)
         out = q.new_zeros(q.shape) if rows < q.shape[0] else torch.empty_like(q)
         decoder.verify(
             q[:rows].reshape(num_requests, tokens, q.shape[2], q.shape[3]),
