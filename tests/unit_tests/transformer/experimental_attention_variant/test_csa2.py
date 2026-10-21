@@ -1575,6 +1575,26 @@ def test_fused_candidate_generation_matches_dense_oracle(
     for rows, (cu_q, cu_k, max_q, max_k, key_rows) in zip(chunks, chunk_metadata):
         assert cu_q[-1] == rows and cu_k[-1] == key_rows
         assert cu_q.diff().max() <= max_q and cu_k.diff().max() <= max_k
+    if precision == "bf16":
+        # Also exercise the default wider BF16 tile; the byte-limited check
+        # above deliberately reduces every invocation to at most 17 rows.
+        wide_chunks = []
+
+        def wide_scorer(chunk_q, *args, **kwargs):
+            wide_chunks.append(chunk_q.shape[0])
+            return scorer(chunk_q, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(csa2_candidates, "_SCORE_CHUNK_MAX_BYTES", 32 * 1024 * 1024)
+            patch.setattr(
+                csa2_candidates.fused_sparse_attention._DSA, "indexer_forward_wrapper", wide_scorer
+            )
+            _reject_cuda_host_reads(patch)
+            wide_topk, wide = indexer._fused_topk_and_candidates(prepared)
+        assert max(wide_chunks) > 128
+        torch.testing.assert_close(wide_topk, expected_topk)
+        torch.testing.assert_close(wide.indices, expected.indices)
+        torch.testing.assert_close(wide.lengths, expected.lengths)
     for x, before in zip((q, k, w), snapshots):
         torch.testing.assert_close(x, before, atol=0, rtol=0)
     for x, before in zip((prepared.q, prepared.k, prepared.weights), prepared_before):

@@ -45,6 +45,7 @@ except ImportError:
 # unavoidable output is [queries, topk_blocks], never [queries, global keys].
 _SCORE_CHUNK_MAX_BYTES = 32 * 1024 * 1024
 _QUERY_CHUNK_SIZE = 128
+_BF16_QUERY_CHUNK_SIZE = 2048
 
 
 @dataclass(frozen=True)
@@ -342,7 +343,10 @@ def fused_candidate_blocks(
     # Account for cuDNN's four-float row alignment. Even a single very long
     # row needs its own score buffer; otherwise cap the chunk at 32 MiB.
     row_bytes = ((score_max_k + 3) // 4 * 4) * 4
-    chunk_size = min(_QUERY_CHUNK_SIZE, max(1, _SCORE_CHUNK_MAX_BYTES // row_bytes))
+    # Amortize BF16 scorer/selection launches within the existing score-byte cap.
+    # Preserve MXFP8 quantization-buffer geometry until that path is profiled.
+    query_chunk_size = _BF16_QUERY_CHUNK_SIZE if precision == "bf16" else _QUERY_CHUNK_SIZE
+    chunk_size = min(query_chunk_size, max(1, _SCORE_CHUNK_MAX_BYTES // row_bytes))
     kernel_k = k
     precision_kwargs = dict(precision=precision)
     if precision == "mxfp8":
