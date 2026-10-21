@@ -77,7 +77,6 @@ class ImplConfig:
     msa_index_input_norm: str = "recompute"  # recompute | fused (reuse the qkv LayerNormLinear norm output)
     msa_indexer_kl_loss_coeff: float = 0.0  # >0 trains the indexer with Magi's KL loss; 0 freezes it
     msa_indexer_kl_temperature: float = 1.0
-    eager_geglu_back: bool = False  # eager Core weighted_quick_geglu_back in the MLPs (also on with deterministic)
 
 
 # MiniMax's training recipe (mm_megatron_forward / mcore M3 config); fa4_varlen requires cp=1.
@@ -88,7 +87,6 @@ MINIMAX_TRAINING_IMPL = dict(
     msa_indexer_kl_temperature=2.0,
     magi_dense_kernel_backend="fa4_varlen",
     moe_permute_fusion=False,
-    eager_geglu_back=True,
 )
 
 
@@ -321,7 +319,6 @@ def build_model(model_cfg: MiniMaxM3Config, *, impl_cfg: ImplConfig) -> ModelBun
         rope_fusion=impl_cfg.rope_fusion,
         msa_index_input_norm=impl_cfg.msa_index_input_norm,
         msa_indexer_trainable=impl_cfg.msa_indexer_kl_loss_coeff > 0,
-        eager_geglu_back=impl_cfg.deterministic or impl_cfg.eager_geglu_back,
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=impl_cfg.deterministic,

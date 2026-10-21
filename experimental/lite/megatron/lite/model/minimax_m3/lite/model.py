@@ -40,20 +40,17 @@ from megatron.lite.primitive.parallel import (
 )
 
 
-def m3_activation(y: torch.Tensor, config: MiniMaxM3Config, eager_back: bool = False) -> torch.Tensor:
+def m3_activation(y: torch.Tensor, config: MiniMaxM3Config) -> torch.Tensor:
     """Clamped SwiGLU ``(up + 1) * gate * sigmoid(1.702 gate)`` (HF ``swigluoai``)."""
-    return swiglu_with_probs(
-        y, None, config.swiglu_limit, config.swiglu_alpha, config.swiglu_up_offset, eager_back
-    )
+    return swiglu_with_probs(y, None, config.swiglu_limit, config.swiglu_alpha, config.swiglu_up_offset)
 
 
 class M3DenseMLP(nn.Module):
     """Dense MLP with the pre-MLP RMSNorm fused into ``gate_up`` (layers 0-2)."""
 
-    def __init__(self, config: MiniMaxM3Config, ps: ParallelState, *, eager_geglu_back: bool = False):
+    def __init__(self, config: MiniMaxM3Config, ps: ParallelState):
         super().__init__()
         self.config = config
-        self.eager_geglu_back = eager_geglu_back
         self.gate_up = ColumnParallelLinear(
             config.hidden_size,
             config.dense_intermediate_size * 2,
@@ -66,22 +63,21 @@ class M3DenseMLP(nn.Module):
         self.down = RowParallelLinear(config.dense_intermediate_size, config.hidden_size, ps, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(m3_activation(self.gate_up(x), self.config, self.eager_geglu_back))
+        return self.down(m3_activation(self.gate_up(x), self.config))
 
 
 class M3SharedExpert(nn.Module):
     """Single shared expert, no gate (unlike Qwen)."""
 
-    def __init__(self, config: MiniMaxM3Config, ps: ParallelState, *, eager_geglu_back: bool = False):
+    def __init__(self, config: MiniMaxM3Config, ps: ParallelState):
         super().__init__()
         self.config = config
-        self.eager_geglu_back = eager_geglu_back
         ffn = config.shared_intermediate_size
         self.gate_up = ColumnParallelLinear(config.hidden_size, ffn * 2, ps, bias=False)
         self.down = RowParallelLinear(ffn, config.hidden_size, ps, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(m3_activation(self.gate_up(x), self.config, self.eager_geglu_back))
+        return self.down(m3_activation(self.gate_up(x), self.config))
 
 
 class M3MoELayer(nn.Module):
@@ -97,7 +93,6 @@ class M3MoELayer(nn.Module):
         moe_hybridep_fused_permute: bool = False,
         moe_act_recompute: bool = False,
         moe_permute_fusion: bool | None = None,
-        eager_geglu_back: bool = False,
     ):
         super().__init__()
         self.router = SigmoidTopKRouter(
@@ -108,9 +103,7 @@ class M3MoELayer(nn.Module):
             gate_fp32=True,  # as mcore moe_router_dtype=fp32
             expert_bias_persistent=True,  # loaded from e_score_correction_bias, updated outside the optimizer
         )
-        self.experts = Experts(
-            config, ps, fp8=False, moe_act_recompute=moe_act_recompute, eager_geglu_back=eager_geglu_back
-        )
+        self.experts = Experts(config, ps, fp8=False, moe_act_recompute=moe_act_recompute)
         self.dispatcher = TokenDispatcher(
             config.num_experts,
             config.hidden_size,
@@ -120,7 +113,7 @@ class M3MoELayer(nn.Module):
             hybridep_num_sms=moe_hybridep_num_sms,
             hybridep_fused_permute=moe_hybridep_fused_permute,
         )
-        self.shared_expert = M3SharedExpert(config, ps, eager_geglu_back=eager_geglu_back)
+        self.shared_expert = M3SharedExpert(config, ps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_shape = x.shape
@@ -156,7 +149,6 @@ class MiniMaxM3Layer(nn.Module):
         rope_fusion: bool = False,
         msa_index_input_norm: str = "recompute",
         msa_indexer_trainable: bool = False,
-        eager_geglu_back: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -210,13 +202,12 @@ class MiniMaxM3Layer(nn.Module):
                 moe_hybridep_fused_permute=moe_hybridep_fused_permute,
                 moe_act_recompute=moe_act_recompute,
                 moe_permute_fusion=moe_permute_fusion,
-                eager_geglu_back=eager_geglu_back,
             )
             self.mlp: M3DenseMLP | None = None
         else:
             self.mlp_norm = None
             self.moe = None
-            self.mlp = M3DenseMLP(config, ps, eager_geglu_back=eager_geglu_back)
+            self.mlp = M3DenseMLP(config, ps)
 
     def forward(self, x: torch.Tensor, magi_ctx):
         if self.is_sparse_attention:
@@ -279,7 +270,6 @@ class MiniMaxM3Model(nn.Module):
                     rope_fusion=getattr(train_config, "rope_fusion", False),
                     msa_index_input_norm=getattr(train_config, "msa_index_input_norm", "recompute"),
                     msa_indexer_trainable=getattr(train_config, "msa_indexer_trainable", False),
-                    eager_geglu_back=getattr(train_config, "eager_geglu_back", False),
                 )
                 for idx in self.layer_indices
             ]
