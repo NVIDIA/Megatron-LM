@@ -5680,6 +5680,13 @@ def evaluate(
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
         model_module.eval()
+    if is_gtp_remat_active(args):
+        # Evaluation runs on transient GTP buffers and leaves the weight slab's plan alone.
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+            get_global_GTP_cache,
+        )
+
+        get_global_GTP_cache().set_forward_only(True)
 
     # Disable result validation during evaluation
     rerun_state_machine = get_rerun_state_machine()
@@ -5851,6 +5858,8 @@ def evaluate(
     # Move model back to the train mode.
     for model_module in model:
         model_module.train()
+    if is_gtp_remat_active(args):
+        get_global_GTP_cache().set_forward_only(False)
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]

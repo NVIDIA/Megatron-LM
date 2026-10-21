@@ -327,6 +327,9 @@ class TestRegisteredLIFOPool:
 
 def _worker_sync_plain_recycle(rank, world_size, port):
     torch.manual_seed(0)
+    # Recycling through the per-shape pool is the pooled policy; the default slab policy hands
+    # out transient scratch instead (covered by test_gtp_transient_buffers).
+    gtp_module.update_gtp_config(eager_buffer_policy="pooled")
     dtype = torch.bfloat16
     group = dist.new_group(list(range(world_size)))
     layer = _make_gtp_linear(64, 128, group, dtype)
