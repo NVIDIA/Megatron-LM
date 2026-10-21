@@ -33,18 +33,18 @@ from megatron.training.utils import print_rank_0
 logger = logging.getLogger(__name__)
 
 
-def has_modelopt_state(checkpoint_path: str) -> bool:
+def has_modelopt_state(checkpoint_path: str, ckpt_format: str) -> bool:
     """Check if modelopt_state folder exists inside the checkpoint and contains nontrivial state.
 
     NOTE: Ignores distillation (KD) state, which is deprecated and unused.
 
     Args:
         checkpoint_path: Path to the checkpoint directory
+        ckpt_format: Checkpoint format used to load the state.
 
     Returns:
         True if modelopt_state exists and contains nontrivial state, False otherwise
     """
-    args = get_args()
 
     def _has_nontrivial_modelopt_state(modelopt_state: dict) -> bool:
         """Check whether modelopt_state contains state beyond the (deprecated, unused) KD mode."""
@@ -55,7 +55,7 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
         return len(modes) > 0
 
     try:
-        if args.ckpt_format == "torch":
+        if ckpt_format == "torch":
             # Non-sharded
             state_dict, _, _ = _load_base_checkpoint(checkpoint_path, rank0=False)
             if state_dict is None:
@@ -72,7 +72,9 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
             modelopt_checkpoint_name = load_dir / "modelopt_state"
             if not modelopt_checkpoint_name.is_dir():
                 return False
-            modelopt_state = dist_checkpointing.load_common_state_dict(str(modelopt_checkpoint_name))
+            modelopt_state = dist_checkpointing.load_common_state_dict(
+                str(modelopt_checkpoint_name)
+            )
             return _has_nontrivial_modelopt_state(modelopt_state)
     except Exception as e:
         print_rank_0(f"Failed to inspect checkpoint in {checkpoint_path}: {e}")

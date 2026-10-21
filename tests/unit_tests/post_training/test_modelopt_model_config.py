@@ -585,13 +585,17 @@ class TestModelOptMtpSpec:
                 make_modelopt_test_args(mtp_num_layers=1, export_real_quant_cfg=quant_cfg)
             )
             decoder_spec = default_layer_spec(config, vp_stage=None)
-            mtp_spec = mtp_block_spec(config, decoder_spec, pp_rank=0)
-            layer = mtp_spec.layer_specs[0].submodules.mtp_model_layer
             from megatron.training.models.gpt import _modelopt_mtp_layer_spec
 
             expected = _modelopt_mtp_layer_spec(config)
+            with patch(
+                "megatron.training.models.gpt._modelopt_mtp_layer_spec", return_value=expected
+            ) as select_mtp_spec:
+                mtp_spec = mtp_block_spec(config, decoder_spec, pp_rank=0)
+            select_mtp_spec.assert_called_once_with(config)
+            layer = mtp_spec.layer_specs[0].submodules.mtp_model_layer
+            assert layer is expected
             assert layer.module is TransformerLayer
-            assert layer.submodules == expected.submodules
             if quant_cfg != "None":
                 assert decoder_spec.layer_specs[0].module is not TransformerLayer
         finally:

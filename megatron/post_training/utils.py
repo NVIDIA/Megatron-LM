@@ -32,7 +32,7 @@ def should_use_modelopt_config(args) -> bool:
 
     if getattr(args, "modelopt_enabled", False):
         return True
-    if args.load is not None and has_modelopt_state(args.load):
+    if args.load is not None and has_modelopt_state(args.load, args.ckpt_format):
         print_rank_0("ModelOpt checkpoint detected")
         return True
     if getattr(args, "export_kd_teacher_load", None) is not None:
@@ -51,6 +51,7 @@ def modelopt_version_higher_than(target_version: str):
     print(info)
     return Version(modelopt.__version__) > Version(target_version)
 
+
 def modelopt_version_at_least(target_version: str):
     """Check if Model-Optimizer is greater or equal than this version."""
     info = "rank {:3}/{:3} checking if nvidia-modelopt-{} is at least {}".format(
@@ -67,6 +68,7 @@ def function_has_parameter(function, argument_name: str) -> bool:
     """Check if a function has a specific argument."""
     sig = inspect.signature(function)
     return argument_name in sig.parameters
+
 
 def get_current_memory_info():
     """Get current memory usage."""
