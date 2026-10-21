@@ -917,3 +917,45 @@ If you use Megatron Core MoE in your research, please cite:
     journal={arXiv preprint arXiv:2504.14960},
 }
 ```
+
+#### Dist-MoE
+
+`moe_megakernel_backend: dist_moe` selects the optional `dist_moe` integration
+branch. MCore retains routing, native expert parameters, DDP, optimizer, and
+checkpoints. Dist-MoE executes routed dispatch, SwiGLU, combine, and backward,
+accumulating WGRAD directly into the native `main_grad` buffers. Shared experts
+run through the ordinary MCore module, including its optional output gate.
+
+Enable `bf16`, `moe_grouped_gemm`, `moe_use_grouped_tensor`,
+`moe_single_grouped_weight`, and `gradient_accumulation_fusion`; disable linear
+bias and physical GLU interleave. MXFP8 compute uses `fp8: e4m3` with
+`fp8_recipe: mxfp8`; Hybrid/E5M2 backward precision is rejected. It
+supports either BF16 primary parameters with a TE workspace or `fp8_param: true`
+with native TE payloads. FP8 primary parameters require DDP's
+`reuse_grad_buf_for_mxfp8_param_ag: true`. Both paths retain TE's independent
+rowwise/columnwise 1D quantization and copy only the converted scale bytes.
+TE versions that gate single grouped parameters with an environment variable
+also require `NVTE_GROUPED_LINEAR_SINGLE_PARAM=1`; the backend checks the actual
+parameter layout rather than relying only on the requested configuration.
+
+The initial integration supports TP/ETP/CP/PP/GTP=1, sequential microbatch
+forward/backward, ordinary SwiGLU, native MCore DDP, and device-resident
+activations. Graph capture, outer activation recomputation, delayed WGRAD,
+Flex dispatch, shared-expert overlap, and FSDP are rejected. Routed precision
+must be uniform; `first_last_layers_bf16` overrides are rejected. Expert parallelism
+comes from the layer's explicit EP process group.
+
+The training entrypoint initializes contexts after DDP, optimizer, and checkpoint
+setup and closes them on exit. Library users call
+`initialize_dist_moe_runtime(model_chunks, ddp_config=..., max_num_local_input_tokens=...)`
+after equivalent setup and `close_dist_moe_runtime(model_chunks)` after the last
+backward and before destroying process groups. These functions are exported by
+`megatron.core.transformer.moe.megakernel.dist_moe`.
+
+Backend options are `num_sms`, `device_scratch_capacity_factor`,
+`activation_slot_bytes` or `activation_slot_capacity_factor`,
+`bf16_grouped_gemm_preset`, and `mxfp8_pipeline` (`mega` or `staged`). Equal-shape
+layers share a context. The default scratch bound covers full EP routing skew;
+the default activation budget targets balanced full-save operation. Optional
+`shared_expert_bf16: true` retains native BF16 shared experts when comparing with
+MOK; otherwise shared precision follows the model configuration.

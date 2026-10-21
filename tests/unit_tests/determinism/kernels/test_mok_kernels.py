@@ -1,11 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Replay the MCore routing adapter without requiring the optional MOK package."""
+"""Replay the shared MOK/Dist routing adapter without optional backend packages."""
 
 import pytest
 import torch
 
-from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
+from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -28,12 +28,12 @@ def test_routing_map_forward_and_backward_replay(dtype, num_experts, topk):
     upstream = torch.randn((num_tokens, topk), device="cuda", dtype=torch.float32)
 
     outputs, gradients = assert_replays_bit_exact(
-        routing_map_to_mok_inputs,
+        routing_map_to_indices,
         (probs, routing_map, topk),
         grad_outputs={"out[0]": upstream},
         replays=3,
         contention=True,
-        what=f"MOK routing map[{dtype}, experts={num_experts}, topk={topk}]",
+        what=f"Megakernel routing map[{dtype}, experts={num_experts}, topk={topk}]",
     )
 
     expected_indices = expert_indices.masked_fill(~valid_routes, num_experts).sort(dim=1).values

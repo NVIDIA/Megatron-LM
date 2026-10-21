@@ -126,6 +126,11 @@ from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
+from megatron.core.transformer.moe.megakernel.dist_moe.runtime import (
+    dist_moe_runtime_lifecycle,
+    has_dist_moe_backend,
+    initialize_dist_moe_runtime,
+)
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
@@ -1582,6 +1587,7 @@ def _get_train_full_dataset_sample_count(args, dataset_provider):
     return int(total_num_samples)
 
 
+@dist_moe_runtime_lifecycle
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -3184,6 +3190,17 @@ def setup_model_and_optimizer(
         print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
         torch.distributed.barrier()
         exit()
+
+    if has_dist_moe_backend(model):
+        if skip_optimizer or not wrap_with_ddp:
+            raise ValueError("dist_moe requires training with native MCore DDP and an optimizer")
+        if args.seq_length is None:
+            raise ValueError("dist_moe training requires an explicit seq_length token bound")
+        initialize_dist_moe_runtime(
+            model,
+            ddp_config=cfg.ddp,
+            max_num_local_input_tokens=cfg.train.micro_batch_size * args.seq_length,
+        )
 
     return model, optimizer, opt_param_scheduler
 
