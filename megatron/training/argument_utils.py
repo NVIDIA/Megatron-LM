@@ -565,21 +565,21 @@ def _default_config_from_args(
 
 
 def resolve_tokenizer_vocab_size(
-    cfg: PretrainConfigContainer | InferenceConfigContainer, padded_vocab_size: int | None
-) -> None:
+    cfg: PretrainConfigContainer | InferenceConfigContainer) -> None:
     """Bind tokenizer-derived vocabulary after runtime tokenizer construction.
+        
+    Final padded_vocab_size value is resolved by tokenizer initialization,
+        and updated on cfg.tokenizer. including any CLI/checkpoint override.
+        None is valid only when the model does not require a tokenizer-derived size.
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
             vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
-        padded_vocab_size: Final size resolved by tokenizer initialization,
-            including any CLI/checkpoint override. None is valid only when the
-            model does not require a tokenizer-derived size.
 
     Raises:
         ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
     """
-    cfg.tokenizer.padded_vocab_size = padded_vocab_size
+    padded_vocab_size = cfg.tokenizer.padded_vocab_size
     if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)) and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
