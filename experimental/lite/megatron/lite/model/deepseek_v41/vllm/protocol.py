@@ -1,14 +1,26 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Native Lite lifecycle/DistOpt; deployment operator model selection only."""
+from dataclasses import dataclass
+
 from megatron.lite.model.deepseek_v41.lite import protocol as native
 from megatron.lite.model.deepseek_v41.lite.protocol import (
-    ImplConfig,
     build_model_config,
     forward_step,
     load_hf_weights,
     unpack_forward_output,
-    validate_impl_cfg_keys,
 )
+
+
+@dataclass(frozen=True)
+class ImplConfig(native.ImplConfig):
+    attention_core: str = "flashmla"
+    head_dtype: str = "float32"
+
+
+def validate_impl_cfg_keys(values):
+    native.validate_impl_cfg_keys(
+        {k: v for k, v in values.items() if k not in ("attention_core", "head_dtype")}
+    )
 
 
 def release_token_map(hf_path):
@@ -24,6 +36,11 @@ def build_model(model_cfg, *, impl_cfg):
     from pathlib import Path
 
     from .model import DeepseekV41Model
+
+    if getattr(impl_cfg, "attention_core", "flashmla") != "flashmla":
+        raise NotImplementedError(
+            "Only attention_core=flashmla and head_dtype=float32 are implemented"
+        )
 
     if (
         impl_cfg.token_map is None

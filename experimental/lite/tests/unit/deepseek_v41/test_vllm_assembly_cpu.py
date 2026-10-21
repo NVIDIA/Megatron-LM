@@ -42,15 +42,14 @@ def test_registry_reuses_native_lifecycle_and_dist_opt():
     name = resolve_runtime_model_name('deepseek_v41', 'vllm')
     assert name == 'deepseek_v41_vllm'
     assert get_train_runtime_module(name) is protocol
-    for symbol in (
-        'ImplConfig',
-        'build_model_config',
-        'forward_step',
-        'load_hf_weights',
-        'validate_impl_cfg_keys',
-    ):
+    for symbol in ('build_model_config', 'forward_step', 'load_hf_weights'):
         assert getattr(protocol, symbol) is getattr(native, symbol)
+    assert issubclass(protocol.ImplConfig, native.ImplConfig)
     assert protocol.ImplConfig().optimizer == 'adam'
+    assert (protocol.ImplConfig().attention_core, protocol.ImplConfig().head_dtype) == (
+        'flashmla',
+        'float32',
+    )
     assert inspect.signature(native.build_model).parameters['_model_class'].default is None
 
 
@@ -96,3 +95,26 @@ def test_native_hf_construction_keeps_explicit_token_map(tmp_path):
         with patch.object(native, "build_model", Mock()) as build:
             protocol.build_model(SimpleNamespace(engram_layer_ids=[1]), impl_cfg=impl)
             assert build.call_args.kwargs["impl_cfg"] is impl
+
+
+def test_recipe_options_are_explicit_and_future_modes_fail_before_build(monkeypatch):
+    from unittest.mock import Mock
+
+    import pytest
+
+    monkeypatch.setenv("DSV41_ATTENTION_CORE", "mega")
+    monkeypatch.setenv("DSV41_HEAD_DTYPE", "bfloat16")
+    default = protocol.ImplConfig()
+    assert (default.attention_core, default.head_dtype) == ("flashmla", "float32")
+    protocol.validate_impl_cfg_keys({"attention_core": "mega", "head_dtype": "bfloat16"})
+    with patch.object(native, "build_model", Mock()) as build:
+        with pytest.raises(NotImplementedError):
+            protocol.build_model(
+                SimpleNamespace(), impl_cfg=protocol.ImplConfig(attention_core="mega")
+            )
+        build.assert_not_called()
+        protocol.build_model(
+            SimpleNamespace(engram_layer_ids=[]),
+            impl_cfg=protocol.ImplConfig(head_dtype="bfloat16"),
+        )
+        assert build.call_args.kwargs["impl_cfg"].head_dtype == "bfloat16"

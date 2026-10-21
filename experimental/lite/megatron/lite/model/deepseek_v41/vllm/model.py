@@ -16,10 +16,17 @@ from .norm import ModelNorm
 
 
 class Head(ColumnParallelLinear):
+    logits_dtype = "float32"
+
     def forward(self, x, weight=None, **kwargs):
         # Core cross entropy owns and mutates its logits buffer in place.
         # A custom Function's view output must not be that mutable buffer.
-        return head_logits(x, self.weight if weight is None else weight).clone(), None
+        return (
+            head_logits(
+                x, self.weight if weight is None else weight, dtype=self.logits_dtype
+            ).clone(),
+            None,
+        )
 
 
 class Block(DS41Block):
@@ -118,5 +125,6 @@ class DeepseekV41Model(NativeModel):
             gather_output=False,
             tp_group=self.ps.tp_group,
         )
+        head.logits_dtype = getattr(self.impl, "head_dtype", "float32")
         head.weight.is_embedding_or_output_parameter = True
         return norm, head

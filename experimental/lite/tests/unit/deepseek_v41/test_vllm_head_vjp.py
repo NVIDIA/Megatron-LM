@@ -27,3 +27,23 @@ def test_head_projection_vjp_uses_compute_weight_and_master_dtype():
 def test_deployment_projection_rejects_cpu_forward():
     with pytest.raises(RuntimeError, match='requires CUDA'):
         _BF16Linear.apply(torch.ones(2, 8), torch.ones(16, 8))
+
+
+def test_configurable_head_rounding_preserves_default_and_bf16_rawbits():
+    from megatron.lite.model.deepseek_v41.vllm.head import _RoundBF16, head_logits
+
+    rng = torch.Generator().manual_seed(71)
+    x = torch.randn(17, 32, generator=rng, requires_grad=True)
+    weight = torch.randn(64, 32, generator=rng, requires_grad=True)
+    original = torch.nn.functional.linear(x, weight)
+    for dtype in ("float32", "bfloat16"):
+        result = head_logits(x, weight, dtype=dtype)
+        expected = original if dtype == "float32" else original.bfloat16()
+        assert torch.equal(
+            result.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+        )
+    special = torch.tensor([0.0, -0.0, 1.00390625, float("nan"), float("inf")], requires_grad=True)
+    rounded = _RoundBF16.apply(special)
+    assert torch.equal(rounded.view(torch.uint8), special.bfloat16().view(torch.uint8))
+    rounded.backward(torch.ones_like(rounded))
+    assert torch.equal(special.grad.view(torch.int32), torch.ones_like(special).view(torch.int32))
