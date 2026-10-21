@@ -195,9 +195,9 @@ def test_precision_aware_optimizer_requires_distributed_optimizer(model_parallel
         _get_optimizer(model, use_distributed_optimizer=False)
 
 
-# (FP8 recipe, main params dtype, format saved with, format loaded with, whether the checkpoint
-# records its format). The unrecorded ones stand for checkpoints written before the format was
-# recorded, so they are saved the way those versions saved them: MCore-managed FP32 main params
+# (FP8 recipe, main params dtype, store_param_remainders saved with, loaded with, whether the
+# checkpoint stores the param remainders flag). The ones without it stand for legacy checkpoints,
+# so they are saved the way legacy versions saved them: MCore-managed FP32 main params
 # with a non-delayed recipe, param remainders without FP8 where TE owned FP32 master weights
 # (unless store_param_remainders was False), and
 # FP32 master values with FP16 main params, where TE stores no remainders.
@@ -224,7 +224,7 @@ _CHECKPOINT_COMPATIBILITY_CASES = [
 
 
 @pytest.mark.parametrize(
-    ("fp8_recipe", "main_params_dtype", "save_remainders", "load_remainders", "record_format"),
+    ("fp8_recipe", "main_params_dtype", "save_remainders", "load_remainders", "with_flag"),
     _CHECKPOINT_COMPATIBILITY_CASES,
 )
 def test_param_remainders_checkpoint_compatibility(
@@ -234,7 +234,7 @@ def test_param_remainders_checkpoint_compatibility(
     main_params_dtype,
     save_remainders,
     load_remainders,
-    record_format,
+    with_flag,
 ):
     """dist-checkpointing would load int16 param remainders as FP32 master params, or the
     reverse, with a silent value cast that corrupts the master weights, so a format mismatch must
@@ -242,7 +242,7 @@ def test_param_remainders_checkpoint_compatibility(
     metadata = {"distrib_optim_sharding_type": "dp_reshardable", "checkpoint_version": 3.1}
     name = (
         f"remainders_{fp8_recipe}_{main_params_dtype}_{save_remainders}_{load_remainders}_"
-        f"{record_format}"
+        f"{with_flag}"
     )
     with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
         model = _ddp_model()
@@ -261,7 +261,7 @@ def test_param_remainders_checkpoint_compatibility(
             assert all(master.dtype == torch.float16 for master in _master_params(optimizer))
         sharded_state_dict = saving.sharded_state_dict({}, metadata=metadata)
         assert sharded_state_dict["param_state_param_remainders"] == saved_remainders
-        if not record_format:
+        if not with_flag:
             del sharded_state_dict["param_state_param_remainders"]
         save({"optimizer": sharded_state_dict}, ckpt_dir)
         saved_shard = saving.get_main_param_shard(model.module.weight)
@@ -358,8 +358,8 @@ def test_param_remainders_through_fp32_buffers(
 def test_torch_format_rejects_mismatched_param_remainders(
     model_parallel, tmp_path_dist_ckpt, save_remainders, load_remainders
 ):
-    """--ckpt-format torch records the master weight format too, so loading either format as the
-    other must raise on every rank instead of silently corrupting the master weights."""
+    """--ckpt-format torch stores the param remainders flag too: a mismatch must raise on every
+    rank instead of silently corrupting the master weights."""
     name = f"torch_format_mismatch_{save_remainders}_{load_remainders}"
     with TempNamedDir(tmp_path_dist_ckpt / name, sync=True) as ckpt_dir:
         model = _ddp_model()
@@ -378,8 +378,8 @@ def test_torch_format_rejects_mismatched_param_remainders(
 def test_unrecorded_fp32_master_weights_are_not_loaded_as_param_remainders(
     model_parallel, tmp_path_dist_ckpt
 ):
-    """A --ckpt-format torch parameter state saved before the format was recorded is assumed to
-    match this run's store_param_remainders. FP32 master weights loaded into a run with param
+    """A legacy --ckpt-format torch parameter state, without the param remainders flag, is assumed
+    to match this run's store_param_remainders. FP32 master weights loaded into a run with param
     remainders must then still be rejected, not truncated to int16."""
     with TempNamedDir(tmp_path_dist_ckpt / "fp32_masters_as_remainders", sync=True) as ckpt_dir:
         model = _ddp_model()

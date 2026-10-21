@@ -208,10 +208,9 @@ class OptimizerConfig:
             - a non-delayed FP8 recipe
         and True in all other cases.
 
-        This is for backwards-compatibility for checkpoints written when this condition applies
-        by Megatron Core versions that did not record the master weight format.
-        Such versions did not enable store_param_remainders. Explicitly setting this flag to True
-        saves memory, but makes old optimizer checkpoints incompatible.
+        This keeps checkpoints compatible with legacy ones of that configuration, which hold
+        MCore-managed FP32 main weights. Explicitly setting this flag to True saves memory, but
+        makes those legacy optimizer checkpoints incompatible.
         Only takes effect with BF16 model params, FP32 main params and no optimizer_cpu_offload.
         The value in effect is the resolved_store_param_remainders property.
     """
@@ -449,44 +448,42 @@ class OptimizerConfig:
         the DDP config by resolve_fp8_param_gather. None until then (possibly quantized)."""
         return self._fp8_param_gather
 
-    def _te_owns_master_weights(self, fp8_param_gather: Optional[bool]) -> bool:
-        """Whether the precision-aware optimizer (TE FusedAdam) owns the master weights, for FP8
-        params (fp8_param_gather True, or None: unresolved, possibly FP8) or BF16 params (False).
-        """
+    def _te_fused_adam_main_weight_and_decoupled_grad(
+        self, fp8_param_gather: Optional[bool]
+    ) -> bool:
+        """Whether TE FusedAdam (the precision-aware optimizer) owns the main weights and consumes
+        decoupled grads (param.decoupled_grad), for FP8 params (fp8_param_gather True, or None:
+        unresolved) or BF16 params (False)."""
         return self.use_precision_aware_optimizer and (
             # Non-FP32 main params are always owned by TE.
             self.main_params_dtype != torch.float32
-            # No FP8, or delayed scaling, which the Adam kernel handles.
+            # Any compute recipe works with BF16 model weights, and the Adam kernel handles FP8
+            # delayed-scaling weights. Other quantized weights (e.g. MXFP8, NVFP4) need
+            # MCore-managed main params.
             or self.fp8_recipe in (None, "delayed")
+            or fp8_param_gather is False
             # The hybrid-device optimizer has its own decoupled-grad support.
             or self.optimizer_cpu_offload
-            # Otherwise (non-delayed FP8 with FP32 main params) only BF16 params: FP8 params need
-            # MCore-managed main params.
-            or fp8_param_gather is False
         )
 
     @property
     def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
-        """Whether the precision-aware optimizer (TE FusedAdam) owns the master weights and
-        consumes decoupled grads. This is also the flag that selects param.grad vs
-        param.decoupled_grad.
-        """
-        return self._te_owns_master_weights(self.fp8_param_gather)
+        """See _te_fused_adam_main_weight_and_decoupled_grad. Also selects param.grad vs
+        param.decoupled_grad."""
+        return self._te_fused_adam_main_weight_and_decoupled_grad(self.fp8_param_gather)
 
-    def _te_master_weights_in_checkpoint_without_format(self) -> bool:
-        """Backward compatibility: whether this configuration's optimizer checkpoints written before
-        the master weight format was recorded hold TE-owned master weights (else MCore-managed main
-        params). Those versions did not distinguish BF16 from FP8 params: they let TE own the master
-        weights only in the configurations where it owns them for FP8 params, which is what
-        fp8_param_gather=True reproduces."""
-        return self._te_owns_master_weights(fp8_param_gather=True)
+    def _use_te_precision_aware_optimizer_legacy(self) -> bool:
+        """The precision-aware optimizer gate before BF16 model weights could use it.
+
+        It did not distinguish BF16 from FP8 model weights, and treated both like FP8 ones. So with
+        BF16 model weights, quantized compute (e.g. MXFP8, NVFP4) and FP32 main weights, the
+        optimizer state held MCore-managed FP32 main weights, which the legacy checkpoints of that
+        configuration therefore hold."""
+        return self._te_fused_adam_main_weight_and_decoupled_grad(fp8_param_gather=True)
 
     def _param_remainders_supported(self) -> bool:
-        """Whether the precision-aware optimizer stores param remainders when asked to, wherever it
-        owns the master weights. TE FusedAdam needs BF16 params, whose 16 bits the remainders
-        complete, and FP32 master weights: with FP16 master weights it silently ignores
-        store_param_remainders. The CPU-offloaded HybridDeviceOptimizer always keeps full FP32
-        master weights."""
+        """Whether store_param_remainders can take effect: TE FusedAdam ignores it without BF16
+        params and FP32 main weights, and the CPU-offloaded optimizer keeps FP32 main weights."""
         return (
             self.bf16
             and self.main_params_dtype == torch.float32
@@ -500,9 +497,9 @@ class OptimizerConfig:
         if self.store_param_remainders is not None:
             requested = self.store_param_remainders
         else:
-            # Off where checkpoints written before the format was recorded hold MCore-managed FP32
-            # main params, so that the checkpoints of this configuration keep that format.
-            requested = self._te_master_weights_in_checkpoint_without_format()
+            # Default to the legacy behavior: param remainders wherever the precision-aware
+            # optimizer was used, so that checkpoints stay compatible with the legacy ones.
+            requested = self._use_te_precision_aware_optimizer_legacy()
         # TE FusedAdam's capturable (CUDA graph) mode cannot store param remainders.
         return requested and self._param_remainders_supported() and not self.optimizer_cuda_graph
 

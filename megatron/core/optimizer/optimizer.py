@@ -2084,7 +2084,7 @@ class ChainedOptimizer(MegatronOptimizer):
             if hasattr(optimizer, 'get_parameter_state_dp_zero'):
                 state_dict = getattr(
                     optimizer,
-                    'get_parameter_state_dp_zero_with_format',
+                    'get_parameter_state_dp_zero_with_remainders_flag',
                     optimizer.get_parameter_state_dp_zero,
                 )()
 
@@ -2123,7 +2123,7 @@ class ChainedOptimizer(MegatronOptimizer):
             state_dict = states[idx] if states else None
             load_parameter_state_from_dp_zero = getattr(
                 optimizer,
-                'load_parameter_state_from_dp_zero_with_format',
+                'load_parameter_state_from_dp_zero_with_remainders_flag',
                 optimizer.load_parameter_state_from_dp_zero,
             )
             load_parameter_state_from_dp_zero(state_dict, update_legacy_format=update_legacy_format)

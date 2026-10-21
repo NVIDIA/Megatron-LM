@@ -98,7 +98,7 @@ def test_precision_aware_gate_and_store_param_remainders_default(
         and main_params_dtype == torch.float32
         and not optimizer_cpu_offload
     )
-    assert config._te_master_weights_in_checkpoint_without_format() == (not only_with_bf16_params)
+    assert config._use_te_precision_aware_optimizer_legacy() == (not only_with_bf16_params)
     assert config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 == (
         not only_with_bf16_params or fp8_param_gather is False
     )
@@ -115,7 +115,7 @@ def test_precision_aware_gate_and_store_param_remainders_default(
 @pytest.mark.parametrize("fp8_recipe", [None, "delayed", "tensorwise"])
 def test_no_param_remainders_with_cpu_offload(fp8_recipe, store_param_remainders):
     """The CPU-offloaded HybridDeviceOptimizer keeps full FP32 master weights, so the config must
-    not claim param remainders: the optimizer checkpoint format and its buffers follow this value.
+    not claim param remainders: the checkpoint's param remainders flag and its buffers follow this value.
     """
     _skip_without_param_remainders_support()
 
@@ -135,7 +135,7 @@ def test_no_param_remainders_with_cpu_offload(fp8_recipe, store_param_remainders
 @pytest.mark.parametrize("fp8_recipe", [None, "delayed", "tensorwise"])
 def test_no_param_remainders_with_fp16_main_params(fp8_recipe, store_param_remainders):
     """TE FusedAdam ignores store_param_remainders for FP16 master weights, so the config must not
-    claim them: the optimizer checkpoint format and its buffers follow this value."""
+    claim them: the checkpoint's param remainders flag and its buffers follow this value."""
     _skip_without_param_remainders_support()
 
     config = _config(

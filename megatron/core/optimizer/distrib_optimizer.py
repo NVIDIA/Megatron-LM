@@ -1624,7 +1624,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             filename (str): path to save parameter state to.
         """
 
-        state_dict = self.get_parameter_state_dp_zero_with_format()
+        state_dict = self.get_parameter_state_dp_zero_with_remainders_flag()
         if self.data_parallel_group.rank() == 0:
             torch.save(state_dict, filename)
 
@@ -1806,32 +1806,27 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return state_dict
 
     def _stores_param_remainders(self) -> bool:
-        """Whether the "param" entries of the parameter state are the int16 remainders of the FP32
-        master weights (see OptimizerConfig.store_param_remainders) rather than main params."""
+        """Whether the "param" optimizer state is int16 param remainders instead of main params."""
         return bool(
             self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
             and self.config.resolved_store_param_remainders
         )
 
     def _check_loaded_param_remainders(self, state_dict: dict) -> None:
-        """Refuse to load a checkpoint whose master weights are stored in another format.
+        """Raise if the checkpoint's param remainders flag differs from this run's.
 
-        The "param" entries of the parameter state hold either full main params or, with
-        store_param_remainders, the int16 low bits of the FP32 master weights. dist-checkpointing
-        casts each loaded tensor to the dtype this run expects, so loading one format as the other
-        does not fail but silently corrupts the master weights. This compares the format of the
-        checkpoint with the format of this run and raises if they differ.
+        dist-checkpointing casts loaded tensors to this run's dtypes, so int16 remainders would
+        load as FP32 main params (or the reverse) without an error.
         """
         error = self._param_remainders_mismatch(state_dict.get('param_state_param_remainders'))
         if error is not None:
             raise RuntimeError(error)
 
     def _param_remainders_mismatch(self, stored: Optional[bool]) -> Optional[str]:
-        """The error message if a checkpoint whose parameter state holds param remainders or not
-        (None: not recorded) cannot be loaded by this run, else None."""
+        """The error for a checkpoint whose param remainders flag is stored (None: legacy
+        checkpoint without it) if it differs from this run's, else None."""
         if stored is None:
-            # This information was not previously stored. Try to infer it.
-            stored = self._param_remainders_in_checkpoint_without_format()
+            stored = self._legacy_checkpoint_has_param_remainders()
         current = self._stores_param_remainders()
         if stored == current:
             return None
@@ -1862,24 +1857,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "or skip loading the optimizer state with --no-load-optim."
         )
 
-    def get_parameter_state_dp_zero_with_format(self) -> Optional[dict]:
-        """get_parameter_state_dp_zero() for --ckpt-format torch, which also records whether the
-        parameter state holds param remainders, for load_parameter_state_from_dp_zero_with_format.
-        """
+    def get_parameter_state_dp_zero_with_remainders_flag(self) -> Optional[dict]:
+        """get_parameter_state_dp_zero() plus the param remainders flag, for --ckpt-format torch."""
         state_dict = self.get_parameter_state_dp_zero()
         if state_dict is not None:
             state_dict['param_state_param_remainders'] = self._stores_param_remainders()
         return state_dict
 
-    def load_parameter_state_from_dp_zero_with_format(
+    def load_parameter_state_from_dp_zero_with_remainders_flag(
         self, state_dict: Optional[dict], *, update_legacy_format: bool = False
     ):
-        """load_parameter_state_from_dp_zero() for state saved by
-        get_parameter_state_dp_zero_with_format(), or before the format was recorded.
+        """load_parameter_state_from_dp_zero() that first checks the param remainders flag.
 
-        As with dist-checkpointing, the parameter state of the other format would load silently as
-        corrupt master weights, so refuse it. The state is only on DP rank 0, which decides for
-        all DP ranks so that they raise together instead of hanging in the scatter.
+        Only DP rank 0 holds the state, so it broadcasts the result: all ranks must raise together
+        or the others hang in the scatter.
         """
         error = [None]
         if self.data_parallel_group.rank() == 0:
@@ -1897,16 +1888,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict, update_legacy_format=update_legacy_format
         )
 
-    def _param_remainders_in_checkpoint_without_format(self) -> bool:
-        """Backward compatibility: infer whether a checkpoint written before the format was recorded
-        holds param remainders.
+    def _legacy_checkpoint_has_param_remainders(self) -> bool:
+        """Infer the param remainders flag of a legacy checkpoint, which does not store it.
+
+        Legacy versions stored param remainders wherever they used the precision-aware optimizer,
+        unless store_param_remainders was False. They did not record that setting, so assume it
+        was this run's. The CUDA graph is ignored: legacy versions could not combine it with param
+        remainders.
         """
-        # Such a checkpoint holds param remainders when TE owned the master weights of BF16 params
-        # and store_param_remainders was not set to False. Those versions honored that setting
-        # but did not record it, so, like them, assume it matches this run's. optimizer_cuda_graph
-        # is ignored: with param remainders, those versions failed to construct the optimizer.
         return bool(
-            self.config._te_master_weights_in_checkpoint_without_format()
+            self.config._use_te_precision_aware_optimizer_legacy()
             and self.config._param_remainders_supported()
             and self.config.store_param_remainders is not False
         )
@@ -2902,7 +2893,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.data_parallel_group.rank() == 0:
             state_dict = torch.load(filename)
 
-        self.load_parameter_state_from_dp_zero_with_format(
+        self.load_parameter_state_from_dp_zero_with_remainders_flag(
             state_dict, update_legacy_format=update_legacy_format
         )
 
