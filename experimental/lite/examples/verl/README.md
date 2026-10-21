@@ -297,7 +297,11 @@ cover end-to-end SFT or GRPO training.
 `run_deepseek_v41_dapo.sh` enables frozen-drafter DSpark (`k=5`, exact block
 rejection sampling, adaptive verification disabled) and sleep level 2. The native
 vLLM sleep lifecycle retains `*.bias_vl` and `draft.*`; the target is updated
-through layerwise checkpoint reload. Use a vLLM build with native sleep parameter
+through layerwise checkpoint reload. Level 2 requires every preserve pattern to
+match a tensor and every selected CUDA parameter and buffer to have a native
+backup. Waking weights verifies the saved tensor set, dtype, shape, and full-byte
+fingerprints before returning; missing or changed state raises an error. These
+checks run by default. Level 1 remains available for diagnosis. Use a vLLM build with native sleep parameter
 preservation and host-resident reload permutations (00474aeec6 or newer).
 
 The paired actor/rollout contract is configurable:
@@ -310,6 +314,8 @@ DSV41_ATTENTION_CORE=flashmla DSV41_HEAD_DTYPE=float32 \
 
 `DSV41_ATTENTION_CORE` accepts `flashmla` or `mega`; `DSV41_HEAD_DTYPE` accepts
 `float32` or `bfloat16`. Both settings reach the actor's `impl_cfg` and vLLM.
+The current actor implements `flashmla`/`float32`; unsupported choices fail before
+build until the corresponding model implementation is available.
 `INDEXER_KV_DTYPE` and `INDEXER_SPARSE_LOGITS` configure vLLM's indexer contract;
 select values supported by the actor implementation and validate the pair.
 CP remains configurable with `ACTOR_CP` (default 1). `GRAD_OFFLOAD=True` releases

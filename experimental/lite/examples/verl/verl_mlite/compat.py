@@ -1720,6 +1720,58 @@ def _patch_vllm_sleep_level2_retention() -> bool:
     return True
 
 
+def _patch_vllm_sleep_preserve_check() -> bool:
+    """Verify required state before discarding and after restoring L2 weights."""
+    if os.environ.get("VERL_MLITE_ROLLOUT_SLEEP_LEVEL") != "2" or not _vllm_importable():
+        return False
+    worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
+    cls = worker_mod.Worker
+    if getattr(cls.sleep, "_verl_mlite_preserve_check", False):
+        return True
+    # Resolve in the canonical worker module; never serialize a replaced method's
+    # globals in a closure (the validation cap regression covers this Ray hazard).
+    worker_mod._verl_mlite_l2_sleep = cls.sleep
+    worker_mod._verl_mlite_l2_wake = cls.wake_up
+
+    def sleep(self, level=1):
+        module = importlib.import_module("vllm.v1.worker.gpu_worker")
+        if level != 2:
+            return module._verl_mlite_l2_sleep(self, level)
+        from verl_mlite.c8_preserve import capture, verify_backups
+
+        if getattr(self, "_verl_mlite_l2_pending", False):
+            raise RuntimeError("L2 sleep repeated before verified weight wake")
+        self._verl_mlite_l2_expected = capture(self)
+        self._verl_mlite_l2_pending = True
+        self._verl_mlite_l2_backup_verified = False
+        result = module._verl_mlite_l2_sleep(self, level)
+        verify_backups(self, self._verl_mlite_l2_expected)
+        self._verl_mlite_l2_backup_verified = True
+        return result
+
+    def wake_up(self, tags=None):
+        from verl_mlite.c8_preserve import verify, verify_backups
+
+        check = getattr(self, "_verl_mlite_l2_pending", False) and (
+            tags is None or "weights" in tags
+        )
+        if check:
+            if not getattr(self, "_verl_mlite_l2_backup_verified", False):
+                raise RuntimeError("L2 wake has no verified sleep backups")
+            verify_backups(self, self._verl_mlite_l2_expected)
+        module = importlib.import_module("vllm.v1.worker.gpu_worker")
+        result = module._verl_mlite_l2_wake(self, tags)
+        if check:
+            verify(self, self._verl_mlite_l2_expected)
+            self._verl_mlite_l2_pending = False
+            self._verl_mlite_l2_expected = None
+        return result
+
+    sleep._verl_mlite_preserve_check = True
+    cls.sleep, cls.wake_up = sleep, wake_up
+    return True
+
+
 def _patch_vllm_sleep_fingerprint() -> bool:
     """Diagnostics: fingerprint target and drafter state at every level-2 sleep.
 
@@ -1803,6 +1855,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08f.headless_api_server_count", result)
     result = _patch_vllm_sleep_level2_retention()
     _trace_runtime_patch("08g.vllm_sleep_level2_retention", result)
+    result = _patch_vllm_sleep_preserve_check()
+    _trace_runtime_patch("08g2.vllm_sleep_preserve_check", result)
     result = _patch_vllm_sleep_fingerprint()
     _trace_runtime_patch("08h.vllm_sleep_fingerprint", result)
     result = _patch_verl_val_max_tokens()
