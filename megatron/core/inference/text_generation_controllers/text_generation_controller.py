@@ -981,8 +981,6 @@ class TextGenerationController(MTPControllerMixin):
             self._select_async_sched_routing_buffer()
             logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
             # logits shape: [1, seq_len, vocab_size]
-        if logits is not None:
-            logits = logits.float()
 
         if not context.config.materialize_only_last_token_logits:
             assert logits_seq_len == input_ids.shape[1]
@@ -3925,7 +3923,7 @@ class TextGenerationController(MTPControllerMixin):
                 )
                 assert batch_prompt_tokens.shape[0] == batch_size, batch_prompt_tokens.shape[0]
                 if is_pipeline_last_stage(self.pp_group):
-                    logits = logits[:batch_size].float()
+                    logits = logits[:batch_size]
 
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
