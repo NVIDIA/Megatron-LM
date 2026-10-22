@@ -193,7 +193,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_fused_activations.py",
-            K + "test_csa_output_rope.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention.py",
         ),
         kind="torch.compile",
@@ -304,7 +303,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_transformer_layer.py",
             C + "test_gpt_model.py",
             K + "test_csa_packed_kernels.py",
-            K + "test_csa_output_rope.py",
         ),
         kind="external-lib",
         notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
@@ -881,7 +879,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_csa_packed_kernels.py",
-            K + "test_csa_output_rope.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
         ),
         kind="triton",
