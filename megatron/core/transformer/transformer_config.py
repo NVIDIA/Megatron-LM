@@ -856,7 +856,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok".
+    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
+    moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
@@ -2369,6 +2370,8 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
+            if self.moe_megakernel_backend == "mok":
+                raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
             def require(condition: bool, message: str) -> None:
@@ -2478,6 +2481,8 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_megakernel_backend == "mok":
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError("MOK requires use_transformer_engine_op_fuser=False")
             if not self.gradient_accumulation_fusion:
                 raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
             if not self.moe_grouped_gemm:

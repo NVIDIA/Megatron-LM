@@ -57,6 +57,8 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
+        {"moe_token_dispatcher_type": "alltoall"},
+        {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"},
         {"moe_shared_expert_gate": True},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
@@ -91,6 +93,8 @@ def test_native_single_grouped_weights_do_not_require_op_fuser():
         ({"bf16": False, "fp16": True}, "FP32, FP16, and FP4 are not supported"),
         ({"fp4": "e2m1"}, "FP32, FP16, and FP4 are not supported"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
+        ({"moe_virtual_expert_load_balance": True}, "MOK does not support MoonEP"),
+        ({"use_transformer_engine_op_fuser": True}, "use_transformer_engine_op_fuser=False"),
         (
             {"overlap_moe_expert_parallel_comm": True},
             "does not support overlap_moe_expert_parallel_comm",
