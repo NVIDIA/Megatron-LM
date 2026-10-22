@@ -47,6 +47,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.tensor_parallel.ordered_reduce import tp_shard_row_linear
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -1399,6 +1400,22 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
+        # batch_invariant_tp_shards: the row-parallel forward folds fixed K-shards in order, so
+        # its bits do not depend on the TP size (tensor_parallel/ordered_reduce.py). With one
+        # shard per rank that is the ordered TP reduction below; with several, forward() computes
+        # the rank's shards itself (the backward stays the stock row-parallel one).
+        tp_shards = getattr(self.config, "batch_invariant_tp_shards", None)
+        self._bi_tp_local_shards = (
+            divide(tp_shards, tp_size)
+            if (
+                tp_shards
+                and parallel_mode == "row"
+                and not explicit_expert_comm
+                and self.config.batch_invariant_mode
+            )
+            else 1
+        )
+
         # Batch-invariant mode at TP >= 3: NCCL's summation order for an element depends on
         # where it sits in the message, so Megatron does the forward reduction itself with
         # the fixed rank-order sum (tensor_parallel/ordered_reduce.py) and TE runs the local
@@ -1506,6 +1523,26 @@ class TELinear(te.pytorch.Linear):
             bias = None
         return out, bias
 
+    def _bi_tp_shards_forward(self, x):
+        """Row-parallel forward with several batch_invariant_tp_shards per rank (see __init__)."""
+        assert (
+            self.config.fp8 is None and getattr(self.config, "fp4", None) is None
+        ), "batch_invariant_tp_shards with more shards than TP ranks supports BF16 only"
+        out = tp_shard_row_linear(
+            x,
+            self.weight,
+            self._tp_group,
+            self._bi_tp_local_shards,
+            self.config.sequence_parallel,
+            wgrad_into_main_grad=self.config.gradient_accumulation_fusion,
+        )
+        bias = self.bias if self.use_bias else None
+        if self.te_return_bias:
+            return out, bias
+        if bias is not None:
+            out = out + bias
+        return out, None
+
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
         if quantization_config is None:
@@ -1523,6 +1560,8 @@ class TELinear(te.pytorch.Linear):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
+        if self._bi_tp_local_shards > 1:
+            return self._bi_tp_shards_forward(x)
         _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 

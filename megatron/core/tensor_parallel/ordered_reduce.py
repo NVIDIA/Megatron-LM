@@ -686,3 +686,168 @@ def symm_ordered_all_reduce(
     assert byte_offset % elem == 0
     views = _peer_views(symm_mem_hdl, byte_offset // elem, input_.numel(), input_.dtype)
     return _launch_pull(views, output, symm_mem_hdl, exact)
+
+
+# ── Fixed-shard row-parallel reductions (TP-invariant forward) ──────────────
+#
+# With ``batch_invariant_tp_shards = G`` a row-parallel output is defined independently of the
+# TP size t (any t dividing G): split the reduction dim K into G equal shards, take each
+# shard's GEMM output as one partial, and fold the G partials in shard order with the same
+# accumulator and single rounding as above. TP rank r owns shards r*c .. r*c + c - 1
+# (c = G / t), so the TP partials of the ordered reduction are the shard partials in order.
+# At c = 1 this is exactly the ordered TP reduction. A shard's GEMM output does not depend
+# on how the GEMM is called (TE or torch, contiguous or strided, single or batched), so a
+# rank computes its c shards with one strided batched GEMM and no copies.
+
+
+def row_parallel_shard_partials(x: torch.Tensor, weight: torch.Tensor, num_shards: int):
+    """Shard partials ``[num_shards, *x.shape[:-1], N]`` of ``x @ weight.T`` (weight ``[N, K]``).
+
+    Shard ``j`` is ``x[..., j*K/c:(j+1)*K/c] @ weight[:, j*K/c:(j+1)*K/c].T``, computed for all
+    ``j`` in one batched GEMM on strided views.
+    """
+    *lead, k = x.shape
+    n = weight.shape[0]
+    assert k % num_shards == 0, f"K ({k}) must be divisible by the local shard count {num_shards}"
+    kc = k // num_shards
+    x2 = x.reshape(-1, k)
+    xb = x2.view(x2.shape[0], num_shards, kc).transpose(0, 1)
+    wb = weight.view(n, num_shards, kc).permute(1, 2, 0)
+    return torch.bmm(xb, wb).view(num_shards, *lead, n)
+
+
+def ordered_reduce_scatter_shards(
+    parts: torch.Tensor, group, exact: Optional[bool] = None
+) -> torch.Tensor:
+    """Reduce-scatter along dim 1 of every rank's shard partials, folded in global shard order.
+
+    ``parts`` is ``[c, M, ...]``: this rank's c shard partials. Returns ``[M / TP, ...]``.
+    Per rank: one copy of the partials into destination order, one all-to-all of
+    c x (TP-1)/TP of the output size, and one fold over TP x c partials.
+    """
+    c = parts.shape[0]
+    world_size = 1 if group is None else group.size()
+    if world_size == 1:
+        return ordered_fold(parts.contiguous(), exact=exact)
+    if c == 1:
+        return ordered_reduce_scatter(parts[0], group, exact=exact)
+    m, rest = parts.shape[1], parts.shape[2:]
+    assert m % world_size == 0, "First dimension of the tensor should be divisible by TP size"
+    rows = m // world_size
+    send = parts.view(c, world_size, rows, *rest).transpose(0, 1).contiguous()
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv, send, group=group)
+    # recv[r, j] is shard r*c + j: the global shard order.
+    return ordered_fold(recv.view(world_size * c, rows, *rest), exact=exact)
+
+
+def ordered_all_reduce_shards(
+    parts: torch.Tensor, group, exact: Optional[bool] = None
+) -> torch.Tensor:
+    """All-reduce of every rank's shard partials ``[c, ...]`` in global shard order."""
+    c = parts.shape[0]
+    world_size = 1 if group is None else group.size()
+    if world_size == 1:
+        return ordered_fold(parts.contiguous(), exact=exact)
+    if c == 1:
+        return ordered_all_reduce(parts[0], group, exact=exact)
+    shape = parts.shape[1:]
+    flat = parts.reshape(c, -1)
+    n = flat.shape[1]
+    align = max(1, 16 // flat.element_size()) * world_size
+    padded = -(-n // align) * align
+    if padded != n:
+        flat = torch.nn.functional.pad(flat, (0, padded - n))
+    chunk = ordered_reduce_scatter_shards(flat, group, exact=exact)
+    out = torch.empty(padded, dtype=flat.dtype, device=flat.device)
+    torch.distributed.all_gather_into_tensor(out, chunk.view(-1), group=group)
+    return out[:n].view(shape)
+
+
+def _accumulate_wgrad(weight: torch.Tensor, grad_out2d: torch.Tensor, input2d: torch.Tensor):
+    """Weight gradient with Megatron's main_grad accumulation (as in tensor_parallel.layers)."""
+    main_grad = getattr(weight, "main_grad", None)
+    if main_grad is None:
+        return grad_out2d.t().matmul(input2d)
+    try:
+        import fused_weight_gradient_mlp_cuda
+
+        if main_grad.dtype == torch.float32:
+            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(input2d, grad_out2d, main_grad)
+        else:
+            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(input2d, grad_out2d, main_grad)
+    except ImportError:
+        main_grad.add_(grad_out2d.t().matmul(input2d).to(main_grad.dtype))
+    if not hasattr(weight, "grad_added_to_main_grad"):
+        return None
+    weight.grad_added_to_main_grad = True
+    # A dummy gradient keeps the DDP backward hooks on the main backprop thread.
+    try:
+        from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+        return get_dummy_wgrad(
+            list(main_grad.shape), input2d.dtype, zero=getattr(weight, "zero_out_wgrad", False)
+        )
+    except ImportError:
+        return torch.zeros(main_grad.shape, dtype=input2d.dtype, device=input2d.device)
+
+
+class _TPShardRowLinear(torch.autograd.Function):
+    """Row-parallel linear whose forward folds this rank's shard partials in global order.
+
+    Only the forward is fixed-order. The backward is the stock row-parallel one: all-gather
+    the output gradient under sequence parallelism, then the full local-K input and weight
+    gradient GEMMs.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad):
+        parts = row_parallel_shard_partials(x, weight, num_shards)
+        if sequence_parallel:
+            out = ordered_reduce_scatter_shards(parts, group)
+        else:
+            out = ordered_all_reduce_shards(parts, group)
+        ctx.save_for_backward(x, weight)
+        ctx.group = group
+        ctx.sequence_parallel = sequence_parallel
+        ctx.wgrad_into_main_grad = wgrad_into_main_grad
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        group = ctx.group
+        world_size = 1 if group is None else group.size()
+        if ctx.sequence_parallel and world_size > 1:
+            grad_output = grad_output.contiguous()
+            full = torch.empty(
+                (grad_output.shape[0] * world_size, *grad_output.shape[1:]),
+                dtype=grad_output.dtype,
+                device=grad_output.device,
+            )
+            torch.distributed.all_gather_into_tensor(full, grad_output, group=group)
+            grad_output = full
+        g2 = grad_output.reshape(-1, grad_output.shape[-1])
+        x2 = x.reshape(-1, x.shape[-1])
+        grad_input = g2.matmul(weight).view(x.shape) if ctx.needs_input_grad[0] else None
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            if ctx.wgrad_into_main_grad:
+                grad_weight = _accumulate_wgrad(weight, g2, x2)
+            else:
+                grad_weight = g2.t().matmul(x2)
+        return grad_input, grad_weight, None, None, None, None
+
+
+def tp_shard_row_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    group,
+    num_shards: int,
+    sequence_parallel: bool,
+    wgrad_into_main_grad: bool = False,
+) -> torch.Tensor:
+    """Row-parallel ``x @ weight.T`` with the fixed-shard forward reduction (see above)."""
+    return _TPShardRowLinear.apply(
+        x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad
+    )

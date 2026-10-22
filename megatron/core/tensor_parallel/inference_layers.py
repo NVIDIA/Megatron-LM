@@ -27,6 +27,8 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.tensor_parallel.ordered_reduce import (
     can_use_symm_pull,
+    ordered_reduce_scatter_shards,
+    row_parallel_shard_partials,
     symm_ordered_reduce_scatter,
     use_ordered_tp_reduce,
 )
@@ -479,6 +481,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
 
+        if self._bi_tp_local_shards > 1:
+            return self._matmul_shards_reduce(x, use_mxfp8)
         if use_ordered_tp_reduce(self.tp_group, x.dtype):
             return self._matmul_ordered_reduce_scatter(x, symm_mem_buffer, use_mxfp8)
 
@@ -534,6 +538,16 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
+    def _matmul_shards_reduce(self, x, use_mxfp8):
+        """batch_invariant_tp_shards with several shards per rank: the same bits as training.
+
+        One strided batched GEMM for this rank's shards, then the reduce-scatter (or, at
+        TP 1, the local fold) of the shard partials in global shard order.
+        """
+        assert not use_mxfp8, "batch_invariant_tp_shards with several shards per rank is BF16 only"
+        parts = row_parallel_shard_partials(x, self.weight, self._bi_tp_local_shards)
+        return ordered_reduce_scatter_shards(parts, self.tp_group if self.tp_size > 1 else None)
+
     def _matmul_ordered_reduce_scatter(self, x, symm_mem_buffer, use_mxfp8):
         """Batch-invariant mode at TP >= 3: reduce-scatter with the fixed rank-order sum.
 
@@ -583,6 +597,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             return super().forward(x)
 
         if self.tp_size == 1:
+            if self._bi_tp_local_shards > 1:
+                return self._matmul_shards_reduce(x, isinstance(self.weight, MXFP8Tensor)), None
             x = _apply_linear(x, self.weight, self.config)
             return x, None
         else:
