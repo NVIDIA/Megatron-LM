@@ -259,6 +259,31 @@ def test_mxfp8_quantize_replays():
     assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize")
 
 
+@pytest.mark.skipif(not hasattr(torch, "float8_e8m0fnu"), reason="needs torch float8 e8m0 dtype")
+def test_mxfp8_quantize_rows_replays():
+    """Live-row MXFP8 quantization replays and matches the whole-buffer kernel on live rows."""
+    from megatron.core.inference.quantization.mxfp8_quantize import (
+        mxfp8_quantize,
+        mxfp8_quantize_rows,
+    )
+
+    seeded()
+    rows, K, n_rows = 16384, 2688, 4992  # 39 full 128-row scale tiles
+    x = torch.randn(rows, K, device="cuda", dtype=torch.bfloat16)
+    n_rows_t = _dev_scalar(n_rows)
+    n_scale_bytes = n_rows // 128 * ((K // 32 + 3) // 4) * 512
+
+    def fn(x):
+        data, scale = mxfp8_quantize_rows(x, n_rows_t)
+        return data[:n_rows].view(torch.uint8), scale.view(torch.uint8)[:n_scale_bytes]
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="mxfp8_quantize_rows")
+    data, scale = fn(x)
+    ref_data, ref_scale = mxfp8_quantize(x)
+    assert torch.equal(data, ref_data[:n_rows].view(torch.uint8))
+    assert torch.equal(scale, ref_scale.view(torch.uint8)[:n_scale_bytes])
+
+
 @pytest.mark.skipif(
     not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 parameter storage needs Blackwell",
@@ -436,6 +461,9 @@ def test_batch_invariant_mxfp8_permute_replays():
         backward=False,
         what="batch_invariant permute_and_quantize_mxfp8",
     )
+    # Padding rows are zeroed by a kernel over the live rows, not a whole-buffer memset.
+    _, _, _, padding_data, padding_scales = logical_rows(hidden_states, probs)
+    assert not padding_data.any() and not padding_scales.any()
 
 
 def _unpermute_case():
@@ -471,6 +499,37 @@ def test_inference_unpermute_batch_invariant_path_replays():
     assert_replays_bit_exact(
         bi, (expert_output,), replays=4, backward=False, what="unpermute_tokens_in_expert_order"
     )
+
+
+def test_inference_unpermute_batch_invariant_live_tokens_replay():
+    """The fixed grid strides over only the live tokens; tokens past the count stay untouched."""
+    from megatron.core.inference.moe import batch_invariant
+
+    seeded()
+    num_tokens, hidden, num_local, topk = 8192, 1024, 16, 4
+    valid = 3000  # more live tokens than the 1024-program grid, so programs stride
+    rows = valid * topk + 128 * num_local
+    expert_output = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    inverse_map = torch.full((num_tokens, num_local), -1, device="cuda", dtype=torch.int32)
+    positions = torch.randperm(rows, device="cuda")[: valid * topk].view(valid, topk).int()
+    experts = torch.stack([torch.randperm(num_local, device="cuda")[:topk] for _ in range(valid)])
+    inverse_map[torch.arange(valid, device="cuda")[:, None], experts] = positions
+    valid_t = _dev_scalar(valid)
+
+    def bi(expert_output):
+        out = torch.full((num_tokens, hidden), 7.0, device="cuda", dtype=torch.float32)
+        return batch_invariant.unpermute_tokens_in_expert_order(
+            expert_output, inverse_map, valid_t, out
+        )
+
+    assert_replays_bit_exact(
+        bi,
+        (expert_output,),
+        replays=4,
+        backward=False,
+        what="unpermute_tokens_in_expert_order (live tokens)",
+    )
+    assert torch.all(bi(expert_output)[valid:] == 7.0)
 
 
 def test_inference_unpermute_batch_invariant_path_accumulates_in_fp64():
