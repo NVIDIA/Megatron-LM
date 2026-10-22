@@ -18,7 +18,7 @@ from megatron.core.transformer.residual_recompute_plan import (
     finalize_recompute_block,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator
+from megatron.core.utils import ensure_params_ready, nvtx_decorator
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
@@ -401,6 +401,10 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
+        # Mapping kernels read parameters directly, bypassing their owning-module pre-hooks.
+        ensure_params_ready(
+            (self.mapping_proj.weight, self.alpha_pre, self.alpha_post, self.alpha_res, self.bias)
+        )
         if self.single_pass:
             return self._compute_single_pass_mappings(x)
 
