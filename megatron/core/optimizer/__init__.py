@@ -578,9 +578,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                         "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
                     }
                 )
-                # Master weight is managed by MCore when main_params_dtype is fp32. This is
-                # because we want to use fp8 primary weight with precision aware optimizer.
-                # Otherwise, master weight will be managed by TransformerEngine.
+                # TransformerEngine manages the master weights unless they are FP32 and the
+                # model params are quantized with a non-delayed FP8 recipe, in which case MCore
+                # manages them (see OptimizerConfig._te_fused_adam_main_weight_and_decoupled_grad).
                 # Delayed scaling is an exception because casting as well as the computation
                 # of the scaling factor can be conducted in the adam kernel.
                 if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not isinstance(

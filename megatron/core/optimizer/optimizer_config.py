@@ -201,18 +201,19 @@ class OptimizerConfig:
     store_param_remainders: Optional[bool] = None
     """If true, the optimizer state keeps only the 16 low bits of each FP32 master weight, the
         int16 remainder of the 16 bits the BF16 parameter holds. This lowers GPU memory usage, and
-        the optimizer checkpoint then holds int16 remainders instead of FP32 master weights. 
+        the optimizer checkpoint then holds int16 remainders instead of FP32 master weights.
         Requires use_precision_aware_optimizer.
 
-        None (default) defaults to False when:
+        None (default) resolves to True, except when:
             - FP32 main params and
             - a non-delayed FP8 recipe
-        and True in all other cases.
+        where it resolves to False.
 
         This keeps checkpoints compatible with legacy ones with this configuration, which hold
         MCore-managed FP32 main weights. Explicitly setting this flag to True
         makes those legacy optimizer checkpoints incompatible.
-        Only takes effect with BF16 model params, FP32 main params and no optimizer_cpu_offload.
+        Only takes effect with BF16 model params and FP32 main params owned by TE FusedAdam
+        and never with optimizer_cpu_offload, optimizer_cuda_graph or Megatron-FSDP.
     """
 
     main_grads_dtype: torch.dtype = torch.float32
@@ -444,6 +445,7 @@ class OptimizerConfig:
 
     @property
     def fp8_param_gather(self) -> Optional[bool]:
+        """fp8_param_gather of the model's DDP config, or None if not resolved for a model."""
         return self._fp8_param_gather
 
     def _te_fused_adam_main_weight_and_decoupled_grad(
@@ -472,7 +474,6 @@ class OptimizerConfig:
 
     def _use_te_precision_aware_optimizer_legacy(self) -> bool:
         """The precision-aware optimizer gate before BF16 model weights could use it.
-
 
         The goal is to ensure we remain compatible with checkpoints produced by previous versions
         of Megatron. Such versions did not allow precision-aware optimizer with

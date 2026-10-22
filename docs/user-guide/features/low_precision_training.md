@@ -234,7 +234,8 @@ Once a recipe is stable, the following options reduce memory further:
     In that case it is off for backward compatibility with checkpoints produced
     without this feature. Explicitly pass `--store-param-remainders` to enable it
     if you do not require loading such checkpoints. Always off with
-    `--optimizer-cuda-graph` and `--optimizer-cpu-offload`.
+    `--optimizer-cuda-graph`, `--optimizer-cpu-offload` and Megatron-FSDP, and
+    has no effect with `--fp8-param-gather` and a non-delayed `--fp8-recipe`.
 
 ## Configuration Cookbook
 

@@ -1490,7 +1490,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Returns:
             dict or None: optimizer state dict on DP rank 0, or all ranks if return_on_all_ranks.
-                Returns None on non-zero DP ranks when return_on_all_ranks=False.
+                Returns None on non-zero DP ranks when return_on_all_ranks=False. Also records
+                whether the "param" state holds param remainders.
         """
         # Data parallelism variables.
         if use_gloo_comm:
@@ -1503,7 +1504,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_global_ranks = torch.distributed.get_process_group_ranks(data_parallel_group)
 
         # Collect param states.
-        state = {"buckets_coalesced": True}
+        state = {
+            "buckets_coalesced": True,
+            "param_state_param_remainders": self._stores_param_remainders(),
+        }
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
 
             # Iterate grad buffers (by data type).
@@ -1618,7 +1622,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             filename (str): path to save parameter state to.
         """
 
-        state_dict = self.get_parameter_state_dp_zero_with_remainders_flag()
+        state_dict = self.get_parameter_state_dp_zero()
         if self.data_parallel_group.rank() == 0:
             torch.save(state_dict, filename)
 
@@ -1849,37 +1853,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             f"The distributed optimizer checkpoint stores {describe(stored)}, but this run uses "
             f"{describe(current)}. Loading it would silently corrupt the master weights. {fix}, "
             "or skip loading the optimizer state with --no-load-optim."
-        )
-
-    def get_parameter_state_dp_zero_with_remainders_flag(self) -> Optional[dict]:
-        """get_parameter_state_dp_zero() plus the param remainders flag, for --ckpt-format torch."""
-        state_dict = self.get_parameter_state_dp_zero()
-        if state_dict is not None:
-            state_dict['param_state_param_remainders'] = self._stores_param_remainders()
-        return state_dict
-
-    def load_parameter_state_from_dp_zero_with_remainders_flag(
-        self, state_dict: Optional[dict], *, update_legacy_format: bool = False
-    ):
-        """load_parameter_state_from_dp_zero() that first checks the param remainders flag.
-
-        Only DP rank 0 holds the state, so it broadcasts the result: all ranks must raise together
-        or the others hang in the scatter.
-        """
-        error = [None]
-        if self.data_parallel_group.rank() == 0:
-            error[0] = self._param_remainders_mismatch(
-                state_dict.pop('param_state_param_remainders', None)
-            )
-        torch.distributed.broadcast_object_list(
-            error,
-            src=torch.distributed.get_global_rank(self.data_parallel_group, 0),
-            group=self.data_parallel_group,
-        )
-        if error[0] is not None:
-            raise RuntimeError(error[0])
-        self.load_parameter_state_from_dp_zero(
-            state_dict, update_legacy_format=update_legacy_format
         )
 
     def _legacy_checkpoint_has_param_remainders(self) -> bool:
@@ -2602,6 +2575,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
           exp_avg_sq).
         """
 
+        # Check the param remainders flag first. Only DP rank 0 holds the state, so it broadcasts
+        # the result: all ranks must raise together or the others hang in the scatter.
+        error = [None]
+        if self.data_parallel_group.rank() == 0 and state_dict is not None:
+            error[0] = self._param_remainders_mismatch(
+                state_dict.pop('param_state_param_remainders', None)
+            )
+        torch.distributed.broadcast_object_list(
+            error,
+            src=torch.distributed.get_global_rank(self.data_parallel_group, 0),
+            group=self.data_parallel_group,
+        )
+        if error[0] is not None:
+            raise RuntimeError(error[0])
+
         # Selectively load from a legacy checkpoint. The legacy format was used
         # prior to Feb 13, 2024.
         if update_legacy_format:
@@ -2887,7 +2875,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.data_parallel_group.rank() == 0:
             state_dict = torch.load(filename)
 
-        self.load_parameter_state_from_dp_zero_with_remainders_flag(
+        self.load_parameter_state_from_dp_zero(
             state_dict, update_legacy_format=update_legacy_format
         )
 
