@@ -8,9 +8,33 @@ CP layout construction, with masked dummy sequences and consistent THD metadata.
 The scheduler reserves an aligned capacity; padding never truncates valid tokens.
 This eager path does not require CUDA graphs.
 
-When unpacking SFT data, prompt-only sub-sequences with no supervised targets are
-omitted. A DP rank can contribute no samples and still receive scheduled work;
-a global batch with no supervised sequences is rejected on all ranks.
+When unpacking SFT data, prompt-only sub-sequences are retained so packing can
+still fill all DP ranks; their zero loss masks exclude them from the loss. A DP
+rank can contribute no samples and still receive scheduled work. A global batch
+with no sequences is rejected on all ranks.
+
+Dynamic CP does not currently support `--deterministic-mode`, CUDA graphs, or
+router z-loss. Configuration validation rejects these combinations before training.
+Static sequence packing without dynamic CP retains its existing deterministic-mode
+support. Dynamic CP for Hybrid models follows in PR #7048.
+
+Batch helpers use `dynamic_cp` and `dynamic_cp_group_func`. The old `is_hybrid_cp`
+and `hybrid_cp_group_func` keyword arguments remain accepted with a deprecation
+warning for downstream callers. Positional arguments and the legacy
+`hybrid_cp_group` batch metadata are unchanged during this compatibility window.
+The deprecated keywords also remain visible to signature-based feature detection
+used by downstream consumers such as MBridge.
+
+The `gpt_packed_train_eval` functional test runs the real GPT entrypoint on eight
+GPUs with TP2/PP2, synthetic variable-length data, and static or dynamic packing.
+It checks finite training/evaluation losses and gradient norms, a completed
+checkpoint, and CP1/CP2 coverage in both training and evaluation. It does not
+claim deterministic or golden-loss equivalence. Run it from the repository root:
+
+```bash
+python tests/functional_tests/test_cases/gpt/gpt_packed_train_eval/run_test.py \
+  --packing-mode dynamic --output-path /path/to/a/new/output-directory
+```
 
 ## Data pre-processing
 
