@@ -704,7 +704,8 @@ def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex
 def test_alltoall_combine_postprocess_releases_router_probs():
     """combine_postprocess drops the dispatcher's reference to the router probs, so their
     autograd graph is not kept alive until the next forward (under full recompute, through
-    the rest of backward). The combined output is unchanged."""
+    the rest of backward). The combined output is unchanged.
+    """
     dispatcher = object.__new__(MoEAlltoAllTokenDispatcher)
     dispatcher.config = SimpleNamespace(moe_permute_fusion=False)
     dispatcher.drop_and_pad = False
