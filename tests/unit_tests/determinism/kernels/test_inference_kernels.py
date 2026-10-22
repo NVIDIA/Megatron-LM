@@ -610,6 +610,45 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         fn, (hidden_states, probs), replays=4, backward=False, what="vllm_fused_moe"
     )
 
+    # Decode-sized steps at Nemotron 3.5 Lightning expert shapes: the multi-CTA
+    # indirection-table builder with 2 (8 tokens) and 24 (128 tokens) working
+    # CTAs, an 8-token hint for 256 valid tokens and, on GB300, the measured
+    # launch configs.
+    decode_hidden, decode_ffn, decode_topk = 2688, 1856, 6
+    decode_routing = torch.rand(256, 128, device="cuda").topk(decode_topk, dim=1).indices
+    decode_hidden_states = torch.randn(256, decode_hidden, device="cuda", dtype=torch.bfloat16)
+    decode_probs = torch.rand(256, decode_topk, device="cuda")
+    decode_fc1 = torch.randn(experts, decode_ffn, decode_hidden, device="cuda").bfloat16() * 0.02
+    decode_fc2 = torch.randn(experts, decode_hidden, decode_ffn, device="cuda").bfloat16() * 0.02
+    # Overestimated prefill hints on either side of the multi-CTA builder's pair
+    # limit: both use 128-row tiles and the multi-kernel builder, with the same
+    # valid prefix and reusable buffers.
+    for decode_tokens, hint in ((8, 8), (128, 128), (256, 8), (256, 1025), (256, 2049)):
+        decode_valid = _dev_scalar(decode_tokens)
+
+        def decode_fn(h, p, decode_valid=decode_valid, decode_tokens=decode_tokens, hint=hint):
+            out = vllm_fused_moe(
+                h,
+                p,
+                decode_fc1,
+                decode_fc2,
+                ActivationType.SQUARED_RELU,
+                experts,
+                0,
+                decode_valid,
+                decode_routing,
+                num_tokens_hint=hint,
+            )
+            return out[:decode_tokens]
+
+        assert_replays_bit_exact(
+            decode_fn,
+            (decode_hidden_states, decode_probs),
+            replays=4,
+            backward=False,
+            what=f"vllm_fused_moe (decode, {decode_tokens} tokens, hint {hint})",
+        )
+
     inp = torch.randn(max_tokens * topk, 2688, device="cuda", dtype=torch.bfloat16)
 
     def moe_sum(inp, p):
@@ -852,3 +891,86 @@ def test_torch_mxfp8_moe_is_batch_invariant():
         "Torch MXFP8 MoE output changed with the batch; max abs diff: "
         f"{(output_alone - output_batched).abs().max().item()}"
     )
+
+
+@pytest.mark.parametrize(
+    "topk,hidden", [(6, 2688), (22, 1024), (22, 2048), (22, 4096), (22, 8192), (3, 129)]
+)
+@pytest.mark.parametrize("apply_weights", [False, True])
+def test_vllm_tiled_sum_matches_original_bits(topk, hidden, apply_weights):
+    """Keep the original slot arithmetic across layouts, sparse routes and graph replays."""
+    from megatron.core.inference.moe.vllm_fused_moe import _get_num_sms, _moe_sum, _moe_sum_kernel
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    seeded()
+    capacity = 33
+    inp = torch.randn(capacity * topk, hidden, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(capacity, topk, device="cuda")
+    routing = torch.randint(-1, 130, (capacity, topk), device="cuda")
+    routing[0] = -1
+    routing[1] = 64
+    inp[0::7] = float("nan")  # Includes undefined non-local slots.
+    inp[1::11] = -0.0
+    valid = _dev_scalar(capacity)
+    expected = torch.full((capacity, hidden), -123.0, device="cuda")
+    actual = torch.full_like(expected, -123.0)
+    block_k = min(1 << (hidden - 1).bit_length(), 1024)
+    sms = _get_num_sms(inp.device)
+
+    def original():
+        _moe_sum_kernel[(sms,)](
+            inp,
+            expected,
+            weights,
+            valid,
+            routing,
+            64,
+            64,
+            hidden,
+            topk=topk,
+            BLOCK_M=sms,
+            BLOCK_K=block_k,
+            NUM_K_BLOCKS=(hidden + block_k - 1) // block_k,
+            APPLY_WEIGHTS=apply_weights,
+            ACC_FP64=False,
+        )
+
+    def candidate():
+        return _moe_sum(
+            inp,
+            weights,
+            capacity,
+            topk,
+            hidden,
+            valid,
+            routing,
+            64,
+            64,
+            out=actual,
+            apply_weights=apply_weights,
+        )
+
+    with set_batch_invariant_mode(False):
+        original()
+        candidate()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            candidate()
+        for tokens in (0, 1, 7, 16, 31, capacity):
+            valid.fill_(tokens)
+            weights.neg_()
+            inp[2::13].neg_()
+            expected.fill_(-123.0)
+            actual.fill_(-123.0)
+            original()
+            graph.replay()
+            assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+        assert_replays_bit_exact(
+            lambda x: candidate(),
+            (inp,),
+            replays=3,
+            backward=False,
+            what=f"ordinary tiled MoE sum topk={topk} hidden={hidden}",
+        )

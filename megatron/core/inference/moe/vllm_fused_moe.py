@@ -102,6 +102,73 @@ def _get_default_config(M: int, E: int, top_k: int) -> dict:
     }
 
 
+def _config(block_m, block_n, block_k, num_warps, num_stages, group_m=1) -> dict:
+    """Build a GEMM launch config from tile sizes and scheduling parameters."""
+    return {
+        'BLOCK_SIZE_M': block_m,
+        'BLOCK_SIZE_N': block_n,
+        'BLOCK_SIZE_K': block_k,
+        'GROUP_SIZE_M': group_m,
+        'num_warps': num_warps,
+        'num_stages': num_stages,
+    }
+
+
+# Offline-tuned BF16 configs keyed by (SM, local experts, FC1 width, hidden size, top-k).
+# Rows: (max token hint, FC1 config, FC2 config); config args: tile M/N/K, warps, stages.
+# FC1 and FC2 share BLOCK_SIZE_M because they reuse the same indirection table.
+# Unmatched keys or hints above the last entry use _get_default_config.
+_TUNED_CONFIGS = {
+    ((10, 3), 32, 1856, 2688, 6): (
+        (8, _config(16, 64, 128, 4, 4), _config(16, 64, 64, 4, 5)),
+        (16, _config(16, 64, 128, 4, 3), _config(16, 64, 64, 4, 3)),
+        (32, _config(16, 128, 128, 4, 3), _config(16, 64, 64, 4, 3)),
+        (64, _config(16, 64, 64, 4, 3), _config(16, 64, 64, 4, 5)),
+        (128, _config(16, 64, 128, 4, 2), _config(16, 64, 128, 4, 3)),
+        (256, _config(16, 128, 128, 4, 2), _config(16, 128, 64, 4, 5)),
+        (512, _config(32, 128, 128, 4, 2), _config(32, 128, 64, 4, 4)),
+        (1024, _config(64, 128, 64, 8, 4), _config(64, 128, 64, 8, 3)),
+        (8192, _config(128, 256, 64, 8, 4), _config(128, 256, 64, 8, 4)),
+    ),
+    ((10, 3), 16, 1856, 2688, 6): (
+        (16, _config(16, 64, 128, 4, 5), _config(16, 64, 64, 4, 5)),
+        (32, _config(16, 64, 128, 4, 4), _config(16, 64, 64, 4, 5)),
+        (128, _config(16, 64, 128, 4, 3), _config(16, 64, 64, 4, 3)),
+        (256, _config(16, 128, 128, 8, 4), _config(16, 64, 64, 4, 3)),
+        (512, _config(32, 128, 64, 4, 5), _config(32, 128, 64, 4, 4)),
+        (1024, _config(64, 128, 64, 8, 4), _config(64, 128, 64, 4, 3)),
+        (8192, _config(128, 256, 64, 8, 4), _config(128, 256, 64, 8, 4)),
+    ),
+}
+
+
+_DEVICE_CAPABILITY = None
+
+
+def _get_device_capability(device: torch.device) -> tuple[int, int]:
+    """Compute capability of this process's GPU, cached like _get_num_sms."""
+    global _DEVICE_CAPABILITY
+    if _DEVICE_CAPABILITY is None:
+        _DEVICE_CAPABILITY = torch.cuda.get_device_capability(device)
+    return _DEVICE_CAPABILITY
+
+
+def _get_launch_configs(
+    M: int, num_local_experts: int, top_k: int, N: int, K: int, device: torch.device
+) -> tuple[dict, dict]:
+    """FC1 and FC2 launch configs for a token-count hint M.
+
+    Uses a measured _TUNED_CONFIGS entry for this device and expert shape when one
+    covers M, else _get_default_config for both GEMMs.
+    """
+    key = (_get_device_capability(device), num_local_experts, N, K, top_k)
+    for max_tokens, fc1_config, fc2_config in _TUNED_CONFIGS.get(key, ()):
+        if M <= max_tokens:
+            return dict(fc1_config), dict(fc2_config)
+    config = _get_default_config(M=M, E=num_local_experts, top_k=top_k)
+    return config, dict(config)
+
+
 @triton.jit
 def _fused_moe_kernel(
     # Pointers
@@ -241,6 +308,11 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def _align_expert_bins(num_local_experts: int) -> int:
+    """Histogram bins of the parallel align kernel: local experts, padded to a power of two."""
+    return max(16, 1 << (num_local_experts - 1).bit_length())
+
+
 class VllmFusedMoeBuffers:
     """Class-level persistent intermediate buffers for the vLLM fused-MoE kernels.
 
@@ -294,7 +366,7 @@ class VllmFusedMoeBuffers:
         # per-block expert table is longest at block_m=16.
         max_sorted_worst = num_valid + 128 * (num_local_experts + 1)
         max_blocks_worst = _ceil_div(num_valid, 16) + (num_local_experts + 1)
-        cls._buffers = {
+        buffers = {
             'intermediate1': torch.empty(
                 num_valid * fc1_output_size, dtype=torch.bfloat16, device=device
             ),
@@ -303,11 +375,15 @@ class VllmFusedMoeBuffers:
             ),
             'sorted_token_ids': torch.empty(max_sorted_worst, dtype=torch.int32, device=device),
             'expert_ids': torch.empty(max_blocks_worst, dtype=torch.int32, device=device),
-            # _moe_sum output when no external buffer (e.g. RSV) is provided.
-            'moe_sum_out': torch.empty(
-                max_tokens * hidden_size, dtype=torch.float32, device=device
-            ),
         }
+        # Only ordinary mode uses parallel alignment. Preserve BI's allocation order.
+        if not batch_invariant.enabled():
+            buffers['num_tokens_post_padded'] = torch.empty(1, dtype=torch.int32, device=device)
+        # _moe_sum output when no external buffer (e.g. RSV) is provided.
+        buffers['moe_sum_out'] = torch.empty(
+            max_tokens * hidden_size, dtype=torch.float32, device=device
+        )
+        cls._buffers = buffers
 
     @classmethod
     def _delete_buffers(cls) -> None:
@@ -500,6 +576,175 @@ def _moe_align_block_size_cuda_graphable(
     return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
+@triton.jit
+def _parallel_align_block_size_kernel(
+    routing_map_ptr,
+    valid_tokens_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    local_expert_start,
+    max_pairs,
+    SENTINEL,
+    topk: tl.constexpr,
+    num_local_experts: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    FIRST_HIST_CHUNK: tl.constexpr,
+    HIST_CHUNK: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    """Multi-CTA, atomics-free build of the vLLM indirection tables.
+
+    Produces the same tables as _moe_align_block_size_cuda_graphable over the
+    range the GEMM reads, [0, num_tokens_post_padded): per-expert counts padded
+    to BLOCK_SIZE_M, the expert id of every BLOCK_SIZE_M block, SENTINEL in the
+    padding slots, and every local (token, slot) pair index in its expert's
+    segment. Entries past num_tokens_post_padded are left untouched; the GEMM
+    grid never reads them.
+
+    The valid pairs are split into CHUNK-pair chunks, and the first CTAs of the
+    grid take one contiguous run of chunks each; the rest exit. Every working
+    CTA counts the pairs of each expert over all valid pairs and over those
+    before its run itself, so no CTA waits for another and no counter needs
+    atomics. A pair's slot is its expert's segment start, plus that expert's
+    pairs before the pair's chunk, plus those earlier in the chunk: each
+    segment lists its pairs in increasing pair order (the multi-kernel
+    builder leaves that order to its atomics; each GEMM row is computed
+    independently, so results do not depend on it). The grid does not depend
+    on the token-count hint, so an underestimated hint costs no parallelism.
+    """
+    pid = tl.program_id(0)
+    num_ctas = tl.num_programs(0)
+    bins = tl.arange(0, NUM_BINS)
+
+    # The first routing load does not wait for valid_tokens.
+    offs = tl.arange(0, FIRST_HIST_CHUNK)
+    lid = tl.load(routing_map_ptr + offs, mask=offs < max_pairs, other=-1) - local_expert_start
+    valid_pairs = tl.load(valid_tokens_ptr) * topk
+    num_chunks = tl.cdiv(valid_pairs, CHUNK)
+    num_working = tl.maximum(tl.minimum(num_ctas, num_chunks), 1)
+    if pid >= num_working:
+        return
+    chunks_per_cta = tl.cdiv(num_chunks, num_working)
+    first = pid * chunks_per_cta * CHUNK
+    last = tl.minimum(first + chunks_per_cta * CHUNK, valid_pairs)
+
+    # 1) Per-expert counts of all valid pairs, and of the pairs before `first`.
+    is_local = (offs < valid_pairs) & (lid >= 0) & (lid < num_local_experts)
+    lid = tl.where(is_local, lid, 0).to(tl.int32)
+    counts = tl.histogram(lid, NUM_BINS, mask=is_local)
+    before = tl.zeros([NUM_BINS], dtype=tl.int32)
+    if pid > 0:
+        before = tl.histogram(lid, NUM_BINS, mask=is_local & (offs < first))
+    for start in range(FIRST_HIST_CHUNK, valid_pairs, HIST_CHUNK):
+        h_offs = start + tl.arange(0, HIST_CHUNK)
+        h_lid = tl.load(routing_map_ptr + h_offs, mask=h_offs < valid_pairs, other=-1)
+        h_lid = h_lid - local_expert_start
+        h_local = (h_offs < valid_pairs) & (h_lid >= 0) & (h_lid < num_local_experts)
+        h_lid = tl.where(h_local, h_lid, 0).to(tl.int32)
+        counts += tl.histogram(h_lid, NUM_BINS, mask=h_local)
+        before += tl.histogram(h_lid, NUM_BINS, mask=h_local & (h_offs < first))
+
+    # 2) Segment offsets: counts rounded up to BLOCK_SIZE_M (empty experts stay 0).
+    padded = tl.cdiv(counts, BLOCK_SIZE_M) * BLOCK_SIZE_M
+    inclusive = tl.cumsum(padded, axis=0)
+    exclusive = inclusive - padded
+    total = tl.sum(padded, axis=0)
+    if pid == 0:
+        tl.store(num_tokens_post_padded_ptr, total)
+
+    # 3) SENTINEL in each segment's padding tail (fewer than BLOCK_SIZE_M slots),
+    #    experts spread over the working CTAs. Real pairs fill the other slots,
+    #    so no slot is written twice.
+    tail = (exclusive + counts)[:, None] + tl.arange(0, BLOCK_SIZE_M)[None, :]
+    mine = (bins % num_working) == pid
+    tl.store(
+        sorted_token_ids_ptr + tail, SENTINEL, mask=mine[:, None] & (tail < inclusive[:, None])
+    )
+
+    # 4) Expert of each block: the number of experts whose segment ends at or
+    #    before it (empty experts end where the previous one ends).
+    segment_end_block = tl.where(bins < num_local_experts, inclusive // BLOCK_SIZE_M, 1 << 30)
+    num_blocks = total // BLOCK_SIZE_M
+    for start in range(pid * CHUNK, num_blocks, num_working * CHUNK):
+        blocks = start + tl.arange(0, CHUNK)
+        owner = tl.sum((blocks[:, None] >= segment_end_block[None, :]).to(tl.int32), axis=1)
+        tl.store(expert_ids_ptr + blocks, owner, mask=blocks < num_blocks)
+
+    # 5) Place this CTA's pairs.
+    rows = tl.arange(0, CHUNK)
+    next_slot = exclusive + before
+    for start in range(first, last, CHUNK):
+        p_offs = start + rows
+        p_lid = tl.load(routing_map_ptr + p_offs, mask=p_offs < last, other=-1)
+        p_lid = p_lid - local_expert_start
+        p_local = (p_offs < last) & (p_lid >= 0) & (p_lid < num_local_experts)
+        p_lid = tl.where(p_local, p_lid, -1).to(tl.int32)
+        earlier_same = (p_lid[:, None] == p_lid[None, :]) & (rows[None, :] < rows[:, None])
+        rank = tl.sum(earlier_same.to(tl.int32), axis=1)
+        slot = tl.sum(tl.where(p_lid[:, None] == bins[None, :], next_slot[None, :], 0), axis=1)
+        tl.store(sorted_token_ids_ptr + slot + rank, p_offs, mask=p_local)
+        if start + CHUNK < last:
+            next_slot += tl.histogram(tl.maximum(p_lid, 0), NUM_BINS, mask=p_local)
+
+
+# Multi-CTA alignment limit in hinted token-expert pairs (num_tokens_hint * topk).
+# Larger hints or BLOCK_SIZE_M >= 128 use the multi-kernel path.
+_PARALLEL_ALIGN_MAX_PAIRS = 12288
+_PARALLEL_ALIGN_CHUNK = 32
+_PARALLEL_ALIGN_NUM_WARPS = 8
+
+
+def _moe_align_block_size_parallel(
+    routing_map: torch.Tensor,
+    block_size: int,
+    num_local_experts: int,
+    local_expert_start: int,
+    valid_tokens: torch.Tensor,
+    num_pairs_hint: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Multi-CTA equivalent of _moe_align_block_size_cuda_graphable.
+
+    Same arguments and return values, plus the host-side pair-count hint that
+    sizes the first histogram tile; only entries before num_tokens_post_padded
+    are written (see _parallel_align_block_size_kernel).
+    """
+    max_tokens, topk = routing_map.shape
+    device = routing_map.device
+    max_pairs = max_tokens * topk
+    max_sorted = max_pairs + block_size * (num_local_experts + 1)
+    max_blocks = _ceil_div(max_sorted, block_size)
+    sorted_token_ids = VllmFusedMoeBuffers.get(
+        "sorted_token_ids", (max_sorted,), torch.int32, device
+    )
+    expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
+    num_tokens_post_padded = VllmFusedMoeBuffers.get(
+        "num_tokens_post_padded", (1,), torch.int32, device
+    )
+    num_ctas = max(1, min(_ceil_div(max_pairs, _PARALLEL_ALIGN_CHUNK), _get_num_sms(device)))
+    _parallel_align_block_size_kernel[(num_ctas,)](
+        routing_map,
+        valid_tokens,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        local_expert_start,
+        max_pairs,
+        max_pairs,
+        topk=topk,
+        num_local_experts=num_local_experts,
+        BLOCK_SIZE_M=block_size,
+        NUM_BINS=_align_expert_bins(num_local_experts),
+        # The hinted pair count as a power of two in [64, 1024].
+        FIRST_HIST_CHUNK=min(max(triton.next_power_of_2(max(num_pairs_hint, 1)), 64), 1024),
+        HIST_CHUNK=1024,
+        CHUNK=_PARALLEL_ALIGN_CHUNK,
+        num_warps=_PARALLEL_ALIGN_NUM_WARPS,
+    )
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+
 # ---------------------------------------------------------------------------
 # Kernel launcher
 # ---------------------------------------------------------------------------
@@ -641,6 +886,83 @@ def _moe_sum_kernel(
             tl.store(output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask)
 
 
+@triton.jit
+def _moe_sum_tiled_kernel(
+    input_ptr,
+    output_ptr,
+    topk_weights_ptr,
+    valid_tokens_ptr,
+    routing_map_ptr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
+    K,
+    topk: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    APPLY_WEIGHTS: tl.constexpr = True,
+):
+    """Reduce topk dimension with routing weight application.
+
+    input:  [max_tokens * topk, K] bf16
+    output: [max_tokens, K] — dtype matches the output buffer (fp32 or bf16)
+
+    For token t < valid_tokens: output[t] = sum of input[t*topk+k] * prob[t*topk+k]
+    over topk slots k where the expert is local.  Non-local slots are skipped
+    (their values in `input` are undefined because FC2 only processes
+    local-expert blocks).
+    Rows for t >= valid_tokens are not written; downstream consumers
+    (e.g. reduce-scatter-v) only read the first valid_tokens rows.
+    Routing weight multiplication and accumulation in fp32 for numerical accuracy.
+
+    Work items are [BLOCK_T tokens, BLOCK_K columns] tiles. The routing ids of
+    a tile are loaded before its topk slot rows, so the slot loads are
+    independent and many rows are in flight per CTA (a token-at-a-time loop
+    with a dependent routing load per slot leaves HBM mostly idle at prefill
+    sizes). Each element still accumulates its local slots in slot order,
+    skipping non-local slots, so results do not depend on the tiling.
+
+    Persistent grid: the CTAs stride over the tiles of valid_tokens.
+    CUDA-graph safe (grid is static); the loop bound is loaded device-side.
+    """
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    valid_tokens = tl.load(valid_tokens_ptr)
+    num_k_blocks = tl.cdiv(K, BLOCK_K)
+    num_tiles = tl.cdiv(valid_tokens, BLOCK_T) * num_k_blocks
+
+    for tile in tl.range(pid, num_tiles, num_programs):
+        offs_t = (tile // num_k_blocks) * BLOCK_T + tl.arange(0, BLOCK_T)
+        offs_k = (tile % num_k_blocks) * BLOCK_K + tl.arange(0, BLOCK_K)
+        t_mask = offs_t < valid_tokens
+        k_mask = offs_k < K
+        slot_base = offs_t.to(tl.int64) * topk
+
+        acc = tl.zeros([BLOCK_T, BLOCK_K], dtype=tl.float32)
+        for t in tl.static_range(topk):
+            eid = tl.load(routing_map_ptr + slot_base + t, mask=t_mask, other=-1)
+            lid = eid - local_expert_start
+            is_local = t_mask & (lid >= 0) & (lid < num_local_experts)
+            v = tl.load(
+                input_ptr + (slot_base + t)[:, None] * K + offs_k[None, :],
+                mask=is_local[:, None] & k_mask[None, :],
+                other=0.0,
+            )
+            if APPLY_WEIGHTS:
+                w = tl.load(topk_weights_ptr + slot_base + t, mask=is_local, other=0.0)
+                contribution = v.to(tl.float32) * w[:, None]
+            else:
+                contribution = v.to(tl.float32)
+            # Skip (rather than add zero for) non-local slots, which keeps a
+            # -0.0 accumulator bit-identical.
+            acc = tl.where(is_local[:, None], acc + contribution, acc)
+
+        tl.store(
+            output_ptr + offs_t.to(tl.int64)[:, None] * K + offs_k[None, :],
+            acc.to(tl.float32),
+            mask=t_mask[:, None] & k_mask[None, :],
+        )
+
+
 def _moe_sum(
     input: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -676,10 +998,37 @@ def _moe_sum(
     """
     if out is None:
         out = VllmFusedMoeBuffers.get("moe_sum_out", (max_tokens, K), torch.float32, input.device)
-    BLOCK_K = min(triton.next_power_of_2(K), 1024)
-    NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    BLOCK_M = _get_num_sms(input.device)
-    _moe_sum_kernel[(BLOCK_M,)](
+    # Preserve the existing BI launch and arithmetic, including FP64 reduction.
+    if acc_fp64 or batch_invariant.enabled():
+        BLOCK_K = min(triton.next_power_of_2(K), 1024)
+        NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
+        BLOCK_M = _get_num_sms(input.device)
+        _moe_sum_kernel[(BLOCK_M,)](
+            input,
+            out,
+            topk_weights,
+            valid_tokens,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            K,
+            topk=topk,
+            BLOCK_M=BLOCK_M,
+            BLOCK_K=BLOCK_K,
+            NUM_K_BLOCKS=NUM_K_BLOCKS,
+            APPLY_WEIGHTS=apply_weights,
+            ACC_FP64=acc_fp64,
+        )
+        return out
+    BLOCK_T = 16
+    BLOCK_K = min(triton.next_power_of_2(K), 128)
+    # Enough CTAs to keep many slot rows in flight at prefill sizes, capped by
+    # the tile count of the worst-case token count. GB300, K=2688, top-6: 8 CTAs
+    # per SM vs 4 take 43 vs 67 us at 8192 tokens and match it at decode sizes.
+    num_programs = min(
+        8 * _get_num_sms(input.device), _ceil_div(max_tokens, BLOCK_T) * _ceil_div(K, BLOCK_K)
+    )
+    _moe_sum_tiled_kernel[(num_programs,)](
         input,
         out,
         topk_weights,
@@ -689,11 +1038,9 @@ def _moe_sum(
         num_local_experts,
         K,
         topk=topk,
-        BLOCK_M=BLOCK_M,
+        BLOCK_T=BLOCK_T,
         BLOCK_K=BLOCK_K,
-        NUM_K_BLOCKS=NUM_K_BLOCKS,
         APPLY_WEIGHTS=apply_weights,
-        ACC_FP64=acc_fp64,
     )
     return out
 
@@ -756,12 +1103,15 @@ def vllm_fused_moe(
     topk = routing_map.shape[1]
     effective_tokens = num_tokens_hint if num_tokens_hint is not None else max_tokens
 
-    # Mirror upstream vLLM: pick the full launch config (tile sizes, warps,
+    N = fc1_weight.size(1)
+    K = fc1_weight.size(2)
+
+    # Mirror upstream vLLM: pick the full launch configs (tile sizes, warps,
     # stages) host-side from the token-count hint, not from the worst-case
-    # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
+    # buffer size. Measured per-device configs may differ between FC1 and FC2.
     batch_invariant_mode = batch_invariant.enabled()
-    config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
     if batch_invariant_mode:
+        fc1_config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
         # Batch-invariant mode: pin only the K-reduction recipe. The kernel
         # accumulates in fp32 with no split-K, so bits depend solely on the
         # K-loop grouping (BLOCK_SIZE_K); M/N tile shapes, tile grouping and
@@ -770,26 +1120,42 @@ def vllm_fused_moe(
         # M/N tiling adaptive preserves the decode-tuned configs; pinning
         # BLOCK_SIZE_K removes the one field _get_default_config varies that
         # could change the summation order across co-batch sizes.
-        config['BLOCK_SIZE_K'] = 64
+        fc1_config['BLOCK_SIZE_K'] = 64
+        fc2_config = fc1_config
+    else:
+        fc1_config, fc2_config = _get_launch_configs(
+            effective_tokens, num_local_experts, topk, N, K, hidden_states.device
+        )
 
-    sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
-        routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
-    )
+    # FC1 and FC2 share the indirection tables, hence BLOCK_SIZE_M.
+    block_m = fc1_config['BLOCK_SIZE_M']
+    assert fc2_config['BLOCK_SIZE_M'] == block_m
+    align_args = (routing_map, block_m, num_local_experts, local_expert_start, valid_tokens)
+    # Keep the large-prefill tile family on one table builder. Switching at the
+    # pair-count cutoff also changes the padded-count pointer's alignment (the
+    # parallel builder owns a scalar; the fallback returns an offsets slice),
+    # compiling another GEMM specialization during a warmed request. Decode
+    # still uses the parallel builder, including underestimated token hints.
+    if (
+        not batch_invariant_mode
+        and block_m < 128
+        and effective_tokens * topk <= _PARALLEL_ALIGN_MAX_PAIRS
+    ):
+        tables = _moe_align_block_size_parallel(*align_args, effective_tokens * topk)
+    else:
+        tables = _moe_align_block_size_cuda_graphable(*align_args)
+    sorted_token_ids, expert_ids, num_post_padded = tables
     num_valid = max_tokens * topk
-
-    N = fc1_weight.size(1)
-    K = fc1_weight.size(2)
 
     # Grid sized for the typical-case token count (num_tokens_hint).  When the
     # actual num_tokens_post_padded exceeds this, the kernel's outer tl.range
     # makes each CTA stride over additional tiles — correct but with reduced
     # parallelism on rare prefill spikes.  EM hint = effective_tokens*topk +
     # BLOCK_SIZE_M*num_local_experts upper-bounds the per-expert padding.
-    block_m = config['BLOCK_SIZE_M']
     em_hint = effective_tokens * topk + block_m * num_local_experts
     num_pid_m_hint = _ceil_div(em_hint, block_m)
-    num_pid_n_fc1 = _ceil_div(N, config['BLOCK_SIZE_N'])
-    num_pid_n_fc2 = _ceil_div(K, config['BLOCK_SIZE_N'])
+    num_pid_n_fc1 = _ceil_div(N, fc1_config['BLOCK_SIZE_N'])
+    num_pid_n_fc2 = _ceil_div(K, fc2_config['BLOCK_SIZE_N'])
     grid_size_fc1 = num_pid_m_hint * num_pid_n_fc1
     grid_size_fc2 = num_pid_m_hint * num_pid_n_fc2
 
@@ -824,7 +1190,7 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=topk,
-        config=config,
+        config=fc1_config,
         grid_size=grid_size_fc1,
         fuse_squared_relu=fuse_squared_relu,
         activation_clamp_scale=activation_clamp_scale,
@@ -876,7 +1242,7 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=1,
-        config=config,
+        config=fc2_config,
         grid_size=grid_size_fc2,
     )
 
