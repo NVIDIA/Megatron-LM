@@ -388,15 +388,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         """The values the other sections own for the mirrors this container writes.
 
         ``data_parallel_size`` needs the world size as well as the model layout and is left out
-        without one; the other layout fields need the model layout; the seed and the validation
-        flags are always available.
+        without one; the other layout fields need the model layout; the validation flags are
+        always available.
         """
         if self.data.dataset is None:
             return {}
         mirrors = self._written_mirrors()
         values: dict[str, Any] = {}
-        if "random_seed" in mirrors:
-            values["random_seed"] = self.rng.seed
         if "full_validation" in mirrors:
             values["full_validation"] = self.validation.full_validation
         if "multiple_validation_sets" in mirrors:

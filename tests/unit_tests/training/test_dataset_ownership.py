@@ -346,7 +346,7 @@ def test_standalone_config_takes_the_mirrors_from_args():
     assert standalone.hybrid_context_parallel is False
     owned = gpt_data_config_from_args(args).dataset
     assert all(mirror_is_unset(owned, name) for name in MIRROR_FIELDS)
-    assert owned.random_seed is None and owned.full_validation is None
+    assert owned.random_seed == 99 and owned.full_validation is None  # the seed is no mirror
 
 
 def test_requested_family_precedence(warnings_log):
@@ -385,6 +385,7 @@ def test_loader_only_is_the_default_for_other_entry_points(container_factory):
 def test_container_keeps_a_caller_supplied_data_section(container_factory):
     preset = DataConfig(
         dataset=GPTDatasetConfig(
+            random_seed=7,  # Core's required argument: a Python caller passes its own seed
             sequence_length=8,
             reset_position_ids=False,
             reset_attention_mask=False,
@@ -398,6 +399,7 @@ def test_container_keeps_a_caller_supplied_data_section(container_factory):
     assert (
         cfg.data.dataset_type is MockGPTDataset and cfg.data.dataloader.dataloader_type == "single"
     )
+    assert cfg.data.dataset.random_seed == 7 and cfg.rng.seed == 1234  # independent seeds
 
 
 def test_run_config_fixture_is_loader_only(run_config):
@@ -414,7 +416,7 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
         ["--seq-length", "64", "--mock-data", "--seed", "99", "--full-validation"], data=True
     )
     dataset = cfg.data.dataset
-    assert args.seed == 99 and cfg.rng.seed == 99 and dataset.random_seed is None
+    assert args.seed == 99 and cfg.rng.seed == 99 and dataset.random_seed == 99
     cfg.model = _layout(
         tensor_model_parallel_size=2,
         context_parallel_size=2,
@@ -422,30 +424,31 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
         hybrid_context_parallel=True,
     )
     monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
-    # The owners stay editable after construction: no stale copy on the dataset config.
+    # The owners stay editable after construction: no stale copy on the dataset config. The dataset
+    # seed is the section's own setting and does not follow rng.seed.
     cfg.rng.seed = 42
     cfg.validation.multiple_validation_sets = True
     cfg.validate()
-    assert dataset.random_seed is None  # validation writes nothing
+    assert dataset.random_seed == 99  # validation writes nothing
     # data_parallel_size needs the world size: an explicit wrong value passes validate() and is
     # rejected by finalize() before anything is written.
     dataset.data_parallel_size = 99
     with pytest.raises(ValueError, match="data.dataset.data_parallel_size=99 disagrees"):
         cfg.finalize()
-    assert dataset.data_parallel_size == 99 and dataset.random_seed is None
+    assert dataset.data_parallel_size == 99 and dataset.random_seed == 99
     assert not cfg._finalized
     dataset.data_parallel_size = 2  # an agreeing explicit value is accepted
     cfg.finalize()
-    assert dataset.random_seed == 42
+    assert dataset.random_seed == 99 and cfg.rng.seed == 42
     assert dataset.full_validation is True and dataset.multiple_validation_sets is True
     assert (dataset.context_parallel_size, dataset.sequence_parallel_size) == (2, 2)
     assert dataset.hybrid_context_parallel is True and dataset.data_parallel_size == 2
     assert cfg.data.dataset_type is MockGPTDataset
     assert not (set(MIRROR_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
+    assert cfg.to_dict()["data"]["dataset"]["random_seed"] == 99
     cfg.validate()  # the written values agree with their owners
     dataset.random_seed = 7
-    with pytest.raises(ValueError, match="data.dataset.random_seed=7 disagrees"):
-        cfg.validate()
+    cfg.validate()  # the dataset seed has no owner to agree with
 
 
 def test_a_layout_mirror_at_core_default_carries_no_explicit_value(container_factory, monkeypatch):
@@ -493,8 +496,8 @@ def test_layout_without_a_model_section_survives_a_reload(
 
 
 def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokenizer):
-    """pretrain_hybrid_flex.py builds its container without a model config: the seed and the
-    validation flags are written, the layout mirrors have no owner."""
+    """pretrain_hybrid_flex.py builds its container without a model config: the validation flags
+    are written, the layout mirrors have no owner (the seed came with the arguments)."""
     _, cfg = container_factory(
         ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
     )
@@ -512,7 +515,7 @@ def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokeniz
         cfg.validate()
     dataset.context_parallel_size = None
     cfg.finalize()
-    assert dataset.random_seed == cfg.rng.seed
+    assert dataset.random_seed == 1234  # --seed, from construction
     assert dataset.full_validation is True and dataset.multiple_validation_sets is False
     assert dataset.context_parallel_size is None and dataset.data_parallel_size == 1
     dataset.prepare(tokenizer)  # Core's defaults stay on the layout
@@ -617,11 +620,12 @@ def test_full_container_round_trips_before_and_after_prepare(
         and after["data"]["dataset"] == section["dataset"]
     )
     reloaded = PretrainConfigContainer.from_dict(after)
-    assert not reloaded.data.dataset.is_prepared and reloaded.data.dataset.random_seed is None
+    assert not reloaded.data.dataset.is_prepared
+    assert reloaded.data.dataset.random_seed == cfg.data.dataset.random_seed  # saved with it
     reloaded.validate()
     reloaded.finalize()
     assert reloaded.data.dataset_type is GPTDataset
-    assert reloaded.data.dataset.random_seed == cfg.rng.seed
+    assert reloaded.data.dataset.random_seed == cfg.data.dataset.random_seed
 
 
 def test_pre_data_run_config_is_completed_on_load(run_config):

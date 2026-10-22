@@ -584,15 +584,15 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
 def test_legacy_wrapper_is_the_shared_helper(monkeypatch, corpus):
     """pretrain_gpt and pretrain_hybrid expose argument_utils.core_gpt_dataset_config_from_args
     itself; hybrid-flex and the cache tool wrap it (the run's tokenizer; the class pinned to
-    GPTDataset). The helper takes the registered run config's seed, validates, and prepares with
-    the tokenizer it is given."""
+    GPTDataset). The helper takes the seed from the arguments, validates, and prepares with the
+    tokenizer it is given."""
     shared = argument_utils.core_gpt_dataset_config_from_args
     assert _entry_point("gpt").core_gpt_dataset_config_from_args is shared
     assert _entry_point("hybrid").core_gpt_dataset_config_from_args is shared
     args, cfg, _ = _prepare(monkeypatch, *corpus["blend"])
-    cfg.rng.seed = 77
+    cfg.rng.seed = 77  # not the dataset's seed: that is --seed
     own = SimpleNamespace(vocab_size=2048)
     config = shared(args, tokenizer=own)
-    assert config.is_prepared and config.tokenizer is own and config.random_seed == 77
+    assert config.is_prepared and config.tokenizer is own and config.random_seed == args.seed
     with pytest.raises(ValueError, match="GPTDataset needs a data source"):
         shared(_validated(["--mock-data"], {}), dataset_type=GPTDataset)

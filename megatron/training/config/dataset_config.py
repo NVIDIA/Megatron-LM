@@ -5,11 +5,11 @@ the dataset class.
 ``GPTDatasetConfig`` here *is* Megatron Core's GPT dataset config: the same fields, consumed by
 ``BlendedMegatronDatasetBuilder`` as is. It defers Core's ``__post_init__``, which needs a tokenizer,
 until ``prepare(tokenizer)`` runs it in full, once; the container is built from the arguments before
-the tokenizer exists (Megatron-Bridge defers it the same way). Its one redeclared field is
-``random_seed``, which Core requires at construction and which the container supplies later. Seven
-fields are *mirrors* of values other container sections own (the seed, the parallel layout, the
-validation flags): the container writes them at ``finalize()`` and they are not serialized with the
-section.
+the tokenizer exists (Megatron-Bridge defers it the same way). It declares no field of its own:
+``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
+saved with the section. Six fields are *mirrors* of values other container sections own (the
+parallel layout, the validation flags): the container writes them at ``finalize()`` and they are
+not serialized with the section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
@@ -19,7 +19,7 @@ Entry points with their own data pipeline carry a loader-only section (``dataset
 nothing here runs for them.
 """
 
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
@@ -32,7 +32,6 @@ DATASET_FAMILIES = ("gpt", "fim", "varlen", "sft")
 # (see PretrainConfigContainer), they are left unset by the container-oriented factory, and they
 # are not serialized with the dataset section.
 MIRROR_FIELDS = (
-    "random_seed",
     "data_parallel_size",
     "context_parallel_size",
     "sequence_parallel_size",
@@ -49,11 +48,9 @@ LAYOUT_MIRRORS = (
 )
 # Megatron Core's own defaults for the mirrors. A layout mirror at its Core default (1, 0, False,
 # None for context_parallel_size) carries no explicit value: the container writes it when it can
-# derive it, and a run without a model config keeps it. random_seed has no Core default.
+# derive it, and a run without a model config keeps it.
 _CORE_MIRROR_DEFAULTS = {
-    f.name: f.default
-    for f in fields(MCoreGPTDatasetConfig)
-    if f.name in MIRROR_FIELDS and f.default is not MISSING
+    f.name: f.default for f in fields(MCoreGPTDatasetConfig) if f.name in MIRROR_FIELDS
 }
 _FIM_TOKEN_KEYS = ("prefix", "middle", "suffix", "pad", "eod")
 
@@ -62,7 +59,7 @@ def mirror_is_unset(dataset: MCoreGPTDatasetConfig, name: str) -> bool:
     """Whether mirror ``name`` carries no explicit value on ``dataset``: ``None``, or Megatron
     Core's default for a layout mirror (what the field holds when nothing writes it)."""
     value = getattr(dataset, name)
-    return value is None or value == _CORE_MIRROR_DEFAULTS.get(name)
+    return value is None or value == _CORE_MIRROR_DEFAULTS[name]
 
 
 @dataclass(kw_only=True)
@@ -123,16 +120,13 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig):
     A tokenizer given to the constructor is bound through ``prepare()`` right away, so a config
     built the Core way behaves as Core's; without one the object waits for ``prepare()``.
 
-    The one redeclared field is ``random_seed``, which Core requires at construction: ``None``
-    means "not set", so the section can be built, and reloaded, before the container writes the
-    seed at ``finalize()``. The other mirrors keep Core's fields and defaults; a layout mirror at
-    its Core default carries no explicit value (``mirror_is_unset``). A prepared object is shared
-    by reference with every dataset built from it and is not edited afterwards: build a new object
-    for a differently configured run.
+    No field is declared here: ``random_seed`` is Core's required constructor argument (the
+    factory fills it from ``--seed``; it is the dataset's own setting, saved with the section), and
+    the mirrors keep Core's fields and defaults, a layout mirror at its Core default carrying no
+    explicit value (``mirror_is_unset``). A prepared object is shared by reference with every
+    dataset built from it and is not edited afterwards: build a new object for a differently
+    configured run.
     """
-
-    random_seed: int | None = None
-    """Seed for dataset shuffling. Mirror of ``cfg.rng.seed``, written by the container."""
 
     def __post_init__(self) -> None:
         """Deferred: Megatron Core's post-init runs in ``prepare()``. A tokenizer passed to the
@@ -193,9 +187,8 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig):
         """Bind the tokenizer and run Megatron Core's ``__post_init__`` in full, once.
 
         Idempotent for the same tokenizer; a different tokenizer is an error (build a new object
-        for a different run). ``random_seed`` must be set (the container writes it from
-        ``cfg.rng.seed`` at ``finalize()``; standalone callers set it explicitly). When Core's
-        post-init fails the tokenizer stays unbound: the object is not prepared.
+        for a different run). When Core's post-init fails the tokenizer stays unbound: the object
+        is not prepared.
         """
         if tokenizer is None:
             raise ValueError("prepare() needs a tokenizer.")
@@ -205,11 +198,6 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig):
             raise RuntimeError(
                 "This dataset config is already prepared with another tokenizer; build a new "
                 "config for a differently configured run."
-            )
-        if self.random_seed is None:
-            raise ValueError(
-                "random_seed is not set: the container writes it from cfg.rng.seed at finalize(); "
-                "a standalone config sets it explicitly."
             )
         self.tokenizer = tokenizer
         try:

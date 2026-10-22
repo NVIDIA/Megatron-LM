@@ -93,17 +93,18 @@ def test_same_fields_as_megatron_core_and_no_eager_post_init():
     assert [f.name for f in fields(cfg) if f.init] == [
         f.name for f in fields(MCoreGPTDatasetConfig) if f.init
     ]
-    assert GPTDatasetConfig.__dataclass_fields__["random_seed"].kw_only
-    # No field beyond Core's: random_seed is the one redeclared (Core requires it at construction).
-    assert [f.name for f in fields(GPTDatasetConfig)] == [
-        f.name for f in fields(MCoreGPTDatasetConfig)
+    # No field of its own: names, order and defaults are Core's (random_seed stays required).
+    assert [(f.name, f.default) for f in fields(GPTDatasetConfig)] == [
+        (f.name, f.default) for f in fields(MCoreGPTDatasetConfig)
     ]
+    with pytest.raises(TypeError, match="random_seed"):
+        GPTDatasetConfig(sequence_length=16, **BOOLS)
     assert cfg.tokenizer is None and cfg.split_matrix is None
     assert cfg.mock is False and cfg.token_dtype_code is None
     assert not cfg.is_prepared
-    unset = GPTDatasetConfig(sequence_length=16, **BOOLS)
+    unset = _dataset()
     assert all(mirror_is_unset(unset, name) for name in MIRROR_FIELDS)
-    assert unset.random_seed is None and unset.context_parallel_size is None
+    assert unset.random_seed == 1234 and unset.context_parallel_size is None
     # The layout mirrors keep Megatron Core's fields and defaults.
     assert (unset.data_parallel_size, unset.sequence_parallel_size) == (1, 0)
     assert unset.hybrid_context_parallel is False
@@ -136,15 +137,13 @@ def test_prepare_runs_megatron_core_post_init_once(tokenizer, overrides):
         cfg.prepare(SimpleNamespace(vocab_size=2048))
 
 
-def test_prepare_needs_a_tokenizer_and_a_seed(tokenizer):
+def test_prepare_needs_a_tokenizer(tokenizer):
     with pytest.raises(ValueError, match="needs a tokenizer"):
         _dataset().prepare(None)
-    unset = GPTDatasetConfig(sequence_length=16, **BOOLS)
-    with pytest.raises(ValueError, match="random_seed is not set"):
-        unset.prepare(tokenizer)
+    unset = _dataset(random_seed=7)
     assert not unset.is_prepared
-    unset.random_seed = 7
     unset.prepare(tokenizer)
+    assert unset.random_seed == 7
     # Layout mirrors hold Megatron Core's defaults unless set; set values are kept.
     assert (unset.data_parallel_size, unset.sequence_parallel_size) == (1, 0)
     assert unset.hybrid_context_parallel is False and unset.context_parallel_size is None
@@ -234,7 +233,7 @@ def test_a_bound_tokenizer_means_prepared(tokenizer):
         **BOOLS,
     )
     assert _core_values(eager) == _core_values(expected)
-    with pytest.raises(ValueError, match="random_seed is not set"):
+    with pytest.raises(TypeError, match="random_seed"):  # Core's requirement, unchanged
         GPTDatasetConfig(sequence_length=16, tokenizer=tokenizer, **BOOLS)
     cfg = _dataset()
     cfg.prepare(tokenizer)
@@ -286,14 +285,14 @@ def test_fim_subclass_carries_the_runtime_fim_fields(tokenizer):
 def test_mirror_is_unset_tells_core_defaults_from_explicit_values():
     """What the container treats as "no explicit value": None, or Megatron Core's default for a
     layout mirror (what the field holds when nothing writes it, before and after prepare())."""
-    assert all(mirror_is_unset(_dataset(random_seed=None), name) for name in MIRROR_FIELDS)
+    assert all(mirror_is_unset(_dataset(), name) for name in MIRROR_FIELDS)
     assert mirror_is_unset(_dataset(data_parallel_size=1), "data_parallel_size")
     assert mirror_is_unset(_dataset(sequence_parallel_size=0), "sequence_parallel_size")
     assert mirror_is_unset(_dataset(hybrid_context_parallel=False), "hybrid_context_parallel")
     assert not mirror_is_unset(_dataset(data_parallel_size=2), "data_parallel_size")
     assert not mirror_is_unset(_dataset(context_parallel_size=1), "context_parallel_size")
     assert not mirror_is_unset(_dataset(full_validation=False), "full_validation")
-    assert not mirror_is_unset(_dataset(), "random_seed")
+    assert "random_seed" not in MIRROR_FIELDS  # the section's own setting, not a mirror
 
 
 def test_to_cfg_dict_omits_tokenizer_mirrors_and_derived_fields(tokenizer):
@@ -301,6 +300,7 @@ def test_to_cfg_dict_omits_tokenizer_mirrors_and_derived_fields(tokenizer):
     before = cfg.to_cfg_dict()
     assert before["_target_"] == "megatron.training.config.dataset_config.GPTDatasetConfig"
     assert "tokenizer" not in before and not (set(MIRROR_FIELDS) & set(before))
+    assert before["random_seed"] == 1234  # the seed is saved with the section
     assert not {"split_matrix", "mock", "token_dtype_code"} & set(before)
     assert before["blend"] == [["prefix-a", "prefix-b"], [0.3, 0.7]] and before["split"] == "9,1,0"
     cfg.prepare(tokenizer)
@@ -311,6 +311,7 @@ def test_to_cfg_dict_omits_tokenizer_mirrors_and_derived_fields(tokenizer):
     )
     assert type(restored) is GPTDatasetConfig and not restored.is_prepared
     assert restored.tokenizer is None and all(mirror_is_unset(restored, n) for n in MIRROR_FIELDS)
+    assert restored.random_seed == 1234
     assert restored.to_cfg_dict() == after
     fim = _fim().to_cfg_dict()
     assert (
