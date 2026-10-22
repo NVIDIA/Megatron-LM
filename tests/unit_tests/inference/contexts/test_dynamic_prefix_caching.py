@@ -11,11 +11,16 @@ import numpy as np
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
 )
+from megatron.core.inference.contexts.kv_block_allocator import MAX_CACHED_PROMPT_TOP_N_LOGPROBS
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
@@ -1475,6 +1480,195 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert offsets == [bs]
 
 
+def _prompt_logprob_params(top_n=0):
+    """Sampling params for a request that returns prompt log-probs."""
+    return SamplingParams(
+        num_tokens_to_generate=4,
+        return_log_probs=True,
+        skip_prompt_log_probs=False,
+        top_n_logprobs=top_n,
+    )
+
+
+def _store_cached_prompt_logprobs(ctx, block_ids, prompt, *, first_block=0, top_n=0):
+    """Cache every prompt row on `block_ids`, scoring source position `s` as `-s`."""
+    bs = ctx.block_size_tokens
+    sources = torch.arange(first_block * bs, (first_block + len(block_ids)) * bs)
+    sources = sources[sources < len(prompt) - 1]
+    scores = -sources.float().numpy()
+    ctx.kv_block_allocator.store_prompt_logprobs(
+        block_ids=np.array([block_ids[s // bs - first_block] for s in sources.tolist()]),
+        slots=(sources % bs).numpy(),
+        log_probs=scores,
+        top_n_log_probs=np.tile(scores[:, None], (1, top_n)),
+        top_n_token_ids=np.tile(sources.numpy()[:, None], (1, top_n)),
+        next_token_ids=prompt[sources + 1].cpu().numpy(),
+    )
+
+
+class TestPromptLogprobCaching(PrefixCachingTestBase):
+    """Prompt log-probs cached on KV blocks gate prefill skipping and fill skipped rows."""
+
+    @pytest.mark.internal
+    def test_skip_is_limited_to_blocks_with_cached_scores(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(3 * bs + 2)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        blocks = self._block_ids(ctx, 0, 3)
+
+        follower = self._req(ctx, prompt.clone(), 2, sampling_params=_prompt_logprob_params())
+        plain = self._req(ctx, prompt.clone(), 3)
+        assert len(ctx._compute_prefix_match(follower, len(prompt)).matched_block_ids) == 3
+        # Without cached scores the KV is shared but every token is computed.
+        assert ctx._compute_prefix_match(follower, len(prompt)).prefix_skip_tokens == 0
+        assert ctx._compute_prefix_match(plain, len(prompt)).prefix_skip_tokens == 3 * bs
+
+        _store_cached_prompt_logprobs(ctx, blocks[:2], prompt)
+        assert ctx._compute_prefix_match(follower, len(prompt)).prefix_skip_tokens == 2 * bs
+        _store_cached_prompt_logprobs(ctx, blocks[2:], prompt, first_block=2)
+        assert ctx._compute_prefix_match(follower, len(prompt)).prefix_skip_tokens == 3 * bs
+
+        ctx.add_request(follower)
+        assert follower.num_cached_tokens == 3 * bs
+        [(start, log_probs, top_n_values, top_n_ids)] = follower.cached_prompt_log_probs
+        assert start == 0
+        np.testing.assert_array_equal(log_probs, -np.arange(3 * bs, dtype=np.float32))
+        assert top_n_values.shape == top_n_ids.shape == (3 * bs, 0)
+
+    @pytest.mark.internal
+    def test_top_n_and_next_token_gate_reuse(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(3 * bs + 2)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        _store_cached_prompt_logprobs(ctx, self._block_ids(ctx, 0, 3), prompt, top_n=2)
+
+        def skip(prompt_tokens, top_n):
+            req = self._req(ctx, prompt_tokens, 9, sampling_params=_prompt_logprob_params(top_n))
+            return ctx._compute_prefix_match(req, len(prompt_tokens)).prefix_skip_tokens
+
+        assert skip(prompt.clone(), 1) == 3 * bs
+        assert skip(prompt.clone(), 2) == 3 * bs
+        assert skip(prompt.clone(), 3) == 0
+        assert skip(prompt.clone(), MAX_CACHED_PROMPT_TOP_N_LOGPROBS + 1) == 0
+
+        # Changing the first token of block 2 keeps blocks 0-1 matched, but block 1's
+        # final row scored the old token, so only block 0's scores are reusable.
+        diverged = prompt.clone()
+        diverged[2 * bs] = 10_000
+        assert skip(diverged, 0) == bs
+
+    @pytest.mark.internal
+    def test_capture_and_commit_cache_rows_on_their_blocks(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+        prompt = self._prompt(2 * bs + 3)
+        req = self._req(ctx, prompt.clone(), sampling_params=_prompt_logprob_params(top_n=2))
+        ctx.add_request(req)
+        ctx.initialize_attention_state()
+        blocks = self._block_ids(ctx, 0, 3)
+        ref_counts = alloc.block_ref_counts[blocks].clone()
+
+        [write] = ctx.capture_prompt_logprob_writes()
+        # The final row scores the first generated token, not a prompt token.
+        assert write.num_rows == len(prompt) - 1
+        np.testing.assert_array_equal(write.slots, np.arange(len(prompt) - 1) % bs)
+        np.testing.assert_array_equal(
+            write.block_ids, np.repeat(blocks, [bs, bs, len(prompt) - 1 - 2 * bs])
+        )
+        np.testing.assert_array_equal(write.next_token_ids, prompt[1:].cpu())
+        # Blocks stay pinned until the rows are stored.
+        assert torch.equal(alloc.block_ref_counts[blocks], ref_counts + 1)
+
+        rows = [-float(i) for i in range(len(prompt))]
+        top_n = {
+            0: [(torch.tensor([-0.5, -1.5]), torch.tensor([i, i + 1])) for i in range(len(prompt))]
+        }
+        ctx.commit_prompt_logprob_writes([write], [rows], top_n)
+        assert torch.equal(alloc.block_ref_counts[blocks], ref_counts)
+
+        entries = [alloc.block_prompt_logprobs[block_id] for block_id in blocks]
+        assert entries[0].valid.all() and entries[1].valid.all()
+        np.testing.assert_array_equal(np.flatnonzero(entries[2].valid), [0, 1])
+        assert [entries[0].next_token_id, entries[1].next_token_id] == [
+            int(prompt[bs]),
+            int(prompt[2 * bs]),
+        ]
+        np.testing.assert_array_equal(entries[1].log_probs, -np.arange(bs, 2 * bs))
+        np.testing.assert_array_equal(entries[1].top_n_token_ids[:, 0], np.arange(bs, 2 * bs))
+
+        follower = self._req(ctx, prompt.clone(), 2, sampling_params=_prompt_logprob_params(1))
+        assert ctx._compute_prefix_match(follower, len(prompt)).prefix_skip_tokens == 2 * bs
+
+    @pytest.mark.internal
+    def test_partial_chunk_caches_its_boundary_row(self):
+        ctx = self._ctx(enable_chunked_prefill=True)
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+        prompt = self._prompt(2 * bs + 3)
+        req = self._req(ctx, prompt.clone(), sampling_params=_prompt_logprob_params())
+        ctx.add_request(req, prefill_chunk_length=bs)
+        ctx.chunked_prefill_request_id = req.request_id
+        ctx.initialize_attention_state()
+
+        [write] = ctx.capture_prompt_logprob_writes()
+        # A partial chunk's final row scores the next chunk's first prompt token.
+        assert write.num_rows == bs
+        assert int(write.next_token_ids[-1]) == int(prompt[bs])
+        ctx.commit_prompt_logprob_writes([write], [[-float(i) for i in range(bs)]], None)
+
+        entry = alloc.block_prompt_logprobs[self._block_ids(ctx, 0, 1)[0]]
+        assert entry.valid.all() and entry.next_token_id == int(prompt[bs])
+
+    @pytest.mark.internal
+    def test_cached_scores_share_their_block_lifetime(self):
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
+        alloc = ctx.kv_block_allocator
+        prompt = self._prompt(2 * ctx.block_size_tokens + 2)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        blocks = self._block_ids(ctx, 0, 2)
+        _store_cached_prompt_logprobs(ctx, blocks, prompt)
+        assert set(blocks) <= alloc.block_prompt_logprobs.keys()
+
+        # Ref-zero eviction deregisters the blocks, and their scores go with them.
+        alloc.release_memory_blocks(torch.tensor(blocks[:1], dtype=torch.int32))
+        assert blocks[0] not in alloc.block_prompt_logprobs
+        assert blocks[1] in alloc.block_prompt_logprobs
+        alloc.reset()
+        assert not alloc.block_prompt_logprobs
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ("saved_state_blocks", "expected_skip_blocks"),
+        [([0, 3], 1), ([0, 1, 3], 2), ([3], 0), ([], 0)],
+    )
+    def test_cached_scores_cap_mamba_restore(
+        self, monkeypatch, saved_state_blocks, expected_skip_blocks
+    ):
+        ctx = self._ctx(
+            mamba_config=self._mamba_config(),
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=256,
+            max_sequence_length=4096,
+        )
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(4 * bs + 2)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        blocks = self._block_ids(ctx, 0, 4)
+        self._mamba_allocate_and_register(ctx, [blocks[i] for i in saved_state_blocks])
+        # Only the first two blocks have cached scores.
+        monkeypatch.setattr(
+            ctx.kv_block_allocator, "match_prompt_logprob_blocks", lambda *args, **kwargs: 2
+        )
+
+        follower = self._req(ctx, prompt.clone(), 2, sampling_params=_prompt_logprob_params())
+        match = ctx._compute_prefix_match(follower, len(prompt))
+        assert len(match.matched_block_ids) == 4
+        assert match.prefix_skip_tokens == expected_skip_blocks * bs
+
+
 class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
     def _setup_mixed_batch(self, model_type):
@@ -2851,6 +3045,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=(test_config.materialize_only_last_token_logits),
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
+                async_sched_mode=test_config.async_sched_mode,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 prefix_caching_mamba_gb=(
@@ -3336,6 +3531,264 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         assert not request.prompt_log_probs
         assert not request.prompt_top_n_logprobs
 
+    @classmethod
+    def _assert_top_n_logprobs_close(cls, actual, expected):
+        """Compare top-N rows, allowing near-tied alternatives at the cutoff to swap."""
+        assert len(actual) == len(expected)
+        actual_ranked = sorted(actual.values(), reverse=True)
+        expected_ranked = sorted(expected.values(), reverse=True)
+        np.testing.assert_allclose(actual_ranked, expected_ranked, rtol=2e-2, atol=5e-2)
+        actual_keys, expected_keys = set(actual), set(expected)
+        for key in actual_keys & expected_keys:
+            cls._assert_scalar_logprob_close(actual[key], expected[key])
+        for key in actual_keys - expected_keys:
+            cls._assert_scalar_logprob_close(actual[key], expected_ranked[-1])
+        for key in expected_keys - actual_keys:
+            cls._assert_scalar_logprob_close(expected[key], actual_ranked[-1])
+
+    @staticmethod
+    def _make_prompt_logprob_request(engine, request_id, prompt, top_n):
+        return DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+                top_n_logprobs=top_n,
+                top_k=1,
+            ),
+            block_size_tokens=engine.context.block_size_tokens,
+            enable_prefix_caching=engine.context.enable_prefix_caching,
+        )
+
+    @classmethod
+    def _run_prompt_logprob_request(cls, engine, request_id, prompt, top_n):
+        """Run one request to completion and return it with its prefill token cost."""
+        request = cls._make_prompt_logprob_request(engine, request_id, prompt, top_n)
+        computed_before = engine.context.lifetime_prefill_token_count
+        engine._add_request(request)
+        for _ in range(32):
+            for output in engine.step_modern()["finished_requests"]:
+                if output.request_id == request_id:
+                    assert not request.cached_prompt_log_probs
+                    cost = engine.context.lifetime_prefill_token_count - computed_before
+                    return output, cost, request
+        pytest.fail(f"prompt-logprob request {request_id} did not finish")
+
+    @classmethod
+    def _assert_prompt_logprob_parity(cls, actual, expected):
+        assert actual.generated_tokens == expected.generated_tokens
+        for field in ("prompt_log_probs", "generated_log_probs"):
+            actual_values, expected_values = getattr(actual, field), getattr(expected, field)
+            assert actual_values is not None and expected_values is not None
+            np.testing.assert_allclose(actual_values, expected_values, rtol=2e-2, atol=5e-2)
+        actual_rows, expected_rows = actual.prompt_top_n_logprobs, expected.prompt_top_n_logprobs
+        assert actual_rows is not None and expected_rows is not None
+        assert len(actual_rows) == len(expected_rows)
+        for actual_row, expected_row in zip(actual_rows, expected_rows):
+            cls._assert_top_n_logprobs_close(actual_row, expected_row)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ("model_provider", "chunked_donor"),
+        [
+            pytest.param("gpt", True, id="gpt-chunked"),
+            pytest.param("hybrid", True, id="hybrid-chunked"),
+            pytest.param("hybrid", False, id="hybrid-unchunked"),
+        ],
+    )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
+    @torch.inference_mode()
+    def test_prompt_logprob_reuse(
+        self, monkeypatch, model_provider, chunked_donor, async_sched_mode
+    ):
+        """Cached prompt scores match a cache-off run while skipping the cached prefill."""
+        if model_provider == "hybrid":
+            skip_if_sequence_packing_not_available("mamba")
+        Utils.initialize_model_parallel()
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "name": f"{model_provider}-prompt-logprob-reuse",
+                "feature": "mamba" if model_provider == "hybrid" else "base",
+                "model_provider": model_provider,
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            block_size = 256
+            prompt_length = 2 * block_size + 1
+            prompt = torch.arange(prompt_length, device=torch.cuda.current_device()) % 99
+            run = self._run_prompt_logprob_request
+
+            oracle_config = self._case_config(case, enable_prefix_caching=False)
+            oracle_config.materialize_only_last_token_logits = False
+            oracle_config.async_sched_mode = AsyncScheduleMode.LEGACY
+            oracle_env = self._build_test_env(oracle_config)
+            oracle_env.engine.controller.tokenizer.detokenize = (
+                lambda tokens, **_: f"tok_{tokens[0]}"
+            )
+            oracle_top5, oracle_cost, _ = run(oracle_env.engine, 0, prompt, 5)
+            oracle_top4, _, _ = run(oracle_env.engine, 1, prompt, 4)
+            oracle_top6, _, _ = run(oracle_env.engine, 2, prompt, 6)
+            assert oracle_cost == prompt_length
+            del oracle_env
+            self._clear_engine_runtime()
+
+            cache_config = self._case_config(case, enable_prefix_caching=True)
+            cache_config.materialize_only_last_token_logits = False
+            cache_config.enable_chunked_prefill = True
+            cache_config.async_sched_mode = async_sched_mode
+            if chunked_donor:
+                cache_config.context_max_tokens = block_size + 8
+            cache_env = self._build_test_env(cache_config)
+            engine = cache_env.engine
+            assert engine.context.config.async_sched_mode == async_sched_mode
+            engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+            allocator = engine.context.kv_block_allocator
+
+            donor, donor_cost, donor_request = run(engine, 10, prompt, 5)
+            assert donor_cost == prompt_length
+            assert (donor_request.finished_chunk_token_count > 0) == chunked_donor
+            self._assert_prompt_logprob_parity(donor, oracle_top5)
+            block_ids = [
+                allocator.kv_hash_to_block_id[block_hash]
+                for block_hash in donor_request.precomputed_block_hashes
+            ]
+            entries = [allocator.block_prompt_logprobs[block_id] for block_id in block_ids]
+            assert len(entries) == 2
+            assert all(entry.valid.all() and entry.top_n == 5 for entry in entries)
+            assert [entry.next_token_id for entry in entries] == [
+                int(prompt[block_size]),
+                int(prompt[2 * block_size]),
+            ]
+
+            # Every prompt token but the last is cached, for hybrid models too: the
+            # final cached row's target is recorded, so the Mamba state restores at
+            # the block boundary instead of replaying the final block.
+            expected_skipped = prompt_length - 1
+            exact, exact_cost, _ = run(engine, 11, prompt, 5)
+            self._assert_prompt_logprob_parity(exact, oracle_top5)
+            assert (exact.num_cached_tokens, exact_cost) == (expected_skipped, 1)
+
+            staged = []
+
+            def stage(uid, payload, **kwargs):
+                staged.append(payload)
+                return SimpleNamespace(response_metadata={"prompt_logprob_test": True})
+
+            with monkeypatch.context() as staging:
+                staging.setattr(engine, "payload_stager", SimpleNamespace(stage=stage))
+                reply = engine._serialize_finished_request(exact, None)
+            assert len(staged) == 1
+            assert staged[0].prompt_log_probs == exact.prompt_log_probs
+            assert len(staged[0].prompt_log_probs) == prompt_length - 1
+            assert reply["payload_offloaded"] and reply["prompt_log_probs"] is None
+
+            # A narrower top-N reuses the cached rows.
+            narrower, narrower_cost, _ = run(engine, 12, prompt, 4)
+            self._assert_prompt_logprob_parity(narrower, oracle_top4)
+            assert (narrower.num_cached_tokens, narrower_cost) == (expected_skipped, 1)
+
+            # Reuse survives memory pressure: pin the cached blocks and leave one free block.
+            pinned = torch.tensor(block_ids, dtype=torch.int32)
+            allocator.block_ref_counts[pinned] += 1
+            filler = None
+            try:
+                filler = allocator.allocate_memory_blocks(
+                    allocator.get_allocatable_count() - 1
+                ).clone()
+                assert allocator.get_allocatable_count() == 1
+                pressure, pressure_cost, _ = run(engine, 13, prompt, 4)
+                self._assert_prompt_logprob_parity(pressure, oracle_top4)
+                assert (pressure.num_cached_tokens, pressure_cost) == (expected_skipped, 1)
+            finally:
+                if filler is not None:
+                    allocator.release_memory_blocks(filler)
+                allocator.release_memory_blocks(pinned)
+
+            # Concurrent requests with different widths both match the cache-off run.
+            for request in (
+                self._make_prompt_logprob_request(engine, 20, prompt, 5),
+                self._make_prompt_logprob_request(engine, 21, prompt, 4),
+            ):
+                engine._add_request(request)
+            outputs = {}
+            for _ in range(32):
+                for output in engine.step_modern()["finished_requests"]:
+                    outputs[output.request_id] = output
+                if outputs.keys() >= {20, 21}:
+                    break
+            self._assert_prompt_logprob_parity(outputs[20], oracle_top5)
+            self._assert_prompt_logprob_parity(outputs[21], oracle_top4)
+
+            # A wider top-N recomputes the prompt and widens the cached rows.
+            wider, wider_cost, _ = run(engine, 14, prompt, 6)
+            self._assert_prompt_logprob_parity(wider, oracle_top6)
+            assert (wider.num_cached_tokens, wider_cost) == (0, prompt_length)
+            assert all(
+                allocator.block_prompt_logprobs[block_id].top_n == 6 for block_id in block_ids
+            )
+            rerun, rerun_cost, _ = run(engine, 15, prompt, 6)
+            self._assert_prompt_logprob_parity(rerun, oracle_top6)
+            assert (rerun.num_cached_tokens, rerun_cost) == (expected_skipped, 1)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+            self._clear_engine_runtime()
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_uncacheable_prompt_top_n_recomputes(self):
+        """A top-N above the cache limit neither reads nor writes cached prompt scores."""
+        Utils.initialize_model_parallel()
+        self._clear_engine_runtime()
+        try:
+            case = {
+                "name": "gpt-uncacheable-prompt-top-n",
+                "feature": "base",
+                "model_provider": "gpt",
+                "policy": PrefixCachingEvictionPolicy.LRU,
+            }
+            prompt_length = 2 * 256 + 1
+            prompt = torch.arange(prompt_length, device=torch.cuda.current_device()) % 99
+            top_n = MAX_CACHED_PROMPT_TOP_N_LOGPROBS + 1
+            run = self._run_prompt_logprob_request
+
+            oracle_config = self._case_config(case, enable_prefix_caching=False)
+            oracle_config.materialize_only_last_token_logits = False
+            oracle_config.vocab_size = 128
+            oracle_env = self._build_test_env(oracle_config)
+            oracle_env.engine.controller.tokenizer.detokenize = (
+                lambda tokens, **_: f"tok_{tokens[0]}"
+            )
+            oracle, _, _ = run(oracle_env.engine, 0, prompt, top_n)
+            del oracle_env
+            self._clear_engine_runtime()
+
+            cache_config = self._case_config(case, enable_prefix_caching=True)
+            cache_config.materialize_only_last_token_logits = False
+            cache_config.vocab_size = 128
+            engine = self._build_test_env(cache_config).engine
+            engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+            run(engine, 10, prompt, 5)
+            allocator = engine.context.kv_block_allocator
+            entries_before = dict(allocator.block_prompt_logprobs)
+
+            result, result_cost, _ = run(engine, 11, prompt, top_n)
+            self._assert_prompt_logprob_parity(result, oracle)
+            assert (result.num_cached_tokens, result_cost) == (0, prompt_length)
+            assert allocator.block_prompt_logprobs == entries_before
+            assert all(len(row) == top_n for row in result.prompt_top_n_logprobs)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
+            self._clear_engine_runtime()
+
     @staticmethod
     def _clear_engine_runtime():
         """Release per-row model and inference allocations before rebuilding."""
@@ -3462,16 +3915,31 @@ class TestMtpPrefixCacheBackOff(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
-    def test_sibling_gives_up_the_last_matched_block(self):
+    @pytest.mark.parametrize("with_prompt_scores", [False, True])
+    def test_sibling_gives_up_the_last_matched_block(self, with_prompt_scores):
         ctx = self._mtp_ctx()
         alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
         p_prompt, s_prompt = self._diverging_pair(ctx, shared_blocks=3)
 
         producer = self._req(ctx, p_prompt)
         ctx.add_request(producer)
         p_blocks = self._block_ids(ctx, 0, 4)
-        ctx.add_request(self._req(ctx, s_prompt, request_id=2))
+        sibling = self._req(ctx, s_prompt, request_id=2)
+        if with_prompt_scores:
+            _store_cached_prompt_logprobs(ctx, p_blocks[:3], p_prompt)
+            sibling.sampling_params = _prompt_logprob_params()
+            match = ctx._compute_prefix_match(sibling, len(s_prompt))
+            # MTP gives up block 2; the scores of the inherited blocks are all reusable.
+            assert match.backed_off_blocks == match.speculative_reserve_blocks == 1
+            assert match.prefix_skip_tokens == 2 * bs
+            assert match.num_blocks_from_pool == 3
+        ctx.add_request(sibling)
         s_blocks = self._block_ids(ctx, 1, 4)
+        if with_prompt_scores:
+            assert sibling.num_cached_tokens == 2 * bs
+            [(start, log_probs, _, _)] = sibling.cached_prompt_log_probs
+            assert start == 0 and len(log_probs) == 2 * bs
 
         # Blocks 0-1 inherited; block 2 was matched but given up, so it is recomputed privately.
         assert s_blocks[:2] == p_blocks[:2]
