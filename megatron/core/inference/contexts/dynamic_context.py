@@ -1118,6 +1118,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.memory_buffer, device="cpu"
             ).pin_memory()
 
+    def _initialize_mha_value_pages(self, block_ids: Sequence[int] | Tensor) -> None:
+        """Zero newly acquired MHA value-cache pages before their first model write."""
+        # Paged attention can read masked V tails; initialize only newly private pages.
+        if self.cache_mla_latent or len(block_ids) == 0:
+            return
+        block_ids = torch.as_tensor(block_ids, dtype=torch.int64, device=self.memory_buffer.device)
+        self.memory_buffer[1].index_fill_(1, block_ids, 0)
+
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
@@ -3543,6 +3551,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
+            self._initialize_mha_value_pages(new_block_ids)
 
         # Track prefix cache hits only after allocation succeeds. Matched blocks
         # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
@@ -4094,6 +4103,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     assert (
                         block_ids is not None and block_ids.numel() == num_new_blocks
                     ), f"failed to allocate {num_new_blocks} blocks for resumed requests"
+                    self._initialize_mha_value_pages(block_ids)
 
                     # Apply updates only to the requests that required a new block
                     relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
@@ -4326,6 +4336,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     raise RuntimeError(
                         "Async scheduling cannot evict requests to allocate new blocks."
                     )
+                self._initialize_mha_value_pages(block_ids)
 
             self.active_token_count = active_request_count * tokens_per_request
             active_token_slice = slice(0, self.active_token_count)

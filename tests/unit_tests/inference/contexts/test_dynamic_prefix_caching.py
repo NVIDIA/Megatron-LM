@@ -535,6 +535,11 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[s0].item() == 0
         assert alloc.block_ref_counts[s1].item() == 0
         assert alloc.block_ref_counts[sx].item() == 0
+        untouched_block_id = next(iter(set(range(alloc.pool_size - 1)) - {s0, s1, sx}))
+        ctx.memory_buffer[1, :, s0] = 1
+        ctx.memory_buffer[1, :, s1] = 2
+        ctx.memory_buffer[1, :, sx] = float("nan")
+        ctx.memory_buffer[1, :, untouched_block_id] = 4
 
         # Force a full pool: the new block for H2 can only come from eviction.
         alloc.pool_avail = 0
@@ -560,6 +565,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_hashes[s0].item() == h0
         assert alloc.block_hashes[s1].item() == h1
         assert alloc.block_hashes[sx].item() == h2
+        assert torch.all(ctx.memory_buffer[1, :, s0] == 1)
+        assert torch.all(ctx.memory_buffer[1, :, s1] == 2)
+        assert torch.count_nonzero(ctx.memory_buffer[1, :, sx]) == 0
+        assert torch.all(ctx.memory_buffer[1, :, untouched_block_id] == 4)
         # Parent bookkeeping is stored as resolved block ids: S1's parent is S0
         # and SX's parent is S1 along the H0 -> H1 -> H2 chain.
         assert alloc.block_parent_id[s1].item() == s0
@@ -666,6 +675,12 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[original_block_id].item() == 1
 
         cached_block_id, cached_hash = self._fill_pool_with_one_evictable_block(ctx)
+        untouched_block_id = next(
+            iter(set(range(alloc.pool_size - 1)) - {original_block_id, cached_block_id})
+        )
+        ctx.memory_buffer[1, :, original_block_id] = 2
+        ctx.memory_buffer[1, :, cached_block_id] = float("nan")
+        ctx.memory_buffer[1, :, untouched_block_id] = 4
 
         result = ctx.update_requests(
             torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32),
@@ -682,6 +697,9 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert new_block_id != original_block_id
         assert cached_hash not in alloc.kv_hash_to_block_id
         assert alloc.block_hashes[new_block_id].item() == -1
+        assert torch.all(ctx.memory_buffer[1, :, original_block_id] == 2)
+        assert torch.count_nonzero(ctx.memory_buffer[1, :, new_block_id]) == 0
+        assert torch.all(ctx.memory_buffer[1, :, untouched_block_id] == 4)
         assert alloc.block_ref_counts[original_block_id].item() == 1
         assert alloc.block_ref_counts[new_block_id].item() == 1
         assert alloc.pool_avail == 0
@@ -1716,6 +1734,10 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         prompt = self._prompt(bs * 4)
 
         ctx.add_request(self._req(ctx, prompt.clone()))
+        shared_blocks = self._block_ids(ctx, 0, 4)
+        for value, block_id in enumerate(shared_blocks, start=1):
+            ctx.memory_buffer[1, :, block_id] = value
+        shared_values = ctx.memory_buffer[1, :, shared_blocks].clone()
 
         # Chunk 1 stops at token 40, i.e. 8 tokens into block 1, leaving
         # `finished_chunk_token_count` unaligned for chunk 2. Both blocks it spans
@@ -1741,6 +1763,7 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         # Every block this request holds is shared with the first request.
         for block_id in self._block_ids(ctx, 1, 4):
             assert ctx.kv_block_allocator.block_ref_counts[block_id].item() == 2
+        assert torch.equal(ctx.memory_buffer[1, :, shared_blocks], shared_values)
 
 
 @pytest.mark.internal

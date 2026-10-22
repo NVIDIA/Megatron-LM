@@ -4,6 +4,7 @@
 
 import asyncio
 from collections import deque
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -12,6 +13,7 @@ import pytest
 import torch
 
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
@@ -163,7 +165,11 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             kv_block_allocator=_KvAllocator(),
             mamba_slot_allocator=None,
             mamba_metadata=_MambaMetadata(available) if hybrid else None,
-            memory_buffer=torch.empty(1),
+            memory_buffer=torch.full((2, 1, 256, 4, 1, 1), 7.0),
+            cache_mla_latent=False,
+        )
+        self.context._initialize_mha_value_pages = partial(
+            DynamicInferenceContext._initialize_mha_value_pages, self.context
         )
         self._kv_transfer_agent = _TransferAgent()
         if hybrid:
@@ -1533,6 +1539,9 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine._kv_transfer_agent.calls == [(kv_meta, [102], [12])]
     assert pending.local_blocks == [10, 11, 12]
     assert pending.cached_prefix_block_count == 2
+    values = engine.context.memory_buffer[1, :, pending.continuation_blocks]
+    assert pending.continuation_blocks == [13] and torch.count_nonzero(values) == 0
+    assert torch.count_nonzero(engine.context.memory_buffer != 7) == values.numel()
     with mock.patch(
         "megatron.core.inference.disaggregation.inference_state_handoff.admit_prefilled_decode"
     ) as admit:

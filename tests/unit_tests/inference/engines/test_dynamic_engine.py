@@ -5757,6 +5757,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )
 
+        if kv_cache_management_mode == "recompute":
+            allocator = context.kv_block_allocator
+            next_block_id = allocator.block_bag[allocator.pool_avail - 1].item()
+            context.memory_buffer[1, :, next_block_id] = float("nan")
+            context.add_request(env.requests[0])
+            assert context.request_last_kv_block_id[0].item() == next_block_id
+            assert torch.count_nonzero(context.memory_buffer[1, :, next_block_id]) == 0
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

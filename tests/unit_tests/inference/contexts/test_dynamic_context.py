@@ -1271,6 +1271,7 @@ class TestDynamicContext:
             last_block_offsets=last_offsets,
         )
         original_tokens = ctx.token_to_input_ids[:active_request_count].clone()
+        ctx.memory_buffer[1].fill_(5)
 
         ctx.prepare_requests()
 
@@ -1291,6 +1292,9 @@ class TestDynamicContext:
         if last_offsets and last_offsets[0] == ctx.block_size_tokens - 1:
             assert ctx.request_kv_block_counts[0] == 2
             assert ctx.token_to_block_idx[0] == ctx.request_last_kv_block_id[0]
+            new_value_page = ctx.memory_buffer[1, :, ctx.request_last_kv_block_id[0].item()]
+            assert torch.count_nonzero(new_value_page) == 0
+            assert torch.count_nonzero(ctx.memory_buffer[1] != 5) == new_value_page.numel()
 
     @pytest.mark.internal
     @rounder_override(8)

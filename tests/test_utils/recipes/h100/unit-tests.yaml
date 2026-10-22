@@ -51,6 +51,9 @@ spec:
     # test_gtp_muon.py/test_gtp_muon_qkv.py, and will skip here instead).
     if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" ]]; then
         export GPUS_PER_NODE=4
+    elif [[ "$BUCKET" == "tests/unit_tests/inference/engines/test_batch_invariant_handoff.py" ]]; then
+        # One prefill worker and one decode worker exchange a real NIXL handoff.
+        export GPUS_PER_NODE=2
     fi
 
     if [[ "$TAG" == "latest" ]]; then
@@ -83,6 +86,15 @@ spec:
     fi
 
 products:
+  # Run the two-worker handoff separately; the broad inference bucket excludes it.
+  - test_case: [tests/unit_tests/inference/engines/test_batch_invariant_handoff.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
   # This file runs in isolated one-rank processes; other buckets exclude it.
   - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
     products:

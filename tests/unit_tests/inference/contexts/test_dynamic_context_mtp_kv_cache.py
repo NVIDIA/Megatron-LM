@@ -1280,10 +1280,13 @@ class TestMtpSpareBlockLifecycle:
         with pytest.raises(RuntimeError, match="cannot pause requests"):
             context.prepare_requests()
         torch.testing.assert_close(context.request_kv_length_offsets, before)
+        context.memory_buffer[1, :, held[0]].fill_(float("nan"))
         context.kv_block_allocator.release_memory_blocks(held[:1])
         assert context.can_prepare_requests()
         context.prepare_requests()
         assert context.request_kv_block_counts[0] == 2
+        assert context.request_to_kv_block_ids[0, 1] == held[0]
+        assert torch.count_nonzero(context.memory_buffer[1, :, held[0]]) == 0
         self._assert_main_token_mapping(context)
         context.kv_block_allocator.release_memory_blocks(held[1:])
 
