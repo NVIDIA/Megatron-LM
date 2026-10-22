@@ -1365,9 +1365,7 @@ def save_checkpoint(
                     iteration=iteration,
                     return_base_dir=True,
                 )
-                from megatron.training.utils.checkpoint_utils import (
-                    get_checkpoint_run_config_filename,
-                )
+                from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 
                 run_config_filename = get_checkpoint_run_config_filename(checkpoint_name)
 
@@ -3419,8 +3417,6 @@ def load_checkpoint(
         # architecture-preserving load. Keep every other resume-time argument
         # compatibility check.
         skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
-        if checkpoint_config is None:
-            checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
         check_checkpoint_args(
             checkpoint_args,
             skip_args=skip_args,
