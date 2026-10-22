@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Ownership and weight-layout contracts independent of full model training."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -173,21 +174,135 @@ def test_checkpoint_load_rejects_live_or_replaced_owners_before_expert_mutation(
         torch.testing.assert_close(owner, torch.zeros_like(owner))
 
 
-def test_completion_reuses_buffers_and_rejects_live_storage_changes():
+def _functional_bridge(monkeypatch):
+    import dist_moe
+
     _, module = _module()
     for owner in module.owners:
         owner.main_grad = torch.full_like(owner, 0.25, dtype=torch.float32)
     module._gradient_binding = tuple(runtime.storage_signature(p.main_grad) for p in module.owners)
     module._weight_binding = module._weight_signature()
+    module._prepared = tuple(owner.detach() for owner in module.owners)
+    module.context = object()
     module._live = True
-    sentinels = module._complete(module.owners)
-    assert not module._live
-    for owner, sentinel in zip(module.owners, sentinels):
-        assert owner.grad_added_to_main_grad and sentinel.data_ptr() == owner.data_ptr()
-        torch.testing.assert_close(owner.main_grad, torch.full_like(owner.main_grad, 0.25))
-    module.owners[0].main_grad = torch.zeros_like(module.owners[0].main_grad)
-    with pytest.raises(RuntimeError, match="main_grad storage changed"):
-        module._complete(module.owners)
+
+    def forward(x, ids, scores, w13, w2, context, *, save_for_backward):
+        assert w13 is module._prepared[0] and w2 is module._prepared[1]
+        assert context is module.context
+        assert not torch.is_grad_enabled()
+        return torch.ones_like(x), (x, scores) if save_for_backward else None
+
+    def backward(state, dy, *, grad_w13, grad_w2):
+        assert grad_w13 is module.owners[0].main_grad
+        assert grad_w2 is module.owners[1].main_grad
+        grad_w13.add_(1)
+        grad_w2.add_(2)
+        return dy * 2, torch.full_like(state[1], 0.5)
+
+    functional = SimpleNamespace(
+        forward=Mock(side_effect=forward), backward=Mock(side_effect=backward)
+    )
+    monkeypatch.setattr(dist_moe, "functional", functional, raising=False)
+    return module, functional
+
+
+@pytest.mark.parametrize("input_grad", [False, True])
+@pytest.mark.parametrize("pack_saved_tensors", [False, True])
+def test_autograd_bridge_accumulates_main_grad_and_completes_each_owner(
+    monkeypatch, input_grad, pack_saved_tensors
+):
+    module, functional = _functional_bridge(monkeypatch)
+    hooks, counts = [], [0, 0]
+    pointers = [owner.main_grad.data_ptr() for owner in module.owners]
+    for index, owner in enumerate(module.owners):
+
+        def finish(param, index=index):
+            assert param is module.owners[index] and param.grad_added_to_main_grad
+            counts[index] += 1
+            # Native DDP discards the hook-only gradient without adding its values.
+            param.grad = None
+
+        hooks.append(owner.register_post_accumulate_grad_hook(finish))
+    for microbatch in range(3):
+        module._live = True
+        for owner in module.owners:
+            owner.grad_added_to_main_grad = False
+        x = torch.ones(2, 256, requires_grad=input_grad)
+        scores = torch.ones(2, 2, requires_grad=input_grad)
+        ids = torch.zeros(2, 2, dtype=torch.int32)
+        with (
+            torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor.detach(), lambda x: x)
+            if pack_saved_tensors
+            else nullcontext()
+        ):
+            output = runtime._DistMoEAutograd.apply(module, x, ids, scores, *module.owners)
+        assert output.requires_grad  # Native owners alone must retain the backward edge.
+        output.sum().backward(retain_graph=microbatch == 2)
+        assert not module._live and counts == [microbatch + 1] * 2
+        if input_grad:
+            torch.testing.assert_close(x.grad, torch.full_like(x, 2))
+            torch.testing.assert_close(scores.grad, torch.full_like(scores, 0.5))
+        for index, owner in enumerate(module.owners):
+            assert owner.grad is None and owner.main_grad.data_ptr() == pointers[index]
+            torch.testing.assert_close(
+                owner.main_grad,
+                torch.full_like(owner.main_grad, 0.25 + (index + 1) * (microbatch + 1)),
+            )
+        if microbatch == 2:
+            with pytest.raises(RuntimeError, match="one backward"):
+                output.sum().backward()
+    assert functional.forward.call_count == functional.backward.call_count == 3
+    for hook in hooks:
+        hook.remove()
+
+
+def test_autograd_bridge_no_grad_does_not_retain_training_state(monkeypatch):
+    module, functional = _functional_bridge(monkeypatch)
+    module._live = False
+    with torch.no_grad():
+        output = runtime._DistMoEAutograd.apply(
+            module,
+            torch.ones(2, 256),
+            torch.zeros(2, 2, dtype=torch.int32),
+            torch.ones(2, 2),
+            *module.owners,
+        )
+    assert not output.requires_grad and not module._live
+    assert functional.forward.call_args.kwargs == {"save_for_backward": False}
+    functional.backward.assert_not_called()
+
+
+@pytest.mark.parametrize("mutation", ["weight", "owner", "main_grad", "input"])
+def test_autograd_bridge_rejects_mutations_before_kernel_backward(monkeypatch, mutation):
+    module, functional = _functional_bridge(monkeypatch)
+    x = torch.ones(2, 256, requires_grad=True)
+    output = runtime._DistMoEAutograd.apply(
+        module, x, torch.zeros(2, 2, dtype=torch.int32), torch.ones(2, 2), *module.owners
+    )
+    with torch.no_grad():
+        if mutation == "weight":
+            module.owners[0].add_(1)
+        elif mutation == "owner":
+            module.routed_fc1_weight = torch.nn.Parameter(module.owners[0].clone())
+        elif mutation == "main_grad":
+            module.owners[0].main_grad = torch.zeros_like(module.owners[0].main_grad)
+        else:
+            x.add_(1)
+    with pytest.raises(RuntimeError, match="storage|version"):
+        output.sum().backward()
+    functional.backward.assert_not_called()
+    assert module._live
+
+
+def test_autograd_bridge_rejects_higher_order_before_kernel_backward(monkeypatch):
+    module, functional = _functional_bridge(monkeypatch)
+    x = torch.ones(2, 256, requires_grad=True)
+    output = runtime._DistMoEAutograd.apply(
+        module, x, torch.zeros(2, 2, dtype=torch.int32), torch.ones(2, 2), *module.owners
+    )
+    with pytest.raises(RuntimeError, match="first-order"):
+        torch.autograd.grad(output.sum(), x, create_graph=True)
+    functional.backward.assert_not_called()
 
 
 @pytest.mark.parametrize("overlap", [False, True])
