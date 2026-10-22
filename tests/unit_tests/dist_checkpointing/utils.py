@@ -329,6 +329,9 @@ def setup_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
         model = get_model(
             partial(
                 initialize_fn,
@@ -343,7 +346,6 @@ def setup_model_and_optimizer(
             )
         )
 
-    _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
@@ -466,6 +468,9 @@ def setup_moe_model_and_optimizer(
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # get_model reads the layer-wise flag from the run config to tag params for DDP
+        # buffer routing, so the run config must be in sync before the model is built.
+        _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
         model = get_model(
             partial(
                 initialize_fn,
@@ -482,7 +487,6 @@ def setup_moe_model_and_optimizer(
             )
         )
 
-    _sync_run_config_optimizer_flags(ddp_use_dist_opt, ddp_use_layer_wise)
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
