@@ -1662,12 +1662,28 @@ class ChainedOptimizer(MegatronOptimizer):
         # a non fully-reshardable format. For backward compatibility we also add it
         # if `chained_optim_avoid_prefix` is False.
         from .distrib_optimizer import DistributedOptimizer
+        from .fully_sharded_optimizer import FullyShardedOptimizer
 
         should_add_prefix = (
             "distrib_optim_sharding_type" in metadata
             and metadata["distrib_optim_sharding_type"]
             not in DistributedOptimizer.checkpoint_fully_reshardable_formats
         ) or not metadata.get('chained_optim_avoid_prefix', False)
+
+        if self.chained_optimizers and all(
+            isinstance(optimizer, FullyShardedOptimizer) for optimizer in self.chained_optimizers
+        ):
+            # FSDP checkpoint transforms operate on one FQN-keyed state mapping.
+            # Muon and Adam own disjoint parameters, so their states can share it.
+            self._synchronize_steps()
+            state: ShardedStateDict = {"state": {}, "param_to_group_meta": {}}
+            for optimizer in self.chained_optimizers:
+                optimizer_state = optimizer.sharded_state_dict(
+                    model_sharded_state_dict, is_loading, **kwargs
+                )
+                for key in state:
+                    state[key].update(optimizer_state[key])
+            return state
 
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].sharded_state_dict(
@@ -1686,6 +1702,12 @@ class ChainedOptimizer(MegatronOptimizer):
             return sharded_state_dict
 
     def load_state_dict(self, state_dict):
+        if isinstance(state_dict, dict) and "param_to_group_meta" in state_dict:
+            # Each FSDP optimizer selects its own FQNs from the combined mapping.
+            for optimizer in self.chained_optimizers:
+                optimizer.load_state_dict(state_dict)
+            self._synchronize_steps()
+            return
         # If there is only one optimizer, we read the state dict as a single optimizer.
         if len(self.chained_optimizers) == 1:
             self.chained_optimizers[0].load_state_dict(state_dict)
@@ -1857,7 +1879,12 @@ class ChainedOptimizer(MegatronOptimizer):
         return self._step()
 
     def grads_states_parallel_group_is_shared(self):
-        """Check if all optimizers share the same gradient statistics parallel group."""
+        """Whether all optimizers' gradient statistics can share one reduction."""
+        if any(
+            getattr(optimizer, 'requires_individual_grad_stats', False)
+            for optimizer in self.chained_optimizers
+        ):
+            return False
         reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
         return all(
             optimizer.get_grad_stats_parallel_group() == reference_group
@@ -1999,15 +2026,7 @@ class ChainedOptimizer(MegatronOptimizer):
             if len(parameters) == 0:
                 continue
 
-            use_fsdp_decoupled_grad = (
-                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                optimizer.config.use_precision_aware_optimizer
-                and getattr(parameters[0], "__fsdp_param__", False)
-            )
-            use_decoupled_grad = (
-                optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                or use_fsdp_decoupled_grad
-            )
+            use_decoupled_grad = self._uses_decoupled_grad(parameters)
 
             main_params = []
             params_by_grad_norm_group = {}
