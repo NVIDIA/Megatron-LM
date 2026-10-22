@@ -1708,7 +1708,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 flash_composed_forest_attention_cp,
             )
 
-            softmax_scale = self.config.softmax_scale or query.shape[-1] ** -0.5
+            softmax_scale = self.get_softmax_scale(query)
             with core_attn_manager as query:
                 if self.pg_collection.cp.size() > 1:
                     core_attn_out = flash_composed_forest_attention_cp(
