@@ -568,13 +568,17 @@ class ModelParallelConfig:
             assert self.max_seqlen_per_dp_cp_rank is not None
             if self.pad_packed_seq_alignment != "max":
                 assert 0 < self.pad_packed_seq_alignment <= self.max_seqlen_per_dp_cp_rank
+            alignment = (
+                self.max_seqlen_per_dp_cp_rank
+                if self.pad_packed_seq_alignment == "max"
+                else self.pad_packed_seq_alignment
+            )
             if self.context_parallel_size > 1:
-                alignment = (
-                    self.max_seqlen_per_dp_cp_rank
-                    if self.pad_packed_seq_alignment == "max"
-                    else self.pad_packed_seq_alignment
-                )
                 assert alignment % 2 == 0, "Packed padding must preserve zigzag CP alignment."
+            if self.sequence_parallel:
+                assert (
+                    alignment % self.tensor_model_parallel_size == 0
+                ), "Packed padding must preserve sequence-parallel TP divisibility."
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

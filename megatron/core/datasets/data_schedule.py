@@ -921,23 +921,25 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
 
-    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
-    # get the correct result.
-    # TODO: Revert this workaround once TE fixes the issue.
+    pad_to_capacity = config is not None and (
+        config.pad_packed_seq_alignment is not None
+        or getattr(config, "thd_max_packed_sequences", None) is not None
+    )
+    # Keep the legacy TE workaround outside the fixed-capacity path. Graph padding
+    # needs the original logical offsets so internal padding and dummy tails never
+    # become real tokens in attention or indexer-loss metadata.
+    logical_cu_seqlens = cu_seqlens if pad_to_capacity else cu_seqlens_padded
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=logical_cu_seqlens,
+        cu_seqlens_kv=logical_cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
     )
 
-    if config is not None and (
-        config.pad_packed_seq_alignment is not None
-        or getattr(config, "thd_max_packed_sequences", None) is not None
-    ):
+    if pad_to_capacity:
         alignment = config.pad_packed_seq_alignment
         local_capacity = padding_mask.shape[-1]
         if alignment == "max":

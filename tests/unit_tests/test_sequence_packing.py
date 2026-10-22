@@ -103,6 +103,47 @@ def test_packed_graph_scheduler_reserves_dummy_document():
     assert [len(group[0]) for group in groups] == [2, 2, 1]
 
 
+@pytest.mark.parametrize("alignment,metadata_capacity", [("max", 4), (None, 4), (None, None)])
+def test_scheduler_loader_preserves_graph_logical_offsets(
+    monkeypatch, alignment, metadata_capacity
+):
+    from megatron.core.datasets import data_schedule
+
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    groups = SimpleNamespace(tp=group, pp=group, cp=group)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
+    monkeypatch.setattr(data_schedule, "broadcast_scalars", lambda values, *args, **kwargs: values)
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *args, **kwargs: None)
+    batch = {
+        "tokens": torch.arange(12, dtype=torch.int64),
+        "labels": torch.arange(12, dtype=torch.int64),
+        "position_ids": torch.arange(12, dtype=torch.int64),
+        "loss_mask": torch.ones(12),
+        "cu_seqlens": torch.tensor([0, 3, 8], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 4, 12], dtype=torch.int32),
+        "max_seqlen": 8,
+    }
+    config = SimpleNamespace(
+        pad_packed_seq_alignment=alignment,
+        thd_max_packed_sequences=metadata_capacity,
+        max_seqlen_per_dp_cp_rank=16,
+    )
+    tokens, _, loss_mask, _, _, params, padding_mask = get_batch_on_this_rank_for_sequence_packing(
+        iter([batch]), pg_collection=groups, config=config
+    )
+    assert tokens.shape[-1] == (16 if alignment == "max" else 12)
+    assert (~padding_mask).sum().item() == loss_mask.sum().item() == 8
+    if metadata_capacity is not None:
+        assert params.cu_seqlens_q.tolist() == params.cu_seqlens_kv.tolist() == [0, 3, 8, 8, 8]
+        end = 16 if alignment == "max" else 12
+        assert params.cu_seqlens_q_padded.tolist() == [0, 4, 12, end, end]
+        assert torch.equal(params.cu_seqlens_q_padded, params.cu_seqlens_kv_padded)
+    else:
+        # Preserve the existing TE workaround when graph-padding options are unused.
+        assert params.cu_seqlens_q.tolist() == params.cu_seqlens_kv.tolist() == [0, 4, 12]
+
+
 class MockVariableLengthSequencePackingDataIterator:
     """
     Mock data iterator for testing get_batch_on_this_rank_for_sequence_packing.
