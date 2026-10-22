@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import List
 
 import requests
+from codeowner_approval_policy import get_exempt_owners
 from github import Github
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -94,8 +95,7 @@ class PRReviewTracker:
         try:
             changed_files = [f.filename for f in pr.get_files()]
         except Exception as e:
-            logger.warning(f"Could not get changed files for PR #{pr.number}: {e}")
-            return required_teams
+            raise RuntimeError(f"Could not get changed files for PR #{pr.number}") from e
 
         for filepath in changed_files:
             matched_teams = None
@@ -126,8 +126,7 @@ class PRReviewTracker:
                     m.login for m in self.org.get_team_by_slug(slug).get_members()
                 }
             except Exception as e:
-                logger.warning(f"Could not get members for team {slug}: {e}")
-                self._team_cache[slug] = set()
+                raise RuntimeError(f"Could not get members for team {slug}") from e
         return self._team_cache[slug]
 
     def _get_teams_members(self, slugs):
@@ -168,14 +167,18 @@ class PRReviewTracker:
                     "variables": {"owner": owner, "name": name, "number": pr_number},
                 },
                 headers={"Authorization": f"Bearer {self.token}"},
+                timeout=30,
             )
             resp.raise_for_status()
-            nodes = resp.json()["data"]["repository"]["pullRequest"]["latestReviews"]["nodes"]
+            payload = resp.json()
+            if payload.get("errors"):
+                raise RuntimeError("GitHub returned errors while fetching latest reviews")
+            nodes = payload["data"]["repository"]["pullRequest"]["latestReviews"]["nodes"]
             for node in nodes:
                 if node["author"]:
                     reviews[node["author"]["login"]] = node["state"]
         except Exception as e:
-            logger.warning(f"Could not get latest reviews for PR #{pr_number}: {e}")
+            raise RuntimeError(f"Could not get latest reviews for PR #{pr_number}") from e
         logger.info(f"Active reviews: {reviews}")
         return reviews
 
@@ -201,13 +204,19 @@ class PRReviewTracker:
             logger.info(f"PR #{pr.number}: no CODEOWNERS teams matched changed files. Skipping.")
             return
 
+        exempt_owners = get_exempt_owners(pr.user.login)
+        exempt_teams = {team for team in required_teams if f"@NVIDIA/{team}" in exempt_owners}
+        if exempt_teams:
+            logger.info(f"PR author {pr.user.login} is exempt from team approvals: {exempt_teams}")
+        required_teams -= exempt_teams
+
         expert_required = required_teams - self.EXCLUDED_TEAMS
         final_required = required_teams & self.EXCLUDED_TEAMS
         logger.info(f"Expert teams required: {expert_required}")
         logger.info(f"Final teams required: {final_required}")
 
-        # 3. Check which required teams still need approval (at least one member must approve)
-        #    If _get_team_members fails (returns {}), the team stays pending — conservative.
+        # 3. Check which required teams still need approval (at least one member must approve).
+        #    Failed team lookups stop evaluation before any labels are changed.
         pending_expert_teams = set()
         for team in expert_required:
             members = self._get_team_members(team)
