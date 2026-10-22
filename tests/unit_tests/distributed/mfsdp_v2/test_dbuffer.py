@@ -13,12 +13,29 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import layout_builder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     RowAtomic,
+    ShardLayout,
     TensorAtomic,
 )
+
+
+def _row_atomic_layout(tensors, mesh, shard_layout, *, block_size=1):
+    return layout_builder.build_row_atomic_layout(
+        (tensor.shape for tensor in tensors),
+        dp_size=mesh.size(),
+        block_size=block_size,
+        shard_layout=shard_layout,
+    )
+
+
+def _assert_layout_matches_shard_layout(layout, tensors, shard_layout) -> None:
+    """Padded layouts have equal segments; unpadded ones store exactly the data."""
+    if shard_layout is ShardLayout.PADDED:
+        assert layout.has_equal_shard_sizes
+    else:
+        assert layout.size == sum(tensor.numel() for tensor in tensors)
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -34,7 +51,10 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_tensor_view(index), tensor)
 
 
-def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup, shard_layout):
     """BlockAtomic keeps every local tensor shard aligned to its configured row block."""
     if distributed_setup.world_size < 2:
         pytest.skip("Requires at least 2 ranks.")
@@ -46,14 +66,9 @@ def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
         torch.arange(24, dtype=torch.bfloat16, device=distributed_setup.device).reshape(4, 6),
         torch.arange(32, dtype=torch.bfloat16, device=distributed_setup.device).reshape(8, 4),
     ]
-    block_atomic = DBuffer.distribute_tensors(
-        tensors,
-        mesh,
-        [BlockAtomic(2)],
-        layout=layout_builder.build_for_row_atomic(
-            (tensor.shape for tensor in tensors), dp_size=mesh.size(), block_size=2
-        ),
-    )
+    layout = _row_atomic_layout(tensors, mesh, shard_layout, block_size=2)
+    _assert_layout_matches_shard_layout(layout, tensors, shard_layout)
+    block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)], layout=layout)
 
     assert all(block_atomic.get_tensor_view(index).shape[0] % 2 == 0 for index in range(2))
 
@@ -328,13 +343,18 @@ def test_distribute_tensors_detaches_and_contiguizes_inputs(distributed_setup):
     )
 
 
-def test_sharded_allgather_round_trip(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_sharded_allgather_round_trip(distributed_setup, shard_layout):
     """Sharded buffers round-trip through all-gather as contiguous tensor fragments."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    layout = _row_atomic_layout(tensors, mesh, shard_layout)
+    _assert_layout_matches_shard_layout(layout, tensors, shard_layout)
 
-    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [RowAtomic()])
-    layout = sharded_buffer.layout
+    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [RowAtomic()], layout=layout)
+    assert sharded_buffer.local_buffer.numel() == layout.rank_size(mesh.get_local_rank())
     for index, tensor in enumerate(tensors):
         local_tensor = sharded_buffer.get_tensor_view(index)
         assert local_tensor.shape[1:] == tensor.shape[1:]
@@ -343,20 +363,27 @@ def test_sharded_allgather_round_trip(distributed_setup):
     replicated_buffer = sharded_buffer.allgather(0)
 
     assert replicated_buffer.layout == layout
+    assert replicated_buffer.local_buffer.numel() == layout.size
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-def test_sharded_allgather_into_existing_buffer(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_sharded_allgather_into_existing_buffer(distributed_setup, shard_layout):
     """Sharded buffers can all-gather directly into a preallocated replicated buffer."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
-    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [RowAtomic()])
+    sharded_buffer = DBuffer.distribute_tensors(
+        tensors, mesh, [RowAtomic()], layout=_row_atomic_layout(tensors, mesh, shard_layout)
+    )
     destination = DBuffer.empty(
         mesh=mesh,
         placements=[Replicate()],
         tensor_shapes=sharded_buffer.layout.tensor_shapes,
         dtype=sharded_buffer.dtype,
         device=sharded_buffer.local_buffer.device,
+        shard_layout=shard_layout,
     )
     destination_data_ptr = destination.local_buffer.data_ptr()
 
@@ -367,12 +394,17 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     _assert_dbuffer_local_tensors_close(destination, tensors)
 
 
-def test_replicate_view_round_trip(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_replicate_view_round_trip(distributed_setup, shard_layout):
     """Replicated buffers view sharded local storage and all-gather back."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
 
-    replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+    replicated_buffer = DBuffer.distribute_tensors(
+        tensors, mesh, [Replicate()], layout=_row_atomic_layout(tensors, mesh, shard_layout)
+    )
     sharded_buffer = replicated_buffer.view([RowAtomic()])
     redistribute_destination = DBuffer.empty(
         mesh=mesh,
@@ -380,6 +412,7 @@ def test_replicate_view_round_trip(distributed_setup):
         tensor_shapes=replicated_buffer.layout.tensor_shapes,
         dtype=replicated_buffer.dtype,
         device=replicated_buffer.local_buffer.device,
+        shard_layout=shard_layout,
     )
     redistributed_sharded_buffer = replicated_buffer.redistribute(
         [RowAtomic()], out=redistribute_destination
@@ -388,8 +421,7 @@ def test_replicate_view_round_trip(distributed_setup):
     assert sharded_buffer.placements == (RowAtomic(),)
     assert redistributed_sharded_buffer is redistribute_destination
     assert redistributed_sharded_buffer.placements == (RowAtomic(),)
-    expected_sharded_local_numel = replicated_buffer.layout.size // distributed_setup.world_size
-    assert sharded_buffer.offset == distributed_setup.rank * expected_sharded_local_numel
+    assert sharded_buffer.offset == replicated_buffer.layout.rank_to_offset[distributed_setup.rank]
     assert (
         sharded_buffer.local_buffer.untyped_storage()
         is replicated_buffer.local_buffer.untyped_storage()
@@ -456,7 +488,10 @@ def test_partial_allreduce_average(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-def test_partial_reduce_scatter_to_row_atomic(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_partial_reduce_scatter_to_row_atomic(distributed_setup, shard_layout):
     """Partial buffers reduce-scatter into sharded buffers."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     rank_scale = float(distributed_setup.rank + 1)
@@ -464,8 +499,9 @@ def test_partial_reduce_scatter_to_row_atomic(distributed_setup):
         torch.full((5, 3), rank_scale, dtype=torch.float32, device=distributed_setup.device),
         torch.full((4,), rank_scale * 10, dtype=torch.float32, device=distributed_setup.device),
     ]
-    partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial()])
-    layout = partial_buffer.layout
+    layout = _row_atomic_layout(tensors, mesh, shard_layout)
+    _assert_layout_matches_shard_layout(layout, tensors, shard_layout)
+    partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial()], layout=layout)
 
     destination = partial_buffer.view([RowAtomic()])
     sharded_buffer = partial_buffer.reduce_scatter(0, RowAtomic(), out=destination)
@@ -474,6 +510,7 @@ def test_partial_reduce_scatter_to_row_atomic(distributed_setup):
     assert sharded_buffer is destination
     assert sharded_buffer.placements == (RowAtomic(),)
     assert sharded_buffer.layout == layout
+    assert sharded_buffer.local_buffer.numel() == layout.rank_size(mesh.get_local_rank())
     assert (
         sharded_buffer.local_buffer.untyped_storage()
         is partial_buffer.local_buffer.untyped_storage()
@@ -487,7 +524,10 @@ def test_partial_reduce_scatter_to_row_atomic(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
-def test_partial_reduce_scatter_to_row_atomic_average(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_partial_reduce_scatter_to_row_atomic_average(distributed_setup, shard_layout):
     """Partial buffers can reduce-scatter with AVG."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     rank_scale = float(distributed_setup.rank + 1)
@@ -495,8 +535,8 @@ def test_partial_reduce_scatter_to_row_atomic_average(distributed_setup):
         torch.full((5, 3), rank_scale, dtype=torch.float32, device=distributed_setup.device),
         torch.full((4,), rank_scale * 10, dtype=torch.float32, device=distributed_setup.device),
     ]
-    partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("avg")])
-    layout = partial_buffer.layout
+    layout = _row_atomic_layout(tensors, mesh, shard_layout)
+    partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial("avg")], layout=layout)
 
     sharded_buffer = partial_buffer.reduce_scatter(0, RowAtomic())
     replicated_buffer = sharded_buffer.allgather(0)
@@ -597,7 +637,10 @@ def test_get_dtensor_from_sharded_buffer(distributed_setup):
     assert dtensor.placements == (Shard(0),)
 
 
-def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup, shard_layout):
     """A 2D mesh can replicate on one axis and use RowAtomic on the other."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
@@ -608,14 +651,21 @@ def test_2d_mesh_replicate_row_atomic_round_trip(distributed_setup):
         (2, distributed_setup.world_size // 2),
         mesh_dim_names=("replicate", "row_atomic"),
     )
-
-    sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), RowAtomic()])
+    sharded_buffer = DBuffer.distribute_tensors(
+        tensors,
+        mesh,
+        [Replicate(), RowAtomic()],
+        layout=_row_atomic_layout(tensors, mesh, shard_layout),
+    )
     replicated_buffer = sharded_buffer.allgather(1)
 
     _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
 
 
-def test_2d_mesh_shards_across_all_ranks(distributed_setup):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_2d_mesh_shards_across_all_ranks(distributed_setup, shard_layout):
     """Multiple RowAtomic axes shard local storage by the product of their mesh sizes."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
@@ -626,24 +676,42 @@ def test_2d_mesh_shards_across_all_ranks(distributed_setup):
         (2, distributed_setup.world_size // 2),
         mesh_dim_names=("dp_outer", "dp_inner"),
     )
-    fully_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [RowAtomic(), RowAtomic()])
+    layout = _row_atomic_layout(tensors, mesh, shard_layout)
+    fully_sharded_buffer = DBuffer.distribute_tensors(
+        tensors, mesh, [RowAtomic(), RowAtomic()], layout=layout
+    )
 
     assert fully_sharded_buffer.layout.tensor_shapes == tuple(tensor.shape for tensor in tensors)
-    expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
-    expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
-    expected_offset = (
-        mesh.get_local_rank(1) * expected_inner_axis_shard_numel
-        + mesh.get_local_rank(0) * expected_local_numel
-    )
-    assert fully_sharded_buffer.offset == expected_offset
-    assert (
-        fully_sharded_buffer.local_buffer.numel() == fully_sharded_buffer.layout.size // mesh.size()
-    )
+    # The inner axis is the most significant shard index, so this rank owns layout
+    # segment inner_rank * outer_size + outer_rank.
+    segment = mesh.get_local_rank(1) * mesh.size(0) + mesh.get_local_rank(0)
+    assert fully_sharded_buffer.offset == layout.rank_to_offset[segment]
+    assert fully_sharded_buffer.local_buffer.numel() == layout.rank_size(segment)
+    if shard_layout is ShardLayout.PADDED:
+        assert fully_sharded_buffer.local_buffer.numel() == layout.size // mesh.size()
     for index, _ in enumerate(tensors):
         assert fully_sharded_buffer.get_tensor_view(index).is_contiguous()
 
+    # Gathering both axes restores every tensor; the inner-only view is the HSDP shard.
+    replicated_buffer = fully_sharded_buffer.allgather((0, 1))
+    _assert_dbuffer_local_tensors_close(replicated_buffer, tensors)
+    inner_view = replicated_buffer.view([Replicate(), RowAtomic()])
+    # Padded layouts gather uninitialized padding too; matching NaNs must compare equal.
+    torch.testing.assert_close(
+        inner_view.view([RowAtomic(), RowAtomic()]).local_buffer,
+        fully_sharded_buffer.local_buffer,
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
 
-def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(distributed_setup):
+
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(
+    distributed_setup, shard_layout
+):
     """Partial+RowAtomic reduce-scatter reduces the existing RowAtomic local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
@@ -658,23 +726,24 @@ def test_2d_mesh_partial_row_atomic_reduce_scatter_to_row_atomic_row_atomic(dist
         torch.full((6, 2), outer_scale, dtype=torch.float32, device=distributed_setup.device),
         torch.full((4,), outer_scale * 10, dtype=torch.float32, device=distributed_setup.device),
     ]
+    layout = _row_atomic_layout(tensors, mesh, shard_layout)
+    _assert_layout_matches_shard_layout(layout, tensors, shard_layout)
 
-    partial_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial(), RowAtomic()])
+    partial_sharded_buffer = DBuffer.distribute_tensors(
+        tensors, mesh, [Partial(), RowAtomic()], layout=layout
+    )
     fully_sharded_buffer = partial_sharded_buffer.reduce_scatter(0, RowAtomic())
     replicated_buffer = fully_sharded_buffer.allgather(0).allgather(1)
 
     assert fully_sharded_buffer.placements == (RowAtomic(), RowAtomic())
-    expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
-    expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
-    expected_offset = (
-        mesh.get_local_rank(1) * expected_inner_axis_shard_numel
-        + mesh.get_local_rank(0) * expected_local_numel
-    )
-    assert fully_sharded_buffer.offset == expected_offset
-    assert (
-        fully_sharded_buffer.local_buffer.numel()
-        == partial_sharded_buffer.local_buffer.numel() // 2
-    )
+    local_range = layout.get_local_range(mesh, [RowAtomic(), RowAtomic()])
+    assert fully_sharded_buffer.offset == local_range.start
+    assert fully_sharded_buffer.local_buffer.numel() == local_range.numel
+    if shard_layout is ShardLayout.PADDED:
+        assert (
+            fully_sharded_buffer.local_buffer.numel()
+            == partial_sharded_buffer.local_buffer.numel() // 2
+        )
 
     outer_scale_sum = float(mesh.size(0) * (mesh.size(0) + 1) // 2)
     expected = [
@@ -865,175 +934,6 @@ def test_block_atomic_rejects_shards_that_split_blocks(distributed_setup):
 
     with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment"):
         DBuffer(mesh, [BlockAtomic(8)], layout, torch.float32, distributed_setup.device)
-
-
-def test_row_atomic_accepts_uneven_layout_only_at_row_boundaries(distributed_setup):
-    """Unequal rank segments are fine for RowAtomic as long as no boundary splits a row."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("Requires at least 2 ranks.")
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    device = distributed_setup.device
-    # Both tensors have row size 4, so a TensorAtomic layout is also row-aligned.
-    shapes = [(4, 4), (2, 4)]
-    layout = layout_builder.build_for_tensor_atomic(
-        shapes, dp_size=mesh.size(), tensor_owners=(0, 1)
-    )
-    assert not layout.has_equal_shard_sizes
-
-    buffer = DBuffer(mesh, [RowAtomic()], layout, torch.float32, device)
-    assert buffer.local_buffer.numel() == layout.rank_size(mesh.get_local_rank())
-    DBuffer.from_local(
-        torch.empty(buffer.local_buffer.numel(), device=device), mesh, [RowAtomic()], layout
-    )
-    DBuffer(mesh, [Replicate()], layout, torch.float32, device).view([RowAtomic()])
-
-    # Shift rank 1's boundary into the middle of a row.
-    split_row = GlobalLayout(
-        tensor_shapes=shapes,
-        tensor_to_offset=layout.tensor_to_offset,
-        size=layout.size,
-        rank_to_offset=(0, 18, *([layout.size] * (mesh.size() - 2))),
-    )
-    with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment"):
-        DBuffer(mesh, [RowAtomic()], split_row, torch.float32, device)
-    with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment"):
-        DBuffer.from_local(torch.empty(18, device=device), mesh, [RowAtomic()], split_row)
-    with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment"):
-        DBuffer(mesh, [Replicate()], split_row, torch.float32, device).view([RowAtomic()])
-
-
-def _uneven_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
-    """Tensors with even dim 0 so they also work with BlockAtomic(2)."""
-    return [
-        torch.arange(24, dtype=torch.float32, device=device).reshape(8, 3),
-        torch.arange(10, dtype=torch.float32, device=device).reshape(2, 5) + 100,
-        torch.arange(6, dtype=torch.float32, device=device) + 200,
-    ]
-
-
-@pytest.mark.parametrize("block_size", [1, 2])
-def test_uneven_sharded_allgather_round_trip(distributed_setup, block_size):
-    """Unpadded RowAtomic/BlockAtomic shards all-gather with list-based collectives."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("Requires at least 2 ranks.")
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    device = distributed_setup.device
-    tensors = _uneven_tensors_on_all_ranks(device)
-    shapes = [tensor.shape for tensor in tensors]
-    layout = layout_builder.build_for_row_atomic_unpadding(
-        shapes, dp_size=mesh.size(), block_size=block_size
-    )
-    assert layout.size == sum(tensor.numel() for tensor in tensors)
-    placement = RowAtomic() if block_size == 1 else BlockAtomic(block_size)
-
-    sharded = DBuffer.distribute_tensors(tensors, mesh, [placement], layout=layout)
-    assert sharded.local_buffer.numel() == layout.rank_size(mesh.get_local_rank())
-    for index, tensor in enumerate(tensors):
-        local = sharded.get_tensor_view(index)
-        assert local.shape[1:] == tensor.shape[1:]
-        assert local.shape[0] % block_size == 0
-
-    replicated = sharded.allgather(0)
-    assert replicated.layout == layout
-    assert replicated.local_buffer.numel() == layout.size
-    _assert_dbuffer_local_tensors_close(replicated, tensors)
-
-    destination = DBuffer(mesh, [Replicate()], layout, torch.float32, device)
-    assert sharded.allgather(0, out=destination) is destination
-    _assert_dbuffer_local_tensors_close(destination, tensors)
-
-    # Replicate -> sharded is a view that aliases this rank's segment.
-    view = destination.view([placement])
-    assert view.offset == sharded.offset
-    torch.testing.assert_close(view.local_buffer, sharded.local_buffer)
-
-
-@pytest.mark.parametrize("reduce_op", ["sum", "avg"])
-def test_uneven_partial_reduce_scatter_to_row_atomic(distributed_setup, reduce_op):
-    """Partial buffers reduce-scatter into unpadded, unequal RowAtomic shards."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("Requires at least 2 ranks.")
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    device = distributed_setup.device
-    world_size = distributed_setup.world_size
-    rank_scale = float(distributed_setup.rank + 1)
-    shapes = [(5, 3), (4,), (3, 7)]
-    tensors = [
-        torch.full(shape, rank_scale, dtype=torch.float32, device=device) for shape in shapes
-    ]
-    layout = layout_builder.build_for_row_atomic_unpadding(shapes, dp_size=mesh.size())
-    assert not layout.has_equal_shard_sizes
-
-    partial = DBuffer.distribute_tensors(tensors, mesh, [Partial(reduce_op)], layout=layout)
-    sharded = partial.reduce_scatter(0, RowAtomic())
-    assert sharded.placements == (RowAtomic(),)
-    assert sharded.layout == layout
-    assert sharded.local_buffer.numel() == layout.rank_size(mesh.get_local_rank())
-
-    total = float(world_size * (world_size + 1) // 2)
-    expected_value = total if reduce_op == "sum" else total / world_size
-    expected = [
-        torch.full(shape, expected_value, dtype=torch.float32, device=device) for shape in shapes
-    ]
-    _assert_dbuffer_local_tensors_close(sharded.allgather(0), expected)
-
-    # In-place into a view of the Partial buffer, as reduce_partial_gradients does.
-    destination = partial.view([RowAtomic()])
-    assert partial.reduce_scatter(0, RowAtomic(), out=destination) is destination
-    _assert_dbuffer_local_tensors_close(destination.allgather(0), expected)
-
-
-def test_2d_mesh_uneven_layout_round_trips(distributed_setup):
-    """Unequal segments work on a 2-D mesh for HSDP- and HFSDP-style placements."""
-    if distributed_setup.world_size < 4 or distributed_setup.world_size % 2:
-        pytest.skip("Requires an even number of at least 4 ranks.")
-    device = distributed_setup.device
-    outer_size = 2
-    inner_size = distributed_setup.world_size // outer_size
-    mesh = init_device_mesh(device.type, (outer_size, inner_size))
-    tensors = _uneven_tensors_on_all_ranks(device)
-    shapes = [tensor.shape for tensor in tensors]
-    layout = layout_builder.build_for_row_atomic_unpadding(shapes, dp_size=mesh.size())
-    assert not layout.has_equal_shard_sizes
-
-    # HFSDP-style: sharded on both axes, gathered over both.
-    fully_sharded = DBuffer.distribute_tensors(
-        tensors, mesh, [RowAtomic(), RowAtomic()], layout=layout
-    )
-    replicated = fully_sharded.allgather((0, 1))
-    _assert_dbuffer_local_tensors_close(replicated, tensors)
-
-    # HSDP-style: replicated across the outer axis, sharded within the inner axis.
-    inner_sharded = DBuffer.distribute_tensors(
-        tensors, mesh, [Replicate(), RowAtomic()], layout=layout
-    )
-    inner_range = layout.get_local_range(mesh, [Replicate(), RowAtomic()])
-    assert inner_sharded.offset == inner_range.start
-    assert inner_sharded.local_buffer.numel() == inner_range.numel
-    _assert_dbuffer_local_tensors_close(inner_sharded.allgather(1), tensors)
-    torch.testing.assert_close(
-        replicated.view([Replicate(), RowAtomic()]).local_buffer, inner_sharded.local_buffer
-    )
-    torch.testing.assert_close(
-        inner_sharded.view([RowAtomic(), RowAtomic()]).local_buffer, fully_sharded.local_buffer
-    )
-
-    # HSDP gradient path: reduce-scatter the inner axis of an outer-replicated Partial.
-    ones = [torch.ones_like(tensor) for tensor in tensors]
-    partial = DBuffer.distribute_tensors(ones, mesh, [Replicate(), Partial()], layout=layout)
-    inner_reduced = partial.reduce_scatter(1, RowAtomic())
-    assert inner_reduced.placements == (Replicate(), RowAtomic())
-    _assert_dbuffer_local_tensors_close(
-        inner_reduced.allgather(1), [tensor * inner_size for tensor in ones]
-    )
-
-    # HFSDP finalize: reduce-scatter the outer axis of an inner-sharded Partial.
-    partial = DBuffer.distribute_tensors(ones, mesh, [Partial(), RowAtomic()], layout=layout)
-    outer_reduced = partial.reduce_scatter(0, RowAtomic())
-    assert outer_reduced.placements == (RowAtomic(), RowAtomic())
-    _assert_dbuffer_local_tensors_close(
-        outer_reduced.allgather((0, 1)), [tensor * outer_size for tensor in ones]
-    )
 
 
 @pytest.mark.parametrize("rows_per_rank", [16, 32])

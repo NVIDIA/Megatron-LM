@@ -11,6 +11,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer impor
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     RowAtomic,
+    ShardLayout,
 )
 
 quantized_dbuffer = pytest.importorskip(
@@ -51,9 +52,11 @@ requires_mxfp8 = pytest.mark.skipif(
         pytest.param(lambda num_ranks: [(32, 128)] * num_ranks, id="short_tensors"),
     ],
 )
-@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
 def test_quantized_dbuffer_quantization_matches_te(
-    distributed_setup, placements, make_shapes, uneven_shards
+    distributed_setup, placements, make_shapes, shard_layout
 ):
     """Quantizing a sharded view matches TE and writes only this rank's shard.
 
@@ -71,9 +74,9 @@ def test_quantized_dbuffer_quantization_matches_te(
     shapes = make_shapes(mesh.size())
     canary = 0xAA
     replicated = QuantizedDBuffer.empty(
-        mesh, [Replicate()] * mesh.ndim, shapes, device, uneven_shards=uneven_shards
+        mesh, [Replicate()] * mesh.ndim, shapes, device, shard_layout=shard_layout
     )
-    if uneven_shards:
+    if shard_layout is ShardLayout.UNPADDED:
         assert replicated.rowwise_data.layout.size == sum(rows * cols for rows, cols in shapes)
     for plane in replicated.planes:
         plane.local_buffer.fill_(canary)
@@ -288,8 +291,10 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
 
 
 @pytest.mark.parametrize("use_out", [False, True])
-@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
-def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, uneven_shards):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, shard_layout):
     """All-gather preserves rank order in every plane, with or without an output buffer.
 
     Unpadded planes have unequal, possibly empty, rank segments; the scale planes
@@ -298,30 +303,27 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, un
     if distributed_setup.world_size < 2:
         pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    shapes = [(128, 64), (32, 128)]
+    shapes = [(96, 64), (32, 128)]
     source = QuantizedDBuffer.empty(
-        mesh, [BlockAtomic(32)], shapes, distributed_setup.device, uneven_shards=uneven_shards
+        mesh, [BlockAtomic(32)], shapes, distributed_setup.device, shard_layout=shard_layout
     )
     data_layout = source.rowwise_data.layout
     assert source.columnwise_data.layout == data_layout
-    assert data_layout.has_equal_shard_sizes != uneven_shards
-    if uneven_shards:
-        assert data_layout.size == 128 * 64 + 32 * 128
-    for scale_plane in (source.rowwise_scale, source.columnwise_scale):
-        assert scale_plane.layout.size == data_layout.size // 32
-        assert scale_plane.layout.rank_to_offset == tuple(
-            offset // 32 for offset in data_layout.rank_to_offset
-        )
+    assert data_layout.has_equal_shard_sizes == (shard_layout is ShardLayout.PADDED)
+    if shard_layout is ShardLayout.UNPADDED:
+        assert data_layout.size == 96 * 64 + 32 * 128
+
     for index, plane in enumerate(source.planes):
         plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
     if use_out:
         destination = QuantizedDBuffer.empty(
-            mesh, [Replicate()], shapes, distributed_setup.device, uneven_shards=uneven_shards
+            mesh, [Replicate()], shapes, distributed_setup.device, shard_layout=shard_layout
         )
         result = source.allgather(0, out=destination)
         assert result is destination
     else:
         result = source.allgather(0)
+
     for index, plane in enumerate(result.planes):
         assert plane.placements == (Replicate(),)
         layout = plane.layout
@@ -333,14 +335,23 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, un
 
 
 @pytest.mark.parametrize("use_out", [False, True])
-def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup, use_out):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(
+    distributed_setup, use_out, shard_layout
+):
     """Gather an axis iterator in every plane, allocating or reusing output."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even world size of at least two.")
     mesh = init_device_mesh(distributed_setup.device.type, (2, world_size // 2))
     source = QuantizedDBuffer.empty(
-        mesh, [BlockAtomic(32), BlockAtomic(32)], [(128, 64), (32, 128)], distributed_setup.device
+        mesh,
+        [BlockAtomic(32), BlockAtomic(32)],
+        [(128, 64), (32, 128)],
+        distributed_setup.device,
+        shard_layout=shard_layout,
     )
     for index, plane in enumerate(source.planes):
         values = (
@@ -350,7 +361,11 @@ def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup, 
     # A one-shot iterator must be reusable across all four planes.
     if use_out:
         out = QuantizedDBuffer.empty(
-            mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+            mesh,
+            [Replicate(), Replicate()],
+            [(128, 64), (32, 128)],
+            distributed_setup.device,
+            shard_layout=shard_layout,
         )
         result = source.allgather(iter((0, 1)), out=out)
         assert result is out

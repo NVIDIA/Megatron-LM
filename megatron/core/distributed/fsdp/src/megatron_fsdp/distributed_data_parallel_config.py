@@ -198,10 +198,12 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
-    megatron_fsdp_uneven_shards: bool = False
-    """Megatron-FSDP v2 only. If true, pack each parameter group without padding and
-    split it into generally unequal per-rank shards at row boundaries (32-row block
-    boundaries for MXFP8).
+    megatron_fsdp_padded_shards: bool = True
+    """Megatron-FSDP v2 only. If true (default), pad each parameter group so every rank
+    gets an equal shard. If false, pack the group without padding and split it into
+    generally unequal per-rank shards at row boundaries (32-row block boundaries for
+    MXFP8), which saves the padding memory and communication but is incompatible with
+    nccl_ub (symmetric memory).
     """
 
     hfsdp_param_gather_overlap: bool = False

@@ -26,7 +26,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from . import layout_builder
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import BlockAtomic, TensorAtomic
+from .placement import BlockAtomic, ShardLayout, TensorAtomic
 from .range import Range, intersect_ranges
 
 
@@ -138,7 +138,7 @@ class DBuffer:
         device: torch.device | str,
         *,
         block_size: int = 1,
-        uneven_shards: bool = False,
+        shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> "DBuffer":
         """Build a RowAtomic or BlockAtomic layout and allocate its local buffer.
 
@@ -152,16 +152,13 @@ class DBuffer:
             dtype: Dtype for the local buffer.
             device: Device for the local buffer.
             block_size: Number of consecutive rows kept together on one rank.
-            uneven_shards: Pack tensors without padding and let rank segments differ in
-                size (``layout_builder.build_for_row_atomic_unpadding``) instead of
-                padding to equal segments (``layout_builder.build_for_row_atomic``).
+            shard_layout: ``ShardLayout.PADDED`` pads to equal segments;
+                ``ShardLayout.UNPADDED`` packs without padding into
+                generally unequal segments.
         """
-        build = (
-            layout_builder.build_for_row_atomic_unpadding
-            if uneven_shards
-            else layout_builder.build_for_row_atomic
+        layout = layout_builder.build_row_atomic_layout(
+            tensor_shapes, dp_size=mesh.size(), block_size=block_size, shard_layout=shard_layout
         )
-        layout = build(tensor_shapes, dp_size=mesh.size(), block_size=block_size)
         return cls(mesh, placements, layout, dtype, device)
 
     @property
@@ -215,11 +212,18 @@ class DBuffer:
     def _peer_chunks(
         self, buffer: "DBuffer", placements: Iterable[Placement], mesh_axis: int
     ) -> list[torch.Tensor]:
-        """Slice ``buffer`` into each peer's range under ``placements`` along ``mesh_axis``."""
-        return [
-            buffer.local_buffer.narrow(0, peer_range.start - buffer.offset, peer_range.numel)
-            for peer_range in self.layout.get_peer_ranges(self.mesh, placements, mesh_axis)
-        ]
+        """Slice ``buffer`` into each peer's range under ``placements`` along ``mesh_axis``.
+
+        Peers are the ranks of this rank's ``mesh_axis`` process group, in group-rank order.
+        """
+        placements = tuple(placements)
+        chunks = []
+        for peer in dist.get_process_group_ranks(self.mesh.get_group(mesh_axis)):
+            peer_range = self.layout.get_rank_range(self.mesh, placements, peer)
+            chunks.append(
+                buffer.local_buffer.narrow(0, peer_range.start - buffer.offset, peer_range.numel)
+            )
+        return chunks
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""

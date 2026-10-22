@@ -9,7 +9,10 @@ from torch.distributed.tensor import Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import layout_builder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    RowAtomic,
+    ShardLayout,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import Range
 
 
@@ -44,11 +47,6 @@ def test_uneven_layout_packs_without_padding_and_snaps_to_row_boundaries():
     assert layout.rank_to_offset == (0, 16)
     assert not layout.has_equal_shard_sizes
 
-    # The padded layout rounds up to LCM(6, 4, 2) * dp_size = 24 multiples and leaves gaps.
-    padded = layout_builder.build_for_row_atomic(shapes, dp_size=2)
-    assert padded.size == 48
-    assert padded.has_equal_shard_sizes
-
 
 def test_uneven_layout_keeps_blocks_whole():
     """Block boundaries, not row boundaries, are the snapping unit for BlockAtomic."""
@@ -61,9 +59,6 @@ def test_uneven_layout_keeps_blocks_whole():
     assert layout.rank_to_offset == (0, 6, 12, 16)
     assert [layout.rank_size(rank) for rank in range(4)] == [6, 6, 4, 8]
 
-    with pytest.raises(ValueError, match="must be divisible by block size"):
-        layout_builder.build_for_row_atomic_unpadding(shapes, dp_size=4, block_size=4)
-
 
 def test_uneven_layout_leaves_ranks_empty_when_boundaries_are_scarce():
     """Fewer row boundaries than ranks leaves some ranks with empty segments."""
@@ -75,6 +70,38 @@ def test_uneven_layout_leaves_ranks_empty_when_boundaries_are_scarce():
     empty = layout_builder.build_for_row_atomic_unpadding([torch.Size((0, 8))], dp_size=3)
     assert empty.size == 0
     assert empty.rank_to_offset == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [layout_builder.build_for_row_atomic, layout_builder.build_for_row_atomic_unpadding],
+    ids=["padded", "unpadded"],
+)
+def test_row_atomic_builders_reject_invalid_shapes_and_sizes(build):
+    """Both RowAtomic builders share the same shape and size validation."""
+    with pytest.raises(ValueError, match="DP size must be positive"):
+        build([torch.Size((4, 4))], dp_size=0)
+    with pytest.raises(ValueError, match="Block size must be positive"):
+        build([torch.Size((4, 4))], dp_size=2, block_size=0)
+    with pytest.raises(ValueError, match="zero-sized non-leading dims"):
+        build([torch.Size((4, 0))], dp_size=2)
+    with pytest.raises(ValueError, match="must be divisible by block size"):
+        build([torch.Size((6, 4))], dp_size=2, block_size=4)
+
+
+def test_build_row_atomic_layout_dispatches_on_shard_layout():
+    """The dispatcher selects the padded or unpadded builder and rejects anything else."""
+    shapes = [torch.Size((2, 6)), torch.Size((4, 4)), torch.Size((1, 2))]
+    padded = layout_builder.build_row_atomic_layout(
+        shapes, dp_size=2, shard_layout=ShardLayout.PADDED
+    )
+    unpadded = layout_builder.build_row_atomic_layout(
+        shapes, dp_size=2, shard_layout=ShardLayout.UNPADDED
+    )
+    assert padded == layout_builder.build_for_row_atomic(shapes, dp_size=2)
+    assert unpadded == layout_builder.build_for_row_atomic_unpadding(shapes, dp_size=2)
+    with pytest.raises(ValueError, match="Unsupported shard layout"):
+        layout_builder.build_row_atomic_layout(shapes, dp_size=2, shard_layout="padded")
 
 
 def test_validate_for_row_atomic_checks_boundaries_not_segment_sizes():

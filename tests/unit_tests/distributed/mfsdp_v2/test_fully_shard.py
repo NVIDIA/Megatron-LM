@@ -28,6 +28,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     RowAtomic,
+    ShardLayout,
     TensorAtomic,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -185,9 +186,11 @@ _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
     ids=["no_shard", "zero1", "zero2", "zero3"],
 )
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
 def test_fully_shard_sgd_losses_match_baseline(
-    distributed_setup, num_microbatches, placements_factory, uneven_shards
+    distributed_setup, num_microbatches, placements_factory, shard_layout
 ):
     """Every supported sharding strategy should match gradient-averaged SGD."""
     rank = distributed_setup.rank
@@ -204,15 +207,8 @@ def test_fully_shard_sgd_losses_match_baseline(
     model.load_state_dict(baseline.state_dict())
 
     with fully_shard_context(device=device) as context:
-        fully_shard(model.fc1, mesh=mesh, placements=placements, uneven_shards=uneven_shards)
-        fully_shard(model.fc2, mesh=mesh, placements=placements, uneven_shards=uneven_shards)
-    for module in (model.fc1, model.fc2):
-        for group in module.parameter_groups:
-            numel = sum(p.sharded.numel() for p in group.fsdp_parameters)
-            if uneven_shards:
-                assert group.main_weight.layout.size == numel
-            else:
-                assert group.main_weight.layout.has_equal_shard_sizes
+        fully_shard(model.fc1, mesh=mesh, placements=placements, shard_layout=shard_layout)
+        fully_shard(model.fc2, mesh=mesh, placements=placements, shard_layout=shard_layout)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
@@ -405,7 +401,10 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none, shard_layout):
     """HSDP (DP-outer replicated, DP-inner sharded) training should match single-rank SGD.
 
     Gradients reduce-scatter within DP-inner every backward and accumulate into
@@ -434,8 +433,8 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 
     with fully_shard_context(device=device) as context:
         for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+            fully_shard(layer, mesh=mesh, placements=_hsdp_placements(), shard_layout=shard_layout)
+        fully_shard(model, mesh=mesh, placements=_hsdp_placements(), shard_layout=shard_layout)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
@@ -479,9 +478,11 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-@pytest.mark.parametrize("uneven_shards", [False, True], ids=["padded", "uneven"])
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
 def test_hfsdp_losses_match_baseline(
-    distributed_setup, num_microbatches, set_to_none, uneven_shards
+    distributed_setup, num_microbatches, set_to_none, shard_layout
 ):
     """HFSDP (optimizer sharded across DP-outer too) training should match single-rank SGD."""
     rank = distributed_setup.rank
@@ -507,10 +508,8 @@ def test_hfsdp_losses_match_baseline(
     # and reduce through the overlap path instead of as independent roots.
     with fully_shard_context(device=device) as context:
         for layer in model.layers:
-            fully_shard(
-                layer, mesh=mesh, placements=_hfsdp_placements(), uneven_shards=uneven_shards
-            )
-        fully_shard(model, mesh=mesh, placements=_hfsdp_placements(), uneven_shards=uneven_shards)
+            fully_shard(layer, mesh=mesh, placements=_hfsdp_placements(), shard_layout=shard_layout)
+        fully_shard(model, mesh=mesh, placements=_hfsdp_placements(), shard_layout=shard_layout)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     # HFSDP's optimizer placement [Shard(0), Shard(0)] differs from the parameter placement

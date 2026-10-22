@@ -26,6 +26,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, current_fully_shard_context
 from .module import FsdpModule
+from .placement import ShardLayout
 from .schedule import SchedulePolicy
 
 # TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
@@ -72,7 +73,7 @@ def fully_shard(
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
     grad_accumulation_count: int | None = None,
-    uneven_shards: bool = False,
+    shard_layout: ShardLayout = ShardLayout.PADDED,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -107,10 +108,11 @@ def fully_shard(
         grad_accumulation_count: Total parameter-gradient callbacks per reduction
             window, including contributions from separate GraphTasks and delayed
             weight gradients. Defaults to one per owned trainable parameter.
-        uneven_shards: Pack each parameter group without padding for RowAtomic/BlockAtomic,
-            and split it into generally unequal per-rank shards at row boundaries
-            (32-row block boundaries for MXFP8) instead of padding every group to equal shards.
             The scheduler must declare the complete count before sharding the unit.
+        shard_layout: How RowAtomic/BlockAtomic parameter groups are split across ranks.
+            ``ShardLayout.PADDED`` (default) pads every group to equal shards;
+            ``ShardLayout.UNPADDED`` packs each group without padding and splits it at row
+            boundaries (32-row block boundaries for MXFP8) into generally unequal shards.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -143,7 +145,7 @@ def fully_shard(
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
             grad_accumulation_count=grad_accumulation_count,
-            uneven_shards=uneven_shards,
+            shard_layout=shard_layout,
         )
     except Exception:
         module.__class__ = original_cls
