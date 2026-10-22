@@ -1,0 +1,16 @@
+# Independent failure alerts; test summaries and Linear remain in cerno.yml.
+gitlab:
+  project_id: 19378
+  repo_name: ADLR/megatron-lm
+
+notification_audit:
+  channel_id: C074W9J7S0N
+  mention: "<!subteam^S06GU680R3N>"
+
+modules:
+  megatron_lm:
+    health:
+      notify:
+        channel_id: C074W9J7S0N
+        groups: [S06GU680R3N]
+        token_env: ALERTMANAGER_TOKEN
