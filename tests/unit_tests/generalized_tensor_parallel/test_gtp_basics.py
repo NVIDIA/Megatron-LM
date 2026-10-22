@@ -542,27 +542,33 @@ class TestGroupedExpertChainClassification:
         # Restore the module default so other tests see a clean CG config.
         gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
 
-    def test_ungraphed_moe_splits_fc1_fc2_into_own_chains(self):
-        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+    @pytest.mark.parametrize("impl,suffix", [("none", "ungraphed"), ("full_iteration", "graphed")])
+    def test_moe_splits_fc1_fc2_into_own_chains(self, impl, suffix):
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl=impl)
         c1 = gtp_module._classify_param_chain(self.FC1)
         c2 = gtp_module._classify_param_chain(self.FC2)
-        assert c1 == "GTP_remat_grouped_fc1_ungraphed", c1
-        assert c2 == "GTP_remat_grouped_fc2_ungraphed", c2
+        assert c1 == f"GTP_remat_grouped_fc1_{suffix}", c1
+        assert c2 == f"GTP_remat_grouped_fc2_{suffix}", c2
         # Separate linked-list chains so next_w links consecutive MoE layers (one-block-ahead).
         assert c1 != c2
         # Removed from the general chain; other layer kinds are unaffected.
-        assert gtp_module._classify_param_chain(self.SHARED) == "GTP_ungraphed"
-        assert gtp_module._classify_param_chain(self.MIXER) == "GTP_ungraphed"
+        assert gtp_module._classify_param_chain(self.SHARED) == f"GTP_{suffix}"
+        assert gtp_module._classify_param_chain(self.MIXER) == f"GTP_{suffix}"
+        assert gtp_module._classify_param_chain("decoder.layers.3.mlp.experts.fused_weight") == (
+            f"GTP_{suffix}"
+        )
 
-    def test_fc1_fc2_share_one_ib_stream(self):
-        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+    @pytest.mark.parametrize("impl", ["none", "full_iteration"])
+    def test_fc1_fc2_share_one_ib_stream(self, impl):
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl=impl)
         group = object()  # same EGTP group for both roles
         c1 = gtp_module._classify_param_chain(self.FC1)
         c2 = gtp_module._classify_param_chain(self.FC2)
         # Distinct chains but ONE shared IB stream (serialize fc1 then fc2).
         assert gtp_module._stream_key(c1, group) == gtp_module._stream_key(c2, group)
-        # Distinct from the general ungraphed chain's stream.
-        assert gtp_module._stream_key(c1, group) != gtp_module._stream_key("GTP_ungraphed", group)
+        # Distinct from the general chain's stream.
+        general = "GTP_graphed" if impl == "full_iteration" else "GTP_ungraphed"
+        assert gtp_module._stream_key(c1, group) != gtp_module._stream_key(general, group)
 
     def test_graphed_moe_keeps_grouped_in_plain_graphed_chain(self):
         # When MoE is captured, grouped weights stay in the plain GRAPHED chain so the

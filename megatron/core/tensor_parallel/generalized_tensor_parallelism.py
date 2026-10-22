@@ -194,7 +194,8 @@ def set_cuda_graph_modules(
 def _classify_param_chain(param_name: str) -> str:
     """Map a GTPShardedParam name + active cuda_graph config to its chain id (a string).
 
-    Full-iteration -> GRAPHED. Otherwise embedding/output_layer are UNGRAPHED, and
+    Full-iteration captures every chain, retaining separate grouped FC1/FC2 chains.
+    Otherwise embedding/output_layer are UNGRAPHED, and
     each layer kind (mixer, attention, shared experts) is GRAPHED iff its scope tag is in
     cuda_graph_modules. Routed grouped experts (``.mlp.experts.``) are special-cased FIRST:
     fc1/fc2 each go to their own homogeneous grouped chain (see ``_GTP_REMAT_GROUPED_FC1``), with
@@ -209,18 +210,19 @@ def _classify_param_chain(param_name: str) -> str:
     # shared experts never fall in here).
     if ".mlp.experts." in n:
         graphed = _FULL_ITERATION or bool(_CUDA_GRAPH_MODULES and "moe" in _CUDA_GRAPH_MODULES)
-        # The grouped split is an EAGER-only optimization: when MoE is captured, keep grouped
-        # weights in the plain GRAPHED chain so the cross-graph drain — wait_async_comms(
-        # GTPChain.GRAPHED.value) in cuda_graphs.py — still targets them by exact chain id.
-        if graphed:
+        # Partial graphs use the plain GRAPHED chain for their cross-graph drain.
+        # Full-iteration capture owns both FC chains: keep their prefetch schedules
+        # separate so MoonEP can peek both weights before either GEMM consumes them,
+        # including a repeated MTP layer.
+        if graphed and not _FULL_ITERATION:
             return G
-        eager = _graphness_suffix(False)
+        graphness = _graphness_suffix(graphed)
         if ".linear_fc1." in n:
-            return f"{_GTP_REMAT_GROUPED_FC1}_{eager}"
+            return f"{_GTP_REMAT_GROUPED_FC1}_{graphness}"
         if ".linear_fc2." in n:
-            return f"{_GTP_REMAT_GROUPED_FC2}_{eager}"
+            return f"{_GTP_REMAT_GROUPED_FC2}_{graphness}"
         # Unknown grouped role (e.g. single fused weight): keep it in the general chain.
-        return U
+        return G if graphed else U
 
     if _FULL_ITERATION:
         return G
@@ -2505,6 +2507,23 @@ class GTPShardedParam(torch.nn.Parameter):
     def peek_group_for_backward(self):
         """Backward counterpart of :meth:`peek_group_for_forward`."""
         return self._peek_gathered_weight(fwd=False)
+
+    def get_group_forward_storage(self) -> tuple[torch.Tensor, ...]:
+        """Return warmed forward storage for pointer metadata, without issuing a gather.
+
+        Contents may belong to another group sharing the cache. Consumers must still
+        peek and materialize normally before reading these buffers.
+        """
+        if not self.prefetch_initialized:
+            raise RuntimeError("GTP forward storage requires a completed eager warmup")
+        cache = get_global_GTP_cache()
+        sources = []
+        for weight in self._weights:
+            slot = cache._slots.get(weight._ag_ticket_fwd)
+            if slot is None or slot.buf is None:
+                raise RuntimeError("GTP forward storage is not initialized")
+            sources.append(weight._strip_padding(slot.buf))
+        return tuple(sources)
 
     def finalize_group_grads(self, wgrads, nvtx_label=None):
         """Protocol: reduce-scatter the group's freshly computed weight grad(s)."""
