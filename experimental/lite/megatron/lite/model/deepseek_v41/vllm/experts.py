@@ -250,9 +250,37 @@ def _empty_weight(outer, n, k, values_per_element, device):
     return weight, scale
 
 
+def _write_experts(dst, src, shard, is_scale):
+    """:func:`_write` for every local expert at once: vLLM's ``_pack_scale`` and
+    ``_kernel_layout_shard`` index maps with an explicit leading expert dimension."""
+    experts, k = dst.shape[0], src.shape[-1]
+    if is_scale:
+        rows = dst.shape[1] // (1 if shard == "w2" else 2)
+        src = src.view(torch.uint8)
+        src = src.repeat_interleave(rows // src.shape[1], 1)
+        src = src.repeat_interleave(dst.shape[2] * 4 // src.shape[2], 2)
+        src = src.contiguous().view(torch.int32)
+        k = src.shape[-1]
+    else:
+        src = src.view(dst.dtype)
+    if shard == "w2":
+        if is_scale:
+            dst = dst.view(experts, -1, 32, 4, k).transpose(2, 3)
+            src = src.reshape(experts, -1, 4, 32, k)
+    else:
+        half = 0 if shard == "w1" else 1
+        if is_scale:
+            dst = dst.view(experts, -1, 2, 2, 8, 4, k)[:, :, :, half].permute(0, 1, 4, 2, 3, 5)
+            src = src.reshape(experts, -1, 4, 2, 8, k)
+        else:
+            dst = dst.view(experts, -1, 2, 8, k)[:, :, half]
+            src = src.reshape(experts, -1, 8, k)
+    dst.copy_(src)
+
+
 @torch.no_grad()
 def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
-    """Pack fresh masters into native MegaMoE kernel layouts."""
+    """Pack fresh masters into native MegaMoE kernel layouts, all local experts at once."""
     from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
     from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
@@ -260,15 +288,14 @@ def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
     inter, hidden = fc1[0].shape[0] // 2, fc1[0].shape[1]
     w13, s13 = _empty_weight((len(fc1),), 2 * inter, hidden, 2, device)
     w2, s2 = _empty_weight((len(fc2),), hidden, inter, 2, device)
-    for e, (a, b) in enumerate(zip(fc1, fc2)):
-        for shard, part in (("w1", a[:inter]), ("w3", a[inter:])):
-            codes, scale = quantize_mxfp4(part.detach())
-            _write(w13[e], codes, shard, False)
-            _write(s13[e], scale, shard, True)
-        codes, scale = quantize_mxfp4(b.detach())
-        _write(w2[e], codes, "w2", False)
-        _write(s2[e], scale, "w2", True)
-    shared = []
+    up = torch.stack([w.detach() for w in fc1])
+    for shard, part in (("w1", up[:, :inter]), ("w3", up[:, inter:])):
+        codes, scale = quantize_mxfp4(part)
+        _write_experts(w13, codes, shard, False)
+        _write_experts(s13, scale, shard, True)
+    codes, scale = quantize_mxfp4(torch.stack([w.detach() for w in fc2]))
+    _write_experts(w2, codes, "w2", False)
+    _write_experts(s2, scale, "w2", True)
     s_inter = shared_fc1.shape[0] // 2
     l1, l1s = _empty_weight((), 2 * s_inter, hidden, 1, device)
     l2, l2s = _empty_weight((), hidden, s_inter, 1, device)
@@ -280,8 +307,7 @@ def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
         codes, scale = quantize_block_fp8(part.detach(), (32, 32), scale_format="e8m0")
         _write(w, codes, shard, False)
         _write(s, scale, shard, True)
-    shared = ((l1, l1s), (l2, l2s))
-    return (w13, s13), (w2, s2), shared[0], shared[1]
+    return (w13, s13), (w2, s2), (l1, l1s), (l2, l2s)
 
 
 def symm_buffer(group, num_experts, max_tokens, top_k, hidden, inter, shared_experts=1):

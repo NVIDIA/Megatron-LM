@@ -153,3 +153,44 @@ def test_native_grouped_backend_uses_te_layouts_once(monkeypatch):
         dw, torch.stack([v.float().T @ u.float() for v, u in zip(y.split(counts), x.split(counts))])
     )
     assert calls == ['TN', 'NN', 'NT']
+
+
+def test_expert_pack_batches_quantization_and_reads_updated_masters(monkeypatch):
+    from megatron.lite.model.deepseek_v41.vllm import experts
+    from megatron.lite.primitive.quantization import mxfp4
+
+    torch.manual_seed(91)
+    fc1 = [torch.randn(256, 128) for _ in range(3)]
+    fc2 = [torch.randn(128, 128) for _ in range(3)]
+    shared = (torch.randn(256, 128), torch.randn(128, 128))
+    quantize, writes, calls = mxfp4.quantize_mxfp4, [], []
+    write = experts._write_experts
+
+    def quantized(value):
+        calls.append(tuple(value.shape))
+        return quantize(value)
+
+    def checked(dst, src, shard, is_scale):
+        sources = fc2 if shard == 'w2' else [w[:128] if shard == 'w1' else w[128:] for w in fc1]
+        reference = torch.stack([quantize(w)[int(is_scale)] for w in sources])
+        assert torch.equal(src.view(torch.uint8), reference.view(torch.uint8))
+        # Check stacked layout against the same single-expert layout independently.
+        expected = dst.clone()
+        for e in range(len(sources)):
+            write(expected[e : e + 1], reference[e : e + 1], shard, is_scale)
+        write(dst, src, shard, is_scale)
+        assert torch.equal(
+            dst, expected
+        )  # packed outputs are int8/int32, so equality is exact bytes
+        writes.append((shard, is_scale))
+
+    monkeypatch.setattr(mxfp4, 'quantize_mxfp4', quantized)
+    monkeypatch.setattr(experts, '_write_experts', checked)
+    # Shared-expert layout is unchanged and separately covered by the real CUDA gate.
+    monkeypatch.setattr(experts, '_write', lambda *args: None)
+    first = experts.kernel_weights(fc1, fc2, *shared)
+    assert calls == [(3, 128, 128)] * 3 and len(writes) == 6
+    fc1[0].data.mul_(-2)  # .data writes need not change Tensor._version.
+    second = experts.kernel_weights(fc1, fc2, *shared)
+    assert len(calls) == 6 and len(writes) == 12
+    assert not torch.equal(first[0][0], second[0][0])
