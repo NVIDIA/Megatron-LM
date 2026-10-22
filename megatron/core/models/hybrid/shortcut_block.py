@@ -380,6 +380,22 @@ class ShortcutMoEBlock(MegatronModule):
         dispatched_probs.record_stream(torch.cuda.current_stream())
         return dispatched_input, dispatched_probs
 
+    def _dispatch_and_compute_routed_experts(
+        self, route_input: torch.Tensor, route_probs: torch.Tensor, overlap: bool
+    ) -> torch.Tensor:
+        """Dispatch tokens and compute local experts within one ownership scope."""
+        dispatched_input, dispatched_probs = self._launch_dispatch(
+            route_input, route_probs, async_op=overlap
+        )
+        if overlap:
+            dispatched_input, dispatched_probs = self._wait_dispatch(
+                dispatched_input, dispatched_probs
+            )
+        output, _ = self.moe_layer.mlp.routed_experts_compute(
+            dispatched_input, dispatched_probs
+        )
+        return output
+
     def _launch_combine(self, output: torch.Tensor, async_op: bool = False) -> torch.Tensor:
         """Launch combine on the current stream or the shortcut side stream."""
         if not async_op:
@@ -535,16 +551,8 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the dispatch, experts, and combine
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            dispatched_input, dispatched_probs = self._launch_dispatch(
-                route_input, route_probs, async_op=overlap
-            )
-            if overlap:
-                dispatched_input, dispatched_probs = self._wait_dispatch(
-                    dispatched_input, dispatched_probs
-                )
-
-            output, _ = self.moe_layer.mlp.routed_experts_compute(
-                dispatched_input, dispatched_probs
+            output = self._dispatch_and_compute_routed_experts(
+                route_input, route_probs, overlap
             )
             combined_output = self._launch_combine(output, async_op=overlap)
             if self.shortcut_pre_mlp_layernorm_checkpoint is not None:
