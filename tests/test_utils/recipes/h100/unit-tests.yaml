@@ -59,12 +59,17 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    if [[ "$BUCKET" == "tests/unit_tests/inference/test_batch_invariant_fp8.py" ]]; then
+        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
+          h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
+    else
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+    fi
 
     ls -al 
 
@@ -78,6 +83,14 @@ spec:
     fi
 
 products:
+  # This file runs in isolated one-rank processes; other buckets exclude it.
+  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ops/**/*.py]
     products:
       - environment: [lts, dev]
