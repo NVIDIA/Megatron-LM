@@ -7,6 +7,9 @@ from unittest.mock import MagicMock
 import torch
 
 from megatron.core.inference.communication.torch_symm_triton.barrier import symm_mem_sync
+from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+    SYMM_MEM_KERNEL_CONFIG,
+)
 from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
@@ -72,12 +75,10 @@ def _squared_relu_with_probs_kernel(
 ):
     """Apply squared ReLU and router probabilities in training order.
 
-    With CLAMP set this reproduces training's fused ``weighted_clamped_squared_relu`` bit
-    for bit: the soft-clamped pre-activation and the square both stay in FP32, and the only
-    BF16 round is the final one after the FP32 routing probability is applied.
-
-    Without CLAMP the square is materialized in BF16 first, matching the unclamped
-    ``weighted_squared_relu``, which squares a BF16 ReLU output.
+    Matches the training fused weighted-squared-relu rounding, clamped (CLAMP) and
+    unclamped alike: the square and the routing probability are applied in FP32 with a
+    single BF16 round at the end. Rounding the square first, as the BF16 input dtype
+    invites, costs a routed element its last bit.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -99,11 +100,6 @@ def _squared_relu_with_probs_kernel(
                     if CLAMP:
                         value = clamp_scale * libdevice.tanh(value / clamp_scale)
                     value = value * value
-                    if not CLAMP:
-                        # Unclamped training (weighted_squared_relu) squares a BF16 ReLU
-                        # output, so the BF16 materialization is part of matching it. The
-                        # clamped path stays in FP32 to the single final round instead.
-                        value = value.to(tl.bfloat16).to(tl.float32)
                     value = (value * prob).to(tl.bfloat16)
                     tl.store(output_ptr + row_i64 * hidden_size + cols, value, mask=mask)
             elif ZERO_PADDING:
@@ -214,7 +210,7 @@ def _weighted_silu_mul_bounded_kernel(
     """
     xbound = tl.load(bound_ptr)
     num_progs = tl.num_programs(0)
-    xoffset = tl.program_id(0) * XBLOCK
+    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
     while xoffset < xbound:
         xindex = xoffset + tl.arange(0, XBLOCK)[:]
         xmask = (xindex < xbound) & (xindex < xnumel)
@@ -393,10 +389,14 @@ def ordered_reduce_scatter_v(
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
 
-    max_num_blocks = kwargs.get("max_num_blocks", 128)
-    block_size = min(triton.next_power_of_2(hidden_size), 1024)
-    num_warps = max(1, block_size // 32)
+    # Do not autotune the number of blocks with Triton: every rank must launch the same grid
+    # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
+    # See torch_symm_triton/kernel_config.py.
+    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    block_size = min(triton.next_power_of_2(hidden_size), SYMM_MEM_KERNEL_CONFIG.max_block_size)
+    num_warps = max(1, block_size // SYMM_MEM_KERNEL_CONFIG.warp_size)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _ordered_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
         output_tensor,
@@ -428,7 +428,9 @@ def _unpermute_tokens_in_expert_order_kernel(
     """Token-local batch-invariant unpermute.
 
     Each program owns one output token and one hidden tile. Contributions are
-    accumulated in fp32 by increasing local expert id, avoiding atomic-add order.
+    accumulated by increasing local expert id, avoiding atomic-add order, in fp64
+    and rounded once to the fp32 rank partial, as training's batch-invariant
+    unpermute does. An fp32 accumulator drops small contributions next to a large one.
     """
     tok = tl.program_id(0)
     block_h = tl.program_id(1)
@@ -436,7 +438,7 @@ def _unpermute_tokens_in_expert_order_kernel(
     offsets = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offsets < hidden_dim
 
-    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H], dtype=tl.float64)
     if tok < valid_tokens:
         tok_i64 = tok.to(tl.int64)
         for lid in tl.range(0, num_local_experts):
@@ -444,10 +446,10 @@ def _unpermute_tokens_in_expert_order_kernel(
             if pos >= 0:
                 pos_i64 = pos.to(tl.int64)
                 vals = tl.load(expert_out_ptr + pos_i64 * hidden_dim + offsets, mask=mask_h).to(
-                    tl.float32
+                    tl.float64
                 )
                 acc += vals
-        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc, mask=mask_h)
+        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
 
 
 def unpermute_tokens_in_expert_order(

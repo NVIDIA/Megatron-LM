@@ -3,7 +3,7 @@ name: pr-review
 description: Review rubric for the `/review` pull-request command. The formal reviewer reads it as a file and it is not an interactive skill — do not load it to answer questions or to review code outside that command.
 license: Apache-2.0
 disable-model-invocation: true
-user_invocable: false
+user-invocable: false
 ---
 
 # PR Review
@@ -16,9 +16,9 @@ It lives in `skills/` so the rubric can be diffed, reviewed and evolved like
 code instead of being buried in YAML, but it is deliberately inert: the
 frontmatter carries `disable-model-invocation: true`, so Claude Code drops it
 from the advertised skill list and refuses to auto-invoke it. Reading it by
-path, which is exactly what the reviewer does, still works. Do not add a
-`when_to_use:` field — that is the trigger text that would make it activate on
-its own.
+path, which is exactly what the reviewer does, still works. Do not add trigger
+text to the `description` field — that is what would make it activate on its
+own.
 
 ## Pick the depth
 

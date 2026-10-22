@@ -149,6 +149,15 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 "mtp_hybrid_override_pattern is not supported by GPTModel. "
                 "For GPT models, define MTP layers through mtp_block_spec."
             )
+        if (
+            self.config.enable_mhc_connections
+            and self.config.pipeline_model_parallel_size > 1
+            and self.config.mtp_num_layers
+        ):
+            raise NotImplementedError(
+                "GPTModel does not support mHC with pipeline parallelism and MTP. "
+                "The decoder contracts the residual before the multi-stream MTP block."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -786,7 +795,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     loss_mask=loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
@@ -996,8 +1004,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         # Old GPT checkpoints only stored the output layer weight key. So we remove the
         # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
+        data = output_extra_state.data if output_extra_state is not None else None
+        assert data is None or (
+            data.numel() == 0 if isinstance(data, torch.Tensor) else not data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict

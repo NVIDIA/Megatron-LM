@@ -1,16 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import json
 import os
-from importlib.metadata import version
-from packaging.version import Version as PkgVersion
 import sys
-import torch
+from importlib.metadata import version
 
-from utils import (
-    chunk_bias,
-    chunk_weight,
-    initialize_checkpoint_converter_fake_process_groups,
-)
+import torch
+from packaging.version import Version as PkgVersion
+from utils import chunk_bias, chunk_weight, initialize_checkpoint_converter_fake_process_groups
+
 
 class MegatronCheckpointSaverBase:
     """Orchestrates saving a Megatron checkpoint using parameters received on a multiprocessing queue.
@@ -143,9 +140,13 @@ class MegatronCheckpointSaverBase:
         Initialize Megatron global variables and fused kernels.
         """
         try:
-            from megatron.training.argument_utils import inference_cfg_container_from_args
-            from megatron.training.global_vars import set_global_variables, get_args
             from megatron.core import mpu
+            from megatron.training.argument_utils import inference_cfg_container_from_args
+            from megatron.training.global_vars import (
+                get_args,
+                get_train_state,
+                set_global_variables,
+            )
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -156,11 +157,13 @@ class MegatronCheckpointSaverBase:
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
 
+        train_state = get_train_state()
+        train_state.iteration = self.md.iteration
         if hasattr(self.md, 'consumed_train_samples'):
-            self.margs.consumed_train_samples = self.md.consumed_train_samples
-            self.margs.consumed_valid_samples = self.md.consumed_valid_samples
-            print(f"Setting consumed_train_samples to {self.margs.consumed_train_samples}"
-                  f" and consumed_valid_samples to {self.margs.consumed_valid_samples}")
+            train_state.consumed_train_samples = self.md.consumed_train_samples
+            train_state.consumed_valid_samples = self.md.consumed_valid_samples
+            print(f"Setting consumed_train_samples to {train_state.consumed_train_samples}"
+                  f" and consumed_valid_samples to {train_state.consumed_valid_samples}")
         else:
             print("consumed_train_samples not provided.")
 
@@ -344,19 +347,21 @@ class MegatronCheckpointSaverBase:
         Save local models in self.models to a megatron checkpoint.
         """
         try:
-            from megatron.training.checkpointing import save_checkpoint
             from megatron.core import mpu
+            from megatron.training import get_train_state
+            from megatron.training.checkpointing import save_checkpoint
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        train_state = get_train_state()
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
             self.get_local_model(pp_rank,0,0)
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
-                    save_checkpoint(self.md.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
+                    save_checkpoint(train_state.iteration, [self.get_local_model(pp_rank, ep_rank, tp_rank)], None, None, num_floating_point_operations_so_far=0,
                         pipeline_rank=pp_rank, pipeline_parallel=self.args.target_pipeline_parallel_size > 1,
                         expert_rank=ep_rank, expert_parallel=self.args.target_expert_parallel_size > 1,
                         tensor_rank=tp_rank)

@@ -3,13 +3,16 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+from megatron.training import training
 from megatron.training.checkpointing import save_grads
-from megatron.training.global_vars import set_args
+from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
@@ -60,7 +63,6 @@ def create_test_args():
     args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
-    args.perform_rl_step = False
     args.phase_transition_iterations = None
 
     return args
@@ -78,6 +80,47 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
     )
 
     assert _get_indexer_logging_layer_counts(args) == (3, 2)
+
+
+@pytest.mark.parametrize("fsdp2", [False, True])
+@pytest.mark.parametrize("megatron_fsdp", [False, True])
+def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2, megatron_fsdp):
+    args = SimpleNamespace(
+        skip_train=False,
+        freeze_all_layers=False,
+        freeze_base_model_for_mtp=False,
+        use_torch_fsdp2=not fsdp2,
+        use_megatron_fsdp=not megatron_fsdp,
+    )
+    run_config.dist.use_torch_fsdp2 = fsdp2
+    run_config.ddp = (
+        training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+        if fsdp2
+        else training.DistributedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
+    )
+    builder = Mock()
+    run_config.model = SimpleNamespace(get_builder_cls=lambda: Mock(return_value=builder))
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+    monkeypatch.setattr(training, "_add_model_freeze_pre_wrap_hook", Mock())
+    monkeypatch.setattr("megatron.training.utils.start_memory_history_recording", Mock())
+    # A passed training container must not be replaced by the global container.
+    monkeypatch.setattr(training, "get_run_config", Mock(side_effect=AssertionError("global read")))
+
+    class ReachedBuilder(Exception):
+        pass
+
+    builder.build_distributed_models.side_effect = ReachedBuilder
+    with pytest.raises(ReachedBuilder):
+        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
+    kwargs = builder.build_distributed_models.call_args.kwargs
+    assert kwargs["ddp_config"] is run_config.ddp
+    assert kwargs["use_torch_fsdp2"] is fsdp2
+    # Forward both flags unchanged, including the pair rejected by the builder.
+    assert kwargs["use_megatron_fsdp"] is megatron_fsdp
 
 
 def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
@@ -122,12 +165,20 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
 
 
 class TestTraining:
+    @pytest.fixture(autouse=True)
+    def training_config(self, run_config):
+        run_config.train = TrainingConfig(train_samples=1, train_iters=1, global_batch_size=1)
+        run_config.validation = ValidationConfig(
+            eval_interval=1, eval_iters=1, eval_global_batch_size=1
+        )
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         args = create_test_args()
         set_args(args)
+        _set_train_state()
 
-    def test_build_train_valid_test_data_iterators(self):
+    def test_build_train_valid_test_data_iterators(self, run_config):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
@@ -153,13 +204,13 @@ class TestTraining:
         args.log_params_norm = False
         assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
 
-    def test_build_train_valid_test_data_iterators_multi_full_validation(self):
+    def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators
-        (one per validation set) and sets args.eval_iters to the per-loader
+        (one per validation set) and sets cfg.validation.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
         args = create_test_args()
-        args.multiple_validation_sets = True
-        args.full_validation = True
+        run_config.validation.multiple_validation_sets = True
+        run_config.validation.full_validation = True
         set_args(args)
         _, valid_iters, _ = build_train_valid_test_data_iterators(
             mock_multi_valid_full_datasets_provider
@@ -169,7 +220,7 @@ class TestTraining:
         assert next(valid_iters[0]) == 2
         assert next(valid_iters[1]) == 20
         # data_parallel_size=1, so MAX across DP ranks equals the local lengths
-        assert args.eval_iters == [2, 3]
+        assert run_config.validation.eval_iters == [2, 3]
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):
@@ -199,6 +250,7 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        destroy_global_vars()
 
 
 class TestGetModelBucketSizingPgCollection:
@@ -248,6 +300,68 @@ class TestGetModelBucketSizingPgCollection:
 
 
 class TestPackedSampleAccounting:
+    @pytest.mark.parametrize("schedule,expected_iters", [(None, 4), ("0:8 32:16", 6)])
+    def test_sample_horizon_uses_config_and_resets_batch_schedule(
+        self, monkeypatch, schedule, expected_iters
+    ):
+        from megatron.core import num_microbatches_calculator as calculator
+        from megatron.training import training
+
+        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+
+        def unexpected_global_config():
+            raise AssertionError("sample horizon must use the supplied TrainingConfig")
+
+        monkeypatch.setattr(training, "get_run_config", unexpected_global_config)
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=64,
+            step_batch_size_schedule=schedule,
+        )
+        calculator.init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=16,
+            micro_batch_size=2,
+            data_parallel_size=1,
+            step_batch_size_schedule=schedule,
+        )
+        training.update_train_iters(train)
+        assert train.train_iters == expected_iters
+        assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
+
+    @pytest.mark.parametrize(
+        "total_cp,num_sequence_shards,weight_shards,samples",
+        [(1, 1, 4, 8), (4, 2, 2, 2), (2, 2, 4, 4)],
+    )
+    def test_static_cp_sample_count_and_scheduler(
+        self, monkeypatch, run_config, total_cp, num_sequence_shards, weight_shards, samples
+    ):
+        """Sequence shards count each sample once for progress and sample-based LR schedules."""
+        import megatron.training.training as training
+
+        args = SimpleNamespace(
+            gtp_remat_num_sequence_shards=num_sequence_shards,
+            world_size=8,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=total_cp,
+            gtp_weight_remat_size=weight_shards,
+            data_parallel_size=2,
+            micro_batch_size=2,
+            train_iters=None,
+            train_samples=10_000,
+        )
+        run_config.train = TrainingConfig(micro_batch_size=2, train_samples=10_000)
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)
+        monkeypatch.setattr(training, "is_pp_last_stage", lambda group: True)
+        monkeypatch.setattr(training, "get_pg_size", lambda group: 1)
+
+        count = training._get_samples_seen_in_iteration([{}] * 3, args, SimpleNamespace(pp=None))
+
+        assert count == 3 * 2 * samples
+        assert _get_optimizer_param_scheduler_increment(args, count) == 3 * 2 * samples
+
     def test_pop_samples_seen_sums_and_removes_metadata(self):
         losses = [
             {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},
@@ -266,16 +380,18 @@ class TestPackedSampleAccounting:
         with pytest.raises(ValueError, match="every microbatch"):
             _pop_samples_seen(losses)
 
-    def test_iteration_schedule_uses_running_batch_size(self, monkeypatch):
+    def test_iteration_schedule_uses_running_batch_size(self, monkeypatch, run_config):
         args = SimpleNamespace(train_iters=100, train_samples=None)
+        run_config.train = TrainingConfig(train_iters=100)
         monkeypatch.setattr(
             "megatron.training.training.get_current_running_global_batch_size", lambda: 256
         )
 
         assert _get_optimizer_param_scheduler_increment(args, 3342) == 256
 
-    def test_sample_schedule_uses_samples_seen(self):
+    def test_sample_schedule_uses_samples_seen(self, run_config):
         args = SimpleNamespace(train_iters=39, train_samples=10_000)
+        run_config.train = TrainingConfig(train_iters=39, train_samples=10_000)
 
         assert _get_optimizer_param_scheduler_increment(args, 3342) == 3342
 

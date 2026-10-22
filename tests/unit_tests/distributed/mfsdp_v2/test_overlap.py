@@ -244,8 +244,10 @@ def test_overlaps_communication_and_compute(
             f"Expected exactly {expected_allgather_overlap_count} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_groups)}."
         )
-    assert reduce_scatter_overlap_count == expected_reduce_scatter_overlap_count, (
-        f"Expected exactly {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
+    # Skipping the wait after non-final microbatches can also let their last
+    # reduction overlap the next forward.
+    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap_count, (
+        f"Expected at least {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_groups)}."
     )
 
