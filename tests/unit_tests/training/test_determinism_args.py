@@ -351,6 +351,7 @@ def test_hopper_nvls_error_points_to_disable_flag(monkeypatch):
     assert "--disable-deterministic-mode" in str(exc_info.value)
 
 
+@pytest.mark.internal
 def test_nccl_algo_still_empty_error_points_to_disable_flag(monkeypatch):
     monkeypatch.setenv("NCCL_ALGO", "")
     ctypes.CDLL(None).setenv(b"NCCL_ALGO", b"^NVLS", 1)
