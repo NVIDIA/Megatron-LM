@@ -77,6 +77,18 @@ class Case:
     sp: bool = False
 
 
+MLA_CASE = Case(
+    "mla",
+    model=dict(
+        multi_latent_attention=True,
+        cache_mla_latents=True,
+        num_attention_heads=64,
+        qk_layernorm=True,
+    ),
+    context={"block_size_tokens": 64},
+)
+
+
 @contextmanager
 def invariant_runtime(case):
     """Pin process-global mode; launch each selected backend in a fresh process."""
@@ -92,7 +104,7 @@ def invariant_runtime(case):
     assert attention.HAVE_FA3 if fa_version == 3 else attention.HAVE_FA4
     assert bik.te_supports_batch_invariant_attention()
     # Another test module can change these class attributes during collection.
-    rounders = DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER
+    rounders = (DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER)
     DynamicInferenceContext.TOKEN_ROUNDER = 64
     DynamicInferenceContext.REQUEST_ROUNDER = 4
     deterministic = torch.are_deterministic_algorithms_enabled()
@@ -122,7 +134,6 @@ def invariant_runtime(case):
 
 
 def model_defaults(backend, fa_version):
-    """Common identical model settings; architecture-specific options stay local."""
     return dict(
         use_cpu_initialization=True,
         hidden_dropout=0.0,

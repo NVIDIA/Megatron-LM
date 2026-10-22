@@ -311,6 +311,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="transformer_engine_wrappers",
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(
+            K + "test_mla_device_placement.py",
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",

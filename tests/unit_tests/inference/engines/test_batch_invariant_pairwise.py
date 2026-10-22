@@ -1,10 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Target-owned batch invariance across executed dynamic-inference features.
 
-Run backend/version groups in separate torch.distributed.run invocations using
-MCORE_BI_TEST_BACKEND and MCORE_BI_TEST_FA_VERSION; never switch a live backend.
-The te_native invocation additionally sets CUBLASLT_WORKSPACE_SIZE=0 before
-the interpreter starts. Required capability failures are not successful skips.
+Run backend/version groups in fresh torch.distributed.run processes using
+MCORE_BI_TEST_BACKEND and MCORE_BI_TEST_FA_VERSION. Start te_native with
+CUBLASLT_WORKSPACE_SIZE=0; missing required capabilities must fail, not skip.
 """
 
 import pytest
