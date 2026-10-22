@@ -30,6 +30,7 @@ from megatron.core import parallel_state
 from megatron.core.fusions import fused_layer_norm
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.mtp_metadata import MTPForwardMode
+from megatron.core.inference.inference_request import DynamicInferenceEventType
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -89,6 +90,7 @@ class _Case:
     config: dict[str, object] = field(default_factory=dict)
     signals: tuple[str, ...] = ("gpt",)
     prerequisite: Optional[str] = None
+    stop_keep: Optional[bool] = None
     exact_top_n: bool = True
     atol: float = 1.0e-3
 
@@ -179,6 +181,10 @@ def _sampling(case: _Case, output_length: int) -> SamplingParams:
         "top_k": int(case.config.get("top_k", 1)),
         "top_p": float(case.config.get("top_p", 0.0)),
     }
+    if case.stop_keep is not None:
+        kwargs.update(
+            stop_words=[f"{_BASE_TOKEN} {_BASE_TOKEN}"], detokenize_stop_sequence=case.stop_keep
+        )
     return SamplingParams(**kwargs)
 
 
@@ -397,7 +403,10 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
         if case.pattern == "distribution":
             _set_logits(result, _BASE_TOKEN, distribution=True)
         else:
-            _set_logits(result, _BASE_TOKEN)
+            token = _BASE_TOKEN
+            if case.pattern == "stop" and context.num_prefill_requests > 0:
+                token = _BASE_TOKEN - 1
+            _set_logits(result, token)
         return result
 
     model.forward = observed_forward
@@ -450,7 +459,7 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
             if case.pattern == "distribution":
                 _set_logits(logits, _BASE_TOKEN, distribution=True)
                 return hidden_states, logits
-            if case.pattern == "accept":
+            if case.pattern in {"accept", "stop"}:
                 tokens = [_BASE_TOKEN] * logits.shape[0]
             elif case.pattern == "reject":
                 tokens = [_REJECT_TOKEN] * logits.shape[0]
@@ -725,6 +734,12 @@ def _assert_complete(session: _Session, case: _Case) -> None:
     for request, output_length in zip(session.requests, case.output_lengths):
         assert request.status.name == "COMPLETED"
         expected_length = output_length
+        if case.stop_keep is True:
+            expected_length = 3
+            assert request.generated_tokens == [_BASE_TOKEN - 1, _BASE_TOKEN, _BASE_TOKEN]
+        elif case.stop_keep is False:
+            expected_length = 1
+            assert request.generated_tokens == [_BASE_TOKEN - 1]
         assert len(request.generated_tokens) == expected_length
         assert request.generated_log_probs is not None
         assert len(request.generated_log_probs) == expected_length
@@ -740,8 +755,30 @@ def _assert_complete(session: _Session, case: _Case) -> None:
             for token, top_n in zip(request.generated_tokens, request.generated_top_n_logprobs)
         ]
         assert selected_top_n == pytest.approx(request.generated_log_probs, rel=0, abs=case.atol)
+        if case.stop_keep is not None:
+            generated_events = [
+                event
+                for event in request.events
+                if event.type is DynamicInferenceEventType.GENERATED_TOKEN
+            ]
+            assert [event.payload["token_id"] for event in generated_events] == (
+                request.generated_tokens
+            )
+            terminal_events = [
+                event.type
+                for event in request.events
+                if event.type
+                in (DynamicInferenceEventType.GENERATED_TOKEN, DynamicInferenceEventType.FINISH)
+            ]
+            assert terminal_events == [
+                DynamicInferenceEventType.GENERATED_TOKEN
+            ] * expected_length + [DynamicInferenceEventType.FINISH]
         if case.pattern not in {"natural", "distribution"}:
-            assert all(token == _BASE_TOKEN for token in request.generated_tokens)
+            expected_token = _BASE_TOKEN
+            if case.pattern == "stop":
+                assert request.generated_tokens[0] == _BASE_TOKEN - 1
+            else:
+                assert all(token == expected_token for token in request.generated_tokens)
 
 
 def _assert_mtp_active(session: _Session, case: _Case) -> None:
@@ -772,7 +809,9 @@ def _assert_mtp_active(session: _Session, case: _Case) -> None:
         assert session.witness.accepted_by_request[request_id]
         assert session.witness.rewinds[request_id]
 
-    expected = {"accept": case.depth, "reject": 0, "partial": 1}.get(case.pattern)
+    expected = {"accept": case.depth, "stop": case.depth, "reject": 0, "partial": 1}.get(
+        case.pattern
+    )
     if expected is not None:
         assert all(
             count == expected
@@ -1079,6 +1118,27 @@ class TestMTPPairwise(_DynamicEngineTestBase):
                 output_lengths=(output_length,),
             )
         )
+
+    @pytest.mark.parametrize("keep", [True, False], ids=["keep", "strip"])
+    @torch.inference_mode()
+    def test_stop_sequence_trims_one_mtp_burst(self, keep):
+        """The earliest stop boundary trims tokens and scores consistently."""
+        case = _Case(
+            name=f"stop-{'keep' if keep else 'strip'}",
+            depth=3,
+            pattern="stop",
+            prompt_lengths=(5,),
+            output_lengths=(10,),
+            config={"track_generated_token_events": True},
+            stop_keep=keep,
+        )
+        if keep:
+            _run_mtp_pair(case)
+        else:
+            # Ordinary one-token steps exercise a separate cross-step strip contract.
+            treatment = _run_session(_build_env(case, mtp_active=True), case)
+            _assert_complete(treatment, case)
+            _assert_mtp_active(treatment, case)
 
     @torch.inference_mode()
     def test_hybrid_mamba_partial_acceptance_selects_exact_intermediate_state(self):

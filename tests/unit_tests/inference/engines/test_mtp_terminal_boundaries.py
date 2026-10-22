@@ -107,6 +107,96 @@ def test_terminal_position_uses_accepted_prefix_then_replacement(
     assert engine._find_mid_block_eos(request, tokens) == expected
 
 
+@pytest.mark.parametrize("keep_stop", [False, True], ids=["strip-stop", "keep-stop"])
+def test_stop_boundary_output_is_aligned_for_keep_and_strip(keep_stop):
+    """Keep tokens, scores, and events aligned for either stop-retention mode."""
+
+    class NoFullHistoryCopy(list):
+        def __add__(self, other):
+            raise AssertionError("stop matching copied the complete generated history")
+
+    request = _make_decode_request(keep_stop=keep_stop)
+    request.generated_tokens = NoFullHistoryCopy(request.generated_tokens)
+    request.stop_word_ids = [[20, 20]]
+    engine = _make_postprocess_engine(
+        request, num_speculative_tokens=3, track_generated_token_events=True
+    )
+
+    active_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.tensor([request.request_id]),
+        finished_request_ids=torch.empty(0, dtype=torch.long),
+        evict_request_ids=None,
+        step_time=0.0,
+        sample=torch.tensor([20]),
+        accepted_tokens=torch.tensor([[20, 20, 20]]),
+        log_probs=[[-0.2, -0.3, -0.4, -0.5]],
+        consumed_chunked_prefill_request_id=-1,
+        top_n_logprobs={0: _top_n_rows([20, 20, 20, 20])},
+    )
+
+    assert active_ids == [request.request_id]
+    assert finished_records == []
+    assert engine.stop_word_finished_request_ids == {request.request_id}
+    assert request.generated_tokens == ([10, 20, 20] if keep_stop else [10])
+    assert request.generated_log_probs == pytest.approx([-0.1, -0.2, -0.3] if keep_stop else [-0.1])
+    assert len(request.generated_log_probs) == len(request.generated_tokens)
+    assert len(request.generated_top_n_logprobs) == len(request.generated_tokens)
+    assert all(
+        str(token) in top_n
+        for token, top_n in zip(request.generated_tokens, request.generated_top_n_logprobs)
+    )
+    generated_events = [
+        event.payload["token_id"]
+        for event in request.events
+        if event.type is DynamicInferenceEventType.GENERATED_TOKEN
+    ]
+    assert generated_events == request.generated_tokens
+    assert engine._get_and_clear_stop_word_finished_ids([request.request_id]) == {
+        request.request_id
+    }
+    assert engine.stop_word_finished_request_ids == set()
+    assert engine.stop_word_being_finished_ids == {request.request_id}
+
+
+def test_eos_wins_same_endpoint_stop_and_keeps_all_metadata_aligned():
+    """EOS remains visible when it also completes a stripped stop sequence."""
+    request = _make_decode_request()
+    request.sampling_params.termination_id = 20
+    request.stop_word_ids = [[19, 20]]
+    engine = _make_postprocess_engine(
+        request, num_speculative_tokens=2, track_generated_token_events=True
+    )
+
+    active_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.tensor([request.request_id]),
+        finished_request_ids=torch.tensor([request.request_id]),
+        evict_request_ids=None,
+        step_time=0.0,
+        sample=torch.tensor([21]),
+        accepted_tokens=torch.tensor([[19, 20]]),
+        log_probs=[[-0.2, -0.3, -0.4]],
+        consumed_chunked_prefill_request_id=-1,
+        top_n_logprobs={0: _top_n_rows([19, 20, 21])},
+    )
+
+    assert active_ids == []
+    assert len(finished_records) == 1
+    assert request.generated_tokens == [10, 19, 20]
+    assert request.generated_log_probs == pytest.approx([-0.1, -0.2, -0.3])
+    assert len(request.generated_top_n_logprobs) == len(request.generated_tokens)
+    assert all(
+        str(token) in top_n
+        for token, top_n in zip(request.generated_tokens, request.generated_top_n_logprobs)
+    )
+    generated_events = [
+        event.payload["token_id"]
+        for event in request.events
+        if event.type is DynamicInferenceEventType.GENERATED_TOKEN
+    ]
+    assert generated_events == request.generated_tokens
+    assert engine.stop_word_finished_request_ids == set()
+
+
 def test_chunked_prefill_provisional_sample_is_not_output_or_metric_data():
     request = DynamicInferenceRequest(
         request_id=7,

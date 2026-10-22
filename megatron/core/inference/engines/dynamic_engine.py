@@ -3021,6 +3021,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request,
                         record=self.requests[request_id].record,
                         num_new_tokens=num_new_tokens,
+                        preserve_terminal_eos=eos_mid_block_hit,
                     )
                 )
 
@@ -3524,6 +3525,7 @@ class DynamicInferenceEngine(AbstractEngine):
         *,
         record: Optional[DynamicInferenceRequestRecord] = None,
         num_new_tokens: Optional[int] = None,
+        preserve_terminal_eos: bool = False,
     ) -> Tuple[bool, int, int]:
         """Check if a request should stop due to stop words (after token is appended).
 
@@ -3545,6 +3547,9 @@ class DynamicInferenceEngine(AbstractEngine):
             num_new_tokens: Number of tokens appended in the current step. The
                 returned trim count is limited to these tokens so the caller can
                 trim pending log-probability results without deleting prompt data.
+
+            preserve_terminal_eos: Keep the already-truncated EOS when a stop sequence
+                ends at that same endpoint; a stop ending earlier still takes precedence.
 
         Returns:
             Tuple of (stop_word_hit, num_new_tokens_trimmed,
@@ -3629,6 +3634,8 @@ class DynamicInferenceEngine(AbstractEngine):
             # A larger trailing-token count means this stop completed earlier;
             # at the same endpoint, prefer the longer stop sequence.
             for trailing_token_count in range(endpoint_count):
+                if preserve_terminal_eos and trailing_token_count == 0:
+                    continue
                 end_idx = -trailing_token_count if trailing_token_count > 0 else None
                 if (
                     list(generated_tokens[-stop_len - trailing_token_count : end_idx])
