@@ -15,7 +15,7 @@ import sys
 
 prefix = "megatron.core.transformer."
 first = (
-    ("transformer_layer", "wide_residual_layer", "residual_recompute_plan")
+    ("transformer_layer", "wide_residual_layer")
     if sys.argv[1] == "legacy-first"
     else (
         "hyper_connection_transformer_layer",
@@ -46,9 +46,6 @@ aliases = [
     ("wide_residual_layer", "load_residual_state", "wide_residual"),
     ("wide_residual_layer", "wide_residual_recompute_enabled", "wide_residual"),
     ("wide_residual_layer", "WideResidualTransformerLayer", "wide_residual_transformer_layer"),
-    ("residual_recompute_plan", "build_recompute_block_end_plan", "residual_recompute"),
-    ("residual_recompute_plan", "build_recompute_layer_managers", "residual_recompute"),
-    ("residual_recompute_plan", "finalize_recompute_block", "residual_recompute"),
 ]
 for old_name, symbol, new_name in aliases:
     old_path, new_path = prefix + old_name, prefix + new_name
