@@ -31,6 +31,15 @@ def test_default_dynamic_cp_scheduler_requires_dynamic_cp():
         )
 
 
+def test_dynamic_cp_rejects_deterministic_mode():
+    with pytest.raises(ValueError, match="does not support deterministic_mode"):
+        ModelParallelConfig(
+            dynamic_context_parallel=True,
+            deterministic_mode=True,
+            max_seqlen_per_dp_cp_rank=4096,
+        )
+
+
 def test_hybrid_cp_alias_normalizes_to_dynamic_cp():
     with pytest.warns(DeprecationWarning, match="deprecated"):
         config = ModelParallelConfig(hybrid_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
