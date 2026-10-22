@@ -94,11 +94,19 @@ def test_same_fields_as_megatron_core_and_no_eager_post_init():
         f.name for f in fields(MCoreGPTDatasetConfig) if f.init
     ]
     assert GPTDatasetConfig.__dataclass_fields__["random_seed"].kw_only
+    # No field beyond Core's: random_seed is the one redeclared (Core requires it at construction).
+    assert [f.name for f in fields(GPTDatasetConfig)] == [
+        f.name for f in fields(MCoreGPTDatasetConfig)
+    ]
     assert cfg.tokenizer is None and cfg.split_matrix is None
     assert cfg.mock is False and cfg.token_dtype_code is None
     assert not cfg.is_prepared
     unset = GPTDatasetConfig(sequence_length=16, **BOOLS)
-    assert all(getattr(unset, name) is None for name in MIRROR_FIELDS)
+    assert all(mirror_is_unset(unset, name) for name in MIRROR_FIELDS)
+    assert unset.random_seed is None and unset.context_parallel_size is None
+    # The layout mirrors keep Megatron Core's fields and defaults.
+    assert (unset.data_parallel_size, unset.sequence_parallel_size) == (1, 0)
+    assert unset.hybrid_context_parallel is False
 
 
 @pytest.mark.parametrize(
@@ -137,7 +145,7 @@ def test_prepare_needs_a_tokenizer_and_a_seed(tokenizer):
     assert not unset.is_prepared
     unset.random_seed = 7
     unset.prepare(tokenizer)
-    # Layout mirrors left unset take Megatron Core's defaults; set values are kept.
+    # Layout mirrors hold Megatron Core's defaults unless set; set values are kept.
     assert (unset.data_parallel_size, unset.sequence_parallel_size) == (1, 0)
     assert unset.hybrid_context_parallel is False and unset.context_parallel_size is None
     explicit = _dataset(
@@ -157,12 +165,12 @@ def test_prepare_applies_megatron_core_checks(tokenizer):
         sbhd.validate()
     with pytest.raises(AssertionError):
         sbhd.prepare(tokenizer)
-    assert not sbhd.is_prepared
+    assert not sbhd.is_prepared and sbhd.tokenizer is None  # a failed prepare() binds nothing
     counts = _dataset(blend=BLEND, split="9,1,0", sequences_per_dataset={"prefix-a": [10, 2]})
     counts.validate()
     with pytest.raises(AssertionError):
         counts.prepare(SimpleNamespace(vocab_size=None))
-    assert not counts.is_prepared
+    assert not counts.is_prepared and counts.tokenizer is None
     counts.prepare(tokenizer)
     assert counts.is_prepared and counts.token_dtype_code == 8
 
@@ -211,11 +219,29 @@ def test_validate_accepts_valid_sections(overrides):
     _dataset(**overrides).validate()
 
 
-def test_replace_and_deepcopy_are_not_reset_apis(tokenizer):
+def test_a_bound_tokenizer_means_prepared(tokenizer):
+    """Core's invariant: an object holding a tokenizer has run Core's post-init. A tokenizer given
+    to the constructor is bound through prepare(); dataclasses.replace() of a prepared object runs
+    Core's post-init on the copy, as for Core's class; deepcopy() copies the prepared state."""
+    eager = _dataset(blend=BLEND, split="9,1,0", tokenizer=tokenizer)
+    assert eager.is_prepared and eager.tokenizer is tokenizer and eager.token_dtype_code == 8
+    expected = MCoreGPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1234,
+        tokenizer=tokenizer,
+        blend=BLEND,
+        split="9,1,0",
+        **BOOLS,
+    )
+    assert _core_values(eager) == _core_values(expected)
+    with pytest.raises(ValueError, match="random_seed is not set"):
+        GPTDatasetConfig(sequence_length=16, tokenizer=tokenizer, **BOOLS)
     cfg = _dataset()
     cfg.prepare(tokenizer)
-    copied = dataclasses.replace(cfg, num_workers=0) if False else dataclasses.replace(cfg)
-    assert not copied.is_prepared and copied.tokenizer is tokenizer and copied.split_matrix is None
+    copied = dataclasses.replace(cfg, blend=BLEND, split="9,1,0")
+    assert copied.is_prepared and copied.tokenizer is tokenizer
+    assert copied.mock is False and copied.split_matrix == expected.split_matrix
+    assert not dataclasses.replace(_dataset()).is_prepared
     assert copy.deepcopy(cfg).is_prepared
 
 
@@ -258,8 +284,8 @@ def test_fim_subclass_carries_the_runtime_fim_fields(tokenizer):
 
 
 def test_mirror_is_unset_tells_core_defaults_from_explicit_values():
-    """What the container treats as "no explicit value": None, or the Core default prepare()
-    substitutes for a layout mirror (so a prepared config still counts as unset)."""
+    """What the container treats as "no explicit value": None, or Megatron Core's default for a
+    layout mirror (what the field holds when nothing writes it, before and after prepare())."""
     assert all(mirror_is_unset(_dataset(random_seed=None), name) for name in MIRROR_FIELDS)
     assert mirror_is_unset(_dataset(data_parallel_size=1), "data_parallel_size")
     assert mirror_is_unset(_dataset(sequence_parallel_size=0), "sequence_parallel_size")
@@ -275,7 +301,7 @@ def test_to_cfg_dict_omits_tokenizer_mirrors_and_derived_fields(tokenizer):
     before = cfg.to_cfg_dict()
     assert before["_target_"] == "megatron.training.config.dataset_config.GPTDatasetConfig"
     assert "tokenizer" not in before and not (set(MIRROR_FIELDS) & set(before))
-    assert not {"split_matrix", "mock", "token_dtype_code", "_prepared"} & set(before)
+    assert not {"split_matrix", "mock", "token_dtype_code"} & set(before)
     assert before["blend"] == [["prefix-a", "prefix-b"], [0.3, 0.7]] and before["split"] == "9,1,0"
     cfg.prepare(tokenizer)
     after = cfg.to_cfg_dict()
@@ -284,7 +310,7 @@ def test_to_cfg_dict_omits_tokenizer_mirrors_and_derived_fields(tokenizer):
         sanitize_dataclass_config(copy.deepcopy(after)), mode=InstantiationMode.STRICT
     )
     assert type(restored) is GPTDatasetConfig and not restored.is_prepared
-    assert restored.tokenizer is None and all(getattr(restored, n) is None for n in MIRROR_FIELDS)
+    assert restored.tokenizer is None and all(mirror_is_unset(restored, n) for n in MIRROR_FIELDS)
     assert restored.to_cfg_dict() == after
     fim = _fim().to_cfg_dict()
     assert (

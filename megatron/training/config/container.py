@@ -418,9 +418,12 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     @staticmethod
     def _check_mirror(dataset: Any, name: str, owned: Any) -> None:
-        """An explicit mirror value must agree with the section that owns it."""
+        """An explicit mirror value must agree with the section that owns it; a mirror at Core's
+        default carries no explicit value and is written over."""
+        if mirror_is_unset(dataset, name):
+            return
         explicit = getattr(dataset, name)
-        if explicit is not None and explicit != owned:
+        if explicit != owned:
             raise ValueError(
                 f"data.dataset.{name}={explicit!r} disagrees with the section that owns it "
                 f"({owned!r}); the container writes this field at finalize(), leave it unset."

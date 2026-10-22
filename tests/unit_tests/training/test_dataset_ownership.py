@@ -37,7 +37,7 @@ from megatron.training.config import (
     PretrainConfigContainer,
 )
 from megatron.training.config import container as container_module
-from megatron.training.config.dataset_config import LAYOUT_MIRRORS, MIRROR_FIELDS
+from megatron.training.config.dataset_config import LAYOUT_MIRRORS, MIRROR_FIELDS, mirror_is_unset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset
@@ -195,7 +195,7 @@ def test_container_from_args_builds_the_core_fields_from_every_data_argument(
     )
     # Runtime state and mirrors are not taken from the arguments by the container factory.
     assert dataset.tokenizer is None and not dataset.is_prepared
-    assert all(getattr(dataset, name) is None for name in MIRROR_FIELDS)
+    assert all(mirror_is_unset(dataset, name) for name in MIRROR_FIELDS)
     assert data.dataloader == DataloaderConfig(
         dataloader_type="cyclic", num_workers=0, data_sharding=False
     )
@@ -345,7 +345,8 @@ def test_standalone_config_takes_the_mirrors_from_args():
     )
     assert standalone.hybrid_context_parallel is False
     owned = gpt_data_config_from_args(args).dataset
-    assert all(getattr(owned, name) is None for name in MIRROR_FIELDS)
+    assert all(mirror_is_unset(owned, name) for name in MIRROR_FIELDS)
+    assert owned.random_seed is None and owned.full_validation is None
 
 
 def test_requested_family_precedence(warnings_log):
@@ -447,6 +448,31 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
         cfg.validate()
 
 
+def test_a_layout_mirror_at_core_default_carries_no_explicit_value(container_factory, monkeypatch):
+    """The layout mirrors keep Megatron Core's fields and defaults (1, 0, False): a value equal to
+    the default is not an explicit value, so it agrees with any layout and is written over; a
+    different value must agree with the layout."""
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    dataset = cfg.data.dataset
+    cfg.model = _layout(
+        tensor_model_parallel_size=2,
+        context_parallel_size=2,
+        sequence_parallel=True,
+        hybrid_context_parallel=True,
+    )
+    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
+    dataset.data_parallel_size, dataset.sequence_parallel_size = 1, 0
+    dataset.hybrid_context_parallel = False
+    cfg.validate()
+    dataset.sequence_parallel_size = 1
+    with pytest.raises(ValueError, match="data.dataset.sequence_parallel_size=1 disagrees"):
+        cfg.validate()
+    dataset.sequence_parallel_size = 0
+    cfg.finalize()
+    assert (dataset.data_parallel_size, dataset.sequence_parallel_size) == (2, 2)
+    assert dataset.hybrid_context_parallel is True
+
+
 def test_layout_without_a_model_section_survives_a_reload(
     container_factory, monkeypatch, tokenizer
 ):
@@ -476,11 +502,11 @@ def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokeniz
     monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     dataset = cfg.data.dataset
     # Without a model config the layout mirrors have no owner: an explicit value is rejected (it
-    # would not be saved with the section), Core's defaults apply at prepare().
+    # would not be saved with the section); the fields keep Core's defaults.
     dataset.data_parallel_size = 4
     with pytest.raises(ValueError, match="data_parallel_size=4 is not written .*no model config"):
         cfg.validate()
-    dataset.data_parallel_size = None
+    dataset.data_parallel_size = 1
     dataset.context_parallel_size = 7
     with pytest.raises(ValueError, match="context_parallel_size=7 is not written"):
         cfg.validate()
@@ -488,10 +514,10 @@ def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokeniz
     cfg.finalize()
     assert dataset.random_seed == cfg.rng.seed
     assert dataset.full_validation is True and dataset.multiple_validation_sets is False
-    assert dataset.context_parallel_size is None and dataset.data_parallel_size is None
-    dataset.prepare(tokenizer)  # Core defaults apply to the layout
+    assert dataset.context_parallel_size is None and dataset.data_parallel_size == 1
+    dataset.prepare(tokenizer)  # Core's defaults stay on the layout
     assert (dataset.data_parallel_size, dataset.sequence_parallel_size) == (1, 0)
-    cfg.validate()  # the prepared defaults are not explicit values
+    cfg.validate()  # Core's defaults are not explicit values
 
 
 @pytest.mark.parametrize(
