@@ -1181,8 +1181,17 @@ class TestMcoreAdapterHybrid:
     @pytest.mark.parametrize("ep_size", [1, 2])
     @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
     @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
+    @pytest.mark.parametrize(
+        "expert_hsdp,expert_strategy",
+        [
+            (True, "optim_grads_params"),
+            (False, "optim"),
+            (False, "optim_grads"),
+            (False, "optim_grads_params"),
+        ],
+    )
     def test_moe_with_independent_hybrid_placements(
-        self, dense_outer_strategy, expert_outer_strategy, ep_size
+        self, dense_outer_strategy, expert_outer_strategy, ep_size, expert_hsdp, expert_strategy
     ):
         """Check dense/expert placements and finite losses across accumulated optimizer steps."""
         outer_size = 2
@@ -1222,7 +1231,8 @@ class TestMcoreAdapterHybrid:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads",
-                expert_data_parallel_sharding_strategy="optim_grads_params",
+                expert_data_parallel_sharding_strategy=expert_strategy,
+                expert_hsdp=expert_hsdp,
                 num_distributed_optimizer_instances=outer_size,
                 outer_dp_sharding_strategy=dense_outer_strategy,
                 expert_outer_dp_sharding_strategy=expert_outer_strategy,
@@ -1248,11 +1258,17 @@ class TestMcoreAdapterHybrid:
             [model],
         )
 
+        expert_inner = RowAtomic() if expert_strategy == "optim_grads_params" else Replicate()
+        expert_placements = (Replicate(), expert_inner) if expert_hsdp else (expert_inner,)
+
         for name, submodule in model.named_modules():
             if isinstance(submodule, FsdpModule):
-                inner = RowAtomic() if "experts" in name else Replicate()
+                is_expert = "experts" in name
+                expected = expert_placements if is_expert else (Replicate(), Replicate())
                 for group in submodule.parameter_groups:
-                    assert group.model_weight.placements == (Replicate(), inner), name
+                    assert group.model_weight.placements == expected, name
+                    if is_expert and not expert_hsdp:
+                        assert group.mesh.get_group() is pg_collection.expt_dp
 
         for _ in range(3):
             optimizer.zero_grad(set_to_none=True)
@@ -1281,6 +1297,10 @@ class TestMcoreAdapterHybrid:
                 is_expert = "experts" in name
                 seen_expert.add(is_expert)
                 outer = expert_outer if is_expert else dense_outer
-                assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-                assert parameter.grad.placements == (outer, Shard(0)), name
+                if is_expert and not expert_hsdp:
+                    assert parameter.grad.device_mesh.mesh_dim_names == ("expert_dp",)
+                    assert parameter.grad.placements == (Shard(0),), name
+                else:
+                    assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+                    assert parameter.grad.placements == (outer, Shard(0)), name
         assert seen_expert == {False, True}

@@ -3129,6 +3129,11 @@ def _add_distributed_args(parser):
                             'The "optim" option is only supported when --data-parallel-sharding-strategy is "optim_grads_params". '
                             'This option is only effective when Hybrid FSDP is enabled (i.e., when dp_outer_dim is not None). '
                             'Default: "no_shard".')
+    group.add_argument('--no-expert-hsdp', action='store_false', dest='expert_hsdp', default=True,
+                       help='In MFSDP v2, disable hybrid sharding for experts and use the existing '
+                            'full expert-DP group with --expert-data-parallel-sharding-strategy. '
+                            'Ignores --expert-outer-dp-sharding-strategy. Dense sharding and '
+                            'process-group initialization are unchanged. Expert HSDP is enabled by default.')
     group.add_argument('--expert-outer-dp-sharding-strategy', type=str, default=None,
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for the outer expert data-parallel group in MFSDP v2. '
