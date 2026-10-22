@@ -142,18 +142,19 @@ def radio_vision_encoder_spec(
     vision_config: TransformerConfig,
     pg_collection: Optional[ProcessGroupCollection],
 ) -> ModuleSpec:
-    """Build the RADIO encoder ``ModuleSpec``, reading the RADIO knobs off ``args``."""
+    """Build the RADIO encoder spec from model geometry and remaining provider inputs."""
+    cfg = get_run_config()
     return ModuleSpec(
         module=RADIOEncoderWrapper,
         params={
             "transformer_config": vision_config,
             "transformer_layer_spec": get_vit_layer_with_transformer_engine_spec(),
             "pg_collection": pg_collection,
-            "img_h": args.img_h,
-            "img_w": args.img_w,
-            "patch_dim": args.patch_dim,
+            "img_h": cfg.model.img_h,
+            "img_w": cfg.model.img_w,
+            "patch_dim": cfg.model.patch_dim,
             "class_token_len": args.class_token_len,
-            "drop_class_token": args.disable_vision_class_token,
+            "drop_class_token": cfg.model.drop_vision_class_token,
             "apply_pixel_shuffle": args.pixel_shuffle,
             "force_eval_mode": args.freeze_vit,
             "dynamic_resolution": bool(getattr(args, "dynamic_resolution", False)),

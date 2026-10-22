@@ -168,8 +168,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         config.task,
         config.input_image_path,
         config.gt_path,
-        args.img_h,
-        args.img_w,
+        cfg.model.img_h,
+        cfg.model.img_w,
         args.use_tiling,
         args.max_num_tiles,
         args.use_thumbnail,
@@ -183,11 +183,11 @@ def generate_samples(model, config: EvaluationConfig, print_output):
     )
 
     num_img_embeddings_per_tile = get_num_image_embeddings(
-        args.img_h,
-        args.img_w,
-        args.patch_dim,
+        cfg.model.img_h,
+        cfg.model.img_w,
+        cfg.model.patch_dim,
         args.vision_model_type,
-        args.disable_vision_class_token,
+        cfg.model.drop_vision_class_token,
         1,
         args.pixel_shuffle,
         args.use_tile_tags,

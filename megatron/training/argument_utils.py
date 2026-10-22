@@ -38,7 +38,7 @@ from megatron.training.config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.models import GPTModelConfig, HybridModelConfig, ModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, LLaVAModelConfig, ModelConfig
 
 # TODO: support arg renames
 
@@ -810,9 +810,17 @@ def model_config_from_args(
         should_pad_vocab=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         rope_scaling=args.use_rope_scaling,
+        img_h=getattr(args, "img_h", getattr(args, "image_size", 224)),
+        img_w=getattr(args, "img_w", getattr(args, "image_size", 224)),
+        drop_vision_class_token=getattr(args, "disable_vision_class_token", False),
+        freeze_language_model=getattr(args, "freeze_LM", False),
+        freeze_vision_model=getattr(args, "freeze_ViT", False),
     )
     model_fields = {f.name for f in fields(model_config_cls) if f.init}
     kwargs.update({name: value for name, value in aliases.items() if name in model_fields})
+    if issubclass(model_config_cls, LLaVAModelConfig):
+        # Both legacy switches enable decoder overlap. Vision/projection disable it.
+        transformer.tp_comm_overlap |= getattr(args, "decoder_tp_comm_overlap", False)
     return model_config_cls(**kwargs)
 
 
@@ -837,8 +845,12 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     optim_cfg, _ = get_megatron_optimizer_config(args)
     ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
+    training = _default_config_from_args(TrainingConfig, args)
+    if not getattr(args, "vision_pretraining", False):
+        training.vision_pretraining_type = None
+
     cfg = PretrainConfigContainer(
-        train=_default_config_from_args(TrainingConfig, args),
+        train=training,
         validation=_default_config_from_args(ValidationConfig, args),
         model=model_cfg,
         optimizer=optim_cfg,

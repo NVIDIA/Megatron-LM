@@ -3468,7 +3468,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         torch.cuda.empty_cache()
 
     # Vision gradients.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+    if cfg.train.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(get_train_state().iteration)
 
@@ -3530,7 +3530,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
 
     # Vision momentum.
-    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+    if cfg.train.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.update_momentum(get_train_state().iteration)
 

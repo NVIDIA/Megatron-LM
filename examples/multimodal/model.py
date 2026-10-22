@@ -73,11 +73,11 @@ def model_provider(
             )
 
         num_image_embeddings = get_num_image_embeddings(
-            img_h=args.img_h,
-            img_w=args.img_w,
-            patch_dim=args.patch_dim,
+            img_h=cfg.model.img_h,
+            img_w=cfg.model.img_w,
+            patch_dim=cfg.model.patch_dim,
             vision_model_type=args.vision_model_type,
-            disable_vision_class_token=args.disable_vision_class_token,
+            disable_vision_class_token=cfg.model.drop_vision_class_token,
             class_token_len=getattr(args, 'class_token_len', None) or 1,
             pixel_shuffle=args.pixel_shuffle,
             use_tile_tags=args.use_tile_tags,
@@ -271,7 +271,7 @@ def model_provider(
         language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
-        drop_vision_class_token=args.disable_vision_class_token,
+        drop_vision_class_token=cfg.model.drop_vision_class_token,
         vision_projection_config=vision_projection_config,
         vision_projection_layer_spec=vision_projection_layer_spec,
         vision_projection_type=args.vision_projection_type,
@@ -285,9 +285,9 @@ def model_provider(
         post_process=post_process,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
-        img_h=args.img_h,
-        img_w=args.img_w,
-        patch_dim=args.patch_dim,
+        img_h=cfg.model.img_h,
+        img_w=cfg.model.img_w,
+        patch_dim=cfg.model.patch_dim,
         language_rotary_base=cfg.model.rotary_base,
         language_rope_scaling=cfg.model.rope_scaling,
         language_rope_scaling_factor=cfg.model.rope_scaling_factor,
@@ -324,8 +324,8 @@ def model_provider(
     )
 
     model.freeze(
-        freeze_language_model=args.freeze_LM,
-        freeze_vision_model=args.freeze_ViT,
+        freeze_language_model=cfg.model.freeze_language_model,
+        freeze_vision_model=cfg.model.freeze_vision_model,
         freeze_vision_projection=args.freeze_vision_projection,
         unfreeze_router=args.unfreeze_router,
     )

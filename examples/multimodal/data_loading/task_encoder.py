@@ -33,6 +33,7 @@ from megatron.energon import stateless
 from megatron.energon.av import AVDecoder
 from megatron.energon.edataclass import edataclass
 from megatron.training import get_args, get_tokenizer
+from megatron.training.global_vars import get_run_config
 
 from .conversation_sample import ConversationSample, ImageMedia, Media, VideoFrameMedia, VideoMedia
 from .cookers.conversation import (
@@ -325,17 +326,29 @@ class MultiModalTaskEncoder(
         ),
     ]
 
-    def __init__(self, is_val: bool = False, tiling_augment_prob: float = 0.4):
+    def __init__(
+        self,
+        is_val: bool = False,
+        tiling_augment_prob: float = 0.4,
+        *,
+        sequence_length: int | None = None,
+    ):
         super().__init__()
         self.is_val = is_val
         self.args = get_args()
+        cfg = get_run_config()
+        # Workers retain serializable preprocessing inputs, not the runtime config.
+        self.img_h = cfg.model.img_h
+        self.img_w = cfg.model.img_w
+        self.patch_dim = cfg.model.patch_dim
+        self.drop_vision_class_token = cfg.model.drop_vision_class_token
         self.tokenizer = get_tokenizer()
         with open(self.args.prompt_path, "r") as f:
             self.manual_prompts = json.load(f)
         # TODO: There is four seq lengths now: seq_length, decoder_seq_length, dataloader_seq_length, packing_seq_length
         # Why do we need all of these? Can we simplify?
         # The docs are not clear.
-        self.dataloader_seq_length = self.args.dataloader_seq_length
+        self.dataloader_seq_length = sequence_length
         # TODO: It's unclear why we need this separately. This should be the same as dataloader_seq_length which should be decoder_seq_length?
         self.packing_seq_length = self.args.packing_seq_length
         self.is_packing_enabled = (
@@ -353,7 +366,6 @@ class MultiModalTaskEncoder(
 
         self.txt_to_token_dict = {}
 
-        self.img_h, self.img_w = self.args.img_h, self.args.img_w
         self.img_token_id = self.tokenizer.image_token_index
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
@@ -1363,8 +1375,8 @@ class MultiModalTaskEncoder(
         if has_fp8 and self.args.dynamic_resolution and no_cp:
             img_seq_len = 0
             for img in imgs:
-                img_seq_len += (img.shape[1] // self.args.patch_dim) * (
-                    img.shape[2] // self.args.patch_dim
+                img_seq_len += (img.shape[1] // self.patch_dim) * (
+                    img.shape[2] // self.patch_dim
                 )
             padding_needed = get_padding(
                 img_seq_len,
@@ -1377,7 +1389,7 @@ class MultiModalTaskEncoder(
             )
             if padding_needed > 0:
                 pad_img = torch.zeros(
-                    [3, self.args.patch_dim, padding_needed * self.args.patch_dim]
+                    [3, self.patch_dim, padding_needed * self.patch_dim]
                 )
                 imgs.append(pad_img)
                 has_pad_img = torch.tensor(True)
