@@ -8,7 +8,11 @@ import pytest
 import torch
 
 import megatron.training.training as training
-from megatron.core.optimizer import OptimizerConfig, _get_param_groups
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    _get_param_groups,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.post_training.model_builder import _propagate_expert_allreduce_to_lsq_params
 from megatron.post_training.optimizer import (
@@ -43,11 +47,9 @@ def _args(lr=3e-5, min_lr=0.0, lsq_scale_lr=None):
 
 
 @pytest.fixture
-def restore_optimizer_config_fn(monkeypatch):
-    """Restore training.get_megatron_optimizer_config after the test wraps it."""
-    monkeypatch.setattr(
-        training, "get_megatron_optimizer_config", training.get_megatron_optimizer_config
-    )
+def restore_optimizer_config_override_fn(monkeypatch):
+    """Restore training.get_standard_config_overrides after the test wraps it."""
+    monkeypatch.setattr(training, "get_standard_config_overrides", get_standard_config_overrides)
 
 
 def test_no_override_when_unset():
@@ -67,22 +69,20 @@ def test_override_when_set():
     assert override == {"max_lr": 1e-4}
 
 
-def test_install_is_idempotent(restore_optimizer_config_fn):
+def test_install_is_idempotent(restore_optimizer_config_override_fn):
     install_lsq_optimizer_overrides()
-    wrapped = training.get_megatron_optimizer_config
+    wrapped = training.get_standard_config_overrides
     install_lsq_optimizer_overrides()
-    assert training.get_megatron_optimizer_config is wrapped
+    assert training.get_standard_config_overrides is wrapped
 
 
-def test_wrapped_config_adds_lsq_override(restore_optimizer_config_fn):
-    base_config, base_overrides = training.get_megatron_optimizer_config(
-        Namespace(lr=3e-5, min_lr=0.0)
-    )
+def test_wrapped_config_adds_lsq_override(monkeypatch, restore_optimizer_config_override_fn):
+    args = Namespace(lsq_scale_lr=1e-4)
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    config = OptimizerConfig(lr=3e-5, min_lr=0.0)
+    base_overrides = training.get_standard_config_overrides(config)
     install_lsq_optimizer_overrides()
-    config, overrides = training.get_megatron_optimizer_config(
-        Namespace(lr=3e-5, min_lr=0.0, lsq_scale_lr=1e-4)
-    )
-    assert config == base_config
+    overrides = training.get_standard_config_overrides(config)
     assert set(base_overrides).issubset(overrides)
     assert len(overrides) == len(base_overrides) + 1
 

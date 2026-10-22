@@ -35,14 +35,15 @@ def install_lsq_optimizer_overrides():
     """
     import megatron.training.training as training
 
-    orig = training.get_megatron_optimizer_config
+    orig = training.get_standard_config_overrides
     if getattr(orig, "_lsq_wrapped", False):
         return
 
-    def get_megatron_optimizer_config(args):
-        config, config_overrides = orig(args)
+    def get_standard_config_overrides(config):
+        config_overrides = orig(config)
+        args = training.get_args()
         config_overrides = {**(config_overrides or {}), **get_lsq_config_overrides(args)}
-        return config, config_overrides
+        return config_overrides
 
-    get_megatron_optimizer_config._lsq_wrapped = True
-    training.get_megatron_optimizer_config = get_megatron_optimizer_config
+    get_standard_config_overrides._lsq_wrapped = True
+    training.get_standard_config_overrides = get_standard_config_overrides

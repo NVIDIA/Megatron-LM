@@ -2747,24 +2747,6 @@ def _reduce_sum_across_data_parallel_group(
     return None if value.item() == 0.0 else value.item()
 
 
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
-    """Return a Megatron optimizer config object from Megatron's arguments."""
-
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-    # Resolve dtypes and derived flags (e.g. use_precision_aware_optimizer_no_fp8_or_ds_fp8)
-    # that the optimizer reads; this config is built from args, not from the finalized run config.
-    config.finalize_optimizer_config()
-
-    # Construct the appropriate config_overrides object. This default handles many cases, but
-    #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
-
-    return config, config_overrides
-
 def get_megatron_ddp_config(
     args: argparse.Namespace, *, use_torch_fsdp2: bool
 ) -> DistributedDataParallelConfig:
