@@ -265,6 +265,11 @@ class LoggerConfig:
     log_interval: int = 100
     """Report loss and timing interval."""
 
+    log_dcp_stats: bool = False
+    """Log final packed-schedule attention-work balance and CP-size sample fractions
+    at log_interval. These are L²/CP estimates, not GPU utilization measurements.
+    """
+
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 

@@ -11,6 +11,7 @@ from megatron.core.datasets.data_schedule_utils import (
     broadcast_scalars,
     broadcast_tensor,
     build_packed_microbatches,
+    compute_schedule_stats,
     create_data_iterator,
     get_batch_and_global_seqlens,
     get_cp_slice_for_thd,
@@ -130,6 +131,7 @@ class BasePackingScheduler:
         dp_cp_group,
         dev,
         config,
+        schedule_stats: Optional[Dict] = None,
     ):
         """
         Run the scheduler and return the new data_iterator.
@@ -237,6 +239,7 @@ class DpBalancedScheduler(BasePackingScheduler):
         dp_cp_group,
         dev: torch.device,
         config,
+        schedule_stats: Optional[Dict] = None,
     ):
         """
         Run the complete scheduling pipeline.
@@ -273,6 +276,8 @@ class DpBalancedScheduler(BasePackingScheduler):
         """
 
         total_dcp_gpus = dp_cp_group.size()
+        if schedule_stats is not None:
+            schedule_stats.clear()
         is_first_pp = pp_group.rank() == 0
         is_last_pp = pp_group.rank() == pp_group.size() - 1
 
@@ -344,6 +349,10 @@ class DpBalancedScheduler(BasePackingScheduler):
 
             # Step 4: Schedule samples into groups
             sample_id_groups = self.get_groups_and_subsamples(global_id_seqlens)
+            if schedule_stats is not None:
+                # get_groups_and_subsamples includes VPP alignment, which can
+                # split microbatches and expand the actual CP sizes.
+                schedule_stats.update(compute_schedule_stats(sample_id_groups, global_id_seqlens))
 
             # Validate scheduling result
             set_gbs = set()
@@ -388,16 +397,33 @@ class DpBalancedScheduler(BasePackingScheduler):
             ) = (None, None, None, None)
 
         # Broadcast to TP group (for non-TP-0 ranks)
-        num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
-            broadcast_scalars(
+        metadata: list[Any] = [
+            num_micro_batches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        ]
+        if schedule_stats is not None:
+            metadata.extend(
                 [
-                    num_micro_batches,
-                    seqlen_sum_this_global_batch,
-                    seqlen_squared_sum_this_global_batch,
-                ],
-                tp_group,
-                dev,
+                    schedule_stats.get('balance_numerator', 0.0),
+                    schedule_stats.get('balance_denominator', 0.0),
+                ]
+                + [
+                    schedule_stats.get('cp_sample_counts', {}).get(c, 0)
+                    for c in range(1, total_dcp_gpus + 1)
+                ]
             )
+            # Preserve long-sequence squared sums and summaries on TP peers.
+            metadata = broadcast_scalars(metadata, tp_group, dev, dtype=torch.float64)
+            schedule_stats.update(
+                balance_numerator=metadata[3],
+                balance_denominator=metadata[4],
+                cp_sample_counts={c: int(metadata[4 + c]) for c in range(1, total_dcp_gpus + 1)},
+            )
+        else:
+            metadata = broadcast_scalars(metadata, tp_group, dev)
+        num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
+            metadata[:3]
         )
         num_micro_batches = int(num_micro_batches)
 
@@ -501,7 +527,11 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
 
 
 def wrap_data_iterator(
-    data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
+    data_iterator,
+    config,
+    num_microbatches,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    schedule_stats: Optional[Dict] = None,
 ):
     """
     A wrapper function that wraps around an existing data_iterator
@@ -512,6 +542,8 @@ def wrap_data_iterator(
         config: The config object containing the max_seqlen_per_dp_cp_rank
         dp_cp_group: Data parallel context parallel group.
         pg_collection: The process group collection.
+        schedule_stats: Optional output dict for final schedule work estimates.
+            TP source ranks also retain the full rank-work matrix.
     """
 
     if pg_collection is None:
@@ -567,7 +599,15 @@ def wrap_data_iterator(
         seqlen_sum_this_global_batch,
         seqlen_squared_sum_this_global_batch,
     ) = scheduler.run(
-        data_iterator, num_microbatches, dp_group, tp_group, pp_group, dp_cp_group, dev, config
+        data_iterator,
+        num_microbatches,
+        dp_group,
+        tp_group,
+        pp_group,
+        dp_cp_group,
+        dev,
+        config,
+        schedule_stats=schedule_stats,
     )
 
     return (
