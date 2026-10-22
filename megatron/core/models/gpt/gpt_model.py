@@ -432,15 +432,19 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 # Flash decoding uses precomputed cos and sin for RoPE
                 if self.config.flash_decode:
                     rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
-                        self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                        inference_context.max_sequence_length_for_model,
+                        self.rotary_pos_emb.get_cos_sin(
+                            inference_context.max_sequence_length_for_model
+                        ),
                     )
                 elif use_flash_infer_fused_rope:
                     assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
                     rotary_pos_cos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
+                        inference_context.max_sequence_length_for_model,
                         torch.cat(
-                            self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                            self.rotary_pos_emb.get_cos_sin(
+                                inference_context.max_sequence_length_for_model
+                            ),
                             -1,
                         ),
                     )

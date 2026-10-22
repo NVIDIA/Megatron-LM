@@ -6628,9 +6628,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=num_speculative_tokens,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             model_provider="gpt",
-            # Disable positional embeddings so speculative position IDs
-            # beyond max_sequence_length don't cause out-of-bounds lookups.
-            position_embedding_type="none",
+            position_embedding_type="rope",
+            use_flashinfer_fused_rope=False,
             sampling_backend=sampling_backend,
         )
         env = self._build_test_env(test_config)
@@ -6642,8 +6641,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # then replace the output logits with deterministic values so all
         # speculative tokens are accepted and sampling is predictable.
         real_forward = unwrapped_model.forward
+        max_position_seen = -1
 
         def deterministic_forward(*args, **kwargs):
+            nonlocal max_position_seen
+            position_ids = kwargs.get("position_ids", args[1] if len(args) > 1 else None)
+            assert position_ids is not None
+            max_position_seen = max(max_position_seen, int(position_ids.max().item()))
             logits = real_forward(*args, **kwargs)
             # Overwrite with deterministic logits: always predict token 0.
             logits.zero_()
@@ -6704,6 +6708,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ), f"Expected all tokens to be 0, got {finished_req.generated_tokens}"
 
         # Verify engine state is clean after completion.
+        assert max_position_seen < env.engine.context.max_sequence_length_for_model
+        if num_tokens_to_generate == 2 and num_speculative_tokens == 3:
+            assert max_position_seen >= max_sequence_length
+        if num_tokens_to_generate == 5 and num_speculative_tokens == 3:
+            assert max_position_seen == env.engine.context.max_sequence_length_for_model - 1
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
 

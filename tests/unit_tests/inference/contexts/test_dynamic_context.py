@@ -1322,6 +1322,37 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    @pytest.mark.parametrize(
+        ("active_length", "expected"),
+        [pytest.param(31, True, id="last-position-fits"), pytest.param(32, False, id="overflow")],
+    )
+    def test_async_sched_can_prepare_requests_respects_sequence_capacity(
+        self, active_length, expected
+    ):
+        """Overlap never prepares beyond the physical speculative capacity."""
+        ctx = self._get_async_sched_context(num_speculative_tokens=2)
+        self._setup_async_sched_decode_rows(ctx, active_request_count=1)
+        tokens_per_request = ctx.num_speculative_tokens + 1
+        ctx.request_query_lengths[0] = tokens_per_request
+        ctx.request_kv_length_offsets[0] = active_length - tokens_per_request
+        ctx.request_last_kv_block_offset[0] = (active_length - 1) % ctx.block_size_tokens
+        ctx.request_output_lengths[0] = ctx.max_sequence_length
+        ctx.active_token_count = tokens_per_request
+        ctx.kv_block_allocator.get_allocatable_count = mock.Mock(return_value=1)
+
+        assert ctx.get_active_sequence_lengths().item() == active_length
+        assert ctx.max_sequence_length_for_model == ctx.max_sequence_length + 2
+        assert (
+            ctx.graph_attn_metadata["mha_metadata"].max_seqlen == ctx.max_sequence_length_for_model
+        )
+        assert (
+            ctx.non_graph_attn_metadata["mha_metadata"].max_seqlen
+            == ctx.max_sequence_length_for_model
+        )
+        assert ctx.can_prepare_requests() is expected
+
+    @pytest.mark.internal
+    @rounder_override(8)
     @pytest.mark.parametrize("state", ["prefill", "paused"])
     def test_async_sched_cannot_prepare_requests_with_lifecycle_state(self, state):
         """Overlap preparation rejects state requiring lifecycle bookkeeping."""
