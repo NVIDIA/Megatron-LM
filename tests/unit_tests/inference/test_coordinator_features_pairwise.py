@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.inference.contexts import dynamic_context
 from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode
 from tests.unit_tests.inference.coordinator_pairwise_utils import greedy_params, routed_model
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
@@ -370,3 +371,52 @@ async def test_routed_moe_participates_in_ep_collectives(monkeypatch):
         assert target["nccl-token-dispatches"] == target["nccl-token-combines"]
         assert target["nccl-combine-before-dispatch"] == 0
         assert target["nccl-dispatch-inflight"] == 0
+
+
+@pytest.mark.parametrize(
+    "head,rotary,interleaved", [(16, 16, False), (16, 8, False), (16, 16, True), (64, 64, False)]
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+async def test_small_neox_rope_matches_complex_rotation(mocker, head, rotary, interleaved, dtype):
+    positions = torch.tensor([3, 0, 3, 1], device="cuda")
+    angles = torch.arange(4 * rotary // 2, device="cuda").reshape(4, -1).float() / 7
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    storage = (torch.arange(6 * 5 * head, device="cuda").reshape(6, 1, 5, head) % 37 / 19).to(dtype)
+    before = storage.clone()
+    query, key = storage[:, :, :3], storage[:, :, 3:]
+    context = SimpleNamespace(
+        use_flashinfer_fused_rope=True,
+        padded_active_token_count=4,
+        gpu_view=SimpleNamespace(token_to_pos_ids=positions),
+    )
+    native = mocker.spy(dynamic_context.flashinfer.rope, "apply_rope_with_cos_sin_cache")
+    apply = dynamic_context.DynamicInferenceContext.apply_fused_qk_rotary_emb
+    config = SimpleNamespace(rotary_interleaved=interleaved)
+    outputs = apply(context, query, key, cache, config)
+    phase = torch.polar(torch.ones_like(angles), angles)[positions, None, None]
+    for original, actual in zip((query, key), outputs):
+        rotated, tail = original[:4, ..., :rotary].float(), original[:4, ..., rotary:]
+        pairs = (
+            rotated.reshape(*rotated.shape[:-1], -1, 2)
+            if interleaved
+            else torch.stack(rotated.chunk(2, -1), -1)
+        )
+        expected = torch.view_as_real(torch.view_as_complex(pairs.contiguous()) * phase)
+        expected = expected.flatten(-2) if interleaved else expected.transpose(-1, -2).flatten(-2)
+        expected = torch.cat((expected, tail), -1).to(dtype)
+        torch.testing.assert_close(actual, expected, atol=2 * torch.finfo(dtype).eps, rtol=0)
+    assert torch.equal(storage, before)
+    query[:, :, 1].add_(0.5)
+    changed, _ = apply(context, query, key, cache, config)
+    assert torch.equal(changed[:, :, 0], outputs[0][:, :, 0])
+    assert native.call_count == (0 if head == 16 and not interleaved else 2)
+
+
+async def test_routed_d16_neox_rope_preserves_model_output(monkeypatch):
+    # This witness observes the completed context boundary, including its D16 mitigation.
+    await test_routed_model_kernels_match_direct(
+        monkeypatch,
+        dict(hidden_size=64, position_embedding_type="rope", use_flashinfer_fused_rope=True),
+        ("fused-rope",),
+        ("fused-rope-kernel",),
+    )

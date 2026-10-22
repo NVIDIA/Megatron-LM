@@ -2128,6 +2128,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         num_q_heads, head_size = query.shape[-2], query.shape[-1]
         num_k_heads = key.shape[-2]
 
+        if head_size == 16 and not config.rotary_interleaved:
+            # FlashInfer's NeoX D16 vector crosses the half-head boundary and reads other heads.
+            rotary_dim = cos_sin_emb.shape[-1]
+            cos, sin = cos_sin_emb[self.gpu_view.token_to_pos_ids[:n]].float().chunk(2, dim=-1)
+            cos, sin = cos[:, None, None, :], sin[:, None, None, :]
+
+            def rotate(tensor):
+                first, second = tensor[:n, ..., :rotary_dim].float().chunk(2, dim=-1)
+                return torch.cat(
+                    (
+                        first * cos - second * sin,
+                        second * cos + first * sin,
+                        tensor[:n, ..., rotary_dim:],
+                    ),
+                    dim=-1,
+                ).to(tensor.dtype)
+
+            return rotate(query), rotate(key)
+
         # use .view instead of .reshape to avoid extra transpose operations
         query_rope, key_rope = flashinfer.rope.apply_rope_with_cos_sin_cache(
             positions=self.gpu_view.token_to_pos_ids[:n],
