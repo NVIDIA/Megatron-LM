@@ -73,6 +73,9 @@ class DeepseekV41Model(NativeModel):
         # Keep the module pipeline, but publish buckets also for functional
         # mHC/expert reads which bypass their owning leaf module's pre-hook.
         ensure_params_ready(self.parameters())
+        from .weights import clear
+
+        clear(enabled=torch.is_grad_enabled())  # inference does not retain cross-layer encodings
         if labels is None or not self.layout.has_head:
             return super().forward(
                 *args,

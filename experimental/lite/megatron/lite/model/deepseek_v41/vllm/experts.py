@@ -30,6 +30,12 @@ def _decode_bf16(codes, scale):
     return dequantize_activation(codes, scale).bfloat16()
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def _gather_decode_bf16(codes, scale, order):
+    """``_decode_bf16`` of rows ``order``, gathered inside the same kernel."""
+    return dequantize_activation(codes[order], scale[order]).bfloat16()
+
+
 def quantize_activation(x):
     if not x.is_cuda:
         raise RuntimeError("Deployment experts require CUDA")
@@ -303,20 +309,45 @@ def _quantize_expert_batch(weight):
 
 
 @torch.no_grad()
+def expert_codes(fc1, fc2):
+    """MXFP4 codes and scales of all local experts' masters, ``[L, N, K/2]`` and
+    ``[L, N, K/32]``; encoded once per model forward."""
+    from .weights import encoded
+
+    def produce():
+        return tuple(
+            _quantize_expert_batch(torch.stack([w.detach() for w in m])) for m in (fc1, fc2)
+        )
+
+    return encoded((*fc1, *fc2), 'mxfp4', produce)
+
+
+@torch.no_grad()
 def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
-    """Pack fresh masters into native MegaMoE kernel layouts, all local experts at once."""
+    """Masters in the native MegaMoE kernel layouts, all local experts at once; packed
+    once per model forward."""
+    from .weights import encoded
+
+    return encoded(
+        (*fc1, *fc2, shared_fc1, shared_fc2),
+        'megamoe',
+        lambda: _kernel_weights(fc1, fc2, shared_fc1, shared_fc2),
+    )
+
+
+def _kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
     from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 
     device = fc1[0].device
     inter, hidden = fc1[0].shape[0] // 2, fc1[0].shape[1]
     w13, s13 = _empty_weight((len(fc1),), 2 * inter, hidden, 2, device)
     w2, s2 = _empty_weight((len(fc2),), hidden, inter, 2, device)
-    # Block boundaries follow a byte budget, not expert ownership or row routing.
-    up, up_scale = _quantize_expert_batch(torch.stack([w.detach() for w in fc1]))
+    # MXFP4 blocks run along K, so the w1/w3 row halves of one encoding are each
+    # shard's own encoding.
+    (up, up_scale), (down, down_scale) = expert_codes(fc1, fc2)
     for shard, rows in (("w1", slice(None, inter)), ("w3", slice(inter, None))):
         _write_experts(w13, up[:, rows], shard, False)
         _write_experts(s13, up_scale[:, rows], shard, True)
-    down, down_scale = _quantize_expert_batch(torch.stack([w.detach() for w in fc2]))
     _write_experts(w2, down, "w2", False)
     _write_experts(s2, down_scale, "w2", True)
     s_inter = shared_fc1.shape[0] // 2

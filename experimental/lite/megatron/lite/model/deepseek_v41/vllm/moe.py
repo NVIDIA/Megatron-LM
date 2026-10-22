@@ -235,10 +235,157 @@ def _sum_routes(gradient, position, rows, topk):
     return torch.segment_reduce(gradient[order], 'sum', lengths=counts, unsafe=True)
 
 
+def _exchange(fields, sends, receives, group, spare=0):
+    """Launch one variable all-to-all per row field into its own contiguous buffer
+    (``spare`` zero rows appended); returns the buffers and their pending works."""
+    buffers, works = [], []
+    total = sum(receives)
+    for field in fields:
+        out = field.new_empty((total + spare, *field.shape[1:]))
+        if spare:
+            out[total:].zero_()
+        work = torch.distributed.all_to_all_single(
+            out[:total], field.contiguous(), receives, sends, group=group, async_op=True
+        )
+        buffers.append(out)
+        works.append(work)
+    return buffers, works
+
+
+def _decoded_experts(fc1, fc2):
+    """All local experts' MXFP4 masters decoded, BF16 ``[L, N, K]`` (exact), from the
+    forward's encoding."""
+    from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+
+    return [dequantize_mxfp4(*codes).bfloat16() for codes in experts.expert_codes(fc1, fc2)]
+
+
+def _grouped(weights, rows, splits, layout, columns):
+    """Lite's TE grouped GEMM over every local expert in one call: ``layout`` "TN" is
+    ``rows @ W.T`` (forward), "NN" is ``rows @ W`` (dgrad); BF16 output."""
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+    out = rows.new_empty((rows.shape[0], columns))
+    general_grouped_gemm(
+        list(weights),
+        list(rows.split(splits)),
+        [out],
+        [None] * len(splits),
+        out.dtype,
+        layout=layout,
+        m_splits=splits,
+        grad=layout == "NN",
+        single_output=True,
+    )
+    return out
+
+
+def _grouped_wgrad(inputs, grads, splits, params):
+    """Lite's fused grouped wgrad: each expert's ``grad.T @ input`` accumulates in FP32
+    straight into its owner's ``main_grad`` (TE ``accumulate``); returns the autograd
+    placeholders, or the FP32 dW in the owner dtype without DDP."""
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+    from .linear import accumulate_wgrad
+
+    fused = all(
+        getattr(p, 'main_grad', None) is not None and p.main_grad.dtype == torch.float32
+        for p in params
+    )
+    if fused:
+        out = [p.main_grad for p in params]
+    else:
+        out = [torch.zeros(p.shape, dtype=torch.float32, device=inputs.device) for p in params]
+    if inputs.shape[0]:
+        general_grouped_gemm(
+            list(inputs.split(splits)),
+            list(grads.split(splits)),
+            out,
+            [None] * len(splits),
+            torch.float32,
+            layout="NT",
+            m_splits=splits,
+            grad=True,
+            accumulate=True,
+        )
+    if fused:
+        return [accumulate_wgrad((p,), None, p) for p in params]
+    return [o.to(p.dtype) for p, o in zip(params, out)]
+
+
+def _routed_grads(codes, scale, grad, weights, ids, fc1, fc2, limit, group, overlap):
+    """Decoded-operand VJP of the routed experts over the rows actually routed.
+
+    Rows go to the expert owner by one variable all-to-all (FP8 codes, scales, BF16 grad,
+    score), every local expert runs in one grouped GEMM per product, and per-slot dX/dscore
+    come back by the inverse all-to-all. Slots are scattered to unique positions and summed
+    in slot order: no atomics, fixed reduction order. Expert GEMMs are lite's TE grouped
+    GEMMs with the wgrad fused into ``main_grad``. Returns FP32 dx/dscore and the expert
+    weight gradients (placeholders when fused), plus ``overlap()``'s result: it runs
+    while the routed rows are in flight; the expert wgrads run while dX returns."""
+    rows, k = ids.shape
+    world, rank, local, hidden = group.size(), group.rank(), len(fc1), codes.shape[1]
+    flat = ids.flatten()
+    key = torch.where(flat >= 0, flat, local * world)
+    position = torch.argsort(key, stable=True)
+    # One host sync: this rank's per-expert sends and every peer's per-(local expert)
+    # sends here give the send/receive splits and the local expert row groups.
+    per_expert = torch.bincount(key, minlength=local * world + 1)[: local * world]
+    counts = torch.cat((per_expert, all_to_all(group, per_expert))).cpu().view(2, world, local)
+    sends, receives = counts.sum(2).tolist()
+    splits = counts[1].sum(0).tolist()
+    position = position[: sum(sends)]
+    token = position // k
+    # Expert ids are exact in FP32; score and id travel together.
+    meta = torch.stack((weights.flatten()[position].float(), flat[position].float()), 1)
+    fields = codes.view(torch.uint8)[token], scale[token], grad.bfloat16()[token], meta
+    (r_codes, r_scale, r_grad, r_meta), works = _exchange(fields, sends, receives, group)
+    shared = overlap()
+    w1, w2 = _decoded_experts(fc1, fc2)
+    for work in works:
+        work.wait()
+    order = torch.argsort(r_meta[:, 1].long() - rank * local, stable=True)
+    if r_codes.shape[0]:
+        a = experts._gather_decode_bf16(r_codes.view(torch.float8_e4m3fn), r_scale, order)
+    else:
+        a = r_grad.new_empty((0, hidden))
+    g, score = r_grad.index_select(0, order), r_meta[:, 0].index_select(0, order)
+    empty = not a.shape[0]
+    if empty:
+        h = a.new_zeros((0, w1.shape[1]), dtype=torch.float32)
+    else:
+        h = _grouped(w1, a, splits, "TN", w1.shape[1]).float()
+    with torch.enable_grad():
+        h_, s_ = h.requires_grad_(), score.detach().float().requires_grad_()
+        gate, up = h_.chunk(2, -1)
+        if limit is not None:
+            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+        act = torch.nn.functional.silu(gate) * up * s_.unsqueeze(-1)
+    if empty:
+        dact = act.detach().new_zeros(act.shape)
+    else:
+        dact = _grouped(w2, g, splits, "NN", w2.shape[2]).float()
+    dh, ds = torch.autograd.grad(act, (h_, s_), dact)
+    dh = dh.bfloat16()
+    da = a.new_zeros((0, hidden)) if empty else _grouped(w1, dh, splits, "NN", hidden)
+    # Back to arrival order, then home; a spare zero row stands for unrouted slots.
+    inverse = torch.argsort(order)
+    fields = da.index_select(0, inverse), ds.float().index_select(0, inverse)
+    (back_x, back_s), works = _exchange(fields, receives, sends, group, spare=1)
+    dfc2 = _grouped_wgrad(_requant_l2(act).bfloat16(), g, splits, fc2)
+    dfc1 = _grouped_wgrad(a, dh, splits, fc1)
+    for work in works:
+        work.wait()
+    source = torch.full((rows * k,), position.shape[0], dtype=torch.long, device=grad.device)
+    source[position] = torch.arange(position.shape[0], device=grad.device)
+    dx = back_x.index_select(0, source).view(rows, k, hidden).sum(1, dtype=torch.float32)
+    dscore = back_s.index_select(0, source)
+    return dx, dscore.view(rows, k), dfc1, dfc2, shared
+
+
 class _FusedMoE(torch.autograd.Function):
-    """Inference ``fp8_fp4_mega_moe`` forward; owned backward: native TE grouped
-    decoded VJP over EP-all-gathered rows, FP32 reduce-scatter back, expert dW straight
-    into ``main_grad``."""
+    """Inference ``fp8_fp4_mega_moe`` forward; owned decoded-operand backward over the
+    routed rows (:func:`_routed_grads`), expert dW straight into ``main_grad``."""
 
     @staticmethod
     def forward(ctx, x, scores, indices, options, *masters):
@@ -257,68 +404,27 @@ class _FusedMoE(torch.autograd.Function):
         need_x, need_w = ctx.needs_input_grad[:2]
         need_m = ctx.needs_input_grad[4:]
         fc1, fc2, s1, s2 = masters[:local], masters[local : 2 * local], *masters[2 * local :]
-        grad = grad.float()
         with torch.autocast(device_type="cuda", enabled=False):
-            a = experts.dequantize_activation(*experts.quantize_activation(x.detach().bfloat16()))
-            dx, _, dw1s, dw2s = _mlp_grads(
-                a,
-                a.new_ones(a.shape[0]),
-                grad,
-                _fp8(s1),
-                _fp8(s2),
-                limit,
-                (need_x, False, need_m[-2], need_m[-1]),
-            )
-            dx = torch.zeros_like(a) if dx is None else dx
-            world, rank = group.size(), group.rank()
-            rows, k = ids.shape
-            if world > 1:
-                capacity = torch.tensor([rows], device=x.device)
-                torch.distributed.all_reduce(capacity, torch.distributed.ReduceOp.MAX, group=group)
-                pad = int(capacity) - rows
+            codes, scale = experts.quantize_activation(x.detach().bfloat16())
 
-                def padded(t, v=0):
-                    return torch.nn.functional.pad(t, (0, 0, 0, pad), value=v)
+            def shared():
+                return _mlp_grads(
+                    experts.dequantize_activation(codes, scale),
+                    x.new_ones(x.shape[0], dtype=torch.float32),
+                    grad.float(),
+                    _fp8(s1),
+                    _fp8(s2),
+                    limit,
+                    (need_x, False, need_m[-2], need_m[-1]),
+                )
 
-                a_all = _all_gather(padded(a.bfloat16()), group)
-                g_all = _all_gather(padded(grad.bfloat16()), group)
-                w_all = _all_gather(padded(weights.float()), group)
-                ids_all = _all_gather(padded(ids, -1), group)
-            else:
-                a_all, g_all, w_all, ids_all = a, grad, weights.float(), ids
-            flat = ids_all.flatten()
-            valid = ((flat >= rank * local) & (flat < (rank + 1) * local)).nonzero().flatten()
-            position = valid[torch.argsort(flat[valid], stable=True)]
-            token = position // k
-            counts = torch.bincount(flat[position] - rank * local, minlength=local)
-            ends = counts.cumsum(0, dtype=torch.int32)
-            first, second = _mx(torch.stack(fc1)), _mx(torch.stack(fc2))
-            da, ds, d1, d2 = _grouped_mlp_grads(
-                a_all[token],
-                w_all.flatten()[position],
-                g_all[token],
-                first,
-                second,
-                ends,
-                limit,
-                (need_x, need_w, any(need_m[:local]), any(need_m[local : 2 * local])),
+            routed, dscore, dfc1, dfc2, (dx, _, dw1s, dw2s) = _routed_grads(
+                codes, scale, grad, weights, ids, fc1, fc2, limit, group, shared
             )
-            da_all = (
-                _sum_routes(da, position, a_all.shape[0], k) if need_x else torch.zeros_like(a_all)
-            )
-            dw_all = torch.zeros_like(w_all)
-            if ds is not None:
-                dw_all.view(-1).index_copy_(0, position, ds)
-            dfc1 = _expert_weight_grads(fc1, d1, need_m[:local])
-            dfc2 = _expert_weight_grads(fc2, d2, need_m[local : 2 * local])
-            if world > 1:
-                da_all = _reduce_scatter(da_all, group)[:rows]
-                dw_all = _reduce_scatter(dw_all, group)[:rows]
-            dx = (dx + da_all).to(x.dtype) if need_x else None
-            dweights = dw_all.to(weights.dtype) if need_w else None
+            dx = (routed if dx is None else dx + routed).to(x.dtype) if need_x else None
         return (
             dx,
-            dweights,
+            dscore.to(weights.dtype) if need_w else None,
             None,
             None,
             *dfc1,

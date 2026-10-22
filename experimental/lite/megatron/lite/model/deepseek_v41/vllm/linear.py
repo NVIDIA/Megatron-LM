@@ -32,23 +32,54 @@ def _like(weight):
     return SimpleNamespace(shape=weight.shape, dtype=weight.dtype, device=weight.device)
 
 
+def _fused(owners):
+    return bool(owners) and all(
+        getattr(o, "main_grad", None) is not None and o.main_grad.dtype == torch.float32
+        for o in owners
+    )
+
+
+def _wgrad_into_main_grad(owners, grad, activation):
+    """Lite's TE Linear fused wgrad: ``main_grad += grad.T @ activation`` for each owner's
+    row block, one FP32-accumulating GEMM per owner parameter."""
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+
+    start = 0
+    for owner in owners:
+        rows = owner.shape[0] if len(owners) > 1 else grad.shape[1]
+        part = grad if len(owners) == 1 else grad[:, start : start + rows].contiguous()
+        general_gemm(
+            activation,
+            part,
+            out_dtype=torch.float32,
+            layout="NT",
+            grad=True,
+            accumulate=True,
+            out=owner.main_grad.view(rows, -1),
+        )
+        start += rows
+
+
 def accumulate_wgrad(owners, dw, like):
     """Weight gradient for the forward input ``like`` whose rows stack ``owners``.
 
     When every owner has an FP32 ``main_grad`` (DDP), the FP32 ``dw`` is added there
     and DDP's placeholder gradient is returned, as Megatron's gradient-accumulation
-    fusion does; otherwise ``dw`` itself in ``like``'s dtype."""
-    if not owners or any(
-        getattr(o, "main_grad", None) is None or o.main_grad.dtype != torch.float32 for o in owners
-    ):
+    fusion does; otherwise ``dw`` itself in ``like``'s dtype. ``dw`` None: the gradient
+    already reached ``main_grad``; only mark the owners."""
+    if not _fused(owners):
+        if dw is None:
+            return torch.zeros(like.shape, dtype=like.dtype, device=like.device)
         return dw.to(like.dtype)
     from megatron.lite.primitive.parallel.linear import _dummy_wgrad
 
     start = 0
     for owner in owners:
+        owner.grad_added_to_main_grad = True
+        if dw is None:
+            continue
         rows = owner.shape[0] if len(owners) > 1 else dw.shape[0]
         owner.main_grad.add_(dw[start : start + rows].reshape(owner.main_grad.shape))
-        owner.grad_added_to_main_grad = True
         start += rows
     return _dummy_wgrad(like)
 
@@ -78,16 +109,27 @@ class _MXFP8Linear(torch.autograd.Function):
                 raise ValueError("Swizzled prequant requires the tensor-core consumer")
             codes, scales = activation.data.reshape(flat.shape), activation.scale
         raw = _row_scales(scales, *flat.shape) if tc else scales
-        packed, weight_scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
-        row_scales = weight_scales.view(torch.uint8).repeat_interleave(32, dim=0)
+
+        def encode():
+            packed, weight_scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
+            row_scales = weight_scales.view(torch.uint8).repeat_interleave(32, dim=0)
+            if tc:
+                row_scales = swizzle_mxfp8_scale(row_scales, *weight.shape)
+            return packed, weight_scales, row_scales
+
+        from .weights import encoded
+
+        packed, weight_scales, row_scales = encoded(owners or (weight,), 'block_fp8', encode)
         kernel_codes = packed
         if row_perm is not None:
-            # vLLM gathers whole rows of the loaded per-row-scale weight
-            # (permute on load): quantize first, then permute codes and scales.
+            # Preserve 3bc's quantize-then-permute order for the optional mega core.
             kernel_codes = packed.view(torch.uint8).index_select(0, row_perm).view(packed.dtype)
+            row_scales = weight_scales.view(torch.uint8).repeat_interleave(32, dim=0)
             row_scales = row_scales.index_select(0, row_perm)
+            if tc:
+                row_scales = swizzle_mxfp8_scale(row_scales, *weight.shape)
+
         if tc:
-            row_scales = swizzle_mxfp8_scale(row_scales, *weight.shape)
             output = torch.ops.vllm.bi_pinned_mxfp8_mm(
                 codes, kernel_codes.t(), scales, row_scales, x.dtype
             )
@@ -126,10 +168,13 @@ class _MXFP8Linear(torch.autograd.Function):
 
 def linear_vjp(ctx, grad, activation, weight):
     flat_grad = grad.reshape(-1, weight.shape[0])
+    owners = getattr(ctx, 'owners', None)
     with torch.autocast(device_type=grad.device.type, enabled=False):
         dx = tc_mm(flat_grad, weight).reshape(ctx.input_shape).to(activation.dtype)
+        if grad.is_cuda and _fused(owners):
+            _wgrad_into_main_grad(owners, flat_grad.bfloat16(), activation.bfloat16())
+            return dx, accumulate_wgrad(owners, None, ctx.like), None
         dw = tc_mm(flat_grad.T, activation, torch.float32)
-    owners = getattr(ctx, 'owners', None)
     if owners is None:
         return dx, dw.to(ctx.weight_dtype), None
     return dx, accumulate_wgrad(owners, dw, ctx.like), None
@@ -155,10 +200,14 @@ class _BF16Linear(torch.autograd.Function):
     def backward(ctx, grad):
         x, compute = ctx.saved_tensors
         flat_grad = grad.reshape(-1, compute.shape[0])
+        owners = getattr(ctx, 'owners', None)
         with torch.autocast(device_type=grad.device.type, enabled=False):
             dx = tc_mm(flat_grad, compute).reshape(x.shape).to(x.dtype)
+            if grad.is_cuda and _fused(owners):
+                rows = x.reshape(-1, compute.shape[1]).bfloat16()
+                _wgrad_into_main_grad(owners, flat_grad.bfloat16(), rows)
+                return dx, accumulate_wgrad(owners, None, ctx.like), None
             dw = tc_mm(flat_grad.T, x.reshape(-1, compute.shape[1]), torch.float32)
-        owners = getattr(ctx, 'owners', None)
         if owners is None:
             return dx, dw.to(ctx.weight_dtype), None
         return dx, accumulate_wgrad(owners, dw, ctx.like), None
