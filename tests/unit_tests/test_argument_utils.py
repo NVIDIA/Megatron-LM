@@ -103,7 +103,7 @@ def test_moe_norm_flag_reaches_transformer_config():
 def test_hash_moe_vocab_is_initialized_before_config_conversion(
     monkeypatch, explicit_hash_vocab_size
 ):
-    from megatron.training import global_vars
+    from megatron.training import global_vars, vocab_utils
 
     parser = ArgumentParser()
     add_megatron_arguments(parser)
@@ -112,19 +112,20 @@ def test_hash_moe_vocab_is_initialized_before_config_conversion(
     args.moe_num_hash_layers = 1
     args.hash_moe_vocab_size = explicit_hash_vocab_size
     args.vocab_size = 100000
-    args.padded_vocab_size = 100352
     tokenizer = SimpleNamespace(vocab_size=100003)
+    cfg = MagicMock()
+    cfg.tokenizer = SimpleNamespace(pad_vocab_size=True, padded_vocab_size=100352)
     monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
-    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
+    monkeypatch.setattr(vocab_utils, 'build_tokenizer', lambda _args: tokenizer)
 
-    global_vars._build_tokenizer(args)
+    global_vars._build_tokenizer(cfg, args)
     config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
 
     expected = 100003 if explicit_hash_vocab_size is None else explicit_hash_vocab_size
     assert config.hash_moe_vocab_size == expected
     assert args.hash_moe_vocab_size == expected
     assert args.vocab_size == 100000
-    assert args.padded_vocab_size == 100352
+    assert cfg.tokenizer.padded_vocab_size == 100352
 
 
 # ---------------------------------------------------------------------------
