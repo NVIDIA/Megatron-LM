@@ -114,6 +114,72 @@ Four-GPU topology variants of the command above are TP2×CP2 (add
 not four. Confirm that the workload actually triggers VPP alignment; requesting
 VPP alone does not prove that microbatches were split.
 
+### Local A6000 acceptance (2026-10-22)
+
+The observation change was validated on dev `a5aa637fa` plus an independent eager
+THD padding-metadata prerequisite, tracked by [#7417](https://github.com/NVIDIA/Megatron-LM/pull/7417).
+That prerequisite is **outside the metrics change**. Unmodified dev marks every
+packed batch as internally padded, disabling FA2 on Ampere; TE's fused BF16 THD
+backend requires SM90+. The acceptance dataset above uses aligned valid lengths,
+so the accurate eager padding flag permits FA2. Internally padded Ampere THD
+workloads are not qualified by these runs.
+
+Environment: RTX A6000/SM86, driver 580.178.04, Python 3.12.4, PyTorch
+2.11.0+cu130, CUDA 13.0, Transformer Engine 2.20.2, FlashAttention 2.8.3,
+cuDNN 9.19.0, NCCL 2.28.9. The dense model has four layers, hidden size 128,
+four attention heads, FFN size 512 and vocabulary size 256. Dropout is disabled.
+All runs execute real BF16 forward/backward and Adam updates with synthetic,
+length-controlled tokens; they do not establish production-model convergence.
+
+Each correctness pair restored the same topology-specific checkpoint and RNG
+state, with seed 1234 and deterministic execution. Five subsequent updates
+matched bitwise in final schedules, microbatch counts, losses, gradients and
+updated parameters. Evaluation ran between training steps. Every enabled
+training step produced exactly one stdout record and one TensorBoard scalar per
+metric; TP peers received the same summary. W&B routing is covered by the logger
+unit test, without an external W&B service in these runs.
+
+| GPUs | TP / PP / CP / VPP | Microbatches before → after alignment | CP1 / CP2 logical samples | Estimated balance |
+|---|---|---|---|---|
+| 2 | 1 / 1 / 2 / 1 | 3 → 3 | 7 / 1 | 0.92 |
+| 4 | 2 / 1 / 2 / 1 | 3 → 3 | 7 / 1 | 0.92 |
+| 4 | 1 / 2 / 2 / 2 | 3 → 4 | 3 / 5 | 0.92 |
+
+The standalone metrics branch passed 84 focused tests per rank on four GPUs;
+the integration with the padding prerequisite passed 49 scheduling tests per
+rank. Existing tests requiring other topology assumptions and four unrelated
+model-builder cases with an optional-import failure were excluded. Black,
+isort, Ruff and the core formatter/Pylint checks passed. The optional mypy stage
+reported existing baseline diagnostics; no new diagnostic messages remained.
+
+Timing reused the existing training interval timer, with TensorBoard and
+`--log-interval 1`. Each arm restored the same checkpoint, ran 100 updates,
+discarded ten warmup updates and retained 90 steady updates, repeated three
+times in rotated order. Only the measurement processes were bound to fixed CPU
+sets. Each step trained 2560 effective tokens; these aligned workloads have
+equal padded and valid lengths. Correctness tensor hashing was disabled.
+
+| Arm | Mean step ± between-run std (ms) | Median of run medians (ms) | Mean effective tokens/s |
+|---|---|---|---|
+| Fixed CP2 | 145.38 ± 3.26 | 144.65 | 17,615 |
+| DCP, metrics off | 113.55 ± 4.18 | 109.95 | 22,566 |
+| DCP, metrics on | 116.22 ± 8.27 | 109.20 | 22,100 |
+
+The on/off mean difference was **+2.35%**; paired differences ranged from
+−1.35% to +6.34%, while the central step times were similar. This shared-host
+measurement does not resolve small observation costs and is not evidence of
+zero overhead. An additional CPU diagnostic measured schedule statistics at
+45–48 µs/step and window updates at about 12 µs/step. On the emitting rank, the
+whole existing `training_log` call averaged 1.565 ms off versus 1.604 ms on;
+Python garbage-collection events did not explain the multi-millisecond tail variation.
+These diagnostics are separate from the primary timing results.
+
+[Validation records and reproduction scripts](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/evidence/dcp-stats-a6000/validation/dcp-stats-a6000)
+include source hashes, checkpoint hashes, exact commands, raw logs, TensorBoard
+events, per-rank audits, initial unbound timing results, CPU diagnostics and the
+standalone compatibility patch. The metrics PR does not contain that patch or
+a new benchmark framework.
+
 ## How Data Loading Works
 
 Understanding the architecture helps explain why specific flags matter.
