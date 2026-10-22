@@ -29,6 +29,10 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.chunk_cuda_graph import (
+    ChunkCudaGraphPostProcessBlock,
+    build_postprocess_block,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -103,6 +107,284 @@ def _validate_hash_moe_pipeline_placement(
             "Currently, all hash MoE layers must be in the same pipeline/virtual-pipeline "
             "stage as the embedding because only that stage owns input_ids. This "
             f"non-embedding stage contains hash MoE layer(s) {local_hash_layer_numbers}."
+        )
+
+
+def _postprocess_after_decoder(
+    model,
+    *,
+    hidden_states,
+    mhc_multistream,
+    input_ids,
+    position_ids,
+    attention_mask,
+    labels,
+    loss_mask,
+    inference_context,
+    inference_params,
+    runtime_gather_output,
+    packed_seq_params,
+    padding_mask,
+    rotary_pos_emb,
+    in_inference_mode,
+    decoder_input=None,
+    use_precomputed_mtp_embeddings=False,
+    mtp_input_mask=None,
+    compute_mtp_loss=True,
+    cp_batch=None,
+    packed_seq_params_by_layout=None,
+    cp_layout_plan=None,
+):
+    """MTP block, LM head and loss of ``model``: everything that follows the decoder.
+
+    A module-level function (not a method) so ``HybridModel.forward`` and the chunk CUDA graph
+    post-process block share it without adding attributes to the model.
+    """
+    output_weight = None
+    if model.share_embeddings_and_output_weights:
+        output_weight = model.shared_embedding_or_output_weight()
+
+    # Check if speculative decoding is active. When it is, MTP must be
+    # computed *after* verification so that it is conditioned on verified
+    # tokens rather than stale speculative tokens from the previous step.
+    is_spec_decode = (
+        in_inference_mode
+        and inference_context is not None
+        and inference_context.is_dynamic_batching()
+        and inference_context.num_speculative_tokens > 0
+    )
+    mtp_cp_group = None
+    sequence_roll_context = None
+    mtp_forward_ran = (
+        model.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
+    )
+    mtp_hidden_states = hidden_states
+    mtp_inputs = None
+    if mtp_forward_ran:
+        mtp_inputs = model.mtp.prepare_cp_layout(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
+            mhc_multistream=mhc_multistream,
+            labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
+            packed_seq_params=packed_seq_params,
+            cp_batch=cp_batch,
+            padding_mask=padding_mask,
+        )
+        if mtp_inputs.decoder_input is None:
+            assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
+                "MTP requires both input_ids and position_ids when precomputed "
+                "decoder_input embeddings are not provided."
+            )
+        # Prefetch only after converting to the MTP layout: cached rows belong
+        # to these token IDs and this packed metadata, not the decoder layout.
+        mtp_cp_group = resolve_cp_group(model.pg_collection.cp, mtp_inputs.packed_seq_params)
+        sequence_roll_tokens = (
+            mtp_inputs.input_ids if mtp_inputs.input_ids is not None else mtp_inputs.labels
+        )
+        sequence_roll_context = prepare_mtp_sequence_roll_context(
+            tensor=sequence_roll_tokens,
+            cp_group=mtp_cp_group,
+            packed_seq_params=mtp_inputs.packed_seq_params,
+        )
+        if sequence_roll_context is not None:
+            roll_position_ids = getattr(model.embedding, "add_position_embedding", True)
+            roll_padding_mask = mtp_inputs.padding_mask
+            if (
+                roll_padding_mask is not None
+                and model.config.sequence_parallel
+                and roll_padding_mask.shape != sequence_roll_tokens.shape
+            ):
+                roll_padding_mask = tensor_parallel.gather_from_sequence_parallel_region(
+                    roll_padding_mask.transpose(0, 1).contiguous(),
+                    tensor_parallel_output_grad=False,
+                    group=model.tp_group,
+                ).transpose(0, 1)
+            sequence_roll_context = sequence_roll_context.prefetch_halos(
+                width=model.config.mtp_num_layers + 1,
+                input_ids=mtp_inputs.input_ids,
+                position_ids=mtp_inputs.position_ids if roll_position_ids else None,
+                labels=mtp_inputs.labels if model.post_process else None,
+                loss_mask=mtp_inputs.loss_mask if model.post_process else None,
+                padding_mask=roll_padding_mask,
+                mtp_input_mask=mtp_inputs.mtp_input_mask,
+            )
+        mtp_hidden_states = model.mtp(
+            input_ids=mtp_inputs.input_ids,
+            position_ids=mtp_inputs.position_ids,
+            hidden_states=mtp_inputs.hidden_states,
+            mhc_multistream=mtp_inputs.mhc_multistream,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=mtp_inputs.packed_seq_params,
+            sequence_roll_context=sequence_roll_context,
+            embedding=model.embedding,
+            decoder_input=mtp_inputs.decoder_input,
+            mtp_input_mask=mtp_inputs.mtp_input_mask,
+            padding_mask=mtp_inputs.padding_mask,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
+        )
+
+    if not model.post_process:
+        return mtp_hidden_states if mtp_forward_ran else hidden_states
+
+    if model.config.mtp_num_layers is not None and model.mtp_process:
+        assert model.config.mtp_num_layers > 0
+        if is_spec_decode:
+            assert inference_context is not None
+            if model.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                # Block-scope CUDA graph mode: copy_() into the
+                # pre-allocated buffer so every graph replay writes to
+                # the same fixed GPU address regardless of batch size.
+                assert inference_context.mtp_decoder_hidden_states is not None
+                inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                    hidden_states
+                )
+            else:
+                # Non-block scope: direct assignment; the controller will set
+                # this back to None after reading to allow GC.
+                inference_context.mtp_decoder_hidden_states = hidden_states
+        elif mtp_forward_ran:
+            assert mtp_inputs is not None
+            # For RL (labels is None), process_mtp_loss derives labels from
+            # input_ids to match the SFT label format.
+            hidden_states = process_mtp_loss(
+                hidden_states=mtp_hidden_states,
+                labels=mtp_inputs.labels,
+                loss_mask=mtp_inputs.loss_mask,
+                output_layer=model.output_layer,
+                output_weight=output_weight,
+                is_training=model.training,
+                compute_language_model_loss=model.compute_language_model_loss,
+                config=model.config,
+                cp_group=mtp_cp_group,
+                tp_group=model.tp_group,
+                dp_cp_group=model.pg_collection.dp_cp,
+                sequence_roll_context=sequence_roll_context,
+                packed_seq_params=mtp_inputs.packed_seq_params,
+                scale_logits_fn=model._scale_logits if model.config.use_mup else None,
+                input_ids=mtp_inputs.input_ids,
+                mtp_input_mask=mtp_inputs.mtp_input_mask,
+                metric_avg_group=(
+                    getattr(model.pg_collection, 'dp_cp_gtp_remat', None)
+                    or model.pg_collection.dp_cp
+                ),
+                main_hidden_states=hidden_states,
+            )
+    sequence_parallel_override = False
+    if (
+        in_inference_mode
+        and inference_context is not None
+        and inference_context.config.materialize_only_last_token_logits
+    ):
+        if inference_context.is_static_batching():
+            hidden_states = hidden_states[-1:, :, :]
+        else:
+            if model.output_layer.sequence_parallel:
+                # Perform the sequence parallel gather here instead of after the output layer
+                # because we need to slice the last token logits from the full view of the
+                # packed logits across all requests.
+                hidden_states = gather_from_sequence_parallel_region(
+                    hidden_states, group=model.pg_collection.tp
+                )
+                model.output_layer.sequence_parallel = False
+                sequence_parallel_override = True
+
+            # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+            # then back to [S', B, H] for the output layer.
+            reshaped = hidden_states.squeeze(1).unsqueeze(0)
+            hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+    if (
+        labels is not None
+        and not in_inference_mode
+        and model.config.cross_entropy_loss_fusion
+        and model.config.cross_entropy_fusion_impl == "linear"
+    ):
+        # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
+        # materialised, so the loss comes straight out of the output layer and muP's output
+        # scaling is applied to the layer input instead (the layer has no bias).
+        return model.output_layer(
+            model._scale_fused_cross_entropy_input(hidden_states),
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            output_cross_entropy_loss=True,
+            labels=labels,
+        )
+
+    logits, _ = model.output_layer(
+        hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+    )
+    logits = model._scale_logits(logits)
+    gather_output = (
+        model.output_layer.gather_output if runtime_gather_output is None else runtime_gather_output
+    )
+    observe_tensor(
+        model.output_layer,
+        "output_logits",
+        "output_logits",
+        logits,
+        tp_shard_dim=None if gather_output else -1,
+        sequence_dim=0,
+        batch_dim=1,
+    )
+
+    # Restore sequence parallel execution to the output layer if necessary.
+    if sequence_parallel_override:
+        assert (
+            in_inference_mode
+            and inference_context.is_dynamic_batching()
+            and inference_context.config.materialize_only_last_token_logits
+        )
+        model.output_layer.sequence_parallel = True
+
+    if labels is None:
+        # [s b h] => [b s h]
+        return logits.transpose(0, 1).contiguous()
+
+    loss = model.compute_language_model_loss(labels, logits)
+
+    return loss
+
+
+class HybridPostProcessBlock(ChunkCudaGraphPostProcessBlock):
+    """``HybridModel`` post-process (MTP block, LM head, loss) as a chunk CUDA graph callable."""
+
+    def forward(
+        self,
+        hidden_states,
+        mhc_multistream=None,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        loss_mask=None,
+        attention_mask=None,
+        packed_seq_params=None,
+        padding_mask=None,
+        rotary_pos_emb=None,
+    ):
+        """Run the owner's training post-process on the (static) graph inputs."""
+        return _postprocess_after_decoder(
+            self._owner,
+            hidden_states=hidden_states,
+            mhc_multistream=mhc_multistream,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            inference_context=None,
+            inference_params=None,
+            runtime_gather_output=None,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            in_inference_mode=False,
         )
 
 
@@ -502,6 +784,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+        # Chunk CUDA graphs also capture the post-process of the last pipeline stage.
+        self.postprocess_block = build_postprocess_block(self, HybridPostProcessBlock)
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -810,215 +1095,55 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states = decoder_output
             mhc_multistream = None
 
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
-        # Check if speculative decoding is active. When it is, MTP must be
-        # computed *after* verification so that it is conditioned on verified
-        # tokens rather than stale speculative tokens from the previous step.
-        is_spec_decode = (
-            in_inference_mode
-            and inference_context is not None
-            and inference_context.is_dynamic_batching()
-            and inference_context.num_speculative_tokens > 0
-        )
-        mtp_cp_group = None
-        sequence_roll_context = None
-        mtp_forward_ran = (
-            self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
-        )
-        mtp_hidden_states = hidden_states
-        mtp_inputs = None
-        if mtp_forward_ran:
-            mtp_inputs = self.mtp.prepare_cp_layout(
+        postprocess_block = getattr(self, 'postprocess_block', None)
+        if (
+            postprocess_block is not None
+            and self.training
+            and labels is not None
+            and not in_inference_mode
+            # The captured post-process takes the decoder's layout and tensors only: no CP
+            # layout conversion plan, no precomputed MTP embeddings, no MTP conditioning mask,
+            # MTP on.
+            and compute_mtp_loss
+            and (cp_batch is None or cp_batch.thd_plan is None)
+            and mtp_input_mask is None
+            and not use_precomputed_mtp_embeddings
+        ):
+            # Captured into / replayed from the chunk CUDA graphs.
+            return postprocess_block(
+                hidden_states,
+                mhc_multistream=mhc_multistream,
                 input_ids=input_ids,
                 position_ids=position_ids,
-                hidden_states=hidden_states,
-                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
-                mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,
-                mtp_input_mask=mtp_input_mask,
-                packed_seq_params=packed_seq_params,
-                cp_batch=cp_batch,
-                padding_mask=padding_mask,
-            )
-            if mtp_inputs.decoder_input is None:
-                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
-                    "MTP requires both input_ids and position_ids when precomputed "
-                    "decoder_input embeddings are not provided."
-                )
-            # Prefetch only after converting to the MTP layout: cached rows belong
-            # to these token IDs and this packed metadata, not the decoder layout.
-            mtp_cp_group = resolve_cp_group(self.pg_collection.cp, mtp_inputs.packed_seq_params)
-            sequence_roll_tokens = (
-                mtp_inputs.input_ids if mtp_inputs.input_ids is not None else mtp_inputs.labels
-            )
-            sequence_roll_context = prepare_mtp_sequence_roll_context(
-                tensor=sequence_roll_tokens,
-                cp_group=mtp_cp_group,
-                packed_seq_params=mtp_inputs.packed_seq_params,
-            )
-            if sequence_roll_context is not None:
-                roll_position_ids = getattr(self.embedding, "add_position_embedding", True)
-                roll_padding_mask = mtp_inputs.padding_mask
-                if (
-                    roll_padding_mask is not None
-                    and self.config.sequence_parallel
-                    and roll_padding_mask.shape != sequence_roll_tokens.shape
-                ):
-                    roll_padding_mask = tensor_parallel.gather_from_sequence_parallel_region(
-                        roll_padding_mask.transpose(0, 1).contiguous(),
-                        tensor_parallel_output_grad=False,
-                        group=self.tp_group,
-                    ).transpose(0, 1)
-                sequence_roll_context = sequence_roll_context.prefetch_halos(
-                    width=self.config.mtp_num_layers + 1,
-                    input_ids=mtp_inputs.input_ids,
-                    position_ids=mtp_inputs.position_ids if roll_position_ids else None,
-                    labels=mtp_inputs.labels if self.post_process else None,
-                    loss_mask=mtp_inputs.loss_mask if self.post_process else None,
-                    padding_mask=roll_padding_mask,
-                    mtp_input_mask=mtp_inputs.mtp_input_mask,
-                )
-            mtp_hidden_states = self.mtp(
-                input_ids=mtp_inputs.input_ids,
-                position_ids=mtp_inputs.position_ids,
-                hidden_states=mtp_inputs.hidden_states,
-                mhc_multistream=mtp_inputs.mhc_multistream,
                 attention_mask=attention_mask,
-                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
                 rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=mtp_inputs.packed_seq_params,
-                sequence_roll_context=sequence_roll_context,
-                embedding=self.embedding,
-                decoder_input=mtp_inputs.decoder_input,
-                mtp_input_mask=mtp_inputs.mtp_input_mask,
-                padding_mask=mtp_inputs.padding_mask,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
             )
 
-        if not self.post_process:
-            return mtp_hidden_states if mtp_forward_ran else hidden_states
-
-        if self.config.mtp_num_layers is not None and self.mtp_process:
-            assert self.config.mtp_num_layers > 0
-            if is_spec_decode:
-                assert inference_context is not None
-                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
-                    # Block-scope CUDA graph mode: copy_() into the
-                    # pre-allocated buffer so every graph replay writes to
-                    # the same fixed GPU address regardless of batch size.
-                    assert inference_context.mtp_decoder_hidden_states is not None
-                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
-                        hidden_states
-                    )
-                else:
-                    # Non-block scope: direct assignment; the controller will set
-                    # this back to None after reading to allow GC.
-                    inference_context.mtp_decoder_hidden_states = hidden_states
-            elif mtp_forward_ran:
-                assert mtp_inputs is not None
-                # For RL (labels is None), process_mtp_loss derives labels from
-                # input_ids to match the SFT label format.
-                hidden_states = process_mtp_loss(
-                    hidden_states=mtp_hidden_states,
-                    labels=mtp_inputs.labels,
-                    loss_mask=mtp_inputs.loss_mask,
-                    output_layer=self.output_layer,
-                    output_weight=output_weight,
-                    is_training=self.training,
-                    compute_language_model_loss=self.compute_language_model_loss,
-                    config=self.config,
-                    cp_group=mtp_cp_group,
-                    tp_group=self.tp_group,
-                    dp_cp_group=self.pg_collection.dp_cp,
-                    sequence_roll_context=sequence_roll_context,
-                    packed_seq_params=mtp_inputs.packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                    input_ids=mtp_inputs.input_ids,
-                    mtp_input_mask=mtp_inputs.mtp_input_mask,
-                    metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
-                    ),
-                    main_hidden_states=hidden_states,
-                )
-        sequence_parallel_override = False
-        if (
-            in_inference_mode
-            and inference_context is not None
-            and inference_context.config.materialize_only_last_token_logits
-        ):
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
-
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S', B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
-
-        if (
-            labels is not None
-            and not in_inference_mode
-            and self.config.cross_entropy_loss_fusion
-            and self.config.cross_entropy_fusion_impl == "linear"
-        ):
-            # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
-            # materialised, so the loss comes straight out of the output layer and muP's output
-            # scaling is applied to the layer input instead (the layer has no bias).
-            return self.output_layer(
-                self._scale_fused_cross_entropy_input(hidden_states),
-                weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-                output_cross_entropy_loss=True,
-                labels=labels,
-            )
-
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        return _postprocess_after_decoder(
+            self,
+            hidden_states=hidden_states,
+            mhc_multistream=mhc_multistream,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            inference_context=inference_context,
+            inference_params=inference_params,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            in_inference_mode=in_inference_mode,
+            decoder_input=decoder_input,
+            use_precomputed_mtp_embeddings=use_precomputed_mtp_embeddings,
+            mtp_input_mask=mtp_input_mask,
+            compute_mtp_loss=compute_mtp_loss,
+            cp_batch=cp_batch,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
         )
-        logits = self._scale_logits(logits)
-        gather_output = (
-            self.output_layer.gather_output
-            if runtime_gather_output is None
-            else runtime_gather_output
-        )
-        observe_tensor(
-            self.output_layer,
-            "output_logits",
-            "output_logits",
-            logits,
-            tp_shard_dim=None if gather_output else -1,
-            sequence_dim=0,
-            batch_dim=1,
-        )
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.config.materialize_only_last_token_logits
-            )
-            self.output_layer.sequence_parallel = True
-
-        if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
-
-        loss = self.compute_language_model_loss(labels, logits)
-
-        return loss

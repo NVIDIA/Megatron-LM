@@ -334,7 +334,7 @@ def _initialize_distributed(
             device_id = None
 
         # Set to non-default stream for cudagraph capturing.
-        if args.cuda_graph_impl == "transformer_engine":
+        if args.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
             torch.cuda.set_stream(torch.cuda.Stream())
 
         # Set flight recorder env vars if specified.

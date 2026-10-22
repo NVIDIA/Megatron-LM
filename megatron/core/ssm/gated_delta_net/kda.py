@@ -340,21 +340,12 @@ class KimiDeltaAttention(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            if self.config.fp8 or self.config.fp4:
-                # Import here to avoid a circular dependency.
-                from megatron.core.extensions.transformer_engine import te_checkpoint
+            # import here to avoid circular import (recompute imports TransformerLayer)
+            from megatron.core.recompute import checkpoint_activations
 
-                out, out_bias = te_checkpoint(
-                    _checkpointed_compute,
-                    False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    hidden_states,
-                )
-            else:
-                out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, False, hidden_states
-                )
+            out, out_bias = checkpoint_activations(
+                self.config, _checkpointed_compute, False, self.pg_collection.tp, hidden_states
+            )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
@@ -671,7 +662,7 @@ class KimiDeltaAttention(_GDNBase):
             )
         # torch.equal synchronises with the device, which a CUDA graph capture forbids; the
         # boundaries were validated during the eager warm-up steps and the captured graph's static
-        # cu_seqlens are identical by construction.
+        # cu_seqlens are identical by construction (same guard as GatedDeltaNet).
         if cu_seqlens_q.shape != cu_seqlens_kv.shape or (
             not torch.cuda.is_current_stream_capturing()
             and not torch.equal(cu_seqlens_q, cu_seqlens_kv)
