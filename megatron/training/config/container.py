@@ -388,6 +388,21 @@ class PretrainConfigContainer(ConfigContainerBase):
         super().validate()
         global_batch_size, _, _ = self._resolve_batch_sizes()
         self._validate_rl_config(global_batch_size)
+        self.optimizer.validate_run(
+            ddp_config=self.ddp,
+            use_torch_fsdp2=self.dist.use_torch_fsdp2,
+            moe_single_grouped_weight=getattr(self.model, "moe_single_grouped_weight", False),
+            virtual_pipeline_model_parallel_size=getattr(
+                self.model, "virtual_pipeline_model_parallel_size", None
+            ),
+            ckpt_format=self.checkpoint.ckpt_format,
+        )
+        self.scheduler.validate_run(
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
+            skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
+        )
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -401,20 +416,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             load_optim=self.checkpoint.load_optim,
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
-        )
-        self.optimizer.validate_run(
-            ddp_config=self.ddp,
-            use_torch_fsdp2=self.dist.use_torch_fsdp2,
-            moe_single_grouped_weight=getattr(self.model, "moe_single_grouped_weight", False),
-            virtual_pipeline_model_parallel_size=getattr(
-                self.model, "virtual_pipeline_model_parallel_size", None
-            ),
-            ckpt_format=self.checkpoint.ckpt_format,
-        self.scheduler.validate_run(
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            weight_decay=self.optimizer.weight_decay,
         )
 
     def _finalize(self) -> None:
