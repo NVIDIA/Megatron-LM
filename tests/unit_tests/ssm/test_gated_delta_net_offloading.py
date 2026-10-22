@@ -23,7 +23,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA
+from megatron.core.ssm.gated_delta_net import HAVE_FLA, GatedDeltaNet2
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -58,7 +58,6 @@ def _config(**kwargs: Any) -> TransformerConfig:
     "kwargs,match",
     [
         ({"experimental_attention_variant": None}, "only supports GDN"),
-        ({"experimental_attention_variant": "gdn2"}, "only supports GDN"),
         ({"bf16": False, "params_dtype": torch.float32}, "BF16"),
         ({"fp8": "e4m3"}, "BF16"),
         ({"fp4": "e2m1"}, "BF16"),
@@ -73,7 +72,9 @@ def _config(**kwargs: Any) -> TransformerConfig:
             },
             "full recomputation",
         ),
-        ({"cuda_graph_impl": "transformer_engine"}, "CUDA graphs"),
+        ({"cuda_graph_impl": "local"}, "Transformer Engine CUDA graphs"),
+        ({"cuda_graph_impl": "full_iteration"}, "Transformer Engine CUDA graphs"),
+        ({"enable_cuda_graph": True}, "Transformer Engine CUDA graphs"),
     ],
 )
 def test_reject_unsupported_gdn_offload(kwargs: dict[str, Any], match: str) -> None:
@@ -89,6 +90,7 @@ def test_gdn_offload_config() -> None:
         assert config.experimental_attention_variant == "gdn"
     config = _config(recompute_granularity="selective", recompute_modules=["gdn_norm_out"])
     assert config.offload_modules == ["gdn_core_attn"]
+    assert _config(experimental_attention_variant="gdn2").offload_modules == ["gdn_core_attn"]
     assert not TransformerConfig(
         num_layers=1, hidden_size=128, num_attention_heads=2
     ).offload_modules
@@ -107,6 +109,18 @@ def gdn_offload_groups() -> Iterator[ProcessGroupCollection]:
     torch.cuda.synchronize()
     off_interface.reset_instance()
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("variant", ["gdn", "gdn2"])
+def test_gdn_offload_te_graph_config(variant: str) -> None:
+    """Both recurrence variants accept TE graphs while retaining BF16/FLA constraints."""
+    config = _config(
+        experimental_attention_variant=variant,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["attn"],
+        cuda_graph_warmup_steps=3,
+    )
+    assert config.cuda_graph_impl == "transformer_engine"
 
 
 def _build(config: TransformerConfig, groups: ProcessGroupCollection) -> torch.nn.ModuleList:
@@ -230,6 +244,79 @@ def test_gdn_offload_replay(
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+def test_gdn2_eval_bypasses_offload_manager(
+    gdn_offload_groups: ProcessGroupCollection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evaluation with gradients does not initialize the offload manager."""
+    pytest.importorskip("fla.ops.gdn2")
+    baseline, offloaded = _build_pair(
+        _config(experimental_attention_variant="gdn2"), gdn_offload_groups
+    )
+    baseline.eval()
+    offloaded.eval()
+    source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(PipelineOffloadManager, "OFFLOAD_MGR", None)
+    _assert_step_equal(_run(baseline, source), _run(offloaded, source))
+    assert PipelineOffloadManager.OFFLOAD_MGR is None
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("value_heads", [4, 8])
+@pytest.mark.parametrize("frozen_gates", [False, True])
+def test_gdn2_offload_retains_live_sigmoid_gates(
+    gdn_offload_groups: ProcessGroupCollection,
+    value_heads: int,
+    frozen_gates: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip copies of live sigmoid outputs while allowing expanded or frozen gates."""
+    pytest.importorskip("fla.ops.gdn2")
+    config = _config(experimental_attention_variant="gdn2", linear_num_value_heads=value_heads)
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
+    if frozen_gates:
+        for model in (baseline, offloaded):
+            for layer in model:
+                layer.in_proj.requires_grad_(False)
+                layer.conv1d.requires_grad_(False)
+
+    gate_storages: dict[str, int] = {}
+    copied_gates: list[set[str]] = []
+    run_core = GatedDeltaNet2._run_gated_delta_rule
+    offload_tensor = ChunkOffloadHandler.offload
+
+    def record_gates(
+        layer: GatedDeltaNet2,
+        kernel_inputs: dict[str, torch.Tensor],
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if layer.offload_core_attention:
+            gate_storages.update(
+                {name: kernel_inputs[name].untyped_storage().data_ptr() for name in ("b", "w")}
+            )
+            copied_gates.append(set())
+        return run_core(layer, kernel_inputs, cu_seqlens)
+
+    def record_copy(handler: ChunkOffloadHandler, tensor: torch.Tensor, **kwargs: Any) -> Any:
+        copied_gates[-1].update(
+            name
+            for name, pointer in gate_storages.items()
+            if pointer == tensor.untyped_storage().data_ptr()
+        )
+        return offload_tensor(handler, tensor, **kwargs)
+
+    monkeypatch.setattr(GatedDeltaNet2, "_run_gated_delta_rule", record_gates)
+    monkeypatch.setattr(ChunkOffloadHandler, "offload", record_copy)
+    source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    reference = _run(baseline, source, detached_inputs=frozen_gates)
+    result = _run(offloaded, source, offload=True, detached_inputs=frozen_gates)
+    _assert_step_equal(reference, result)
+    assert len(copied_gates) == config.num_layers
+    for names in copied_gates:
+        assert ("w" in names) == frozen_gates
+        assert ("b" in names) == (frozen_gates or value_heads != 4)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("recompute_norm", [False, True])
 def test_gdn_offload_microbatch_accumulation(
@@ -336,11 +423,17 @@ def test_gdn_offload_packed_sequence(
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("frozen_query", [False, True])
+@pytest.mark.parametrize("variant", ["gdn", "gdn2"])
 def test_gdn_offload_delayed_d2h(
-    gdn_offload_groups: ProcessGroupCollection, monkeypatch: pytest.MonkeyPatch, frozen_query: bool
+    gdn_offload_groups: ProcessGroupCollection,
+    monkeypatch: pytest.MonkeyPatch,
+    frozen_query: bool,
+    variant: str,
 ) -> None:
     """Warmup and missing query gradients still order fallback H2D after delayed D2H."""
-    config = _config()
+    if variant == "gdn2":
+        pytest.importorskip("fla.ops.gdn2")
+    config = _config(experimental_attention_variant=variant)
     baseline, offloaded = _build_pair(config, gdn_offload_groups)
     if frozen_query:
         for model in (baseline, offloaded):
@@ -457,3 +550,34 @@ def test_gdn_offload_frozen_recurrence_bypass(
         for layer in model:
             source, _ = layer(source, None)
     assert not source.requires_grad
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("recompute_norm", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_gdn2_offload_replay(
+    gdn_offload_groups: ProcessGroupCollection, fraction: float, recompute_norm: bool, packed: bool
+) -> None:
+    """GDN2 channel-wise gates retain outputs and all gradients through pool reuse."""
+    pytest.importorskip("fla.ops.gdn2")
+    config = _config(
+        experimental_attention_variant="gdn2",
+        activation_offload_fraction=fraction,
+        recompute_granularity="selective" if recompute_norm else None,
+        recompute_modules=["gdn_norm_out"] if recompute_norm else [],
+    )
+    baseline, offloaded = _build_pair(config, gdn_offload_groups)
+    sequence = None
+    if packed:
+        cu = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
+        sequence = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+    manager = PipelineOffloadManager.get_instance()
+    for _ in range(3):
+        source = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16)
+        reference = _run(baseline, source, sequence)
+        result = _run(offloaded, source, sequence, offload=True, fraction=fraction)
+        _assert_step_equal(reference, result)
+        assert manager.cpu_tensor_pool.get_pool_status()["global_stats"]["current_in_use"] == 0
+        off_interface.reset(process_group=torch.distributed.group.WORLD)
+        assert (manager.offload_summary_total_bytes > 0) == (fraction > 0)

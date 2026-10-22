@@ -1,6 +1,6 @@
 # GDN recurrence activation offloading
 
-`gdn_core_attn` offloads tensors saved by the BF16/FLA GatedDeltaNet recurrence.
+`gdn_core_attn` offloads tensors saved by BF16/FLA GatedDeltaNet and GatedDeltaNet2 recurrences.
 It reuses the existing activation-offload manager, streams and pinned-memory pool.
 The option is disabled by default. Projection and convolution/QKV recomputation
 and convolution-input offload are separate scopes proposed in
@@ -21,8 +21,14 @@ The training CLI requires `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine 2.10
 or newer. Programmatic configurations set `fine_grained_activation_offloading=True`,
 `offload_modules=["gdn_core_attn"]` and `gdn_kernel_backend="fla"`.
 Selective `gdn_norm_out` recomputation and the existing opt-in pre-GDR fusion are
-supported. Configuration rejects GDN2, FP8/FP4, non-BF16 execution, other recurrence
-backends, full-layer recomputation and CUDA graphs.
+supported for GDN. GDN2 supports `gdn_norm_out` recomputation and requires FLA's
+`fla.ops.gdn2` kernel. Configuration rejects FP8/FP4, non-BF16 execution, other
+recurrence backends and full-layer recomputation. CUDA graphs require
+`cuda_graph_impl="transformer_engine"`; attention or whole-layer capture uses the
+existing transfer stream/event callbacks. Replay stays on the caller's autograd
+stream to preserve the order of layer graphs sharing a memory pool. Local and
+full-iteration graphs remain unsupported.
+`delay_offload_until_cuda_graph` uses the existing replay flush.
 
 The manager's minimum tensor size, offload fraction and last-group margin apply.
 After warmup, fraction zero selects no transfers. Warmup can still copy eligible
@@ -39,6 +45,10 @@ Profiling records saved-tensor storage identity, size, save location and first
 backward access. The recurrence saves Q/K/V, gates and its internal WY
 representation. Some saves alias inputs retained by neighboring operations;
 moving one saved reference does not free a storage still used on GPU.
+
+GDN2 keeps differentiable write-gate outputs on GPU because sigmoid backward
+also retains their storage. The erase gate stays on GPU when its heads do not
+need expansion; expanded and frozen gates remain eligible for offloading.
 
 The offload scope wraps only the FLA recurrence. A differentiable recurrence input
 anchors backward prefetch, including a trainable gate when Q is frozen. The scope
@@ -64,16 +74,31 @@ python -m torch.distributed.run --standalone --nproc-per-node=1 \
   --output /tmp/gdn-benchmark.json
 ```
 
+Add `--variant gdn2` to profile or benchmark the GDN2 recurrence. These stack
+benchmarks exclude vocabulary loss and optimizer updates.
+
 The reduced-model test trains complete GDN/attention decoder blocks, embeddings,
 MLPs and vocabulary loss with the native schedules and BF16 Adam. Four ranks
-cover DP, TP, TP+SP, CP, PP, PP+VPP, TP+SP+CP and TP+SP+PP, with both fusion
-variants, both norm-recomputation settings and fractions 0/0.5/1:
+cover DP, TP, TP+SP, CP, PP, PP+VPP, TP+SP+CP and TP+SP+PP, with GDN's two fusion
+settings and unfused GDN2, both norm-recomputation settings and fractions 0/0.5/1:
 
 ```bash
 python -m torch.distributed.run --standalone --nproc-per-node=4 \
   --log-dir /tmp/gdn-training-ranks --redirects 3 --tee 3 \
   -m pytest -q tests/unit_tests/ssm/test_gdn_offload_training.py
 ```
+
+The TE graph test captures attention or whole layers after three native optimizer
+steps, verifies that graphs were created, then compares three replay steps with
+offloading disabled and enabled. It covers GDN/GDN2, norm recomputation and
+delayed offload on single-stage DP, TP2+SP and PP2 configurations:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=2 \
+  -m pytest -q tests/unit_tests/ssm/test_gdn_offload_cuda_graphs.py
+```
+
+For a one-GPU check, use `--nproc-per-node=1` and select `-k tp1`.
 
 The optional Qwen tool imports local Hugging Face Qwen3.5-0.8B weights through
 Megatron Bridge and trains all 24 text decoder blocks. Vision and MTP are excluded.
@@ -175,6 +200,59 @@ support and documentation.
 retain earlier results, including the fixed-reduction fused implementation at
 `2f1ee4f2e` and unfused measurements at `4e18562c6`. Those results do not qualify
 the restored native fused implementation or establish a cross-version speedup.
+
+Whole-layer TE graph measurements at
+`f19ebc5b1da1c9b0075eecfd2f93fc6ca4b3ba8d` cover the complete Qwen text model
+and a randomly initialized eight-block GDN2/attention model. Both include
+embeddings, MLPs, vocabulary loss and native BF16 Adam. Each model uses one A6000,
+sequence 2048, four microbatches, unfused pre-GDR, norm recomputation off, fraction 1
+and the default tensor threshold. Three fresh-process pairs alternate arm order;
+each arm trains three native steps, captures graphs, then trains three replay
+warmup and ten timed optimizer steps. Input preparation, capture and state
+fingerprints are outside performance timing. The optimizer remains eager.
+
+| Model | Allocated-peak change | Reserved-peak reduction, median [range] | Paired step-time increase, median [range] |
+| --- | --- | --- | --- |
+| Qwen3.5-0.8B, 24 text blocks | +512 bytes | 444 MiB [442, 446] | +21.00% [20.68%, 21.11%] |
+| GDN2, 8 blocks, hidden size 1024, vocabulary 4096 | approximately +1 MiB | 258 MiB [248, 286] | +96.45% [96.05%, 96.66%] |
+
+These graph runs reduce reserved memory but show no allocated-peak reduction and
+substantial runtime cost. Evaluate the trade-off on the target workload before
+enabling graph offloading. The pairs hold TE graph mode fixed. Six-step
+correctness runs match losses, gradients, weights and complete optimizer-state
+fingerprints; all performance pairs also match their loss and gradient-norm
+sequences. Pinned-buffer ownership returns to zero before schedule resets and
+pool allocation counters stay constant during replay.
+[Commands, raw timings, rank logs and verification](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/6ec7df0dc5adcd9f704077636398999ebdfea027/gdn-graph-training-20261017)
+identify the exact source, environment and workload. These measurements precede
+the GDN2 live-gate change below; `d18040ba5a` used the same runtime as this source.
+
+Profiling at `d18040ba5a` identifies transfer time without overlapping kernels as
+the main graph-offload cost. GDN2 copies 1600 MiB in each direction per optimizer
+step; its write-gate storage is also retained by sigmoid backward outside the
+recurrence. At `367d014c7bf74ba3553c9db58da47fa5bcba906e`, keeping live sigmoid
+gates resident reduces each direction to 1440 MiB with unchanged kernel call counts.
+
+Three fresh-process pairs compare the previous and adjusted GDN2 implementations,
+both with offloading enabled and the same whole-layer graph workload above.
+Paired median step time falls by 5.93% (5.89–5.95%); the medians of process-median
+times are 451.71 and 424.91 ms. Peak reserved falls by an additional paired median
+22 MiB (20–38 MiB); allocated peaks are unchanged. The retained pinned-buffer count
+falls from 54 to 48. These results measure the gate-selection adjustment, not a
+speedup from enabling offloading. Transfer overhead remains substantial.
+
+At the adjusted source, two ranks each pass 20 scope, 18 native training and nine
+real TE graph cases without skips. Separate complete-model comparisons with
+linear key/value heads 8/16 and 16/16 match all six steps of losses, gradients,
+weights and complete optimizer/master-state fingerprints. Evaluation and frozen
+gate regressions exercise the resident-gate boundary.
+[Transfer traces, paired samples, rank logs and verification](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/a2cd3e9ddc1bfefe92c2a2b4052251c996c16544/gdn-graph-profile-20261017)
+retain exact commands, source identities and the earlier configuration probes.
+
+The earlier GDN2 stack result at `043e3173451bea74e63c02b197867bf356ad72e9`
+saved 192 MiB allocated (16.88%), with +58.42% median runtime. It excludes
+vocabulary loss, optimizer updates and CUDA graphs and remains a separate
+historical measurement in the linked evidence.
 
 Pretrained Qwen CP remains unqualified: the recorded disabled baseline cannot
 select an attention backend for head dimension 256 on A6000. This does not qualify

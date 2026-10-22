@@ -60,6 +60,7 @@ def _training_config(
     recompute_norm: bool,
     *,
     fused_pre_gdr: bool = False,
+    variant: str = "gdn",
 ) -> TransformerConfig:
     """Configure the reduced-size complete decoder and its parallel topology."""
     return TransformerConfig(
@@ -91,7 +92,7 @@ def _training_config(
         # PP=2/VPP requires the native ordering for both directions to the same peer.
         batch_p2p_comm=False,
         attention_backend=AttnBackend.auto if cp > 1 else AttnBackend.unfused,
-        experimental_attention_variant="gdn",
+        experimental_attention_variant=variant,
         linear_attention_freq=4,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=64,
@@ -106,6 +107,7 @@ def _training_config(
         offload_modules=["gdn_core_attn"],
         activation_offload_fraction=fraction,
         min_offloaded_tensor_size=1024,
+        cuda_graph_warmup_steps=0,
     )
 
 
@@ -117,7 +119,11 @@ def _build_training_model(
     layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(config)
     stack_spec = ModuleSpec(
         module=HybridStack,
-        submodules=HybridStackSubmodules(gdn_layer=layer_specs[0], attention_layer=layer_specs[3]),
+        submodules=HybridStackSubmodules(
+            gdn_layer=layer_specs[0],
+            gdn2_layer=layer_specs[0] if config.experimental_attention_variant == "gdn2" else None,
+            attention_layer=layer_specs[3],
+        ),
     )
     torch.manual_seed(31)
     model_parallel_cuda_manual_seed(31)
@@ -186,7 +192,11 @@ def _snapshot_leaf(value: Any) -> Any:
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("recompute_norm", [False, True])
-@pytest.mark.parametrize("fused_pre_gdr", [False, True], ids=["unfused", "fused"])
+@pytest.mark.parametrize(
+    "variant,fused_pre_gdr",
+    [("gdn", False), ("gdn", True), ("gdn2", False)],
+    ids=["gdn-unfused", "gdn-fused", "gdn2"],
+)
 @pytest.mark.parametrize(
     "tp,sp,cp,pp,vp",
     [
@@ -210,11 +220,14 @@ def test_gdn_offload_training(
     fraction: float,
     recompute_norm: bool,
     fused_pre_gdr: bool,
+    variant: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Match losses, accumulated gradients, updated weights and Adam states on every rank."""
     if Utils.world_size % (tp * cp * pp):
         pytest.skip("This topology requires a world size divisible by TP * CP * PP.")
+    if variant == "gdn2":
+        pytest.importorskip("fla.ops.gdn2")
     if fused_pre_gdr:
         pytest.importorskip("causal_conv1d", minversion="1.6.1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
@@ -226,7 +239,15 @@ def test_gdn_offload_training(
     try:
         groups = ProcessGroupCollection.use_mpu_process_groups()
         config = _training_config(
-            tp, sp, cp, pp, vp, fraction, recompute_norm, fused_pre_gdr=fused_pre_gdr
+            tp,
+            sp,
+            cp,
+            pp,
+            vp,
+            fraction,
+            recompute_norm,
+            fused_pre_gdr=fused_pre_gdr,
+            variant=variant,
         )
         baseline_config = replace(
             config, fine_grained_activation_offloading=False, offload_modules=[]

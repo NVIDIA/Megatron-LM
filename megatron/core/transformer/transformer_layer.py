@@ -2064,6 +2064,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""
         cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(*args, **kwargs)
+        if "gdn_core_attn" in (self.config.offload_modules or []):
+            # TE shares graph memory pools, so preserve replay order on the caller's stream.
+            cudagraph_kwargs.pop("cuda_graph_stream", None)
+            cudagraph_kwargs.pop("cuda_graph_event", None)
 
         assert (
             len(cudagraph_args) == 1
@@ -2210,6 +2214,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         cuda_graph_modules = self.config.cuda_graph_modules or []
+        if (
+            self.config.cuda_graph_impl == "transformer_engine"
+            and (not cuda_graph_modules or CudaGraphModule.attn in cuda_graph_modules)
+            and "gdn_core_attn" in (self.config.offload_modules or [])
+            and getattr(self.self_attention, "offload_core_attention", False)
+        ):
+            self.offload_module_in_cuda_graph = True
         if CudaGraphModule.attn in cuda_graph_modules:
             if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True

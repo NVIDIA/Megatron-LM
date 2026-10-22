@@ -49,7 +49,7 @@ def build_model(
         bf16=True,
         params_dtype=torch.bfloat16,
         use_cpu_initialization=True,
-        experimental_attention_variant="gdn",
+        experimental_attention_variant=args.variant,
         linear_attention_freq=[1] * args.layers,
         fine_grained_activation_offloading=offload,
         offload_modules=["gdn_core_attn"] if offload else [],
@@ -306,6 +306,7 @@ def main() -> None:
     """Write machine-readable profile or comparison evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["profile", "benchmark"], required=True)
+    parser.add_argument("--variant", choices=["gdn", "gdn2"], default="gdn")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--seq-length", type=int, default=2048)

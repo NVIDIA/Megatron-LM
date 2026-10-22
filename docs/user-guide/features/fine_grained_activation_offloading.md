@@ -13,7 +13,7 @@ Contributed in collaboration with RedNote.
 
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
-Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, `"shortcut_post_norm"`, and `"gdn_core_attn"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`. `gdn_core_attn` requires BF16 GDN with the FLA recurrence.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, `"shortcut_post_norm"`, and `"gdn_core_attn"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`. `gdn_core_attn` requires BF16 GDN/GDN2 with the FLA recurrence.
 
 ## User Guide
 
@@ -43,7 +43,7 @@ Each scope offloads saved activations to CPU during forward and reloads them bef
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
-| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN only; no full recomputation or CUDA graphs |
+| `gdn_core_attn` | Tensors saved inside the FLA GDN/GDN2 recurrence | BF16 only; no full recomputation; TE CUDA graphs supported |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
@@ -53,9 +53,10 @@ replay-owned forward so that replay and offloading do not release the same activ
 
 Use `--fine-grained-activation-offloading --offload-modules gdn_core_attn` with BF16
 GDN (`--experimental-attention-variant gdn`, including the legacy `gated_delta_net`
-alias). This scope captures tensors saved by FLA's chunked gated delta rule, including
-Q/K/V and its internal WY representation. It commits the transfer on the recurrence
-output, before the gated output norm, and reloads before recurrence backward.
+alias), or `--experimental-attention-variant gdn2`. This scope captures tensors saved
+by FLA's recurrence, including Q/K/V and its internal WY representation. It commits
+the transfer on the recurrence output, before the gated output norm, and reloads
+before recurrence backward.
 
 Megatron's training CLI requires `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine
 2.10 or newer. Set it before starting the training process.
@@ -68,7 +69,11 @@ inputs bypass the offload scope. When Q is frozen, the first differentiable inpu
 anchors the backward prefetch callback.
 
 Initial support requires BF16 without FP8/FP4, the FLA recurrence (not the deterministic
-Torch reference), and no CUDA graphs or full-layer recomputation. GDN2 is not included.
+Torch reference), and no full-layer recomputation. CUDA graphs require
+`--cuda-graph-impl transformer_engine`; the existing graph stream/event integration
+also covers captured GDN recurrence groups. Choose attention or whole-layer
+capture and set a positive `--cuda-graph-warmup-steps`. Local and full-iteration
+graphs are not supported by this scope. GDN2 requires FLA's `fla.ops.gdn2` kernel.
 Saved inputs are not force-released: any storage still held by another operation stays
 on GPU. The manager's minimum size, fraction, and last-group margin still apply; a
 single GDN group is kept resident after warmup. Use multiple layers when evaluating
@@ -125,7 +130,8 @@ from all configured offload modules after those filters.
 
 ### CUDA Graph Integration
 
-Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabled, the following constraints apply:
+Fine-grained offloading is compatible with CUDA graphs. The following partial-capture
+recipe covers MoE attention/router offloading; GDN's supported scopes are described above:
 
 - `attn_norm` and `mlp_norm` **cannot** be offloaded (they cross CUDA graph boundaries).
 - `cuda_graph_scope` must include `attn` and `moe_router`.
@@ -143,7 +149,7 @@ Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabl
 
 Boundaries that run **outside** the captured region still execute as normal eager PyTorch each forward—for the recommended MoE setup, that includes expert compute after a graphed `moe_router` (e.g. offloading `expert_fc1` / `moe_act`). For those groups, each `group_offload` would otherwise submit D2H work from the host as soon as the forward hits the commit point.
 
-**What this flag does.** It only affects offload commits that are explicitly wired with **delayed** group commit (currently the MoE expert path: `expert_fc1`, `moe_act`). Around each layer’s `TransformerEngine` CUDA graph replay, the offload manager enters **replay mode**; delayed commits **enqueue** `(callback, group name, forced tensors)` instead of launching D2H immediately, then **flush_delayed_groups** runs **after** that graph replay returns and issues the queued D2H copies in forward order, without changing the offload/reload semantics.
+**What this flag does.** It only affects offload commits explicitly wired with **delayed** group commit: `expert_fc1`, `moe_act`, and `gdn_core_attn`. Around each layer’s `TransformerEngine` CUDA graph replay, the offload manager enters **replay mode**; delayed commits **enqueue** `(callback, group name, forced tensors)` instead of launching D2H immediately, then **flush_delayed_groups** runs **after** that graph replay returns and issues the queued D2H copies in forward order, without changing the offload/reload semantics. Transfers captured inside a GDN graph remain part of that graph; selecting the flag does not move captured transfers back to Python.
 
 **When this actually buys time (EP A2A after replay).** The benefit assumes a **real CPU/GPU synchronization gap right after graph replay**—in the usual MoE training layout, **expert parallel (EP) all-to-all** and related dispatch follows the graphed `moe_router` region. That A2A path typically needs the host to coordinate collectives and to **sync with the GPU** (e.g. wait for graph work to finish or for communication staging), so the CPU is not fully overlapped with useful launch work during that interval. Scheduling `flush_delayed_groups` **immediately after** `cudaGraphLaunch` returns uses that window to issue D2H copies from the host: the enqueue cost is largely **hidden** in slack that EP A2A would already incur. If there were no such post-replay sync (or expert work were fully captured inside the graph with no host-visible gap), deferring commits would not provide the same “free” host time.
 
