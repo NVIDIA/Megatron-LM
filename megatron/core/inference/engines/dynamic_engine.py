@@ -1681,7 +1681,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     req.num_matched_prefix_blocks = 0
 
             # Reset the chunked prefill request id
-            self.chunked_prefill_request_id = -1
+            self.context.chunked_prefill_request_id = -1
         else:
             recompute_resident_ids = []
         self.resume_request_ids = [*recompute_resident_ids, *waiting_request_ids]

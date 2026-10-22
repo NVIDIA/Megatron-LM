@@ -276,3 +276,26 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
             for state in forward_states
             if state["partial_id"] == request.request_id
         ] == [progress, 2 * progress]
+
+    @torch.inference_mode()
+    def test_mid_partial_recompute_resets_and_completes(self):
+        """RECOMPUTE restarts the prompt, then emits the fixed model's three tokens."""
+        env, request, forward_states = self._build_chunked_env(
+            KVCacheManagementMode.RECOMPUTE, AsyncScheduleMode.ASYNC
+        )
+        _, progress = self._assert_partial_primer(env, request, forward_states)
+        env.engine.suspend()
+        assert request.finished_chunk_token_count == 0
+        assert torch.equal(request.remaining_prompt_tokens, request.prompt_tokens)
+        assert not env.engine.controller._async_sched_forward.is_valid
+        assert env.engine.context.chunked_prefill_request_id == -1
+        assert "chunked_prefill_request_id" not in vars(env.engine)
+        env.engine.resume()
+        completed = self._finish_request(env, request.request_id)
+        assert completed.generated_tokens == [_OUTPUT_TOKEN] * 3
+        partial_progress = [
+            state["partial_progress"]
+            for state in forward_states
+            if state["partial_id"] == request.request_id
+        ]
+        assert partial_progress[:2] == [progress, progress]
