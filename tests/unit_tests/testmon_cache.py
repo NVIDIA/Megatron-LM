@@ -27,24 +27,8 @@ TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}
 )
 TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
-COMPATIBILITY_FILES = (
-    ".github/actions/action.yml",
-    ".github/workflows/_build_ci_container.yml",
-    "README.md",
-    "pyproject.toml",
-    "uv.lock",
-    "megatron/core/__init__.py",
-    "megatron/core/package_info.py",
-    "tests/unit_tests/run_ci_test.sh",
-    "tests/unit_tests/find_test_cases.py",
-    "tests/unit_tests/testmon_selector.py",
-    "tests/unit_tests/testmon_cache.py",
-    "tests/unit_tests/testmon_mandatory.py",
-    "tests/test_utils/python_scripts/launch_nemo_run_workload.py",
-    "tests/test_utils/python_scripts/recipe_parser.py",
-    "tests/test_utils/python_scripts/download_unit_tests_dataset.py",
-)
-COMPATIBILITY_GLOBS = ("docker/**/*", ".dockerignore", "tests/unit_tests/**/conftest.py")
+COMPATIBILITY_FILES: set[str] = {"tests/test_utils/python_scripts/download_unit_tests_dataset.py"}
+COMPATIBILITY_GLOBS: tuple[str, ...] = ()
 DATABASE_TABLES = {
     "metadata",
     "environment",
@@ -102,6 +86,32 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _bucket_conftests(root: Path, bucket: str) -> set[Path]:
+    """Select ancestor conftests and descendants of a bucket's collection directory."""
+    bucket_path = Path(bucket)
+    directory = root / bucket_path
+    recursive = directory.is_dir()
+    for index, part in enumerate(bucket_path.parts):
+        if any(character in part for character in "*?["):
+            # Conservatively include descendants below the glob's literal prefix,
+            # even when marker or ignore filters exclude tests during collection.
+            directory = root.joinpath(*bucket_path.parts[:index])
+            recursive = True
+            break
+    else:
+        if not recursive:
+            directory = directory.parent
+
+    return {
+        path
+        for path in (root / "tests/unit_tests").rglob("conftest.py")
+        if path.is_file()
+        and (
+            directory.is_relative_to(path.parent) or (recursive and path.is_relative_to(directory))
+        )
+    }
+
+
 def cache_identity(
     root: Path, bucket: str, recipe_platform: str, image_id: str = "unknown"
 ) -> dict:
@@ -111,10 +121,10 @@ def cache_identity(
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
-    paths.update(root / definition["recipe"] for definition in PLATFORMS.values())
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
     )
+    paths.update(_bucket_conftests(root, bucket))
     inputs = {str(path.relative_to(root)): _digest(path) for path in sorted(paths)}
     contract = {
         "schema": SCHEMA,

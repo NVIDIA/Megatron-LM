@@ -2,10 +2,12 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -93,9 +95,13 @@ def test_producer_consumes_the_actual_build_matrix(
             "IS_MAINTAINER": maintainer,
             "ENABLE_GB_TESTING": gb_enabled,
             "REGISTRY_AWS": "h100.example.test/team",
+            "REGISTRY_GCP_H100": "gcp.example.test/team",
             "REGISTRY_GB_GPU": "gb200.example.test/team",
             "SELECTED_RUNNER": "h100-runner",
+            "SELECTED_RUNNER_GCP_H100": "gcp-build-runner",
             "SELECTED_RUNNER_GB_GPU": "gb200-runner",
+            "USE_GCP_H100": "false",
+            "INCLUDE_GCP_H100": "false",
         },
     )
     assert build.returncode == 0, build.stderr
@@ -148,6 +154,58 @@ def test_producer_rejects_an_unsupported_built_platform(
     )
     assert result.returncode != 0
     assert "matrix" not in outputs
+
+
+def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
+    tmp_path: Path, shell_environment: dict[str, str]
+) -> None:
+    build_step = _step("_build_ci_container.yml", "cicd-compute-build-matrix", "compute")
+    build, build_outputs = _run(
+        build_step["run"],
+        tmp_path,
+        {
+            "IS_MAINTAINER": "true",
+            "ENABLE_GB_TESTING": "true",
+            "REGISTRY_AWS": "h100.example.test/team",
+            "REGISTRY_GCP_H100": "gcp.example.test/team",
+            "REGISTRY_GB_GPU": "gb200.example.test/team",
+            "SELECTED_RUNNER": "h100-runner",
+            "SELECTED_RUNNER_GCP_H100": "gcp-build-runner",
+            "SELECTED_RUNNER_GB_GPU": "gb200-runner",
+            "USE_GCP_H100": "false",
+            "INCLUDE_GCP_H100": "true",
+        },
+    )
+    assert build.returncode == 0, build.stderr
+    builds = json.loads(build_outputs["matrix"])["include"]
+    assert {entry["cloud"] for entry in builds} == {"aws-h100", "gcp-h100", "gb-gpu"}
+
+    source_sha = "1234567890abcdef" * 2 + "12345678"
+    producer_step = _step("populate-build-cache.yml", "parse-unit-tests", "matrix")
+    producer, outputs = _run(
+        producer_step["run"],
+        tmp_path,
+        {**shell_environment, "BUILDS": build_outputs["matrix"], "SOURCE_SHA": source_sha},
+    )
+    assert producer.returncode == 0, producer.stderr
+    matrix = json.loads(outputs["matrix"])
+    assert {entry["platform"] for entry in matrix} == {"dgx_h100", "dgx_gb200"}
+
+    for platform, bucket_file, cloud, registry, runner in (
+        ("dgx_h100", "h100", "aws-h100", "h100.example.test/team", "h100-runner"),
+        ("dgx_gb200", "gb200", "gb-gpu", "gb200.example.test/team", "gb200-runner"),
+    ):
+        recipe = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml").read_text()
+        )
+        expected_buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        entries = [entry for entry in matrix if entry["platform"] == platform]
+        assert [entry["bucket"] for entry in entries] == expected_buckets
+        assert all(
+            entry["runner"] == runner
+            and entry["image"] == f"{registry}/megatron-lm:{source_sha}-{cloud}"
+            for entry in entries
+        )
 
 
 @pytest.mark.parametrize(
@@ -398,18 +456,196 @@ def configure_environment(
         "REF": "refs/heads/pull-request/6934",
         "FORCE_RUN_ALL": "false",
         "TEST_PR_LABEL_LOOKUP_EXIT": "0",
+        "H100_TRAFFIC_MODE": "aws",
+        "PREFLIGHT_IS_MEMBER": "true",
+        "IS_MAINTAINER": "true",
+        "EPHEMERAL_RUNNER": "nvidia-ci-aws-gpu-x8-ephemeral",
+        "RUN_ATTEMPT": "1",
+        "REGISTRY_AWS": "h100.example.test/team",
+        "REGISTRY_GCP_H100": "gcp.example.test/team",
     }
 
 
 def _run_configure(
-    tmp_path: Path, environment: dict[str, str], labels: list[str]
+    tmp_path: Path, environment: dict[str, str], labels: list[str], random_seed: int | None = None
 ) -> tuple[subprocess.CompletedProcess, dict]:
     script = _step("cicd-main.yml", "configure", "configure")["run"]
     script = script.replace(
         "${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}", "6934"
     )
     script = script.replace("${{ github.repository }}", "NVIDIA/Megatron-LM")
-    return _run(script, tmp_path, {**environment, "TEST_PR_LABELS": json.dumps(labels)})
+    effective_environment = {
+        **environment,
+        "IS_PR": str(
+            environment["EVENT_NAME"] == "push"
+            and environment["REF"].startswith("refs/heads/pull-request/")
+        ).lower(),
+    }
+    if random_seed is not None:
+        # Seed Bash's RANDOM before the actual workflow script for repeatable
+        # coverage of each 50-50 routing outcome.
+        script = f"RANDOM={random_seed}\n{script}"
+    return _run(script, tmp_path, {**effective_environment, "TEST_PR_LABELS": json.dumps(labels)})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "random_seed", "cloud", "build_runner", "gpu_runner", "registry", "use_gcp"),
+    [
+        pytest.param(
+            {},
+            None,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="member-pr-aws",
+        ),
+        pytest.param(
+            {"H100_TRAFFIC_MODE": "gcp"},
+            None,
+            "gcp-h100",
+            "nvidia-ci-gcp-cpu-h100",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-gcp-h100-x8"},
+            "gcp.example.test/team",
+            "true",
+            id="member-pr-gcp",
+        ),
+        pytest.param(
+            {"H100_TRAFFIC_MODE": "50-50"},
+            3,
+            "gcp-h100",
+            "nvidia-ci-gcp-cpu-h100",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-gcp-h100-x8"},
+            "gcp.example.test/team",
+            "true",
+            id="member-pr-50-50-gcp",
+        ),
+        pytest.param(
+            {"H100_TRAFFIC_MODE": "50-50"},
+            2,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="member-pr-50-50-aws",
+        ),
+        pytest.param(
+            {
+                "PREFLIGHT_IS_MEMBER": "false",
+                "IS_MAINTAINER": "false",
+                "H100_TRAFFIC_MODE": "gcp",
+                "EPHEMERAL_RUNNER": "ephe-v2-example",
+                "RUN_ATTEMPT": "2",
+            },
+            None,
+            "aws-h100",
+            "ephe-v2-example-a2",
+            "ephe-v2-example-a2",
+            "h100.example.test/team",
+            "false",
+            id="external-pr-ephemeral-aws",
+        ),
+        pytest.param(
+            {
+                "EVENT_NAME": "merge_group",
+                "REF": "refs/heads/gh-readonly-queue/main/pr-6934-abc",
+                "H100_TRAFFIC_MODE": "gcp",
+            },
+            None,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="merge-queue-stays-aws",
+        ),
+        pytest.param(
+            {
+                "EVENT_NAME": "workflow_dispatch",
+                "REF": "refs/heads/main",
+                "H100_TRAFFIC_MODE": "gcp",
+            },
+            None,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="dispatch-stays-aws",
+        ),
+    ],
+)
+def test_h100_runner_traffic_routing(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    overrides: dict[str, str],
+    random_seed: int | None,
+    cloud: str,
+    build_runner: str,
+    gpu_runner: dict[str, str] | str,
+    registry: str,
+    use_gcp: str,
+) -> None:
+    result, outputs = _run_configure(
+        tmp_path, {**configure_environment, **overrides}, [], random_seed=random_seed
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs["h100_cloud"] == cloud
+    assert outputs["h100_build_runner"] == build_runner
+    assert json.loads(outputs["h100_gpu_runs_on"]) == gpu_runner
+    assert outputs["h100_registry"] == registry
+    assert outputs["h100_use_gcp"] == use_gcp
+
+
+def test_nemo_cicd_validator_declares_every_needs_reference_directly() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
+    job = workflow["jobs"]["Nemo_CICD_Test"]
+    direct_dependencies = set(job["needs"])
+    referenced_dependencies = set(re.findall(r"needs\.([A-Za-z0-9_-]+)", yaml.safe_dump(job)))
+    assert "configure" in direct_dependencies
+    assert (
+        job["steps"][-1]["env"]["RUN_H100_FUNCTIONAL"]
+        == "${{ needs.configure.outputs.run_h100_functional }}"
+    )
+    assert referenced_dependencies <= direct_dependencies
+
+
+@pytest.mark.parametrize(
+    ("run_h100_functional", "h100_result", "expected_success"),
+    [("true", "skipped", False), ("false", "skipped", True), ("true", "success", True)],
+)
+def test_nemo_cicd_validator_checks_h100_functional_result(
+    tmp_path: Path, run_h100_functional: str, h100_result: str, expected_success: bool
+) -> None:
+    gh = tmp_path / "bin/gh"
+    gh.parent.mkdir(parents=True)
+    gh.write_text("#!/bin/sh\nprintf '0\\n'\n")
+    gh.chmod(0o755)
+    step = _step("cicd-main.yml", "Nemo_CICD_Test", "result")
+    result, _ = _run(
+        step["run"],
+        tmp_path,
+        {
+            "PATH": f"{gh.parent}{os.pathsep}{os.environ['PATH']}",
+            "GH_TOKEN": "test-token",
+            "GITHUB_RUN_ID": "1",
+            "DOCS_ONLY": "false",
+            "IS_DEPLOYMENT": "false",
+            "IS_MAINTAINER": "true",
+            "IS_CI_WORKLOAD": "false",
+            "FORCE_RUN_ALL": "false",
+            "RUN_H100_FUNCTIONAL": run_h100_functional,
+            "GB200_SHOULD_RUN": "false",
+            "ENABLE_GB200_TESTING": "false",
+            "UNIT_RESULT": "success",
+            "UNIT_GB200_RESULT": "skipped",
+            "H100_RESULT": h100_result,
+            "GB200_RESULT": "skipped",
+        },
+    )
+    assert (result.returncode == 0) == expected_success, result.stdout + result.stderr
 
 
 def test_selective_default_uses_the_repository_variable() -> None:
@@ -522,3 +758,125 @@ def test_full_test_guards_override_selective_requests(
     summary = (tmp_path / "summary").read_text()
     assert f"| `unit_testmon_requested` | `{str(requested).lower()}` |" in summary
     assert "| `unit_testmon_eligible` | `false` |" in summary
+
+
+@pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
+def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, has_tests):
+    # Hosted runners provide zstd, but the existing GPU baselines use gzip.
+    zstd = tmp_path / "zstd"
+    zstd.write_text("#!/bin/sh\nprintf '1.5.7\\n'\n")
+    zstd.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+    result, compression = _run(
+        _step("_unit-tests.yml", "select", "cache-compression")["run"],
+        tmp_path,
+        {**environment, "RUNNER_TEMP": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    restore = _step("_unit-tests.yml", "select", "baseline")
+    assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    assert all(
+        "PATH" not in step.get("env", {})
+        for step in workflow["jobs"]["select"]["steps"]
+        if step.get("id") != "baseline"
+    )
+    probe = subprocess.run(
+        ["zstd", "--quiet", "--version"],
+        env={**environment, "PATH": compression["path"]},
+        text=True,
+        capture_output=True,
+    )
+    # The pinned cache action uses gzip when the version probe emits no output.
+    assert probe.stdout == probe.stderr == ""
+    assert probe.returncode != 0
+    assert (
+        subprocess.check_output(["zstd", "--quiet", "--version"], env=environment, text=True)
+        == "1.5.7\n"
+    )
+
+    bucket = "tests/unit_tests/test_example.py"
+    result, outputs = _run(
+        _step("_unit-tests.yml", "select", "result")["run"],
+        tmp_path,
+        {
+            "PLAN_MODE": "selected",
+            "HAS_TESTS": str(has_tests).lower(),
+            "PLAN_OUTCOME": "success",
+            "UPLOAD_OUTCOME": "success",
+            "PLAN_ARTIFACT": "plan",
+            "BUCKET": bucket,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs == {
+        "mode": "selected",
+        "has_tests": str(has_tests).lower(),
+        "plan_artifact": "plan",
+    }
+    assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
+    assert workflow["jobs"]["run"]["needs"] == "select"
+    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
+    needs = SimpleNamespace(
+        select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
+    )
+    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    context = {"needs": needs, "inputs": inputs}
+    assert eval(expression, {"__builtins__": {}}, context) == has_tests
+    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
+    mode = mode.removeprefix("${{").removesuffix("}}").replace("&&", "and").replace("||", "or")
+    assert eval(mode, {"__builtins__": {}}, context) == "preselected"
+
+    # Setup failures must fail on CPU rather than move selection onto the GPU.
+    needs.select.result = "failure"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    needs.select.result = "success"
+
+    # When CPU selection requires the full bucket, GPU execution receives full.
+    result, full = _run(
+        _step("_unit-tests.yml", "select", "result")["run"],
+        tmp_path,
+        {
+            "PLAN_MODE": "full",
+            "HAS_TESTS": "true",
+            "PLAN_OUTCOME": "success",
+            "UPLOAD_OUTCOME": "skipped",
+            "PLAN_ARTIFACT": "plan",
+            "BUCKET": bucket,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert full == {"mode": "full", "has_tests": "true", "plan_artifact": ""}
+    needs.select.outputs = SimpleNamespace(**full)
+    assert eval(expression, {"__builtins__": {}}, context)
+    assert eval(mode, {"__builtins__": {}}, context) == "full"
+
+    for platform in ("dgx_h100", "dgx_gb200"):
+        directory = tmp_path / f"unit-test-plan-{platform}"
+        directory.mkdir()
+        (directory / "plan.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "source_sha": "a" * 40,
+                    "bucket": bucket,
+                    "platform": platform,
+                    "mode": "selected",
+                    "phases": {"prod": [bucket] if has_tests else [], "experimental": []},
+                }
+            )
+        )
+    result, outputs = _run(
+        _step("cicd-main.yml", "Coverage", "coverage")["run"],
+        tmp_path,
+        {
+            "SELECTIVE": "true",
+            "H100_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "GB200_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "SOURCE_SHA": "a" * 40,
+        },
+    )
+    # Missing coverage is valid only when every bucket selected no tests.
+    assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
+    assert outputs == ({} if has_tests else {"has_coverage": "false"})

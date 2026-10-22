@@ -339,16 +339,22 @@ def _init_sorted_ids_kernel(
     expert_ids_ptr,
     max_sorted,
     max_blocks,
+    pre_initialized_output_buffer_ptr,
+    num_local_experts,
     SENTINEL: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Initialize sorted_token_ids to SENTINEL and expert_ids to -1."""
+    """Initialize sorted_token_ids to SENTINEL and expert_ids to -1.
+
+    Also zero the local-expert counters.
+    """
     pid = tl.program_id(0)
     block_start = pid * BLOCK
     if block_start < max_sorted or block_start < max_blocks:
         offs = block_start + tl.arange(0, BLOCK)
         tl.store(sorted_token_ids_ptr + offs, SENTINEL, mask=offs < max_sorted)
         tl.store(expert_ids_ptr + offs, -1, mask=offs < max_blocks)
+        tl.store(pre_initialized_output_buffer_ptr + offs, 0, mask=offs < num_local_experts)
 
 
 @triton.jit
@@ -443,14 +449,29 @@ def _moe_align_block_size_cuda_graphable(
     )
     expert_ids = VllmFusedMoeBuffers.get("expert_ids", (max_blocks,), torch.int32, device)
 
+    pre_initialized_output_buffer = torch.empty(num_local_experts, dtype=torch.int32, device=device)
     INIT_BLOCK = 1024
+    # max_sorted exceeds num_local_experts, so this grid also covers the counters.
     init_grid = _ceil_div(max(max_sorted, max_blocks), INIT_BLOCK)
     _init_sorted_ids_kernel[(init_grid,)](
-        sorted_token_ids, expert_ids, max_sorted, max_blocks, SENTINEL=sentinel, BLOCK=INIT_BLOCK
+        sorted_token_ids,
+        expert_ids,
+        max_sorted,
+        max_blocks,
+        pre_initialized_output_buffer,
+        num_local_experts,
+        SENTINEL=sentinel,
+        BLOCK=INIT_BLOCK,
     )
 
+    # A separate, stream-ordered launch is necessary before atomic counting.
     tokens_per_expert = compute_local_tokens_per_expert(
-        routing_map, local_expert_start, num_local_experts, valid_tokens, persistent=True
+        routing_map,
+        local_expert_start,
+        num_local_experts,
+        valid_tokens,
+        persistent=True,
+        pre_initialized_output_buffer=pre_initialized_output_buffer,
     )
     exclusive_offsets, inclusive_offsets = compute_expert_offsets(
         tokens_per_expert, alignment=block_size
