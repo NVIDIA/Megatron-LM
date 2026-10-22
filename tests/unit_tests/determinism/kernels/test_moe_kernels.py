@@ -25,6 +25,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.utils import get_comm_stream, set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import moe_utils
@@ -767,6 +768,33 @@ class _InQuantizationContext(torch.nn.Module):
             return self.module(*args)
 
 
+class _RunDelayedWgrad(torch.autograd.Function):
+    """Identity whose backward runs ``layer.backward_dw()`` once the layer's dgrads are queued."""
+
+    @staticmethod
+    def forward(ctx, hidden, layer):
+        ctx.layer = layer
+        return hidden.view_as(hidden)
+
+    @staticmethod
+    def backward(ctx, grad):
+        # The EP-overlap schedule runs the latent projection's fwd/dgrad on the comm stream.
+        get_comm_stream().wait_stream(torch.cuda.current_stream())
+        ctx.layer.backward_dw()
+        return grad, None
+
+
+class _DelayedWgradMoELayer(torch.nn.Module):
+    """MoELayer whose delayed wgrads run inside backward, so the harness reads them after."""
+
+    def __init__(self, layer):
+        super().__init__()
+        self.layer = layer
+
+    def forward(self, hidden):
+        return self.layer(_RunDelayedWgrad.apply(hidden, self.layer))
+
+
 class TestMoEModules:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -1189,3 +1217,37 @@ class TestMoEModules:
                 )
             finally:
                 torch.utils.deterministic.fill_uninitialized_memory = prev_fill
+
+    @pytest.mark.skipif(not HAVE_TE, reason="delayed wgrad needs Transformer Engine")
+    def test_latent_moe_layer_delayed_wgrad_replays(self):
+        """Delayed wgrads under EP overlap, incl. fc2_latent_proj's comm-stream one, replay."""
+        ep = 2
+        if Utils.world_size % ep != 0:
+            pytest.skip(f"needs a world size divisible by EP={ep}")
+        self._init(ep=ep)
+        set_streams()
+        seeded()
+        config = _moe_config(
+            moe_token_dispatcher_type="alltoall",
+            expert_model_parallel_size=ep,
+            moe_latent_size=256,
+            overlap_moe_expert_parallel_comm=True,
+            delay_wgrad_compute=True,
+        )
+        mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=8, moe_grouped_gemm=True
+        ).submodules.mlp
+        layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+        layer.set_layer_number(0)
+        module = _DelayedWgradMoELayer(layer)
+        hidden = torch.randn(2048, 2, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        with deterministic_algorithms(True):
+            _, grads = assert_module_replays_bit_exact(
+                module,
+                (hidden,),
+                replays=3,
+                contention=True,
+                what="MoELayer[latent, delayed wgrad, ep=2]",
+            )
+        fc2_grad = grads["chunk0.layer.fc2_latent_proj.weight"]
+        assert torch.isfinite(fc2_grad).all() and fc2_grad.abs().sum() > 0
