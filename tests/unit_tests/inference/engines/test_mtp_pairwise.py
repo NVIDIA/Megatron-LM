@@ -23,12 +23,15 @@ from typing import Optional
 
 import pytest
 import torch
+from transformer_engine.pytorch import RMSNorm as TERMSNorm
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import AsyncScheduleMode, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.mtp_metadata import MTPForwardMode
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.tensor_parallel import InferenceColumnParallelLinear
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -267,6 +270,34 @@ def _install_mtp_witnesses(env, case: _Case, runtime: Counter) -> _MTPWitness:
 
                 module.register_forward_pre_hook(observed_mtp_fp8)
                 runtime["mtp-fp8-modules-installed"] += 1
+
+            if "nccl-dispatch" in case.signals and class_name == "MoELayer":
+                dispatcher = getattr(module, "_inference_token_dispatcher", None)
+                if (
+                    dispatcher is not None
+                    and type(dispatcher).__name__ == "NCCLAllGatherDispatcher"
+                ):
+                    real_dispatch = dispatcher.token_dispatch
+                    real_combine = dispatcher.token_combine
+
+                    def observed_mtp_dispatch(*args, _real=real_dispatch, **kwargs):
+                        result = _real(*args, **kwargs)
+                        runtime["mtp-nccl-token-dispatches"] += 1
+                        runtime["mtp-nccl-dispatch-inflight"] += 1
+                        return result
+
+                    def observed_mtp_combine(*args, _real=real_combine, **kwargs):
+                        runtime["mtp-nccl-combine-before-dispatch"] += int(
+                            runtime["mtp-nccl-dispatch-inflight"] <= 0
+                        )
+                        result = _real(*args, **kwargs)
+                        runtime["mtp-nccl-token-combines"] += 1
+                        runtime["mtp-nccl-dispatch-inflight"] -= 1
+                        return result
+
+                    dispatcher.token_dispatch = observed_mtp_dispatch
+                    dispatcher.token_combine = observed_mtp_combine
+                    runtime["mtp-nccl-dispatchers-installed"] += 1
 
             tp_size = int(case.config.get("tensor_model_parallel_size", 1))
             if tp_size > 1 and class_name == "ColumnParallelLinear":
@@ -761,6 +792,12 @@ def _run_mtp_pair(case: _Case) -> tuple[_Session, _Session]:
         assert hasattr(mtp_model, "mtp")
         assert mtp_model.mtp.mtp_use_repeated_layer is case.repeated
         assert len(mtp_model.mtp.layers) == (1 if case.repeated else case.depth)
+        if case.config.get("transformer_impl") == "inference_optimized":
+            for layer in mtp_model.mtp.layers:
+                assert isinstance(layer.eh_proj, InferenceColumnParallelLinear), type(layer.eh_proj)
+                for norm_name in ("enorm", "hnorm", "final_layernorm"):
+                    norm = getattr(layer, norm_name)
+                    assert isinstance(norm, TERMSNorm), (norm_name, type(norm))
     else:
         assert not hasattr(mtp_model, "mtp")
 
@@ -785,6 +822,7 @@ def _run_mtp_pair(case: _Case) -> tuple[_Session, _Session]:
 def _cleanup() -> None:
     gc.collect()
     delete_cuda_graphs()
+    VllmFusedMoeBuffers._delete_buffers()
     torch.cuda.empty_cache()
 
 
@@ -1114,6 +1152,18 @@ _PARALLEL_CASES = (
         signals=("gpt",),
     ),
     _Case(
+        name="ep2-moe-optimized",
+        depth=2,
+        pattern="accept",
+        config={
+            "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+        },
+        signals=("inference-optimized", "moe", "nccl-dispatch"),
+    ),
+    _Case(
         name="tp2-pp2-sp-dp2",
         depth=2,
         pattern="accept",
@@ -1165,6 +1215,17 @@ class TestMTPPairwiseParallel(_DynamicEngineTestBase):
             if case.name == "pp2":
                 assert runtime["pipeline-logits-broadcasts"] > 0
                 assert runtime["mtp-pipeline-logits-broadcasts"] > 0
+            elif case.name == "ep2-moe-optimized":
+                assert runtime["module-forward:inference-optimized"] > 0
+                assert runtime["module-forward:moe"] > 0
+                assert runtime["nccl-dispatchers-installed"] > 0
+                assert runtime["nccl-token-dispatches"] > 0
+                assert runtime["nccl-token-dispatches"] == runtime["nccl-token-combines"]
+                assert runtime["nccl-combine-before-dispatch"] == 0
+                assert runtime["mtp-nccl-dispatchers-installed"] > 0
+                assert runtime["mtp-nccl-token-dispatches"] > 0
+                assert runtime["mtp-nccl-token-dispatches"] == runtime["mtp-nccl-token-combines"]
+                assert runtime["mtp-nccl-combine-before-dispatch"] == 0
             else:
                 assert parallel_state.get_data_parallel_world_size() == 2
                 outputs = [request.generated_tokens for request in treatment.requests]

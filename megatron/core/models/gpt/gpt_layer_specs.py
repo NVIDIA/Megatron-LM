@@ -719,10 +719,8 @@ def get_gpt_mtp_block_spec(
     pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    # MTP has only ever used the Transformer Engine or the local backend, never the
-    # inference one, so it does not go through _base_backend_name().
     backend: BackendSpecProvider = get_backend_from_config(
-        config, transformer_impl="transformer_engine" if use_transformer_engine else "local"
+        config, transformer_impl=_base_backend_name(config, use_transformer_engine)
     )
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
