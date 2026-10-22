@@ -32,6 +32,8 @@ from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.config import PretrainConfigContainer
+from megatron.training.global_vars import get_run_config
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
@@ -530,9 +532,11 @@ def modelopt_gpt_hybrid_builder(
         # NOTE: Unknown memory leak occuring per fwd-bwd pass if model
         # is converted to a `modelopt.torch.opt.DynamicModule`.
         # Argument `--manual-gc` can result in an eventual OOM.
-        assert (
-            not args.manual_gc
-        ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
+        cfg = get_run_config()
+        if isinstance(cfg, PretrainConfigContainer):
+            assert (
+                not cfg.train.manual_gc
+            ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."

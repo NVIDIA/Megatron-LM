@@ -68,9 +68,10 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    grad_divisor: int = 1,
+    grad_scale: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
+    grad_accumulation_count: int | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -83,8 +84,7 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        grad_divisor: Additional divisor applied to the reduced gradient, on top of the
-            averaging the mesh already performs. Defaults to 1, which is correct whenever
+        grad_scale: Multiplier applied after mesh averaging. Defaults to 1, which is correct when
             each mesh rank contributes exactly one term to the gradient.
 
             Expert parallelism is the motivating case. A rank's experts process tokens
@@ -92,13 +92,21 @@ def fully_shard(
             pass routes those tokens' gradients back, so a rank's expert gradient already
             sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
             the expert-data-parallel mesh alone therefore divides by too little, and
-            ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
-            their own rank's tokens and need no divisor.
+            ``grad_scale=1 / ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no additional scaling.
+
+            For per-token loss, ``grad_scale=mesh.size()`` cancels mesh averaging
+            so gradients are summed. Normalize once by the global token count after
+            accumulating all microbatches and before clipping or updating weights.
         schedule_policy: Communication scheduling policy for this FSDP module.
         register_hooks: Whether to register the automatic forward and backward execution
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
+        grad_accumulation_count: Total parameter-gradient callbacks per reduction
+            window, including contributions from separate GraphTasks and delayed
+            weight gradients. Defaults to one per owned trainable parameter.
+            The scheduler must declare the complete count before sharding the unit.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -126,10 +134,11 @@ def fully_shard(
             main_grad_placements=tuple(placements.gradient),
             main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
-            grad_divisor=grad_divisor,
+            grad_scale=grad_scale,
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
+            grad_accumulation_count=grad_accumulation_count,
         )
     except Exception:
         module.__class__ = original_cls
@@ -168,13 +177,13 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
     """Mark an FSDP microbatch as the last accumulation microbatch.
 
-    At present, this is only needed for HSDP/HFSDP gradient accumulation, so
-    FSDP finalizes gradients only on the last backward. Plain all-``Shard(0)`` data
-    parallelism finalizes gradients on every backward and does not need it.
+    Non-final microbatches still release unsharded weights, but defer automatic
+    gradient synchronization. HSDP/HFSDP also defer DP-outer gradient reduction
+    until the last microbatch. Wrap both forward and backward in this scope.
 
     Args:
         context: FSDP context whose roots should use this microbatch state.
-        is_last: Whether forwards in this scope are for the last microbatch.
+        is_last: Whether this scope contains the last accumulation microbatch.
     """
     context.ensure_finalized()
     previous_state = context.is_last_microbatch

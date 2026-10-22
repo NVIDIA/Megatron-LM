@@ -9,7 +9,7 @@ spec:
   nodes: 1
   gpus: 8
   n_repeat: 5
-  platforms: dgx_a100
+  platforms: dgx_h100
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -45,8 +45,6 @@ spec:
     ls
     cd /opt/megatron-lm
 
-    NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
-
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/workspace/data/cache"
@@ -72,47 +70,37 @@ products:
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_h100]
   # - test_case: [gpt3_mcore_tp2_pp2_resume_torch_dist_te_2experts]
   #   products: # non-determinism: #478
   #     - environment: [dev, lts]
@@ -164,13 +152,9 @@ products:
       - environment: [dev]
         scope: [mr, mr-github, L0-smoke]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts_etp1_ep4]
-    products:
       # - environment: [dev]
       #   scope: [mr]
       #   platforms: [dgx_h100] # hang: #513
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4]
     products:
       - environment: [dev]
@@ -186,10 +170,6 @@ products:
       - environment: [dev]
         scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
-      - environment: [lts]
-        # A100 exact numerical trajectories differ across allocations: #7801.
-        scope: [nightly-broken]
-        cadence: [nightly]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]

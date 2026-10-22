@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Export a GPTModel."""
-
 import functools
 import inspect
 import os
@@ -18,10 +17,10 @@ from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 from model_provider import model_provider
 
@@ -71,8 +70,7 @@ if __name__ == "__main__":
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, training=True)
-    initialize_megatron(training=True)
+    initialize_megatron(training=False)
 
     args = get_args()
 
@@ -102,6 +100,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Invalid load checkpoint directory: {args.load}")
 
+
     # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
     # Only the last pp stage may have extra_modules, hence broadcast from the last rank.
     export_extra_modules = hasattr(unwrapped_model, "eagle_module") or hasattr(
@@ -117,9 +116,7 @@ if __name__ == "__main__":
         "export_dir": args.export_dir,
         "moe_router_dtype": unwrapped_model.config.moe_router_dtype,
     }
-    export_fn = (
-        mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
-    )
+    export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
 
     if "trust_remote_code" in inspect.signature(export_fn).parameters:
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})

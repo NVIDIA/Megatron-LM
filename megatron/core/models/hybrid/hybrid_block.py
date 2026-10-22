@@ -51,6 +51,10 @@ from megatron.core.transformer.residual_recompute import (
     build_residual_stream_recompute_plan,
     residual_stream_recompute_enabled,
 )
+from megatron.core.transformer.residual_recompute_plan import (
+    build_recompute_block_end_plan,
+    finalize_recompute_block,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -201,7 +205,7 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        self._mhc_block_end_plan: Optional[List[bool]] = None
+        self._mhc_block_end_plan: Optional[Tuple[bool, ...]] = None
 
         self.layer_config_list = layer_config_list
         self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
@@ -531,20 +535,9 @@ class HybridStack(MegatronModule):
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
-    def _compute_mhc_block_end_plan(self) -> List[bool]:
+    def _compute_mhc_block_end_plan(self) -> Tuple[bool, ...]:
         """Compute deterministic per-layer mHC recompute block boundaries."""
-        num_layers = len(self.layers)
-        block_ends: List[bool] = [False] * num_layers
-        if num_layers == 0:
-            return block_ends
-
-        layers_per_block = self.config.mhc_recompute_layer_num
-        for layer_idx in range(num_layers):
-            is_last_in_stack = layer_idx == num_layers - 1
-            block_ends[layer_idx] = is_last_in_stack or (
-                layers_per_block is not None and (layer_idx + 1) % layers_per_block == 0
-            )
-        return block_ends
+        return build_recompute_block_end_plan(len(self.layers), self.config.mhc_recompute_layer_num)
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
@@ -571,8 +564,7 @@ class HybridStack(MegatronModule):
         manager: Optional[MHCCheckpointManager], hidden_states: Tensor, is_block_end: bool
     ) -> None:
         """Finalize the current mHC recompute block when its last layer finishes."""
-        if manager is not None and is_block_end:
-            manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        finalize_recompute_block(manager, hidden_states, is_block_end)
 
     def forward(
         self,

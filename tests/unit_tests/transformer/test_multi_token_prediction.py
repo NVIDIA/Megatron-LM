@@ -110,6 +110,64 @@ def _randint_stub(expected_size, make_result):
     return fake_randint
 
 
+@pytest.mark.parametrize("precision", ["bf16", "fp4"])
+def test_checkpointed_forward_uses_layer_tp_group_not_global(precision, monkeypatch):
+    """MTP full recompute must use the layer's TP group, never the global MPU one: a model
+    built from an explicit ProcessGroupCollection may never initialize global MPU."""
+    import megatron.core.transformer.utils as transformer_utils
+
+    def _uninitialized_global_tp_group(*args, **kwargs):
+        raise AssertionError("tensor model parallel group is not initialized")
+
+    monkeypatch.setattr(
+        mtp_module.parallel_state, "get_tensor_model_parallel_group", _uninitialized_global_tp_group
+    )
+    calls = []
+
+    def fake_tensor_parallel_checkpoint(function, distribute_saved_activations, *args):
+        calls.append(("tensor_parallel", None))
+        return function(*args)
+
+    def fake_te_checkpoint(
+        function, distribute_saved_activations, get_rng_tracker, tp_group, *args, **kwargs
+    ):
+        calls.append(("te", tp_group))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        transformer_utils.tensor_parallel, "checkpoint", fake_tensor_parallel_checkpoint
+    )
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.te_checkpoint", fake_te_checkpoint
+    )
+
+    # Bypass __init__ so no process groups are built; set only what the recompute path reads.
+    layer = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+    tp_group = object()
+    config = types.SimpleNamespace(
+        fp8=None,
+        fp4="nvfp4" if precision == "fp4" else None,
+        fp8_recipe=None,
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=False,
+    )
+    object.__setattr__(layer, "config", config)
+    object.__setattr__(layer, "tp_group", tp_group)
+    object.__setattr__(layer, "mtp_layer_pattern", None)
+    object.__setattr__(
+        layer,
+        "_proj_and_transformer_layer",
+        lambda **kwargs: kwargs["hidden_states"] + kwargs["decoder_input"],
+    )
+
+    output = layer._checkpointed_forward(torch.ones(2, 1, 4), torch.full((2, 1, 4), 2.0))
+
+    assert torch.equal(output, torch.full((2, 1, 4), 3.0))
+    expected = ("te", tp_group) if precision == "fp4" else ("tensor_parallel", None)
+    assert calls == [expected]
+
+
 class TestMultiTokenPredictionLayer:
     def setup_method(self, method):
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
@@ -2028,8 +2086,8 @@ class TestMTPHiddenStateRollUnderParallelism:
 
         Also pins which packed-parameter shapes are recognised. One tensor used as both
         ``cu_seqlens_q`` and ``cu_seqlens_q_padded`` is what the training scripts build
-        when ``CP > 1`` and must be translated; genuinely different padded boundaries
-        are not handled and must leave the caller alone rather than be mistranslated.
+        when ``CP > 1`` and must be translated. Genuinely different padded boundaries
+        must also be translated, retaining repeated boundaries at local seams.
         """
         tp, cp = 2, 2
         if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
@@ -2107,8 +2165,8 @@ class TestMTPHiddenStateRollUnderParallelism:
         )
         assert really_padded is not None
         expected_padded = {
-            (0, 0): [0, 4, 8, 8, 8],
-            (0, 1): [0, 0, 0, 4, 8],
+            (0, 0): [0, 4, 4, 4, 8, 8, 8, 8, 8],
+            (0, 1): [0, 0, 0, 0, 0, 4, 4, 4, 8],
             (1, 0): [0, 6, 8, 8, 8],
             (1, 1): [0, 0, 0, 6, 8],
         }[(get_pg_rank(cp_group), get_pg_rank(tp_group))]
@@ -2514,7 +2572,9 @@ class TestMultiTokenPrediction:
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize()
+        set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
@@ -3456,6 +3516,135 @@ class TestMultiTokenPrediction:
         for sharded, gathered in zip(results[False], results[True]):
             torch.testing.assert_close(gathered, sharded)
 
+    def test_process_mtp_loss_counts_with_argmax_from_loss(self, monkeypatch):
+        """When the loss returns the argmax of the logits, the acceptance counts use it."""
+        captured = {}
+        calls = []
+
+        def capture_metrics(loss, correct, total, *args, **kwargs):
+            captured["correct"], captured["total"] = correct, total
+
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=3,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        # The MTP logits are all zero, so their own argmax would be token 0 everywhere.
+        hidden_states = torch.zeros(2 * seq_len, 1, 3)
+        labels = torch.tensor([[0, 1, 2, 0]])
+        # Labels after the MTP roll are [1, 2, 0, 0], the last one masked.
+        preds_from_loss = torch.tensor([[1], [2], [0], [1]])
+
+        def compute_language_model_loss(labels, logits, return_argmax=False):
+            calls.append(return_argmax)
+            loss = torch.ones_like(labels, dtype=logits.dtype)
+            return (loss, preds_from_loss) if return_argmax else loss
+
+        for is_training in (True, False):
+            process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=torch.ones(1, seq_len),
+                output_layer=lambda hidden, **kwargs: (hidden, None),
+                output_weight=None,
+                is_training=is_training,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                metric_avg_group=object(),
+            )
+
+        assert calls == [True, False]
+        assert captured["correct"].item() == 3
+        assert captured["total"].item() == 3
+
+    @pytest.mark.skipif(not HAVE_TE, reason="needs Transformer Engine")
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_process_mtp_loss_te_argmax_matches_acceptance_argmax(self, tp, monkeypatch):
+        """Acceptance counts from the argmax of TE's cross entropy equal those from the logits,
+        and the loss and gradients do not change."""
+        from megatron.core.extensions import transformer_engine as te_extensions
+
+        if not getattr(te_extensions, "_TE_FUSED_PARALLEL_CE_RETURN_ARGMAX", False):
+            pytest.skip("TE's parallel_cross_entropy cannot return the argmax")
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        tp_group = get_tensor_model_parallel_group()
+        config = TransformerConfig(
+            hidden_size=64,
+            num_layers=2,
+            num_attention_heads=4,
+            mtp_num_layers=2,
+            use_cpu_initialization=True,
+        )
+        # A small vocabulary, so that some predictions are right.
+        seq_len, vocab_size = 64, 16
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len, self.micro_batch_size, config.hidden_size
+        ).cuda()
+        labels = torch.randint(0, vocab_size, (self.micro_batch_size, seq_len)).cuda()
+        argmax_requests = []
+
+        def loss_with_argmax(labels, logits, return_argmax=False):
+            out = te_extensions.te_cross_entropy(
+                logits, labels.transpose(0, 1).contiguous(), tp_group, return_argmax=return_argmax
+            )
+            loss, argmax = out if return_argmax else (out, None)
+            loss = loss.transpose(0, 1).contiguous()
+            if not return_argmax:
+                return loss
+            argmax_requests.append(argmax is not None)
+            return loss, argmax
+
+        def loss_without_argmax(labels, logits):
+            return loss_with_argmax(labels, logits)
+
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        results = []
+        for compute_language_model_loss in (loss_without_argmax, loss_with_argmax):
+            torch.manual_seed(_SEED)  # Same weights for both runs.
+            output_layer = ColumnParallelLinear(
+                config.hidden_size,
+                vocab_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=False,
+                tp_group=tp_group,
+            ).cuda()
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            hidden = hidden_states.clone().requires_grad_(True)
+            process_mtp_loss(
+                hidden_states=hidden,
+                labels=labels,
+                loss_mask=None,
+                output_layer=output_layer,
+                output_weight=None,
+                is_training=True,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                tp_group=tp_group,
+            ).sum().backward()
+            tracker = MTPLossLoggingHelper.tracker
+            metrics = torch.cat(
+                [tracker[key] for key in ("loss_values", "correct_values", "total_values")]
+            )
+            results.append((metrics, output_layer.weight.grad, hidden.grad))
+
+        assert argmax_requests == [True] * config.mtp_num_layers
+        correct_values = results[0][0][config.mtp_num_layers : 2 * config.mtp_num_layers]
+        assert correct_values.sum() > 0
+        for without_argmax, with_argmax in zip(*results):
+            torch.testing.assert_close(with_argmax, without_argmax, rtol=0, atol=0)
+
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
         """Test roll_tensor function with packed sequences, with and without CP.
@@ -3856,11 +4045,145 @@ class TestMultiTokenPrediction:
             cu_seqlens_q_padded=cu_seqlens_padded,
             cu_seqlens_kv_padded=cu_seqlens_padded,
             qkv_format="thd",
+            pad_between_seqs=True,
         )
 
         rolled, _ = roll_tensor(tensor, shifts=-1, dims=-1, packed_seq_params=packed_seq_params)
 
         torch.testing.assert_close(rolled, expected)
+
+    def test_roll_tensor_rolls_trailing_slots_after_final_packed_sequence(self):
+        tensor = torch.arange(10)
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+            pad_between_seqs=True,
+            total_tokens=tensor.numel(),
+        )
+
+        rolled, _ = roll_tensor(tensor, packed_seq_params=packed_seq_params)
+
+        torch.testing.assert_close(rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0]))
+
+    @pytest.mark.parametrize("dims", [-1, 0])
+    def test_roll_tensor_local_packed_gradients_with_trailing_slots(self, dims):
+        tensor = torch.arange(20, dtype=torch.float32).reshape(2, 10).movedim(-1, dims)
+        tensor.requires_grad_()
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+        )
+        weights = torch.arange(1, 21, dtype=torch.float32).reshape_as(tensor)
+
+        rolled, rolled_sum = roll_tensor(
+            tensor, dims=dims, packed_seq_params=packed, return_sum=False
+        )
+        assert rolled_sum is None
+        (rolled * weights).sum().backward()
+
+        expected_grad = torch.zeros_like(tensor)
+        expected_grad.select(dims, 1).copy_(weights.select(dims, 0))
+        expected_grad.select(dims, 2).copy_(weights.select(dims, 1))
+        expected_grad.select(dims, 9).copy_(weights.select(dims, 8))
+        torch.testing.assert_close(tensor.grad, expected_grad)
+
+    def test_roll_tensor_with_no_packed_documents_rolls_trailing_slots(self):
+        tensor = torch.arange(4)
+        boundaries = torch.tensor([0], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries,
+            cu_seqlens_kv=boundaries,
+            cu_seqlens_q_padded=boundaries,
+            cu_seqlens_kv_padded=boundaries,
+            qkv_format="thd",
+        )
+
+        rolled, rolled_sum = roll_tensor(tensor, packed_seq_params=packed)
+
+        torch.testing.assert_close(rolled, torch.tensor([1, 2, 3, 0]))
+        torch.testing.assert_close(rolled_sum, rolled.sum())
+
+    def test_roll_tensor_accepts_cpu_boundaries_with_cuda_tokens(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+        tensor = torch.arange(10, device="cuda")
+        logical = torch.tensor([0, 3], dtype=torch.int32)
+        physical = torch.tensor([0, 8], dtype=torch.int32)
+        packed = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+        )
+
+        rolled, _ = roll_tensor(tensor, packed_seq_params=packed)
+
+        torch.testing.assert_close(
+            rolled, torch.tensor([1, 2, 0, 0, 0, 0, 0, 0, 9, 0], device="cuda")
+        )
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_roll_tensor_rejects_misaligned_cp_document(self, device):
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+
+        class CPGroup:
+            def size(self):
+                return 2
+
+        tensor = torch.tensor([7], device=device)
+        boundaries = torch.tensor([0, 2], dtype=torch.int32, device=device)
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
+        )
+
+        with pytest.raises(ValueError, match="divisible by twice the CP size"):
+            roll_tensor(tensor, cp_group=CPGroup(), packed_seq_params=packed)
+        torch.testing.assert_close(tensor + 1, tensor.new_tensor([8]))
+
+    def test_roll_tensor_packed_cp_gradients(self):
+        cp = 4
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+        tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda", requires_grad=True)
+        weights = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda")
+        boundaries = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+        packed = PackedSeqParams(
+            cu_seqlens_q=boundaries, cu_seqlens_kv=boundaries, qkv_format="thd"
+        )
+
+        rolled, rolled_sum = roll_tensor(
+            tensor, cp_group=cp_group, packed_seq_params=packed, return_sum=False
+        )
+        assert rolled_sum is None
+        expected = torch.tensor(
+            [2.0, 3.0 if cp_rank == cp - 1 else 1.0, 4.0, 0.0 if cp_rank == 0 else 3.0],
+            device="cuda",
+        )
+        torch.testing.assert_close(rolled, expected)
+        unpacked_rolled, _ = roll_tensor(tensor.detach(), cp_group=cp_group, return_sum=False)
+        torch.testing.assert_close(unpacked_rolled, expected)
+        (rolled * weights).sum().backward()
+
+        expected_grad = torch.tensor(
+            [0.0, 1.0, 2.0 if cp_rank == cp - 1 else 0.0, 3.0], device="cuda"
+        )
+        torch.testing.assert_close(tensor.grad, expected_grad)
+        Utils.destroy_model_parallel()
 
     def test_roll_tensor_with_attention_padded_packed_sequences(self):
         cp = 4
@@ -3892,6 +4215,7 @@ class TestMultiTokenPrediction:
             cu_seqlens_q_padded=cu_seqlens_padded,
             cu_seqlens_kv_padded=cu_seqlens_padded,
             qkv_format="thd",
+            pad_between_seqs=True,
         )
 
         rolled, _ = roll_tensor(
@@ -3899,6 +4223,54 @@ class TestMultiTokenPrediction:
         )
 
         torch.testing.assert_close(rolled, expected)
+
+        # pretrain_gpt supplies the physical boundaries as both arrays and
+        # leaves pad_between_seqs unset.
+        physical_only = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format="thd",
+        )
+        rolled_physical_only, _ = roll_tensor(
+            tensor, cp_group=cp_group, packed_seq_params=physical_only
+        )
+        torch.testing.assert_close(rolled_physical_only, expected)
+
+        unpadded = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens_padded, cu_seqlens_kv=cu_seqlens_padded, qkv_format="thd"
+        )
+        rolled_unpadded, _ = roll_tensor(tensor, cp_group=cp_group, packed_seq_params=unpadded)
+        torch.testing.assert_close(rolled_unpadded, expected)
+
+        # Fixed-size RL metadata may contain empty documents anywhere, while
+        # trailing local slots beyond the final boundary form another segment.
+        tensor_with_tail = torch.cat((tensor, torch.tensor([99, 100], device="cuda")))
+        physical_with_empty = torch.tensor([0, 0, 8, 8, 24, 24], dtype=torch.int32, device="cuda")
+        logical_with_empty = torch.tensor([0, 0, 3, 3, 13, 13], dtype=torch.int32, device="cuda")
+        packed_with_empty = PackedSeqParams(
+            cu_seqlens_q=logical_with_empty,
+            cu_seqlens_kv=logical_with_empty,
+            cu_seqlens_q_padded=physical_with_empty,
+            cu_seqlens_kv_padded=physical_with_empty,
+            qkv_format="thd",
+            pad_between_seqs=True,
+            total_tokens=tensor_with_tail.numel() * cp,
+        )
+        rolled_with_tail, _ = roll_tensor(
+            tensor_with_tail, cp_group=cp_group, packed_seq_params=packed_with_empty
+        )
+        expected_with_tail = torch.cat((expected, torch.tensor([100, 0], device="cuda")))
+        torch.testing.assert_close(rolled_with_tail, expected_with_tail)
+
+        unpadded_with_tail = PackedSeqParams(
+            cu_seqlens_q=physical_with_empty, cu_seqlens_kv=physical_with_empty, qkv_format="thd"
+        )
+        rolled_unpadded_with_tail, _ = roll_tensor(
+            tensor_with_tail, cp_group=cp_group, packed_seq_params=unpadded_with_tail
+        )
+        torch.testing.assert_close(rolled_unpadded_with_tail, expected_with_tail)
         Utils.destroy_model_parallel()
 
 
@@ -4683,7 +5055,9 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize()
+        set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
@@ -4935,22 +5309,26 @@ class TestMultiTokenPredictionHybrid:
         position_ids = torch.tensor([[0, 1]])
         labels = torch.tensor([[2, 3]])
         loss_mask = torch.ones(1, 2)
+        mtp_input_mask = torch.tensor([[True, False]])
         zigzag_input_ids = torch.tensor([[4, 3]])
         zigzag_position_ids = torch.tensor([[3, 2]])
         zigzag_labels = torch.tensor([[5, 4]])
         zigzag_loss_mask = torch.tensor([[1.0, 0.0]])
+        zigzag_mtp_input_mask = torch.tensor([[False, True]])
         batches_by_layout = {
             "contiguous": {
                 "tokens": input_ids,
                 "position_ids": position_ids,
                 "labels": labels,
                 "loss_mask": loss_mask,
+                "mtp_input_mask": mtp_input_mask,
             },
             "zigzag": {
                 "tokens": zigzag_input_ids,
                 "position_ids": zigzag_position_ids,
                 "labels": zigzag_labels,
                 "loss_mask": zigzag_loss_mask,
+                "mtp_input_mask": zigzag_mtp_input_mask,
             },
         }
         cp_batch = ContextParallelBatch(
@@ -4977,6 +5355,7 @@ class TestMultiTokenPredictionHybrid:
             decoder_input=hidden_states,
             labels=labels,
             loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             packed_seq_params=contiguous_packed_seq_params,
             cp_batch=cp_batch,
             padding_mask=padding_mask,
@@ -4986,6 +5365,7 @@ class TestMultiTokenPredictionHybrid:
         assert captured["mtp"]["decoder_input"] is zigzag_hidden_states
         assert captured["mtp"]["input_ids"] is zigzag_input_ids
         assert captured["mtp"]["position_ids"] is zigzag_position_ids
+        assert captured["mtp"]["mtp_input_mask"] is zigzag_mtp_input_mask
         assert captured["mtp"]["packed_seq_params"] is zigzag_packed_seq_params
         assert (
             captured["mtp"]["packed_seq_params_by_layout"] is expected_packed_seq_params_by_layout
@@ -5539,14 +5919,24 @@ class TestRollTensorWithCPSubgroup:
         assert seen_groups, "CP boundary exchange must go through batch_isend_irecv"
         assert all(group is cp_group for group in seen_groups)
 
-    def test_roll_tensor_packed_seq_cp_boundary_exchange(self):
+    @pytest.mark.parametrize("dims", [-1, 0])
+    def test_roll_tensor_packed_seq_cp_boundary_exchange(self, monkeypatch, dims):
         cp_group = get_context_parallel_group()
         cp_size = cp_group.size()
         cp_rank = torch.distributed.get_rank(group=cp_group)
 
+        seen_batches = []
+        real_batch_isend_irecv = torch.distributed.batch_isend_irecv
+
+        def spy_batch_isend_irecv(ops):
+            seen_batches.append([op.group for op in ops])
+            return real_batch_isend_irecv(ops)
+
+        monkeypatch.setattr(torch.distributed, "batch_isend_irecv", spy_batch_isend_irecv)
+
         seq_lengths = [8, 16]  # each divisible by 2 * cp_size
         cu_seqlens = torch.tensor([0, 8, 24], dtype=torch.int32, device="cuda")
-        full = torch.arange(1 * 24, dtype=torch.float32, device="cuda").reshape(1, 24)
+        full = torch.arange(2 * 24, dtype=torch.float32, device="cuda").reshape(2, 24)
 
         packed_seq_params = PackedSeqParams(cu_seqlens_q=cu_seqlens)
         # Oracle: single-rank packed semantics (per-sequence roll) on the full tensor.
@@ -5563,14 +5953,17 @@ class TestRollTensorWithCPSubgroup:
                 start += length
             return torch.cat(pieces, dim=-1)
 
-        expected_local = shard_packed(expected_full)
-        local = shard_packed(full).contiguous()
+        expected_local = shard_packed(expected_full).movedim(-1, dims)
+        local = shard_packed(full).movedim(-1, dims).contiguous()
         rolled, rolled_sum = roll_tensor(
-            local, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+            local, shifts=-1, dims=dims, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
         assert torch.equal(rolled, expected_local)
         assert rolled_sum == expected_local.sum()
+        assert len(seen_batches) == 1, "All packed documents must share one boundary exchange"
+        assert seen_batches[0]
+        assert all(group is cp_group for group in seen_batches[0])
 
 
 class TestLearnedOutputContractReference:

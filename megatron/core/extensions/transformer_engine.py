@@ -73,6 +73,9 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
+# Token alignment required by TE's grouped-tensor and fused grouped-MLP kernels.
+TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT = 256
+
 try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
@@ -2147,6 +2150,12 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
             stride=stride,
         )
 
+        # With MTP the main and MTP heads use this weight in one backward pass, so autograd adds
+        # the dummy weight gradients TE returns once it has accumulated into main_grad: a
+        # [vocab, hidden] add whose result is discarded. TE versions that read this attribute
+        # return a ZeroTensor dummy, which costs nothing to add; older versions ignore it.
+        self.weight.zero_tensor_dummy_wgrad = True
+
         self.input_size = input_size
         self.output_size = output_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
@@ -2839,6 +2848,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
+            num_virtual_experts: int = 0,
             parallel_mode: Optional[str],
             config: ModelParallelConfig,
             init_method: Callable,
@@ -2851,9 +2861,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         ):
             """
             Args:
+                num_gemms (int): number of owned experts to initialize and checkpoint.
+                num_virtual_experts (int): additional runtime GEMM slots with unregistered weights.
                 name (str | None): module instance name passed top-down from its paranet module
             """
             self.config = config
+            if num_virtual_experts < 0:
+                raise ValueError("num_virtual_experts must be nonnegative.")
+            self.num_virtual_experts = num_virtual_experts
 
             # TE returns a zero length Tensor when bias=False and
             # return_bias=True, but we prefer None.  So in that case we
@@ -2965,7 +2980,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             with init_quant_context, init_gtp_remat_context as output_size:
                 super().__init__(
-                    num_gemms=num_gemms,
+                    num_gemms=num_gemms + num_virtual_experts,
                     in_features=input_size,
                     out_features=output_size,
                     sequence_parallel=self.config.sequence_parallel,
@@ -3157,6 +3172,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     quantization_config, model_config=self.config
                 )
 
+        def reset_parameters(self, defer_init=False):
+            """Override TE's reset_parameters to remove virtual weights before initialization.
+
+            TE constructs every GEMM's weight before calling this method. Drop virtual
+            placeholders before delegating to TE so they neither enter the model tree nor
+            consume RNG values.
+            """
+            for index in range(self.num_gemms - self.num_virtual_experts, self.num_gemms):
+                self.register_parameter(f"weight{index}", None)
+                self.param_init_meta.pop(f"weight{index}", None)
+            super().reset_parameters(defer_init=defer_init)
+
         def will_execute_quantized(self, is_context_quantized: bool) -> bool:
             """Returns whether the module is configured to execute quantized."""
             return _get_should_context_be_quantized_params(
@@ -3165,7 +3192,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def forward(self, x, m_splits):
             """Forward."""
-            _is_first_microbatch = _resolve_is_first_microbatch(self)
+            if self.num_virtual_experts:
+                # Virtual slot contents may change between microbatches; TE must not cache their
+                # quantized weights based on the owned experts' first-microbatch marker.
+                _is_first_microbatch = None
+            else:
+                _is_first_microbatch = _resolve_is_first_microbatch(self)
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
@@ -3261,6 +3293,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             prefix should be module_name to make keys identical to sequetial ones.
             """
             singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+            checkpoint_gemms = self.num_gemms - self.num_virtual_experts
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
             grouped_split_cache = {}
@@ -3278,11 +3311,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 grouped_splits = grouped_split_cache[param_name]
                 return grouped_splits[gemm_idx]
 
-            num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
-            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+            num_global_experts = get_pg_size(self._pg_collection.ep) * checkpoint_gemms
+            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * checkpoint_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
-            for gemm_idx in range(self.num_gemms):
+            for gemm_idx in range(checkpoint_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
                     f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),
@@ -3370,6 +3403,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
+            num_virtual_experts: int = 0,
             config: ModelParallelConfig,
             init_method: Callable,
             bias: bool,
@@ -3387,6 +3421,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 num_gemms=num_gemms,
                 input_size=input_size,
                 output_size=output_size,
+                num_virtual_experts=num_virtual_experts,
                 parallel_mode="column",
                 config=config,
                 init_method=condition_init_method(config, init_method),
@@ -3422,6 +3457,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
+            num_virtual_experts: int = 0,
             config: ModelParallelConfig,
             init_method: Callable,
             bias: bool,
@@ -3439,6 +3475,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 num_gemms=num_gemms,
                 input_size=input_size,
                 output_size=output_size,
+                num_virtual_experts=num_virtual_experts,
                 parallel_mode="row",
                 config=config,
                 init_method=condition_init_method(config, init_method),
@@ -3641,6 +3678,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         "pytorch.ops.ScaledSiTUGLU support."
                     )
 
+            self._grouped_linear_kwargs = {}
+            if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
+                self._grouped_linear_kwargs["split_alignment"] = (
+                    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+                )
+
         def _reset_fused_impl(self) -> None:
             """Discard both cached execution views."""
             super()._reset_fused_impl()
@@ -3716,6 +3759,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 bias=False,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+                **self._grouped_linear_kwargs,
             )
             op.weight0 = weight
             op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
@@ -3746,6 +3790,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 bias=False,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+                **self._grouped_linear_kwargs,
             )
             op.weight0 = weight
             # FC2 has no SwiGLU — MXFP8 quantization done on-the-fly in fuser_forward.
@@ -3798,6 +3843,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             hidden_size = hidden_states.size(-1)
             hidden_states_2d = hidden_states.view(-1, hidden_size)
             total_tokens = hidden_states_2d.size(0)
+            if total_tokens % TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT != 0:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires the flattened token count to be "
+                    f"divisible by {TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT} for grouped MLP "
+                    f"fusion, but got {total_tokens}. "
+                    "Inputs must already be aligned; this module does not pad them."
+                )
 
             tokens_per_expert = torch.full(
                 (1,), total_tokens, dtype=torch.long, device=hidden_states.device
@@ -4138,6 +4190,9 @@ try:
     _TE_FUSED_PARALLEL_CE_OVERWRITE_INPUT = (
         "overwrite_input" in inspect.signature(parallel_cross_entropy).parameters
     )
+    _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX = (
+        "return_argmax" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -4146,8 +4201,13 @@ try:
         tp_group: torch.distributed.ProcessGroup,
         is_cg_capturable: bool = False,
         overwrite_input: bool = True,
+        return_argmax: bool = False,
     ):
-        """Wrapper function for TE's Cross Entropy Loss kernel"""
+        """Wrapper function for TE's Cross Entropy Loss kernel
+
+        With ``return_argmax``, returns ``(loss, argmax)``: the argmax of each row over the full
+        vocabulary, found by the loss kernel, or None if this TE version cannot return it.
+        """
         parallel_cross_entropy_kwargs = {
             "label_smoothing": 0.0,
             "reduce_loss": False,
@@ -4162,6 +4222,10 @@ try:
             parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
             parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        if return_argmax:
+            if not _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX:
+                return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs), None
+            parallel_cross_entropy_kwargs["return_argmax"] = True
         return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
 
 except ImportError:
@@ -4175,13 +4239,22 @@ def te_cross_entropy(
     *,
     cuda_graph_capturable: bool = False,
     overwrite_input: bool = True,
-) -> torch.Tensor:
-    """Adapt TE cross entropy to the backend target signature and required label stride."""
+    return_argmax: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+    """Adapt TE cross entropy to the backend target signature and required label stride.
+
+    With ``return_argmax``, returns ``(loss, argmax)`` as ``te_parallel_cross_entropy`` does.
+    """
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
     return te_parallel_cross_entropy(
-        logits, labels, tp_group, cuda_graph_capturable, overwrite_input=overwrite_input
+        logits,
+        labels,
+        tp_group,
+        cuda_graph_capturable,
+        overwrite_input=overwrite_input,
+        return_argmax=return_argmax,
     )
 
 

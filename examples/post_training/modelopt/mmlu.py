@@ -27,10 +27,10 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
@@ -67,7 +67,9 @@ def add_mmlu_args(parser):
     # Kept for backward compatibility with prior MLM_EXTRA_ARGS callers. Has no effect:
     # `megatron_mmlu` already disables its progress bar on non-master ranks.
     group.add_argument("--disable-tqdm", action="store_true", help=argparse.SUPPRESS)
-    group.add_argument("--mmlu-dataset", type=str, default="cais/mmlu", help=argparse.SUPPRESS)
+    group.add_argument(
+        "--mmlu-dataset", type=str, default="cais/mmlu", help=argparse.SUPPRESS
+    )
     add_modelopt_args(parser)
     return parser
 
@@ -84,8 +86,7 @@ if __name__ == "__main__":
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args, training=True)
-    initialize_megatron(training=True)
+    initialize_megatron(training=False)
 
     args = get_args()
 
@@ -104,7 +105,8 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
+        wrap_with_ddp=False,
     )
     report_current_memory_info()
 
@@ -125,7 +127,9 @@ if __name__ == "__main__":
     # however, this is not the case when share_embeddings_and_output_weights is False.
     # [TODO]: fold_weight does not support TEGroupedMLP (QuantTEColumnParallelGroupedLinear)
     # which stores per-expert weights as weight0, weight1, etc. instead of a single weight.
-    has_grouped_mlp = any("TEGroupedMLP" in type(m).__name__ for m in unwrapped_model.modules())
+    has_grouped_mlp = any(
+        "TEGroupedMLP" in type(m).__name__ for m in unwrapped_model.modules()
+    )
     if (
         not getattr(unwrapped_model, "share_embeddings_and_output_weights", False)
         and not has_grouped_mlp
@@ -142,6 +146,6 @@ if __name__ == "__main__":
         )
 
     if torch.distributed.get_rank() == 0 and args.lower_bound is not None:
-        assert (
-            avg > args.lower_bound
-        ), f"MMLU accuracy {avg:.4f} below lower bound {args.lower_bound}"
+        assert avg > args.lower_bound, (
+            f"MMLU accuracy {avg:.4f} below lower bound {args.lower_bound}"
+        )

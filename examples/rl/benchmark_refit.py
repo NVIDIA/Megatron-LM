@@ -25,11 +25,7 @@ from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import (
-    get_run_config,
-    initialize_runtime_services,
-    set_run_config,
-)
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -258,7 +254,7 @@ def benchmark_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
     )
 
     dst_config = core_transformer_config_from_args(args)
@@ -355,7 +351,7 @@ def benchmark_non_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
     torch.distributed.barrier()
@@ -444,7 +440,6 @@ def main():
     set_run_config(pretrain_cfg_container_from_args(args))
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
-    initialize_runtime_services(args, training=True)
     initialize_megatron(training=True, skip_dependency_compilation=True)
 
     args = get_args()

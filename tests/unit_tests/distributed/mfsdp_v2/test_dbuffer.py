@@ -11,8 +11,8 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import layout_builder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     RowAtomic,
@@ -56,7 +56,7 @@ def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
         tensors,
         mesh,
         [BlockAtomic(2)],
-        layout=GlobalLayout.build_for_row_atomic(
+        layout=layout_builder.build_for_row_atomic(
             (tensor.shape for tensor in tensors), dp_size=mesh.size(), block_size=2
         ),
     )
@@ -282,7 +282,7 @@ def test_distribute_tensors_rejects_layout_with_wrong_tensor_order(distributed_s
     """A supplied layout must describe tensors in the same logical order as the input."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
-    layout = GlobalLayout.build_for_row_atomic(
+    layout = layout_builder.build_for_row_atomic(
         (tensor.shape for tensor in reversed(tensors)), dp_size=mesh.size()
     )
     with pytest.raises(ValueError, match="Layout tensor shapes must match"):
@@ -768,7 +768,7 @@ def test_tensor_atomic_init_normal(distributed_setup):
     buffer = DBuffer(
         mesh=mesh,
         placements=[TensorAtomic()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             shapes, dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
         dtype=torch.float32,
@@ -795,7 +795,7 @@ def test_tensor_atomic_rejects_split_tensors(distributed_setup, block_size, cons
         pytest.skip("Requires at least 2 ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     shapes = [(4 * mesh.size(), 4)]
-    layout = GlobalLayout.build_for_row_atomic(shapes, dp_size=mesh.size(), block_size=block_size)
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=mesh.size(), block_size=block_size)
 
     with pytest.raises(ValueError, match="crosses a rank segment boundary"):
         if construction == "empty":
@@ -826,9 +826,9 @@ def test_accepts_compatible_layout_from_either_builder(distributed_setup, placem
     ]
     shapes = [tensor.shape for tensor in tensors]
     if isinstance(placement, TensorAtomic):
-        layout = GlobalLayout.build_for_row_atomic(shapes, dp_size=mesh.size())
+        layout = layout_builder.build_for_row_atomic(shapes, dp_size=mesh.size())
     else:
-        layout = GlobalLayout.build_for_tensor_atomic(
+        layout = layout_builder.build_for_tensor_atomic(
             shapes, dp_size=mesh.size(), tensor_owners=range(mesh.size())
         )
     buffer = DBuffer.distribute_tensors(tensors, mesh, [placement], layout=layout)
@@ -841,7 +841,7 @@ def test_block_atomic_rejects_shards_that_split_blocks(distributed_setup):
     if distributed_setup.world_size < 2 or distributed_setup.world_size % 2:
         pytest.skip("Requires an even number of at least 2 ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    layout = GlobalLayout.build_for_row_atomic([(4 * mesh.size(), 4)], dp_size=mesh.size())
+    layout = layout_builder.build_for_row_atomic([(4 * mesh.size(), 4)], dp_size=mesh.size())
 
     with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment"):
         DBuffer(mesh, [BlockAtomic(8)], layout, torch.float32, distributed_setup.device)
@@ -856,7 +856,9 @@ def test_row_atomic_rejects_uneven_layout(distributed_setup):
     # Both tensors have row size 4 and row-aligned offsets, so only the unequal
     # segment sizes can trip validation.
     shapes = [(4, 4), (2, 4)]
-    layout = GlobalLayout.build_for_tensor_atomic(shapes, dp_size=mesh.size(), tensor_owners=(0, 1))
+    layout = layout_builder.build_for_tensor_atomic(
+        shapes, dp_size=mesh.size(), tensor_owners=(0, 1)
+    )
     assert not layout.has_equal_shard_sizes
 
     with pytest.raises(ValueError, match="Unequal rank segment sizes"):
@@ -879,7 +881,7 @@ def test_quantized_dbuffer_validates_replicated_layout_alignment(distributed_set
         "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbuffer"
     )
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    layout = GlobalLayout.build_for_row_atomic(
+    layout = layout_builder.build_for_row_atomic(
         [(rows_per_rank * mesh.size(), 32)], dp_size=mesh.size()
     )
     if rows_per_rank == 16:
@@ -914,7 +916,7 @@ def test_replicate_placement_with_tensor_atomic_layout(distributed_setup):
     buffer = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             shapes, dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
         dtype=torch.float32,
@@ -944,7 +946,7 @@ def test_partial_placement_with_tensor_atomic_layout(distributed_setup):
     buffer = DBuffer(
         mesh=mesh,
         placements=[Partial()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             shapes, dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
         dtype=torch.float32,
@@ -992,7 +994,7 @@ def test_sharded_allgather_round_trip_with_tensor_atomic(distributed_setup, tens
         tensors,
         mesh,
         [TensorAtomic()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
     )
@@ -1022,7 +1024,7 @@ def test_sharded_allgather_into_existing_buffer_rejects_mismatched_layout(distri
         tensors,
         mesh,
         [TensorAtomic()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
     )
@@ -1051,14 +1053,14 @@ def test_sharded_allgather_into_existing_buffer_with_tensor_atomic(distributed_s
         tensors,
         mesh,
         [TensorAtomic()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
     )
     destination = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             sharded_buffer.layout.tensor_shapes, dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
         dtype=sharded_buffer.dtype,
@@ -1098,7 +1100,7 @@ def test_replicate_view_round_trip_with_tensor_atomic(distributed_setup):
         tensors,
         mesh,
         [Replicate()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
     )
@@ -1108,7 +1110,7 @@ def test_replicate_view_round_trip_with_tensor_atomic(distributed_setup):
     redistribute_destination = DBuffer(
         mesh=mesh,
         placements=[TensorAtomic()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             replicated_buffer.layout.tensor_shapes, dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
         dtype=replicated_buffer.dtype,
@@ -1153,7 +1155,7 @@ def test_partial_reduce_scatter_to_tensor_atomic(distributed_setup, tensor_owner
         tensors,
         mesh,
         [Partial()],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
     )
@@ -1216,7 +1218,7 @@ def test_partial_reduce_scatter_to_tensor_atomic_average(distributed_setup):
         tensors,
         mesh,
         [Partial("avg")],
-        layout=GlobalLayout.build_for_tensor_atomic(
+        layout=layout_builder.build_for_tensor_atomic(
             (tensor.shape for tensor in tensors), dp_size=mesh.size(), tensor_owners=tensor_owners
         ),
     )

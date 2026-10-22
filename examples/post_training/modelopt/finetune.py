@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 """Supervised Finetuning GPT."""
-
 import itertools
 import os
 import sys
@@ -13,21 +12,21 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import datasets
 import torch
 import transformers
-from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import get_context_parallel_group
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
-from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
 from megatron.training.utils import print_rank_0
+from megatron.training.global_vars import set_run_config
+from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 from model_provider import model_provider
+from megatron.core.parallel_state import get_context_parallel_group
+
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -37,15 +36,11 @@ REMOVE_THINK_CHAT_TEMPLATE = (
 def add_finetune_args(parser):
     """Add additional arguments for finetune."""
     group = parser.add_argument_group(title='Finetune')
-    group.add_argument(
-        "--offline-distillation-data",
-        type=str,
-        help="Path to the offline dataset directory with base model features.",
-    )
+    group.add_argument("--offline-distillation-data", type=str, help="Path to the offline dataset directory with base model features.")
+
 
     add_modelopt_args(parser)
     return parser
-
 
 class OfflineDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir: str, num_samples):
@@ -66,7 +61,6 @@ class OfflineDataset(torch.utils.data.Dataset):
         file_path = self.file_paths[idx]
         sample = torch.load(file_path)
         return sample
-
 
 class SFTDataset(torch.utils.data.Dataset):
 
@@ -90,7 +84,7 @@ class SFTDataset(torch.utils.data.Dataset):
     }
 
     hf_dataset_to_prompt_template = {
-        "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}"
+        "Open-Orca/OpenOrca": "{{ messages['question'] + ' ' + messages['response'] + ' ' }}",
     }
 
     @classmethod
@@ -155,7 +149,9 @@ class SFTDataset(torch.utils.data.Dataset):
             # Some published HF parquet shards contain newer `datasets` feature
             # metadata than the runtime parser understands. Dropping that metadata
             # lets `datasets.Dataset` infer equivalent features from Arrow schema.
-            tables.append(pq.read_table(filename, memory_map=True).replace_schema_metadata(None))
+            tables.append(
+                pq.read_table(filename, memory_map=True).replace_schema_metadata(None)
+            )
 
         table = tables[0] if len(tables) == 1 else pa.concat_tables(tables)
         return datasets.Dataset(table)
@@ -235,7 +231,9 @@ class SFTDataset(torch.utils.data.Dataset):
             SFTDataset.hf_dataset_to_kwargs.get(self.hf_dataset, {"split": "train"})
         )
         if self.hf_dataset_data_files:
-            data_files_builder = SFTDataset._infer_data_files_builder(self.hf_dataset_data_files)
+            data_files_builder = SFTDataset._infer_data_files_builder(
+                self.hf_dataset_data_files
+            )
             data_files = SFTDataset._load_dataset_synchronized(
                 lambda: SFTDataset._materialize_data_files(
                     self.hf_dataset, self.hf_dataset_data_files
@@ -262,7 +260,9 @@ class SFTDataset(torch.utils.data.Dataset):
                 self.hf_dataset, token=os.environ.get("HF_TOKEN", None), **hf_dataset_kwargs
             )
 
-        self._raw_samples = self._raw_samples.shard(num_shards=self.num_shards, index=shard_index)
+        self._raw_samples = self._raw_samples.shard(
+            num_shards=self.num_shards, index=shard_index
+        )
 
         print(
             "Rank {:3}/{:3} creates SFT data shard {:3}/{:3} with {:10} raw samples".format(
@@ -378,7 +378,9 @@ class SFTDataset(torch.utils.data.Dataset):
                 return None
 
         # We always add eos between samples for training purpose.
-        input_ids = SFTDataset._normalize_input_ids(self.tokenizer.apply_chat_template(example))
+        input_ids = SFTDataset._normalize_input_ids(
+            self.tokenizer.apply_chat_template(example)
+        )
 
         current_loss_mask = [1] * len(input_ids)
         input_ids = input_ids + [get_eos_token_id(self.tokenizer)]
@@ -445,15 +447,9 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
     if args.export_offline_model:
-        train_ds = OfflineDataset(
-            os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0]
-        )
-        valid_ds = OfflineDataset(
-            os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1]
-        )
-        test_ds = OfflineDataset(
-            os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2]
-        )
+        train_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0])
+        valid_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1])
+        test_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2])
 
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
@@ -503,13 +499,12 @@ def get_batch(data_iterator):
         data_b = tensor_parallel.broadcast_data(keys, data, datatype)
         data_b["loss_mask"] = torch.ones_like(data_b["input_ids"])
         data_b["loss_mask"][data_b["loss_mask"] == get_eos_token_id()] = 0
-        data_b["loss_mask"] = torch.cat(
-            [data_b["loss_mask"], torch.zeros(1, 1).to(torch.cuda.current_device())], dim=-1
-        )
+        data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
 
         keys = ["aux_hidden_states", "hidden_states"]
         datatype = torch.bfloat16
         feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
+
 
     sample_loss_mask = data_b.get("loss_mask")
     batch = build_lm_batch(
@@ -524,9 +519,7 @@ def get_batch(data_iterator):
     )
 
     if args.export_offline_model:
-        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[
-            : args.seq_length
-        ]
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[: args.seq_length]
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
 
     return batch
@@ -540,6 +533,7 @@ def non_loss_data_func(model: GPTModel):
             report_draft_acceptance_length(model)
         except Exception as e:
             print(e)
+
 
 
 def forward_step(data_iterator, model: GPTModel):
@@ -567,14 +561,7 @@ def forward_step(data_iterator, model: GPTModel):
     timers("batch-generator").stop()
 
     if args.export_offline_model:
-        output_tensor = model(
-            tokens,
-            position_ids,
-            attention_mask,
-            labels=labels,
-            aux_hidden_states=aux_hidden_states,
-            hidden_states=hidden_states,
-        )
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
@@ -591,8 +578,6 @@ if __name__ == "__main__":
     )
     full_config = pretrain_cfg_container_from_args(args)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     pretrain(
         full_config,
         train_valid_test_sft_datasets_provider,

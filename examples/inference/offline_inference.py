@@ -51,9 +51,9 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import initialize_megatron
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -99,8 +99,9 @@ def _validate_prompt_lengths(args, llm, requests):
         for idx, r in enumerate(requests)
         if len(r.prompt_tokens) > llm.context.max_tokens
     }
-    assert not invalid, "request idxs with prompts longer than context.max_tokens: " ", ".join(
-        f"{k}({v})" for k, v in invalid.items()
+    assert not invalid, (
+        "request idxs with prompts longer than context.max_tokens: "
+        ", ".join(f"{k}({v})" for k, v in invalid.items())
     )
 
 
@@ -117,7 +118,9 @@ def _capture_engine_stats(llm) -> dict:
         "step_count": llm.engine.context.step_count,
         "lifetime_prefill_token_count": llm.engine.context.lifetime_prefill_token_count,
         "async_sched_step_count": llm.engine.context.async_sched_step_count,
-        "async_sched_compaction_step_count": (llm.engine.context.async_sched_compaction_step_count),
+        "async_sched_compaction_step_count": (
+            llm.engine.context.async_sched_compaction_step_count
+        ),
         "capture_stats": llm.engine.capture_stats,
     }
 
@@ -129,7 +132,9 @@ def _print_setup_prefix(setup_prefix: str) -> None:
         print("~~~")
 
 
-def _report_results(args, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured):
+def _report_results(
+    args, setup_prefix, results, throughputs, total_time, peak_mem_stats, captured
+):
     if dist.get_rank() != 0:
         return
 
@@ -150,7 +155,9 @@ def _report_results(args, setup_prefix, results, throughputs, total_time, peak_m
     peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
     throughput = throughputs[-1] if throughputs else 0.0
     capture_str = (
-        f"{captured['capture_stats']['time']:.2f} sec" if captured["capture_stats"] else "--"
+        f"{captured['capture_stats']['time']:.2f} sec"
+        if captured["capture_stats"]
+        else "--"
     )
     print("~~~")
     print(
@@ -263,7 +270,6 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args)
     initialize_megatron()
     _validate_high_level_api_args(args)
 
@@ -299,15 +305,7 @@ def main():
 
     prompts_list = [r.prompt_text for r in requests]
 
-    runner_args = (
-        args,
-        model,
-        tokenizer,
-        inference_config,
-        requests,
-        prompts_list,
-        sampling_params,
-    )
+    runner_args = (args, model, tokenizer, inference_config, requests, prompts_list, sampling_params)
     if args.async_mode:
         asyncio.run(_run_async(*runner_args))
     else:

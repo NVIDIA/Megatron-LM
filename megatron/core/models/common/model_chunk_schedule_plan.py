@@ -1111,6 +1111,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 b_schedule_plan.tensor_release.finalize_phase(
                     b_schedule_plan.event, phase="backward"
                 )
+
+            model = b_schedule_plan._model_chunk_state.model
+            if isinstance(model, FsdpModule):
+                # This schedule bypasses the root's autograd completion callback.
+                # Finish this microbatch's weight cleanup; gradient sync stays caller-managed.
+                model.context.post_backward()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 

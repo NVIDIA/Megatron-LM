@@ -10,7 +10,6 @@ from pydantic import PrivateAttr
 
 try:
     import h2  # noqa: F401
-
     use_http2 = True
 except ImportError:
     use_http2 = False
@@ -44,35 +43,36 @@ def resolve_generation_lag(
     dp_size: int,
     max_requests: int,
 ) -> float:
-    """Return the generation lag to run with. An unset `generation_lag` autotunes."""
+    """Return the generation lag to run with. An unset `generation_lag` autotunes.
+
+    This local DP/capacity estimate is inaccurate for disaggregated inference:
+    it does not aggregate the capacities of the built decode engines. See #8200
+    and #7138; an explicit lag avoids relying on this estimate for run-ahead.
+    """
     max_effective_groups = dp_size * max_requests // group_size
     max_effective_lag = max_effective_groups / prompts_per_step - 1
     if generation_lag is None:
         generation_lag = max_effective_lag
         print_rank_0(
             f"Autotuned rl-generation-lag={max_effective_lag:.2f} "
-            f"(DP={dp_size}, max_requests={max_requests}, G={group_size}, P={prompts_per_step})."
-        )
+            f"(DP={dp_size}, max_requests={max_requests}, G={group_size}, P={prompts_per_step}).")
     else:
         print_rank_0(
             f"Using rl-generation-lag={generation_lag} "
             f"(max effective lag={max_effective_lag:.2f}; "
-            f"DP={dp_size}, max_requests={max_requests}, G={group_size}, P={prompts_per_step})."
-        )
+            f"DP={dp_size}, max_requests={max_requests}, G={group_size}, P={prompts_per_step}).")
     groups_in_flight = (generation_lag + 1) * prompts_per_step
     if groups_in_flight > max_effective_groups + 1e-6:
         print_rank_0(
             f"WARNING: {groups_in_flight:.1f} groups in flight oversubscribes the "
             f"inference engine (max effective lag is {max_effective_lag:.2f}). "
-            f"Additional run-ahead beyond that point has no benefit."
-        )
+            f"Additional run-ahead beyond that point has no benefit.")
     if max_effective_lag < 0:
         print_rank_0(
             f"WARNING: max effective lag is {max_effective_lag:.2f} (negative) — the "
             f"inference engine cannot hold even one training step's worth of rollouts "
             f"({max_effective_groups} groups < P={prompts_per_step}). Even fully-synchronous GRPO "
-            f"would oversubscribe. Consider scaling up inference resources."
-        )
+            f"would oversubscribe. Consider scaling up inference resources.")
     return generation_lag
 
 
@@ -157,6 +157,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         inference_engine.local_metadata_ledger_enabled = True
+        if inference_engine.context.config.disaggregation_shards is not None:
+            print_rank_0(
+                "WARNING: disaggregated RL generation-lag autotuning and HTTP concurrency "
+                "limits use local shard capacity, not aggregate decode capacity. "
+                "Set --rl-generation-lag explicitly when using partial rollouts; "
+                "capacity aggregation is tracked in Megatron-LM #8200 / #7138."
+            )
         generation_lag = cfg.rl.rl_generation_lag
         if cfg.rl.rl_partial_rollouts:
             generation_lag = resolve_generation_lag(
@@ -167,7 +174,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 max_requests=inference_engine.context.max_requests,
             )
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=41521, launch_inference_coordinator=True
+            inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
 
         if dist.get_rank() == 0:
@@ -201,14 +208,19 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
         )
         custom_limits = httpx.Limits(
-            max_connections=concurrency_limit, max_keepalive_connections=concurrency_limit
+            max_connections=concurrency_limit,
+            max_keepalive_connections=concurrency_limit,
         )
-        http_client = DefaultAioHttpClient(timeout=None, limits=custom_limits, http2=use_http2)
+        http_client = DefaultAioHttpClient(
+            timeout=None,
+            limits=custom_limits,
+            http2=use_http2
+        )
 
         launched_server._openai_client = AsyncOpenAI(
             base_url=f"http://{launched_server.host}:{launched_server.port}",
             api_key="NONE",
-            http_client=http_client,
+            http_client=http_client
         )
 
         return launched_server
@@ -234,7 +246,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
                 stop_text_gen_server,
             )
-
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):
@@ -259,9 +270,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         merged: dict[str, FinishedRequestRecord] = {}
         for shard in shards:
             merged.update(shard)
-        assert len(merged) == sum(
-            len(shard) for shard in shards
-        ), "finished-request ledger: duplicate uids across engine ledgers"
+        assert len(merged) == sum(len(shard) for shard in shards), (
+            "finished-request ledger: duplicate uids across engine ledgers"
+        )
         return merged
 
     async def resume(self):

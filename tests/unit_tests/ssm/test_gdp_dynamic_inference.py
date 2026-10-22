@@ -64,6 +64,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.ssm import ssm_inference
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
@@ -217,19 +218,25 @@ class _FakeSSM(SSMDynamicInferenceMixin):
 
 
 @pytest.mark.parametrize(
-    ("batch_invariant_mode", "num_requests", "tokens_per_request", "padded_token_count"),
-    [
-        (False, 40, 1, 40),
-        (True, 40, 1, 40),
-        (True, 40, 1, 64),
-        (False, 20, 3, 60),
-        (True, 20, 3, 64),
-    ],
+    ("batch_invariant_mode", "global_batch_invariant_mode"),
+    [(False, False), (False, True), (True, False), (True, True)],
 )
-def test_decode_ssm_preserves_batch_invariant_token_padding(
-    batch_invariant_mode, num_requests, tokens_per_request, padded_token_count
+@pytest.mark.parametrize(
+    ("num_requests", "tokens_per_request", "padded_token_count"),
+    [(40, 1, 40), (40, 1, 64), (20, 3, 60), (20, 3, 64)],
+)
+def test_decode_ssm_preserves_token_padding(
+    monkeypatch,
+    batch_invariant_mode,
+    global_batch_invariant_mode,
+    num_requests,
+    tokens_per_request,
+    padded_token_count,
 ):
-    """Only batch-invariant token-only rows bypass SSM decode."""
+    """Token-only padding requires at least one of the independent switches."""
+    monkeypatch.setattr(
+        ssm_inference, "is_batch_invariant_mode_enabled", lambda: global_batch_invariant_mode
+    )
     metadata_token_count = num_requests * tokens_per_request
     projected = torch.arange(padded_token_count * 4, dtype=torch.float32).reshape(
         padded_token_count, 1, 4
@@ -249,6 +256,13 @@ def test_decode_ssm_preserves_batch_invariant_token_padding(
         mamba_metadata=types.SimpleNamespace(batch_indices_decode=batch_indices),
         padding_slice=slice(metadata_token_count, padded_token_count),
     )
+
+    if padded_token_count > metadata_token_count and not (
+        batch_invariant_mode or global_batch_invariant_mode
+    ):
+        with pytest.raises(AssertionError, match="Token-only SSM padding requires"):
+            mixer.ssm_dynamic_inference(torch.empty(0), context)
+        return
 
     output, bias = mixer.ssm_dynamic_inference(torch.empty(0), context)
 
@@ -1354,12 +1368,21 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
         assert torch.equal(state.view(torch.uint8), state_before.view(torch.uint8))
 
     @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
-    def test_matches_upstream_fla(self):
-        """Fork parity with the pip FLA kernel the training path still uses."""
+    @pytest.mark.parametrize("gate_in_kernel", [False, True])
+    def test_matches_upstream_fla(self, gate_in_kernel):
+        """Fork parity with the pip FLA kernel; the in-kernel gate is GDN's decode form."""
         from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
         q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
         indices = torch.tensor([7, 0, 3, 10, 1, 5], device="cuda", dtype=torch.int32)
+        gate_kwargs = {}
+        if gate_in_kernel:
+            HV = self.SHAPE["HV"]
+            gate_kwargs = dict(
+                A_log=torch.randn(HV, device="cuda"),
+                dt_bias=torch.randn(HV, device="cuda"),
+                use_beta_sigmoid_in_kernel=True,
+            )
 
         state_fork = state.clone()
         out_fork, _ = fused_recurrent_gated_delta_rule_update(
@@ -1371,6 +1394,7 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
             beta=beta,
             state_indices=indices,
             use_qk_l2norm_in_kernel=True,
+            **gate_kwargs,
         )
 
         # Upstream needs the initial states gathered in, and returns the final
@@ -1384,6 +1408,8 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
             initial_state=state[indices.long()],
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=gate_in_kernel,
+            **gate_kwargs,
         )
         state_fla = state.clone()
         state_fla[indices.long()] = final_state.to(state.dtype)

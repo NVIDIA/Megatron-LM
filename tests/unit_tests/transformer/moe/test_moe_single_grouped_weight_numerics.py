@@ -231,7 +231,9 @@ class TestMoESingleGroupedWeightNumerics:
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
         # migrated settings use config; remaining settings still use legacy args.
-        set_run_config(pretrain_cfg_container_from_args(args))
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize()
+        set_run_config(cfg)
         initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
