@@ -590,6 +590,59 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
         check_checkpoint_args(checkpoint_args)
 
 
+def test_load_args_restores_attention_residual_config_from_checkpoint():
+    """Checkpoint arguments should restore the attention-residual architecture flags."""
+    checkpoint_args = SimpleNamespace(
+        enable_attention_residuals=True, attn_res_block_layers=4, attn_res_impl='compile'
+    )
+    args = SimpleNamespace(
+        load='checkpoint',
+        iteration=0,
+        enable_attention_residuals=False,
+        attn_res_block_layers=None,
+        attn_res_impl='fla',
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {'args': checkpoint_args, 'iteration': 12}
+
+    with mock.patch(
+        'megatron.training.checkpointing._load_base_checkpoint',
+        return_value=(state_dict, 'checkpoint', False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.enable_attention_residuals is True
+    assert restored_args.attn_res_block_layers == 4
+    # The kernel backend is a launch-time choice, not an architecture setting.
+    assert restored_args.attn_res_impl == 'fla'
+
+
+def test_check_checkpoint_args_rejects_attention_residual_mismatch():
+    """Resuming must reject a checkpoint with a different attention-residual layout."""
+    current_args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        add_position_embedding=False,
+        vocab_file=None,
+        data_parallel_random_init=False,
+        phase_transition_iterations=None,
+        use_dist_ckpt=True,
+        enable_attention_residuals=True,
+        attn_res_block_layers=2,
+    )
+    checkpoint_args = SimpleNamespace(**vars(current_args))
+    checkpoint_args.attn_res_block_layers = 4
+
+    with (
+        mock.patch('megatron.training.checkpointing.get_args', return_value=current_args),
+        mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
+        pytest.raises(AssertionError, match='attn_res_block_layers value from checkpoint'),
+    ):
+        check_checkpoint_args(checkpoint_args)
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123

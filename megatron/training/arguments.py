@@ -3082,6 +3082,9 @@ def _add_network_size_args(parser):
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
+        # defined manually in _add_experimental_args; the config field is filled
+        # by the hasattr-gated copy in core_transformer_config_from_args
+        "hybrid_layer_pattern",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")

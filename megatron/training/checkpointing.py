@@ -125,6 +125,14 @@ _WIDE_RESIDUAL_ARG_DEFAULTS = (
     ('wide_residual_retention_max_forget', 0.10),
 )
 
+# Attention-residual architecture settings: the flag adds per-sublayer pseudo-queries and key
+# norms, and attn_res_block_layers fixes the depth-source layout. attn_res_impl only selects the
+# kernel backend and stays under launch-time control.
+_ATTENTION_RESIDUAL_ARG_DEFAULTS = (
+    ('enable_attention_residuals', False),
+    ('attn_res_block_layers', None),
+)
+
 # Track deletion processes to prevent zombies
 _deletion_processes = []
 
@@ -250,6 +258,18 @@ def check_checkpoint_args(
         checkpoint_args, 'wide_residual_num_streams'
     ):
         for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
+            if arg_name in skip_args:
+                continue
+            checkpoint_value = getattr(checkpoint_args, arg_name, default)
+            args_value = getattr(args, arg_name, default)
+            assert checkpoint_value == args_value, (
+                f'{arg_name} value from checkpoint ({checkpoint_value}) is not equal to '
+                f'the input argument value ({args_value}).'
+            )
+    if getattr(args, 'enable_attention_residuals', False) or getattr(
+        checkpoint_args, 'enable_attention_residuals', False
+    ):
+        for arg_name, default in _ATTENTION_RESIDUAL_ARG_DEFAULTS:
             if arg_name in skip_args:
                 continue
             checkpoint_value = getattr(checkpoint_args, arg_name, default)
@@ -2599,6 +2619,11 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     # the checkpoint in the same way as other fixed model settings above.
     for arg_name, default in _WIDE_RESIDUAL_ARG_DEFAULTS:
         _set_arg(arg_name, force=default is not None)
+
+    # Restore attention-residual architecture settings. The enabling flag defaults to False
+    # (not None), so it must be forced to follow the checkpoint.
+    for arg_name, _ in _ATTENTION_RESIDUAL_ARG_DEFAULTS:
+        _set_arg(arg_name, force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)

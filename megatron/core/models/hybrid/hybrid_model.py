@@ -437,6 +437,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pre_process=self.pre_process,
             layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
+            vp_stage=vp_stage,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
@@ -501,6 +502,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def _attn_res_input_payload_slices(self) -> int:
+        """Slice count of the AttnRes pipeline payload received by this decoder chunk."""
+        from megatron.core.transformer.attention_residual import (
+            attn_res_num_payload_slices,
+            attn_res_uniform_payload_slices,
+        )
+
+        if self.config.virtual_pipeline_model_parallel_size is not None:
+            # Interleaved VPP pads every boundary payload to one uniform width.
+            return attn_res_uniform_payload_slices(self.config)
+        return attn_res_num_payload_slices(
+            self.decoder.pp_layer_offset, self.config.attn_res_block_layers
+        )
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -704,11 +719,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and decoder_reference is None
         ):
             decoder_reference = self.decoder.input_tensor
+        decoder_reference_len = (
+            decoder_reference.shape[0] if decoder_reference is not None else None
+        )
+        if (
+            decoder_reference_len is not None
+            and decoder_reference is not decoder_input
+            and getattr(self.config, "enable_attention_residuals", False)
+        ):
+            # AttnRes later stages receive a seq-concatenated depth-source payload;
+            # divide the slice count out to recover the local sequence length.
+            decoder_reference_len //= self._attn_res_input_payload_slices()
         if (
             decoder_padding_mask is not None
             and self.config.sequence_parallel
-            and decoder_reference is not None
-            and decoder_padding_mask.shape[1] != decoder_reference.shape[0]
+            and decoder_reference_len is not None
+            and decoder_padding_mask.shape[1] != decoder_reference_len
         ):
             decoder_padding_mask = (
                 tensor_parallel.scatter_to_sequence_parallel_region(
@@ -804,11 +830,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
             )
+        # With MTP the outer HybridStack may return one auxiliary value: mHC's
+        # pre-contraction multi-stream tensor or AttnRes's complete trunk source
+        # tuple. The modes are mutually exclusive, so disambiguate by config.
+        mhc_multistream = None
+        attn_res_sources = None
         if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
+            if self.config.enable_attention_residuals:
+                hidden_states, attn_res_sources = decoder_output
+            else:
+                hidden_states, mhc_multistream = decoder_output
         else:
             hidden_states = decoder_output
-            mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -887,6 +920,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 position_ids=mtp_inputs.position_ids,
                 hidden_states=mtp_inputs.hidden_states,
                 mhc_multistream=mtp_inputs.mhc_multistream,
+                attn_res_sources=attn_res_sources,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,

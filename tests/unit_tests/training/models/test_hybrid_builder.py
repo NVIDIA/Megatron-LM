@@ -79,6 +79,66 @@ class TestHybridModelConfigInitialization:
         config = _make_hybrid_config()
         assert config.hybrid_stack_spec is None
 
+    def test_own_field_not_shadowed_by_transformer_field(self):
+        """Own dataclass fields must stay on the model config even when
+        TransformerConfig declares a same-named field.
+
+        ``hybrid_layer_pattern`` exists on both classes; the __setattr__ proxy
+        used to route the model-config value to the transformer config, leaving
+        the class default (None) visible on the model config. The model then
+        silently built zero decoder layers.
+        """
+        config = _make_hybrid_config(hybrid_layer_pattern="M-M*|M-M*")
+        assert "hybrid_layer_pattern" in HybridModelConfig.__dataclass_fields__
+        assert "hybrid_layer_pattern" in type(config.transformer).__dataclass_fields__
+        assert config.hybrid_layer_pattern == "M-M*|M-M*"
+        # Explicit assignment after init must also land on the model config.
+        config.hybrid_layer_pattern = "MM|MM"
+        assert object.__getattribute__(config, "hybrid_layer_pattern") == "MM|MM"
+
+    @pytest.mark.parametrize("enable_attention_residuals", [False, True])
+    def test_finalize_syncs_pattern_for_attention_residuals(self, enable_attention_residuals):
+        """AttnRes payload widths read the pattern from the TransformerConfig."""
+        attn_res_kwargs = (
+            dict(enable_attention_residuals=True, attn_res_block_layers=2)
+            if enable_attention_residuals
+            else {}
+        )
+        config = _make_hybrid_config(
+            transformer=_make_transformer(num_layers=4, **attn_res_kwargs),
+            hybrid_layer_pattern="M*M*",
+        )
+        config.finalize()
+        expected = "M*M*" if enable_attention_residuals else None
+        assert config.transformer.hybrid_layer_pattern == expected
+
+    def test_finalize_rejects_mismatched_pattern_for_attention_residuals(self):
+        config = _make_hybrid_config(
+            transformer=_make_transformer(
+                num_layers=4,
+                enable_attention_residuals=True,
+                attn_res_block_layers=2,
+                hybrid_layer_pattern="MM**",
+            ),
+            hybrid_layer_pattern="M*M*",
+        )
+        with pytest.raises(ValueError, match="hybrid_layer_pattern"):
+            config.finalize()
+
+    def test_finalize_requires_is_hybrid_model_for_attention_residuals_with_pp(self):
+        config = _make_hybrid_config(
+            transformer=_make_transformer(
+                num_layers=6,
+                enable_attention_residuals=True,
+                attn_res_block_layers=2,
+                pipeline_model_parallel_size=2,
+                pipeline_dtype=torch.float32,
+            ),
+            hybrid_layer_pattern="M*|M*M*",
+        )
+        with pytest.raises(ValueError, match="is_hybrid_model"):
+            config.finalize()
+
 
 class TestHybridModelConfigGetAttr:
     """Tests for HybridModelConfig.__getattr__ — direct access vs. TransformerConfig proxy."""

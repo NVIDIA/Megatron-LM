@@ -27,6 +27,8 @@ from megatron.training.training import (
     validate_vision_flops_metadata,
 )
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
@@ -65,6 +67,8 @@ def _make_gpt_args(
     args.num_query_groups = num_attention_heads
     args.attention_output_gate = False
     args.gated_attention_proj_granularity = "elementwise"
+    args.enable_attention_residuals = False
+    args.attn_res_block_layers = None
     args.multi_latent_attention = False
     # MoE / MTP disabled.
     args.num_experts = None
@@ -833,6 +837,170 @@ class TestGatedDeltaProductFlops:
         assert flops_m4 - flops_m3 == expected_delta
 
 
+class TestAttentionResidualFlops:
+    """AttnRes FLOPs must follow the runtime depth-source schedule."""
+
+    @staticmethod
+    def _enabled_delta(args, batch_size=2, block_layers=2, **flops_kwargs):
+        disabled_args = SimpleNamespace(**vars(args))
+        disabled_args.enable_attention_residuals = False
+        disabled_args.attn_res_block_layers = None
+        disabled_flops = num_floating_point_operations(disabled_args, batch_size, **flops_kwargs)
+        enabled_args = SimpleNamespace(**vars(args))
+        enabled_args.enable_attention_residuals = True
+        enabled_args.attn_res_block_layers = block_layers
+        enabled_flops = num_floating_point_operations(enabled_args, batch_size, **flops_kwargs)
+        return enabled_flops - disabled_flops
+
+    @staticmethod
+    def _source_visits(num_layers, block_layers, *, hybrid, mtp_depths=0, mtp_entries=2):
+        """Simulate the residual-state transitions independently of the closed formula."""
+        sources = ["embedding"]
+        partial = []
+        visits = 0
+        for start in range(0, num_layers, block_layers):
+            if partial:
+                sources.append(tuple(partial))
+            partial = []
+            for layer in range(start, min(start + block_layers, num_layers)):
+                visits += len(sources) + bool(partial)
+                partial.append((layer, "attention"))
+                if not hybrid:
+                    visits += len(sources) + bool(partial)
+                    partial.append((layer, "mlp"))
+        trunk_history = (*sources, tuple(partial))
+        visits += len(trunk_history)
+        for depth in range(mtp_depths):
+            # A fresh projection/partial per depth; never append it to trunk_history.
+            depth_sources = (*trunk_history, (depth, "partial"))
+            for _ in range(mtp_entries):
+                visits += len(depth_sources)
+            visits += len(depth_sources)  # The per-depth output aggregation.
+        return visits
+
+    @staticmethod
+    def _hybrid_args(main_pattern, mtp_pattern=None, mtp_depths=0):
+        args = _make_mla_hybrid_args()
+        args.num_layers = len(main_pattern.replace("|", ""))
+        args.hybrid_layer_pattern = main_pattern + (f"/{mtp_pattern}" * mtp_depths)
+        args.mtp_num_layers = mtp_depths or None
+        args.linear_key_head_dim = args.linear_value_head_dim = 32
+        args.linear_num_key_heads = args.linear_num_value_heads = 8
+        args.linear_conv_kernel_dim = 4
+        args.num_experts = 4
+        args.moe_router_topk = 2
+        args.moe_ffn_hidden_size = 256
+        return args
+
+    def test_standard_transformer_counts_both_sublayers_and_final_head(self):
+        args = _make_gpt_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # Source arities for block size 2:
+        # attention = [1, 2, 2, 3], MLP = [2, 2, 3, 3], final = [3].
+        total_source_arity = 21
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
+
+    def test_hybrid_counts_pattern_entries_and_final_head(self):
+        args = _make_hybrid_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # A hybrid pattern entry is one sublayer. For block size 2, "*M*M"
+        # therefore has per-entry arities [1, 2, 2, 3] and final arity 3.
+        total_source_arity = 11
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
+
+    def test_standard_mtp_counts_three_aggregations_per_depth(self):
+        args = _make_gpt_args(num_layers=4)
+        args.mtp_num_layers = 2
+        total_tokens = 2 * args.seq_length
+
+        # The trunk contributes 21 source-visits. Its final history has arity
+        # three; each MTP depth adds a fresh partial to three aggregations.
+        total_source_arity = 21 + 2 * 3 * 4
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize("mtp_depths", [0, 1, 2])
+    @pytest.mark.parametrize(
+        ("num_layers", "block_layers"),
+        [(1, 1), (1, 8), (3, 1), (4, 2), (5, 2), (5, 3), (7, 4), (32, 24)],
+    )
+    def test_matches_residual_state_transitions(self, hybrid, mtp_depths, num_layers, block_layers):
+        if hybrid:
+            args = self._hybrid_args("K" * num_layers, "+E", mtp_depths)
+        else:
+            args = _make_gpt_args(num_layers=num_layers)
+            args.mtp_num_layers = mtp_depths or None
+        visits = self._source_visits(num_layers, block_layers, hybrid=hybrid, mtp_depths=mtp_depths)
+        expected = 3 * 4 * (2 * args.seq_length) * args.hidden_size * visits
+        assert self._enabled_delta(args, block_layers=block_layers) == expected
+
+    @pytest.mark.parametrize("mtp_pattern", ["+", "+E", "KE", "+EKE+E"])
+    @pytest.mark.parametrize("mtp_depths", [1, 2])
+    @pytest.mark.parametrize("block_layers", [1, 3, 24])
+    def test_hybrid_mtp_entries_share_trunk_history(self, mtp_pattern, mtp_depths, block_layers):
+        # Uneven pipeline segmentation must not add a source or reset depth history.
+        args = self._hybrid_args("K-|KE+E", mtp_pattern, mtp_depths)
+        visits = self._source_visits(
+            6, block_layers, hybrid=True, mtp_depths=mtp_depths, mtp_entries=len(mtp_pattern)
+        )
+        expected = 3 * 4 * (2 * args.seq_length) * args.hidden_size * visits
+        assert self._enabled_delta(args, block_layers=block_layers) == expected
+
+    @pytest.mark.parametrize("block_layers", [1, 2, 5])
+    @pytest.mark.parametrize("mtp_depths", [0, 1, 2])
+    def test_equivalent_gpt_and_hybrid_block_units(self, block_layers, mtp_depths):
+        gpt = _make_gpt_args(num_layers=4)
+        gpt.mtp_num_layers = mtp_depths or None
+        hybrid = _make_hybrid_args(num_layers=8)
+        hybrid.hybrid_layer_pattern = "*-|*-*-*-" + "/*-" * mtp_depths
+        hybrid.mtp_num_layers = mtp_depths or None
+        assert self._enabled_delta(gpt, block_layers=block_layers) == self._enabled_delta(
+            hybrid, block_layers=2 * block_layers
+        )
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize(("tokens", "sum_sq"), [(0, 0), (150, 12500), (150, 22500)])
+    def test_packed_tokens_scale_linearly(self, hybrid, tokens, sum_sq):
+        args = self._hybrid_args("K-+E", "+E", 2) if hybrid else _make_gpt_args(num_layers=4)
+        args.mtp_num_layers = 2
+        visits = self._source_visits(4, 2, hybrid=hybrid, mtp_depths=2)
+        assert (
+            self._enabled_delta(
+                args, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq
+            )
+            == 3 * 4 * tokens * args.hidden_size * visits
+        )
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize("block_layers", [None, 0, -1, 1.5, True, "2"])
+    def test_invalid_block_size(self, hybrid, block_layers):
+        args = self._hybrid_args("K-+E", "+E", 2) if hybrid else _make_gpt_args()
+        with pytest.raises(ValueError, match="positive integer"):
+            self._enabled_delta(args, block_layers=block_layers)
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    def test_missing_optional_flags_preserves_disabled_flops(self, hybrid):
+        args = self._hybrid_args("K-+E", "+E", 2) if hybrid else _make_gpt_args()
+        expected = num_floating_point_operations(args, 2)
+        del args.enable_attention_residuals
+        del args.attn_res_block_layers
+        assert num_floating_point_operations(args, 2) == expected
+
+    @pytest.mark.parametrize("backend", ["eager", "compile", "fla"])
+    def test_nominal_flops_are_backend_independent(self, backend):
+        args = _make_gpt_args(num_layers=4)
+        args.attn_res_impl = backend
+        assert self._enabled_delta(args) == 3 * 4 * (2 * args.seq_length) * args.hidden_size * 21
+
+
 class TestPaddingRemoval:
     """``total_real_tokens_in_batch`` removes padding from token-linear FLOPs.
 
@@ -1167,6 +1335,35 @@ class TestAccumulatorDistributed:
 
         _reset_seqlen_accumulator()
         Utils.destroy_model_parallel()
+
+    def test_distributed_rank_is_global(self):
+        """Multi-node runs must not reuse node-local ranks in the world group."""
+        import os
+
+        from tests.unit_tests.test_utilities import Utils
+
+        assert Utils.rank == int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+
+    @pytest.mark.parametrize(
+        "global_rank,local_rank,world_size,expected_rank",
+        [(6, 2, 8, 6), (6, 2, 4, -1), (6, None, 8, 6), (None, 2, 8, 2)],
+    )
+    def test_resize_uses_global_rank(
+        self, monkeypatch, global_rank, local_rank, world_size, expected_rank
+    ):
+        """Resizing a test world must select global, not per-node, participants."""
+        from tests.unit_tests.test_utilities import Utils
+
+        monkeypatch.setattr(Utils, 'rank', Utils.rank)
+        monkeypatch.setattr(Utils, 'world_size', Utils.world_size)
+        monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
+        for name, value in [('RANK', global_rank), ('LOCAL_RANK', local_rank)]:
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, str(value))
+        Utils.set_world_size(world_size=world_size)
+        assert Utils.rank == expected_rank
 
     def test_pure_dp_sums_across_ranks(self):
         from tests.unit_tests.test_utilities import Utils

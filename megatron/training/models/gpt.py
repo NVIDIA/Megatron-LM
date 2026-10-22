@@ -129,6 +129,7 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             use_kitchen_attention=config.transformer.use_kitchen_attention,
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
             enable_hyper_connection=config.transformer.enable_hyper_connections,
+            enable_attention_residual=config.transformer.enable_attention_residuals,
             mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
             use_grouped_gemm_for_dense_mlp=config.transformer.use_grouped_gemm_for_dense_mlp,
             **kwargs,
@@ -145,6 +146,7 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             use_kitchen_attention=transformer_cfg.use_kitchen_attention,
             kitchen_attention_backend=transformer_cfg.kitchen_attention_backend,
             enable_hyper_connection=transformer_cfg.enable_hyper_connections,
+            enable_attention_residual=transformer_cfg.enable_attention_residuals,
         )
 
 
@@ -216,6 +218,14 @@ class GPTModelConfig(ModelConfig):
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
+        # Own dataclass fields always live on this object: proxying them to the
+        # embedded TransformerConfig would leave the class-level default visible
+        # through normal attribute lookup on self whenever TransformerConfig
+        # declares a same-named field (e.g. ``hybrid_layer_pattern``), silently
+        # dropping the configured value.
+        if name in type(self).__dataclass_fields__:
+            super().__setattr__(name, value)
+            return
         # Use object.__getattribute__ to avoid triggering __getattr__ while
         # `transformer` may not yet exist (e.g. during dataclass __init__).
         try:

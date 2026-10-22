@@ -211,6 +211,15 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         wrapper with TE fallback for unsupported operations.
     """
 
+    if config.enable_attention_residuals:
+        # These specs build plain/mHC TransformerLayers, which do not aggregate the depth
+        # sources. Hybrid stacks select experimental attention variants through their own
+        # layer specs and are unaffected; this function only builds GPT stacks.
+        raise NotImplementedError(
+            "enable_attention_residuals is not yet supported with experimental_attention_variant "
+            "on GPT stacks; use a hybrid model (hybrid_layer_pattern) instead."
+        )
+
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
