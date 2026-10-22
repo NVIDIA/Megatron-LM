@@ -93,6 +93,16 @@ async def main(
         num_requests_added = 0
         next_suspend_at = args.suspend_resume_interval or 0
         cycles_done = 0
+        batch_boundaries = (
+            {int(boundary) for boundary in args.batch_boundaries.split(",")}
+            if args.drain_between_batches and args.batch_boundaries
+            else set()
+        )
+
+        async def wait_for_batch_boundary():
+            """Drain submitted requests before starting the next configured batch."""
+            if num_requests_added in batch_boundaries and futures:
+                await asyncio.gather(*futures)
 
         while True:
             current_time = time.time_ns() / 10**9
@@ -102,6 +112,7 @@ async def main(
                     num_requests_added < num_requests_total
                     and requests[num_requests_added].time_arrival <= current_time
                 ):
+                    await wait_for_batch_boundary()
                     request = requests[num_requests_added]
                     # These add-request calls will queue up the request on a zmq socket and return
                     # instantaneously. They will return an asyncio future which can be awaited for
@@ -122,6 +133,7 @@ async def main(
                 for i in range(
                     min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
                 ):
+                    await wait_for_batch_boundary()
                     # Change sampling parameters to force different generation lengths.
                     request = requests[num_requests_added]
                     n = request.sampling_params.num_tokens_to_generate

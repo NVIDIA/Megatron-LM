@@ -511,10 +511,12 @@ def validate_args(args, defaults={}):
 
     update_use_dist_ckpt(args)
 
-    # GTP_remat counts toward total_model_size (an independent weight-shard axis), so the
-    # args.data_parallel_size below is the replicate degree (matches
-    # parallel_state). gtp_weight_remat_size is derived from --tensor-parallel-num-weight-shards.
+    # Resolve the actual weight degree before deriving the rank layout. Independent
+    # sample count is computed separately below, including when CP overlaps GTP.
     from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+    from megatron.core.tensor_parallel.gtp_parallel_layout import (
+        resolve_tensor_parallel_sequence_shards,
+    )
 
     args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
@@ -523,12 +525,29 @@ def validate_args(args, defaults={}):
             getattr(args, "gtp_weight_remat_size", 1),
         )
     )
+    (args.tensor_parallel_num_sequence_shards, args.gtp_remat_num_sequence_shards) = (
+        resolve_tensor_parallel_sequence_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_sequence_shards,
+            args.gtp_weight_remat_size,
+            args.sequence_parallel,
+        )
+    )
     total_model_size = (
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
         * args.gtp_weight_remat_size
     )
+    # Normalize CLI CP once: downstream args/config consumers expect the full runtime group size.
+    args.context_parallel_size *= args.gtp_remat_num_sequence_shards
+    if args.gtp_remat_num_sequence_shards > 1:
+        if args.ckpt_format != "torch_dist":
+            raise ValueError("GTP sequence sharding requires --ckpt-format torch_dist")
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
+        if args.use_tp_pp_dp_mapping:
+            raise ValueError("GTP sequence sharding does not support --use-tp-pp-dp-mapping")
 
     # Total model size.
     assert (
@@ -543,13 +562,12 @@ def validate_args(args, defaults={}):
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
-    total_model_size = (
+    args.data_parallel_size = args.world_size // total_model_size
+    args.batch_parallel_size = args.world_size // (
         args.tensor_model_parallel_size
         * args.pipeline_model_parallel_size
         * args.context_parallel_size
-        * args.gtp_weight_remat_size
     )
-    args.data_parallel_size = args.world_size // total_model_size
 
     from megatron.training.config import InferenceSetupConfig, RLConfig
 
@@ -558,7 +576,7 @@ def validate_args(args, defaults={}):
 
     print_rank_0(
         'using world size: {}, data-parallel size: {}, '
-        'context-parallel size: {}, '
+        'resolved context-parallel group size: {}, '
         'hierarchical context-parallel sizes: {}, '
         'tensor-model-parallel size: {}, '
         'pipeline-model-parallel size: {}'.format(
@@ -707,7 +725,7 @@ def validate_args(args, defaults={}):
     if args.step_batch_size_schedule is not None and is_global_batch_size_explicitly_specified:
         raise ValueError('Cannot specify both --step-batch-size-schedule and --global-batch-size')
     if args.global_batch_size is None:
-        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
+        args.global_batch_size = args.micro_batch_size * args.batch_parallel_size
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
@@ -716,17 +734,13 @@ def validate_args(args, defaults={}):
         args.eval_global_batch_size = args.global_batch_size
     if args.eval_micro_batch_size is None:
         args.eval_micro_batch_size = args.micro_batch_size
-    # data_parallel_size is the replicate degree, so multiply the GTP-remat axis back in: evaluate()
-    # divides eval_global_batch_size by the same product to get its microbatch count, and without
-    # gtp_weight_remat_size here that division can silently floor (down to zero microbatches).
+    # Evaluation microbatches depend on independent sequences, not weight shards.
     assert (
-        args.eval_global_batch_size
-        % (args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size)
-        == 0
+        args.eval_global_batch_size % (args.eval_micro_batch_size * args.batch_parallel_size) == 0
     ), (
         f"eval_global_batch_size ({args.eval_global_batch_size}) must be divisible by "
-        f"eval_micro_batch_size ({args.eval_micro_batch_size}) * data_parallel_size ({args.data_parallel_size})"
-        f" * gtp_weight_remat_size ({args.gtp_weight_remat_size})"
+        f"eval_micro_batch_size ({args.eval_micro_batch_size}) "
+        f"* batch_parallel_size ({args.batch_parallel_size})"
     )
 
     # === Hybrid layer pattern: deprecation handling and validation ===
@@ -1335,11 +1349,6 @@ def validate_args(args, defaults={}):
                     "--accumulate-allreduce-grads-in-fp32 already reduces in fp32"
                 )
 
-    if args.cuda_graph_impl == "full_iteration":
-        assert (
-            not args.check_for_nan_in_loss_and_grad
-        ), "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-impl=full_iteration for training."
-
     if args.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
         if args.fp8 is not None:
             assert args.transformer_impl == "inference_optimized", (
@@ -1366,13 +1375,6 @@ def validate_args(args, defaults={}):
 
     # data
     assert args.num_dataset_builder_threads > 0
-
-    # Consumed tokens.
-    args.consumed_train_samples = 0
-    args.skipped_train_samples = 0
-    args.consumed_valid_samples = 0
-    if args.rl_use_sequence_packing:
-        args.consumed_train_bins = 0
 
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
@@ -1441,8 +1443,9 @@ def validate_args(args, defaults={}):
 
     if args.seq_length is not None and args.context_parallel_size > 1:
         assert args.seq_length % (args.context_parallel_size * 2) == 0, (
-            'seq-length should be a multiple of 2 * context-parallel-size '
-            'if context-parallel-size > 1.'
+            f"seq-length ({args.seq_length}) must be a multiple of 2 * the resolved "
+            f"context-parallel group size ({args.context_parallel_size}), "
+            "including GTP sequence shards."
         )
 
     if getattr(args, 'dataloader_inter_document_masking', False):
@@ -1689,21 +1692,7 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-    # Derive the internal gtp_weight_remat_size from the user-facing
-    # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
-    # from argument generation), so it is set here as a fresh attribute on args before it is
-    # consumed below (and in initialize/training, which read args.gtp_weight_remat_size directly).
-    # Mirrors ModelParallelConfig.__post_init__.
-    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-
-    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
-        resolve_tensor_parallel_weight_shards(
-            args.tensor_model_parallel_size,
-            args.tensor_parallel_num_weight_shards,
-            getattr(args, "gtp_weight_remat_size", 1),
-        )
-    )
-    # Same for the expert layers: derive the internal expert_gtp_weight_remat_size from the
+    # Derive the internal expert_gtp_weight_remat_size from the
     # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
     # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
     args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size = (
@@ -2173,11 +2162,11 @@ def validate_args(args, defaults={}):
             )
 
     # The PG-distribution cache stores one file per parallelization group, keyed by
-    # that group's minimum global rank, and each file holds both the save and the
-    # load distribution. If save and load used different parallelization groups,
-    # two distinct groups could map to the same file (they can share a minimum
-    # global rank), so one side would silently read a distribution computed for the
-    # other group's layout. Require both sides to use the same group.
+    # that group's ordered global ranks, and each file holds both the save and the
+    # load distribution derived from one gather over that group. A single create
+    # run (even one that only loads) therefore covers later saves only when save
+    # and load use the same group; otherwise a read run finds no cache file for the
+    # other side's group. Require both sides to use the same group.
     if args.ckpt_pg_tensors_cache_path is not None:
         assert (
             args.ckpt_fully_parallel_save_process_group
@@ -2187,12 +2176,37 @@ def validate_args(args, defaults={}):
             "--ckpt-fully-parallel-load-process-group to be identical, but got "
             f"save='{args.ckpt_fully_parallel_save_process_group}' and "
             f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
-            "parallelization group, so mixing groups can read a distribution computed for a "
-            "different layout."
+            "parallelization group, so with mixed groups a run that creates the cache for one "
+            "side leaves the other side without a cache file."
         )
 
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
+
+    if args.stream_ckpt_dequant:
+        # Inference-only load path: the loaded state dict holds the re-quantized params
+        # themselves, so nothing that consumes the loaded values in high precision (optimizer
+        # main params) may run. `load_checkpoint` additionally refuses any optimizer.
+        assert args.no_load_optim and not args.finetune, (
+            '--stream-ckpt-dequant is an inference-only load path: it requires --no-load-optim '
+            'and cannot be used with --finetune.'
+        )
+        assert not args.load_main_params_from_ckpt, (
+            '--stream-ckpt-dequant cannot be used with --load-main-params-from-ckpt: the main '
+            'params would be initialized from the re-quantized params instead of the '
+            'high-precision checkpoint values.'
+        )
+        assert args.fp8 is None or args.fp8_recipe != 'delayed', (
+            '--stream-ckpt-dequant does not support --fp8-recipe delayed (its scale is only '
+            'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
+        )
+        assert (
+            not args.ckpt_fully_parallel_load
+            or args.ckpt_fully_parallel_load_exchange_algo == 'broadcast'
+        ), (
+            '--stream-ckpt-dequant supports --ckpt-fully-parallel-load only with '
+            '--ckpt-fully-parallel-load-exchange-algo broadcast.'
+        )
 
     if args.use_dist_ckpt and args.async_save:
         if not args.use_persistent_ckpt_worker:
@@ -2414,8 +2428,16 @@ def validate_args(args, defaults={}):
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
     assert not (
-        args.moe_shortcut_connection and args.cuda_graph_impl != "none"
-    ), "CUDA graphs are not supported with --moe-shortcut-connection."
+        args.moe_shortcut_connection
+        and args.cuda_graph_impl != "none"
+        and not (
+            args.cuda_graph_impl == "local"
+            and args.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        )
+    ), (
+        "--moe-shortcut-connection supports CUDA graphs only with "
+        "--cuda-graph-impl=local and --inference-cuda-graph-scope=block."
+    )
 
     if args.multi_latent_attention:
         assert (
@@ -2897,7 +2919,9 @@ def _add_inference_args(parser):
         choices=['raw_logprobs', 'processed_logprobs'],
         help='How returned inference log-probs are computed engine-wide. '
         '"raw_logprobs" (default) uses the unmodified model logits; '
-        '"processed_logprobs" uses temperature and filters by top-k/top-p.',
+        '"processed_logprobs" applies temperature and top-k/top-p to '
+        'sampled-token and top-N log-probs. Prompt log-probs, '
+        'including prompt top-N, are always raw.',
     )
     group.add_argument(
         '--inference-logging-step-interval',
@@ -2968,6 +2992,14 @@ def _add_inference_args(parser):
         'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
         'is several independent decode instances.',
     )
+    group.add_argument(
+        '--disagg-kv-transport-backend',
+        type=str,
+        default='nixl',
+        choices=['nccl', 'nixl'],
+        help='State transport for native disaggregated inference: '
+        '"nccl" uses two-sided transfers and "nixl" uses one-sided pulls.',
+    )
     return parser
 
 
@@ -3026,7 +3058,6 @@ def _add_network_size_args(parser):
         "gated_linear_unit",
         "bias_activation_fusion",
         "activation_func_fp8_input_store",
-        "test_mode",
         "memory_efficient_layer_norm",
         "fused_single_qkv_rope",
         "fp8_dot_product_attention",
@@ -4195,6 +4226,14 @@ def _add_distributed_args(parser):
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument(
+        '--use-megatron-fsdp',
+        action='store_true',
+        default=False,
+        help="Use Megatron's Fully Sharded Data Parallel. "
+        "Cannot be used together with use_torch_fsdp2.",
+    )
+
+    group.add_argument(
         '--decoder-first-pipeline-num-layers',
         type=int,
         default=None,
@@ -4538,14 +4577,6 @@ def _add_distributed_args(parser):
         type=str,
         default=None,
         choices=['dp_balanced', 'default_dynamic_cp'],
-    )
-    group.add_argument(
-        '--fake-process-group',
-        action='store_true',
-        default=False,
-        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
-                       This is quite useful for profiling memory usage of distributed training with just one GPU. \
-                       Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.',
     )
     group.add_argument(
         '--use-layer-wise-param-layout',

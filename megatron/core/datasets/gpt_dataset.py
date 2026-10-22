@@ -300,7 +300,10 @@ class GPTDataset(MegatronDataset):
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
+                # Cache a copy: loss_mask is masked in place below, so caching the
+                # tensor itself would bake this sample's padding into every
+                # subsequent sample served by this dataset.
+                self.cached_loss_mask = loss_mask.clone()
                 self.cached_position_ids = position_ids
                 self.masks_and_position_ids_are_cached = True
         else:

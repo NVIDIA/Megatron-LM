@@ -19,6 +19,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     InferenceBatchDimensions,
 )
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
@@ -364,6 +365,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
 
+    # True when any pipeline stage holds recurrent (Mamba/GDN) layers. `__init__` sets it
+    # from a pipeline collective; the default describes an attention-only model.
+    pipeline_has_recurrent_layers: bool = False
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message=(
@@ -482,10 +487,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
-                assert not self.enable_prefix_caching, (
-                    "batch_invariant_mode does not support Mamba prefix caching; "
-                    "set enable_prefix_caching=False."
-                )
+                if self.enable_prefix_caching:
+                    assert inference_config.block_size_tokens % self.ssm_chunk_alignment == 0, (
+                        "batch-invariant Mamba prefix caching requires block_size_tokens "
+                        "to be a multiple of ssm_chunk_alignment so restored states "
+                        "start at the same scan boundary as uncached prefill."
+                    )
                 assert self.num_speculative_tokens == 0, (
                     "batch_invariant_mode for Mamba dynamic inference only supports "
                     "one-token decode; set num_speculative_tokens=0."
@@ -629,6 +636,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         mamba_max_requests = float('inf')
+        # Handoff may retain every request-owned recurrent-state slot after the requests leave
+        # the batch. An idle EP rank must still run a dummy forward to join its peers' expert
+        # collectives, so disaggregated callers can reserve one slot outside request capacity.
+        self.reserve_recurrent_state_dummy_slot = bool(
+            self.is_hybrid_model
+            and inference_config.reserve_recurrent_state_dummy_slot
+            and model_config.expert_model_parallel_size > 1
+        )
+        reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
+        reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
 
         if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
             assert self.is_hybrid_model
@@ -637,7 +654,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # Calculate total memory before partition
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
             mamba_memory_bytes = total_memory * mamba_memory_ratio
-            mamba_max_requests = int(mamba_memory_bytes // mamba_states_memory_per_request)
+            mamba_max_requests = (
+                int(mamba_memory_bytes // mamba_states_memory_per_request) - reserved_mamba_slots
+            )
+            if mamba_max_requests < 1:
+                raise ValueError(
+                    f"mamba_memory_ratio {mamba_memory_ratio} leaves no request capacity after "
+                    f"reserving {reserved_mamba_slots} recurrent-state dummy slot(s)"
+                )
 
             # Reduce buffer sizes for KV cache
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
@@ -650,10 +674,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
             # mamba memory for max_requests, and give the rest to KV cache blocks.
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_needed = inference_config.max_requests * mamba_states_memory_per_request
+            mamba_memory_needed = (
+                inference_config.max_requests * mamba_states_memory_per_request
+                + reserved_mamba_bytes
+            )
             assert mamba_memory_needed < total_memory, (
-                f"Not enough memory for {inference_config.max_requests} mamba requests. "
-                f"Need {mamba_memory_needed / 1024**3:.2f} GB for mamba states, "
+                f"Not enough memory for {inference_config.max_requests} mamba requests "
+                f"plus {reserved_mamba_slots} reserved EP dummy slot(s). "
+                f"Need {mamba_memory_needed / 1024**3:.2f} GB for recurrent states, "
                 f"but total buffer is {total_memory / 1024**3:.2f} GB."
             )
             mamba_max_requests = inference_config.max_requests
@@ -678,10 +706,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # If using pipeline parallelism synchronize the total block count in case the
         # pipeline stages have different layer allocations. Non-uniform block counts
         # can lead to some ranks pausing requests earlier than other ranks
-        # (i.e., divergence in the scheduling behavior).
+        # (i.e., divergence in the scheduling behavior). The same collective reports
+        # whether every stage holds recurrent (Mamba/GDN) layers; the MIN of the
+        # negated flag is the negated MAX.
+        self.pipeline_has_recurrent_layers = self.is_hybrid_model
         if pp_size > 1:
+            has_recurrent_layers = int(self.is_hybrid_model)
             block_count_tensor = torch.tensor(
-                (block_count, paused_block_count),
+                (block_count, paused_block_count, has_recurrent_layers, -has_recurrent_layers),
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
@@ -692,6 +724,34 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
             block_count = block_count_tensor[0].item()
             paused_block_count = block_count_tensor[1].item()
+            all_stages_recurrent = block_count_tensor[2].item() == 1
+            self.pipeline_has_recurrent_layers = block_count_tensor[3].item() == -1
+
+            # Every stage must skip the same prompt tokens on a prefix-cache hit. With a
+            # Mamba cache budget, a recurrent stage skips only the blocks whose Mamba
+            # state it can restore, which a stage without recurrent layers cannot track;
+            # the recurrent stages would also wait alone in the cache-capacity
+            # negotiation. Every stage sees the same reduced flags, so all of them raise
+            # here together. Memory-only prefix caching skips no prompt tokens on any
+            # stage (see `_compute_prefix_match`), so it stays available.
+            mamba_prefix_cache_requested = (
+                self.enable_prefix_caching
+                and inference_config.prefix_caching_mamba_gb is not None
+                and inference_config.prefix_caching_mamba_gb > 0
+            )
+            if (
+                mamba_prefix_cache_requested
+                and self.pipeline_has_recurrent_layers
+                and not all_stages_recurrent
+            ):
+                raise ValueError(
+                    "Mamba prefix caching (prefix_caching_mamba_gb > 0) with pipeline "
+                    "parallelism requires every pipeline stage of a hybrid model to hold at "
+                    "least one Mamba or GDN layer, but this stage holds "
+                    f"{'some' if self.is_hybrid_model else 'none'} and another stage "
+                    "differs. Place a recurrent layer on every pipeline stage, or leave "
+                    "prefix_caching_mamba_gb unset for memory-only prefix caching."
+                )
 
         self.kv_block_allocator = KVBlockAllocator(
             context=self,
@@ -972,24 +1032,27 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 * self.num_mamba_layers
             )
             mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
-            mamba_total_bytes = mamba_bytes_per_req * self.max_requests
+            state_slot_count = self.max_requests + int(self.reserve_recurrent_state_dummy_slot)
+            mamba_total_bytes = mamba_bytes_per_req * state_slot_count
             log_lines += [
                 f"  Mamba states:",
                 f"    num_mamba_layers:      {self.num_mamba_layers}",
                 f"    conv_state_shape:      {self.mamba_conv_states_shape}",
                 f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
                 f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
-                f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
+                f"    total ({state_slot_count} state slots):  "
+                f"{get_mem_size_str(mamba_total_bytes)}",
             ]
 
             if self.num_speculative_tokens > 0:
                 spec_multiplier = self.num_speculative_tokens + 1
                 spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
-                spec_total_bytes = spec_bytes_per_req * self.max_requests
+                spec_total_bytes = spec_bytes_per_req * state_slot_count
                 log_lines += [
                     f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
                     f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
-                    f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
+                    f"    total ({state_slot_count} state slots):  "
+                    f"{get_mem_size_str(spec_total_bytes)}",
                 ]
 
             prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
@@ -1062,6 +1125,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 max_intermediate_count=self.max_mamba_intermediate_states_per_step,
+                reserve_dummy_state_slot=self.reserve_recurrent_state_dummy_slot,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
                 decode_indices_dtype=self._mamba_decode_indices_dtype,
@@ -1091,13 +1155,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 )
             self.mamba_metadata.bind_cpu_buffers(_mamba_cpu_bufs)
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
+            state_slot_count = self.max_requests + int(self.reserve_recurrent_state_dummy_slot)
             self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                (self.num_mamba_layers, state_slot_count) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
                 device=torch.cuda.current_device(),
             )
             self.mamba_ssm_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                (self.num_mamba_layers, state_slot_count) + self.mamba_ssm_states_shape,
                 dtype=self.mamba_ssm_states_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -1105,7 +1170,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.mamba_intermediate_conv_states = torch.empty(
                     (
                         self.num_mamba_layers,
-                        self.max_requests,
+                        state_slot_count,
                         self.num_speculative_tokens + 1,
                         *self.mamba_conv_states_shape,
                     ),
@@ -1115,7 +1180,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.mamba_intermediate_ssm_states = torch.empty(
                     (
                         self.num_mamba_layers,
-                        self.max_requests,
+                        state_slot_count,
                         self.num_speculative_tokens + 1,
                         *self.mamba_ssm_states_shape,
                     ),
@@ -2458,10 +2523,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.request_query_lengths[0:N],
             )
 
-            # 5. Mamba state: allocate slots for dummy requests.
-            self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
-                self.mamba_metadata.batch_allocate_slots(N)
-            )
+            # 5. An EP dummy step has one synthetic decode request. Its output is discarded, so
+            # the dedicated slot can be reused without request allocation or handoff retention.
+            if self.mamba_metadata.dummy_state_idx is not None:
+                assert N == 1, "The reserved recurrent-state dummy slot supports one request"
+            else:
+                dummy_slots = self.mamba_metadata.batch_allocate_slots(N)
+                assert (
+                    dummy_slots is not None
+                ), f"No free recurrent-state slots for {N} expert-parallel dummy request(s)"
+                self.mamba_metadata.request_to_mamba_state_idx[0:N] = dummy_slots
 
     def initialize_attention_state(
         self,
@@ -2716,8 +2787,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
                     self.mamba_slot_allocator.get_intermediate_cpu_data()
                 )
+            active_mamba_indices = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
+            if (
+                is_expert_parallel_dummy_cuda_graph_step
+                and self.mamba_metadata.dummy_state_indices is not None
+            ):
+                active_mamba_indices = self.mamba_metadata.dummy_state_indices
             self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
-                active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
+                active_mamba_indices=active_mamba_indices,
                 token_to_request_idx=self.token_to_request_idx[: self.active_token_count],
                 cpu_cu_query=self._cpu_mha_cu_query_seq_lengths,
                 batch_dimensions=attn_dimensions,
@@ -2728,7 +2805,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             )
 
         if self.moe_enable_routing_replay:
-            if self.using_cuda_graph_this_step():
+            if (
+                self.config.async_sched_mode == AsyncScheduleMode.ASYNC
+                or self.using_cuda_graph_this_step()
+            ):
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
@@ -3232,7 +3312,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     prefix_skip_tokens = raw_skip
             else:
                 prefix_skip_tokens = 0
-        elif self.is_hybrid_model:
+        elif self.is_hybrid_model or self.pipeline_has_recurrent_layers:
+            # A stage without recurrent layers in a hybrid pipeline follows the
+            # recurrent stages' rule, so every stage skips the same prompt tokens.
             if record_mamba_match:
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
@@ -4879,23 +4961,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         return no_top_k, no_top_p
 
     def _processed_log_probs(
-        self,
-        logits: Tensor,
-        n_active: int,
-        active_query_lengths: Optional[Tensor],
-        sampling: Optional[Sampling],
-        row_to_request: Optional[Tensor] = None,
+        self, logits: Tensor, sampling: Optional[Sampling], row_to_request: Optional[Tensor] = None
     ) -> Tensor:
         """Calculate raw or sampling-processed per-row log probabilities.
 
         Args:
             logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
-            n_active (int): Number of active requests represented by the rows.
-            active_query_lengths (Optional[Tensor]): CPU token counts used to
-                map prefill rows to active requests, or `None` for decode.
             sampling (Optional[Sampling]): Backend providing processed logprobs.
             row_to_request (Optional[Tensor]): Explicit CPU mapping from each
-                logit row to an active request.
+                logit row to an active request, or `None` if row `i` belongs to
+                active request `i`.
 
         Returns:
             Tensor: Per-row log probabilities over the vocabulary.
@@ -4904,10 +4979,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return F.log_softmax(logits, dim=-1)
 
         assert sampling is not None, "processed_logprobs requires a sampling backend"
-
-        # Map each logits row to its active request.
-        if row_to_request is None and active_query_lengths is not None:
-            row_to_request = torch.arange(n_active).repeat_interleave(active_query_lengths)
         return sampling.log_probs_kernel(logits, self, token_to_request_index=row_to_request)
 
     def calculate_log_probs_tensors(
@@ -4941,9 +5012,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             active_logits = logits_squeezed[: len(new_tokens)].float()
-            log_probs = self._processed_log_probs(
-                active_logits, n_active, None, sampling, row_to_request
-            )
+            log_probs = self._processed_log_probs(active_logits, sampling, row_to_request)
             selected_log_probs = log_probs[seq_idx, new_tokens]
             if self.config.logprobs_mode != "raw_logprobs" and not all(
                 self.active_sampling_filter_flags(n_active)
@@ -4965,8 +5034,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return selected_log_probs, log_probs
 
         logits_squeezed = logits_squeezed.float()
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        active_query_lengths_cpu = self.request_query_lengths[active_slice]
         active_query_lengths_gpu = self.gpu_view.request_query_lengths[:n_active]
 
         # Shift away each request's first prompt token, then insert its sampled token.
@@ -4974,23 +5041,37 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         new_token_idx = active_query_lengths_gpu.cumsum(0) - 1
         active_token_ids[new_token_idx] = new_tokens
 
-        log_probs = self._processed_log_probs(
-            logits_squeezed, n_active, active_query_lengths_cpu, sampling
-        )
+        # Prompt rows score tokens the engine did not sample, so they always use the
+        # raw distribution. Sampling settings apply only to engine-sampled rows. Top-N
+        # log-probs are read from `log_probs`, so prompt top-N stays raw as well.
+        log_probs = F.log_softmax(logits_squeezed, dim=-1)
+        num_sampled = 0
+        if self.config.logprobs_mode != "raw_logprobs":
+            # A partial chunk's final row scores its next prompt token. The chunked
+            # prefill request is always the last active request.
+            num_sampled = n_active
+            chunked_idx = self.get_index_of_chunked_prefill_request(safe=True)
+            if chunked_idx != -1:
+                assert (
+                    chunked_idx == self.total_request_count - 1
+                ), "chunked prefill request must be the last active request"
+                num_sampled -= 1
+            if num_sampled > 0:
+                sampled_idx = new_token_idx[:num_sampled]
+                sampled_logits = logits_squeezed[sampled_idx]
+                log_probs[sampled_idx] = self._processed_log_probs(
+                    sampled_logits, sampling, torch.arange(num_sampled)
+                )
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
         selected_log_probs = log_probs[seq_idx, active_token_ids]
-        if self.config.logprobs_mode != "raw_logprobs" and not all(
-            self.active_sampling_filter_flags(n_active)
-        ):
-            # Only each request's final row is engine-sampled; prompt rows may keep -inf.
-            temperature = self.gpu_view.temperature[:n_active]
-            scaled = logits_squeezed[new_token_idx] / temperature.clamp(
-                min=MIN_SAMPLING_TEMPERATURE
-            ).unsqueeze(1)
-            gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+        if num_sampled > 0 and not all(self.active_sampling_filter_flags(n_active)):
+            # Sampled tokens outside the filtered support fall back to the tempered logprob.
+            temperature = self.gpu_view.temperature[:num_sampled]
+            scaled = sampled_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(1)
+            gathered = scaled.gather(1, new_tokens[:num_sampled].view(-1, 1).long()).squeeze(1)
             tempered = gathered - scaled.logsumexp(dim=1)
-            sampled = selected_log_probs[new_token_idx]
-            selected_log_probs[new_token_idx] = torch.where(
+            sampled = selected_log_probs[sampled_idx]
+            selected_log_probs[sampled_idx] = torch.where(
                 torch.isfinite(sampled), sampled, tempered
             )
         return selected_log_probs, log_probs

@@ -30,7 +30,10 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.ssm.gated_delta_net_test_cases import GatedDeltaNetModuleTestCases
+from tests.unit_tests.ssm.gated_delta_net_test_cases import (
+    HAVE_FUSED_PRE_GDR,
+    GatedDeltaNetModuleTestCases,
+)
 from tests.unit_tests.ssm.gated_delta_net_test_utils import _unpack_sequence
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
@@ -205,14 +208,6 @@ def test_gdn_kernel_backend_validation(backend):
         TransformerConfig(
             num_layers=1, hidden_size=128, num_attention_heads=2, gdn_kernel_backend=backend
         )
-
-
-try:
-    from causal_conv1d.cpp_functions import causal_conv1d_bwd_function
-except ImportError:
-    HAVE_FUSED_PRE_GDR = False
-else:
-    HAVE_FUSED_PRE_GDR = callable(causal_conv1d_bwd_function)
 
 
 def _make_gdn_config(**overrides):

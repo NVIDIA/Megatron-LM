@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
+import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -50,6 +51,81 @@ def test_gdn2_rejects_heads_not_divisible_by_cp():
             linear_num_key_heads=1,
             linear_num_value_heads=2,
         )
+
+
+def _make_glu_interleave_config(**overrides):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        gated_linear_unit=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize("kind", ["routed", "shared"])
+def test_glu_interleave_rejects_fp32_model_parameters(kind):
+    interleave_kwargs = (
+        {"moe_mlp_glu_interleave_size": 32}
+        if kind == "routed"
+        else {
+            "use_grouped_gemm_for_shared_expert": True,
+            "moe_shared_expert_intermediate_size": 256,
+            "moe_shared_expert_glu_interleave_size": 32,
+        }
+    )
+    with pytest.raises(
+        ValueError, match="GLU interleave is not supported with FP32 model parameters"
+    ):
+        _make_glu_interleave_config(params_dtype=torch.float32, **interleave_kwargs)
+
+
+@pytest.mark.parametrize("params_dtype", [torch.bfloat16, torch.float16])
+def test_glu_interleave_accepts_low_precision_model_parameters(params_dtype):
+    config = _make_glu_interleave_config(
+        params_dtype=params_dtype,
+        moe_mlp_glu_interleave_size=32,
+        use_grouped_gemm_for_shared_expert=True,
+        moe_shared_expert_intermediate_size=256,
+        moe_shared_expert_glu_interleave_size=32,
+    )
+
+    assert config.params_dtype == params_dtype
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({}, id="interleave-disabled"),
+        pytest.param(
+            {"gated_linear_unit": False, "moe_mlp_glu_interleave_size": 32}, id="non-glu-routed"
+        ),
+        pytest.param(
+            {
+                "gated_linear_unit": False,
+                "use_grouped_gemm_for_shared_expert": True,
+                "moe_shared_expert_intermediate_size": 256,
+                "moe_shared_expert_glu_interleave_size": 32,
+            },
+            id="non-glu-shared",
+        ),
+        pytest.param(
+            {
+                "moe_shared_expert_intermediate_size": 256,
+                "moe_shared_expert_glu_interleave_size": 32,
+            },
+            id="shared-without-grouped-gemm",
+        ),
+    ],
+)
+def test_inactive_glu_interleave_accepts_fp32_model_parameters(overrides):
+    config = _make_glu_interleave_config(params_dtype=torch.float32, **overrides)
+
+    assert config.params_dtype == torch.float32
 
 
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
@@ -393,8 +469,8 @@ def test_attn_logit_softcapping_rejects_invalid_values(softcap):
         pytest.param(
             {"num_moe_experts": 2, "moe_shortcut_connection": True, "cuda_graph_impl": "local"},
             AssertionError,
-            "CUDA graphs are not supported",
-            id="cuda-graphs",
+            "supports CUDA graphs only",
+            id="cuda-graphs-layer-scope",
         ),
     ],
 )
@@ -408,6 +484,22 @@ def test_shortcut_rejects_incompatible_configurations(overrides, error, message)
             moe_router_pre_softmax=True,
             **overrides,
         )
+
+
+def test_shortcut_accepts_local_block_cuda_graphs():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        cuda_graph_impl="local",
+        inference_cuda_graph_scope="block",
+    )
+    assert config.cuda_graph_impl == "local"
+    assert config.inference_cuda_graph_scope.name == "block"
 
 
 def _make_shortcut_memory_config(**overrides):

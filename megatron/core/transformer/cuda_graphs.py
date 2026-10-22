@@ -18,6 +18,7 @@ from math import ceil
 from typing import Any, Dict, List
 
 import torch
+from torch.utils._pytree import tree_flatten as tree_flatten_pyt
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
@@ -26,7 +27,7 @@ from megatron.core.num_microbatches_calculator import (
     get_global_batch_size_upper_bound,
     get_num_microbatches,
 )
-from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_thd_tail_padding_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
@@ -326,14 +327,17 @@ class CudagraphBufferMetadata:
 class ArgMetadata:
     """Arg meta."""
 
-    def __init__(self, arg):
+    def __init__(self, arg, keep_values: bool = False):
         self.type = type(arg)
+        self.values = None
         if isinstance(arg, torch.Tensor):
             self.shape = arg.shape
             self.dtype = arg.dtype
             self.device = arg.device
             self.value = arg.data_ptr()
             self.requires_grad = arg.requires_grad
+            if keep_values:
+                self.values = arg.detach().clone()
             if hasattr(arg, "cg_buffer_metadata"):
                 # Its important this is a reference copy
                 self.cg_buffer_metadata = arg.cg_buffer_metadata
@@ -356,6 +360,10 @@ def alloc_tensor_from_graph_mempool(meta: ArgMetadata):
         torch.cuda.current_device(), CudaGraphManager.global_mempool
     )
     out = meta.zeros_like()
+    if meta.values is not None:
+        # Warmup runs the layer on this buffer before capture.
+        # Sequence metadata (cu_seqlens) must hold real values until TransfomerEngine#3205.
+        out.copy_(meta.values)
     out.is_from_global_mempool = True
     out.requires_grad_(meta.requires_grad)
 
@@ -1726,8 +1734,19 @@ class _CudaGraphRunner(torch.nn.Module):
 
             self.apply_cudagraph_record_metadata(args, kwargs, out)
 
+            # Sequence metadata (cu_seqlens) must hold real values until TransfomerEngine#3205.
+            warmup_value_ids = {
+                id(value)
+                for leaf in tree_flatten_pyt((args, kwargs))[0]
+                if isinstance(leaf, PackedSeqParams)
+                for value in vars(leaf).values()
+                if torch.is_tensor(value)
+            }
+
             def _replace_with_meta(arg):
-                return ArgMetadata(arg) if torch.is_tensor(arg) else arg
+                if not torch.is_tensor(arg):
+                    return arg
+                return ArgMetadata(arg, keep_values=id(arg) in warmup_value_ids)
 
             m_args = tree_map(_replace_with_meta, args)
             m_kwargs = tree_map(_replace_with_meta, kwargs)

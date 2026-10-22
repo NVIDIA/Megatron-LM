@@ -378,6 +378,13 @@ class Utils:
         # tests setting them doesn't interfere current test.
         clear_nvte_env_vars()
 
+        if torch.distributed.is_initialized():
+            # Groups from an earlier call (e.g. in setup_method) may still be live. Wait until every
+            # rank has finished creating them before tearing them down: a rank that destroys a Gloo
+            # group while its peers are still connecting to it fails them with "Connection closed
+            # by peer", and the ranks fall out of step.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
         ps.initialize_model_parallel(
