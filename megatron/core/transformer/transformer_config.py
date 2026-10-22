@@ -2791,6 +2791,16 @@ class TransformerConfig(ModelParallelConfig):
                     "expert-tensor-parallel size, so the dispatch would be sized short and the "
                     "pinned permuted-token count would stop check_dispatch_capacity seeing it."
                 )
+            # expert_weight_parameters() hands the autograd node only the weight tensors, so a
+            # bias would join DDP and the optimizer yet never receive a gradient.
+            if self.add_bias_linear:
+                raise ValueError(
+                    "moe_ep_chunk_overlap does not support add_bias_linear=True: the schedule "
+                    "passes _MoEEPChunkOverlapFunction only the experts' weight tensors, so the "
+                    "expert biases never enter its autograd graph, their main_grad stays zero, "
+                    "and the optimizer updates them by zero for the whole run while the loss "
+                    "curve looks healthy."
+                )
 
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
