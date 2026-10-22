@@ -3131,7 +3131,7 @@ def dummy_train_step(data_iterator):
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.dynamic_context_parallel
+    dynamic_cp = args.dynamic_context_parallel
 
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
@@ -3154,7 +3154,7 @@ def dummy_train_step(data_iterator):
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
                 cp_size=args.context_parallel_size,
                 tp_rank=tp_rank,
@@ -3167,9 +3167,9 @@ def dummy_train_step(data_iterator):
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 cp_group=get_context_parallel_group(),
-                hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
+                dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
             )
 
 

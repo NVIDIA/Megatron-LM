@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Iterable
 
 import torch
 
+from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
@@ -200,13 +201,14 @@ def _build_packed_seq_params(
     )
 
 
+@deprecated_hybrid_cp_kwargs
 def get_batches_on_this_cp_rank(
     batch: Dict[str, Any],
     boundary_layout: CPLayout,
-    is_hybrid_cp: bool,
+    dynamic_cp: bool,
     cp_group: torch.distributed.ProcessGroup | None,
     additional_layouts: Iterable[CPLayout] = (),
-    hybrid_cp_group_func: Callable[[int], torch.distributed.ProcessGroup] | None = None,
+    dynamic_cp_group_func: Callable[[int], torch.distributed.ProcessGroup] | None = None,
     use_per_sequence_balancing: bool = False,
     sequence_parallel: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
@@ -229,12 +231,12 @@ def get_batches_on_this_cp_rank(
     """
     from megatron.core.utils import _resolve_dynamic_cp_group_for_batch, get_batch_on_this_cp_rank
 
-    if is_hybrid_cp:
+    if dynamic_cp:
         # Resolve once before selecting layouts. In particular, CP size and the
         # TPxCP conversion plan must describe this microbatch's runtime group,
         # including the real singleton group used for CP-off execution.
         batch = dict(batch)
-        cp_group = _resolve_dynamic_cp_group_for_batch(batch, hybrid_cp_group_func)
+        cp_group = _resolve_dynamic_cp_group_for_batch(batch, dynamic_cp_group_func)
 
     requested_layouts = set(additional_layouts)
     requested_layouts.add(boundary_layout)
@@ -244,7 +246,7 @@ def get_batches_on_this_cp_rank(
         cp_size > 1
         and batch.get('cu_seqlens') is not None
         and "zigzag" in requested_layouts
-        and (is_hybrid_cp or use_per_sequence_balancing or "contiguous" in requested_layouts)
+        and (dynamic_cp or use_per_sequence_balancing or "contiguous" in requested_layouts)
     )
     build_thd_plan = build_packed_zigzag_view and "contiguous" in requested_layouts
 
@@ -270,9 +272,9 @@ def get_batches_on_this_cp_rank(
         if build_thd_plan:
             batches_by_layout["contiguous"] = get_batch_on_this_cp_rank(
                 dict(batch),
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 cp_group=cp_group,
-                hybrid_cp_group_func=hybrid_cp_group_func,
+                dynamic_cp_group_func=dynamic_cp_group_func,
                 use_contiguous_cp=True,
             )
         packed_seq_params_by_layout = {
@@ -321,14 +323,14 @@ def get_batches_on_this_cp_rank(
             "padding_mask",
         )
     )
-    if has_sequence_data and (cp_size > 1 or is_hybrid_cp):
+    if has_sequence_data and (cp_size > 1 or dynamic_cp):
         # Copy the dictionary because the CP sharder replaces sequence-valued entries in place.
         batches_by_layout = {
             layout: get_batch_on_this_cp_rank(
                 dict(batch),
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 cp_group=cp_group,
-                hybrid_cp_group_func=hybrid_cp_group_func,
+                dynamic_cp_group_func=dynamic_cp_group_func,
                 use_per_sequence_balancing=use_per_sequence_balancing,
                 use_contiguous_cp=layout == "contiguous",
             )

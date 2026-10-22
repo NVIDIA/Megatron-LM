@@ -166,7 +166,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
-        is_hybrid_cp=False,
+        dynamic_cp=False,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
@@ -195,7 +195,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     return get_batches_on_this_cp_rank(
         batch,
         boundary_layout=config.linear_cp_layout,
-        is_hybrid_cp=False,
+        dynamic_cp=False,
         cp_group=get_context_parallel_group(),
         additional_layouts=additional_layouts,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,

@@ -832,10 +832,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         return get_batches_on_this_cp_rank(
             batch,
             boundary_layout=config.linear_cp_layout,
-            is_hybrid_cp=dynamic_cp,
+            dynamic_cp=dynamic_cp,
             cp_group=runtime_cp_group,
             additional_layouts=additional_layouts,
-            hybrid_cp_group_func=dynamic_cp_group_func,
+            dynamic_cp_group_func=dynamic_cp_group_func,
             sequence_parallel=config.sequence_parallel,
             tp_group=tp_group,
             tp_cp_group=_sequence_parallel_tp_cp_group(

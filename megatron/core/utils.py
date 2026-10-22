@@ -45,6 +45,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
+from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 try:
@@ -2292,10 +2293,11 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
+@deprecated_hybrid_cp_kwargs
 def get_batch_on_this_tp_rank(
     batch: dict[str, torch.Tensor],
     has_cu_seqlens: bool,
-    is_hybrid_cp: bool,
+    dynamic_cp: bool,
     create_attention_mask_in_dataloader: bool,
     broadcast_src_rank: int,
     broadcast_group: torch.distributed.ProcessGroup,
@@ -2331,7 +2333,7 @@ def get_batch_on_this_tp_rank(
             buffers are allocated internally).
         has_cu_seqlens (bool): Whether the batch contains cu_seqlens and
             max_seqlen metadata (e.g., SFT or --dataloader-inter-document-masking).
-        is_hybrid_cp (bool): Whether dynamic context parallelism is enabled.
+        dynamic_cp (bool): Whether dynamic context parallelism is enabled.
         create_attention_mask_in_dataloader (bool): Whether the dataloader
             creates an explicit attention mask tensor.
         broadcast_src_rank (int): Global rank of the broadcast source (TP rank 0).
@@ -2376,25 +2378,25 @@ def get_batch_on_this_tp_rank(
                 ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
                 _broadcast(cu_seqlens)
 
-        if is_hybrid_cp:
-            hybrid_cp_seq_length = torch.tensor(
+        if dynamic_cp:
+            dynamic_cp_seq_length = torch.tensor(
                 batch['tokens'].shape[1], dtype=torch.int32, device=torch.cuda.current_device()
             )
-            _broadcast(hybrid_cp_seq_length)
+            _broadcast(dynamic_cp_seq_length)
 
         if pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['position_ids'])
-            if has_cu_seqlens or is_hybrid_cp:
+            if has_cu_seqlens or dynamic_cp:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
-            if is_hybrid_cp:
+            if dynamic_cp:
                 _broadcast(batch['local_cp_size'])
 
         elif is_pipeline_first_stage:
@@ -2439,12 +2441,12 @@ def get_batch_on_this_tp_rank(
                 _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
 
     else:
-        if is_hybrid_cp:
-            hybrid_cp_seq_length = torch.tensor(
+        if dynamic_cp:
+            dynamic_cp_seq_length = torch.tensor(
                 0, dtype=torch.int32, device=torch.cuda.current_device()
             )
-            _broadcast(hybrid_cp_seq_length)
-            shape = (micro_batch_size, hybrid_cp_seq_length.item())
+            _broadcast(dynamic_cp_seq_length)
+            shape = (micro_batch_size, dynamic_cp_seq_length.item())
         else:
             shape = (micro_batch_size, seq_length)
 
@@ -2458,7 +2460,7 @@ def get_batch_on_this_tp_rank(
         attention_mask = None
         local_cp_size = None
 
-        if has_cu_seqlens or is_hybrid_cp:
+        if has_cu_seqlens or dynamic_cp:
             max_seqlen = torch.empty(
                 micro_batch_size, dtype=torch.int32, device=torch.cuda.current_device()
             )
@@ -2469,7 +2471,7 @@ def get_batch_on_this_tp_rank(
                 device=torch.cuda.current_device(),
             )
 
-        if is_hybrid_cp:
+        if dynamic_cp:
             local_cp_size = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
 
         def _broadcast_cu_seqlens():
@@ -2508,14 +2510,14 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(position_ids)
-            if has_cu_seqlens or is_hybrid_cp:
+            if has_cu_seqlens or dynamic_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
                     cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
-            if is_hybrid_cp:
+            if dynamic_cp:
                 _broadcast(local_cp_size)
 
         elif is_pipeline_first_stage:
@@ -2796,7 +2798,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
 
 def _resolve_dynamic_cp_group_for_batch(
     batch: Dict[str, Any],
-    hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]],
+    dynamic_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]],
 ) -> torch.distributed.ProcessGroup:
     """Resolve and validate the runtime CP group recorded by a scheduled batch."""
     local_cp_size = batch.get('local_cp_size')
@@ -2809,9 +2811,9 @@ def _resolve_dynamic_cp_group_for_batch(
 
     runtime_cp_group = batch.get('hybrid_cp_group')
     if runtime_cp_group is None:
-        if hybrid_cp_group_func is None:
-            raise ValueError("hybrid_cp_group_func is required to resolve the dynamic CP group")
-        runtime_cp_group = hybrid_cp_group_func(group_size=local_cp_size)
+        if dynamic_cp_group_func is None:
+            raise ValueError("dynamic_cp_group_func is required to resolve the dynamic CP group")
+        runtime_cp_group = dynamic_cp_group_func(group_size=local_cp_size)
     if runtime_cp_group is None:
         raise ValueError(f"No dynamic CP group exists for local_cp_size={local_cp_size}")
     runtime_cp_size = runtime_cp_group.size()
@@ -2824,11 +2826,12 @@ def _resolve_dynamic_cp_group_for_batch(
     return runtime_cp_group
 
 
+@deprecated_hybrid_cp_kwargs
 def get_batch_on_this_cp_rank(
     batch: Dict[str, Any],
-    is_hybrid_cp: bool,
+    dynamic_cp: bool,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
+    dynamic_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
     use_contiguous_cp: bool = False,
 ):
@@ -2840,7 +2843,7 @@ def get_batch_on_this_cp_rank(
         ``use_per_sequence_balancing`` is True, delegates to
         ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
       - **Per-document zigzag**: When ``cu_seqlens`` is present and
-        ``is_hybrid_cp`` is False, delegates to
+        ``dynamic_cp`` is False, delegates to
         ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Dynamic CP**: Resolves the runtime CP group before selecting either
         sharding strategy. The singleton group is retained as batch metadata.
@@ -2849,12 +2852,12 @@ def get_batch_on_this_cp_rank(
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
             'cu_seqlens' key (may be None for pretraining).
-        is_hybrid_cp (bool): Whether dynamic context parallelism is enabled.
+        dynamic_cp (bool): Whether dynamic context parallelism is enabled.
         cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel
             process group used for CP partitioning.
-        hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
+        dynamic_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
             Factory function that returns a dynamic CP process group for a given
-            ``group_size``. Required when ``is_hybrid_cp`` is True.
+            ``group_size``. Required when ``dynamic_cp`` is True.
         use_per_sequence_balancing (bool): When True, use per-sequence zigzag
             even when ``cu_seqlens`` is present (e.g., for inter-document
             masking where document lengths are not divisible by
@@ -2866,14 +2869,14 @@ def get_batch_on_this_cp_rank(
         to this CP rank.
     """
 
-    if is_hybrid_cp:
-        cp_group = _resolve_dynamic_cp_group_for_batch(batch, hybrid_cp_group_func)
+    if dynamic_cp:
+        cp_group = _resolve_dynamic_cp_group_for_batch(batch, dynamic_cp_group_func)
 
     if use_contiguous_cp:
         from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
 
         batch = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=cp_group)
-    elif is_hybrid_cp or use_per_sequence_balancing or batch.get("cu_seqlens") is None:
+    elif dynamic_cp or use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
     else:
         batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
