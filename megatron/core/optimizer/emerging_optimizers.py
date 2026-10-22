@@ -413,8 +413,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
         duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
         after, since every rank holds a uniform, fully-reconstructed tensor by then.
-        distributed keeps the padding needed by its collective, but applies Muon's scale
-        factor using the unpadded logical matrix shape.
+        distributed zeros the local momentum's padded rows before its collectives and
+        applies Muon's scale factor using the unpadded logical matrix shape.
 
         ``qkv_split_shapes`` (when set) runs Newton-Schulz on q, k and v separately. The
         split needs the whole matrix, so under GTP it is available on the duplicated path
@@ -552,6 +552,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     "Distributed GTP Muon padding requires the momentum and parameter "
                     f"layouts to match, got grad={tuple(grad.shape)} and p={tuple(p.shape)}"
                 )
+            # Stale padded momentum must not enter NS normalization or its Gram all-reduce.
+            # Zero it before either TP/GTP collective, including fully padded shards. The
+            # bounds use only metadata; no tensor-value checks or host synchronization.
+            shard_rows = grad.size(0)
+            ranks_from_end = gtp_remat_size - 1 - gtp_rank
+            local_pad_length = min(shard_rows, max(0, pad_length - ranks_from_end * shard_rows))
+            if local_pad_length:
+                grad[-local_pad_length:].zero_()
             size = [grad.size(-2) * gtp_remat_size - pad_length, grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
