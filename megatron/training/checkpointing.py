@@ -175,113 +175,16 @@ def get_loaded_iteration():
 _MISSING_CONFIG_VALUE = object()
 
 
-def _checkpoint_model_spec(spec, legacy_spec):
-    """Resolve saved model specs to the existing CLI import-path representation."""
-    if spec is None:
-        return None
-    import yaml
-
-    from megatron.core.transformer.spec_utils import ModuleSpec, import_module
-    from megatron.training.config.yaml_utils import safe_yaml_representers
-    from megatron.training.models.base import _model_value_to_dict
-
-    if isinstance(spec, dict) and spec.get('_call_') is False:
-        return spec['_target_'].rsplit('.', 1)
-
-    def canonical(value):
-        # ModuleSpec may contain partials, whose equality is object identity.
-        # Preserve partial kwargs before YAML normalization: its generic object
-        # fallback used to discard nested dataclass fields in older checkpoints.
-        value = _model_value_to_dict(value)
-        with safe_yaml_representers():
-            return yaml.safe_load(yaml.safe_dump(value))
-
-    saved_spec = canonical(spec)
-
-    def matches_legacy(value, candidate, *, partial_kwarg=False):
-        # Only the old dataclass skeleton inside a partial kwarg is incomplete.
-        # Do not treat arbitrary missing fields as wildcards or guess a named spec.
-        if isinstance(value, dict) and isinstance(candidate, dict):
-            if (
-                partial_kwarg
-                and set(value) == {'_target_', '_call_'}
-                and value['_call_'] is True
-                and candidate.get('_target_') == value['_target_']
-                and '_call_' not in candidate
-            ):
-                return True
-            return value.keys() == candidate.keys() and all(
-                matches_legacy(
-                    item, candidate[key],
-                    partial_kwarg=value.get('_partial_', False) and not key.startswith('_'),
-                )
-                for key, item in value.items()
-            )
-        if isinstance(value, list) and isinstance(candidate, list):
-            return len(value) == len(candidate) and all(
-                matches_legacy(item, other) for item, other in zip(value, candidate)
-            )
-        return value == candidate
-
-    if legacy_spec is not None:
-        try:
-            legacy_value = import_module(legacy_spec)
-        except ImportError:
-            legacy_value = None
-        legacy_value = canonical(legacy_value)
-        if legacy_value == saved_spec:
-            return legacy_spec
-        if matches_legacy(saved_spec, legacy_value):
-            print_rank_0(
-                'WARNING: Restoring nested model-spec fields omitted by old checkpoint '
-                'serialization from the saved legacy args.spec.'
-            )
-            return legacy_spec
-    if isinstance(spec, ModuleSpec) or (
-        isinstance(spec, dict)
-        and spec.get('_target_') == 'megatron.core.transformer.spec_utils.ModuleSpec'
-    ):
-        from megatron.core.models.hybrid import hybrid_layer_specs
-
-        for name, candidate in vars(hybrid_layer_specs).items():
-            if isinstance(candidate, ModuleSpec) and canonical(candidate) == saved_spec:
-                return [hybrid_layer_specs.__name__, name]
-    raise ValueError(
-        'The saved model spec has no equivalent CLI import path. Supply the native '
-        'model config directly instead of reconstructing it with --use-checkpoint-args.'
-    )
-
-
 def _checkpoint_model_arg(model_config, arg_name):
-    """Read model metadata in the legacy CLI vocabulary at the checkpoint boundary.
+    """Read saved model metadata for compatibility checks and checkpoint layout.
 
-    This does not construct or synchronize an args snapshot. Missing fields use
-    the legacy checkpoint metadata; present config values, including None, win.
-    Actual data sequence length is deliberately not model position capacity.
+    Saved config describes the checkpoint when present; older checkpoints fall
+    back to saved args. This lookup does not override the current run's config.
+    CLI argument restoration remains in load_args_from_checkpoint.
     """
     if not model_config:
         return _MISSING_CONFIG_VALUE
     transformer = model_config.get("transformer", {})
-    if arg_name == "seq_length":
-        return _MISSING_CONFIG_VALUE
-    if arg_name == "spec":
-        return model_config.get(
-            'hybrid_stack_spec', model_config.get('transformer_layer_spec', _MISSING_CONFIG_VALUE)
-        )
-    aliases = {
-        "max_position_embeddings": (model_config, "seq_length"),
-        "num_experts": (transformer, "num_moe_experts"),
-        "apply_layernorm_1p": (transformer, "layernorm_zero_centered_gamma"),
-        "untie_embeddings_and_output_weights": (
-            model_config, "share_embeddings_and_output_weights"
-        ),
-    }
-    if arg_name in aliases:
-        section, name = aliases[arg_name]
-        value = section.get(name, _MISSING_CONFIG_VALUE)
-        if arg_name == "untie_embeddings_and_output_weights" and value is not _MISSING_CONFIG_VALUE:
-            value = not value
-        return value
     if arg_name.startswith("wide_residual_"):
         wide_residual = transformer.get("wide_residual", _MISSING_CONFIG_VALUE)
         if wide_residual is _MISSING_CONFIG_VALUE:
@@ -289,34 +192,6 @@ def _checkpoint_model_arg(model_config, arg_name):
         if wide_residual is None:
             return dict(_WIDE_RESIDUAL_ARG_DEFAULTS)[arg_name]
         return wide_residual.get(arg_name.removeprefix("wide_residual_"), _MISSING_CONFIG_VALUE)
-    if arg_name == "group_query_attention":
-        groups = transformer.get("num_query_groups", _MISSING_CONFIG_VALUE)
-        if groups is _MISSING_CONFIG_VALUE:
-            return groups
-        return groups is not None and groups != transformer.get("num_attention_heads")
-    if arg_name in ("swiglu", "squared_relu", "quick_geglu", "activation_func"):
-        activation = transformer.get("activation_func", {})
-        target = activation.get("_target_") if isinstance(activation, dict) else None
-        if target is None:
-            return _MISSING_CONFIG_VALUE
-        if arg_name == "activation_func":
-            from megatron.training.config.instantiate_utils import instantiate
-
-            return instantiate(activation)
-        if arg_name == "swiglu":
-            return target == "torch.nn.functional.silu" and transformer.get("gated_linear_unit", False)
-        if arg_name == "quick_geglu":
-            return (
-                target == "megatron.core.fusions.fused_bias_geglu.quick_gelu"
-                and transformer.get("gated_linear_unit", False)
-            )
-        return target == "megatron.core.activations.squared_relu"
-    if arg_name in ("add_position_embedding", "use_rotary_position_embeddings"):
-        position_type = model_config.get("position_embedding_type", _MISSING_CONFIG_VALUE)
-        if position_type is _MISSING_CONFIG_VALUE:
-            return position_type
-        # These deprecated flags are normalized into position_embedding_type.
-        return arg_name == "add_position_embedding"
     if arg_name == "padded_vocab_size":
         value = model_config.get("vocab_size", _MISSING_CONFIG_VALUE)
         if value is _MISSING_CONFIG_VALUE or value is None:
@@ -2576,8 +2451,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         return args
 
     checkpoint_args = state_dict['args']
-    checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
-    checkpoint_model = (checkpoint_config or {}).get('model')
     checkpoint_version = state_dict.get('checkpoint_version', 0)
 
     # One-off conversion for foundation models
@@ -2605,16 +2478,12 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         if not force and getattr(args, arg_name, None) is not None:
             return
 
-        checkpoint_value = _checkpoint_model_arg(checkpoint_model, arg_name)
-        from_model_config = checkpoint_value is not _MISSING_CONFIG_VALUE
-        if checkpoint_value is _MISSING_CONFIG_VALUE:
-            checkpoint_value = getattr(checkpoint_args, old_arg_name or arg_name, None)
-        elif arg_name == 'spec':
-            checkpoint_value = _checkpoint_model_spec(
-                checkpoint_value, getattr(checkpoint_args, 'spec', None)
-            )
+        if old_arg_name is not None:
+            checkpoint_value = getattr(checkpoint_args, old_arg_name, None)
+        else:
+            checkpoint_value = getattr(checkpoint_args, arg_name, None)
 
-        if checkpoint_value is not None or from_model_config:
+        if checkpoint_value is not None:
             print_rank_0(f'Setting {arg_name} to {checkpoint_value} from checkpoint')
             setattr(args, arg_name, checkpoint_value)
         else:
@@ -2640,11 +2509,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
-    if 'activation_func' in (checkpoint_model or {}).get('transformer', {}):
-        # Normalize the saved activation, including native choices without a CLI alias.
-        _set_arg('activation_func', force=True)
-        _set_arg('gated_linear_unit', force=True)
-        _set_arg('quick_geglu', force=True)
     _set_arg('activation_func_tanh_clamp_scale', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
@@ -2669,10 +2533,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('num_experts', force=True)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('moe_layer_freq', force=True)
-    checkpoint_num_experts = _checkpoint_model_arg(checkpoint_model, 'num_experts')
-    if checkpoint_num_experts is _MISSING_CONFIG_VALUE:
-        checkpoint_num_experts = getattr(checkpoint_args, 'num_experts', None)
-    if checkpoint_num_experts is not None:
+    if getattr(checkpoint_args, 'num_experts', None) is not None:
         _set_arg('moe_ffn_hidden_size', force=True)
     else:
         setattr(args, 'moe_ffn_hidden_size', None)
