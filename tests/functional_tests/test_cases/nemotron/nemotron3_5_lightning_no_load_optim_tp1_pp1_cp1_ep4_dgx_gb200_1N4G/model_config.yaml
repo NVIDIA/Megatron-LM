@@ -131,6 +131,8 @@ MODEL_ARGS:
   # --finetune resets the iteration counter to 0 so the run logs steps 1..20;
   # --no-load-optim is what actually drops the optimizer state.
   --load: ${CHECKPOINT_LOAD_PATH}/model/nemotron3_5_lightning_1n4g/v1
+  # This validates loading pretrained weights, never a random-init fallback.
+  --exit-on-missing-checkpoint: true
   --no-load-optim: true
   --no-load-rng: true
   --finetune: true
@@ -140,6 +142,17 @@ MODEL_ARGS:
   --ckpt-assume-constant-structure: true
   --ckpt-fully-parallel-load: true
   --dist-ckpt-strictness: log_all
+
+  # Checkpointing optimizations exercised by this load. All three are meant to be
+  # numerically neutral, so the golden values must stay identical with them on.
+  # Every rank reads its own ShardedObjects instead of exchanging them with a
+  # WORLD all_gather_object.
+  --ckpt-fully-parallel-load-per-rank-objects: true
+  # Skips the determine_global_metadata all_gather_object that validates sharding.
+  --no-ckpt-load-validate-sharding-integrity: true
+  # Redundant TE _extra_state is neither written nor requested on load; only
+  # delayed-scaling FP8 extra state is ever needed, and this model does not use it.
+  --ckpt-drop-redundant-extra-state: true
 
   # Validation and functional metrics. eval-interval < train-iters so the
   # evaluation loop actually runs during the test.

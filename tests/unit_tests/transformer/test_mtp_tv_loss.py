@@ -101,6 +101,27 @@ def _make_tv_config(mtp_num_layers: int, hidden_size: int) -> TransformerConfig:
     )
 
 
+def test_contiguous_halo_normalizes_integer_conditioning_mask(monkeypatch):
+    from types import SimpleNamespace
+
+    mask = torch.tensor([[1, 0, 1, 1]], dtype=torch.int64)
+    plan = SimpleNamespace(sequence_length=4)
+    received = []
+
+    def prefetch(**kwargs):
+        received.append(kwargs)
+        return mtp_module.ContiguousPackedCPRollHalos(mtp_input_mask=kwargs['tensors'][0][..., :2])
+
+    monkeypatch.setattr(mtp_module, '_prefetch_contiguous_packed_cp_roll_halos', prefetch)
+    context = mtp_module.ContiguousPackedCPRollContext(plan=plan)
+    warmed = context.prefetch_halos(width=2, mtp_input_mask=mask)
+    assert received[0]['sequence_fields'] == ['mtp_input_mask']
+    assert received[0]['tensors'][0].dtype == torch.bool
+    torch.testing.assert_close(received[0]['tensors'][0], mask.bool())
+    assert mask.dtype == torch.int64
+    assert warmed.halos.mtp_input_mask.dtype == torch.bool
+
+
 def test_mtp_loss_type_validation():
     default_config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
     assert default_config.mtp_loss_type == "cross_entropy"
@@ -179,7 +200,11 @@ def test_full_vocab_tv_forward_and_gradient_match_native_reference(dtype):
 
 
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(calculate_per_token_loss):
+@pytest.mark.parametrize("masked_conditioning", [False, True])
+@pytest.mark.parametrize("separate_main_output", [False, True])
+def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(
+    calculate_per_token_loss, masked_conditioning, separate_main_output
+):
     """Check shifted target alignment, Eq. (13), and draft-only gradients on CPU."""
     torch.manual_seed(7)
     mtp_num_layers = 2
@@ -196,6 +221,12 @@ def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(calculate_per_
     hidden_actual = hidden_data.detach().clone().requires_grad_(True)
     labels = torch.zeros(batch_size, seq_len, dtype=torch.long)
     loss_mask = torch.ones(batch_size, seq_len)
+    input_mask = (
+        torch.tensor([[True, False, True, True, True, True]]) if masked_conditioning else None
+    )
+    main_output = (
+        hidden_data[:seq_len].flip(0).clone().requires_grad_(True) if separate_main_output else None
+    )
 
     MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
     result = process_mtp_loss(
@@ -208,6 +239,11 @@ def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(calculate_per_
         is_training=False,
         compute_language_model_loss=lambda *_: pytest.fail("cross entropy must not run for e2e TV"),
         config=config,
+        main_hidden_states=main_output,
+        mtp_input_mask=input_mask,
+    )
+    torch.testing.assert_close(
+        result, main_output if separate_main_output else hidden_data[:seq_len]
     )
     result.sum().backward()
 
@@ -217,6 +253,7 @@ def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(calculate_per_
     draft_logits = []
     draft_references = []
     reference_mask = loss_mask.clone()
+    reference_input_mask = input_mask.clone() if input_mask is not None else None
     chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
     for draft_hidden_step in draft_hidden:
         target_hidden = torch.roll(target_hidden, shifts=-1, dims=-1)
@@ -230,6 +267,10 @@ def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(calculate_per_
         reference_mask = torch.roll(reference_mask, shifts=-1, dims=-1)
         reference_mask[..., -1] = 0
         chain_valid &= reference_mask.bool()
+        if reference_input_mask is not None:
+            reference_input_mask = torch.roll(reference_input_mask, shifts=-1, dims=-1)
+            reference_input_mask[..., -1] = False
+            chain_valid &= reference_input_mask
 
     chain_mask = chain_valid.transpose(0, 1).float()
     reference_loss = _native_e2e_tv_loss(draft_logits, target_logits)
@@ -242,7 +283,14 @@ def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient(calculate_per_
 
     assert hidden_actual.grad is not None
     actual_chunks = torch.chunk(hidden_actual.grad, 1 + mtp_num_layers, dim=0)
-    torch.testing.assert_close(actual_chunks[0], torch.ones_like(actual_chunks[0]))
+    expected_base_grad = (
+        torch.zeros_like(actual_chunks[0])
+        if separate_main_output
+        else torch.ones_like(actual_chunks[0])
+    )
+    torch.testing.assert_close(actual_chunks[0], expected_base_grad)
+    if separate_main_output:
+        torch.testing.assert_close(main_output.grad, torch.ones_like(main_output))
     for actual_grad, draft_reference in zip(actual_chunks[1:], draft_references):
         assert draft_reference.grad is not None
         _assert_similarity(actual_grad, draft_reference.grad)

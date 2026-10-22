@@ -46,6 +46,12 @@ class KVBlockAllocator:
         self.on_blocks_deregistered: Optional[Callable] = None
         self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
+        # Handoff blocks remain pinned until decode finishes pulling them.
+        # Pinning at request finish only happens on engines with KV transfer
+        # configured (setup_kv_transfer flips this on); other engines have no
+        # release path for the pins.
+        self.enable_handoff_pinning = False
+
         assert (
             0 <= paused_limit <= pool_size - 2
         ), "paused block limit must leave at least one usable block outside the limit"
@@ -67,6 +73,16 @@ class KVBlockAllocator:
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros((self.pool_size,), dtype=torch.int32, device='cpu')
+
+            # Token the block's FINAL MTP draft slot was computed against, or -1 when that slot
+            # holds no draft KV. A block's last draft entry pairs its last hidden with the first
+            # token of the NEXT block, so it is reusable only by a consumer whose next token
+            # matches; the hash alone does not determine it. -1 is the safe default: only the
+            # prefill path that knows the producer's next token records one, so blocks
+            # registered by any other route (a disaggregated import, say) stay uninheritable.
+            self.block_mtp_next_token = torch.full(
+                (self.pool_size,), -1, dtype=torch.int64, device='cpu'
+            )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
@@ -251,6 +267,21 @@ class KVBlockAllocator:
             self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
             self.pool_avail += num_blocks
 
+    def retain_memory_blocks(self, block_ids: list[int]) -> None:
+        """Add one prefix-cache reference to each block.
+
+        Args:
+            block_ids: Blocks retained by a new owner.
+        """
+        assert self.enable_prefix_caching, "retaining KV blocks requires prefix caching"
+        if block_ids:
+            blocks = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+            unique_blocks, retain_counts = torch.unique(blocks, return_counts=True)
+            self.block_ref_counts[unique_blocks] += retain_counts.to(
+                dtype=self.block_ref_counts.dtype
+            )
+            self.update_timestamps(unique_blocks)
+
     def reset(self) -> None:
         """Reset the allocator to initial state.
 
@@ -279,6 +310,7 @@ class KVBlockAllocator:
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
+            self.block_mtp_next_token.fill_(-1)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
                 self.block_parent_id.fill_(-1)
@@ -296,7 +328,7 @@ class KVBlockAllocator:
         block_ids: list[int],
         block_hashes: list[int],
         parent_hashes: Optional[list[int]] = None,
-    ) -> None:
+    ) -> list[int]:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Registration is idempotent: a block that already carries the hash being
@@ -323,9 +355,13 @@ class KVBlockAllocator:
                 length as block_ids); 0 marks a root block with no parent. Used
                 by LRU eviction to avoid evicting a parent before its children.
                 If None, parents default to 0.
+
+        Returns:
+            Newly registered block IDs, in input order. Already registered blocks
+            are excluded so callers can preserve their existing metadata.
         """
         if not block_ids:
-            return
+            return []
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
         # Tensor views of the batch, used to index the per-block state arrays.
@@ -353,7 +389,7 @@ class KVBlockAllocator:
             # hash-map update and the child-count bumps all see the same subset.
             keep = torch.nonzero(~already_registered, as_tuple=True)[0]
             if keep.numel() == 0:
-                return
+                return []
             keep_list = keep.tolist()
             block_ids = [block_ids[i] for i in keep_list]
             block_hashes = [block_hashes[i] for i in keep_list]
@@ -391,6 +427,7 @@ class KVBlockAllocator:
                     parent_id_tensor[has_parent],
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
+        return block_ids
 
     def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
         """Register a callback invoked when cached blocks are deregistered.
@@ -441,6 +478,7 @@ class KVBlockAllocator:
             self.block_timestamps[block_ids] = 0
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
+        self.block_mtp_next_token[block_ids] = -1
 
         # Return blocks to free pool
         self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids

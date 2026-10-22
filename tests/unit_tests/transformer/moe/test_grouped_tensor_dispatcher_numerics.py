@@ -1,11 +1,11 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Distributed MoE coverage for the TE grouped-tensor expert path.
 
 The dispatchers place expert-token padding at different boundaries:
 
 * All-to-All returns unpadded expert segments and TEGroupedMLP pads them before FC1.
-* DeepEP communicates first, then its local fused permutation pads expert segments.
+* DeepEP v1/v2 communicates first, then its local fused permutation pads expert segments.
 * HybridEP fuses communication, permutation, and expert-segment padding.
 * NCCL-EP returns aligned expert segments from fused dispatch, like HybridEP. Its non-op-fuser
   grouped-tensor integration is not enabled yet, so its parity and lifecycle cases remain skipped.
@@ -30,21 +30,31 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.fused_a2a import (
     HAVE_DEEP_EP,
+    HAVE_DEEP_EP_V2,
     HAVE_HYBRIDEP,
     reset_hybrid_ep_buffer,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import fused_permute_and_pad_with_probs
+from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available
 
 pytestmark = [
     pytest.mark.internal,
     pytest.mark.launch_on_gb200,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _allow_nondeterministic_grouped_dbias():
+    """Allow TE's nondeterministic grouped-dbias kernel for tolerance-based comparisons."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
+        yield
 
 
 _ALIGN_SIZE = 256
@@ -74,9 +84,13 @@ def _require_test_environment(dispatcher: str) -> int:
         pytest.skip("DeepEP/HybridEP parity requires at least two distributed ranks")
     if dispatcher == "deepep" and not HAVE_DEEP_EP:
         pytest.skip("DeepEP is not available")
+    if dispatcher == "deepepv2" and not HAVE_DEEP_EP_V2:
+        pytest.skip("DeepEP v2 is not available")
     if dispatcher == "hybridep" and not HAVE_HYBRIDEP:
         pytest.skip("HybridEP is not available")
-    if dispatcher == "deepep" and fused_permute_and_pad_with_probs is None:
+    if dispatcher == "ncclep" and not is_nccl_ep_available():
+        pytest.skip("NCCL EP is not available")
+    if dispatcher in ("deepep", "deepepv2") and fused_permute_and_pad_with_probs is None:
         pytest.skip("DeepEP grouped-tensor padding requires TE fused permute-and-pad")
 
     try:
@@ -97,11 +111,11 @@ def _dispatcher_options(dispatcher: str) -> Dict[str, object]:
             "moe_flex_dispatcher_backend": None,
             "moe_permute_fusion": True,
         }
-    if dispatcher == "deepep":
+    if dispatcher in ("deepep", "deepepv2"):
         # DeepEP communicates first. Its fused local permutation then groups and pads tokens.
         return {
             "moe_token_dispatcher_type": "flex",
-            "moe_flex_dispatcher_backend": "deepep",
+            "moe_flex_dispatcher_backend": dispatcher,
             "moe_permute_fusion": True,
         }
     if dispatcher == "hybridep":
@@ -112,15 +126,13 @@ def _dispatcher_options(dispatcher: str) -> Dict[str, object]:
             "moe_permute_fusion": True,
         }
     if dispatcher == "ncclep":
-        # NCCL-EP dispatch packs aligned expert segments, but the module grouped-tensor path is
-        # intentionally config-rejected until its end-to-end numerics and padding are validated.
+        # NCCL-EP dispatch packs aligned expert segments inside its fused dispatch. Eager mode
+        # (no moe_expert_rank_capacity_factor) returns exactly the received rows, which the
+        # lifecycle assertions compare against the padded expert counts.
         return {
             "moe_token_dispatcher_type": "flex",
             "moe_flex_dispatcher_backend": "ncclep",
             "moe_permute_fusion": True,
-            # The lifecycle assertions inspect the dynamically narrowed expert buffer, so leave
-            # moe_expert_rank_capacity_factor unset to select NCCL-EP eager mode. Setting it
-            # selects static shapes, which expose the full receive-capacity buffer instead.
         }
     raise ValueError(f"Unknown dispatcher {dispatcher!r}")
 
@@ -277,6 +289,11 @@ def _run_numerical_parity_case(
     grad_output = torch.randn_like(base_input)
 
     reference_result = _run_forward_backward(reference, base_input, grad_output)
+    if dispatcher == "ncclep":
+        # The NCCL-EP backend caches one per-expert alignment per process. The reference layer
+        # (no grouped tensor) uses 0 and the target uses 256, so release the context so the
+        # target re-bootstraps with its own alignment.
+        nccl_ep_release_context()
     target_result = _run_forward_backward(target, base_input, grad_output)
 
     assert target.experts._use_grouped_tensor
@@ -533,13 +550,14 @@ class TestGroupedTensorDispatcherNumerics:
     @pytest.mark.parametrize(
         "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
     )
+    @pytest.mark.parametrize("dispatcher", ["deepep", "deepepv2"])
     @pytest.mark.timeout(180)
     def test_deepep_grouped_tensor_moe_parity(
-        self, single_grouped_weight, use_bias, single_grouped_bias
+        self, dispatcher, single_grouped_weight, use_bias, single_grouped_bias
     ):
         """DeepEP grouped-tensor MoE forward/backward matches its legacy expert path."""
         _run_numerical_parity_case(
-            "deepep",
+            dispatcher,
             single_grouped_weight=single_grouped_weight,
             use_bias=use_bias,
             single_grouped_bias=single_grouped_bias,
@@ -581,10 +599,11 @@ class TestGroupedTensorDispatcherNumerics:
         """All-to-All explicitly pads in TEGroupedMLP and removes it before combine."""
         _run_padding_lifecycle_case("alltoall", monkeypatch)
 
+    @pytest.mark.parametrize("dispatcher", ["deepep", "deepepv2"])
     @pytest.mark.timeout(180)
-    def test_deepep_grouped_tensor_padding_lifecycle(self, monkeypatch):
+    def test_deepep_grouped_tensor_padding_lifecycle(self, dispatcher, monkeypatch):
         """DeepEP fused local permutation pads, and local unpermute removes those rows."""
-        _run_padding_lifecycle_case("deepep", monkeypatch)
+        _run_padding_lifecycle_case(dispatcher, monkeypatch)
 
     @pytest.mark.timeout(180)
     def test_hybridep_grouped_tensor_padding_lifecycle(self, monkeypatch):

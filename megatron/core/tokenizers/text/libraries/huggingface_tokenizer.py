@@ -1,10 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import json
 import logging
 from typing import List, Optional
 
 try:
     from transformers import AutoTokenizer
+    from transformers.utils import cached_file
 
     HAVE_TRANSFORMERS = True
 except ModuleNotFoundError:
@@ -15,6 +17,41 @@ from megatron.core.utils import log_single_rank
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
 logger = logging.getLogger(__name__)
+
+
+def _load_generation_config(tokenizer_path: str) -> Optional[dict]:
+    """Load the model's generation_config.json, if present.
+
+    HF tokenizers do not load generation_config.json themselves -- it is a
+    model-level file -- but it holds `eos_token_id`, which may be a LIST of stop
+    tokens (e.g. [2, 11]). Reading it here lets termination honor every declared
+    eos token.
+
+    `tokenizer_path` can be a local directory OR a Hub model id (the
+    AutoTokenizer.from_pretrained call in __init__ already handles both). A
+    plain `os.path.join` + `os.path.isfile` only ever resolves the
+    local-directory case, silently finding nothing for a Hub id with no error
+    raised -- so this uses HF's own `cached_file` helper, which resolves and
+    caches from either source the same way `from_pretrained` does.
+
+    Returns None when the file is missing or unreadable (graceful, logged at
+    WARNING -- not every model ships a generation_config.json).
+    """
+    try:
+        gc_path = cached_file(
+            tokenizer_path, "generation_config.json", _raise_exceptions_for_missing_entries=False
+        )
+        if gc_path is None:
+            return None
+        with open(gc_path) as gc_file:
+            return json.load(gc_file)
+    except Exception as gc_e:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Could not read generation_config.json from {tokenizer_path}: {gc_e}",
+        )
+        return None
 
 
 class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
@@ -40,6 +77,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         trust_remote_code: Optional[bool] = False,
         include_special_tokens: bool = True,
         chat_template: str = None,
+        use_gigatoken: bool = False,
     ):
         """
         Args:
@@ -62,6 +100,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             use_fast: whether to use fast HuggingFace tokenizer
             include_special_tokens: when True, converting text to ids will include special
                 tokens / prompt tokens (if any), yielding self.tokenizer(text).input_ids
+            use_gigatoken: whether to use GigaToken implementation
         """
 
         try:
@@ -93,6 +132,8 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 f'for {tokenizer_path}. Exception: {e}'
             )
 
+        self.generation_config = _load_generation_config(tokenizer_path)
+
         # Store the tokenizer's existing chat template if the user does not provide
         # a custom chat template. Otherwise, override the default chat template with
         # the user-provided template.
@@ -101,10 +142,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         else:
             self.tokenizer.chat_template = chat_template
 
+        self.use_gigatoken = use_gigatoken
         self.include_special_tokens = include_special_tokens
         self.original_vocab_size = len(self.tokenizer)
-        self.chat_template = chat_template
         self.eos_token = eos_token
+        self.chat_template = chat_template
         special_tokens_dict = {}
 
         # # setting special tokens, by default the default model's special tokens will be preserved
@@ -184,6 +226,13 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             'x'
         ) + self.text_to_tokens('y')
         self._inv_vocab_dict = {}
+
+        self._hf_tokenizer = self.tokenizer
+        if self.use_gigatoken:
+            # restore tokenizer with gigatoken
+            from megatron.core.tokenizers.utils import init_gigatoken_from_hf
+
+            self.tokenizer = init_gigatoken_from_hf(self.tokenizer, tokenizer_path)
 
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
@@ -286,9 +335,31 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def apply_chat_template(self, conversation, chat_template, **kwargs):
         """Applies chat template and tokenizes results"""
-        return self.tokenizer.apply_chat_template(
+        return self._hf_tokenizer.apply_chat_template(
             conversation=conversation, chat_template=chat_template, **kwargs
         )
+
+    def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
+        """Encodes whole jsonl file."""
+        if self.use_gigatoken:
+            from megatron.core.tokenizers.utils import has_gigatoken_support
+
+            if has_gigatoken_support():
+                import gigatoken as gt
+
+                return self.tokenizer.tokenizer.encode_files(
+                    gt.JsonlFileSource(paths, field=field), parallel=True
+                )
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
+        else:
+            raise NotImplementedError(
+                "This method is supported only for gigatoken tokenizers. "
+                "Please, set `use_gigatoken=True`."
+            )
 
     @property
     def vocab(self) -> list:
@@ -364,10 +435,10 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def save_vocabulary(self, save_directory: str, filename_prefix: str = None):
         """Saves tokenizer's vocabulary and other artifacts to the specified directory"""
-        return self.tokenizer.save_vocabulary(
+        return self._hf_tokenizer.save_vocabulary(
             save_directory=save_directory, filename_prefix=filename_prefix
         )
 
     def save_pretrained(self, save_directory: str):
         """Saves tokenizer's vocabulary and other artifacts to the specified directory"""
-        return self.tokenizer.save_pretrained(save_directory)
+        return self._hf_tokenizer.save_pretrained(save_directory)

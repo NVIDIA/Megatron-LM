@@ -5,14 +5,22 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training as training_module
 from megatron.training.checkpointing import save_grads
-from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
+from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+from megatron.training.training import (
+    _get_indexer_logging_layer_counts,
+    _get_optimizer_param_scheduler_increment,
+    _pop_samples_seen,
+    _should_compute_params_norm,
+    build_train_valid_test_data_iterators,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -55,10 +63,64 @@ def create_test_args():
     args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
-    args.perform_rl_step = False
     args.phase_transition_iterations = None
 
     return args
+
+
+def test_indexer_logging_counts_only_active_legacy_ratios():
+    """Unused ratio-tail entries must not dilute the reported indexer loss."""
+    args = SimpleNamespace(
+        num_layers=2,
+        mtp_num_layers=1,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern=None,
+        csa_compress_ratios=[4, 0, 4, 4],
+        csa_dense_mode=False,
+    )
+
+    assert _get_indexer_logging_layer_counts(args) == (3, 2)
+
+
+def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
+    """Hybrid MTP repeats each inner-pattern indexer once per unshared prediction depth."""
+    args = SimpleNamespace(
+        num_layers=2,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern="DD/DDD/DDD",
+        csa_compress_ratios=[4, 0, 4, 0, 4, 4],
+        csa_dense_mode=False,
+    )
+
+    assert _get_indexer_logging_layer_counts(args) == (5, 5)
+
+    args.mtp_use_repeated_layer = True
+    assert _get_indexer_logging_layer_counts(args) == (5, 3)
+
+    args.csa_dense_mode = True
+    assert _get_indexer_logging_layer_counts(args) == (5, 0)
+
+
+def test_indexer_logging_uses_normalized_hybrid_layer_positions():
+    """C layers in the main and repeated MTP patterns keep their positional denominator."""
+    args = SimpleNamespace(
+        experimental_attention_variant="dsv4_hybrid",
+        num_layers=3,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern="W-C/H-C/H-C",
+        csa_compress_ratios=None,
+        csa_dense_mode=False,
+    )
+    config_kwargs = {}
+
+    normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, args.hybrid_layer_pattern)
+
+    expected_ratios = [0, 0, 4, 128, 0, 4, 128, 0, 4]
+    assert args.csa_compress_ratios == expected_ratios
+    assert config_kwargs["csa_compress_ratios"] == expected_ratios
+    assert _get_indexer_logging_layer_counts(args) == (6, 3)
 
 
 class TestTraining:
@@ -66,8 +128,9 @@ class TestTraining:
         Utils.initialize_model_parallel(1, 1)
         args = create_test_args()
         set_args(args)
+        _set_train_state()
 
-    def test_build_train_valid_test_data_iterators(self):
+    def test_build_train_valid_test_data_iterators(self, run_config):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(
             mock_train_valid_test_datasets_provider
         )
@@ -76,7 +139,24 @@ class TestTraining:
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
 
-    def test_build_train_valid_test_data_iterators_multi_full_validation(self):
+    def test_params_norm_is_computed_only_when_it_can_be_logged(self, run_config):
+        args = SimpleNamespace(
+            log_params_norm=True, log_interval=20, tensorboard_dir=None, tensorboard_log_interval=1
+        )
+        run_config.logger = args
+
+        assert _should_compute_params_norm(args, iteration=1, is_first_iteration=True)
+        assert _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
+        assert not _should_compute_params_norm(args, iteration=19, is_first_iteration=False)
+
+        args.tensorboard_dir = "/tmp/tensorboard"
+        args.tensorboard_log_interval = 5
+        assert _should_compute_params_norm(args, iteration=5, is_first_iteration=False)
+
+        args.log_params_norm = False
+        assert not _should_compute_params_norm(args, iteration=20, is_first_iteration=False)
+
+    def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators
         (one per validation set) and sets args.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
@@ -122,9 +202,10 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        destroy_global_vars()
 
 
-def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch):
+def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch, run_config):
     """The second per-step log must not include the first step's loss."""
     args = SimpleNamespace(
         consumed_train_samples=0,
@@ -140,6 +221,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         mtp_num_layers=None,
         num_experts=None,
         perform_rl_step=False,
+        profile_ranks=[],
         record_memory_history=False,
         rl_profile=False,
         rl_use_sequence_packing=False,
@@ -147,8 +229,10 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         skipped_train_samples=0,
         timing_log_level=0,
         train_iters=2,
+        train_samples=None,
         world_size=1,
     )
+    run_config.logger = args
     timers = mock.MagicMock()
     timers.return_value.elapsed.return_value = 1.0
     log_lines = []
@@ -216,7 +300,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     assert " alignment loss: 4.000000E+00 |" not in log_lines[-1]
 
 
-def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatch):
+def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatch, run_config):
     """DSA metrics use the stable parent and actual indexer-execution divisor."""
     parent_dp_cp_group = object()
     pp_group = object()
@@ -234,6 +318,7 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         consumed_train_samples=0,
         context_parallel_size=4,
         csa_compress_ratios=None,
+        csa_dense_mode=False,
         cuda_graph_impl="none",
         data_parallel_size=2,
         dsa_indexer_loss_coeff=0.1,
@@ -255,6 +340,7 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         timing_log_level=0,
         world_size=8,
     )
+    run_config.logger = args
 
     monkeypatch.setattr(training_module, "get_args", lambda: args)
     monkeypatch.setattr(training_module, "get_timers", mock.MagicMock)
@@ -422,6 +508,39 @@ class TestGetModelBucketSizingPgCollection:
         assert bucket_size == 40000000
         # pp rank is driven by pg_collection.pp, not the mpu global.
         assert pp_rank == 3
+
+
+class TestPackedSampleAccounting:
+    def test_pop_samples_seen_sums_and_removes_metadata(self):
+        losses = [
+            {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},
+            {"lm loss": torch.tensor(2.0), "_samples_seen": torch.tensor(5.0)},
+        ]
+
+        assert _pop_samples_seen(losses).item() == 8
+        assert all("_samples_seen" not in loss for loss in losses)
+
+    def test_pop_samples_seen_requires_every_microbatch(self):
+        losses = [
+            {"lm loss": torch.tensor(1.0), "_samples_seen": torch.tensor(3.0)},
+            {"lm loss": torch.tensor(2.0)},
+        ]
+
+        with pytest.raises(ValueError, match="every microbatch"):
+            _pop_samples_seen(losses)
+
+    def test_iteration_schedule_uses_running_batch_size(self, monkeypatch):
+        args = SimpleNamespace(train_iters=100, train_samples=None)
+        monkeypatch.setattr(
+            "megatron.training.training.get_current_running_global_batch_size", lambda: 256
+        )
+
+        assert _get_optimizer_param_scheduler_increment(args, 3342) == 256
+
+    def test_sample_schedule_uses_samples_seen(self):
+        args = SimpleNamespace(train_iters=39, train_samples=10_000)
+
+        assert _get_optimizer_param_scheduler_increment(args, 3342) == 3342
 
 
 class TestSaveGrads:

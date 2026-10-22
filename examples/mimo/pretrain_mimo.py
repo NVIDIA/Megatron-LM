@@ -4,6 +4,13 @@
 
 from __future__ import annotations
 
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
+
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
+
 import argparse
 from functools import partial
 
@@ -29,7 +36,7 @@ from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.global_vars import set_global_variables
+from megatron.training.global_vars import initialize_runtime_services, set_args, set_run_config
 from megatron.training.training import pretrain
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -43,31 +50,39 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     return parser
 
 
+def _set_stock_parallel_args(args: argparse.Namespace) -> None:
+    # validate_args and the stock training loop consume these fields.
+    args.tensor_model_parallel_size = args.mimo_llm_tp
+    args.pipeline_model_parallel_size = args.mimo_llm_pp
+    args.context_parallel_size = args.mimo_llm_cp
+    args.expert_model_parallel_size = args.mimo_llm_ep
+    args.expert_tensor_parallel_size = args.mimo_llm_expt_tp or 1
+
+
 def _parse_and_validate() -> argparse.Namespace:
     """Parse stock plus MIMO arguments and validate the disjoint module grids."""
     args = parse_args(extra_args_provider)
-    validate_hetero_grid_args(args, args.world_size)
+    _, llm_size = validate_hetero_grid_args(args, args.world_size)
+    _set_stock_parallel_args(args)
     physical_world_size = args.world_size
-    # Stock validate_args sets data_parallel_size = world_size // (tp*pp*cp); feed the
-    # language module's world (llm_dp; stock tp/pp/cp stay 1, MIMO parallelism is in --llm-*)
-    # so it yields llm_dp. The physical world incl. encoder ranks is restored below.
-    args.world_size = (
-        args.llm_dp
-        * args.tensor_model_parallel_size
-        * args.pipeline_model_parallel_size
-        * args.context_parallel_size
-    )
+    args.world_size = llm_size
     try:
         validate_args(args, {"dataloader_type": "external"})
     finally:
         args.world_size = physical_world_size
-    if not args.use_distributed_optimizer:
-        raise ValueError("heterogeneous MIMO training requires --use-distributed-optimizer")
+    if not (
+        args.use_distributed_optimizer
+        or getattr(args, "use_layer_wise_distributed_optimizer", False)
+    ):
+        raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
     validate_encoder_prefetch_args(args)
 
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = calculate_padded_vocab_size(
-            args.vocab_size, args.make_vocab_size_divisible_by, args.llm_tp, logging_enabled=False
+            args.vocab_size,
+            args.make_vocab_size_divisible_by,
+            args.mimo_llm_tp,
+            logging_enabled=False,
         )
     return args
 
@@ -75,7 +90,11 @@ def _parse_and_validate() -> argparse.Namespace:
 def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
-    set_global_variables(args, build_tokenizer=False)
+    set_args(args)
+    model_cfg = MimoBuildConfig()
+    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(cfg)
+    initialize_runtime_services(args, build_tokenizer=False, training=True)
     provider = resolve_provider(args)
 
     prefetch_loader = None
@@ -84,7 +103,7 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs)
+    topology = create_topology(specs, args.high_priority_stream_groups)
 
     communicator = provider.build_communicator(args, topology)
 
@@ -103,8 +122,8 @@ def main() -> None:
             return models
 
         hooks.append(capture_model)
-    model_cfg = MimoBuildConfig(_topology=topology, post_wrap_hooks=hooks)
-    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    model_cfg._topology = topology
+    model_cfg.post_wrap_hooks = hooks
 
     def train_valid_test_data_provider(_train_val_test_num_samples):
         nonlocal prefetch_loader

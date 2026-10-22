@@ -14,8 +14,8 @@ spec:
     set -euo pipefail
     unset https_proxy
     umask 077
-    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
-    trap 'rm -f /root/.netrc; unset RO_API_TOKEN' EXIT
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -36,10 +36,10 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
-    rm -f /root/.netrc
+    rm -f "$HOME/.netrc"
     unset RO_API_TOKEN
   script: |-
-    rm -f /root/.netrc
+    rm -f "${{HOME}}/.netrc"
     unset RO_API_TOKEN
     set -euo pipefail
     ls
@@ -63,6 +63,11 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
+  - test_case: [hybrid_llama3_proxy_mfsdp_v2_cuda_graph]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]

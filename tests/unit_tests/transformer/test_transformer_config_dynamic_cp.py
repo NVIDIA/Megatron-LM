@@ -10,9 +10,15 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig, T
 
 
 def _make_config(**overrides):
-    kwargs = dict(num_layers=2, hidden_size=128, num_attention_heads=4, use_cpu_initialization=True)
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        max_seqlen_per_dp_cp_rank=128,
+    )
     variant = overrides.get("experimental_attention_variant")
-    if variant in ("gdn", "kda"):
+    if variant in ("gdn", "gdn2", "kda"):
         kwargs.update(
             linear_attention_freq=1,
             linear_conv_kernel_dim=4,
@@ -75,6 +81,11 @@ def cp_config(request):
             id="gdn-contiguous-headwise",
         ),
         pytest.param(
+            dict(cp_partition_mode="contiguous", experimental_attention_variant="gdn2"),
+            "incompatible with GDN-family linear_cp_mode='headwise'",
+            id="gdn2-contiguous",
+        ),
+        pytest.param(
             dict(cp_partition_mode="zigzag", experimental_attention_variant="dsv4_hybrid"),
             "requires cp_partition_mode='contiguous'",
             id="dsv4-zigzag",
@@ -89,13 +100,14 @@ def test_cp_layout_compatibility(cp_config, overrides, error):
 @pytest.mark.parametrize("variant", ["gdn", "kda"])
 @pytest.mark.parametrize("linear_cp_mode", ["headwise", "chunkwise", "invalid", None])
 def test_gdn_cp_mode(cp_config, variant, linear_cp_mode):
-    error = linear_cp_mode not in ("headwise", "chunkwise")
+    error = linear_cp_mode not in ("headwise", "chunkwise", None)
     with (
         pytest.raises(ValueError, match="linear_cp_mode must be either") if error else nullcontext()
     ):
-        _make_config(
+        config = _make_config(
             **cp_config, experimental_attention_variant=variant, linear_cp_mode=linear_cp_mode
         )
+        assert config.linear_cp_mode == (linear_cp_mode or "chunkwise")
 
 
 @pytest.mark.parametrize("variant", ["gdn", "kda"])
@@ -113,6 +125,58 @@ def test_gdn_cp_conv_padding(cp_config, variant, linear_cp_mode, alignment):
             experimental_attention_variant=variant,
             linear_cp_mode=linear_cp_mode,
             gdn_conv_pad_alignment=alignment,
+        )
+
+
+@pytest.mark.parametrize("linear_cp_mode", ["headwise", "chunkwise", None])
+def test_gdn2_cp_support(cp_config, linear_cp_mode):
+    """GDN2 supports static headwise CP, not chunkwise or per-microbatch CP groups."""
+    if linear_cp_mode == "chunkwise":
+        error = "GDN2 context parallelism requires linear_cp_mode='headwise'"
+    elif cp_config.get("dynamic_context_parallel", False):
+        error = "does not support dynamic_context_parallel"
+    else:
+        error = None
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        config = _make_config(
+            **cp_config, experimental_attention_variant="gdn2", linear_cp_mode=linear_cp_mode
+        )
+        assert config.linear_cp_mode == (linear_cp_mode or "headwise")
+
+
+@pytest.mark.parametrize(
+    ("variant", "linear_cp_mode", "key_heads", "value_heads", "head_count_error"),
+    [
+        # GDN2 rejects chunkwise mode before checking head counts. Its supported headwise
+        # path still requires TP1/CP2 head counts divisible by 2, including a positive case.
+        ("gdn2", "chunkwise", 1, 2, True),
+        ("gdn2", "headwise", 1, 2, True),
+        ("gdn2", "chunkwise", 2, 4, False),
+        ("gdn2", "headwise", 2, 4, False),
+        # GDN and KDA chunkwise CP keep every TP-local head on each CP rank.
+        ("gdn", "chunkwise", 1, 2, False),
+        ("kda", "chunkwise", 1, 1, False),
+        ("gdn", "headwise", 1, 2, True),
+    ],
+)
+def test_gdn2_head_divisibility_uses_tp_times_cp(
+    variant, linear_cp_mode, key_heads, value_heads, head_count_error
+):
+    if variant == "gdn2" and linear_cp_mode == "chunkwise":
+        expectation = pytest.raises(ValueError, match="GDN2 context parallelism requires")
+    elif head_count_error:
+        expectation = pytest.raises(
+            AssertionError, match="must be a multiple of linear_head_parallel_size"
+        )
+    else:
+        expectation = nullcontext()
+    with expectation:
+        _make_config(
+            context_parallel_size=2,
+            experimental_attention_variant=variant,
+            linear_cp_mode=linear_cp_mode,
+            linear_num_key_heads=key_heads,
+            linear_num_value_heads=value_heads,
         )
 
 

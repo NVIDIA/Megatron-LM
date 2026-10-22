@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 from megatron.core.tokenizers.text.libraries.abstract_tokenizer import MegatronTokenizerTextAbstract
@@ -31,7 +31,6 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 library (str): tokenizer library.
                 class_name (str): name of tokenizer class.
                 class_path (str): path to tokenizer class.
-                model_type (str): type of the model to be used with tokenizer.
                 chat_template (str): tokenizer chat template.
         """
 
@@ -121,7 +120,11 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         )
 
     def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
+        self,
+        conversation: List[Dict],
+        return_target: bool,
+        add_generation_prompt: bool,
+        chat_template_kwargs: Dict[str, Any] | None = None,
     ):
         """Convert a conversation to tokens. Needed for SFTTokenizer.
 
@@ -135,6 +138,8 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 ]
             return_target (bool): Return target tokens with system and assistant masked.
             add_generation_prompt (bool): Add assistant prefix to the end.
+            chat_template_kwargs (Dict[str, Any] | None): Additional keyword arguments passed
+                to the tokenizer's chat template.
         """
 
         if self.library == 'sft':
@@ -142,9 +147,31 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 conversation=conversation,
                 return_target=return_target,
                 add_generation_prompt=add_generation_prompt,
+                chat_template_kwargs=chat_template_kwargs,
             )
         else:
             raise NotImplementedError("This method is supported only for SFTTokenizer.")
+
+    def tokenize_files(self, paths: str | list[str], field: str = "text") -> "ak.Array":
+        """
+        Tokenizes whole jsonl files with gigatoken.
+        Only supported for `huggingface` and `megatron` libraries.
+
+        Args:
+            paths (str | list[str]): path to the jsonl file(s).
+            field (str): field name to extract text from jsonl file(s).
+        Returns:
+            ak.Array: an array of tokenized documents.
+        """
+
+        if self.library in ["huggingface", "megatron"]:
+            if isinstance(paths, str):
+                paths = [paths]
+            return self._tokenizer.encode_files(paths, field=field)
+        else:
+            raise NotImplementedError(
+                "This method is supported only for `huggingface` and `megatron` libraries."
+            )
 
     def save_pretrained(self, path: str) -> None:
         """
@@ -229,6 +256,16 @@ class MegatronTokenizerText(MegatronTokenizerBase):
     def eod(self) -> int:
         """Returns id of end of document token."""
         return self._tokenizer.eod
+
+    @property
+    def generation_config(self):
+        """Model generation_config attached to the underlying library tokenizer, if any.
+
+        HF library tokenizers read `generation_config.json` (which may declare an
+        `eos_token_id` list); expose it here so inference can honor every eos token.
+        Returns None for libraries that don't attach one.
+        """
+        return getattr(self._tokenizer, "generation_config", None)
 
     @property
     def bos(self) -> int:

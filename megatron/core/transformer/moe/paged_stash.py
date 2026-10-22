@@ -12,6 +12,7 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.cuda_graph_config import is_whole_moe_cuda_graph_scope
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
+    GLOBAL_MAX_BLOCKS,
     paged_stash_copy_kernel,
     paged_stash_pop_kernel,
 )
@@ -24,7 +25,38 @@ logger = logging.getLogger(__name__)
 # receive budget to exceed) and disables paged stashing, so the retry cannot fail either way.
 _MAX_RERUN_ATTEMPTS = 2
 
+# Dtypes the paged-stash Triton copy kernels address natively. Anything else is
+# moved as uint8 bytes; see _stash_buffer_dtype().
+_STASH_NATIVE_DTYPES = (
+    torch.float64,
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+)
+
 SCALE_INV_BLOCK_SIZE = 32
+
+
+def _stash_buffer_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Dtype of the stash buffer that holds tensors of ``dtype``.
+
+    Dtypes the Triton copy kernels address natively are stashed as-is. Anything else (FP8,
+    FP4, ...) is byte-copied as uint8, which only preserves the shape for 1-byte dtypes.
+    """
+    if dtype in _STASH_NATIVE_DTYPES:
+        return dtype
+    if dtype.itemsize != 1:
+        raise ValueError(
+            f"Paged stash cannot byte-copy {dtype} (itemsize {dtype.itemsize}); "
+            "add it to _STASH_NATIVE_DTYPES if Triton supports it."
+        )
+    return torch.uint8
 
 
 class PagedStashBuffer:
@@ -196,8 +228,17 @@ class PagedTensor:
         """Get the schedule layer."""
         return self.schedule_layer_no
 
-    def offload_to_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Offload the paged tensor to paged stash buffer (CUDA or host if CUDA full)."""
+    def offload_to_stash(
+        self,
+        paged_stash_buffer: PagedStashBuffer,
+        block_size: int = GLOBAL_BLOCK_SIZE,
+        max_blocks: int = GLOBAL_MAX_BLOCKS,
+    ):
+        """Offload the paged tensor to paged stash buffer (CUDA or host if CUDA full).
+
+        ``block_size`` is the number of elements each program copies per inner-loop iteration
+        (a power of two) and ``max_blocks`` the maximum number of programs per launch.
+        """
         # Zero uninitialized metadata before copy kernel (enqueued on current stream;
         # stash_paged_tensors runs offload on the pack stream).
         self.page_record.zero_()
@@ -213,7 +254,6 @@ class PagedTensor:
             max_num_tokens = self.max_num_tokens
 
         tensor_to_copy = self._tensor
-        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
@@ -242,15 +282,22 @@ class PagedTensor:
             new_free_list_head,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=block_size,
             HAS_HOST_BUFFER=has_host,
         )
         paged_stash_buffer.free_list_head.copy_(new_free_list_head)
         self._original_tensor = self._tensor
         self._tensor = None
 
-    def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
+    def reload_from_stash(
+        self,
+        paged_stash_buffer: PagedStashBuffer,
+        block_size: int = GLOBAL_BLOCK_SIZE,
+        max_blocks: int = GLOBAL_MAX_BLOCKS,
+    ):
         """Reload the paged tensor from paged stash buffer (CUDA or host from spilled_to_host).
+
+        ``block_size`` / ``max_blocks``: kernel launch configuration, as in offload_to_stash.
 
         ``_tensor`` must already be allocated on the main (default) stream by the caller;
         this method only enqueues unpack-stream kernels that fill it from the stash.
@@ -268,7 +315,6 @@ class PagedTensor:
         else:
             num_tokens_tensor = self.num_tokens_tensor
             max_num_tokens = self.max_num_tokens
-        BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
@@ -293,7 +339,7 @@ class PagedTensor:
             new_free_list_tail,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
-            BLOCK_SIZE=BLOCK_SIZE,
+            BLOCK_SIZE=block_size,
         )
 
         paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
@@ -445,6 +491,10 @@ class PagedStashManager:
 
         # Page size for paged memory (default; overwritten from config in paged_stash_reset)
         self.page_size = 64
+        # Copy/pop kernel launch sizes (defaults; selected for the current device in
+        # paged_stash_reset)
+        self.copy_block_size = GLOBAL_BLOCK_SIZE
+        self.copy_max_blocks = GLOBAL_MAX_BLOCKS
 
     @property
     def pack_stream(self):
@@ -496,7 +546,11 @@ class PagedStashManager:
                 while len(self.paged_tensors_to_stash) > 0:
                     paged_tensor = self.paged_tensors_to_stash.pop(0)
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
-                    paged_tensor.offload_to_stash(stash_buffer)
+                    paged_tensor.offload_to_stash(
+                        stash_buffer,
+                        block_size=self.copy_block_size,
+                        max_blocks=self.copy_max_blocks,
+                    )
                     self.paged_tensors_to_reload[pp_schedule_layer].append(paged_tensor)
                     self.paged_tensors_stash_in_progress.append(paged_tensor)
             else:
@@ -544,7 +598,11 @@ class PagedStashManager:
                 self._unpack_stream_status = 'reloading'
                 for paged_tensor in reload_batch:
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
-                    paged_tensor.reload_from_stash(stash_buffer)
+                    paged_tensor.reload_from_stash(
+                        stash_buffer,
+                        block_size=self.copy_block_size,
+                        max_blocks=self.copy_max_blocks,
+                    )
             else:
                 pass
             assert len(self.paged_tensors_to_reload[pp_schedule_layer]) == 0, (
@@ -616,9 +674,6 @@ class PagedStashManager:
                 if host_tokens_dict is not None and (dtype, hidden_size) in host_tokens_dict
                 else 0
             )
-            buf_dtype = (
-                torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
-            )
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
                 num_tokens,
                 hidden_size,
@@ -626,7 +681,7 @@ class PagedStashManager:
                 self.device,
                 self.overflow,
                 self.host_spill,
-                buf_dtype,
+                _stash_buffer_dtype(dtype),
                 num_tokens_host=num_tokens_host,
             )
             sb = self.stash_buffers[dtype][hidden_size]
@@ -1150,8 +1205,10 @@ def paged_stash_te_graph_capture(enabled, order=None, config=None):
 def paged_stash_reset(enabled=True, config=None):
     """Reset the chunk handler, called at the start of a training iteration.
 
-    config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu and
-    moe_paged_stash_page_size are read from it. Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
+    config: optional TransformerConfig; if provided, moe_paged_stash_buffer_size_factor_cuda/cpu
+    and moe_paged_stash_page_size are read from it. Otherwise defaults to 1.10 (CUDA), 0.0 (CPU).
+    Copy launch sizes are fixed for the current device: 4096/8192 on Rubin (SM107),
+    1024/2048 elsewhere.
     """
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
@@ -1163,6 +1220,10 @@ def paged_stash_reset(enabled=True, config=None):
 
     if not enabled:
         return
+
+    is_rubin = torch.cuda.get_device_capability() == (10, 7)
+    stash_manager.copy_block_size = 4096 if is_rubin else GLOBAL_BLOCK_SIZE
+    stash_manager.copy_max_blocks = 8192 if is_rubin else GLOBAL_MAX_BLOCKS
 
     if stash_manager.status == 'begin':
         stash_manager.status = 'capture'
@@ -1210,15 +1271,15 @@ class PagedStashRunner:
         # them (NCCL EP only). Both set by check_moe_overflow.
         self._required_recv_capacity = None
         self._required_capacity_factor = None
-        # TransformerConfig objects that must stay in sync for moe_paged_stash: the training
-        # loop `config` (schedules / paged_stash_reset) plus each VP chunk's GPT root config
-        # (GPTModel.forward). MoE mlps use the same config reference as that root, so we do
-        # not track mlp.config separately.
+        # Config objects that must stay in sync for moe_paged_stash: the training loop config
+        # (schedules / paged_stash_reset), each model chunk's root config (model forward), and
+        # every MoE layer config (expert forward). Some models may use a distinct config for
+        # each layer.
         seen_cfg_ids = set()
         self._configs_to_sync_moe_paged_stash = []
 
         def _track_cfg(c):
-            if c is None:
+            if c is None or not hasattr(c, 'moe_paged_stash'):
                 return
             cid = id(c)
             if cid not in seen_cfg_ids:
@@ -1236,6 +1297,16 @@ class PagedStashRunner:
                 model_chunk, "decoder", allow_none=False, return_model_obj=True
             )
             _track_cfg(model_with_decoder.config)
+
+            # Track MoE configs independently from the existing structural discovery below.
+            # This keeps overflow and retry behavior unchanged for models whose modules share
+            # the root config while allowing distinct module configs to stay synchronized.
+            for module in model_with_decoder.modules():
+                token_dispatcher = getattr(module, 'token_dispatcher', None)
+                if token_dispatcher is None or not hasattr(token_dispatcher, 'check_over_budget'):
+                    continue
+                _track_cfg(getattr(module, 'config', None))
+
             for layer in model_with_decoder.decoder.layers:
                 transformer_layer = (
                     layer.mtp_model_layer if isinstance(layer, MultiTokenPredictionLayer) else layer
@@ -1263,7 +1334,7 @@ class PagedStashRunner:
                         self.moe_layers.append(mlp)
 
     def _set_moe_paged_stash_all(self, value: bool) -> None:
-        """Set moe_paged_stash on every tracked config (train + per VP chunk root)."""
+        """Set moe_paged_stash on every tracked training, model, and MoE config."""
         for c in self._configs_to_sync_moe_paged_stash:
             c.moe_paged_stash = value
 
@@ -1273,12 +1344,15 @@ class PagedStashRunner:
         self._te_graph_runtime_num_microbatches = num_microbatches
 
     def _reset_qb_histograms(self) -> None:
-        """Discard histogram observations from a failed full-iteration attempt."""
+        """Discard QB observations from a failed full-iteration attempt."""
         for mlp in self.moe_layers:
             router = getattr(mlp, 'router', None)
             qb_histogram = getattr(router, 'qb_histogram', None)
             if qb_histogram is not None:
                 qb_histogram.zero_()
+            if getattr(router, 'qb_beta_accum', None) is not None:
+                router.qb_beta_accum.zero_()
+                router.qb_beta_count.zero_()
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -1451,8 +1525,11 @@ class PagedStashRunner:
         if self.copy_main_params:
 
             def _try_copy_main_params(opt):
-                if isinstance(opt, DistributedOptimizer) and hasattr(
-                    opt, 'shard_fp32_from_float16_groups'
+                if (
+                    isinstance(opt, DistributedOptimizer)
+                    and hasattr(opt, 'shard_fp32_from_float16_groups')
+                    and opt.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                    and opt.ddp_config.overlap_param_gather
                 ):
                     opt._copy_main_params_to_param_buffer()
 
@@ -1518,7 +1595,9 @@ class PagedStashRunner:
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
         self._validate_te_whole_moe_graph_runtime(training, num_microbatches)
-        saved_moe_paged_stash = self.config.moe_paged_stash
+        saved_moe_paged_stash_values = [
+            (config, config.moe_paged_stash) for config in self._configs_to_sync_moe_paged_stash
+        ]
         num_tries = 0
         while True:
             num_tries += 1
@@ -1559,7 +1638,8 @@ class PagedStashRunner:
                     for mlp in self.moe_layers:
                         mlp.token_dispatcher.invalidate_ep_bootstrap()
                     nccl_ep_release_context()
-                self._set_moe_paged_stash_all(saved_moe_paged_stash)
+                for config, value in saved_moe_paged_stash_values:
+                    config.moe_paged_stash = value
                 break
 
             # Overflow or over-budget: prepare_for_rerun clears capacity factor and paged stash.

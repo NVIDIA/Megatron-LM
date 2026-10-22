@@ -21,7 +21,9 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -31,6 +33,102 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("layout, pp_size", [("Et|mL", 2), ("Et|m|L", 3)])
+def test_gpt_mhc_rejects_standalone_mtp_pipeline_chunks(layout, pp_size):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=pp_size,
+        pipeline_model_parallel_layout=layout,
+        enable_hyper_connections=True,
+        mtp_num_layers=1,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="requires MTP and the final decoder layer"):
+        GPTModel(
+            config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=8,
+        )
+
+
+def test_mhc_mtp_preserves_multistream_on_pipeline_stages():
+    """Dev's PP path must pass pre-contraction streams to the real MTP block."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            mtp_num_layers=1,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        first_stage = pg_collection.pp.rank() == 0
+        layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=True)
+        mtp_spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True)
+        model = GPTModel(
+            config,
+            layer_spec,
+            vocab_size=128,
+            max_sequence_length=16,
+            pre_process=first_stage,
+            post_process=not first_stage,
+            share_embeddings_and_output_weights=False,
+            mtp_block_spec=mtp_spec,
+            pg_collection=pg_collection,
+        ).cuda()
+        tokens = torch.arange(32, device="cuda").reshape(2, 16)
+        positions = torch.arange(16, device="cuda").expand_as(tokens)
+        multistream_shape = (16, 2, config.num_residual_streams * config.hidden_size)
+        captured = {}
+        pipeline_input = None
+        if not first_stage:
+            pipeline_input = torch.randn(
+                multistream_shape, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            )
+            model.set_input_tensor(pipeline_input)
+
+            def capture_mtp_input(module, args, kwargs):
+                captured["contracted"] = kwargs["hidden_states"].shape
+                captured["multistream"] = kwargs["mhc_multistream"].shape
+
+            model.mtp.register_forward_pre_hook(capture_mtp_input, with_kwargs=True)
+
+        output = model(tokens, positions, attention_mask=None, labels=tokens)
+        assert torch.isfinite(output).all()
+        if first_stage:
+            assert output.shape == multistream_shape
+        else:
+            assert output.shape == tokens.shape
+            assert captured["contracted"] == (16, 2, config.hidden_size)
+            assert captured["multistream"] == multistream_shape
+        output.float().square().mean().backward()
+        if pipeline_input is not None:
+            assert pipeline_input.grad is not None
+            assert torch.isfinite(pipeline_input.grad).all()
+            assert torch.count_nonzero(pipeline_input.grad) > 0
+            mtp_grads = [p.grad for p in model.mtp.parameters() if p.grad is not None]
+            assert mtp_grads
+            assert all(torch.isfinite(grad).all() for grad in mtp_grads)
+            assert any(torch.count_nonzero(grad) > 0 for grad in mtp_grads)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class TestGPTModel:
@@ -77,6 +175,84 @@ class TestGPTModel:
 
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
+
+    @pytest.mark.parametrize("add_bias_linear", [False, True])
+    def test_hash_routed_moe_receives_token_ids_and_backpropagates(self, add_bias_linear):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            num_moe_experts=4,
+            moe_num_hash_layers=1,
+            hash_moe_vocab_size=100,
+            use_cpu_initialization=True,
+            add_bias_linear=add_bias_linear,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
+            vocab_size=128,
+            max_sequence_length=8,
+        ).cuda()
+        router = model.decoder.layers[0].mlp.router
+        assert router.is_hash_layer
+        assert not model.decoder.layers[1].mlp.router.is_hash_layer
+        received = []
+        router.register_forward_pre_hook(
+            lambda module, args, kwargs: received.append(kwargs['input_ids'].clone()),
+            with_kwargs=True,
+        )
+        tokens = torch.arange(16, device='cuda').reshape(2, 8)
+        positions = torch.arange(8, device='cuda').expand_as(tokens)
+        loss = model(tokens, positions, None, labels=tokens)
+        torch.testing.assert_close(received[0], tokens)
+        assert torch.isfinite(loss).all()
+        loss.mean().backward()
+        grad = model.embedding.word_embeddings.weight.grad
+        assert grad is not None and torch.isfinite(grad).all() and torch.count_nonzero(grad) > 0
+
+    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+    def test_hsm_requires_two_mtp_layers(self, mtp_num_layers):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=mtp_num_layers,
+            mtp_hsm=True,
+        )
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
+        assert config.mtp_hsm is True
+
+    def test_rejects_hybrid_mtp_override(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_hybrid_override_pattern="*",
+        )
+        with pytest.raises(
+            ValueError, match="mtp_hybrid_override_pattern is not supported by GPTModel"
+        ):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
 
     @pytest.mark.internal
     def test_set_input_tensor(self):
@@ -404,6 +580,7 @@ def test_gpt_with_te_activation_func(num_experts, gated_linear_unit):
 class TestGPTModelWithCustomPG:
     def setup_method(self, method):
         Utils.destroy_model_parallel()
+        Utils.initialize_distributed()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -626,3 +803,38 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         assert (
             call_kwargs.get('use_te_activation_func') is True
         ), "use_te_activation_func must be forwarded from config"
+
+
+def test_gpt_builder_forwards_rope_scaling_factor():
+    """Test that gpt_builder forwards rope_scaling_factor to GPTModel.
+
+    Regression test for https://github.com/NVIDIA/Megatron-LM/issues/6305
+    The --rope-scaling-factor flag was silently ignored because gpt_builder
+    passed rope_scaling but not rope_scaling_factor, so GPTModel always fell
+    back to its default factor of 8.0.
+    """
+    mock_config = MagicMock()
+
+    mock_args = MagicMock()
+    mock_args.spec = None
+    mock_args.transformer_impl = "transformer_engine"
+    mock_args.experimental_attention_variant = None
+    mock_args.num_experts = None
+    mock_args.heterogeneous_layers_config_path = None
+    mock_args.mtp_num_layers = None
+    mock_args.use_rope_scaling = True
+    mock_args.rope_scaling_factor = 32.0
+
+    with (
+        patch('gpt_builders.GPTModel') as mock_gpt_model,
+        patch('gpt_builders._get_transformer_layer_spec'),
+    ):
+        from gpt_builders import gpt_builder
+
+        gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
+
+        mock_gpt_model.assert_called_once()
+        _, call_kwargs = mock_gpt_model.call_args
+        assert (
+            call_kwargs.get('rope_scaling_factor') == 32.0
+        ), "rope_scaling_factor must be forwarded from args"

@@ -3,6 +3,7 @@
 """Integration coverage for ordinary DSA and architecture-neutral enhancements."""
 
 from argparse import ArgumentParser
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -423,6 +424,7 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group(monkeypatch):
         recompute_up_proj=False,
         linear_gate=None,
         linear_proj=linear_proj,
+        _mla_projection_context=lambda **_: nullcontext(),
     )
     dummy_attention._checkpointed_attention_forward = lambda *args, **kwargs: (
         AbsorbedMLASelfAttention._checkpointed_attention_forward(dummy_attention, *args, **kwargs)

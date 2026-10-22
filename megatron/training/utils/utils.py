@@ -38,13 +38,11 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
         trace_alloc_record_context=True,
     )
 
-    def _oom_observer(
-        device: int, alloc: int, device_alloc: int, device_free: int
-    ) -> None:
+    def _oom_observer(device: int, alloc: int, device_alloc: int, device_free: int) -> None:
         """Dump a snapshot on OOM so we can inspect what was live at the failure."""
         rank = safe_get_rank()
         base, ext = os.path.splitext(profiling.memory_snapshot_path)
-        filename = f"{base}_oom_rank-{rank}{ext}"
+        filename = f"{base}_oom_rank_{rank}{ext}"
         torch.cuda.memory._dump_snapshot(filename)
         # logger.info so the message reaches stderr on any profiled rank, not just rank 0.
         logger.info(f"[OOM] rank {rank} saved memory snapshot to {filename}")

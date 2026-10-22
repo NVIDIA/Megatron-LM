@@ -832,6 +832,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         assert padding_mask is not None
         assert padding_mask.dtype == torch.bool
         assert padding_mask.dim() == 2
+        assert padding_mask.size(0) == 1
         assert packed_seq_params is not None
         has_padding = padding_mask.any().to(torch.int32)
         effective_cp_group = (
