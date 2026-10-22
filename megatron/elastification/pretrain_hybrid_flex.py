@@ -499,21 +499,14 @@ def core_gpt_dataset_config_from_args(args):
     return argument_utils.core_gpt_dataset_config_from_args(args, tokenizer=get_tokenizer())
 
 
-def train_valid_test_datasets_provider(
-    train_val_test_num_samples, vp_stage=None, *, data_config=None
-):
-    """Build the train, validation and test datasets.
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+    """Build the train, validation and test datasets from the run config's ``cfg.data``.
 
     The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
     ``pretrain_gpt.py`` and ``pretrain_hybrid.py``; this script passes its own rank predicate.
-    ``data_config`` is ``cfg.data``: ``build_train_valid_test_datasets`` passes it, the run
-    config's is used when omitted.
     """
     return build_gpt_datasets(
-        train_val_test_num_samples,
-        vp_stage,
-        data_config=data_config,
-        built_on_rank=is_dataset_built_on_rank,
+        train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )
 
 

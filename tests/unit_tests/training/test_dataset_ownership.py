@@ -4,7 +4,6 @@
 mirrors the container writes, the lifecycle and the serialization."""
 
 import copy
-import functools
 import json
 from argparse import ArgumentParser, Namespace
 from types import SimpleNamespace
@@ -628,17 +627,14 @@ def test_full_container_round_trips_before_and_after_prepare(
     assert reloaded.data.dataset.random_seed == cfg.data.dataset.random_seed
 
 
-def test_pre_data_run_config_is_completed_on_load(run_config):
+def test_pre_data_run_config_loads_with_the_default_section(run_config):
+    """A run_config.yaml saved before the data section existed loads with the loader-only
+    default: the field's dataclass default, no upgrade hook."""
     serialized = run_config.to_dict()
     legacy = copy.deepcopy(serialized)
     legacy.pop("data")
     restored = PretrainConfigContainer.from_dict(legacy)
     assert restored.data == DataConfig()
-    args = _parse(["--seq-length", "24", "--num-workers", "4", "--dataloader-type", "cyclic"])
-    completed = PretrainConfigContainer.from_dict(legacy, legacy_args=args)
-    assert completed.data == DataConfig(
-        dataloader=DataloaderConfig(dataloader_type="cyclic", num_workers=4)
-    )
     assert "data" not in legacy  # the caller's dictionary is not modified
     # A snapshot of the unmerged earlier schema is not migrated.
     old_schema = copy.deepcopy(legacy)
@@ -721,79 +717,3 @@ def test_set_global_variables_finalizes_a_dataset_section(
     args, loader_only = container_factory(["--seq-length", "64"])
     global_vars.set_global_variables(args, loader_only, build_tokenizer=False)
     assert global_vars.get_run_config() is loader_only and not loader_only._finalized
-
-
-# The data builders hand the data section to providers that declare it (and only to those).
-
-
-def _recording_providers():
-    calls = []
-
-    def plain(train_valid_test_num_samples):
-        calls.append(("plain", train_valid_test_num_samples, {}))
-        return (1, 2, 3)
-
-    def declared(train_valid_test_num_samples, vp_stage=None, *, data_config=None):
-        calls.append(
-            (
-                "declared",
-                train_valid_test_num_samples,
-                dict(vp_stage=vp_stage, data_config=data_config),
-            )
-        )
-        return (1, 2, 3)
-
-    def kwargs_only(train_valid_test_num_samples, **kwargs):
-        calls.append(("kwargs", train_valid_test_num_samples, kwargs))
-        return (1, 2, 3)
-
-    return calls, plain, declared, kwargs_only
-
-
-def test_declared_provider_keywords():
-    from megatron.training.training import _declared_provider_keywords as declared_keywords
-
-    _, plain, declared, kwargs_only = _recording_providers()
-    names = ("data_config",)
-    assert declared_keywords(plain, names) == ()
-    assert declared_keywords(kwargs_only, names) == ()
-    assert declared_keywords(declared, names) == names
-    assert declared_keywords(functools.partial(declared, vp_stage=1), names) == names
-    assert declared_keywords(functools.partial(declared, data_config="bound"), names) == ()
-
-    def positional_or_keyword(train_valid_test_num_samples, data_config=None):
-        return None
-
-    def positional_only(train_valid_test_num_samples, data_config=None, /):
-        return None
-
-    assert declared_keywords(positional_or_keyword, names) == names
-    assert declared_keywords(positional_only, names) == ()
-    assert declared_keywords(42, names) == ()
-
-
-def test_builders_pass_the_data_section_only_to_providers_that_declare_it(monkeypatch, run_config):
-    from megatron.training.training import build_train_valid_test_datasets
-
-    calls, plain, declared, kwargs_only = _recording_providers()
-    counts = (10, 20, 30)
-    for provider in (plain, kwargs_only, declared):
-        assert build_train_valid_test_datasets(provider, counts, cfg_container=run_config) == (
-            1,
-            2,
-            3,
-        )
-    assert calls[0] == ("plain", counts, {})
-    assert calls[1] == ("kwargs", counts, {})
-    assert calls[2] == ("declared", counts, dict(vp_stage=None, data_config=run_config.data))
-    assert calls[2][2]["data_config"] is run_config.data
-    # A partial keeps what it bound.
-    bound = functools.partial(declared, vp_stage=3, data_config="bound")
-    build_train_valid_test_datasets(bound, counts, cfg_container=run_config)
-    assert calls[3][2] == dict(vp_stage=3, data_config="bound")
-    # Without an explicit container the run config is used; without either, nothing is injected.
-    build_train_valid_test_datasets(declared, counts)
-    assert calls[4][2]["data_config"] is run_config.data
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
-    build_train_valid_test_datasets(declared, counts)
-    assert calls[5][2] == dict(vp_stage=None, data_config=None)

@@ -85,17 +85,10 @@ class ConfigContainerBase:
             rng.finalize_model_config(getattr(self, "model", None))
 
     @classmethod
-    def _upgrade_config_dict(cls, config_dict: dict[str, Any], legacy_args: Any) -> dict[str, Any]:
-        """Hook for containers that complete configurations saved by older versions."""
-        return config_dict
-
-    @classmethod
     def from_dict(
         cls: Type[T],
         config_dict: dict[str, Any],
         mode: InstantiationMode = InstantiationMode.STRICT,
-        *,
-        legacy_args: Any = None,
     ) -> T:
         """
         Create a config container from a dictionary.
@@ -103,8 +96,6 @@ class ConfigContainerBase:
         Args:
             config_dict: Dictionary containing configuration
             mode: Serialization mode (strict or lenient)
-            legacy_args: Optional validated argparse namespace used to complete sections that
-                the dictionary predates (see ``PretrainConfigContainer``)
 
         Returns:
             A new instance of this class initialized with the dictionary values
@@ -117,7 +108,6 @@ class ConfigContainerBase:
         # Apply backward compatibility: remove init=False fields that may have been
         # serialized by older versions (these are computed in __post_init__)
         config_dict = sanitize_dataclass_config(config_dict)
-        config_dict = cls._upgrade_config_dict(config_dict, legacy_args)
 
         # Check for extra keys in strict mode
         expected_fields = {f.name for f in dataclass_fields(cls) if not f.name.startswith("_")}
@@ -138,21 +128,13 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(
-        cls: Type[T],
-        yaml_path: str,
-        mode: InstantiationMode = InstantiationMode.LENIENT,
-        *,
-        legacy_args: Any = None,
-    ) -> T:
+    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
         """
         Create a config container from a YAML file.
 
         Args:
             yaml_path: Path to the YAML file
             mode: Serialization mode (strict or lenient)
-            legacy_args: Optional validated argparse namespace used to complete sections that
-                the file predates (see ``PretrainConfigContainer``)
 
         Returns:
             A new instance of this class initialized with the YAML file values
@@ -176,10 +158,7 @@ class ConfigContainerBase:
         # Convert to OmegaConf first for better compatibility with instantiate
         conf = OmegaConf.create(config_dict)
 
-        config_dict = OmegaConf.to_container(conf, resolve=True)
-        if legacy_args is None:
-            return cls.from_dict(config_dict, mode=mode)
-        return cls.from_dict(config_dict, mode=mode, legacy_args=legacy_args)
+        return cls.from_dict(OmegaConf.to_container(conf, resolve=True), mode=mode)
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -471,23 +450,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
-
-    @classmethod
-    def _upgrade_config_dict(cls, config_dict: dict[str, Any], legacy_args: Any) -> dict[str, Any]:
-        """Complete a run configuration saved before the ``data`` section existed.
-
-        The section takes its defaults when missing; with ``legacy_args`` the loader settings come
-        from the legacy arguments. Dataset sections are supplied by the GPT entry points, as for a
-        fresh run, never inferred from the arguments here.
-        """
-        if "data" in config_dict or legacy_args is None:
-            return config_dict
-        from megatron.training.argument_utils import dataloader_config_from_args
-
-        config_dict["data"] = cls._convert_value_to_dict(
-            DataConfig(dataloader=dataloader_config_from_args(legacy_args))
-        )
-        return config_dict
 
 
 @dataclass(kw_only=True)

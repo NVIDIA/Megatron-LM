@@ -54,8 +54,8 @@ def build_gpt_datasets(
         train_val_test_num_samples: the number of samples for the train, validation and test
             splits.
         vp_stage: the virtual pipeline stage the datasets are built for.
-        data_config: ``cfg.data``; ``build_train_valid_test_datasets`` passes it, the run config's
-            is used when omitted.
+        data_config: ``cfg.data``; the registered run config's when omitted (the scripts'
+            providers), given explicitly by tests and direct callers.
         built_on_rank: the rank predicate, called with ``vp_stage`` and ``is_packed_sequence``;
             ``is_dataset_built_on_rank`` (the GPT and hybrid rule) when omitted.
     """

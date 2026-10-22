@@ -395,22 +395,15 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def train_valid_test_datasets_provider(
-    train_val_test_num_samples, vp_stage=None, *, data_config=None
-):
-    """Build the train, validation and test datasets.
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+    """Build the train, validation and test datasets from the run config's ``cfg.data``.
 
     The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
     ``pretrain_hybrid.py`` and ``pretrain_hybrid_flex.py``; this script uses the shared rank
-    predicate. ``data_config`` is ``cfg.data`` (the dataset config prepared with the run's
-    tokenizer, the loader settings and the dataset class): ``build_train_valid_test_datasets``
-    passes it, the run config's is used when omitted.
+    predicate.
     """
     return build_gpt_datasets(
-        train_val_test_num_samples,
-        vp_stage,
-        data_config=data_config,
-        built_on_rank=is_dataset_built_on_rank,
+        train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )
 
 
