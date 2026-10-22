@@ -199,6 +199,7 @@ class MoEModelTestContainer:
         )
         _set_random_seed(seed_=123, data_parallel_random_init=data_parallel_random_init)
         self.config = TransformerConfig(
+            params_dtype=test_dtype,
             tensor_model_parallel_size=tp_size,
             expert_model_parallel_size=ep_size,
             pipeline_model_parallel_size=pp_size,

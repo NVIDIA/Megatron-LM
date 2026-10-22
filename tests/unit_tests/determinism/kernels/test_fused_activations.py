@@ -110,6 +110,33 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
 
 
+@pytest.mark.parametrize("weighted", [False, True])
+def test_clamped_swiglu_boundaries_replay_bit_exactly(weighted):
+    seeded()
+    # Include both endpoints and their adjacent BF16 values in each clamp branch.
+    bounds = torch.tensor(
+        [-10.0625, -10.0, -9.9375, 9.9375, 10.0, 10.0625], device="cuda", dtype=DTYPE
+    )
+    x = torch.cat((bounds, bounds)).repeat(32, 1).requires_grad_(True)
+    if weighted:
+        fn = lambda x, w: weighted_bias_swiglu_impl(x, None, w, clamp_value=10.0)
+        inputs = (x, _weights(32) + 1.0)
+    else:
+        fn = lambda x: bias_swiglu_impl(x, None, clamp_value=10.0)
+        inputs = (x,)
+    _, grads = assert_replays_bit_exact(fn, inputs, replays=3, what="clamped SwiGLU boundaries")
+
+    # Replay alone would also accept a consistently wrong endpoint derivative.
+    # Compare its zero mask with the installed PyTorch scalar-clamp contract.
+    reference_x = x.detach().clone().requires_grad_(True)
+    gate, linear = reference_x.float().chunk(2, dim=-1)
+    reference = (F.silu(gate.clamp(max=10.0)) * linear.clamp(-10.0, 10.0)).to(DTYPE)
+    if weighted:
+        reference = (reference * inputs[1]).to(DTYPE)
+    reference_grad = torch.autograd.grad(reference.sum(), reference_x)[0]
+    assert torch.equal(grads["in[0]"] == 0, reference_grad == 0)
+
+
 # --- plain compiled activations -----------------------------------------------------------
 
 ACTIVATION_CASES = {

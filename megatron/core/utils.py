@@ -524,7 +524,12 @@ def is_emerging_optimizers_min_version(version, check_equality=True):
     return get_emerging_optimizers_version() > PkgVersion(version)
 
 
-_VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
+# Values that select a fused kernel backend and therefore carry optional dependencies.
+_FUSED_DSA_KERNEL_BACKENDS = ("tilelang", "cudnn")
+# Values that select a DSA implementation needing no optional dependency: "none" plus the
+# DSA-over-GQA paths, which are written in PyTorch and Triton.
+_UNFUSED_DSA_KERNEL_BACKENDS = ("none", "min-memory-triton", "min-memory-torch", "reference")
+_VALID_DSA_KERNEL_BACKENDS = _UNFUSED_DSA_KERNEL_BACKENDS + _FUSED_DSA_KERNEL_BACKENDS
 
 
 def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
@@ -562,7 +567,7 @@ def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
         raise ValueError(
             "dsa_kernel_backend must be one of: " f"{', '.join(_VALID_DSA_KERNEL_BACKENDS)}."
         )
-    if dsa_kernel_backend == "none":
+    if dsa_kernel_backend in _UNFUSED_DSA_KERNEL_BACKENDS:
         return
     if not torch.cuda.is_available():
         raise ValueError(
@@ -2609,15 +2614,22 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
-            (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
+        SEQUENCE_KEYS = (
+            "tokens",
+            "labels",
+            "loss_mask",
+            "position_ids",
+            "decoder_input",
+            "mtp_input_mask",
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
+        sequence_tensor = next(
+            (batch.get(key) for key in SEQUENCE_KEYS if batch.get(key) is not None), None
+        )
+        if sequence_tensor is None:
+            return batch
+        index = tex.thd_get_partitioned_indices(
+            cu_seqlens_for_te, sequence_tensor.size(1), cp_size, cp_rank
+        )
         for key in SEQUENCE_KEYS:
             if batch.get(key) is not None:
                 batch[key] = batch[key].index_select(1, index)

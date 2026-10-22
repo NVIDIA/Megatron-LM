@@ -55,6 +55,7 @@ class FlashInferSampling(Sampling):
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
         output: Optional[Tensor] = None,
+        sequence_lengths: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:

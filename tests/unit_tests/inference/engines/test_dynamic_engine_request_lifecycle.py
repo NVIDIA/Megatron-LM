@@ -26,6 +26,7 @@ REQUEST_FIELD_POLICY = {
     "prompt_length": "checkpoint:reset / merge:reset / wire:derive",
     "arrival_time": "checkpoint:reset / merge:reset",
     "status": "checkpoint:preserve / merge:last",
+    "finish_reason": "checkpoint:reset / merge:last",
     "encoder_prompt": "checkpoint:drop / merge:drop",
     "generated_text": "checkpoint:reset / merge:reset / finalize:decode-concatenated-tokens",
     "segments": "checkpoint:drop / merge:drop-unsupported",
@@ -64,6 +65,7 @@ REQUEST_FIELD_POLICY = {
 }
 
 SAMPLING_FIELD_POLICY = {
+    "seed": "preserve",
     "temperature": "preserve",
     "top_k": "preserve",
     "top_p": "preserve",
@@ -77,6 +79,7 @@ SAMPLING_FIELD_POLICY = {
     "return_prompt_top_n_logprobs": "preserve-derived-policy",
     "add_BOS": "preserve",
     "stop_words": "deep-copy-preserve",
+    "stop_token_ids": "deep-copy-preserve",
     "detokenize_stop_sequence": "preserve",
     "detokenize_generations": "preserve",
     "return_prompt_tokens": "preserve",
