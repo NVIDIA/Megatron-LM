@@ -4584,6 +4584,97 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
 
 
+def _flashinfer_sampling_context(top_k, top_p, temperature=None):
+    """Minimal context for `FlashInferSampling.sample_kernel` (CPU tensors)."""
+    n = len(top_k)
+    top_k = torch.tensor(top_k, dtype=torch.int32)
+    return SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=torch.ones(n) if temperature is None else temperature,
+            top_k=top_k,
+            top_p=torch.tensor(top_p),
+        ),
+        active_request_metadata={"top_k": top_k.clone()},
+    )
+
+
+@pytest.mark.parametrize("use_output", [True, False])
+def test_flashinfer_sample_kernel_greedy_batch_takes_argmax(monkeypatch, use_output):
+    """A batch whose requests are all top-k 1 takes argmax and launches no sampling kernel."""
+    fake = mock.MagicMock()
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+    n, vocab_size = 3, 16
+    context = _flashinfer_sampling_context([1] * n, [0.0] * n)
+    backend = FlashInferSampling(vocab_size, torch.Generator())
+    logits = torch.randn(n + 2, vocab_size, dtype=torch.float32)
+    gather = torch.tensor([4, 0, 2])
+    output = torch.empty(n, dtype=torch.int64) if use_output else None
+    sampled = backend.sample_kernel(
+        logits, n, context, no_top_k=False, no_top_p=True, gather_indices=gather, output=output
+    )
+    if use_output:
+        assert sampled is output
+    assert sampled.dtype == torch.int64
+    assert torch.equal(sampled, logits[gather].argmax(dim=-1))
+    assert not fake.sampling.method_calls
+
+
+@pytest.mark.parametrize(
+    "no_top_k,no_top_p,top_k,top_p,speculative,expected_kernel",
+    [
+        # One greedy row and one top-k 5 row: sampled, not argmax.
+        (False, True, [1, 5], [0.0, 0.0], False, "top_k_sampling_from_probs"),
+        # Greedy rows next to a top-p row: the joint kernel.
+        (False, False, [1, 0], [0.0, 0.9], False, "top_k_top_p_sampling_from_logits"),
+        # All greedy, but per-token (speculative) parameters: the kernel dispatch.
+        (False, True, [1, 1], [0.0, 0.0], True, "top_k_sampling_from_probs"),
+    ],
+)
+def test_flashinfer_sample_kernel_non_greedy_batches_sample(
+    monkeypatch, no_top_k, no_top_p, top_k, top_p, speculative, expected_kernel
+):
+    """Only all-greedy, per-request batches take the argmax shortcut."""
+    n, vocab_size = len(top_k), 16
+    fake = mock.MagicMock()
+    getattr(fake.sampling, expected_kernel).return_value = torch.zeros(n, dtype=torch.int32)
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+    context = _flashinfer_sampling_context(top_k, top_p)
+    backend = FlashInferSampling(vocab_size, torch.Generator())
+    logits = torch.randn(n, vocab_size, dtype=torch.float32)
+    token_to_request_index = torch.arange(n) if speculative else None
+    backend.sample_kernel(
+        logits,
+        n,
+        context,
+        no_top_k=no_top_k,
+        no_top_p=no_top_p,
+        token_to_request_index=token_to_request_index,
+    )
+    assert [call[0] for call in fake.sampling.method_calls] == [expected_kernel]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashInfer sampling needs CUDA")
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_flashinfer_greedy_sampling_matches_torch_greedy(temperature):
+    """FlashInfer's greedy shortcut picks the same tokens as TorchSampling with top-k 1."""
+    pytest.importorskip("flashinfer")
+    torch.manual_seed(0)
+    n, vocab_size = 8, 1024
+    context = _flashinfer_sampling_context(
+        [1] * n, [0.0] * n, temperature=torch.full((n,), temperature)
+    )
+    context.gpu_view = SimpleNamespace(
+        **{name: value.cuda() for name, value in vars(context.gpu_view).items()}
+    )
+    logits = torch.randn(n, vocab_size, device="cuda", dtype=torch.bfloat16)
+    backend = FlashInferSampling(vocab_size, torch.Generator(device="cuda"))
+    sampled = backend.sample_kernel(logits, n, context, no_top_k=False, no_top_p=True)
+    expected = TorchSampling.sample_from_logits(
+        logits, temperature, 1, 0.0, generator=torch.Generator(device="cuda"), vocab_size=vocab_size
+    )
+    assert torch.equal(sampled, expected)
+
+
 @pytest.mark.parametrize(
     "no_top_k,no_top_p,top_k,top_p,expected_kernel",
     [
@@ -4620,7 +4711,8 @@ def test_flashinfer_sample_kernel_dispatch(
             temperature=torch.ones(n),
             top_k=torch.tensor(top_k, dtype=torch.int32),
             top_p=torch.tensor(top_p),
-        )
+        ),
+        active_request_metadata={"top_k": torch.tensor(top_k, dtype=torch.int32)},
     )
     rng = torch.Generator()
     backend = FlashInferSampling(vocab_size, rng)
