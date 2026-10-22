@@ -6,6 +6,12 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_linear_cross_entropy import linear_cross_entropy
+from megatron.core.transformer.padding_aware_gemm import (
+    current_live_rows_for,
+    lm_head_wgrad_uses_grouped,
+    padding_aware_linear,
+    static_capacity_rows,
+)
 
 
 class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
@@ -35,6 +41,34 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
                 ignore_index=ignore_index,
             )
 
+        live_rows = (
+            current_live_rows_for(input_.shape[:-1].numel())
+            if self.config.padding_aware_lm_head
+            else None
+        )
+        if (
+            live_rows is not None
+            and not runtime_gather_output
+            and not self.gather_output
+            and not self.sequence_parallel
+            and self.bias is None
+            and self.embedding_activation_buffer is None
+            and not self.explicit_expert_comm
+        ):
+            # Padding-aware LM head: the GEMM covers only the live rows of the THD buffer.
+            weight = weight if weight is not None else self.weight
+            output = padding_aware_linear(
+                input_,
+                weight,
+                live_rows,
+                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                allreduce_dgrad=self.allreduce_dgrad,
+                tp_group=self.tp_group,
+                wgrad_grouped=lm_head_wgrad_uses_grouped(
+                    static_capacity_rows(self.config) or input_.shape[:-1].numel()
+                ),
+            )
+            return output, None
         # Fall back to standard ColumnParallelLinear forward.
         # ColumnParallelLinear.forward returns (output, bias) or just output
         # depending on configuration, so keep the return type as Tensor.

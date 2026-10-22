@@ -224,6 +224,11 @@ class BroadcastTensorFused(torch.autograd.Function):
     def forward(ctx, x, fused_add_3_fn):
         """Return three view aliases and save the fused gradient combiner."""
         ctx.fused_add_3_fn = fused_add_3_fn
+        # The padding-aware live-row bound is published only during the forward; keep it for
+        # the backward's gradient combine.
+        from megatron.core.transformer.padding_aware_gemm import current_live_rows_for
+
+        ctx.live_rows = current_live_rows_for(x.shape[0] * x.shape[1]) if x.dim() >= 2 else None
         return x.view_as(x), x.view_as(x), x.view_as(x)
 
     @staticmethod
@@ -236,6 +241,19 @@ class BroadcastTensorFused(torch.autograd.Function):
             return grads[0], None
         if len(grads) == 2:
             return grads[0] + grads[1], None
+        from megatron.core.fusions.fused_padding_aware_elementwise import (
+            padding_aware_add3,
+            padding_aware_add3_available,
+        )
+
+        bound = ctx.live_rows
+        if bound is not None and grad1.dim() >= 2:
+            if padding_aware_add3_available(grad1, grad2, grad3):
+                rows = grad1.shape[0] * grad1.shape[1]
+                out = padding_aware_add3(
+                    grad1.view(rows, -1), grad2.view(rows, -1), grad3.view(rows, -1), bound
+                )
+                return out.view_as(grad1), None
         return ctx.fused_add_3_fn(grad1, grad2, grad3), None
 
 

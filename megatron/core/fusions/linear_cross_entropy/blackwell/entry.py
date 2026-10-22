@@ -10,6 +10,10 @@ try:
     import cuda.bindings.driver as cuda  # type: ignore
     import cutlass
     import cutlass.cute as cute
+
+    if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
+        # CUTLASS DSL >= 4.3 (NGC 26.07) renamed make_fragment -> make_rmem_tensor (same signature)
+        cute.make_fragment = cute.make_rmem_tensor  # type: ignore[attr-defined]
     import torch
     import torch.distributed as dist
     import triton  # type: ignore

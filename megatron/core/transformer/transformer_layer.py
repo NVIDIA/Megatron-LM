@@ -41,6 +41,7 @@ from megatron.core.transformer.enums import (
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.padding_aware_gemm import with_padding_aware_dense_linears
 from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     checkpoint_residual_read,
@@ -775,6 +776,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
         return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
 
+    @with_padding_aware_dense_linears
+    @with_padding_aware_dense_linears
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -1357,6 +1360,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         return mlp_output_with_bias, residual
 
+    @with_padding_aware_dense_linears
     def _forward_mlp(
         self,
         hidden_states: Tensor,
@@ -2940,6 +2944,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         return hidden_states, context
 
+    @with_padding_aware_dense_linears
+    @with_padding_aware_dense_linears
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -3050,6 +3056,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         return hidden_states, context
 
+    @with_padding_aware_dense_linears
+    @with_padding_aware_dense_linears
     def _forward_mlp(
         self,
         hidden_states,
@@ -4032,6 +4040,8 @@ class MoETransformerLayer(TransformerLayer):
         output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
         return self._apply_mlp_bda_step((output, mlp_bias), residual)
 
+    @with_padding_aware_dense_linears
+    @with_padding_aware_dense_linears
     def _forward_mlp(
         self,
         hidden_states,

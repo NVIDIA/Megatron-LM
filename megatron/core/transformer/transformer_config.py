@@ -1535,6 +1535,39 @@ class TransformerConfig(ModelParallelConfig):
     token budget); setting it too large just allocates a slightly larger cu_seqlens
     buffer."""
 
+    padding_aware_lm_head: bool = False
+    """Run the LM head (and MTP head) GEMMs only over the live rows of a packed-sequence (THD)
+    buffer with a fixed per-rank capacity. The number of live rows is a device-side scalar derived
+    from the padding mask (last real row + 1, rounded up to 128), so it changes per microbatch
+    without host synchronization and inside CUDA graph replays; the padding tail of the logits and
+    of the hidden-state gradient is zero-filled. Uses Transformer Engine's grouped GEMM with one
+    group (bf16 LM head only; TP dgrad all-reduce supported, sequence parallelism and deferred
+    embedding wgrad are not). Numerically the same cuBLAS kernels as the dense path."""
+
+    padding_aware_dense_linear: bool = False
+    """Run the Transformer Engine linear layers of every transformer layer (``TELinear`` and its
+    column/row-parallel subclasses, bf16 or MXFP8) only over the live rows of the packed-sequence
+    (THD) buffer, through Transformer Engine's grouped GEMM with one group whose row count is a
+    device-side scalar. Enabled per layer from the model shape: requires
+    ``max_seqlen_per_dp_cp_rank`` of at least 4096 rows, no bias, no tensor-parallel communication
+    inside the layer (TP=1 or duplicated weights), weight dims multiples of 32. The weight gradient
+    of layers above 8 MiB of fp32 gradient goes through a beta-0 GEMM into a persistent fp32 scratch
+    plus one add (cuBLASLt's grouped beta-1 epilogue is slow); smaller layers accumulate
+    in-kernel. ``MCORE_PADDING_AWARE_WGRAD=scratch|accumulate`` overrides. Also covers the fused
+    norm+linear layers (``TELayerNormColumnParallelLinear``: norm over the buffer, GEMMs over the
+    live rows). The op-fuser MLPs (``TEFusedMLP``, ``TEFusedMLPWithGroupedLinear``,
+    ``FusedSharedExpertMLP``) are not covered. Only active with CUDA graphs (``cuda_graph_impl``
+    other than ``none``): the grouped path costs about twice the CPU time of the dense linear per
+    call, which eager steps pay on the critical path while graph replay hides it
+    (``MCORE_PADDING_AWARE_EAGER=1`` overrides)."""
+
+    padding_aware_assumed_padding: float = 0.2
+    """Padding fraction of the per-rank THD buffer that the static per-layer cost model of
+    ``padding_aware_dense_linear`` assumes when deciding which layers run padding-aware (the
+    decision is made once from the weight shape and ``max_seqlen_per_dp_cp_rank``, never from
+    the runtime row count). Set it to the expected tail-padding fraction of the recipe; a larger
+    value enables smaller layers."""
+
     cuda_graph_dynamic_microbatches: bool = False
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
     This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence

@@ -263,6 +263,12 @@ def _backend_uses_cutile(backend: MHCBackend) -> bool:
 if _TRITON_AVAILABLE:
     TLOG2E = tl.constexpr(LOG2E)
 
+    def _zero_tail_rows(t: Tensor, m_rows: Tensor) -> None:
+        """Zero rows >= m_rows of a 2-D tensor (padding tail skipped by the kernels)."""
+        from megatron.core.transformer.padding_aware_gemm import zero_tail_rows
+
+        zero_tail_rows(t, m_rows)
+
     # ============================================================================
     # Sinkhorn-Knopp
     # ============================================================================
@@ -272,9 +278,10 @@ if _TRITON_AVAILABLE:
     )
     @triton.jit
     def _triton_sinkhorn_fwd_kernel(
-        inp_ptr, out_ptr, M_init_ptr, N_batch, eps, HC: tl.constexpr, NUM_ITERS: tl.constexpr
+        inp_ptr, out_ptr, M_init_ptr, N_batch, m_ptr, eps, HC: tl.constexpr, NUM_ITERS: tl.constexpr
     ):
-        """Grid: (N_batch,). Each program handles one [HC, HC] matrix."""
+        """Grid: (N_batch,). Each program handles one [HC, HC] matrix; matrices of padding
+        rows (program id >= *m_ptr) are written as zeros."""
         pid = tl.program_id(0)
         if pid >= N_batch:
             return
@@ -283,6 +290,11 @@ if _TRITON_AVAILABLE:
         offs_r = tl.arange(0, HC)
         offs_c = tl.arange(0, HC)
         mat_ptrs = base + offs_r[:, None] * HC + offs_c[None, :]
+        if pid >= tl.load(m_ptr):
+            zero = tl.zeros((HC, HC), dtype=tl.float32)
+            tl.store(out_ptr + mat_ptrs, zero.to(out_ptr.dtype.element_ty))
+            tl.store(M_init_ptr + mat_ptrs, zero.to(M_init_ptr.dtype.element_ty))
+            return
 
         logits = tl.load(inp_ptr + mat_ptrs).to(tl.float32)
         row_max = tl.max(logits, axis=1)
@@ -314,11 +326,13 @@ if _TRITON_AVAILABLE:
         ws_rs_ptr,
         ws_cs_ptr,
         N_batch,
+        m_ptr,
         eps,
         HC: tl.constexpr,
         NUM_ITERS: tl.constexpr,
     ):
-        """Grid: (N_batch,). Each program handles one [HC, HC] backward."""
+        """Grid: (N_batch,). Each program handles one [HC, HC] backward; padding rows
+        (program id >= *m_ptr) get a zero gradient."""
         pid = tl.program_id(0)
         if pid >= N_batch:
             return
@@ -329,6 +343,12 @@ if _TRITON_AVAILABLE:
         offs_r = tl.arange(0, HC)
         offs_c = tl.arange(0, HC)
         mat_ptrs = base + offs_r[:, None] * HC + offs_c[None, :]
+        if pid >= tl.load(m_ptr):
+            tl.store(
+                grad_inp_ptr + mat_ptrs,
+                tl.zeros((HC, HC), dtype=tl.float32).to(grad_inp_ptr.dtype.element_ty),
+            )
+            return
 
         M = tl.load(M_init_ptr + mat_ptrs).to(tl.float32)
         for t in range(NUM_ITERS):
@@ -384,7 +404,10 @@ if _TRITON_AVAILABLE:
         tl.store(grad_inp_ptr + mat_ptrs, grad.to(grad_inp_ptr.dtype.element_ty))
 
     def _triton_sinkhorn_fwd(
-        input_logits: Tensor, num_iterations: int, eps: float = 1e-6
+        input_logits: Tensor,
+        num_iterations: int,
+        eps: float = 1e-6,
+        m_rows: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         original_shape = input_logits.shape
         hc = original_shape[-1]
@@ -393,11 +416,24 @@ if _TRITON_AVAILABLE:
         out = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         M_init = torch.empty(N_batch, hc, hc, dtype=input_logits.dtype, device=dev)
         inp = input_logits.contiguous().view(N_batch, hc, hc)
-        _triton_sinkhorn_fwd_kernel[(N_batch,)](inp, out, M_init, N_batch, eps, hc, num_iterations)
+        _triton_sinkhorn_fwd_kernel[(N_batch,)](
+            inp,
+            out,
+            M_init,
+            N_batch,
+            _rows_bound_tensor(m_rows, N_batch, dev),
+            eps,
+            hc,
+            num_iterations,
+        )
         return out.view(original_shape), M_init.view(original_shape)
 
     def _triton_sinkhorn_bwd(
-        grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-6
+        grad_output: Tensor,
+        M_init: Tensor,
+        num_iterations: int,
+        eps: float = 1e-6,
+        m_rows: Optional[Tensor] = None,
     ) -> Tensor:
         original_shape = grad_output.shape
         hc = original_shape[-1]
@@ -410,7 +446,17 @@ if _TRITON_AVAILABLE:
         ws_rs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
         ws_cs = torch.empty(N_batch * num_iterations * hc, dtype=torch.float32, device=dev)
         _triton_sinkhorn_bwd_kernel[(N_batch,)](
-            go, mi, grad_input, ws_M, ws_rs, ws_cs, N_batch, eps, hc, num_iterations
+            go,
+            mi,
+            grad_input,
+            ws_M,
+            ws_rs,
+            ws_cs,
+            N_batch,
+            _rows_bound_tensor(m_rows, N_batch, dev),
+            eps,
+            hc,
+            num_iterations,
         )
         return grad_input.view(original_shape)
 
@@ -420,17 +466,22 @@ if _TRITON_AVAILABLE:
         @staticmethod
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
             """Run Triton Sinkhorn forward and save initial matrix for backward."""
-            out, M_init = _triton_sinkhorn_fwd(input_logits, num_iterations, eps)
+            hc = input_logits.shape[-1]
+            m_rows = _live_rows_bound_for_rows(input_logits.numel() // (hc * hc))
+            out, M_init = _triton_sinkhorn_fwd(input_logits, num_iterations, eps, m_rows)
             ctx.save_for_backward(M_init)
             ctx.num_iterations = num_iterations
             ctx.eps = eps
+            ctx.m_rows = m_rows
             return out
 
         @staticmethod
         def backward(ctx, grad_output: Tensor):
             """Run Triton Sinkhorn backward."""
             (M_init,) = ctx.saved_tensors
-            grad_input = _triton_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
+            grad_input = _triton_sinkhorn_bwd(
+                grad_output, M_init, ctx.num_iterations, ctx.eps, ctx.m_rows
+            )
             return grad_input, None, None
 
     def triton_fused_sinkhorn(
@@ -463,12 +514,17 @@ if _TRITON_AVAILABLE:
         stride_x_s,
         stride_x_n,
         stride_x_c,
+        m_ptr,
+        HAS_BOUND: tl.constexpr,
         BLOCK_C: tl.constexpr,
         BLOCK_S: tl.constexpr,
     ):
-        """out[s, c] = sum_i x[s, i, c] * h[s, i]."""
+        """out[s, c] = sum_i x[s, i, c] * h[s, i]; rows >= *m_ptr are skipped (padding tail)."""
         pid_s = tl.program_id(0)
         pid_c = tl.program_id(1)
+        if HAS_BOUND:
+            if pid_s * BLOCK_S >= tl.load(m_ptr):
+                return
         offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
         offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         mask_s = offs_s < sb
@@ -490,7 +546,9 @@ if _TRITON_AVAILABLE:
             mask=mask_2d,
         )
 
-    def _triton_h_aggregate_fwd(x: Tensor, h_pre: Tensor, out: Optional[Tensor] = None) -> Tensor:
+    def _triton_h_aggregate_fwd(
+        x: Tensor, h_pre: Tensor, out: Optional[Tensor] = None, m_rows: Optional[Tensor] = None
+    ) -> Tensor:
         s, b, n, C = x.shape
         sb = s * b
         if out is None:
@@ -512,8 +570,20 @@ if _TRITON_AVAILABLE:
 
         grid = lambda META: (triton.cdiv(sb, META["BLOCK_S"]), triton.cdiv(C, META["BLOCK_C"]))
         _triton_h_agg_fwd_kernel[grid](
-            x_flat, h_flat, out_flat, sb, C, n, x_flat.stride(0), x_flat.stride(1), x_flat.stride(2)
+            x_flat,
+            h_flat,
+            out_flat,
+            sb,
+            C,
+            n,
+            x_flat.stride(0),
+            x_flat.stride(1),
+            x_flat.stride(2),
+            m_rows if m_rows is not None else h_flat,
+            HAS_BOUND=m_rows is not None,
         )
+        if m_rows is not None:
+            _zero_tail_rows(out_flat, m_rows)
         return out
 
     # ============================================================================
@@ -549,11 +619,15 @@ if _TRITON_AVAILABLE:
         stride_out_s,
         stride_out_n,
         stride_out_c,
+        m_ptr,
         HAS_BIAS: tl.constexpr,
+        HAS_BOUND: tl.constexpr,
         BLOCK_C: tl.constexpr,
         BLOCK_S: tl.constexpr,
     ):
-        """out = hr.T @ orig + hp * (x + bias)."""
+        """out = hr.T @ orig + hp * (x + bias); row blocks >= *m_ptr (padding tail) copy ``orig``
+        through instead of mixing, so the padding tokens' residual streams stay finite and
+        non-zero (the next layer's projected-RMS mixing divides by their norm)."""
         pid_s = tl.program_id(0)
         pid_c = tl.program_id(1)
         offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
@@ -561,6 +635,26 @@ if _TRITON_AVAILABLE:
         mask_s = offs_s < sb
         mask_c = offs_c < C
         mask_2d = mask_s[:, None] & mask_c[None, :]
+        if HAS_BOUND:
+            if pid_s * BLOCK_S >= tl.load(m_ptr):
+                for i in tl.static_range(N):
+                    orig_i = tl.load(
+                        orig_ptr
+                        + offs_s[:, None] * stride_orig_s
+                        + i * stride_orig_n
+                        + offs_c[None, :],
+                        mask=mask_2d,
+                        other=0.0,
+                    )
+                    tl.store(
+                        out_ptr
+                        + offs_s[:, None] * stride_out_s
+                        + i * stride_out_n
+                        + offs_c[None, :],
+                        orig_i.to(out_ptr.dtype.element_ty),
+                        mask=mask_2d,
+                    )
+                return
 
         x_tile = tl.load(x_ptr + offs_s[:, None] * C + offs_c[None, :], mask=mask_2d, other=0.0).to(
             tl.float32
@@ -596,7 +690,12 @@ if _TRITON_AVAILABLE:
             )
 
     def _triton_h_post_bda_fwd(
-        h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        m_rows: Optional[Tensor] = None,
     ) -> Tensor:
         s, b, n, C = original_residual.shape
         sb = s * b
@@ -627,7 +726,9 @@ if _TRITON_AVAILABLE:
             out.stride(0),
             out.stride(1),
             out.stride(2),
+            m_rows if m_rows is not None else hp_flat,
             HAS_BIAS=(bias is not None),
+            HAS_BOUND=m_rows is not None,
         )
         return out.view(s, b, n, C)
 
@@ -659,12 +760,17 @@ if _TRITON_AVAILABLE:
         stride_orig_s,
         stride_orig_n,
         stride_orig_c,
+        m_ptr,
+        HAS_BOUND: tl.constexpr,
         BLOCK_C: tl.constexpr,
         BLOCK_S: tl.constexpr,
     ):
-        """g_x = hp @ go, g_orig = hr @ go."""
+        """g_x = hp @ go, g_orig = hr @ go; rows >= *m_ptr are skipped (padding tail)."""
         pid_s = tl.program_id(0)
         pid_c = tl.program_id(1)
+        if HAS_BOUND:
+            if pid_s * BLOCK_S >= tl.load(m_ptr):
+                return
         offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
         offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         mask_s = offs_s < sb
@@ -735,12 +841,17 @@ if _TRITON_AVAILABLE:
         stride_hr_s,
         stride_hr_i,
         stride_hr_j,
+        m_ptr,
         HAS_BIAS: tl.constexpr,
+        HAS_BOUND: tl.constexpr,
         BLOCK_C: tl.constexpr,
         BLOCK_S: tl.constexpr,
     ):
-        """g_hp = sum_c go*(x+bias), g_hr = orig @ go.T."""
+        """g_hp = sum_c go*(x+bias), g_hr = orig @ go.T; rows >= *m_ptr are skipped."""
         pid_s = tl.program_id(0)
+        if HAS_BOUND:
+            if pid_s * BLOCK_S >= tl.load(m_ptr):
+                return
         offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
         mask_s = offs_s < sb
 
@@ -813,6 +924,7 @@ if _TRITON_AVAILABLE:
         h_post: Tensor,
         x: Tensor,
         bias: Optional[Tensor],
+        m_rows: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
         s, b, n, C = original_residual.shape
         sb = s * b
@@ -848,6 +960,8 @@ if _TRITON_AVAILABLE:
             g_res.stride(0),
             g_res.stride(1),
             g_res.stride(2),
+            m_rows if m_rows is not None else hp_flat,
+            HAS_BOUND=m_rows is not None,
         )
 
         grid_b = lambda META: (triton.cdiv(sb, META["BLOCK_S"]),)
@@ -870,8 +984,16 @@ if _TRITON_AVAILABLE:
             g_hr.stride(0),
             g_hr.stride(1),
             g_hr.stride(2),
+            m_rows if m_rows is not None else hp_flat,
             HAS_BIAS=(bias is not None),
+            HAS_BOUND=m_rows is not None,
         )
+        if m_rows is not None:
+            # The padding rows' gradients are zero (their loss is masked); the kernels skipped them.
+            _zero_tail_rows(g_res.view(sb, n * C), m_rows)
+            _zero_tail_rows(g_x, m_rows)
+            _zero_tail_rows(g_hp, m_rows)
+            _zero_tail_rows(g_hr.view(sb, n * n), m_rows)
 
         g_bias = g_x.sum(dim=0).to(dtype=bias.dtype) if bias is not None else None
         return (
@@ -902,6 +1024,13 @@ _TRITON_IMPLS = (
 if _CUTILE_AVAILABLE:
     ConstInt = ct.Constant[int]
     PAD_ZERO = ct.PaddingMode.ZERO
+
+    # Padding-aware row bound for the cuTile kernels: a device int64 ``(1,)`` tensor read in-kernel
+    # (``ct.load(MV, ...).astype(ct.int32).item()``); row tiles at or beyond it skip their work and
+    # write zeros where a consumer could read them. Without a published bound a cached full-row
+    # tensor is passed so every kernel has a single code path (graph-capturable either way).
+    def _cutile_rows_bound(m_rows: Optional[Tensor], rows: int, device) -> Tensor:
+        return _rows_bound_tensor(m_rows, rows, device)
 
     # -- Sinkhorn kernels ----------------------------------------------------
 
@@ -1118,9 +1247,23 @@ if _CUTILE_AVAILABLE:
             ct.store(out, index=(pid, j), tile=acc.astype(out.dtype))
 
     @ct.kernel
-    def _ct_h_agg_bwd_kernel(go, x, h_pre, gx, gh, N: ConstInt, TILE_M: ConstInt, TILE_C: ConstInt):
+    def _ct_h_agg_bwd_kernel(
+        go, x, h_pre, gx, gh, N: ConstInt, TILE_M: ConstInt, TILE_C: ConstInt, MV
+    ):
         pid = ct.bid(0)
         num_c_tiles = ct.num_tiles(go, axis=1, shape=(TILE_M, TILE_C))
+        m_live = ct.load(MV, index=(0,), shape=(1,)).astype(ct.int32).item()
+        if pid * TILE_M >= m_live:
+            # Padding tail: zero gradients, no reads.
+            zero_gx = ct.full((TILE_M, N, TILE_C), 0.0, dtype=ct.float32)
+            for ct_idx in range(num_c_tiles):
+                ct.store(gx, index=(pid, 0, ct_idx), tile=zero_gx.astype(gx.dtype))
+            ct.store(
+                gh,
+                index=(pid, 0),
+                tile=ct.full((TILE_M, N), 0.0, dtype=ct.float32).astype(gh.dtype),
+            )
+            return
         h_tile = ct.load(h_pre, index=(pid, 0), shape=(TILE_M, N), padding_mode=PAD_ZERO)
         h_expanded = ct.expand_dims(h_tile, axis=2)
         gh_acc = ct.full((TILE_M, N), 0, dtype=ct.float32)
@@ -1172,7 +1315,7 @@ if _CUTILE_AVAILABLE:
         return out
 
     def _cutile_h_aggregate_bwd(
-        grad_output: Tensor, x: Tensor, h_pre: Tensor
+        grad_output: Tensor, x: Tensor, h_pre: Tensor, m_rows: Optional[Tensor] = None
     ) -> Tuple[Tensor, Tensor]:
         s, b, n, C = x.shape
         sb = s * b
@@ -1189,7 +1332,7 @@ if _CUTILE_AVAILABLE:
             stream,
             (math.ceil(sb / tm),),
             _ct_h_agg_bwd_kernel,
-            (go_flat, x_flat, h_flat, gx, gh, n, tm, tc),
+            (go_flat, x_flat, h_flat, gx, gh, n, tm, tc, _cutile_rows_bound(m_rows, sb, x.device)),
         )
 
         return gx.view(s, b, n, C), gh.view(s, b, n)
@@ -1516,15 +1659,18 @@ if _CUTILE_AVAILABLE:
         TILE_N: ConstInt,
         TILE_K: ConstInt,
         SPLIT_K: ConstInt,
+        MV,
     ):
         '''
         Grid: (num_tiles_m, num_tiles_k).
         Fused matmul + norm + r: proj, norm, r in one pass over K.
         R is a retained signature placeholder; r is computed after split-K
-        reduction from NORM.
+        reduction from NORM. Row tiles at or beyond *MV (padding tail) do nothing.
         '''
         tile_m_id = ct.bid(0)
         split_k_id = ct.bid(1)
+        if tile_m_id * TILE_M >= ct.load(MV, index=(0,), shape=(1,)).astype(ct.int32).item():
+            return
         num_m_tiles = ct.cdiv(M, TILE_M)
         num_k_tiles = ct.cdiv(K, TILE_K)
         num_k_tiles_per_split = ct.cdiv(num_k_tiles, SPLIT_K)
@@ -1580,6 +1726,7 @@ if _CUTILE_AVAILABLE:
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         SPLIT_K: ConstInt,
+        MV,
     ):
         """Reduce split-K partial proj/norm, compute r, and apply compute_h activations.
 
@@ -1589,6 +1736,21 @@ if _CUTILE_AVAILABLE:
         """
         bid_m = ct.bid(0)
         num_bid_m = ct.cdiv(M, TILE_SIZE_M)
+        if bid_m * TILE_SIZE_M >= ct.load(MV, index=(0,), shape=(1,)).astype(ct.int32).item():
+            # Padding tail: finite outputs (the partials were not computed). r = 1, not 0: the
+            # backward divides by r for every row (grad_x = ... + grad_r_total * x / (r K)), and
+            # 0 * (1/0) would be NaN in the tail.
+            zero_n = ct.full((TILE_SIZE_M, n), 0.0, dtype=ct.float32)
+            one_1 = ct.full((TILE_SIZE_M, 1), 1.0, dtype=ct.float32)
+            ct.store(PROJ_OUT, index=(bid_m, 0), tile=zero_n.astype(PROJ_OUT.dtype))
+            ct.store(PROJ_OUT, index=(bid_m, 1), tile=zero_n.astype(PROJ_OUT.dtype))
+            ct.store(R, index=(bid_m, 0), tile=one_1.astype(R.dtype))
+            ct.store(H_PRE, index=(bid_m, 0), tile=zero_n.astype(H_PRE.dtype))
+            ct.store(H_POST, index=(bid_m, 0), tile=zero_n.astype(H_POST.dtype))
+            for res_chunk in ct.static_iter(range(n)):
+                ct.store(PROJ_OUT, index=(bid_m, 2 + res_chunk), tile=zero_n.astype(PROJ_OUT.dtype))
+                ct.store(H_RES, index=(bid_m, res_chunk), tile=zero_n.astype(H_RES.dtype))
+            return
 
         alpha_pre = ct.load(Alpha_pre, index=(0,), shape=(1,)).item()
         alpha_post = ct.load(Alpha_post, index=(0,), shape=(1,)).item()
@@ -1738,6 +1900,7 @@ if _CUTILE_AVAILABLE:
         tile_n: int,
         split_k: int,
         out_dtype: torch.dtype,
+        m_rows: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Launch reduce split-K + compute_h kernel.
 
@@ -1788,6 +1951,7 @@ if _CUTILE_AVAILABLE:
                 tm,
                 tile_n,
                 split_k,
+                _cutile_rows_bound(m_rows, M, proj_acc.device),
             )
 
         if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
@@ -1824,11 +1988,13 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         compute_h_eps: float,
+        m_rows: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused proj_rms + compute_h forward.
 
         Launches the existing _ct_proj_rms_fwd_kernel (split-K matmul + partial norm),
-        then _ct_reduce_compute_h_kernel (reduce + r + activations).
+        then _ct_reduce_compute_h_kernel (reduce + r + activations). ``m_rows`` (device
+        int64 ``(1,)``) bounds the live rows; the padding tail gets zero outputs.
 
         Returns:
             h_pre: [M, n] activated pre weights
@@ -1840,6 +2006,7 @@ if _CUTILE_AVAILABLE:
         M, K = x.shape
         N = weight.shape[0]
         TILE_N = _next_power_of_2(N)
+        mv = _cutile_rows_bound(m_rows, M, x.device)
         dev = x.device
         # The mHC mapping is a keep_in_fp32 computation (see
         # HyperConnectionModule._projection_and_get_norm): keep the split-K
@@ -1867,7 +2034,22 @@ if _CUTILE_AVAILABLE:
                 stream,
                 (math.ceil(M / tm), split_k),
                 _ct_proj_rms_fwd_kernel,
-                (x, weight, proj_acc, norm_acc, r_placeholder, M, N, K, eps, tm, tn, tk, split_k),
+                (
+                    x,
+                    weight,
+                    proj_acc,
+                    norm_acc,
+                    r_placeholder,
+                    M,
+                    N,
+                    K,
+                    eps,
+                    tm,
+                    tn,
+                    tk,
+                    split_k,
+                    mv,
+                ),
             )
         else:
             from types import SimpleNamespace
@@ -1898,6 +2080,7 @@ if _CUTILE_AVAILABLE:
                         tn,
                         tk,
                         split_k,
+                        mv,
                     ),
                 )
             else:
@@ -1924,6 +2107,7 @@ if _CUTILE_AVAILABLE:
                         cfg.TILE_N,
                         cfg.TILE_K,
                         cfg.SPLIT_K,
+                        mv,
                     ),
                     search_space=configs,
                 )
@@ -1958,6 +2142,7 @@ if _CUTILE_AVAILABLE:
                         tn,
                         tk,
                         split_k,
+                        mv,
                     ),
                 )
 
@@ -1979,6 +2164,7 @@ if _CUTILE_AVAILABLE:
             TILE_N,
             split_k,
             torch.promote_types(x.dtype, weight.dtype),
+            m_rows=m_rows,
         )
         return h_pre, h_post, h_res, r, proj_reduced
 
@@ -2011,12 +2197,23 @@ if _CUTILE_AVAILABLE:
         HAS_GRAD_H_POST: ConstInt,
         HAS_GRAD_H_RES: ConstInt,
         HAS_GRAD_R_EXT: ConstInt,
+        MV,
     ):
         """Precompute grad_h, grad_proj, and grad_r_total for downstream backward kernels.
 
-        Grid: (ceil(M / TILE_SIZE_M),).
+        Grid: (ceil(M / TILE_SIZE_M),). Row tiles at or beyond *MV write zeros.
         """
         tile_m_id = ct.bid(0)
+        if tile_m_id * TILE_SIZE_M >= ct.load(MV, index=(0,), shape=(1,)).astype(ct.int32).item():
+            zero_full = ct.full((TILE_SIZE_M, TILE_SIZE_N), 0.0, dtype=ct.float32)
+            ct.store(GRAD_H, index=(tile_m_id, 0), tile=zero_full.astype(GRAD_H.dtype))
+            ct.store(GRAD_PROJ, index=(tile_m_id, 0), tile=zero_full.astype(GRAD_PROJ.dtype))
+            ct.store(
+                GRAD_R_TOTAL,
+                index=(tile_m_id, 0),
+                tile=ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32).astype(GRAD_R_TOTAL.dtype),
+            )
+            return
 
         alpha_pre = ct.load(Alpha_pre, index=(0,), shape=(1,)).item()
         alpha_post = ct.load(Alpha_post, index=(0,), shape=(1,)).item()
@@ -2140,7 +2337,8 @@ if _CUTILE_AVAILABLE:
         """Compute grad_x and grad_weight simultaneously.
 
         Grid: (ceil(K / TILE_SIZE_K),).
-        Each block handles one K-tile and loops over all M-tiles.
+        Each block handles one K-tile and loops over all M-tiles (a data-dependent live bound
+        measured slower here: the padding rows' grad_proj is zero, so they add nothing).
         Per M-tile: computes and stores grad_x, accumulates grad_weight.
         """
         tile_k_id = ct.bid(0)
@@ -2208,12 +2406,39 @@ if _CUTILE_AVAILABLE:
         eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
+        MV,
     ):
         """Compute per-M-tile scalar-gradient partials.
 
-        Grid: (ceil(M / TILE_SIZE_M),).  Each block processes one M-tile.
+        Grid: (ceil(M / TILE_SIZE_M),).  Each block processes one M-tile; tiles at or
+        beyond *MV (padding tail) contribute zero partials.
         """
         bid_m = ct.bid(0)
+        if bid_m * TILE_SIZE_M >= ct.load(MV, index=(0,), shape=(1,)).astype(ct.int32).item():
+            zero_11 = ct.full((1, 1), 0.0, dtype=ct.float32)
+            ct.store(
+                GRAD_ALPHA_PRE_PARTIALS,
+                index=(bid_m, 0),
+                tile=zero_11.astype(GRAD_ALPHA_PRE_PARTIALS.dtype),
+            )
+            ct.store(
+                GRAD_ALPHA_POST_PARTIALS,
+                index=(bid_m, 0),
+                tile=zero_11.astype(GRAD_ALPHA_POST_PARTIALS.dtype),
+            )
+            ct.store(
+                GRAD_ALPHA_RES_PARTIALS,
+                index=(bid_m, 0),
+                tile=zero_11.astype(GRAD_ALPHA_RES_PARTIALS.dtype),
+            )
+            ct.store(
+                GRAD_BIAS_PARTIALS,
+                index=(bid_m, 0),
+                tile=ct.full((1, TILE_SIZE_N), 0.0, dtype=ct.float32).astype(
+                    GRAD_BIAS_PARTIALS.dtype
+                ),
+            )
+            return
 
         offsets = ct.arange(TILE_SIZE_N, dtype=ct.int32)
         one = ct.full((TILE_SIZE_N,), 1.0, dtype=ct.float32)
@@ -2316,6 +2541,7 @@ if _CUTILE_AVAILABLE:
         N: int,
         K: int,
         TILE_N_SIZE: ConstInt,
+        MV,
     ):
         """Fused backward (small K path) with work-stealing.
 
@@ -2330,12 +2556,14 @@ if _CUTILE_AVAILABLE:
         TILE_DB_SIZE_K = 64
         NUM_M_TILES = ct.cdiv(M, TILE_DB_SIZE_M)
         NUM_K_TILES = ct.cdiv(K, TILE_DB_SIZE_K)
+        m_live = ct.load(MV, index=(0,), shape=(1,)).astype(ct.int32).item()
+        NUM_LIVE_DB_M_TILES = ct.minimum(ct.cdiv(m_live, TILE_DB_SIZE_M), NUM_M_TILES)
 
         if ct.bid(1) == 0:
-            # --- grad_weight path ---
+            # --- grad_weight path (live rows only; the tail's grad_proj is zero anyway) ---
             for tile_id in range(ct.bid(0), NUM_K_TILES, ct.num_blocks(0)):
                 accumulator_db = ct.full((TILE_DB_SIZE_K, TILE_N_SIZE), 0.0, dtype=ct.float32)
-                for m_tile in range(NUM_M_TILES):
+                for m_tile in range(NUM_LIVE_DB_M_TILES):
                     x_tile = ct.load(
                         X,
                         index=(m_tile, tile_id),
@@ -2446,6 +2674,7 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         compute_h_eps: float,
+        m_rows: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused compute_h + proj_rms backward.
 
@@ -2460,6 +2689,7 @@ if _CUTILE_AVAILABLE:
         M, K = x.shape
         N = weight.shape[0]
         TILE_N = _next_power_of_2(N)
+        mv = _cutile_rows_bound(m_rows, M, x.device)
         assert TILE_N <= 256, f"TILE_SIZE_N too large: {TILE_N}"
         dev = x.device
         stream = torch.cuda.current_stream()
@@ -2512,6 +2742,7 @@ if _CUTILE_AVAILABLE:
                 int(has_grad_h_post),
                 int(has_grad_h_res),
                 has_grad_r_ext_flag,
+                mv,
             ),
         )
 
@@ -2614,6 +2845,7 @@ if _CUTILE_AVAILABLE:
                     N,
                     K,
                     TILE_N,
+                    mv,
                 ),
             )
 
@@ -2647,6 +2879,7 @@ if _CUTILE_AVAILABLE:
                 eps,
                 tile_m_scalar,
                 TILE_N,
+                mv,
             ),
         )
         ct.launch(
@@ -2937,9 +3170,11 @@ if _CUTILE_AVAILABLE:
             compute_h_eps: float = 1e-6,
         ):
             """Run fused cuTile projection, RMS normalization, and compute_h forward."""
+            m_rows = _live_rows_bound_for_rows(x.shape[0])
             h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
-                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps, compute_h_eps
+                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps, compute_h_eps, m_rows
             )
+            ctx.m_rows = m_rows
             ctx.save_for_backward(
                 x,
                 weight,
@@ -2995,10 +3230,47 @@ if _CUTILE_AVAILABLE:
                     ctx.n,
                     ctx.eps,
                     ctx.compute_h_eps,
+                    m_rows=ctx.m_rows,
                 )
             )
 
             return (grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias, None, None, None)
+
+
+_full_rows_cache: dict = {}
+
+
+def _rows_bound_tensor(m_rows: Optional[Tensor], rows: int, device) -> Tensor:
+    """The published live-row bound, or a cached device int64 ``(1,)`` holding ``rows`` so that
+    bounded kernels have one code path (both are static addresses, CUDA-graph safe)."""
+    if m_rows is not None:
+        return m_rows
+    key = (rows, str(device))
+    t = _full_rows_cache.get(key)
+    if t is None:
+        t = torch.full((1,), rows, dtype=torch.int64, device=device)
+        _full_rows_cache[key] = t
+    return t
+
+
+def _live_rows_bound_for_rows(rows: int) -> Optional[Tensor]:
+    """Padding-aware live-row bound published for a buffer of ``rows`` rows, if any
+    (see ``megatron.core.transformer.padding_aware_gemm``)."""
+    if not (_TRITON_AVAILABLE or is_cutile_available()):
+        return None
+    from megatron.core.transformer.padding_aware_gemm import (
+        current_live_rows_for,
+        padding_aware_feature_disabled,
+    )
+
+    if padding_aware_feature_disabled("mhc"):
+        return None
+    return current_live_rows_for(rows)
+
+
+def _live_rows_bound_for(t: Tensor) -> Optional[Tensor]:
+    """Padding-aware live-row bound for a ``(s, b, ...)`` activation (its ``s * b`` rows)."""
+    return _live_rows_bound_for_rows(t.shape[0] * t.shape[1])
 
 
 class FusedHAggregate(torch.autograd.Function):
@@ -3009,13 +3281,14 @@ class FusedHAggregate(torch.autograd.Function):
         """Run h_aggregate forward using the best available backend."""
         triton_fwd = _get_triton_h_aggregate_fwd(backend)
         if triton_fwd is not None:
-            output = triton_fwd(x, h_pre)
+            output = triton_fwd(x, h_pre, m_rows=_live_rows_bound_for(x))
         elif _backend_uses_cutile(backend):
             output = _cutile_h_aggregate_fwd(x, h_pre)
         else:
             output = native_h_aggregate(x, h_pre)
         ctx.save_for_backward(x, h_pre)
         ctx.backend = backend
+        ctx.m_rows = _live_rows_bound_for(x)
         return output
 
     @staticmethod
@@ -3023,7 +3296,7 @@ class FusedHAggregate(torch.autograd.Function):
         """Run h_aggregate backward using the best available backend."""
         x, h_pre = ctx.saved_tensors
         if _backend_uses_cutile(ctx.backend):
-            grad_x, grad_h_pre = _cutile_h_aggregate_bwd(grad_output, x, h_pre)
+            grad_x, grad_h_pre = _cutile_h_aggregate_bwd(grad_output, x, h_pre, m_rows=ctx.m_rows)
         else:
             grad_x, grad_h_pre = _torch_h_aggregate_bwd(grad_output, x, h_pre)
         return grad_x, grad_h_pre, None
@@ -3050,7 +3323,7 @@ class FusedHAggregateInto(torch.autograd.Function):
         ctx.mark_dirty(out)
         triton_fwd = _get_triton_h_aggregate_fwd(backend)
         if triton_fwd is not None:
-            output = triton_fwd(x, h_pre, out)
+            output = triton_fwd(x, h_pre, out, m_rows=_live_rows_bound_for(x))
         elif _backend_uses_cutile(backend):
             output = _cutile_h_aggregate_fwd(x, h_pre, out)
         else:
@@ -3058,6 +3331,7 @@ class FusedHAggregateInto(torch.autograd.Function):
             output = out
         ctx.save_for_backward(x, h_pre)
         ctx.backend = backend
+        ctx.m_rows = _live_rows_bound_for(x)
         return output
 
     @staticmethod
@@ -3065,7 +3339,7 @@ class FusedHAggregateInto(torch.autograd.Function):
         """Run h_aggregate backward; the caller-owned output needs no grad slot."""
         x, h_pre = ctx.saved_tensors
         if _backend_uses_cutile(ctx.backend):
-            grad_x, grad_h = _cutile_h_aggregate_bwd(grad_output, x, h_pre)
+            grad_x, grad_h = _cutile_h_aggregate_bwd(grad_output, x, h_pre, m_rows=ctx.m_rows)
         else:
             grad_x, grad_h = _torch_h_aggregate_bwd(grad_output, x, h_pre)
         return grad_x, grad_h, None, None
@@ -3085,13 +3359,18 @@ class FusedHPostBDA(torch.autograd.Function):
         backend: MHCBackend,
     ):
         """Run h_post_bda forward using the best available backend."""
+        # Padding rows: the Triton forward passes the original residual streams through for the
+        # tail (finite, non-zero: the next layer's projected-RMS mixing divides by their norm and
+        # its backward is singular at zero); the backward skips them (their gradients are zero).
+        m_rows = _live_rows_bound_for(original_residual)
         triton_fwd = _get_triton_h_post_bda_fwd(backend)
         if triton_fwd is not None:
-            output = triton_fwd(h_res, original_residual, h_post, x, bias)
+            output = triton_fwd(h_res, original_residual, h_post, x, bias, m_rows=m_rows)
         elif _backend_uses_cutile(backend):
             output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
         else:
             output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
+        ctx.m_rows = m_rows
         if bias is not None:
             ctx.save_for_backward(h_res, original_residual, h_post, x, bias)
             ctx.has_bias = True
@@ -3112,7 +3391,7 @@ class FusedHPostBDA(torch.autograd.Function):
 
         triton_bwd = _get_triton_h_post_bda_bwd(ctx.backend)
         if triton_bwd is not None:
-            grads = triton_bwd(grad_output, h_res, orig_res, h_post, x, bias)
+            grads = triton_bwd(grad_output, h_res, orig_res, h_post, x, bias, m_rows=ctx.m_rows)
         elif _backend_uses_cutile(ctx.backend):
             grads = _cutile_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
         else:

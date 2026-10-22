@@ -28,6 +28,10 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine_int4_fake_qat import (
     maybe_fake_quantize_int4_weight_tensors,
 )
+from megatron.core.fusions.fused_padding_aware_norm import (
+    padding_aware_rms_norm,
+    padding_aware_rms_norm_available,
+)
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
@@ -56,6 +60,14 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
+from megatron.core.transformer.padding_aware_gemm import (
+    DISABLED_POLICY,
+    current_live_rows_for,
+    dense_linear_policy,
+    log_policy_decision,
+    te_layernorm_linear_padding_aware_forward,
+    te_linear_padding_aware_forward,
+)
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -1199,6 +1211,23 @@ else:
     TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
 
 
+class PaddingAwareTERMSNorm(te.pytorch.RMSNorm):
+    """Transformer Engine RMSNorm that normalises only the live rows of a THD buffer when the
+    padding-aware context has published a live-row bound for the input's rows (Triton kernel,
+    fp32 statistics like TE's; the padding tail is zero). Otherwise TE's own kernels run."""
+
+    def forward(self, inp: torch.Tensor, *args, **kwargs):
+        """RMSNorm over the last dimension; padding rows skipped when a bound is published."""
+        if inp.dim() >= 2 and not args and not kwargs:
+            rows = inp.numel() // inp.shape[-1]
+            bound = current_live_rows_for(rows)
+            if bound is not None and padding_aware_rms_norm_available(inp):
+                return padding_aware_rms_norm(
+                    inp, self.weight, self.eps, bound, self.zero_centered_gamma
+                )
+        return super().forward(inp, *args, **kwargs)
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
@@ -1243,7 +1272,7 @@ class TENorm:
                 ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
                 norm_module = TEFusedResidualRMSNorm
             else:
-                norm_module = te.pytorch.RMSNorm
+                norm_module = PaddingAwareTERMSNorm
         else:
             raise Exception("Only LayerNorm and RMSNorm are currently supported")
 
@@ -1473,6 +1502,16 @@ class TELinear(te.pytorch.Linear):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
+        # Padding-aware (live-row) GEMMs for THD buffers: decided once from the model shape.
+        self._padding_aware_policy = dense_linear_policy(self, config)
+        if getattr(config, "padding_aware_dense_linear", False):
+            log_policy_decision(
+                type(self).__name__,
+                int(self.out_features),
+                int(self.in_features),
+                self._padding_aware_policy.enabled,
+                self._padding_aware_policy.reason,
+            )
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -1494,8 +1533,19 @@ class TELinear(te.pytorch.Linear):
         _is_first_microbatch = _resolve_is_first_microbatch(self)
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
-        with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        out = None
+        policy = getattr(self, "_padding_aware_policy", DISABLED_POLICY)
+        if policy.enabled and x.dim() >= 2:
+            live_rows = current_live_rows_for(x.shape[:-1].numel())
+            if live_rows is not None:
+                # Only the live rows of the THD buffer go through the GEMMs (tail zero-filled).
+                with quant_context:
+                    out = te_linear_padding_aware_forward(
+                        self, x, live_rows, _is_first_microbatch, policy
+                    )
+        if out is None:
+            with quant_context:
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
         # TE only returns a tuple when return_bias is True, otherwise
@@ -1860,6 +1910,16 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
+        # Padding-aware (live-row) GEMMs for THD buffers: decided once from the model shape.
+        self._padding_aware_policy = dense_linear_policy(self, config)
+        if getattr(config, "padding_aware_dense_linear", False):
+            log_policy_decision(
+                type(self).__name__,
+                int(self.out_features),
+                int(self.in_features),
+                self._padding_aware_policy.enabled,
+                self._padding_aware_policy.reason,
+            )
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override"""
@@ -1888,8 +1948,19 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         if x.dtype != self.layer_norm_weight.dtype:
             x = x.to(self.layer_norm_weight.dtype)
 
-        with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        out = None
+        policy = getattr(self, "_padding_aware_policy", DISABLED_POLICY)
+        if policy.enabled and x.dim() >= 2:
+            live_rows = current_live_rows_for(x.shape[:-1].numel())
+            if live_rows is not None:
+                # Norm over the buffer, GEMMs over its live rows only (tail zero-filled).
+                with quant_context:
+                    out = te_layernorm_linear_padding_aware_forward(
+                        self, x, live_rows, _is_first_microbatch, policy
+                    )
+        if out is None:
+            with quant_context:
+                out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
         self.is_first_microbatch = False
 

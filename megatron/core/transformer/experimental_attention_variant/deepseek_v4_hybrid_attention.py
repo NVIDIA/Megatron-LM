@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -23,6 +24,11 @@ from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import _build_csa_submodule
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.padding_aware_gemm import (
+    current_live_rows_for,
+    grouped_projection_is_padding_aware,
+    padding_aware_grouped_projection,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -210,6 +216,10 @@ class DSv4HybridAttention(Attention):
         if self.config.perform_initialization:
             self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
+        # Padding-aware grouped projection (THD live rows only), decided from the model shape.
+        self._padding_aware_o_group_proj = grouped_projection_is_padding_aware(
+            self.config, self.o_local_groups, self.config.o_lora_rank, group_proj_in_size
+        )
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
 
@@ -245,6 +255,28 @@ class DSv4HybridAttention(Attention):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    def _q_rms_norm_padding_aware(self, q: torch.Tensor) -> torch.Tensor:
+        """Query RMS norm; rows of padding tokens are skipped when a live-row bound exists."""
+        from megatron.core.fusions.fused_padding_aware_norm import (
+            padding_aware_rms_norm,
+            padding_aware_rms_norm_available,
+        )
+        from megatron.core.transformer.padding_aware_gemm import current_live_rows_for
+
+        # Opt-in: the row-bounded kernel is slower than torch.compile's fused reduction on the
+        # [tokens * heads, 576] view (1.39 vs 1.11 ms at 16K tokens, 70 % live), so the compiled
+        # norm stays the default.
+        if os.environ.get("MCORE_PADDING_AWARE_QNORM", "0") != "1":
+            return _q_rms_norm(q, self.config.layernorm_epsilon)
+        tokens = q.numel() // (q.shape[-1] * q.shape[-2])
+        bound = current_live_rows_for(tokens)
+        if bound is not None and padding_aware_rms_norm_available(q):
+            # rows of the [tokens, heads, dim] view are token-major: live rows = live tokens * heads
+            return padding_aware_rms_norm(
+                q, None, self.config.layernorm_epsilon, bound * q.shape[-2]
+            )
+        return _q_rms_norm(q, self.config.layernorm_epsilon)
 
     def forward(
         self,
@@ -377,7 +409,16 @@ class DSv4HybridAttention(Attention):
         wo_a_weight = self.linear_o_group_proj.view(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
-        core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
+        live_rows = None
+        if self._padding_aware_o_group_proj and core_attn_out.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            live_rows = current_live_rows_for(core_attn_out.shape[0] * core_attn_out.shape[1])
+        if live_rows is not None:
+            core_attn_out = padding_aware_grouped_projection(core_attn_out, wo_a_weight, live_rows)
+        else:
+            core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
@@ -629,7 +670,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            q = self._q_rms_norm_padding_aware(q)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:

@@ -132,6 +132,8 @@ def _mla_rope_fwd_inplace_kernel(
     REMOVE_INTERLEAVING: tl.constexpr,
     ROPE_FIRST: tl.constexpr,
     HAS_THD_GLOBAL_START: tl.constexpr,
+    m_ptr,
+    HAS_BOUND: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -149,6 +151,10 @@ def _mla_rope_fwd_inplace_kernel(
         cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
     """
     pid_m = tl.program_id(axis=0)
+    if HAS_BOUND:
+        # Padding-aware THD buffers: rows at and beyond the live-row bound are skipped.
+        if pid_m >= tl.load(m_ptr):
+            return
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
@@ -245,6 +251,8 @@ def _mla_rope_bwd_kernel(
     HAS_THD_GLOBAL_START: tl.constexpr,
     COPY_NOPE: tl.constexpr,
     BLOCK_NOPE: tl.constexpr,
+    m_ptr,
+    HAS_BOUND: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -269,6 +277,10 @@ def _mla_rope_bwd_kernel(
         DO_OUT: same shape and strides as DO_IN
     """
     pid_m = tl.program_id(axis=0)
+    if HAS_BOUND:
+        # Padding-aware THD buffers: rows at and beyond the live-row bound are skipped.
+        if pid_m >= tl.load(m_ptr):
+            return
     pid_head = tl.program_id(axis=1)
 
     if position_ids is not None:
@@ -375,6 +387,7 @@ def mla_rope_apply_raw_(
     position_ids: Optional[torch.Tensor] = None,
     rope_first: bool = False,
     thd_global_start: Optional[int] = None,
+    m_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Apply the MLA RoPE rotation to ``t`` in place, bypassing autograd.
 
@@ -393,6 +406,8 @@ def mla_rope_apply_raw_(
         rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones
         thd_global_start: first global packed row for a contiguous THD slice, derived from
             ``cu_seqlens_q`` instead of materializing ``position_ids``
+        m_rows: optional device int64 ``(1,)`` live-row bound of a padding-aware THD buffer;
+            rows at and beyond it are left untouched (they hold padding)
 
     Returns:
         t: the same tensor, modified in place
@@ -425,6 +440,8 @@ def mla_rope_apply_raw_(
         REMOVE_INTERLEAVING=remove_interleaving,
         ROPE_FIRST=rope_first,
         HAS_THD_GLOBAL_START=has_thd_global_start,
+        m_ptr=m_rows if m_rows is not None else x,
+        HAS_BOUND=m_rows is not None,
     )
     return t
 
@@ -444,6 +461,7 @@ def mla_rope_unapply_raw(
     out: Optional[torch.Tensor] = None,
     rope_first: bool = False,
     thd_global_start: Optional[int] = None,
+    m_rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Undo :func:`mla_rope_apply_raw_`, bypassing autograd.
 
@@ -455,6 +473,10 @@ def mla_rope_unapply_raw(
     is aliased by a tensor another autograd node still expects to hold the
     rotated values; the leading ``nope_dim`` elements are copied across so
     ``out`` is fully populated in a single pass.
+
+    ``m_rows`` (device int64 ``(1,)``) is the live-row bound of a padding-aware THD buffer:
+    in the in-place form the rows at and beyond it are skipped (their gradient is zero and
+    stays zero); it is ignored with ``out`` because those rows would be left unpopulated.
 
     Returns:
         ``t`` when ``out`` is None, otherwise ``out``.
@@ -498,6 +520,8 @@ def mla_rope_unapply_raw(
         HAS_THD_GLOBAL_START=has_thd_global_start,
         COPY_NOPE=out is not None,
         BLOCK_NOPE=triton.next_power_of_2(nope_dim) if out is not None else 1,
+        m_ptr=m_rows if (m_rows is not None and out is None) else x,
+        HAS_BOUND=m_rows is not None and out is None,
     )
     return t if out is None else out
 
@@ -516,6 +540,18 @@ _autotuned_mla_rope_bwd_inplace_kernel = triton.autotune(
     key=["emb_dim", "head_num"],
     restore_value=["DO_OUT"],
 )(_mla_rope_bwd_kernel)
+
+
+def _live_rows_bound_for_rope(x_flat: torch.Tensor) -> Optional[torch.Tensor]:
+    """Padding-aware live-row bound published for a buffer of ``x_flat.shape[0]`` rows."""
+    from megatron.core.transformer.padding_aware_gemm import (
+        current_live_rows_for,
+        padding_aware_feature_disabled,
+    )
+
+    if padding_aware_feature_disabled("rope"):
+        return None
+    return current_live_rows_for(x_flat.shape[0])
 
 
 class _FusedMLARoPEInplace(torch.autograd.Function):
@@ -555,6 +591,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             thd_global_start: first global packed row for a contiguous THD input slice
         """
         assert not rotary_interleaved
+        m_rows = _live_rows_bound_for_rope(_flatten_rope_input(q, cu_seqlens_q, position_ids)[0])
         mla_rope_apply_raw_(
             q,
             cos,
@@ -569,7 +606,9 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             position_ids=position_ids,
             rope_first=rope_first,
             thd_global_start=thd_global_start,
+            m_rows=m_rows,
         )
+        ctx.m_rows = m_rows
         ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
         ctx.has_position_ids = position_ids is not None
         ctx.nope_dim = nope_dim
@@ -615,6 +654,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             position_ids=position_ids,
             rope_first=ctx.rope_first,
             thd_global_start=ctx.thd_global_start,
+            m_rows=ctx.m_rows,
         )
         return grad, None, None, None, None, None, None, None, None, None, None, None, None, None
 

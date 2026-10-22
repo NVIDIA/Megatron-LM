@@ -39,6 +39,7 @@ from megatron.core.transformer.multi_token_prediction import (
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
+from megatron.core.transformer.padding_aware_gemm import padding_aware_lm_head_context
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
@@ -903,122 +904,123 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if not self.post_process:
             return mtp_hidden_states if mtp_forward_ran else hidden_states
 
-        if self.config.mtp_num_layers is not None and self.mtp_process:
-            assert self.config.mtp_num_layers > 0
-            if is_spec_decode:
-                assert inference_context is not None
-                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
-                    # Block-scope CUDA graph mode: copy_() into the
-                    # pre-allocated buffer so every graph replay writes to
-                    # the same fixed GPU address regardless of batch size.
-                    assert inference_context.mtp_decoder_hidden_states is not None
-                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
-                        hidden_states
+        with padding_aware_lm_head_context(self.config, padding_mask):
+            if self.config.mtp_num_layers is not None and self.mtp_process:
+                assert self.config.mtp_num_layers > 0
+                if is_spec_decode:
+                    assert inference_context is not None
+                    if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                        # Block-scope CUDA graph mode: copy_() into the
+                        # pre-allocated buffer so every graph replay writes to
+                        # the same fixed GPU address regardless of batch size.
+                        assert inference_context.mtp_decoder_hidden_states is not None
+                        inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                            hidden_states
+                        )
+                    else:
+                        # Non-block scope: direct assignment; the controller will set
+                        # this back to None after reading to allow GC.
+                        inference_context.mtp_decoder_hidden_states = hidden_states
+                elif mtp_forward_ran:
+                    assert mtp_inputs is not None
+                    # For RL (labels is None), process_mtp_loss derives labels from
+                    # input_ids to match the SFT label format.
+                    hidden_states = process_mtp_loss(
+                        hidden_states=mtp_hidden_states,
+                        labels=mtp_inputs.labels,
+                        loss_mask=mtp_inputs.loss_mask,
+                        output_layer=self.output_layer,
+                        output_weight=output_weight,
+                        is_training=self.training,
+                        compute_language_model_loss=self.compute_language_model_loss,
+                        config=self.config,
+                        cp_group=mtp_cp_group,
+                        tp_group=self.tp_group,
+                        dp_cp_group=self.pg_collection.dp_cp,
+                        sequence_roll_context=sequence_roll_context,
+                        packed_seq_params=mtp_inputs.packed_seq_params,
+                        scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                        input_ids=mtp_inputs.input_ids,
+                        mtp_input_mask=mtp_inputs.mtp_input_mask,
+                        metric_avg_group=(
+                            getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                            or self.pg_collection.dp_cp
+                        ),
+                        main_hidden_states=hidden_states,
                     )
-                else:
-                    # Non-block scope: direct assignment; the controller will set
-                    # this back to None after reading to allow GC.
-                    inference_context.mtp_decoder_hidden_states = hidden_states
-            elif mtp_forward_ran:
-                assert mtp_inputs is not None
-                # For RL (labels is None), process_mtp_loss derives labels from
-                # input_ids to match the SFT label format.
-                hidden_states = process_mtp_loss(
-                    hidden_states=mtp_hidden_states,
-                    labels=mtp_inputs.labels,
-                    loss_mask=mtp_inputs.loss_mask,
-                    output_layer=self.output_layer,
-                    output_weight=output_weight,
-                    is_training=self.training,
-                    compute_language_model_loss=self.compute_language_model_loss,
-                    config=self.config,
-                    cp_group=mtp_cp_group,
-                    tp_group=self.tp_group,
-                    dp_cp_group=self.pg_collection.dp_cp,
-                    sequence_roll_context=sequence_roll_context,
-                    packed_seq_params=mtp_inputs.packed_seq_params,
-                    scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                    input_ids=mtp_inputs.input_ids,
-                    mtp_input_mask=mtp_inputs.mtp_input_mask,
-                    metric_avg_group=(
-                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
-                        or self.pg_collection.dp_cp
-                    ),
-                    main_hidden_states=hidden_states,
-                )
-        sequence_parallel_override = False
-        if (
-            in_inference_mode
-            and inference_context is not None
-            and inference_context.config.materialize_only_last_token_logits
-        ):
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
-
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S', B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
-
-        if (
-            labels is not None
-            and not in_inference_mode
-            and self.config.cross_entropy_loss_fusion
-            and self.config.cross_entropy_fusion_impl == "linear"
-        ):
-            # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
-            # materialised, so the loss comes straight out of the output layer and muP's output
-            # scaling is applied to the layer input instead (the layer has no bias).
-            return self.output_layer(
-                self._scale_fused_cross_entropy_input(hidden_states),
-                weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-                output_cross_entropy_loss=True,
-                labels=labels,
-            )
-
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-        logits = self._scale_logits(logits)
-        gather_output = (
-            self.output_layer.gather_output
-            if runtime_gather_output is None
-            else runtime_gather_output
-        )
-        observe_tensor(
-            self.output_layer,
-            "output_logits",
-            "output_logits",
-            logits,
-            tp_shard_dim=None if gather_output else -1,
-            sequence_dim=0,
-            batch_dim=1,
-        )
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
+            sequence_parallel_override = False
+            if (
                 in_inference_mode
-                and inference_context.is_dynamic_batching()
+                and inference_context is not None
                 and inference_context.config.materialize_only_last_token_logits
+            ):
+                if inference_context.is_static_batching():
+                    hidden_states = hidden_states[-1:, :, :]
+                else:
+                    if self.output_layer.sequence_parallel:
+                        # Perform the sequence parallel gather here instead of after the output layer
+                        # because we need to slice the last token logits from the full view of the
+                        # packed logits across all requests.
+                        hidden_states = gather_from_sequence_parallel_region(
+                            hidden_states, group=self.pg_collection.tp
+                        )
+                        self.output_layer.sequence_parallel = False
+                        sequence_parallel_override = True
+
+                    # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                    # then back to [S', B, H] for the output layer.
+                    reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                    hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+            if (
+                labels is not None
+                and not in_inference_mode
+                and self.config.cross_entropy_loss_fusion
+                and self.config.cross_entropy_fusion_impl == "linear"
+            ):
+                # Fused linear + cross-entropy (same branch as GPTModel.forward): the logits are never
+                # materialised, so the loss comes straight out of the output layer and muP's output
+                # scaling is applied to the layer input instead (the layer has no bias).
+                return self.output_layer(
+                    self._scale_fused_cross_entropy_input(hidden_states),
+                    weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                    output_cross_entropy_loss=True,
+                    labels=labels,
+                )
+
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
-            self.output_layer.sequence_parallel = True
+            logits = self._scale_logits(logits)
+            gather_output = (
+                self.output_layer.gather_output
+                if runtime_gather_output is None
+                else runtime_gather_output
+            )
+            observe_tensor(
+                self.output_layer,
+                "output_logits",
+                "output_logits",
+                logits,
+                tp_shard_dim=None if gather_output else -1,
+                sequence_dim=0,
+                batch_dim=1,
+            )
 
-        if labels is None:
-            # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            # Restore sequence parallel execution to the output layer if necessary.
+            if sequence_parallel_override:
+                assert (
+                    in_inference_mode
+                    and inference_context.is_dynamic_batching()
+                    and inference_context.config.materialize_only_last_token_logits
+                )
+                self.output_layer.sequence_parallel = True
 
-        loss = self.compute_language_model_loss(labels, logits)
+            if labels is None:
+                # [s b h] => [b s h]
+                return logits.transpose(0, 1).contiguous()
 
-        return loss
+            loss = self.compute_language_model_loss(labels, logits)
+
+            return loss
