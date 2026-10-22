@@ -503,8 +503,8 @@ def wrap_data_iterator(
     """
 
     # GTP_remat peers consume distinct samples, so packing must span them like the rest of DP.
-    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
-    dp_group = getattr(pg_collection, 'dp_gtp_remat', None) or pg_collection.dp
+    dp_cp_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+    dp_group = pg_collection.dp_gtp_remat or pg_collection.dp
     tp_group = pg_collection.tp
     pp_group = pg_collection.pp
     assert (
