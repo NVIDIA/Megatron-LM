@@ -161,6 +161,90 @@ def test_next_forward_uses_optimizer_updated_weights(
         torch.testing.assert_close(train_iteration(), torch.tensor(expected, device=device))
 
 
+@pytest.mark.parametrize("single_grouped_weight", [False, True], ids=["separate", "grouped"])
+@pytest.mark.parametrize(
+    "placements",
+    [
+        Placements(
+            dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Replicate()]
+        ),
+        Placements(
+            dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
+        ),
+        Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]),
+        Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]),
+    ],
+    ids=["no_shard", "zero1", "zero2", "zero3"],
+)
+def test_grouped_linear_uses_updated_weights(
+    distributed_setup, monkeypatch, single_grouped_weight, placements
+):
+    """Grouped GEMMs read updated FSDP storage across repeated optimizer steps."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    pytest.importorskip("transformer_engine.pytorch.tensor.grouped_tensor")
+    device = distributed_setup.device
+    world_size = distributed_setup.world_size
+    if device.type != "cuda" or world_size < 2:
+        pytest.skip("Requires at least two CUDA ranks.")
+
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+    num_experts, tokens_per_expert, hidden = 4, 32, 64
+    model = te.GroupedLinear(
+        num_gemms=num_experts,
+        in_features=hidden,
+        out_features=hidden,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device=device,
+        use_grouped_tensor=True,
+        single_grouped_weight=single_grouped_weight,
+    )
+    assert model.single_grouped_weight == single_grouped_weight
+    assert len(list(model.parameters())) == (1 if single_grouped_weight else num_experts)
+    for parameter in model.parameters():
+        nn.init.ones_(parameter.rowwise_data if single_grouped_weight else parameter)
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+        )
+    (group,) = model.parameter_groups
+    if single_grouped_weight:
+        (parameter,) = group.fsdp_parameters
+        # Initialization must release the original allocation as well as bind storage.
+        assert parameter.unsharded.rowwise_data.untyped_storage().nbytes() == 0
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=1 / 128, foreach=False)
+    fully_shard_optimizer(optimizer)
+    inputs = torch.ones(
+        num_experts * tokens_per_expert, hidden, device=device, dtype=torch.bfloat16
+    )
+    splits = torch.full((num_experts,), tokens_per_expert, device=device, dtype=torch.int64)
+
+    # Identical inputs on every rank give an exact gradient of 32 for each weight.
+    # Each SGD step therefore subtracts 1/4; powers of two are exact in BF16.
+    for step in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        output = model(inputs, splits)
+        torch.testing.assert_close(
+            output, torch.full_like(output, hidden * (1 - step / 4)), rtol=0, atol=0
+        )
+        output.float().sum().backward()
+        gradients = group.main_grad.redistribute([Replicate()]).local_buffer
+        torch.testing.assert_close(
+            gradients, torch.full_like(gradients, tokens_per_expert), rtol=0, atol=0
+        )
+        optimizer.step()
+        weights = group.main_weight.redistribute([Replicate()]).local_buffer
+        torch.testing.assert_close(
+            weights, torch.full_like(weights, 1 - (step + 1) / 4), rtol=0, atol=0
+        )
+
+
 def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
     """Optimizer synchronization should run once per group, not once per microbatch."""
     world_size = distributed_setup.world_size

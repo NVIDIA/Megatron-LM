@@ -2,6 +2,7 @@
 
 """MCore optimizer wrapper for experimental Megatron-FSDP v2."""
 
+from functools import cached_property
 from typing import Any, Callable, List, Optional, override
 
 import torch
@@ -87,11 +88,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
-        # Each parameter's globally unique checkpoint name, mirroring
-        # :class:`DistributedOptimizer`'s ``param_to_name``. Keyed by parameter because that
-        # is the direction the checkpoint path resolves, and because the optimizer names each
-        # parameter once: a tied parameter is one ``nn.Parameter`` with one state entry, and
-        # its several FQNs are the model state dict's business, not this map's.
+
+    @cached_property
+    def _param_to_fqn(self) -> dict[torch.nn.Parameter, str]:
+        """Resolve globally unique parameter names on first checkpoint access.
+
+        Training does not use this map. In particular, unsupported grouped-expert
+        checkpoint names should not prevent training without checkpointing.
+        """
         parameters = self.get_parameters()
         if not is_te_min_version("2.18.0"):
             # Include the empty local shards filtered out of older TE optimizers.
@@ -100,7 +104,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 for param in model_chunk.parameters():
                     if param.requires_grad:
                         parameters.append(param)
-        self._param_to_fqn: dict[torch.nn.Parameter, str] = {
+        return {
             param: get_global_unique_param_name(self.model_chunks, param) for param in parameters
         }
 

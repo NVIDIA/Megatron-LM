@@ -3,15 +3,23 @@
 """``fsdp_dtensor`` checkpoint round-trip tests for the MFSDP v2 MCore optimizer."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
 
+import megatron.core.optimizer.fully_sharded_optimizer as optimizer_module
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
@@ -269,6 +277,61 @@ class TestOptimizerCheckpoint:
 
     def teardown_method(self):
         Utils.destroy_model_parallel()
+
+    def test_checkpoint_names_are_resolved_lazily(self, distributed_setup, monkeypatch):
+        """Training skips checkpoint naming, and checkpoint access caches names once."""
+        device = distributed_setup.device
+        mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+        model = torch.nn.Linear(8, 8, device=device, dtype=torch.bfloat16)
+        model.config = SimpleNamespace(cuda_graph_impl="none", num_moe_experts=None)
+        model.ddp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True, megatron_fsdp_version=2
+        )
+        with fully_shard_context(device=device):
+            fully_shard(
+                model,
+                mesh=mesh,
+                placements=Placements(
+                    dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+                ),
+            )
+
+        calls = []
+        original_get_name = optimizer_module.get_global_unique_param_name
+
+        def record_name_lookup(model_chunks, parameter):
+            calls.append(parameter)
+            return original_get_name(model_chunks, parameter)
+
+        monkeypatch.setattr(optimizer_module, "get_global_unique_param_name", record_name_lookup)
+        optimizer = FullyShardedOptimizer(
+            torch.optim.SGD(model.parameters(), lr=0.01, foreach=False),
+            OptimizerConfig(
+                optimizer="sgd",
+                lr=0.01,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                clip_grad=0.0,
+                use_distributed_optimizer=False,
+                use_precision_aware_optimizer=False,
+            ),
+            grad_scaler=None,
+            init_state_fn=None,
+            model_chunks=[model],
+        )
+        for _ in range(2):
+            optimizer.zero_grad()
+            model(torch.ones(4, 8, device=device, dtype=torch.bfloat16)).float().sum().backward()
+            success, _, _ = optimizer.step()
+            assert success
+        assert not calls
+        assert "_param_to_fqn" not in optimizer.__dict__
+
+        metadata = optimizer._param_to_group_meta()
+        assert set(metadata) == {"weight", "bias"}
+        assert len(calls) == len(list(model.parameters()))
+        optimizer._param_to_group_meta()
+        assert len(calls) == len(list(model.parameters()))
 
     @pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
     def test_checkpoint_roundtrip(self, tmp_path_dist_ckpt: Path, precision_aware: bool) -> None:

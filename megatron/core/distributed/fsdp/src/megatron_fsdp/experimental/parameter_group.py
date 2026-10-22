@@ -30,6 +30,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from ..utils import HAVE_TE
 from . import layout_builder
 from .dbuffer import DBuffer
+from .grouped_tensor import GroupedTensor, get_values, install_storage
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic, RowAtomic, TensorAtomic
@@ -292,7 +293,7 @@ class FsdpParameterGroup:
                     )
                 parameter.clear_high_precision_init_val()
             else:
-                initial_value = parameter
+                initial_value = get_values(parameter)
             self.main_weight.copy_from(index, initial_value)
 
         if use_symmetric_memory:
@@ -384,6 +385,9 @@ class FsdpParameterGroup:
                 )
                 copy_parameter_attributes(parameter, materialized_parameter)
                 torch.utils.swap_tensors(parameter, materialized_parameter)
+            elif isinstance(parameter, GroupedTensor):
+                install_storage(parameter, unsharded_tensor)
+                parameter.grad = None
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
@@ -468,11 +472,15 @@ class FsdpParameterGroup:
                 )
 
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = (
+            unsharded_tensor = (
                 unsharded_model_weight.get_tensor_view(index)
                 if isinstance(unsharded_model_weight, DBuffer)
                 else unsharded_model_weight.get_tensor(index)
             )
+            if isinstance(fsdp_parameter.unsharded, GroupedTensor):
+                install_storage(fsdp_parameter.unsharded, unsharded_tensor)
+            else:
+                fsdp_parameter.unsharded.data = unsharded_tensor
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
