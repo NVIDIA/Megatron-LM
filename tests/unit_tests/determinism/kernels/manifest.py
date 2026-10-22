@@ -592,14 +592,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- inference (single GPU)
     KernelEntry(
-        name="simplified_dsa_decode",
+        name="dsa_gqa_decode",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_decode_kernel.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
         ),
         tests=(
             K + "test_dsa_gqa_decode.py",
-            "tests/unit_tests/transformer/test_attention_variant_dsa_gqa_decode.py",
+            "tests/unit_tests/transformer/test_attention_variant_dsa_gqa.py",
         ),
         kind="cutedsl",
         training_path=False,
