@@ -9,7 +9,7 @@ import enum
 import logging
 import weakref
 from collections.abc import Callable
-from typing import Any, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Optional, TypeVar, Union
 
 import torch
 from torch import _C
@@ -609,6 +609,7 @@ def model_parallel_cuda_manual_seed(
 # dtypes, no crash, wrong model.
 _EXPERT_CPU_INIT_SALT: Optional[int] = None
 _EXPERT_CPU_INIT_INDEX: Optional[int] = None
+_EXPERT_CPU_INIT_RNG_STATE: Optional[torch.Tensor] = None
 # Odd multiplier spreading adjacent expert indices across the seed space.
 _EXPERT_SEED_STRIDE = 7919
 
@@ -646,13 +647,14 @@ def expert_cpu_init_index(global_expert_index: Optional[int]):
     the values an expert gets do not depend on which EP rank happens to own it. GPU initialization
     ignores both: the CUDA tracker already folds in ``ep_rank``.
     """
-    global _EXPERT_CPU_INIT_INDEX
-    previous = _EXPERT_CPU_INIT_INDEX
+    global _EXPERT_CPU_INIT_INDEX, _EXPERT_CPU_INIT_RNG_STATE
+    previous = _EXPERT_CPU_INIT_INDEX, _EXPERT_CPU_INIT_RNG_STATE
     _EXPERT_CPU_INIT_INDEX = global_expert_index
+    _EXPERT_CPU_INIT_RNG_STATE = None
     try:
         yield
     finally:
-        _EXPERT_CPU_INIT_INDEX = previous
+        _EXPERT_CPU_INIT_INDEX, _EXPERT_CPU_INIT_RNG_STATE = previous
 
 
 @contextlib.contextmanager
@@ -665,16 +667,23 @@ def expert_cpu_init_rng():
     desync every weight built after the MoE layer. Only the CPU generator is touched:
     ``torch.manual_seed`` would also reseed every CUDA generator, which this cannot restore.
     """
+    global _EXPERT_CPU_INIT_RNG_STATE
     global_expert_index, salt = _EXPERT_CPU_INIT_INDEX, _EXPERT_CPU_INIT_SALT
     if global_expert_index is None or salt is None:
         yield
         return
     cpu_rng_state = torch.get_rng_state()
     try:
-        seed = (salt + global_expert_index * _EXPERT_SEED_STRIDE) % (2**63 - 1)
-        torch.default_generator.manual_seed(seed)
+        if _EXPERT_CPU_INIT_RNG_STATE is None:
+            seed = (salt + global_expert_index * _EXPERT_SEED_STRIDE) % (2**63 - 1)
+            torch.default_generator.manual_seed(seed)
+        else:
+            torch.set_rng_state(_EXPERT_CPU_INIT_RNG_STATE)
         yield
     finally:
+        # SequentialMLP builds FC1 and FC2 within one expert index. Continue its stream
+        # across weights instead of initializing both from the same random draws.
+        _EXPERT_CPU_INIT_RNG_STATE = torch.get_rng_state()
         torch.set_rng_state(cpu_rng_state)
 
 

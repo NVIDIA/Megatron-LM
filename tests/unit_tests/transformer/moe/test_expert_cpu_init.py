@@ -14,6 +14,8 @@ Both expert implementations are covered because they reach the CPU path differen
 ``TEGroupedLinear`` holds ``weight0..weightN-1`` in a single module.
 """
 
+import hashlib
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -35,7 +37,7 @@ SEED = 1234
 DTYPE = torch.bfloat16
 
 
-def _config(ep, grouped):
+def _config(ep, grouped, etp=1, egtp=1):
     return TransformerConfig(
         num_layers=1,
         hidden_size=HIDDEN,
@@ -51,16 +53,22 @@ def _config(ep, grouped):
         attention_dropout=0.0,
         bias_dropout_fusion=False,
         expert_model_parallel_size=ep,
+        expert_tensor_parallel_size=etp,
+        expert_gtp_weight_remat_size=egtp,
         use_cpu_initialization=True,
         init_method_std=0.02,
     )
 
 
-def _build(ep, grouped):
+def _build(ep, grouped, etp=1, egtp=1):
     """Re-initialize model parallelism at this EP degree and build a CPU-initialized block."""
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, expert_model_parallel_size=ep
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=ep,
+        expert_tensor_parallel_size=etp,
+        expert_gtp_remat_size=egtp,
     )
     # CPU init draws from the CPU generator, which every rank seeds identically; the CUDA tracker
     # is seeded too so a weight that falls back to GPU init is not silently skipped.
@@ -72,7 +80,9 @@ def _build(ep, grouped):
     spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=NUM_EXPERTS, moe_grouped_gemm=grouped
     )
-    block = TransformerBlock(_config(ep, grouped), spec, pg_collection=pg_collection).cuda()
+    block = TransformerBlock(
+        _config(ep, grouped, etp, egtp), spec, pg_collection=pg_collection
+    ).cuda()
     return block, pg_collection
 
 
@@ -103,14 +113,29 @@ def _global_digest(block, pg_collection, ep):
             )
         else:
             key = name
-        values = param.data.detach().float().cpu()
-        local[key] = (tuple(values.shape), round(values.double().sum().item(), 5))
+        values = param.data.detach().float()
+        if getattr(param, "gtp_remat_size", 1) > 1:
+            shards = [torch.empty_like(values) for _ in range(pg_collection.expt_gtp_remat.size())]
+            dist.all_gather(shards, values, group=pg_collection.expt_gtp_remat)
+            values = torch.cat(shards, dim=0)
+            pad_length = getattr(param, "pad_length", 0)
+            if pad_length:
+                values = values[:-pad_length]
+        if "#e" in key and pg_collection.expt_tp.size() > 1:
+            shards = [torch.empty_like(values) for _ in range(pg_collection.expt_tp.size())]
+            dist.all_gather(shards, values, group=pg_collection.expt_tp)
+            values = torch.cat(shards, dim=param.partition_dim)
+        values = values.cpu().contiguous()
+        local[key] = (tuple(values.shape), hashlib.sha256(values.numpy().tobytes()).hexdigest())
 
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, local)
     merged = {}
     for rank_digest in gathered:
-        merged.update(rank_digest)
+        for key, value in rank_digest.items():
+            if key in merged:
+                assert merged[key] == value, f"replicas disagree for {key}"
+            merged[key] = value
     return merged
 
 
@@ -121,15 +146,15 @@ def _expert_weight_keys(digest):
 def _require_world():
     """Skip unless this is a WORLD-rank torchrun job, bringing the process group up if needed.
 
-    The guard has to initialize first: under torchrun nothing has called init_process_group when
-    collection runs, so querying the world size would raise instead of skipping.
+    Initialize before querying world size. Multiples of four also run these cases in the
+    eight-rank CI job instead of silently skipping them.
     """
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     if not dist.is_initialized():
         Utils.initialize_distributed()
-    if dist.get_world_size() != WORLD:
-        pytest.skip(f"requires world_size={WORLD}")
+    if dist.get_world_size() % WORLD:
+        pytest.skip(f"requires world_size divisible by {WORLD}")
 
 
 class TestExpertCpuInitialization:
@@ -153,15 +178,17 @@ class TestExpertCpuInitialization:
         )
 
     @pytest.mark.parametrize("grouped", [True, False])
-    @pytest.mark.parametrize("ep", [2, 4])
-    def test_global_model_matches_ep1(self, ep, grouped):
+    @pytest.mark.parametrize(
+        "ep,etp,egtp", [(2, 1, 1), (4, 1, 1), (2, 2, 1), (1, 4, 1), (2, 1, 2), (1, 1, 4)]
+    )
+    def test_global_model_matches_ep1(self, ep, etp, egtp, grouped):
         """The whole model, experts included, must be bit-identical to the EP=1 build."""
         _require_world()
         reference_block, reference_pgs = _build(1, grouped)
         reference = _global_digest(reference_block, reference_pgs, 1)
         del reference_block
 
-        block, pg_collection = _build(ep, grouped)
+        block, pg_collection = _build(ep, grouped, etp, egtp)
         actual = _global_digest(block, pg_collection, ep)
         del block
 

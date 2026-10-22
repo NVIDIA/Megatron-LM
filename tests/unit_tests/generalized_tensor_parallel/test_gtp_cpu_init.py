@@ -255,3 +255,41 @@ class TestGTPCpuInitialization:
         _requires_multi_gpu(WORLD)
         _requires_mxfp8()
         _run_distributed(_worker_high_precision_init_val, WORLD, gtp_remat_size)
+
+
+def _worker_duplicated_cpu_init(rank, world_size, port, fp8_param, gtp_remat_size):
+    from megatron.core.extensions.transformer_engine import TELinear
+    from megatron.core.fp8_utils import get_fp8_context
+
+    config = _make_config(fp8_param)
+
+    def build(size):
+        pgs = _init_mpu(size)
+        with get_fp8_context(config, is_init=True):
+            layer = TELinear(
+                HIDDEN,
+                FFN_HIDDEN,
+                parallel_mode="duplicated",
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                gtp_remat_group=pgs.gtp_remat,
+            ).cuda()
+        return _full_weights(layer, pgs.gtp_remat)
+
+    reference = build(1)
+    actual = build(gtp_remat_size)
+    for name in reference:
+        torch.testing.assert_close(actual[name], reference[name], rtol=0, atol=0)
+
+
+class TestDuplicatedLinearCpuInitialization:
+    @pytest.mark.parametrize("fp8_param", [False, True])
+    @pytest.mark.parametrize("gtp_remat_size", GTP_SIZES)
+    def test_cpu_init_is_gtp_invariant(self, gtp_remat_size, fp8_param):
+        _requires_multi_gpu(WORLD)
+        if fp8_param:
+            _requires_mxfp8()
+        _run_distributed(_worker_duplicated_cpu_init, WORLD, fp8_param, gtp_remat_size)
