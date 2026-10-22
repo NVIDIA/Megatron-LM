@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Layer specs that wire DSA-over-GQA into the hybrid (Mamba) stack.
 
@@ -40,12 +40,18 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 
-dsa_gqa_indexer_spec = ModuleSpec(
-    module=SimplifiedDSGQAIndexer,
-    submodules=SimplifiedDSGQAIndexerSubmodules(
-        linear_q=ModuleSpec(module=TELinear), linear_k=ModuleSpec(module=TELinear)
-    ),
-)
+
+def _make_indexer_spec() -> ModuleSpec:
+    """Build fresh spec containers while retaining the backend constructor references."""
+    return ModuleSpec(
+        module=SimplifiedDSGQAIndexer,
+        submodules=SimplifiedDSGQAIndexerSubmodules(
+            linear_q=ModuleSpec(module=TELinear), linear_k=ModuleSpec(module=TELinear)
+        ),
+    )
+
+
+dsa_gqa_indexer_spec = _make_indexer_spec()
 
 
 def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
@@ -55,20 +61,27 @@ def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
         stack_spec: A Mamba/hybrid stack spec to derive from. Not modified.
 
     Returns:
-        A deep copy whose ``attention_layer`` builds :class:`DSGroupedSelfAttention`
-        over a :class:`DSGQACoreAttention`.
+        A copy of the modified attention branch, which builds
+        :class:`DSGroupedSelfAttention` over :class:`DSGQACoreAttention`.
+        Unmodified layer specs and backend constructors retain their identities.
     """
-    spec = copy.deepcopy(stack_spec)
+    # Copy each container we modify, not backend constructors. Without TE installed,
+    # some constructors are import placeholders whose closure state cannot be deep-copied.
+    spec = copy.copy(stack_spec)
+    spec.submodules = copy.copy(stack_spec.submodules)
+    spec.submodules.attention_layer = copy.copy(stack_spec.submodules.attention_layer)
+    attention_layer = spec.submodules.attention_layer
+    attention_layer.submodules = copy.copy(attention_layer.submodules)
+    attention_layer.submodules.self_attention = copy.copy(attention_layer.submodules.self_attention)
     self_attention = spec.submodules.attention_layer.submodules.self_attention
+    self_attention.submodules = copy.copy(self_attention.submodules)
     self_attention.module = DSGroupedSelfAttention
     # The stack's own dense attention becomes DSA's warmup core (dsa_fwd_use_dense_attn),
     # captured rather than named, so upstream changes to it are inherited.
     self_attention.submodules.core_attention = ModuleSpec(
         module=DSGQACoreAttention,
         submodules=DSGQAAttentionSubmodules(
-            # Copied, not shared: the two stacks must not alias one indexer spec, for the
-            # same reason this function deep copies the stack.
-            indexer=copy.deepcopy(dsa_gqa_indexer_spec),
+            indexer=_make_indexer_spec(),
             dense_core_attention=self_attention.submodules.core_attention,
         ),
     )
