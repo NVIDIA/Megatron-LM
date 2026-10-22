@@ -29,12 +29,17 @@ from .optimizer_config import ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
+    from emerging_optimizers import utils as emerging_optimizer_utils
     from emerging_optimizers.orthogonalized_optimizers import (
         AdaptiveMuon,
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        NSCoeffT,
+        newton_schulz,
+        newton_schulz_tp,
+    )
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
@@ -255,7 +260,12 @@ def _select_tp_mode(
 
 
 class TensorParallelMuon(OrthogonalizedOptimizer):
-    """Tensor Parallel Muon optimizer."""
+    """Tensor Parallel Muon with optional batching of unsharded expert matrices.
+
+    ``ns_batch_size`` caps same-shape Newton-Schulz batches in duplicated mode.
+    Dense, QKV-split, and TP/GTP-sharded weights retain their per-parameter path.
+    The default of one delegates the entire step to Emerging Optimizers unchanged.
+    """
 
     def __init__(
         self,
@@ -276,9 +286,18 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        ns_batch_size: int = 1,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if ns_batch_size < 1:
+            raise ValueError(f"ns_batch_size must be at least 1, got {ns_batch_size}")
+        if ns_batch_size > 1 and tp_mode != "duplicated":
+            raise ValueError("Batched TensorParallelMuon requires tp_mode='duplicated'.")
+        if ns_batch_size > 1 and not is_emerging_optimizers_min_version("0.3.0"):
+            raise ImportError("Batched TensorParallelMuon requires emerging_optimizers >= 0.3.0.")
+        if ns_batch_size > 1 and use_syrk:
+            raise ValueError("Batched duplicated Muon does not support use_syrk.")
         if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
             raise ValueError(
                 f"use_syrk requires emerging_optimizers >= {_SYRK_MIN_EO_VERSION}, but "
@@ -331,6 +350,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # For the tp_mode="auto" cost model (_resolve_tp_mode / _select_tp_mode).
         self.num_ns_steps = num_ns_steps
         self.use_syrk = use_syrk
+        self.ns_batch_size = ns_batch_size
+        self.coefficient_type = coefficient_type
+        self.scale_mode = scale_mode
+        self.extra_scale_factor = extra_scale_factor
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
@@ -351,6 +374,84 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+
+    def _expert_batch_key(self, p: torch.Tensor, grad: torch.Tensor) -> tuple | None:
+        """Identify expert updates that need no QKV splitting or TP/GTP reconstruction."""
+        if not getattr(p, "expert_tp", False) or grad.ndim != 2:
+            return None
+        if self.split_qkv and (self.is_qkv_fn is None or self.is_qkv_fn(p)):
+            return None
+
+        tp_group = self.pg_collection.expt_tp if self.pg_collection else None
+        partition_dim = getattr(p, "partition_dim", None)
+        if partition_dim == -1:
+            partition_dim = None
+        if partition_dim is not None and (tp_group is None or get_pg_size(tp_group) > 1):
+            return None
+        if self.pg_collection and getattr(p, "is_gtp_weight_remat", False):
+            gtp_group = resolve_gtp_remat_group(self.pg_collection, is_expert=True)
+            if gtp_group is not None and get_pg_size(gtp_group) > 1:
+                return None
+        return (tuple(grad.shape), grad.dtype, grad.device)
+
+    def _orthogonalize_expert_batch(self, grads: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Orthogonalize each expert matrix independently with one batched NS call."""
+        batch = torch.stack(grads)
+        updates = newton_schulz(
+            batch, steps=self.num_ns_steps, coefficient_type=self.coefficient_type
+        )
+        scale = get_muon_scale_factor(batch.size(-2), batch.size(-1), mode=self.scale_mode)
+        return list((updates * scale * self.extra_scale_factor).unbind(0))
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Batch compatible expert updates while retaining per-parameter optimizer state."""
+        # LayerShardedMuon may delegate here before homes are assigned; keep its
+        # non-duplicated and SYRK fallback paths on the inherited implementation.
+        if self.ns_batch_size == 1 or self.tp_mode != "duplicated" or self.use_syrk:
+            return OrthogonalizedOptimizer.step(self, closure)
+        if closure is not None:
+            raise ValueError("closure is not supported")
+
+        for group in self.param_groups:
+            self._init_group(group)
+            buckets: dict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+            group_kwargs = {key: value for key, value in group.items() if key != "params"}
+
+            def apply_chunk(chunk: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+                with emerging_optimizer_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                    if len(chunk) == 1:
+                        p, grad = chunk[0]
+                        updates = [self.orthogonalize(p, grad, **group_kwargs)]
+                    else:
+                        updates = self._orthogonalize_expert_batch([grad for _, grad in chunk])
+                for (p, _), update in zip(chunk, updates):
+                    self.pre_weight_update_fn_inplace(p, update)
+                    p.add_(update, alpha=-group["lr"])
+                    self.post_weight_update_fn_inplace(p)
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                self._apply_weight_decay_inplace(p, grad, group["lr"], group["weight_decay"])
+                momentum = self.state[p]["momentum_buffer"]
+                momentum.lerp_(grad, 1 - group["momentum"])
+                update = grad.lerp(momentum, group["momentum"]) if self.nesterov else momentum
+                key = self._expert_batch_key(p, update)
+                if key is None:
+                    apply_chunk([(p, update)])
+                    continue
+                chunk = buckets.setdefault(key, [])
+                chunk.append((p, update))
+                if len(chunk) == self.ns_batch_size:
+                    apply_chunk(chunk)
+                    chunk.clear()
+
+            for chunk in buckets.values():
+                if chunk:
+                    apply_chunk(chunk)
+        return None
 
     @staticmethod
     def _all_gather_tensor(t, group, dim):
@@ -805,6 +906,7 @@ def _muon_registry_config_to_kwargs(config, model_chunks, pg_collection) -> Dict
 def _adaptive_muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to TensorParallelAdaptiveMuon constructor kwargs."""
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+    kwargs.pop("ns_batch_size", None)
     kwargs.update(_kwargs_from_config(TensorParallelAdaptiveMuon, "adaptive_muon", config))
     return kwargs
 
