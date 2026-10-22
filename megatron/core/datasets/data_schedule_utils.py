@@ -188,10 +188,6 @@ def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.
                 continue
             for key in ["tokens", "labels", "loss_mask", "position_ids"]:
                 sub_sample_dict[key] = sample[key][start_idx:end_idx]
-            # Truncation can leave a prompt-only final conversation. It has no
-            # supervised targets and must not occupy a scheduled microbatch.
-            if not torch.any(sub_sample_dict['loss_mask']):
-                continue
             # Since sft_dataset.py does not provide cu_seqlens_original,
             # we assume original_seq_len equals padded_seq_len here.
             # Ideally the dataset should define the pre-padding seq_len.
