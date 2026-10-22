@@ -200,6 +200,16 @@ def test_static_cp_capacity_counts_per_sequence_padding(pad_sequences):
     assert [sid for group in groups for sid in group[0]] == list(range(12))
 
 
+def test_static_cp_splits_a_single_packed_group_across_dp_ranks():
+    scheduler = DpBalancedScheduler(1024, 1, 4, None)
+    groups = scheduler.get_groups_and_subsamples(list(enumerate([100] * 8)))
+    # All eight fit in one packed group, which is split so each DP rank gets one.
+    assert groups == [[[0, 1, 2, 3, 4], [7], [6], [5]]]
+
+    with pytest.raises(AssertionError, match="Not enough samples to move"):
+        scheduler.get_groups_and_subsamples(list(enumerate([100] * 3)))
+
+
 @pytest.mark.parametrize('scheduler_type', ['dp_balanced', 'default_dynamic_cp'])
 @pytest.mark.parametrize('alignment', [None, 32, 'max'])
 def test_wrap_iterator_enables_padding_aware_capacity(
