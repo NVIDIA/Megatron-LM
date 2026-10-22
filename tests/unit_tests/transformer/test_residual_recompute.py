@@ -767,7 +767,10 @@ class TestResidualStreamRecomputeIntegration:
     @pytest.mark.parametrize(
         "fp32_residual_connection", [False, True], ids=["native-residual", "fp32-residual"]
     )
-    def test_hybrid_stack_matches_eager_forward_and_backward(self, fp32_residual_connection):
+    @pytest.mark.parametrize("layerwise", [False, True])
+    def test_hybrid_stack_matches_eager_forward_and_backward(
+        self, fp32_residual_connection, layerwise
+    ):
         recomputed_config = _wide_recompute_config(
             fp32_residual_connection=fp32_residual_connection
         )
@@ -804,6 +807,29 @@ class TestResidualStreamRecomputeIntegration:
             .to(dtype=recomputed_config.params_dtype)
         )
         recomputed.load_state_dict(reference.state_dict())
+        assert not reference.enable_layerwise_residual_recompute()
+        backward_events = []
+        if layerwise:
+            # Wrappers may be constructed under no_grad; setup must still take effect.
+            with torch.no_grad():
+                assert recomputed.enable_layerwise_residual_recompute()
+            # Setup is idempotent: one finalizer per execution layer.
+            assert recomputed.enable_layerwise_residual_recompute()
+            assert all(len(layer._forward_hooks) == 1 for layer in recomputed.layers)
+            # Exercise the owning-module backward boundary used by FSDP, without
+            # requiring the adapter or shortcut-specific ownership policy.
+            for index, layer in enumerate(recomputed.layers):
+                layer.register_full_backward_pre_hook(
+                    lambda _module, _grads, index=index: backward_events.append(("owner", index))
+                )
+                reader = (
+                    layer.residual_read
+                    if isinstance(layer, MambaLayer)
+                    else layer.residual_read_self_attn
+                )
+                reader.register_forward_pre_hook(
+                    lambda _module, _inputs, index=index: backward_events.append(("read", index))
+                )
 
         input_dtype = torch.float32 if fp32_residual_connection else reference_config.params_dtype
         reference_input = torch.randn(4, 3, 8, device="cuda", dtype=input_dtype, requires_grad=True)
@@ -811,7 +837,14 @@ class TestResidualStreamRecomputeIntegration:
         reference_output = reference(hidden_states=reference_input, attention_mask=None)
         reference_output.square().mean().backward()
         recomputed_output = recomputed(hidden_states=recomputed_input, attention_mask=None)
+        backward_events.clear()
         recomputed_output.square().mean().backward()
+        if layerwise:
+            for index in range(len(recomputed.layers)):
+                assert backward_events.count(("read", index)) == 1
+                assert backward_events.index(("owner", index)) < backward_events.index(
+                    ("read", index)
+                )
 
         assert reference_output.shape == reference_input.shape
         assert not reference.layers[1].received_residual_recompute_kwarg
@@ -823,7 +856,8 @@ class TestResidualStreamRecomputeIntegration:
         assert reference_output.dtype == expected_dtype
         assert recomputed_output.dtype == expected_dtype
 
-    def test_hybrid_mamba_cp_layout_finalizes_before_residual_replay(self, monkeypatch):
+    @pytest.mark.parametrize("layerwise", [False, True])
+    def test_hybrid_mamba_cp_layout_finalizes_before_residual_replay(self, monkeypatch, layerwise):
         config = _wide_recompute_config(num_layers=1)
         stack = HybridStack(
             config,
@@ -832,6 +866,8 @@ class TestResidualStreamRecomputeIntegration:
             post_layer_norm=False,
             pg_collection=_process_groups(),
         ).cuda()
+        if layerwise:
+            assert stack.enable_layerwise_residual_recompute()
 
         events = []
         boundary_packed_seq_params = object()
@@ -884,17 +920,19 @@ class TestResidualStreamRecomputeIntegration:
             packed_seq_params=boundary_packed_seq_params,
         )
 
-        assert events == [
-            "cp_build",
-            "cp_prepare",
-            "mamba_forward",
-            "cp_finalize",
-            "replay_finalize",
-        ]
+        finalizers = (
+            ["replay_finalize", "cp_finalize"] if layerwise else ["cp_finalize", "replay_finalize"]
+        )
+        assert events == ["cp_build", "cp_prepare", "mamba_forward", *finalizers]
         assert stack.layers[0].received_packed_seq_params is layer_packed_seq_params
         assert stack.layers[0].received_residual_recompute_context is not None
         assert len(replay_inputs) == 1
-        assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
+        if layerwise:
+            torch.testing.assert_close(
+                replay_inputs[0] + 1.0, cp_layout_state.finalized_hidden_states
+            )
+        else:
+            assert replay_inputs[0] is cp_layout_state.finalized_hidden_states
         assert output.shape == hidden_states.shape
 
     def test_hybrid_mtp_stack_stays_ordinary_width_and_skips_residual_replay(self):
@@ -907,6 +945,7 @@ class TestResidualStreamRecomputeIntegration:
             is_mtp_layer=True,
             pg_collection=_process_groups(),
         ).cuda()
+        assert not stack.enable_layerwise_residual_recompute()
         hidden_states = torch.randn(4, 3, config.hidden_size, device="cuda", requires_grad=True)
 
         output = stack(hidden_states=hidden_states, attention_mask=None)

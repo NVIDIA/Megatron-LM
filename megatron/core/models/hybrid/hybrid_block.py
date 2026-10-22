@@ -179,6 +179,7 @@ class HybridStack(MegatronModule):
         # MTP consumes the decoder readout and shifted-token embedding at hidden_size.
         # Its auxiliary stack therefore remains ordinary width when the decoder is wide.
         self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
+        self._layerwise_residual_recompute = False
         boundary_layout = (
             self.config.linear_cp_layout if boundary_layout is None else boundary_layout
         )
@@ -420,6 +421,64 @@ class HybridStack(MegatronModule):
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+
+    def enable_layerwise_residual_recompute(self) -> bool:
+        """Keep residual replay inside each execution layer's call boundary.
+
+        Residual replay saves activation memory by checkpointing the cheap
+        residual reads, connected norms, and non-terminal writes. Forward
+        records these operations in a shared replay manager. At the end of a
+        replay region, ``context.finalize(output)`` releases their output
+        storage and attaches a backward hook to the region's live output.
+        That hook reruns the recorded operations in forward order, restoring
+        their outputs before backward needs them. The region's input residual
+        stream and the attention/Mamba/MLP branch outputs remain available as
+        replay inputs; this mode does not rerun those expensive branches.
+
+        A replay region can otherwise span several layers. This method makes
+        each execution layer a separate region and registers its finalizer as
+        a forward hook, inside the layer call. A ShortcutMoE compute/MoE pair
+        stays together as one execution layer. The final residual write in
+        each region stays uncheckpointed, so shorter regions retain more
+        residual-stream boundary activations.
+
+        Call before wrapping layers with FSDP. Finalizing inside the layer's
+        forward hook attaches replay before Module.__call__ installs the
+        output boundary for its full backward-pre hook. During backward,
+        FSDP can therefore gather the layer's weights before replay uses its
+        residual and norm parameters. Finalizing after the layer returns
+        would attach replay outside that gather boundary.
+
+        Returns:
+            Whether this stack uses layerwise residual replay. Ordinary-width
+            stacks (including shared MTP stacks) keep their existing behavior.
+        """
+        if (
+            not self.uses_wide_residual_stream
+            or self.config.recompute_granularity != "selective"
+            or "residual_stream" not in (self.config.recompute_modules or [])
+        ):
+            return False
+        if not self._layerwise_residual_recompute:
+            for layer in self.layers:
+                layer.register_forward_hook(
+                    self._finalize_layer_residual_recompute, with_kwargs=True
+                )
+            self._layerwise_residual_recompute = True
+        return True
+
+    @staticmethod
+    def _finalize_layer_residual_recompute(
+        module: nn.Module, args: tuple, kwargs: dict, output: Tensor | tuple
+    ) -> None:
+        """Attach replay before Module.__call__ installs its backward-pre boundary."""
+        context = kwargs.get("moe_recompute_context")
+        if context is None:
+            context = kwargs.get("residual_stream_recompute_context")
+        if context is not None:
+            if not context.is_block_end:
+                raise RuntimeError("Layerwise residual replay must end within its execution layer.")
+            context.finalize(output[0] if isinstance(output, tuple) else output)
 
     def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
         """Return physical layer indices that must share one residual replay block."""
@@ -667,7 +726,11 @@ class HybridStack(MegatronModule):
         residual_stream_recompute_plan = (
             build_residual_stream_recompute_plan(
                 self.num_layers_per_pipeline_rank,
-                self.config.residual_stream_recompute_num_layers,
+                (
+                    1
+                    if self._layerwise_residual_recompute
+                    else self.config.residual_stream_recompute_num_layers
+                ),
                 atomic_layer_pairs=self._residual_stream_atomic_layer_pairs,
             )
             if use_residual_stream_recompute
@@ -815,7 +878,10 @@ class HybridStack(MegatronModule):
                                 physical_layer_idx, hidden_states
                             )
 
-                    if residual_stream_recompute_context is not None:
+                    if (
+                        residual_stream_recompute_context is not None
+                        and not self._layerwise_residual_recompute
+                    ):
                         residual_stream_recompute_context.finalize(hidden_states)
                     self._finalize_mhc_recompute_layer(
                         manager=mhc_manager,
