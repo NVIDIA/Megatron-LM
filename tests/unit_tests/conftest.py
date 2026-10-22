@@ -21,7 +21,7 @@ from tests.unit_tests.test_utilities import (
 
 
 def pytest_configure(config):
-    """Set NCCL defaults for the unit-test suite.
+    """Set NCCL and Transformer Engine defaults for the unit-test suite.
 
     These previously lived as ``export``s in ``tests/unit_tests/run_ci_test.sh``.
     They reduce NCCL memory usage / SM contention and were originally added to
@@ -31,9 +31,13 @@ def pytest_configure(config):
     CI launch script and into pytest. Individual buckets that want
     production-like NCCL settings (e.g. MFSDP v2) can pop these in their own
     conftest before initializing their process group.
+
+    ``config.deterministic_mode`` is on by default, and Transformer Engine's
+    DotProductAttention then requires ``NVTE_ALLOW_NONDETERMINISTIC_ALGO=0``.
     """
     os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
+    os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
 
 
 def pytest_addoption(parser):

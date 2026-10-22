@@ -96,7 +96,7 @@ def test_cli_determinism_reaches_transformer_config(flags, expected):
     args = parser.parse_args(flags)
     args.params_dtype = torch.float32
     config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
-    assert args.disable_deterministic_mode == (not expected)
+    assert args.deterministic_mode is expected
     assert config.deterministic_mode is expected
 
 

@@ -1563,7 +1563,7 @@ class TestPartialCudaGraph:
             setattr(args, key, value)
 
         # moe_router_fusion implies the aux loss fusion, which deterministic mode rejects.
-        args.disable_deterministic_mode = True
+        args.deterministic_mode = False
         validate_args(args)
         set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args

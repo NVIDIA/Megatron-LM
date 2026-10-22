@@ -845,6 +845,7 @@ class TestHybridBlock:
         self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs
     ):
         """Build a HybridStack with the "gdn2" experimental attention variant selected."""
+        config_kwargs.setdefault("deterministic_mode", False)
         return self.get_hybrid_block(
             layer_pattern,
             stack_spec=stack_spec,

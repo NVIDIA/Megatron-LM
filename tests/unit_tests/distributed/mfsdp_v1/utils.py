@@ -77,7 +77,7 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
         moe_permute_fusion=True,
         moe_router_fusion=True,
         # moe_router_fusion implies the aux loss fusion, which deterministic mode rejects.
-        disable_deterministic_mode=True,
+        deterministic_mode=False,
         moe_router_topk=2,
         moe_router_dtype="fp32",
         create_attention_mask_in_dataloader=True,

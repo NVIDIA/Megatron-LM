@@ -262,22 +262,21 @@ class ModelParallelConfig:
     """
 
     deterministic_mode: bool = field(
-        default=False,
+        default=True,
         metadata={
             "argparse_meta": {
-                # On by default on the CLI (the dataclass default stays False); opt out with
-                # --disable-deterministic-mode. Stored as args.disable_deterministic_mode and
-                # converted back to ``deterministic_mode`` in core_transformer_config_from_args.
+                # On by default, matching the dataclass default; opt out on the CLI with
+                # --disable-deterministic-mode, which stores False in args.deterministic_mode.
                 "arg_names": ["--disable-deterministic-mode"],
-                "dest": "disable_deterministic_mode",
-                "action": "store_true",
-                "default": False,
-                "help": "Disable deterministic mode (enabled by default on the command line).",
+                "dest": "deterministic_mode",
+                "action": "store_false",
+                "default": True,
+                "help": "Disable deterministic mode (enabled by default).",
             }
         },
     )
     """If true, code that has deterministic execution will be chosen. This usually
-       means slower execution, but is good for debugging and testing. Defaults to False."""
+       means slower execution, but is good for debugging and testing. Defaults to True."""
 
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""

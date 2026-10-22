@@ -26,7 +26,7 @@ def _te_cross_entropy_training_args(monkeypatch):
     args.cross_entropy_loss_fusion = True
     args.cross_entropy_fusion_impl = 'te'
     # Cross entropy loss fusion is rejected by deterministic mode.
-    args.disable_deterministic_mode = True
+    args.deterministic_mode = False
     return args
 
 

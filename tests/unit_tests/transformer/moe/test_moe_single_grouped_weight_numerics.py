@@ -229,7 +229,7 @@ class TestMoESingleGroupedWeightNumerics:
 
         # Callers may set NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 (TE dbias needs atomic adds),
         # which deterministic mode rejects.
-        args.disable_deterministic_mode = True
+        args.deterministic_mode = False
         validate_args(args)
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:

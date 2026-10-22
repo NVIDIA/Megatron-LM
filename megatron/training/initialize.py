@@ -148,7 +148,7 @@ def initialize_megatron(
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
     tuning.install(
         _triton_autotune_config_from_args(args),
-        deterministic=not getattr(args, 'disable_deterministic_mode', False),
+        deterministic=args.deterministic_mode,
     )
 
     # torch.distributed initialization
@@ -434,7 +434,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
-        if not getattr(args, 'disable_deterministic_mode', False):
+        if args.deterministic_mode:
             from megatron.training.determinism import assert_nccl_algo_still_empty
 
             assert_nccl_algo_still_empty()
