@@ -586,6 +586,78 @@ FP8 training provides benefits across all three performance walls:
 
 > **Note**: For blockwise and MXFP8 recipes with current scaling, training loss curves show negligible difference compared to BF16 baselines.
 
+### MoE Megakernel Backends
+
+#### MOK
+
+A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.
+Select MOK for a SwiGLU model with the following YAML configuration:
+
+```yaml
+bf16: true
+add_bias_linear: false
+moe_grouped_gemm: true
+moe_ffn_hidden_size: 3072
+gradient_accumulation_fusion: true
+moe_shared_expert_intermediate_size: 3072
+moe_megakernel_backend: mok
+moe_megakernel_backend_config:
+  fwd_num_comm_sms: 40
+  bwd_num_comm_sms: 28
+```
+
+The equivalent backend-specific CLI value is a JSON object:
+
+```bash
+--moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
+```
+
+MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
+image already installs the supported
+[MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
+through `docker/common/install_mok.sh`. Use that image or its installation helper to retain the
+supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
+target is unsupported.
+
+| Area | Current MOK support |
+|------|---------------------|
+| GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
+| Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
+| Shared experts | Required; BF16; same intermediate size as routed experts; optional BF16 sigmoid output gate via `moe_shared_expert_gate` |
+| Activation | SwiGLU, without a linear offset or tanh clamp |
+| Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
+| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
+| Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
+| Recomputation | Whole-MoE activation recompute |
+| CUDA Graph | Full-iteration capture |
+| Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
+
+Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
+precision: FP32 retains FP32 contributions, while BF16 rounds each contribution before adding it
+to the BF16 gradient buffer. This is independent of the BF16 shared-expert weight dtype.
+The pinned MOK entrypoint requires shared and routed expert main-grad buffers to use the same dtype.
+The optional shared output gate aliases the native shared-expert parameter and accumulates into
+its FP32 or BF16 `main_grad`. It supports Qwen3.5's gated shared-expert MoE without changing native
+parameter ownership or checkpoint keys; the GDN and attention layers retain their existing paths.
+
+With `reuse_grad_buf_for_mxfp8_param_ag`, MCore completes parameter all-gather, requantizes into
+native TE storage, and clears the staging buffer before MOK runs. Single-grouped MXFP8 parameters
+require this mode in the current MCore buffer implementation. MOK aliases the native payloads
+and refreshes its converted scale buffers once per optimizer iteration. The adapter requires
+both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
+
+Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`. Supporting
+per-layer MOK replay needs saved-state stashing or a recompute path for pending microbatches;
+static input token counts alone do not establish that lifecycle.
+
+The current backend requires grouped experts and fused gradient accumulation. It does not support
+linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
+wgrad, native shared-expert overlap, shared-expert-only
+recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
+partial MoE CUDA Graph replay, MCore expert-input
+capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
+layouts.
+
 
 ### GLU Checkpoint Layout
 
@@ -845,3 +917,58 @@ If you use Megatron Core MoE in your research, please cite:
     journal={arXiv preprint arXiv:2504.14960},
 }
 ```
+
+#### Dist-MoE
+
+`moe_megakernel_backend: dist_moe` selects the optional `dist_moe` integration
+branch. MCore retains routing, native expert parameters, DDP, optimizer, and
+checkpoints. Dist-MoE executes routed dispatch, SwiGLU, combine, and backward,
+accumulating WGRAD directly into the native `main_grad` buffers. Shared experts
+run through the ordinary MCore module, including its optional output gate.
+The MCore autograd bridge calls `dist_moe.functional.forward` / `backward` and
+completes the native parameter hooks after direct accumulation. Dist-MoE receives
+borrowed weights and gradient buffers; parameter ownership and DDP completion
+remain in MCore, including during local CUDA Graph replay.
+
+Enable `bf16`, `moe_grouped_gemm`, `moe_use_grouped_tensor`,
+`moe_single_grouped_weight`, and `gradient_accumulation_fusion`; disable linear
+bias and physical GLU interleave. MXFP8 compute uses `fp8: e4m3` with
+`fp8_recipe: mxfp8`; Hybrid/E5M2 backward precision is rejected. It
+supports either BF16 primary parameters with a TE workspace or `fp8_param: true`
+with native TE payloads. FP8 primary parameters require DDP's
+`reuse_grad_buf_for_mxfp8_param_ag: true`. Both paths retain TE's independent
+rowwise/columnwise 1D quantization and copy only the converted scale bytes.
+TE versions that gate single grouped parameters with an environment variable
+also require `NVTE_GROUPED_LINEAR_SINGLE_PARAM=1`; the backend checks the actual
+parameter layout rather than relying only on the requested configuration.
+
+The initial integration supports TP/ETP/CP/PP/GTP=1, sequential microbatch
+forward/backward, ordinary SwiGLU, native MCore DDP, and device-resident
+activations. Local whole-layer CUDA graphs (`cuda_graph_impl: local` with
+`cuda_graph_modules: []`) reuse MCore's graph runner and native DDP hooks.
+MXFP8 CUDA graphs require `fp8_param: true`; MXFP8 compute with BF16 primary
+parameters is supported only in eager mode. BF16 compute also supports local graphs.
+Prepared scales refresh in place after parameter gathering and before replay;
+the graphs retain their runtime storage until `delete_cuda_graphs()` is called.
+Training graphs require forward/backward pairs; `no_grad` replay is rejected
+before launch. Evaluation through a captured training runner is unsupported.
+Other graph modes, outer activation recomputation, delayed WGRAD, Flex dispatch,
+and FSDP are rejected. Routed precision
+must be uniform; `first_last_layers_bf16` overrides are rejected. Expert parallelism
+comes from the layer's explicit EP process group.
+
+The training entrypoint initializes contexts after DDP, optimizer, and checkpoint
+setup and closes them on exit. Library users call
+`initialize_dist_moe_runtime(model_chunks, ddp_config=..., max_num_local_input_tokens=...)`
+after equivalent setup and `close_dist_moe_runtime(model_chunks)` after the last
+backward and before destroying process groups. Library users must delete local
+graphs before closing the runtime or loading model weights. These functions are exported by
+`megatron.core.transformer.moe.megakernel.dist_moe`.
+
+Backend options are `num_sms`, `device_scratch_capacity_factor`,
+`activation_slot_bytes` or `activation_slot_capacity_factor`,
+`bf16_grouped_gemm_preset`, and `mxfp8_pipeline` (`mega` or `staged`). Equal-shape
+layers share a context. The default scratch bound covers full EP routing skew;
+the default activation budget targets balanced full-save operation. Optional
+`shared_expert_bf16: true` retains native BF16 shared experts when comparing with
+MOK; otherwise shared precision follows the model configuration.

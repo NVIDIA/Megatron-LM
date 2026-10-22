@@ -1026,6 +1026,11 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.moe_megakernel_backend in ("mok", "dist_moe") and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
+        raise ValueError("MoE megakernels have not been validated with Megatron-FSDP or Torch FSDP2")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -2411,9 +2416,18 @@ def _add_network_size_args(parser):
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
+        # Parsed manually as a JSON object below.
+        "moe_megakernel_backend_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        "--moe-megakernel-backend-config",
+        type=json.loads,
+        default=None,
+        metavar="JSON",
+        help="Backend-specific MoE megakernel options as a JSON object.",
+    )
 
     group = parser.add_argument_group(title='network size')
 

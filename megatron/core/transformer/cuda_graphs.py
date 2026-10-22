@@ -16,6 +16,7 @@ from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
+from weakref import WeakSet
 
 import torch
 from torch.utils._pytree import tree_flatten as tree_flatten_pyt
@@ -33,6 +34,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     ensure_params_ready,
@@ -588,6 +590,8 @@ class _CudagraphGlobalRecord:
     'record_bwd_graph."""
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
+    # Training capture clears its schedule; retain weak references for teardown.
+    created_runners = WeakSet()
     _saved_tensors_observer = None
 
     @classmethod
@@ -790,13 +794,19 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
     # Reset runners.
-    for record in [
-        *_CudagraphGlobalRecord.cudagraph_record,
-        *_CudagraphGlobalRecord.cudagraph_inference_record,
-    ]:
-        runner = record[0]
+    runners = {
+        record[0]
+        for record in [
+            *_CudagraphGlobalRecord.cudagraph_record,
+            *_CudagraphGlobalRecord.cudagraph_inference_record,
+        ]
+    }
+    runners.update(_CudagraphGlobalRecord.created_runners)
+    for runner in runners:
         assert isinstance(runner, _CudaGraphRunner)
 
+        for backend in runner.megakernel_backends:
+            backend.cuda_graph_release()
         runner.cudagraph_created = False
         runner.fwd_graph_recorded = False
         runner.bwd_graph_recorded = False
@@ -935,6 +945,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
             runner.static_grad_outputs
         ), "Bwd cudagraph received a different number of tensors than what it was graphed with!"
 
+        for backend in runner.megakernel_backends:
+            backend.cuda_graph_prepare_backward()
+
         # Copy new data into bwd graph input buffer
         for user_output_grad, cudagraph_output_grad in zip(grads, runner.static_grad_outputs):
             if cudagraph_output_grad is None:
@@ -957,6 +970,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
             runner.bwd_graph.replay()
 
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
+        for backend in runner.megakernel_backends:
+            backend.cuda_graph_finish_replay()
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
             if hasattr(param, 'grad_added_to_main_grad'):
@@ -1005,6 +1020,13 @@ class _CudaGraphRunner(torch.nn.Module):
         super().__init__()
 
         self.base_module = base_module
+        self.megakernel_backends = tuple(
+            module
+            for module in (
+                base_module.modules() if isinstance(base_module, torch.nn.Module) else ()
+            )
+            if isinstance(module, MegakernelBackend) and module.supports_cuda_graphs
+        )
         self.mempool = mempool
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
@@ -1222,6 +1244,10 @@ class _CudaGraphRunner(torch.nn.Module):
         self.args = args
         self.kwargs = kwargs
         self.outputs = outputs
+
+        _CudagraphGlobalRecord.created_runners.add(self)
+        for backend in self.megakernel_backends:
+            backend.cuda_graph_capture_prepare()
 
         # Save buffers, grads, and other variables that may be affected by graph warmup.
         # For example, megatron/core/transformer/moe/router.py's expert_bias is a persistent
@@ -1751,6 +1777,10 @@ class _CudaGraphRunner(torch.nn.Module):
     def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
 
+        if self.megakernel_backends and self.grad_enabled and not torch.is_grad_enabled():
+            # Stateful training forwards retain activation slots until backward.
+            raise RuntimeError("megakernel training CUDA graphs do not support no_grad replay")
+
         # Arguments passed to a cudagraph for replay must match the args in the captured graph.
         #  Tensor arguments need to have the same shape, dtype, and device location.
         #  All other arguments must have the exact same memory addresses for graph safety.
@@ -1761,6 +1791,11 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if self._gtp_fwd_params_to_ensure_ready:
             ensure_params_ready(self._gtp_fwd_params_to_ensure_ready)
+
+        for backend in self.megakernel_backends:
+            backend.cuda_graph_prepare_replay(
+                is_first_microbatch, self.grad_enabled and torch.is_grad_enabled()
+            )
 
         inp_tensors = self.get_tensors(args, kwargs, check_types=False)
         if self.grad_enabled:
