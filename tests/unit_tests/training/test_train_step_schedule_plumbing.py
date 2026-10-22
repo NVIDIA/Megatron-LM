@@ -5,7 +5,14 @@
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from megatron.training import training as training_mod
+
+
+@pytest.fixture(autouse=True)
+def training_config(run_config):
+    run_config.train.micro_batch_size = 1
 
 
 class _Rerun:

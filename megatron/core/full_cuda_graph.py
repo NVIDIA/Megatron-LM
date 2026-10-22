@@ -4,6 +4,8 @@
 
 import gc
 import logging
+from collections.abc import Callable, Iterable, Sequence
+from typing import Optional
 
 import torch
 
@@ -55,6 +57,96 @@ def get_graph_pool(use_single_mempool):
     if use_single_mempool:
         return get_shared_graph_pool()
     return torch.cuda.graph_pool_handle()
+
+
+class FullIterationGradCopy:
+    """Reuse forward/backward graph scratch for later optimizer-gradient conversion.
+
+    Replay must stay ordered: forward/backward, gradient conversion, then the
+    eager optimizer update. Retained gradient handles are rebound after zero_grad;
+    their values may be overwritten by the next forward/backward replay.
+    """
+
+    def __init__(self) -> None:
+        self.graph = None
+        self.forward_backward_graph = None
+        self.outputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.source_signature = None
+
+    @torch.no_grad()
+    def copy(
+        self,
+        copy_fn: Callable[[], None],
+        group_pairs: Iterable[tuple[Sequence[torch.Tensor], Sequence[torch.Tensor]]],
+        source_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> None:
+        """Replay ``copy_fn`` as a CUDA graph in the training graph's pool and warmup stream.
+
+        Args:
+            copy_fn: The optimizer's ordinary gradient-conversion operation.
+            group_pairs: Matching (model parameter group, optimizer parameter group)
+                sequences, as the optimizers already keep them.
+            source_fn: Maps a model parameter to the gradient storage ``copy_fn`` reads;
+                defaults to its ``main_grad``. The distributed optimizer reads a shard of it.
+        """
+        source_fn = source_fn or (lambda model_param: model_param.main_grad)
+        pairs = [
+            (source_fn(model_param), main_param)
+            for model_group, main_group in group_pairs
+            for model_param, main_param in zip(model_group, main_group)
+        ]
+        for source, main_param in pairs:
+            assert source.numel() == main_param.numel()
+        if not pairs:
+            copy_fn()
+            return
+        assert not torch.cuda.is_current_stream_capturing()
+        fb_graph = FullCudaGraphWrapper.cuda_graph.get("training")
+        if self.forward_backward_graph is not fb_graph:
+            # reset_cuda_graph() can discard the training graph without rebuilding
+            # the optimizer. Conversion state belongs to that graph's pool and must
+            # be rebuilt if training is warmed up or captured again.
+            self.graph = None
+            self.outputs = []
+            self.source_signature = None
+            self.forward_backward_graph = fb_graph
+        stream = get_shared_capture_stream()
+        if fb_graph is None:
+            caller = torch.cuda.current_stream()
+            stream.wait_stream(caller)
+            with torch.cuda.stream(stream):
+                copy_fn()
+            caller.wait_stream(stream)
+            # Adam reads on caller after conversion allocated on the F/B stream.
+            for _, main_param in pairs:
+                main_param.grad.record_stream(caller)
+            return
+
+        signature = [
+            (
+                source.data_ptr(),
+                tuple(source.shape),
+                source.stride(),
+                source.dtype,
+                source.device,
+                id(main_param),
+            )
+            for source, main_param in pairs
+        ]
+        if self.graph is None:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(
+                graph, pool=fb_graph.pool(), stream=stream, capture_error_mode="thread_local"
+            ):
+                copy_fn()
+            self.outputs = [(main_param, main_param.grad) for _, main_param in pairs]
+            self.source_signature = signature
+            self.graph = graph
+        if signature != self.source_signature:
+            raise RuntimeError("Full-CG optimizer gradient storage changed after capture")
+        for main_param, grad in self.outputs:
+            main_param.grad = grad
+        self.graph.replay()
 
 
 # The below functions traverse through nested data structures (tuples, lists, dicts)
