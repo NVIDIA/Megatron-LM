@@ -131,7 +131,7 @@ class _MambaMetadata:
 
 
 class _SchedulerHarness:
-    def schedule_waiting_requests(self, prompt_logprob_updates=None):
+    def schedule_waiting_requests(self):
         if not self.waiting_request_ids:
             return
         request_id = self.waiting_request_ids[0]
@@ -144,11 +144,6 @@ class _SchedulerHarness:
 
 
 class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
-    _validate_prompt_logprob_continuation = (
-        DynamicInferenceEngine._validate_prompt_logprob_continuation
-    )
-    _bind_prompt_logprob_continuation = DynamicInferenceEngine._bind_prompt_logprob_continuation
-
     def __init__(self, loop, *, hybrid=False, available=0, extra_eos_token_id_set=()):
         self._loop = loop
         # Ids a model declares beyond the request's own termination_id, e.g. nanov3p5's
@@ -1207,7 +1202,7 @@ def test_transfer_polling_defers_batch_mutation_to_scheduling(handoff_loop):
         assert engine._poll_pending_kv_imports() == 1
         finalize.assert_not_called()
 
-        engine.schedule_waiting_requests({"sentinel": {}})
+        engine.schedule_waiting_requests()
         _drain_loop(handoff_loop)
 
     finalize.assert_called_once_with(pending)
