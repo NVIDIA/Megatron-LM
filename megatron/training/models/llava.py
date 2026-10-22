@@ -11,14 +11,25 @@ from megatron.training.models.base import ModelConfig
 class LLaVAModelConfig(ModelConfig):
     """LLaVA language-model inputs used by the multimodal provider callbacks.
 
-    Vision and projection specialization remains in those applications; this config
-    owns the model settings consumed by the shared training lifecycle.
+    Vision and projection architecture specialization remains in those applications.
     """
 
     transformer: TransformerConfig
     """Base language-transformer architecture, precision, and parallelism."""
     seq_length: int
     """Maximum position capacity, not the image or text data sequence length."""
+    img_h: int = 224
+    """Vision input height, also consumed by image preprocessing."""
+    img_w: int = 224
+    """Vision input width, also consumed by image preprocessing."""
+    patch_dim: int = 16
+    """Vision patch size."""
+    drop_vision_class_token: bool = False
+    """Drop vision class tokens before projecting image embeddings."""
+    freeze_language_model: bool = False
+    """Freeze language-model parameters."""
+    freeze_vision_model: bool = False
+    """Freeze vision-encoder parameters."""
     vocab_size: int | None = None
     """Language-model vocabulary, or None until tokenizer initialization."""
     should_pad_vocab: bool = False

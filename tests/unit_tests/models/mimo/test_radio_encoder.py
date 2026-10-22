@@ -24,7 +24,11 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.global_vars import get_run_config
+from megatron.training.models import MimoModelConfig
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.usefixtures("run_config")
 
 IMG = 224
 PATCH = 14
@@ -49,6 +53,14 @@ def _build_wrapper(
         params_dtype=params_dtype,
         bf16=params_dtype == torch.bfloat16,
         attention_backend=attention_backend,
+    )
+    get_run_config().model = MimoModelConfig(
+        transformer=config,
+        seq_length=PATCHES,
+        img_h=IMG,
+        img_w=IMG,
+        patch_dim=PATCH,
+        drop_vision_class_token=drop_class_token,
     )
     args = SimpleNamespace(
         img_h=IMG,

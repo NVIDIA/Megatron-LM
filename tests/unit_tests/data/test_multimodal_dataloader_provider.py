@@ -68,7 +68,7 @@ def test_new_dataloader_prefetch_factor(
     monkeypatch.setattr(
         dataloader_provider,
         "datasets_provider",
-        lambda task_encoder, worker_config: ("train-dataset", None, None),
+        lambda task_encoder, worker_config, **kwargs: ("train-dataset", None, None),
     )
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kwargs: kwargs)
@@ -105,6 +105,24 @@ def test_new_dataloader_rejects_non_positive_prefetch_factor(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("new_path", [False, True])
+def test_dataset_provider_passes_explicit_sequence_length(monkeypatch, new_path):
+    # No dataloader_seq_length in legacy args: the caller owns this data input.
+    args = SimpleNamespace(
+        data_path=["dataset"], micro_batch_size=1, packing_buffer_size=None, eval_iters=1
+    )
+    monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: new_path)
+    encoder = Mock()
+    monkeypatch.setattr(dataloader_provider, "MultiModalTaskEncoder", encoder)
+    monkeypatch.setattr(dataloader_provider, "TaskEncoder", encoder)
+    monkeypatch.setattr(dataloader_provider, "get_train_dataset", Mock())
+    monkeypatch.setattr(dataloader_provider, "get_val_datasets", Mock(return_value=[]))
+    dataloader_provider.datasets_provider(None, sequence_length=128)
+    assert encoder.call_count == 2
+    assert all(call.kwargs["sequence_length"] == 128 for call in encoder.call_args_list)
+
+
 @pytest.fixture
 def strict_resume_provider(monkeypatch):
     args = SimpleNamespace(
@@ -130,7 +148,9 @@ def strict_resume_provider(monkeypatch):
     ):
         monkeypatch.setattr(dataloader_provider.parallel_state, name, Mock(return_value=value))
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kw: kw)
-    monkeypatch.setattr(dataloader_provider, "datasets_provider", lambda *a: (object(), None, None))
+    monkeypatch.setattr(
+        dataloader_provider, "datasets_provider", lambda *a, **kw: (object(), None, None)
+    )
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kw: None)
     monkeypatch.setattr(dataloader_provider, "get_savable_loader", lambda *a, **kw: loader)

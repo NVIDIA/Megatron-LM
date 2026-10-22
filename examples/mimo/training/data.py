@@ -288,6 +288,7 @@ def build_train_valid_test_data_loaders(
     args: argparse.Namespace, topology: HeteroTopology
 ) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """Build independent mock DataLoaders for the data-consuming rank role."""
+    cfg = get_run_config()
     if getattr(args, "dataset_provider", "mock") != "mock":
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 
@@ -312,7 +313,7 @@ def build_train_valid_test_data_loaders(
     if encoder_name is not None:
         encoder_pgc = topology.module_pgs[encoder_name]
         rank_in_encoder = topology.grids[encoder_name].is_current_rank_in_grid()
-        if rank_in_encoder and not getattr(args, "disable_vision_class_token", False):
+        if rank_in_encoder and not cfg.model.drop_vision_class_token:
             raise ValueError("RADIO mock data requires --disable-vision-class-token")
         encoder_needs_data = rank_in_encoder and is_pp_first_stage(encoder_pgc.pp)
 
@@ -363,15 +364,15 @@ def _build_split_loaders(
 
 def _mock_loader_kwargs(args: argparse.Namespace, encoder_name: Optional[str]) -> dict:
     """Translate parsed training arguments to the reusable mock loader."""
+    cfg = get_run_config()
     seq_len = args.seq_length
     dtype = getattr(args, "params_dtype", None)
     if dtype is None:
         dtype = torch.bfloat16 if getattr(args, "bf16", False) else torch.float32
 
-    image_size = getattr(args, "image_size", 224)
-    img_h = getattr(args, "img_h", image_size)
-    img_w = getattr(args, "img_w", image_size)
-    patch_dim = getattr(args, "patch_dim", 16)
+    img_h = cfg.model.img_h
+    img_w = cfg.model.img_w
+    patch_dim = cfg.model.patch_dim
     num_image_tiles = getattr(args, "num_image_tiles", 1)
     pixel_shuffle = bool(getattr(args, "pixel_shuffle", False))
     dynamic_resolution = bool(getattr(args, "dynamic_resolution", False))
