@@ -857,7 +857,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 "i.e. num_distributed_optimizer_instances > 1."
             )
         if (
-            ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
+            ddp_config.expert_hsdp
+            and ddp_config.expert_outer_dp_sharding_strategy != "no_shard"
             and ddp_config.num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
@@ -1073,7 +1074,7 @@ def _build_expert_mesh_and_placements(
 
     inner_strategy = get_sharding_strategy(ddp_config, is_expert_param=True)
 
-    if ddp_config.num_distributed_optimizer_instances > 1:
+    if ddp_config.expert_hsdp and ddp_config.num_distributed_optimizer_instances > 1:
         # Match v1 topology: dense and expert parameters share the outer DP axis,
         # while experts use the existing expert-DP inner group. Only placements differ.
         dp_mesh = _build_hybrid_dp_mesh(

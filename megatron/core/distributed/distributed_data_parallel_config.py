@@ -118,6 +118,13 @@ class DistributedDataParallelConfig:
       parallelism is enabled, so the two classes have very different traffic-per-byte.
       None is replaced with `data_parallel_sharding_strategy` during initialization."""
 
+    expert_hsdp: bool = True
+    """Use the existing inner/outer expert-DP groups for hybrid sharding in MFSDP v2.
+    When False, shard experts over the existing full expert-DP group using
+    ``expert_data_parallel_sharding_strategy`` and ignore ``expert_outer_dp_sharding_strategy``.
+    Dense sharding and process-group initialization are unchanged.
+    """
+
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
 
@@ -194,7 +201,7 @@ class DistributedDataParallelConfig:
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
     Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
     ``'optim_grads_params'``. None is replaced with
-    ``outer_dp_sharding_strategy`` during initialization.
+    ``outer_dp_sharding_strategy`` during initialization. Ignored when ``expert_hsdp=False``.
     """
 
     disable_symmetric_registration: bool = False
