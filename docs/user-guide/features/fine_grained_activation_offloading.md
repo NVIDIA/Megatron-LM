@@ -232,6 +232,11 @@ remove `core_attn` and its dependent `attn_proj` from `offload_modules`. This re
 apply when core attention offloading is disabled or the fraction is zero; it is not a blanket
 restriction on models without Q/K normalization.
 
+**TODO:** Support packed Q/K/V inputs with `core_attn` fine-grained activation offloading
+(FGAO). Preserve the layout required by attention backward while transferring each shared QKV
+storage only once in each direction. Add fused/FlashAttention forward and gradient parity tests,
+including partial offload and CUDA graphs, before removing the current runtime restriction.
+
 ### CUDA Graph Support
 
 When offloading interacts with CUDA graphs:
