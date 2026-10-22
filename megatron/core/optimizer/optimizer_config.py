@@ -598,6 +598,27 @@ class OptimizerConfig:
                 'distributed checkpointing yet'
             )
 
+    @property
+    def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
+        """Whether decoupled grads / precision-aware handling applies outside FP8 (except delayed).
+
+        The following condition is used to avoid repetition in distrib_optimizer.py.
+        This is because in distrib_optimizer.py, the process to handle parameters are
+        different for different training precision settings. FP8 cases require different
+        handling while FP8 delayed scaling is an exception because the Adam optimizer in
+        TransformerEngine supports it in the kernel computation.
+        This is also the flag to determine the usage of param.grad or param.decoupled_grad
+        Derived on access so configs built directly (without finalize_optimizer_config) work.
+        """
+        return bool(
+            self.use_precision_aware_optimizer
+            and (
+                self.main_params_dtype not in (torch.float32, 'fp32')
+                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                or self.optimizer_cpu_offload
+            )
+        )
+
     def finalize_optimizer_config(self) -> None:
         """Resolve dtypes, derived flags and optimizer aliases once the config is validated."""
         # Map string data-type to torch.dtype.
@@ -618,21 +639,6 @@ class OptimizerConfig:
 
         if self.use_precision_aware_optimizer and not is_te_min_version("2.1.0"):
             self.store_param_remainders = False
-
-        # The following condition is used to avoid repetition in distrib_optimizer.py.
-        # This is because in distrib_optimizer.py, the process to handle parameters are
-        # different for different training precision settings. FP8 cases require different
-        # handling while FP8 delayed scaling is an exception because the Adam optimizer in
-        # TransformerEngine supports it in the kernel computation.
-        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
-        self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
-            self.use_precision_aware_optimizer
-            and (
-                self.main_params_dtype != torch.float32
-                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
-            )
-        )
 
         # emerging optimizer check
         if self.optimizer not in ('sgd', 'adam'):
