@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -123,6 +124,7 @@ def _make_fake_grouped_mlp(fake_te, normalization="LayerNorm"):
 
     module.linear_fc1 = fc1
     module.linear_fc2 = fc2
+    module._grouped_linear_kwargs = {"split_alignment": 256}
 
     return module
 
@@ -215,6 +217,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert fc1_op.kwargs["in_features"] == 4
         assert fc1_op.kwargs["out_features"] == 8
         assert fc1_op.kwargs["accumulate_into_main_grad"] is True
+        assert fc1_op.kwargs["split_alignment"] == 256
         assert fc1_op.weight0 is module.linear_fc1.weight
         assert fc1_op._glu_interleave_size == 32
         assert isinstance(fused_impl[1], fake_te.ScaledSwiGLU)
@@ -223,6 +226,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert fc2_op.kwargs["in_features"] == 4
         assert fc2_op.kwargs["out_features"] == 4
         assert fc2_op.kwargs["accumulate_into_main_grad"] is False
+        assert fc2_op.kwargs["split_alignment"] == 256
         assert fc2_op.weight0 is module.linear_fc2.weight
 
     @pytest.mark.parametrize(("bad_attr", "match"), [("linear_fc1", "FC1"), ("linear_fc2", "FC2")])
@@ -315,11 +319,18 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         )
 
         with pytest.warns(UserWarning, match="pre-forward hook"):
-            output, bias = TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 3, 4))
+            output, bias = TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 128, 4))
 
         assert events == ["fc1-pre", "norm", "fc2-pre", "fused"]
-        assert output.shape == (2, 3, 4)
+        assert output.shape == (2, 128, 4)
         assert bias is None
+
+    def test_grouped_forward_rejects_unaligned_token_count(self, monkeypatch):
+        fake_te = _patch_fake_te_ops(monkeypatch)
+        module = _make_fake_grouped_mlp(fake_te)
+
+        with pytest.raises(ValueError, match="divisible by 256.*got 384"):
+            module(torch.ones(3, 128, 4))
 
     def test_grouped_hook_registration_rejects_external_phase_selection(self, monkeypatch):
         fake_te = _patch_fake_te_ops(monkeypatch)
@@ -419,9 +430,9 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         else:
             monkeypatch.delenv("FP4_RECIPE", raising=False)
 
-        out, bias = TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 3, 4))
+        out, bias = TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 128, 4))
 
-        assert out.shape == (2, 3, 4)
+        assert out.shape == (2, 128, 4)
         assert bias is None
         assert module._recipe is recipe
         assert recipe_calls == [recipe_name]
@@ -459,6 +470,52 @@ class TestTEFusedMLPWithGroupedLinearSpec:
         config = _make_config()
         mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules())
         assert isinstance(mlp, TEFusedMLPWithGroupedLinear)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    def test_split_alignment_enables_fusion_without_env(self, monkeypatch):
+        import transformer_engine.pytorch as te
+
+        if "split_alignment" not in inspect.signature(te.ops.GroupedLinear).parameters:
+            pytest.skip("Installed TE op fuser GroupedLinear lacks split_alignment")
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+        monkeypatch.delenv("FP4_RECIPE", raising=False)
+        mxfp8_available, reason = te.is_mxfp8_available(return_reason=True)
+        if not mxfp8_available:
+            pytest.skip(reason)
+        fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        if not fused_cls.is_supported():
+            pytest.skip("Fused grouped MLP requires supported GPU and cuDNN frontend kernels")
+
+        config = _make_config(
+            hidden_size=128,
+            ffn_hidden_size=256,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=False,
+        )
+        mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules()).cuda()
+        hidden = torch.randn(
+            (2, 128, config.hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        output, bias = mlp(hidden)
+        output.backward(torch.randn_like(output))
+
+        (sequential,) = mlp._fused_impl
+        assert sequential[0].split_alignment == 256
+        assert sequential[2].split_alignment == 256
+        (fuser,) = sequential._module_groups
+        assert len(fuser._forward_ops) == 1
+        assert len(fuser._backward_ops) == 1
+        assert isinstance(fuser._forward_ops[0][0], fused_cls)
+        assert fuser._backward_ops[0][0] is fuser._forward_ops[0][0]
+        assert output.shape == hidden.shape
+        assert bias is None
+        assert torch.isfinite(output).all()
+        for tensor in (hidden, *mlp.parameters()):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad).all()
 
     def test_wrong_activation_raises(self):
         config = _make_config(activation_func=F.gelu, gated_linear_unit=False)

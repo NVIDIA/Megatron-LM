@@ -8415,7 +8415,7 @@ class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_gap_steps=0,
             top_k=1,
             context_max_requests=32,
-            use_cuda_graphs_for_non_decode_steps=False,
+            use_cuda_graphs_for_non_decode_steps=True,
         )
         eager = self._run_test(**common, num_cuda_graphs=None)
         graphed = self._run_test(
