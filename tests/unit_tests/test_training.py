@@ -11,6 +11,7 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
+from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
@@ -164,6 +165,13 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
 
 
 class TestTraining:
+    @pytest.fixture(autouse=True)
+    def training_config(self, run_config):
+        run_config.train = TrainingConfig(train_samples=1, train_iters=1, global_batch_size=1)
+        run_config.validation = ValidationConfig(
+            eval_interval=1, eval_iters=1, eval_global_batch_size=1
+        )
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         args = create_test_args()
@@ -198,11 +206,11 @@ class TestTraining:
 
     def test_build_train_valid_test_data_iterators_multi_full_validation(self, run_config):
         """multiple_validation_sets + full_validation builds a list of iterators
-        (one per validation set) and sets args.eval_iters to the per-loader
+        (one per validation set) and sets cfg.validation.eval_iters to the per-loader
         lengths MAX-reduced across DP ranks."""
         args = create_test_args()
-        args.multiple_validation_sets = True
-        args.full_validation = True
+        run_config.validation.multiple_validation_sets = True
+        run_config.validation.full_validation = True
         set_args(args)
         _, valid_iters, _ = build_train_valid_test_data_iterators(
             mock_multi_valid_full_datasets_provider
@@ -212,7 +220,7 @@ class TestTraining:
         assert next(valid_iters[0]) == 2
         assert next(valid_iters[1]) == 20
         # data_parallel_size=1, so MAX across DP ranks equals the local lengths
-        assert args.eval_iters == [2, 3]
+        assert run_config.validation.eval_iters == [2, 3]
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):
@@ -292,12 +300,42 @@ class TestGetModelBucketSizingPgCollection:
 
 
 class TestPackedSampleAccounting:
+    @pytest.mark.parametrize("schedule,expected_iters", [(None, 4), ("0:8 32:16", 6)])
+    def test_sample_horizon_uses_config_and_resets_batch_schedule(
+        self, monkeypatch, schedule, expected_iters
+    ):
+        from megatron.core import num_microbatches_calculator as calculator
+        from megatron.training import training
+
+        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+
+        def unexpected_global_config():
+            raise AssertionError("sample horizon must use the supplied TrainingConfig")
+
+        monkeypatch.setattr(training, "get_run_config", unexpected_global_config)
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=64,
+            step_batch_size_schedule=schedule,
+        )
+        calculator.init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=16,
+            micro_batch_size=2,
+            data_parallel_size=1,
+            step_batch_size_schedule=schedule,
+        )
+        training.update_train_iters(train)
+        assert train.train_iters == expected_iters
+        assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
+
     @pytest.mark.parametrize(
         "total_cp,num_sequence_shards,weight_shards,samples",
         [(1, 1, 4, 8), (4, 2, 2, 2), (2, 2, 4, 4)],
     )
     def test_static_cp_sample_count_and_scheduler(
-        self, monkeypatch, total_cp, num_sequence_shards, weight_shards, samples
+        self, monkeypatch, run_config, total_cp, num_sequence_shards, weight_shards, samples
     ):
         """Sequence shards count each sample once for progress and sample-based LR schedules."""
         import megatron.training.training as training
@@ -314,6 +352,7 @@ class TestPackedSampleAccounting:
             train_iters=None,
             train_samples=10_000,
         )
+        run_config.train = TrainingConfig(micro_batch_size=2, train_samples=10_000)
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)
         monkeypatch.setattr(training, "is_pp_last_stage", lambda group: True)
         monkeypatch.setattr(training, "get_pg_size", lambda group: 1)
@@ -341,16 +380,18 @@ class TestPackedSampleAccounting:
         with pytest.raises(ValueError, match="every microbatch"):
             _pop_samples_seen(losses)
 
-    def test_iteration_schedule_uses_running_batch_size(self, monkeypatch):
+    def test_iteration_schedule_uses_running_batch_size(self, monkeypatch, run_config):
         args = SimpleNamespace(train_iters=100, train_samples=None)
+        run_config.train = TrainingConfig(train_iters=100)
         monkeypatch.setattr(
             "megatron.training.training.get_current_running_global_batch_size", lambda: 256
         )
 
         assert _get_optimizer_param_scheduler_increment(args, 3342) == 256
 
-    def test_sample_schedule_uses_samples_seen(self):
+    def test_sample_schedule_uses_samples_seen(self, run_config):
         args = SimpleNamespace(train_iters=39, train_samples=10_000)
+        run_config.train = TrainingConfig(train_iters=39, train_samples=10_000)
 
         assert _get_optimizer_param_scheduler_increment(args, 3342) == 3342
 

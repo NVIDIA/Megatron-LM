@@ -23,6 +23,7 @@ from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.transformer import shared_prefix_attention
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import TopKRouter
@@ -186,6 +187,7 @@ def test_full_attention_window_accepted(window_size):
 def _attention_layer():
     layer = Mock(spec=TransformerLayer)
     layer.self_attention = Mock(spec=SelfAttention)
+    layer.self_attention.core_attention = Mock(spec=DotProductAttention)
     layer.self_attention.checkpoint_core_attention = False
     layer.self_attention.pg_collection = SimpleNamespace(tp=_group(1), cp=_group(1))
     layer.is_moe_layer = False
