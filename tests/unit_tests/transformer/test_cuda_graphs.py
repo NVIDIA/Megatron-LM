@@ -4,6 +4,7 @@ import gc
 import logging
 import os
 import sys
+import warnings
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -2761,6 +2762,45 @@ class TestChunkWiseCudaGraphs:
         layer = object.__new__(TransformerLayer)
         object.__setattr__(layer, 'config', config)
         assert not _layer_is_graphable(layer, config)
+
+    def test_chunk_config_warns_when_packed_pp_keeps_the_p2p_shape_exchange(self):
+        """Packing pads every microbatch to max_seqlen_per_dp_cp_rank, so the pipeline P2P shape
+        is static; without pipeline_p2p_fixed_shape every P2P still exchanges shapes (a host
+        synchronization)."""
+        packed_pp = dict(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            cuda_graph_dynamic_microbatches=True,
+            sequence_packing_scheduler="dp_balanced",
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=128,
+            thd_max_packed_sequences=8,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+        )
+        with pytest.warns(UserWarning, match="pipeline_p2p_fixed_shape=True"):
+            _base_cuda_graph_config(**packed_pp)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            _base_cuda_graph_config(**packed_pp, pipeline_p2p_fixed_shape=True)
+            _base_cuda_graph_config(**{**packed_pp, "pipeline_model_parallel_size": 1})
+
+    def test_te_capture_runs_on_the_shared_capture_stream_for_pool_sharing(self, monkeypatch):
+        """The chunk graphs and the optimizer-step graph share one memory pool, whose free blocks
+        are keyed by the allocating stream: TE's capture (torch.cuda.graph without a stream) must
+        therefore run on get_shared_capture_stream(). The helper only redirects torch's default
+        capture stream; the full-iteration path keeps passing the stream explicitly."""
+        from megatron.core import full_cuda_graph
+
+        monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", None)
+        monkeypatch.setattr(torch.cuda.graphs.graph, "default_capture_stream", None)
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        full_cuda_graph.capture_te_graphs_on_shared_stream()
+        assert (
+            torch.cuda.graphs.graph.default_capture_stream
+            is full_cuda_graph.get_shared_capture_stream()
+        )
 
 
 class TestPartialCudaGraph:

@@ -4906,6 +4906,22 @@ class TransformerConfig(ModelParallelConfig):
                         "cuda_graph_dynamic_microbatches so the capture uses the conservative "
                         "upper bound on the packed microbatch count."
                     )
+                if (
+                    self.sequence_packing_scheduler is not None
+                    and self.pipeline_model_parallel_size > 1
+                    and not self.pipeline_p2p_fixed_shape
+                    and not self.mtp_standalone
+                ):
+                    # Packing marks the sequence length variable, so every pipeline P2P first
+                    # exchanges shapes (a host synchronization that waits for the producing
+                    # graph replay), although pad_packed_seq_alignment="max" makes the
+                    # inter-stage shape static.
+                    warnings.warn(
+                        "cuda_graph_impl='chunk_wise' with packed sequences pads every "
+                        "microbatch to max_seqlen_per_dp_cp_rank, so the pipeline P2P shape is "
+                        "static; set pipeline_p2p_fixed_shape=True to skip the per-call shape "
+                        "exchange and its host synchronization."
+                    )
                 if self.recompute_granularity == "full" and (
                     self.hidden_dropout != 0.0
                     or self.attention_dropout != 0.0
@@ -5591,10 +5607,20 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                # Static THD padding (every rank's microbatch is padded to
+                # max_seqlen_per_dp_cp_rank, as CUDA graphs require) already equalizes the
+                # token counts across the dispatcher ranks; the runtime padding would add an
+                # all-reduce plus a host read per MoE layer, which a graph capture forbids.
+                statically_padded_graph_inputs = (
+                    self.cuda_graph_impl != "none"
+                    and self.max_seqlen_per_dp_cp_rank is not None
+                    and self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
+                )
                 if (
                     self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
+                    and not statically_padded_graph_inputs
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "

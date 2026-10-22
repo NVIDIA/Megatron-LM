@@ -1102,9 +1102,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and labels is not None
             and not in_inference_mode
             # The captured post-process takes the decoder's layout and tensors only: no CP
-            # layout plan, no precomputed MTP embeddings, no MTP conditioning mask, MTP on.
+            # layout conversion plan, no precomputed MTP embeddings, no MTP conditioning mask,
+            # MTP on.
             and compute_mtp_loss
-            and cp_batch is None
+            and (cp_batch is None or cp_batch.thd_plan is None)
             and mtp_input_mask is None
             and not use_precomputed_mtp_embeddings
         ):

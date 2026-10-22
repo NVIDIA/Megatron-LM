@@ -157,6 +157,8 @@ step graph is captured into that same pool.
 --cuda-graph-warmup-steps 2 \
 # packed sequences: static shapes and a capture bound on the packed microbatch count
 --pad-packed-seq-alignment max --thd-max-packed-sequences <N> --cuda-graph-dynamic-microbatches \
+# packed sequences with PP > 1: the padded inter-stage shape is static, skip the P2P shape exchange
+--pipeline-p2p-fixed-shape \
 # optional: optimizer step in the same graph memory pool (optimizer state must stay on the GPU)
 --optimizer-cuda-graph
 ```

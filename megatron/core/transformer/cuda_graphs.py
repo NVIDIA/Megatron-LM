@@ -3640,9 +3640,15 @@ class TECudaGraphHelper:
                 te_parameters = inspect.signature(make_graphed_callables).parameters
                 # One process-wide pool: the optimizer step graph (optimizer_cuda_graph) is
                 # captured into the same pool and reuses the blocks the chunk graphs leave idle.
+                # Pool blocks are keyed by the allocating stream, so TE has to capture on the
+                # same stream as that graph.
                 if 'pool' in te_parameters:
-                    from megatron.core.full_cuda_graph import get_shared_graph_pool
+                    from megatron.core.full_cuda_graph import (
+                        capture_te_graphs_on_shared_stream,
+                        get_shared_graph_pool,
+                    )
 
+                    capture_te_graphs_on_shared_stream()
                     kwargs['pool'] = get_shared_graph_pool()
                 # With gradient accumulation fusion the parameter grads a graph returns are
                 # placeholders (the real wgrad goes to main_grad), so there is nothing to clone.

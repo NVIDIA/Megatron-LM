@@ -92,6 +92,15 @@ class ChunkCudaGraphBlockMixin:
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Build the static inputs of a complete decoder-block graph."""
+        layout_manager = getattr(self, '_cp_layout_manager', None)
+        if layout_manager is not None and layout_manager.requires_conversion:
+            raise ValueError(
+                "cuda_graph_impl='chunk_wise' cannot capture a hybrid stack whose layers use "
+                "different context-parallel layouts "
+                f"(layer layouts {sorted(set(layout_manager.layer_layouts))}): the per-layer "
+                "layout conversion exchanges tokens with data-dependent split sizes. Use one "
+                "cp_partition_mode for every layer or run without chunk graphs."
+            )
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         config = self.config
         device = torch.cuda.current_device()
@@ -161,9 +170,27 @@ class ChunkCudaGraphBlockMixin:
             static_inputs, cu_seqlens, self._chunk_cp_group(), max_tokens
         )
 
+    def _drop_cp_layout_kwargs(self, kwargs):
+        """Drop the per-layout packed metadata a hybrid stack receives next to ``packed_seq_params``.
+
+        ``packed_seq_params_by_layout`` and ``cp_layout_plan`` only carry information when the
+        stack converts between CP layouts across its layers (``ContextParallelLayoutManager.
+        requires_conversion``); that conversion routes tokens with data-dependent split sizes and
+        cannot be captured, so ``get_layer_static_inputs`` rejects such stacks. For a single layout
+        the dict holds the one ``packed_seq_params`` already passed and the plan is ``None``, and the
+        block rebuilds nothing from them.
+        """
+        kwargs.pop('packed_seq_params_by_layout', None)
+        plan = kwargs.pop('cp_layout_plan', None)
+        assert plan is None, (
+            "Chunk CUDA graphs received a THD CP layout plan: per-layer CP layout conversion is "
+            "not supported inside a captured block."
+        )
+
     def _decompose_packed_seq_params_to_kwargs(self, kwargs):
         """Replace ``packed_seq_params`` by its graph-copyable tensors (``cu_seqlens`` and, with
         the graph-dynamic balanced CP indexer, the per-pack route pair)."""
+        self._drop_cp_layout_kwargs(kwargs)
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
