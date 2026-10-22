@@ -487,6 +487,19 @@ class _VirtualExperts(_GTPTEWeightBridge):
             {} for _ in parameters
         ]
 
+    def prepare_for_cuda_graph(self) -> None:
+        """Build tables invalidated by first-time GTP chain discovery before capture."""
+        for fc_layer, leader in enumerate(self.gtp_leaders):
+            if leader is None or WeightDirection.FORWARD in self._tables[fc_layer]:
+                continue
+            # Read addresses only: normal materialization still owns the gather and wait.
+            sources = leader.get_group_forward_storage()
+            rows = self._ptrs(WeightDirection.FORWARD, sources)
+            tensor = torch.tensor(rows, dtype=torch.int64, device=self.config.device)
+            self._tables[fc_layer][WeightDirection.FORWARD] = _PointerTable(
+                tensor, rows, tuple(tensor.unbind())
+            )
+
     def _components(self, key: WeightDirection | Literal["grad"]) -> tuple[str, ...]:
         if self.config.mxfp8 and key != "grad":
             offset = 2 if key == WeightDirection.BACKWARD else 0
@@ -569,6 +582,24 @@ class _VirtualExperts(_GTPTEWeightBridge):
 
 
 # ---- Load balancer ---------------------------------------------------------------------------
+
+
+def prepare_virtual_expert_tables_for_cuda_graph(
+    model: torch.nn.Module | list[torch.nn.Module],
+) -> None:
+    """Prepare MoonEP metadata after eager warmup without advancing GTP prefetch."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Virtual-expert pointer tables must be prepared before capture")
+    chunks = model if isinstance(model, list) else [model]
+    seen = set()
+    for chunk in chunks:
+        for module in chunk.modules():
+            dispatcher = getattr(module, "token_dispatcher", None)
+            manager = getattr(dispatcher, "_comm_manager", None)
+            experts = getattr(manager, "virtual_experts", None)
+            if experts is not None and id(experts) not in seen:
+                seen.add(id(experts))
+                experts.prepare_for_cuda_graph()
 
 
 class _VirtualExpertHook(torch.autograd.Function):
