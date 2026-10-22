@@ -428,30 +428,21 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
-@pytest.mark.parametrize("preserve_layout", [False, True])
-def test_chunk_offload_handler_low_coverage_views(preserve_layout):
+def test_chunk_offload_handler_gathers_low_coverage_views():
     handler = _make_chunk_handler_for_offload_reload()
 
     base = torch.randn(64, 96, device="cuda")
-    view = base[:, 8:16]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
+    view = base[:, :8]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
 
-    state = handler.offload(view, preserve_layout=preserve_layout)
+    state = handler.offload(view)
     _, cpu_backup, _, view_meta = state
-    if preserve_layout:
-        # TE can require the original packed layout even for a small view.
-        assert view_meta == (view.size(), view.stride(), view.storage_offset())
-        assert cpu_backup.shape == (base.numel(),)
-    else:
-        assert view_meta is None
-        assert cpu_backup.shape == view.shape
+    # Low-coverage views fall back to the contiguous gather.
+    assert view_meta is None
+    assert cpu_backup.shape == view.shape
 
     reloaded = handler.reload(state)
     torch.cuda.synchronize()
-    if preserve_layout:
-        assert reloaded.stride() == view.stride()
-        assert reloaded.storage_offset() == view.storage_offset()
-    else:
-        assert reloaded.is_contiguous()
+    assert reloaded.is_contiguous()
     assert torch.equal(reloaded, view)
 
 
@@ -464,36 +455,6 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
     handler.offload_groups = list(groups)
     handler._max_group_size = len(groups)
     return handler
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
-@pytest.mark.parametrize("group_name", ["core_attn", "expert_fc1"])
-def test_packed_views_preserve_attention_layout_and_transfer_accounting(group_name):
-    packed = torch.randn(64, 4, 3, 16, device="cuda")
-    views = packed.unbind(dim=2)
-    group = OffloadTensorGroup(group_name)
-    for index, view in enumerate(views):
-        group.push_tensor((1, index), view)
-    chunk = _make_warmup_chunk([group])
-    chunk.bulk_offload_group(group)
-    torch.cuda.synchronize()
-
-    preserve_layout = group_name == "core_attn"
-    storage_bytes = packed.untyped_storage().nbytes()
-    assert group.total_offload_bytes == (3 if preserve_layout else 1) * storage_bytes
-    assert group.duplicate_storage_tensor_count == (2 if preserve_layout else 0)
-    assert group.duplicate_storage_bytes == (2 if preserve_layout else 0) * storage_bytes
-    for index, view in enumerate(views):
-        state = group._tensors[(1, index)]
-        assert (state[3] is not None) == preserve_layout
-        reloaded = chunk.reload(state)
-        torch.cuda.synchronize()
-        torch.testing.assert_close(reloaded, view, rtol=0, atol=0)
-        if preserve_layout:
-            assert reloaded.stride() == view.stride()
-            assert reloaded.storage_offset() == view.storage_offset()
-        else:
-            assert reloaded.is_contiguous()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
@@ -700,9 +661,7 @@ def test_bulk_offload_group_does_not_flag_views_copying_their_own_bytes(caplog, 
     group = OffloadTensorGroup("core_attn")
     group.push_tensor((1, 0), base[:512])
     group.push_tensor((1, 1), base[512:])
-    # Groups without a layout-sensitive backward gather low-coverage views,
-    # copying only their own elements even though the spans interleave.
-    other_group = OffloadTensorGroup("expert_fc1")
+    other_group = OffloadTensorGroup("core_attn")
     other_group.push_tensor((2, 0), base[:, :8])
     other_group.push_tensor((2, 1), base[:, 8:16])
 
@@ -776,6 +735,7 @@ def _build_gpt_model(
     is_mla: bool,
     activation_offload_fraction: float = 1.0,
     attention_backend: AttnBackend = AttnBackend.unfused,
+    qk_layernorm: bool = True,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
@@ -787,6 +747,7 @@ def _build_gpt_model(
         num_attention_heads=num_attention_heads,
         use_cpu_initialization=True,
         attention_backend=attention_backend,
+        qk_layernorm=qk_layernorm and not is_mla,
         bf16=True,
         # Recompute
         recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
@@ -806,6 +767,7 @@ def _build_gpt_model(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
             multi_latent_attention=is_mla,
+            qk_layernorm=qk_layernorm and not is_mla,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
@@ -890,6 +852,46 @@ def _run_one_iter_and_capture(
         grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
 
     return logits.detach().float().cpu(), grads, peak_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("offload_core_attn", [False, True])
+def test_packed_qkv_offload_requires_unpacked_inputs(fraction, offload_core_attn):
+    """Reject packed inputs only when core attention can actually be offloaded."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    off_interface.reset_instance()
+    try:
+        model = _build_gpt_model(
+            seed=123,
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            vocab_size=1024,
+            seq_length=128,
+            num_experts=None,
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn", "attn_proj"] if offload_core_attn else ["qkv_linear"],
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            activation_offload_fraction=fraction,
+            attention_backend=AttnBackend.fused,
+            qk_layernorm=False,
+        ).cuda()
+        input_ids, position_ids, attention_mask = _make_gpt_inputs(
+            seq_length=128, micro_batch_size=1, device=torch.device("cuda")
+        )
+        off_interface.reset()
+        if offload_core_attn and fraction > 0:
+            with pytest.raises(ValueError, match="core_attn offloading does not support packed"):
+                model(input_ids, position_ids, attention_mask)
+        else:
+            output = model(input_ids, position_ids, attention_mask)
+            output.float().sum().backward()
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
@@ -1256,6 +1258,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             num_attention_heads=num_attention_heads,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.unfused,
+            qk_layernorm=not is_mla,
             # Recompute
             recompute_modules=["layernorm", "moe_act"],
             recompute_granularity="selective",
@@ -1278,7 +1281,10 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             GPTModel(
                 config=transformer_config,
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=num_experts, moe_grouped_gemm=True, multi_latent_attention=is_mla
+                    num_experts=num_experts,
+                    moe_grouped_gemm=True,
+                    multi_latent_attention=is_mla,
+                    qk_layernorm=not is_mla,
                 ),
                 vocab_size=vocab_size,
                 max_sequence_length=seq_length,
@@ -1451,6 +1457,7 @@ def _build_gpt_model_with_cuda_graph(
         num_attention_heads=num_attention_heads,
         use_cpu_initialization=True,
         attention_backend=AttnBackend.unfused,
+        qk_layernorm=not is_mla,
         bf16=True,
         # Recompute
         recompute_modules=["layernorm", "moe_act"] if num_experts is not None else ["layernorm"],
@@ -1476,6 +1483,7 @@ def _build_gpt_model_with_cuda_graph(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
             multi_latent_attention=is_mla,
+            qk_layernorm=not is_mla,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,

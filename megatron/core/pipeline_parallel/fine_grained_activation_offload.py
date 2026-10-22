@@ -894,27 +894,24 @@ class ChunkOffloadHandler:
     # cover before offloading the storage instead of gathering the view: the
     # storage path trades D2H/H2D bytes on the copy engines for skipping the
     # gather kernel and its temporary GPU buffer, which only pays off when the
-    # view spans most of the storage. Layout-sensitive groups bypass this
-    # heuristic because attention backward requires the original layout.
+    # view spans most of the storage.
     BASE_OFFLOAD_MIN_COVERAGE = 0.5
 
     @_otel_trace_fn('activation_offload', 'megatron.activation.offload')
-    def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True, preserve_layout=False):
+    def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
         """Offload.
 
         A non-contiguous view that covers most of its underlying storage is
         offloaded as the flat storage (a plain memcpy plus the view's
         (size, stride, storage_offset) metadata) instead of being gathered into a
-        temporary contiguous copy. ``preserve_layout`` also takes this path
-        regardless of coverage for layout-sensitive groups such as core attention.
-        The base is resolved through
+        temporary contiguous copy. The base is resolved through
         ``untyped_storage()`` rather than ``._base`` because autograd hands the
         saved-tensor hooks a detach()-ed alias (e.g. CheckpointWithoutOutput's
         saved input), which drops the view metadata but not the storage.
         """
         debug_rank("--------offload")
 
-        view_meta = self._get_offload_view_meta(src_tensor, preserve_layout=preserve_layout)
+        view_meta = self._get_offload_view_meta(src_tensor)
         if view_meta is not None:
             # Flat alias of the full storage; contiguous by construction.
             src_tensor = torch.empty(0, dtype=src_tensor.dtype, device=src_tensor.device).set_(
@@ -935,18 +932,14 @@ class ChunkOffloadHandler:
         return state
 
     @classmethod
-    def _get_offload_view_meta(cls, tensor, preserve_layout=False):
+    def _get_offload_view_meta(cls, tensor):
         """Describe a full-storage transfer, or return None for a logical tensor copy."""
         if not tensor.is_contiguous():
             storage_bytes = tensor.untyped_storage().nbytes()
             element_size = tensor.element_size()
-            # Packed Q/K/V views have a layout retained by attention backward.
-            # Gathering such a view changes its strides and violates
-            # that layout even when the tensor values are preserved. Honor the
-            # explicit request regardless of the bandwidth coverage heuristic.
-            if storage_bytes % element_size == 0 and (
-                preserve_layout
-                or tensor.numel() * element_size >= cls.BASE_OFFLOAD_MIN_COVERAGE * storage_bytes
+            if (
+                storage_bytes % element_size == 0
+                and tensor.numel() * element_size >= cls.BASE_OFFLOAD_MIN_COVERAGE * storage_bytes
             ):
                 return (tensor.size(), tensor.stride(), tensor.storage_offset())
         return None
@@ -1122,9 +1115,7 @@ class ChunkOffloadHandler:
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
                     state = self.offload(
-                        tensor_on_device,
-                        use_cpu_pool=group_to_offload.use_cpu_pool,
-                        preserve_layout=group_to_offload._name == "core_attn",
+                        tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
                     )
                     # record_stream on the view marks the shared storage
                     # allocation, so this also covers base-storage offloads.
@@ -1157,10 +1148,7 @@ class ChunkOffloadHandler:
             if not self.tensor_need_offloading_checker(tensor):
                 continue
             storage = tensor.untyped_storage()
-            full_storage = (
-                self._get_offload_view_meta(tensor, preserve_layout=group._name == "core_attn")
-                is not None
-            )
+            full_storage = self._get_offload_view_meta(tensor) is not None
             num_bytes = storage.nbytes() if full_storage else tensor.numel() * tensor.element_size()
             group.update_offload_info(num_bytes)
             record = storage_records[(tensor.device, storage.data_ptr(), storage.nbytes())]
