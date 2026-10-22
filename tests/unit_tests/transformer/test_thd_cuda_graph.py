@@ -1537,9 +1537,10 @@ def _train_step(model, batch):
 class TestChunkGraphRegression:
     """Real chunk-graph capture and replay on a small packed-sequence GPT, checked against eager.
 
-    Guards the failure modes fixed during review: a captured kwarg missing at replay, the SP-scattered
-    padding mask reaching the post-process, the MTP-gated static inputs, and recompute or losses that
-    silently drift once graphs exist. Numerical comparisons: no dropout, no MoE routing randomness.
+    Guards the failure modes fixed during review: a captured kwarg missing at replay, the
+    SP-scattered padding mask reaching the post-process, the MTP-gated static inputs, and recompute
+    or losses that silently drift once graphs exist. Numerical comparisons: no dropout, no MoE
+    routing randomness.
     """
 
     @_REQUIRES_TWO_RANKS

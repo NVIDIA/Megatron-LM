@@ -2659,7 +2659,8 @@ def is_hybrid_ep_available():
 
 
 class TestChunkWiseCudaGraphs:
-    """Chunk-wise TE CUDA graphs (cuda_graph_impl='chunk_wise'): config validation, callable selection."""
+    """Chunk-wise TE CUDA graphs (cuda_graph_impl='chunk_wise'): config validation and callable
+    selection."""
 
     def test_chunk_config_accepts_full_recompute(self):
         cfg = _base_cuda_graph_config(

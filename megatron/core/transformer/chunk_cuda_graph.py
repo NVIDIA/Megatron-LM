@@ -171,14 +171,15 @@ class ChunkCudaGraphBlockMixin:
         )
 
     def _drop_cp_layout_kwargs(self, kwargs):
-        """Drop the per-layout packed metadata a hybrid stack receives next to ``packed_seq_params``.
+        """Drop the per-layout packed metadata (``packed_seq_params_by_layout``, ``cp_layout_plan``)
+        that a hybrid stack receives alongside ``packed_seq_params``.
 
         ``packed_seq_params_by_layout`` and ``cp_layout_plan`` only carry information when the
         stack converts between CP layouts across its layers (``ContextParallelLayoutManager.
         requires_conversion``); that conversion routes tokens with data-dependent split sizes and
         cannot be captured, so ``get_layer_static_inputs`` rejects such stacks. For a single layout
-        the dict holds the one ``packed_seq_params`` already passed and the plan is ``None``, and the
-        block rebuilds nothing from them.
+        the dict holds the one ``packed_seq_params`` already passed and the plan is ``None``, and
+        the block rebuilds nothing from them.
         """
         kwargs.pop('packed_seq_params_by_layout', None)
         plan = kwargs.pop('cp_layout_plan', None)
