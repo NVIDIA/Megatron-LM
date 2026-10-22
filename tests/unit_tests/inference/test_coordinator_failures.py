@@ -161,6 +161,65 @@ def test_send_to_client_reraises_other_errors(coordinator_runtime):
 
 
 @pytest.mark.asyncio
+async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coordinator_runtime):
+    runtime = coordinator_runtime
+    coordinator = runtime.coordinator
+    engine = _EnginePeer(runtime.address, b"removed-engine")
+    first_client, second_client = [_start_client(runtime) for _ in range(2)]
+    try:
+        await runtime.wait_for_engine(engine)
+        futures = [
+            first_client.add_request([1, 2], SamplingParams(num_tokens_to_generate=1)),
+            second_client.add_request([3, 4], SamplingParams(num_tokens_to_generate=1)),
+        ]
+        resolved = []
+        for future in futures:
+            future.add_done_callback(resolved.append)
+        server_request_ids = [engine.receive_request(), engine.receive_request()]
+        await _eventually(lambda: runtime.processed[Headers.SUBMIT_REQUEST] == 2, "not admitted")
+        assert set(coordinator.request_id_to_rank.values()) == {engine.identity}
+        assert coordinator._pending_counts.tolist() == [2]
+        coordinator.request_id_to_sampling_params[server_request_ids[0]]["streaming_interval"] = 0
+        engine.disconnect()
+        replies = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+        by_id = {reply["request_id"]: reply for reply in replies}
+        assert by_id[server_request_ids[0]]["sampling_params"] == SamplingParams().serialize()
+        assert by_id[server_request_ids[1]]["sampling_params"]["num_tokens_to_generate"] == 1
+        for reply in replies:
+            _assert_reply(reply)
+        assert {reply["request_id"] for reply in replies} == set(server_request_ids)
+        await _eventually(
+            lambda: engine.identity not in coordinator.identities_of_data_parallel_ranks,
+            "engine was not removed",
+        )
+        runtime.assert_requests_retired()
+        assert coordinator._pending_counts.size == 0
+        for server_request_id in server_request_ids:
+            engine.send_reply(server_request_id)
+        await _eventually(
+            lambda: runtime.processed[Headers.ENGINE_REPLY] == len(server_request_ids),
+            "late finals were not processed",
+        )
+        runtime.assert_healthy()
+        assert Counter(resolved) == Counter(futures)
+        # These real replies follow the already-observed late-handler completions.
+        engine.socket.send(b"")
+        await runtime.wait_for_engine(engine)
+        for client in (first_client, second_client):
+            barrier = client.add_request([9], SamplingParams(num_tokens_to_generate=1))
+            engine.send_reply(engine.receive_request())
+            _assert_reply(await asyncio.wait_for(barrier, 5.0), Status.COMPLETED)
+            assert not client.listener_task.done()
+        assert first_client.socket.replies == second_client.socket.replies == {0: 1, 1: 1}
+        runtime.assert_requests_retired()
+        assert coordinator._pending_counts.tolist() == [0]
+    finally:
+        first_client.stop()
+        second_client.stop()
+        engine.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["partial", "final"])
 async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_runtime, delivery):
     runtime = coordinator_runtime

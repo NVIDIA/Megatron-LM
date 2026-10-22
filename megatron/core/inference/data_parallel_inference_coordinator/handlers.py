@@ -194,6 +194,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
@@ -347,6 +348,7 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.request_id_to_sampling_params[request_id] = sampling_params
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
@@ -583,13 +585,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
                 sender_identity,
             )
             continue
-        client_identity, client_request_id = coordinator._forget_client_request(fid)
-        assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
-        if assigned_rank is not None:
-            idx = coordinator.identity_to_rank_index.get(assigned_rank)
-            if idx is not None:
-                assert coordinator._pending_counts[idx] >= 1
-                coordinator._pending_counts[idx] -= 1
+        client_identity, client_request_id, _ = coordinator._cleanup_request(fid)
         if coordinator.is_disaggregated_inference():
             coordinator.disaggregated_runtime.handle_decode_done(fid)
 
