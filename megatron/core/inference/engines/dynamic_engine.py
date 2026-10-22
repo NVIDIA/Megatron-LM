@@ -2809,6 +2809,70 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                 return
 
+    @staticmethod
+    def _find_step_stop_match(
+        generated_tokens: List[int],
+        step_tokens: List[int],
+        stop_word_ids: Optional[List[List[int]]],
+    ) -> Optional[Tuple[int, int]]:
+        """Find the earliest stop-sequence match ending in the current burst.
+
+        Args:
+            generated_tokens: Tokens retained before the current burst.
+            step_tokens: Untrimmed tokens produced by the current step.
+            stop_word_ids: Configured tokenized stop sequences.
+
+        Returns:
+            The zero-based position in ``step_tokens`` of the stop sequence's
+            final token and the matched sequence length, or ``None`` when no
+            stop sequence ends in this burst.
+        """
+        if not stop_word_ids or not step_tokens:
+            return None
+
+        max_stop_length = max((len(stop_tokens) for stop_tokens in stop_word_ids), default=0)
+        history_length = max(0, max_stop_length - 1)
+        history = generated_tokens[-history_length:] if history_length else []
+        previous_count = len(history)
+        candidate_tokens = history + step_tokens
+        for step_position in range(len(step_tokens)):
+            end = previous_count + step_position + 1
+            for stop_tokens in stop_word_ids:
+                stop_length = len(stop_tokens)
+                if stop_length > 0 and end >= stop_length:
+                    if candidate_tokens[end - stop_length : end] == stop_tokens:
+                        return step_position, stop_length
+        return None
+
+    @staticmethod
+    def _get_usable_speculative_proposal_count(
+        num_speculative_tokens: int,
+        accepted_token_count: int,
+        terminal_token_position: Optional[int],
+    ) -> int:
+        """Count proposal positions usable before a semantic terminal boundary.
+
+        A terminal accepted draft makes only proposals through that draft usable.
+        A replacement-token boundary still required verification of the entire
+        speculative group, as did a step with no terminal boundary.
+
+        Args:
+            num_speculative_tokens: Configured proposals per decode request.
+            accepted_token_count: Accepted draft prefix length for this request.
+            terminal_token_position: Earliest logical output-burst boundary, ``-1``
+                for a boundary before this burst, or ``None`` for no boundary.
+
+        Returns:
+            Number of leading proposal positions to include in acceptance metrics.
+        """
+        if terminal_token_position is None:
+            return num_speculative_tokens
+        if terminal_token_position < 0:
+            return 0
+        if terminal_token_position < accepted_token_count:
+            return min(num_speculative_tokens, terminal_token_position + 1)
+        return num_speculative_tokens
+
     def _process_request_outputs(
         self,
         request_ids: torch.Tensor,
@@ -2932,6 +2996,35 @@ class DynamicInferenceEngine(AbstractEngine):
             num_stop_word_prompt_score_trim = 0
             eos_mid_block_hit = False
             is_prefill = len(request.generated_tokens) == 0
+            semantic_terminal_position = None
+            accepted_token_count = len(accepted_tokens_list) - accepted_tokens_list.count(-1)
+            if self.num_speculative_tokens > 0 and not is_prefill:
+                boundaries = []
+                eos_position = self._find_mid_block_eos(request, tokens)
+                if eos_position is not None:
+                    boundaries.append(eos_position)
+                remaining = request.sampling_params.num_tokens_to_generate - len(
+                    request.generated_tokens
+                )
+                if remaining <= len(tokens):
+                    boundaries.append(max(-1, remaining - 1))
+                if request.stop_word_ids:
+                    # Only the longest stop's suffix is needed, including tokens
+                    # retained in older checkpoint segments.
+                    history_length = max(map(len, request.stop_word_ids)) - 1
+                    history = []
+                    for segment in reversed(self.requests[request_id].record.requests):
+                        take = min(history_length - len(history), len(segment.generated_tokens))
+                        if take > 0:
+                            history[:0] = segment.generated_tokens[-take:]
+                        if len(history) == history_length:
+                            break
+                    stop_match = self._find_step_stop_match(history, tokens, request.stop_word_ids)
+                    if stop_match is not None:
+                        boundaries.append(stop_match[0])
+                semantic_terminal_position = min(boundaries) if boundaries else None
+                if request_id in self.stop_word_being_finished_ids:
+                    semantic_terminal_position = -1
             if request_id != consumed_chunked_prefill_request_id:
                 tokens, request_log_probs, eos_mid_block_hit = self._truncate_at_mid_block_eos(
                     request, tokens, request_log_probs, top_n_logprobs, req_idx
@@ -3057,17 +3150,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip prefill requests: MTP heads only propose speculative tokens
                 # for decode requests, so counting prefill requests would inflate
                 # the denominator and artificially deflate the acceptance rate.
-                if (
-                    not is_prefill
-                    and len(request.generated_tokens) > 0
-                    and self.num_speculative_tokens > 0
-                ):
-                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
-                    accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
-                    self._spec_tokens_accepted_per_pos[:actual_proposed] += (
-                        accepted_t != -1
-                    ).long()
+                if not is_prefill and self.num_speculative_tokens > 0:
+                    actual_proposed = self._get_usable_speculative_proposal_count(
+                        self.num_speculative_tokens,
+                        accepted_token_count,
+                        semantic_terminal_position,
+                    )
+                    if actual_proposed > 0:
+                        self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
+                        accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
+                        self._spec_tokens_accepted_per_pos[:actual_proposed] += (
+                            accepted_t != -1
+                        ).long()
 
                 if (
                     stop_word_hit or eos_mid_block_hit
