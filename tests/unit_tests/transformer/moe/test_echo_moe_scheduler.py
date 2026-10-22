@@ -380,20 +380,28 @@ def test_moe_scheduler_builds_echo_planner_with_replica_dispatch(backend):
     assert scheduler.expert_dispatch.dispatcher_name == backend
 
 
-def test_moe_scheduler_builds_moonep_planner_with_replica_dispatch():
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_moe_scheduler_builds_moonep_planner_with_replica_dispatch(ep_size):
     class _Group:
         def size(self):
-            return 1
+            return ep_size
 
         def rank(self):
             return 0
 
     scheduler = MoEScheduler.from_config(
-        _scheduler_config(moe_scheduler_planner_type="moon_ep"), SimpleNamespace(ep=_Group())
+        _scheduler_config(
+            moe_scheduler_planner_type="moon_ep",
+            expert_model_parallel_size=ep_size,
+            num_moe_experts=ep_size * 2,
+            moe_scheduler_num_idle_experts=ep_size * 2,
+        ),
+        SimpleNamespace(ep=_Group()),
     )
 
     assert isinstance(scheduler.planner, MoonEPLoadPlanner)
-    assert scheduler.planner.num_redundant_experts == 4
+    # The config counts slots over the EP group; the planner takes per-rank slots.
+    assert scheduler.planner.num_redundant_experts == 2
     assert isinstance(scheduler.expert_dispatch, ReplicaExpertDispatch)
 
 
