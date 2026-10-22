@@ -1258,15 +1258,13 @@ class TestMcoreAdapterHybrid:
             [model],
         )
 
+        expert_inner = RowAtomic() if expert_strategy == "optim_grads_params" else Replicate()
+        expert_placements = (Replicate(), expert_inner) if expert_hsdp else (expert_inner,)
+
         for name, submodule in model.named_modules():
             if isinstance(submodule, FsdpModule):
                 is_expert = "experts" in name
-                inner = (
-                    RowAtomic()
-                    if is_expert and expert_strategy == "optim_grads_params"
-                    else Replicate()
-                )
-                expected = (inner,) if is_expert and not expert_hsdp else (Replicate(), inner)
+                expected = expert_placements if is_expert else (Replicate(), Replicate())
                 for group in submodule.parameter_groups:
                     assert group.model_weight.placements == expected, name
                     if is_expert and not expert_hsdp:
