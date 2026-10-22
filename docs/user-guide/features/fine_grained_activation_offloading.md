@@ -221,6 +221,14 @@ policy independently, preserving the preference for earlier forward groups:
 
 A 'OffloadTensorPool` (on CPU with pinned memory) caches allocated tensors by `(shape, dtype)`. This avoids repeated `cudaMallocHost` / `cudaFreeHost` calls and reduces D2H latency after the first iteration.
 
+Non-contiguous views covering at least half their storage are transferred as full storage and
+restored with their original shape, stride, and storage offset. Smaller views normally use a
+contiguous copy. The `core_attn` group always preserves non-contiguous views' original storage
+layout: packed Q/K/V views may each cover only one third of the storage, while fused attention
+backward still uses the packed layout recorded during forward. Transfer-size and duplicate-copy
+statistics include these full-storage copies. This does not rely on TE's own offload context or
+its `offload_base_tensor` annotations, which may be absent when MCore owns the offload hooks.
+
 ### CUDA Graph Support
 
 When offloading interacts with CUDA graphs:

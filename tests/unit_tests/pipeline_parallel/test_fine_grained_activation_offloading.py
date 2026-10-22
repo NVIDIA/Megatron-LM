@@ -428,21 +428,30 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
-def test_chunk_offload_handler_gathers_low_coverage_views():
+@pytest.mark.parametrize("preserve_layout", [False, True])
+def test_chunk_offload_handler_low_coverage_views(preserve_layout):
     handler = _make_chunk_handler_for_offload_reload()
 
     base = torch.randn(64, 96, device="cuda")
-    view = base[:, :8]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
+    view = base[:, 8:16]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
 
-    state = handler.offload(view)
+    state = handler.offload(view, preserve_layout=preserve_layout)
     _, cpu_backup, _, view_meta = state
-    # Low-coverage views fall back to the contiguous gather.
-    assert view_meta is None
-    assert cpu_backup.shape == view.shape
+    if preserve_layout:
+        # TE can require the original packed layout even for a small view.
+        assert view_meta == (view.size(), view.stride(), view.storage_offset())
+        assert cpu_backup.shape == (base.numel(),)
+    else:
+        assert view_meta is None
+        assert cpu_backup.shape == view.shape
 
     reloaded = handler.reload(state)
     torch.cuda.synchronize()
-    assert reloaded.is_contiguous()
+    if preserve_layout:
+        assert reloaded.stride() == view.stride()
+        assert reloaded.storage_offset() == view.storage_offset()
+    else:
+        assert reloaded.is_contiguous()
     assert torch.equal(reloaded, view)
 
 
@@ -455,6 +464,36 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
     handler.offload_groups = list(groups)
     handler._max_group_size = len(groups)
     return handler
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+@pytest.mark.parametrize("group_name", ["core_attn", "expert_fc1"])
+def test_packed_views_preserve_attention_layout_and_transfer_accounting(group_name):
+    packed = torch.randn(64, 4, 3, 16, device="cuda")
+    views = packed.unbind(dim=2)
+    group = OffloadTensorGroup(group_name)
+    for index, view in enumerate(views):
+        group.push_tensor((1, index), view)
+    chunk = _make_warmup_chunk([group])
+    chunk.bulk_offload_group(group)
+    torch.cuda.synchronize()
+
+    preserve_layout = group_name == "core_attn"
+    storage_bytes = packed.untyped_storage().nbytes()
+    assert group.total_offload_bytes == (3 if preserve_layout else 1) * storage_bytes
+    assert group.duplicate_storage_tensor_count == (2 if preserve_layout else 0)
+    assert group.duplicate_storage_bytes == (2 if preserve_layout else 0) * storage_bytes
+    for index, view in enumerate(views):
+        state = group._tensors[(1, index)]
+        assert (state[3] is not None) == preserve_layout
+        reloaded = chunk.reload(state)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(reloaded, view, rtol=0, atol=0)
+        if preserve_layout:
+            assert reloaded.stride() == view.stride()
+            assert reloaded.storage_offset() == view.storage_offset()
+        else:
+            assert reloaded.is_contiguous()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
@@ -661,9 +700,9 @@ def test_bulk_offload_group_does_not_flag_views_copying_their_own_bytes(caplog, 
     group = OffloadTensorGroup("core_attn")
     group.push_tensor((1, 0), base[:512])
     group.push_tensor((1, 1), base[512:])
-    # Low-coverage strided views are gathered, so they too copy only their own
-    # elements even though the gathered spans interleave in the storage.
-    other_group = OffloadTensorGroup("core_attn")
+    # Groups without a layout-sensitive backward gather low-coverage views,
+    # copying only their own elements even though the spans interleave.
+    other_group = OffloadTensorGroup("expert_fc1")
     other_group.push_tensor((2, 0), base[:, :8])
     other_group.push_tensor((2, 1), base[:, 8:16])
 
@@ -799,6 +838,18 @@ def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> 
             p.copy_(params[name].to(device=p.device, dtype=p.dtype))
 
 
+def _expected_unique_offload_bytes(manager, offload_modules):
+    # These GPT tests run one microbatch without pipeline parallelism. Copying
+    # multiple views' full storage increases PCIe traffic, but the source GPU
+    # allocation can only be freed once. Compare memory savings to unique bytes.
+    (chunk,) = manager._cached_chunks_forward
+    return sum(
+        group.total_offload_bytes - group.duplicate_storage_bytes
+        for group in chunk.offload_groups
+        if group.offload and group._name in offload_modules
+    )
+
+
 def _run_one_iter_and_capture(
     model: GPTModel,
     *,
@@ -845,6 +896,15 @@ def _run_one_iter_and_capture(
 @pytest.mark.parametrize("attention_backend", [AttnBackend.fused, AttnBackend.flash])
 def test_partial_offload_warmup_preserves_attention_output(monkeypatch, attention_backend):
     """Projection must not free the output retained by fused/FlashAttention backward."""
+    from transformer_engine.pytorch.attention.dot_product_attention import dot_product_attention
+
+    # TE caches backend selection across models; changing only the environment
+    # can otherwise make both parameters exercise the same cached backend.
+    monkeypatch.setattr(
+        dot_product_attention,
+        "_attention_backends",
+        dict(dot_product_attention._attention_backends, attention_params=None),
+    )
     for name in ("NVTE_FUSED_ATTN", "NVTE_FLASH_ATTN", "NVTE_UNFUSED_ATTN"):
         monkeypatch.delenv(name, raising=False)
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
@@ -877,6 +937,12 @@ def test_partial_offload_warmup_preserves_attention_output(monkeypatch, attentio
         expected_output, expected_grads, _ = _run_one_iter_and_capture(
             baseline, **inputs, enable_offload_reset=False
         )
+        backend_key = (
+            "use_fused_attention"
+            if attention_backend == AttnBackend.fused
+            else "use_flash_attention"
+        )
+        assert dot_product_attention._attention_backends[backend_key]
         del baseline
         model = _build_gpt_model(
             **model_args,
@@ -894,7 +960,13 @@ def test_partial_offload_warmup_preserves_attention_output(monkeypatch, attentio
             if expected_grad is None:
                 assert grads[name] is None
             else:
-                torch.testing.assert_close(grads[name], expected_grad, rtol=1e-3, atol=1e-3)
+                torch.testing.assert_close(
+                    grads[name],
+                    expected_grad,
+                    rtol=1e-3,
+                    atol=1e-3,
+                    msg=lambda msg, name=name: f"{name}: {msg}",
+                )
     finally:
         torch.cuda.synchronize()
         off_interface.reset_instance()
@@ -1026,9 +1098,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         )
 
         mgr = PipelineOffloadManager.get_instance()
-        expected_offload_bytes = int(
-            sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
-        )
+        expected_offload_bytes = _expected_unique_offload_bytes(mgr, offload_modules)
         expected_offload_mib = expected_offload_bytes / (1024**2)
 
         _reset_cuda_memory()
@@ -1299,9 +1369,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             )
 
             mgr = PipelineOffloadManager.get_instance()
-            expected_offload_bytes = int(
-                sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
-            )
+            expected_offload_bytes = _expected_unique_offload_bytes(mgr, offload_modules)
             expected_offload_mib = expected_offload_bytes / (1024**2)
 
             _reset_cuda_memory()
