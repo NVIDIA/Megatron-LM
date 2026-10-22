@@ -47,10 +47,10 @@ from megatron.core.transformer.hyper_connection import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
-from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
-from megatron.core.transformer.residual_recompute_plan import (
+from megatron.core.transformer.residual_recompute import (
     build_recompute_block_end_plan,
     build_recompute_layer_managers,
+    build_residual_stream_recompute_plan,
     finalize_recompute_block,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -60,7 +60,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     build_wide_residual_readout,
     expand_wide_residual_stream,
     wide_residual_recompute_enabled,

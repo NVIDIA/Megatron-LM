@@ -13,7 +13,7 @@ from megatron.core.transformer.residual_connection import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.transformer.wide_residual_policy import (
+from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
 )

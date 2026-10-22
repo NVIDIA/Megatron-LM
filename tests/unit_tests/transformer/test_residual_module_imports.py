@@ -15,9 +15,14 @@ import sys
 
 prefix = "megatron.core.transformer."
 first = (
-    ("transformer_layer", "wide_residual_layer")
+    ("transformer_layer", "wide_residual_layer", "residual_recompute_plan")
     if sys.argv[1] == "legacy-first"
-    else ("hyper_connection_transformer_layer", "wide_residual_transformer_layer", "wide_residual_policy")
+    else (
+        "hyper_connection_transformer_layer",
+        "wide_residual_transformer_layer",
+        "wide_residual",
+        "residual_recompute",
+    )
 )
 for name in first:
     importlib.import_module(prefix + name)
@@ -37,10 +42,13 @@ aliases = [
     ("wide_residual_layer", "_mark_retention_parameter", "wide_residual"),
     ("wide_residual_layer", "expand_wide_residual_stream", "wide_residual"),
     ("wide_residual_layer", "build_wide_residual_readout", "wide_residual"),
-    ("wide_residual_layer", "StreamwiseSigmoidWideResidualConnection", "wide_residual_policy"),
-    ("wide_residual_layer", "load_residual_state", "wide_residual_policy"),
-    ("wide_residual_layer", "wide_residual_recompute_enabled", "wide_residual_policy"),
+    ("wide_residual_layer", "StreamwiseSigmoidWideResidualConnection", "wide_residual"),
+    ("wide_residual_layer", "load_residual_state", "wide_residual"),
+    ("wide_residual_layer", "wide_residual_recompute_enabled", "wide_residual"),
     ("wide_residual_layer", "WideResidualTransformerLayer", "wide_residual_transformer_layer"),
+    ("residual_recompute_plan", "build_recompute_block_end_plan", "residual_recompute"),
+    ("residual_recompute_plan", "build_recompute_layer_managers", "residual_recompute"),
+    ("residual_recompute_plan", "finalize_recompute_block", "residual_recompute"),
 ]
 for old_name, symbol, new_name in aliases:
     old_path, new_path = prefix + old_name, prefix + new_name
@@ -56,7 +64,7 @@ for old_name, symbol, new_name in aliases:
 
 for symbol, new_name in (
     ("_MIN_CONTROLLER_NUMEL", "wide_residual"),
-    ("_RESIDUAL_STATE_PREFIXES", "wide_residual_policy"),
+    ("_RESIDUAL_STATE_PREFIXES", "wide_residual"),
 ):
     legacy = importlib.import_module(prefix + "wide_residual_layer")
     canonical_module = importlib.import_module(prefix + new_name)

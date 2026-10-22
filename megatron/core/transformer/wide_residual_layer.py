@@ -5,11 +5,17 @@
 
 from megatron.core.transformer.wide_residual import _MIN_CONTROLLER_NUMEL as _MIN_CONTROLLER_NUMEL
 from megatron.core.transformer.wide_residual import (
+    _RESIDUAL_STATE_PREFIXES as _RESIDUAL_STATE_PREFIXES,
+)
+from megatron.core.transformer.wide_residual import (
     LearnedWideResidualRetention as LearnedWideResidualRetention,
 )
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidMap as StreamwiseSigmoidMap
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidResidualReadout as StreamwiseSigmoidResidualReadout,
+)
+from megatron.core.transformer.wide_residual import (
+    StreamwiseSigmoidWideResidualConnection as StreamwiseSigmoidWideResidualConnection,
 )
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualRead as StreamwiseSigmoidWideResidualRead,
@@ -31,16 +37,8 @@ from megatron.core.transformer.wide_residual import (
 from megatron.core.transformer.wide_residual import (
     expand_wide_residual_stream as expand_wide_residual_stream,
 )
-from megatron.core.transformer.wide_residual_policy import (
-    _RESIDUAL_STATE_PREFIXES as _RESIDUAL_STATE_PREFIXES,
-)
-from megatron.core.transformer.wide_residual_policy import (
-    StreamwiseSigmoidWideResidualConnection as StreamwiseSigmoidWideResidualConnection,
-)
-from megatron.core.transformer.wide_residual_policy import (
-    load_residual_state as load_residual_state,
-)
-from megatron.core.transformer.wide_residual_policy import (
+from megatron.core.transformer.wide_residual import load_residual_state as load_residual_state
+from megatron.core.transformer.wide_residual import (
     wide_residual_recompute_enabled as wide_residual_recompute_enabled,
 )
 from megatron.core.transformer.wide_residual_transformer_layer import (
