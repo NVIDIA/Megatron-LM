@@ -24,6 +24,7 @@ Test groups
 - TestGTPDDPBucketAlignment  - GTP/regular DDP bucket ends padded for dist-opt alignment
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
+- TestGTPBufferReuse         - weight readiness and persistent eager wgrad ring reuse
 - TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and RS-input correctness
 - TestGTPCountZerosExcludesPadding - real distributed optimizer: count_zeros_fp32 must not
                                 count structural alignment-padding rows as zero gradient
@@ -47,6 +48,7 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
+import megatron.core.tensor_parallel.gtp_eager_wgrad as gtp_eager_wgrad
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1445,6 +1447,286 @@ class TestGTPDDPGradReadyWiring:
         _run_distributed(_worker_gtp_ddp_grad_ready_wiring, 4)
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestGTPBufferReuse:
+    """Weight readiness and persistent wgrad reuse across eager and graph scheduling."""
+
+    @pytest.fixture(scope="class")
+    def four_rank_gtp_group(self):
+        """Keep the exact four-shard oracle on both four- and eight-GPU nodes."""
+        if dist.get_world_size() not in (4, 8):
+            pytest.skip("buffer-reuse regressions require four or eight ranks")
+        groups = [
+            dist.new_group(list(range(start, start + 4)))
+            for start in range(0, dist.get_world_size(), 4)
+        ]
+        group = groups[dist.get_rank() // 4]
+        try:
+            yield group
+        finally:
+            torch.cuda.synchronize()
+            dist.barrier()
+            dist.destroy_process_group(group)
+
+    @pytest.mark.parametrize("fwd", [True, False], ids=["forward", "backward"])
+    @pytest.mark.parametrize("readiness", ["missing", "in_flight", "ready"])
+    def test_peek_returns_ready_current_data(
+        self, monkeypatch, four_rank_gtp_group, fwd, readiness
+    ):
+        """Every readiness path exposes current bytes before consume, with exactly one gather.
+
+        Two same-key cache buffers prevent a key-only lookup from identifying the actual AG output.
+        The first consume can replace its ticket; subsequent peeks must follow the actual gather.
+        """
+        check_states = True
+        cache = gtp_module.GTPWeightCache()
+        monkeypatch.setattr(gtp_module, "_GTP_CACHE", cache)
+        monkeypatch.setattr(gtp_module, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", check_states)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "weight_prefetch", True)
+        p = GTPShardedParam(torch.zeros(8, 16, dtype=torch.bfloat16, device="cuda"))
+        p.group = four_rank_gtp_group
+        p.chain_id = "GTP_remat_grouped_fc1_ungraphed"
+        held = [cache.reserve(p, p.dtype, fwd=fwd) for _ in range(2)]
+        buffers = [cache.get(ticket) for ticket in held]
+        for ticket in held:
+            cache.release(ticket)
+        assert buffers[0].data_ptr() != buffers[1].data_ptr()
+
+        calls = []
+        gather = p._all_gather_weight
+
+        def counted_gather(*args, **kwargs):
+            calls.append(kwargs["fwd"])
+            return gather(*args, **kwargs)
+
+        monkeypatch.setattr(p, "_all_gather_weight", counted_gather)
+        peek = p.peek_group_for_forward if fwd else p.peek_group_for_backward
+        consume = p.materialize_group_for_forward if fwd else p.materialize_group_for_backward
+        pointers = []
+        for step in range(3):
+            p.data.fill_(16 * step + dist.get_rank())
+            shards = [torch.empty_like(p.data) for _ in range(p.group.size())]
+            dist.all_gather(shards, p.data, group=p.group)
+            full = torch.cat(shards, dim=0)
+            expected = full[: full.shape[0] - p.pad_length] if p.pad_length else full
+            if readiness != "missing":
+                _, p._prefetch_handle = p._all_gather_weight(async_op=True, fwd=fwd)
+                assert p._prefetch_handle is not None
+                if check_states:
+                    assert p.state == gtp_module.GTPWeightState.ASYNC_WAIT
+            if readiness == "ready":
+                # An external drain (or another peek) has finished the gather's host-side work.
+                p._wait_param_gather()
+                p._already_ag_drained = True
+            initialized, previous, following = p.prefetch_initialized, p.prev_w, p.next_w
+            peeked = peek()
+            # Read immediately: a later consume must not supply the missing completion wait.
+            torch.testing.assert_close(peeked, expected, rtol=0, atol=0)
+            assert p._prefetch_handle is None and p._already_ag_drained
+            if check_states:
+                assert p.state == gtp_module.GTPWeightState.DATA_READY
+            assert (p.prefetch_initialized, p.prev_w, p.next_w) == (
+                initialized,
+                previous,
+                following,
+            )
+            # A second peek on a different stream still observes completion and issues no gather.
+            with torch.cuda.stream(torch.cuda.Stream()):
+                again = peek()
+                torch.testing.assert_close(again, expected, rtol=0, atol=0)
+            assert again.data_ptr() == peeked.data_ptr()
+            gathered = consume()
+            assert gathered.data_ptr() == peeked.data_ptr()
+            torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+            assert len(calls) == step + 1
+            assert p._prefetch_handle is None
+            assert not getattr(p, "_already_ag_drained", False)
+            pointers.append(peeked.data_ptr())
+        assert (
+            pointers[1] == pointers[2]
+        ), "the established deterministic schedule must reuse storage"
+
+    @pytest.mark.parametrize("eager_first", [True, False], ids=["eager-first", "graph-first"])
+    def test_eager_wgrad_preserves_graph_rings(self, monkeypatch, four_rank_gtp_group, eager_first):
+        """Eager allocation cannot suppress or rebuild graph rings, even after a reset."""
+        monkeypatch.setattr(gtp_eager_wgrad, "_EAGER_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "eager_wgrad_ring_size", 4)
+        weights = [gtp_module.GTPShardedParam(torch.zeros(3, 4, device="cuda")) for _ in range(5)]
+        for weight in weights:
+            weight.group = four_rank_gtp_group
+            weight.chain_id = gtp_module.GTPChain.GRAPHED.value
+            weight.pad_length = 2
+            weight.main_grad = torch.zeros_like(weight)
+        graphed, eager = weights[:4], weights[-1]
+        eager.chain_id = gtp_module.GTPChain.UNGRAPHED.value
+        # Frozen weights are registered too, but DDP does not create their main_grad.
+        frozen = gtp_module.GTPShardedParam(torch.zeros_like(eager), requires_grad=False)
+        frozen.group = eager.group
+        frozen.chain_id = eager.chain_id
+        for previous, current in zip(graphed, graphed[1:]):
+            previous.next_w, current.prev_w = current, previous
+        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", [*weights, frozen])
+
+        old_slots = []
+        for _ in range(2):
+            if eager_first:
+                eager_view = eager.get_wgrad_tensor(persistent=True)
+            gtp_module.initialize_graph_wgrad_rings()
+            if not eager_first:
+                eager_view = eager.get_wgrad_tensor(persistent=True)
+            assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
+            key, slots = next(iter(gtp_cuda_graphs._GRAPH_WGRAD_RINGS.items()))
+            assert len(slots) == 2
+            assert [slot.index for slot in slots] == [0, 1]
+            assert all(slot.key == key for slot in slots)
+            assert graphed[1]._gtp_graph_wgrad_ring_slot is slots[0]
+            assert graphed[2]._gtp_graph_wgrad_ring_slot is slots[1]
+            assert graphed[3]._gtp_graph_wgrad_ring_slot is slots[0]
+            assert len(gtp_eager_wgrad._EAGER_WGRAD_RINGS) == 1
+            assert not hasattr(frozen, "_gtp_eager_wgrad_ring_slot")
+            assert eager_view.shape == (10, 4)
+            eager_view.fill_(7)
+            for slot in slots:
+                slot.tensor.fill_(3)
+            torch.testing.assert_close(eager_view, torch.full_like(eager_view, 7))
+            assert len({slot.tensor.data_ptr() for slot in slots} | {eager_view.data_ptr()}) == 3
+            assert all(slot is not old for slot in slots for old in old_slots)
+            gtp_module.initialize_graph_wgrad_rings()
+            assert next(iter(gtp_cuda_graphs._GRAPH_WGRAD_RINGS.values())) is slots
+            assert eager.get_wgrad_tensor().data_ptr() == eager_view.data_ptr()
+            old_slots = [*slots, eager._gtp_eager_wgrad_ring_slot]
+            torch.cuda.synchronize()
+            gtp_module.reset_gtp_state()
+            assert not gtp_cuda_graphs._GRAPH_WGRAD_RINGS
+            assert not gtp_eager_wgrad._EAGER_WGRAD_RINGS
+            for weight in weights:
+                assert not hasattr(weight, "_gtp_graph_wgrad_ring_slot")
+                assert not hasattr(weight, "_gtp_eager_wgrad_ring_slot")
+
+    @pytest.mark.parametrize(
+        "async_reduction,ring_size",
+        [(False, 1), (True, 1), (True, 2), (True, 8)],
+        ids=["sync", "async-single-slot", "async-double-buffer", "async-excess-capacity"],
+    )
+    def test_persistent_wgrad_reuse_preserves_every_reduction(
+        self, monkeypatch, four_rank_gtp_group, async_reduction, ring_size
+    ):
+        """Full gradients, padding and exactly-once completion survive shared/repeated writers."""
+        group = four_rank_gtp_group
+        rank = dist.get_rank(group)
+        monkeypatch.setattr(gtp_eager_wgrad, "_EAGER_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_module, "_GTP_GROUPED_BUF_PARITY_COUNTER", {})
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "eager_wgrad_ring_size", ring_size)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", async_reduction)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "reduce_scatter_with_fp32_accumulation", False)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "calculate_per_token_loss", False)
+        # Both FC roles deliberately have the same shape; each has two independent experts.
+        layers = []
+        expected, completions = {}, {}
+        for layer in range(5):
+            roles = []
+            for role in ("fc1", "fc2"):
+                weights = [
+                    gtp_module.GTPShardedParam(
+                        torch.zeros(33, 16, dtype=torch.bfloat16, device="cuda")
+                    )
+                    for _ in range(2)
+                ]
+                for expert, weight in enumerate(weights):
+                    weight.group, weight.pad_length, weight.expert_idx = group, 2, expert
+                    weight.chain_id = f"GTP_remat_grouped_{role}_ungraphed"
+                    weight.is_routed_expert = True
+                    weight._debug_name = f"layers.{layer}.{role}.weight{expert}"
+                    weight.main_grad = torch.full_like(weight, 0.5)
+                    weight._double_buffer_parity()  # Normally assigned by the forward gathers.
+                    expected[id(weight)] = weight.main_grad.clone()
+                    completions[id(weight)] = 0
+
+                    def completed(weight=weight):
+                        completions[id(weight)] += 1
+
+                    weight.register_grad_accum_hook(None, completed)
+                weights[0].weight_list = weights
+                roles.append(weights)
+            layers.append(roles)
+        for previous, current in zip(layers, layers[1:]):
+            for prev_weights, weights in zip(previous, current):
+                prev_weights[0].next_w, weights[0].prev_w = weights[0], prev_weights[0]
+        monkeypatch.setattr(
+            gtp_module,
+            "_GTP_PARAMS",
+            [weight for layer in layers for weights in layer for weight in weights],
+        )
+
+        # Invalid depths must fail before binding storage; the same writers then recover.
+        for invalid_size in (0, -1):
+            monkeypatch.setattr(gtp_module.GTP_CONFIG, "eager_wgrad_ring_size", invalid_size)
+            with pytest.raises(ValueError, match="eager_wgrad_ring_size must be at least 1"):
+                layers[0][0][0].get_wgrad_tensor(persistent=True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "eager_wgrad_ring_size", ring_size)
+
+        pointers = {}
+        try:
+            # Repeating the tail before the cascade drains its first RS exercises early reuse.
+            for step in range(3):
+                for layer_index in (4, 4, 3, 2, 1, 0):
+                    for role_index in (1, 0):
+                        weights = layers[layer_index][role_index]
+                        if async_reduction:
+                            with torch.cuda.stream(
+                                gtp_module.get_rs_stream(weights[0].chain_id, group)
+                            ):
+                                torch.cuda._sleep(1_000_000)
+                        grads = []
+                        for weight in weights:
+                            if step == 1:
+                                # Skip acquisition so input preparation must finalize the old
+                                # reader before copying a foreign gradient into the shared slot.
+                                grad = torch.empty(
+                                    weight._unsharded_shape,
+                                    dtype=weight.main_grad.dtype,
+                                    device=weight.device,
+                                )
+                            else:
+                                grad = weight.get_wgrad_tensor(persistent=True)
+                                prior = pointers.setdefault(id(weight), grad.data_ptr())
+                                assert grad.data_ptr() == prior
+                            base = (
+                                torch.arange(130 * 16, device="cuda").view(130, 16) % 11 - 5
+                            ).float() / 4 + (step + layer_index + weight.expert_idx) / 8
+                            grad.copy_(base + rank / 4)
+                            mean = torch.nn.functional.pad(base + 3 / 8, (0, 0, 0, 2))
+                            expected[id(weight)].add_(mean.chunk(4)[rank])
+                            grads.append(grad)
+                        weights[0].finalize_group_grads(grads)
+                torch.cuda.synchronize()
+                for layer in layers:
+                    for weights in layer:
+                        for weight in weights:
+                            torch.testing.assert_close(
+                                weight.main_grad, expected[id(weight)], rtol=0, atol=0
+                            )
+                            assert not torch.count_nonzero(
+                                weight._gtp_eager_wgrad_ring_slot.tensor[130:]
+                            )
+                            calls_per_step = 2 if layer is layers[-1] else 1
+                            assert completions[id(weight)] == (step + 1) * calls_per_step
+                # Allocate only the configured depth (or the number of writers if smaller).
+                expected_slots = min(ring_size, len(layers)) * 2 * 2
+                assert len(set(pointers.values())) == expected_slots
+        finally:
+            torch.cuda.synchronize()
+            for layer in layers:
+                for weights in layer:
+                    weights[0]._wait_reduce_scatter(finalize_grad=True)
+
+
 class TestGTPGraphWgradRing:
     @staticmethod
     def _make_padded_chain(count=4):
@@ -1978,7 +2260,7 @@ def _worker_count_zeros_excludes_gtp_padding(rank, world_size, port):
         )
     finally:
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 class TestGTPCountZerosExcludesPadding:
@@ -2058,7 +2340,7 @@ def _worker_bias_is_replicated(rank, world_size, port, gtp_remat_size):
         )
     finally:
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 class TestGTPReplicatedBias:
@@ -2069,3 +2351,49 @@ class TestGTPReplicatedBias:
         biased at GTP_remat=2, with no error)."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_bias_is_replicated, 4, gtp_remat_size)
+
+
+_NO_CALCULATOR = object()
+
+
+class TestWgradAccumBatchScheduleGate:
+    """Pre-RS wgrad accumulation stays off when num_microbatches can change mid-run.
+
+    A rising consume count double-fires DDP grad-ready and drops that iteration's last
+    consume (see _is_last_expected_consume). CPU-only: the gate is decided at tagging time.
+    """
+
+    def _tag_output_layer(self, monkeypatch, schedule):
+        """Enabled flag for one output_layer param, under the calculator production builds."""
+        from types import SimpleNamespace
+
+        from megatron.core import num_microbatches_calculator as nmb
+
+        nmb.destroy_num_microbatches_calculator()
+        if schedule is not _NO_CALCULATOR:
+            nmb.init_num_microbatches_calculator(
+                rank=0,
+                global_batch_size=None if schedule else 32,
+                micro_batch_size=1,
+                data_parallel_size=1,
+                step_batch_size_schedule=schedule,
+            )
+        # The stub stands in for a GTPShardedParam; only the name drives the decision.
+        monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: True)
+        param = SimpleNamespace()
+        try:
+            gtp_module.tag_gtp_params_with_names(
+                SimpleNamespace(named_parameters=lambda: [("module.output_layer.weight", param)])
+            )
+        finally:
+            nmb.destroy_num_microbatches_calculator()
+        return param._wgrad_accum_enabled
+
+    @pytest.mark.parametrize(
+        "schedule, enabled",
+        # "THRESHOLD:BS THRESHOLD:BS ..." is what --step-batch-size-schedule takes.
+        [(None, True), ("0:16 1000:32", False), (_NO_CALCULATOR, True)],
+        ids=["fixed-batch", "step-schedule", "no-calculator"],
+    )
+    def test_gate(self, monkeypatch, schedule, enabled):
+        assert self._tag_output_layer(monkeypatch, schedule) is enabled

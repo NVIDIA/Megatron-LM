@@ -13,8 +13,10 @@ from torch.optim import SGD, Adam
 # FP8 recipe will be used to test precision-aware-optimizer.
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import (
@@ -38,6 +40,7 @@ from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -80,6 +83,17 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+class WideResidualRetentionOptimizerNet(nn.Module):
+    """Small parameter set covering retention and ordinary weight-decay routing."""
+
+    def __init__(self):
+        super().__init__()
+        self.retention = nn.Parameter(torch.ones(128))
+        self.retention.is_wide_residual_retention_parameter = True
+        self.ordinary_vector = nn.Parameter(torch.ones(6))
+        self.ordinary_matrix = nn.Parameter(torch.ones(6, 6))
 
 
 def test_copy_optimizer_param_metadata_preserves_allreduce():
@@ -177,6 +191,45 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
     assert wd_mults == {1.0, 0.0}
+
+
+@pytest.mark.parametrize("apply_wd_to_qk_layernorm", [False, True])
+def test_standard_overrides_apply_weight_decay_to_wide_residual_retention(
+    monkeypatch, apply_wd_to_qk_layernorm
+):
+    """Retention logits inherit ordinary WD despite being represented as 1-D parameters."""
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, **kwargs: output.__setitem__(0, value),
+    )
+    net = WideResidualRetentionOptimizerNet()
+    config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        weight_decay=0.1,
+        apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm,
+    )
+    overrides = get_standard_config_overrides(config)
+    check_config_overrides_consistency(config, overrides)
+    param_groups = _get_param_groups([net], config, overrides)
+
+    def group_for(parameter):
+        matches = [
+            group for group in param_groups if any(param is parameter for param in group['params'])
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    retention_group = group_for(net.retention)
+    vector_group = group_for(net.ordinary_vector)
+    matrix_group = group_for(net.ordinary_matrix)
+    assert retention_group['wd_mult'] == 1.0
+    assert vector_group['wd_mult'] == 0.0
+    assert matrix_group['wd_mult'] == 1.0
+    assert config.weight_decay * retention_group['wd_mult'] == pytest.approx(0.1)
+    assert config.weight_decay * vector_group['wd_mult'] == 0.0
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
@@ -1184,6 +1237,76 @@ def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_
         assert q_key not in state_dict
         assert kv_key not in state_dict
         torch.testing.assert_close(state_dict[fused_key], torch.cat([q_weight, kv_weight], dim=0))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state_dict():
+    """Fused-LN MLA keeps the input LayerNorm params on linear_qkv_down_proj at runtime while the
+    checkpoint keeps them fused on linear_qkv_down_proj.layer_norm_*; reloading main
+    params through a DDP-wrapped model must still match every parameter."""
+    if not is_te_min_version("1.10.0"):
+        pytest.skip("Requires TE >= 1.10.0")
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        transformer_config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            mla_down_proj_fusion=True,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            multi_latent_attention=True, mla_down_proj_fusion=True
+        )
+        layer = build_module(layer_spec, config=transformer_config, layer_number=1)
+        if not layer.submodules_config.sharded_state_dict_keys_map:
+            pytest.skip("Backend does not fuse the input LayerNorm into the MLA down-projection")
+        runtime_names = [name for name, _ in layer.named_parameters()]
+        assert any("linear_qkv_down_proj.layer_norm_" in name for name in runtime_names)
+
+        model = nn.Module()
+        model.decoder = nn.Module()
+        model.decoder.layers = nn.ModuleList([layer])
+        model = model.bfloat16().cuda()
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+        model = DistributedDataParallel(transformer_config, ddp_config, model)
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', bf16=True, use_distributed_optimizer=True
+        )
+        optim = get_megatron_optimizer(optimizer_config, [model])
+
+        # Checkpoint-style state dict: canonical keys from sharded_state_dict, all values 3.
+        sharded_state_dict = layer.sharded_state_dict(prefix="decoder.layers.0.")
+        state_dict = {
+            key: torch.full_like(sh_ten.data, 3.0)
+            for key, sh_ten in sharded_state_dict.items()
+            if isinstance(sh_ten, ShardedTensor)
+        }
+        assert any(
+            key.startswith("decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_")
+            for key in state_dict
+        )
+
+        optim.reload_model_params(state_dict)
+
+        for group in optim.param_groups:
+            for main_param in group['params']:
+                assert main_param.dtype == torch.float32
+                torch.testing.assert_close(
+                    main_param, torch.full_like(main_param, 3.0), atol=0, rtol=0
+                )
     finally:
         Utils.destroy_model_parallel()
 

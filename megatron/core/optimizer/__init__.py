@@ -101,19 +101,23 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
-    # First, figure out how we are going to do wd skipping. The two main approaches are:
-    #  1. The classic megatron approach of skipping all len 1 and bias parameters.
-    #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.
+    # Select the model-family convention for zero weight decay on vector-like parameters:
+    # the classic rule skips all 1-D parameters and biases, while the Qwen3-Next rule keeps
+    # weight decay on Q/K layernorm parameters. Wide-residual retention controllers intentionally
+    # follow the run's ordinary weight-decay policy rather than this generic vector exemption.
     if config.apply_wd_to_qk_layernorm:
         shape_1_not_qkln_param = ParamWithNamePredicate(
             name="s1_not_qkln",
             fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
-            and not ("q_layernorm." in name or "k_layernorm." in name),
+            and not ("q_layernorm." in name or "k_layernorm." in name)
+            and not getattr(param, "is_wide_residual_retention_parameter", False),
         )
         param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
     else:
         param_length_1_match = ParamPredicate(
-            name="param_len_1", fn=lambda param: len(param.shape) == 1
+            name="param_len_1_except_wide_residual_retention",
+            fn=lambda param: len(param.shape) == 1
+            and not getattr(param, "is_wide_residual_retention_parameter", False),
         )
         param_wd_mult_key = ParamKey(name="*.bias", predicate=param_length_1_match)
 
@@ -701,6 +705,11 @@ def _get_megatron_optimizer_based_on_param_groups(
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
     setattr(optimizer, 'expert_tp_group', expert_tp_group)
+    # The GTP axes this optimizer's params are sharded over. Taken from the collection rather
+    # than MPU because a MIMO module owns its axes through its own grid and leaves the MPU
+    # globals unset, where the duplicate filter would read rank 0 everywhere.
+    setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
+    setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
 
     return optimizer
 
@@ -926,6 +935,8 @@ def _get_megatron_emerging_optimizer(
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
             setattr(optimizer, 'expert_tp_group', expert_tp_group)
+            setattr(optimizer, 'gtp_group', getattr(pg_collection, 'gtp_remat', None))
+            setattr(optimizer, 'expert_gtp_group', getattr(pg_collection, 'expt_gtp_remat', None))
             results.append(optimizer)
             continue
         else:
@@ -1009,6 +1020,20 @@ def _get_megatron_emerging_optimizer(
     return ChainedOptimizer(results)
 
 
+def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> None:
+    """Release saved initializers after all local optimizer master weights are constructed.
+
+    Sharded optimizers only consume initializers for locally owned parameters. Sweep the
+    model as well so non-owned and frozen parameters do not retain their CPU copies.
+    """
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            getter_fn = getattr(param, 'get_high_precision_init_val', None)
+            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
+            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
+                clearer_fn()
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -1064,13 +1089,15 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
-        return _get_megatron_emerging_optimizer(
+        optimizer = _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
             config_overrides=config_overrides,
             pg_collection=pg_collection,
             param_group_process_group=param_group_process_group,
         )
+        _clear_high_precision_initializers(model_chunks)
+        return optimizer
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
@@ -1194,6 +1221,7 @@ def get_megatron_optimizer(
             optimizers.append(optimizer_part)
             model_chunk_offset += 1
 
+        _clear_high_precision_initializers(model_chunks)
         if len(optimizers) == 1:
             return optimizers[0]
 
@@ -1287,11 +1315,5 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    for model_chunk in model_chunks:
-        for param in model_chunk.parameters():
-            getter_fn = getattr(param, 'get_high_precision_init_val', None)
-            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
-            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
-                clearer_fn()
-
+    _clear_high_precision_initializers(model_chunks)
     return ChainedOptimizer(optimizers)

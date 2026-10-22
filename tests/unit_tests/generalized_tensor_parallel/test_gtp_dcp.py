@@ -66,6 +66,7 @@ from megatron.core.utils import (  # noqa: E402
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
     _requires_mxfp8,
     _torchrun_dist_init,
+    reset_gtp_globals,
 )
 
 
@@ -851,7 +852,7 @@ def _worker_gtp_sharded_tp_replicated_roundtrip(rank, world_size, ckpt_base):
         )
     finally:
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def _worker_helper_replicated_sink_rejects_gtp(rank, world_size, port):
@@ -936,7 +937,7 @@ def _worker_mamba_replicated_param_replica_ids(rank, world_size, port):
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     if rank == 0:
         bases = set(gathered[0])
@@ -1039,7 +1040,7 @@ def _worker_embedding_writer_election_gtp_inclusive_default(rank, world_size, po
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
     if rank == 0:
         by_offset = defaultdict(list)
@@ -1133,7 +1134,7 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel()
-    GTPShardedParam._chain_state = {}
+    GTPShardedParam._chain_state.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1256,7 +1257,7 @@ def _worker_gdp_inproj_gather_split(rank, world_size, port):
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def _worker_gdp_save_load_roundtrip(rank, world_size, ckpt_base):
@@ -1325,7 +1326,7 @@ def _worker_gdp_save_load_roundtrip(rank, world_size, ckpt_base):
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
@@ -1399,7 +1400,7 @@ def _worker_gdp_inproj_optim_param_map(rank, world_size, port):
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def _worker_save_load_roundtrip_needs_gtp_inclusive_group(rank, world_size, ckpt_base):
@@ -1545,7 +1546,7 @@ def _worker_cross_gtp_degree_save_load_roundtrip(rank, world_size, ckpt_base):
         torch.testing.assert_close(loaded["weight"].cpu(), expected.cpu(), rtol=0, atol=0)
     finally:
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckpt_base):
@@ -1730,7 +1731,7 @@ def _worker_restrict_shape_mismatch_to_explainable_padding(rank, world_size, ckp
         )
     finally:
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1818,7 +1819,7 @@ def _worker_save_without_gtp_load_with_gtp_remat(rank, world_size, ckpt_base):
         )
     finally:
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def _worker_save_with_gtp_load_without_gtp_aligned(rank, world_size, ckpt_base):
@@ -1870,7 +1871,7 @@ def _worker_save_with_gtp_load_without_gtp_aligned(rank, world_size, ckpt_base):
         )
     finally:
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_size, ckpt_base):
@@ -1938,7 +1939,7 @@ def _worker_save_with_gtp_padded_load_without_gtp_shape_mismatch(rank, world_siz
     finally:
         update_gtp_config(pad_for_alignment=orig_pad)
         ps.initialize_model_parallel()
-        GTPShardedParam._chain_state = {}
+        GTPShardedParam._chain_state.clear()
 
 
 @pytest.mark.run_only_on_devices_with_compute_capability(compute_capability=(10, 0))

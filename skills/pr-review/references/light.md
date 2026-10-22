@@ -27,6 +27,14 @@ this file → applicable style guidance → review).
     migration fallback
   - Prefer passing a `ProcessGroupCollection` or explicit
     `torch.distributed.ProcessGroup` from the caller
+- GPU kernel changes without a determinism test
+  - If the PR adds or changes a GPU kernel (Triton kernel,
+    `jit_fuser`/`torch.compile` function, CUDA extension, Transformer Engine
+    or external-library dispatch, or a scatter/index accumulation), check that
+    a bit-exact determinism test under
+    `tests/unit_tests/determinism/kernels/` is added or updated and that the
+    kernel is registered in `tests/unit_tests/determinism/kernels/manifest.py`
+    (see `docs/developer/determinism/testing.md`)
 
 ## Do NOT comment on
 
@@ -37,7 +45,7 @@ this file → applicable style guidance → review).
 
 These are the strict-review categories. Raising them here turns a fast sanity
 check into a design debate the author did not ask for; if they want that, they
-will run `/claude strict-review`.
+will run `/review mode=strict`.
 
 ## Completion
 

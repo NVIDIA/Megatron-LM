@@ -1,9 +1,12 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 
 import torch
 
 from megatron.core import config
 from megatron.core import utils as mcore_utils
+from tests.unit_tests.test_utilities import Utils
 
 # Message emitted by experimental_fn wrapper when EXPERIMENTAL flag is enabled.
 _LOG_MSG = "ENABLE_EXPERIMENTAL is True, running experimental code."
@@ -16,6 +19,8 @@ def _get_test_logger():
 
 def test_experimental_fn_logs_once(caplog):
     """Ensure the experimental_fn decorator writes the enable message only once."""
+    if Utils.world_size > 1:
+        Utils.initialize_distributed()
 
     # Enable experimental features for this test.
     config.set_experimental_flag(True)
@@ -57,6 +62,8 @@ def test_experimental_fn_logs_once(caplog):
 
 def test_experimental_cls_logs_once(caplog):
     """Ensure the experimental_cls decorator writes the enable message only once for classes."""
+    if Utils.world_size > 1:
+        Utils.initialize_distributed()
 
     config.set_experimental_flag(True)
 

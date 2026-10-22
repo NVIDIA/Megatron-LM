@@ -428,7 +428,7 @@ def test_start_param_sync_dp_size_1():
     """When dp_size == 1 (e.g., expt_dp_size == 1), start_param_sync should set
     param_gather_dispatched=True and return immediately without launching any
     all-gather collective."""
-    world_size = torch.distributed.get_world_size()
+    world_size = Utils.world_size
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
 
     ddp_config = DistributedDataParallelConfig(

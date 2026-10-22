@@ -8,7 +8,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -42,6 +45,7 @@ if HAVE_TE:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
     )
@@ -55,9 +59,10 @@ else:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
         fused_unpermute,
         te_general_gemm,
-    ) = (None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, False, None, None)
 
 
 def switch_load_balancing_loss_func(
@@ -130,6 +135,14 @@ def switch_load_balancing_loss_func(
         # padding_mask: [num_tokens], probs: [num_tokens, num_experts]
         mask_expanded = padding_mask.unsqueeze(-1)
         probs = probs * mask_expanded
+
+    # An entirely padded MTP depth can have no valid tokens across the reduction
+    # group. Its masked probabilities contribute zero loss; keep normalization
+    # finite so backward does not turn that zero contribution into NaNs.
+    if isinstance(total_num_tokens, torch.Tensor):
+        total_num_tokens = total_num_tokens.clamp(min=1)
+    else:
+        total_num_tokens = max(total_num_tokens, 1)
 
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
@@ -268,23 +281,35 @@ def get_capacity(
 
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
-    reduce_group: torch.distributed.ProcessGroup,
+    reduce_group: Union[torch.distributed.ProcessGroup, Tuple[torch.distributed.ProcessGroup, ...]],
     topk: int = None,
     with_padding_mask: bool = False,
 ) -> torch.Tensor:
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+
+    ``reduce_group`` accepts one group or an ordered tuple of orthogonal groups
+    (for example runtime CP followed by TP). The single-group positional API is preserved.
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
-    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-        local_tokens_per_expert, reduce_group
-    )
+    reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
+
+    # The reduction all-reduces contiguous tensors in place; reduce a copy so
+    # local_tokens_per_expert keeps this rank's counts for local_num_tokens below.
+    global_tokens_per_expert = local_tokens_per_expert.clone()
+    reduce_world_size = 1
+    for group in reduce_groups:
+        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            global_tokens_per_expert, group
+        )
+        reduce_world_size *= group.size()
+
     if with_padding_mask:
         local_num_tokens = local_tokens_per_expert.sum() // topk
         total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
         local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_group.size()
+        total_num_tokens = local_num_tokens * reduce_world_size
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
@@ -604,9 +629,6 @@ def unpermute(
     if torch.are_deterministic_algorithms_enabled():
         # Use index_add which is deterministic when deterministic algorithms are enabled
         # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
         # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
         # and is CUDA graph compatible unlike scatter_add
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
@@ -744,8 +766,10 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     Returns:
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
     """
-    # Transpose to [num_experts, num_tokens] for easier row-wise operations
-    routing_map = routing_map.transpose(0, 1)  # [num_experts, num_tokens]
+    # Work on a copy because fused router autograd saves the returned routing
+    # map for backward. Padding a transposed view in place would increment the
+    # saved tensor's version counter and make backward fail.
+    routing_map = routing_map.clone().transpose(0, 1)  # [num_experts, num_tokens]
 
     # Calculate how many tokens need to be padded for each expert
     num_ones = routing_map.sum(dim=1)
@@ -776,6 +800,7 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -804,6 +829,8 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices (e.g. for quantile balancing). Defaults to None.
+        topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
+                                               [num_tokens, topk]. Only used by the fused TE path.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -813,7 +840,8 @@ def topk_routing_with_score_function(
                   entries correspond to the top-k selected experts per token.
                 - routing_map (torch.Tensor): Shape [num_tokens, num_experts]. Boolean mask where
                   True indicates the token is routed to that expert (i.e. the expert was in the
-                  token's top-k selection).
+                  token's top-k selection). When topk_indices is provided, this is instead that
+                  [num_tokens, topk] dense index buffer.
             When dense_output=True:
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
@@ -844,6 +872,11 @@ def topk_routing_with_score_function(
             scaling_factor=scaling_factor,
             score_function=score_function,
             expert_bias=expert_bias,
+            **(
+                {"topk_indices": topk_indices}
+                if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None
+                else {}
+            ),
         )
 
     def _compute_topk(
@@ -1491,9 +1524,9 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
-    # TE's grouped-tensor and fused grouped-MLP kernels require 256-token alignment.
+    # TE's grouped-tensor and fused grouped-MLP kernels share an expert-token alignment.
     if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
-        return 256
+        return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:
@@ -1503,11 +1536,11 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
 
 
 def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
-    """Whether DeepEP fused permutation pads input for TE grouped-tensor GEMM."""
+    """Whether DeepEP v1/v2 fused permutation pads input for TE grouped-tensor GEMM."""
     return (
         config.moe_use_grouped_tensor
         and config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "deepep"
+        and config.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
         and config.moe_permute_fusion
         and fused_permute_and_pad_with_probs is not None
     )

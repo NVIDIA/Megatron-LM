@@ -44,6 +44,10 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
 
+When selective `residual_stream` replay is active, its shared checkpoint manager owns the
+connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
+replay-owned forward so that replay and offloading do not release the same activation.
+
 ### Tuning Parameters
 
 ```bash

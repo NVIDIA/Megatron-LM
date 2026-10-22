@@ -1,8 +1,7 @@
 ---
 name: mcore-testing
-description: Test system for Megatron-LM. Covers test layout, recipe YAML structure, adding and running unit and functional tests, golden values, marker filters, and CI parity.
+description: Test system for Megatron-LM. Covers test layout, recipe YAML structure, adding and running unit and functional tests, golden values, marker filters, and CI parity. Use when adding or running a unit or functional test; understanding the test layout; writing a recipe YAML; downloading or updating golden values; reproducing a test failure locally; 'how do I add a test', 'run unit tests', 'pytest fails', 'test layout', 'golden values', 'recipe YAML', 'marker filter'.
 license: Apache-2.0
-when_to_use: Adding or running a unit or functional test; understanding the test layout; writing a recipe YAML; downloading or updating golden values; reproducing a test failure locally; 'how do I add a test', 'run unit tests', 'pytest fails', 'test layout', 'golden values', 'recipe YAML', 'marker filter'.
 metadata:
   author: Oliver Koenig <okoenig@nvidia.com>
 ---
@@ -215,6 +214,8 @@ lack the `full` marker. Legacy files (no marker) are still compared at five
 decimals until they are regenerated from a CI run.
 
 ---
+
+Golden comparisons report absolute and relative errors; see [diagnostics](../../docs/developer/determinism/testing.md).
 
 ## Common Pitfalls
 

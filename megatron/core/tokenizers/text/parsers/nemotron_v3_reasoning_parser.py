@@ -12,8 +12,8 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
     in that case, if no content would otherwise be returned (either because
     `</think>` never closes, e.g. reasoning exceeded the max length, or because
     it closes with nothing following it), the reasoning text is returned as
-    content instead of being discarded, so callers always get a non-empty
-    response.
+    content instead of being discarded. Empty reasoning remains empty content
+    without a reasoning marker.
     """
 
     @staticmethod
@@ -55,7 +55,7 @@ class NemotronV3ReasoningParser(DeepSeekR1ReasoningParser):
         content, info = DeepSeekR1ReasoningParser.parse(text, **kwargs)
         if (
             content == ""
-            and info.get("reasoning")
+            and "reasoning" in info
             and NemotronV3ReasoningParser._should_force_content(kwargs.get("chat_template_kwargs"))
         ):
             return info["reasoning"], {}
