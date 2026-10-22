@@ -9,7 +9,7 @@ import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 from typing_extensions import override
@@ -775,7 +775,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         return found_inf_flag
 
     @torch.no_grad()
-    def prepare_grads(self) -> bool:
+    def prepare_grads(self, update_grad_scaler: bool = True) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
         timers = self.config.timers
 
@@ -804,7 +804,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
             # We are done with scaling gradients
             # so we can update the loss scale.
-            self.grad_scaler.update(found_inf_flag)
+            if update_grad_scaler:
+                self.grad_scaler.update(found_inf_flag)
 
             return found_inf_flag
 
@@ -1741,11 +1742,36 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def prepare_grads(self) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
-        found_inf_flag = False
-        for optimizer in self.chained_optimizers:
-            found_inf_flag |= optimizer.prepare_grads()
+        optimizers = list(self._get_leaf_optimizers())
+        scalers = dict.fromkeys(
+            optimizer.grad_scaler
+            for optimizer in optimizers
+            if isinstance(optimizer, MixedPrecisionOptimizer) and optimizer.grad_scaler is not None
+        )
+        # Backward uses the first optimizer's scale, including after checkpoint restore.
+        if scalers:
+            scaler_state = next(iter(scalers)).state_dict()
+            for scaler in list(scalers)[1:]:
+                scaler.load_state_dict(scaler_state)
 
+        found_inf_flag = False
+        for optimizer in optimizers:
+            if isinstance(optimizer, MixedPrecisionOptimizer):
+                found_inf_flag |= optimizer.prepare_grads(update_grad_scaler=False)
+            else:
+                found_inf_flag |= optimizer.prepare_grads()
+
+        # All gradients must be unscaled before any shared scaler is updated.
+        for scaler in scalers:
+            scaler.update(found_inf_flag)
         return found_inf_flag
+
+    def _get_leaf_optimizers(self) -> Iterator[MegatronOptimizer]:
+        for optimizer in self.chained_optimizers:
+            if isinstance(optimizer, ChainedOptimizer):
+                yield from optimizer._get_leaf_optimizers()
+            else:
+                yield optimizer
 
     def _step(self) -> bool:
         """Step all optimizers in this chain."""
