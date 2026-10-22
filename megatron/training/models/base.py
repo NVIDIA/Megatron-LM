@@ -159,11 +159,7 @@ class ModelConfig:
     """
 
     def finalize(self) -> None:
-        """Resolve nested transformer settings before deriving dependent run configs."""
-        transformer = getattr(self, "transformer", None)
-        finalize = getattr(transformer, "finalize", None)
-        if callable(finalize):
-            finalize()
+        """Finalize model-specific settings; the base implementation is a no-op."""
 
     def get_builder_cls(self) -> type:
         """Get the appropriate builder type for this config.

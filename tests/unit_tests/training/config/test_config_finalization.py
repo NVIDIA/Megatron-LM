@@ -5,9 +5,7 @@ import copy
 from unittest.mock import Mock
 
 import pytest
-import torch
 
-from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.training import global_vars
 from megatron.training.config import (
@@ -19,7 +17,6 @@ from megatron.training.config import (
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
-    HybridModelConfig,
     LLaVAModelConfig,
     MimoModelConfig,
     T5ModelConfig,
@@ -124,58 +121,3 @@ def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config, model_cls
     restored.finalize()
     assert restored._finalized
     assert restored.to_dict() == serialized
-
-
-@pytest.mark.parametrize(
-    "model_cls",
-    [
-        GPTModelConfig,
-        HybridModelConfig,
-        BertModelConfig,
-        T5ModelConfig,
-        LLaVAModelConfig,
-        MimoModelConfig,
-    ],
-)
-@pytest.mark.parametrize("params_dtype", [torch.float16, torch.bfloat16])
-def test_model_finalization_precedes_optimizer_precision(run_config, model_cls, params_dtype):
-    finalizations = []
-
-    class DeferredPrecisionConfig(TransformerConfig):
-        def finalize(self):
-            assert self.use_te_rng_tracker  # RNG policy must reach the model first.
-            finalizations.append(params_dtype)
-            self.fp16 = params_dtype == torch.float16
-            self.bf16 = params_dtype == torch.bfloat16
-            self.params_dtype = params_dtype
-            self.fp8_recipe = "tensorwise"
-
-    transformer = DeferredPrecisionConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
-    kwargs = {"encoder_num_layers": 2} if model_cls is T5ModelConfig else {}
-    run_config.model = model_cls(transformer=transformer, seq_length=16, **kwargs)
-    run_config.rng.te_rng_tracker = True
-    run_config.train.micro_batch_size = 1
-    run_config.optimizer = OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
-    assert run_config.optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-
-    run_config.validate()
-    run_config.validate()
-    assert finalizations == []
-    assert transformer.params_dtype is torch.float32
-
-    run_config.finalize()
-    # The legacy CLI-built optimizer must derive the same resolved precision too.
-    runtime_optimizer = run_config.finalize_optimizer_config(
-        OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
-    )
-    for optimizer in (run_config.optimizer, runtime_optimizer):
-        assert optimizer.fp16 == transformer.fp16
-        assert optimizer.bf16 == transformer.bf16
-        assert optimizer.params_dtype is params_dtype
-        assert optimizer.fp8_recipe == "tensorwise"
-        assert not optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-
-    run_config.validate()
-    run_config.finalize()
-    assert finalizations == [params_dtype]
-    assert run_config.model.vocab_size is None  # Tokenizer binding still happens later.

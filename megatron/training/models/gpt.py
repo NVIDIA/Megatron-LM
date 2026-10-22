@@ -220,7 +220,8 @@ class GPTModelConfig(ModelConfig):
     def finalize(self) -> None:
         """One time validation to run once config is ready to be used by builder."""
 
-        super().finalize()
+        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
+            self.transformer.finalize()
 
         if self.transformer.cuda_graph_impl != "none" and "transformer_engine" in (
             self.transformer.transformer_impl, self.transformer.cuda_graph_impl
