@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""SDSA decode must be batch invariant in eager mode and CUDA Graph replay."""
+"""DSA-GQA decode must be batch invariant in eager mode and CUDA Graph replay."""
 
 import pytest
 import torch

@@ -10,12 +10,25 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
+from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.common.embeddings import RotaryEmbedding
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_stack_spec,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import (
+    dsa_gqa_decode_kernel as decode_kernels,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGQACoreAttention,
@@ -42,6 +55,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     dsa_min_memory_gqa,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 class _DummyTPGroup:
@@ -1114,3 +1128,627 @@ def test_transformer_config_accepts_min_memory_sparse_forward_dense_loss():
 
         assert not config.dsa_fwd_use_dense_attn
         assert not config.dsa_indexer_use_sparse_loss
+
+
+def _dynamic_packed_seq_params(inference_context: DynamicInferenceContext) -> PackedSeqParams:
+    request_count = inference_context.get_active_request_count()
+    cu_seqlens_q, max_seqlen_q = inference_context.cu_query_lengths()
+    cu_seqlens_kv, _, max_seqlen_kv = inference_context.cu_kv_lengths()
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_q[: request_count + 1],
+        cu_seqlens_kv=cu_seqlens_kv[: request_count + 1],
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        total_tokens=inference_context.active_token_count,
+    )
+
+
+@pytest.mark.skipif(not decode_kernels.HAVE_CUTEDSL, reason="CuTeDSL is required")
+class TestDSGQADynamicInference:
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.fixture
+    def decode_compile_calls(self, monkeypatch):
+        for name in ("_COMPILED", "_OPERATORS", "_ATTENTION_COMPILED", "_ATTENTION_OPERATORS"):
+            monkeypatch.setattr(decode_kernels, name, {})
+
+        compile_calls = []
+        original_compile = decode_kernels.cute.compile
+
+        def count_compile(*args, **kwargs):
+            compile_calls.append(1)
+            return original_compile(*args, **kwargs)
+
+        monkeypatch.setattr(decode_kernels.cute, "compile", count_compile)
+        return compile_calls
+
+    @pytest.mark.parametrize("head_dim", [128, 192, 256])
+    def test_paged_decode_kernels_match_reference(self, head_dim):
+        torch.manual_seed(17)
+        device = torch.device("cuda", torch.cuda.current_device())
+        batch, pages_per_request, page_size, heads = 4, 3, 64, 4
+        lengths = torch.tensor([3, 63, 65, 137], dtype=torch.int32, device=device)
+        block_table = (
+            torch.randperm(batch * pages_per_request, device=device)
+            .reshape(batch, pages_per_request)
+            .to(torch.int32)
+        )
+        keys = torch.randn(
+            batch * pages_per_request, page_size, 1, head_dim, device=device, dtype=torch.bfloat16
+        )
+        values = torch.randn_like(keys)
+        index_q = torch.randn(batch, head_dim, device=device, dtype=torch.bfloat16)
+        scores = torch.empty(batch, 151, device=device, dtype=torch.float32)
+        decode_kernels.dsa_gqa_decode_indexer_score(
+            index_q, keys[:, :, 0], block_table, lengths, out=scores
+        )
+        expected_scores = torch.full_like(scores, -torch.inf)
+        for request, length in enumerate(lengths.tolist()):
+            positions = torch.arange(length, device=device)
+            k = keys[block_table[request, positions // page_size].long(), positions % page_size, 0]
+            expected_scores[request, :length] = k.float() @ index_q[request].float()
+        torch.testing.assert_close(scores, expected_scores, atol=2e-4, rtol=2e-4)
+
+        indices = scores.topk(16, dim=-1).indices.to(torch.int32)
+        # Attention must accept a query view with the pitched token stride produced by QKV.
+        q = torch.randn(batch, heads + 2, head_dim, device=device, dtype=torch.bfloat16)[:, :heads]
+        output = torch.empty(batch, heads, head_dim, device=device, dtype=torch.bfloat16)
+        scale = head_dim**-0.5
+        decode_kernels.dsa_gqa_decode_attention(
+            q, keys, values, block_table, indices, lengths, scale, out=output
+        )
+        expected = torch.empty_like(output)
+        for request, length in enumerate(lengths.tolist()):
+            selected = indices[request, : min(length, indices.size(1))].long()
+            pages = block_table[request, selected // page_size].long()
+            k = keys[pages, selected % page_size, 0]
+            v = values[pages, selected % page_size, 0]
+            probs = (q[request].float() @ k.float().T * scale).softmax(-1).to(torch.bfloat16)
+            expected[request] = (probs.float() @ v.float()).to(torch.bfloat16)
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+    @pytest.mark.parametrize("batch", [1, 3])
+    def test_decode_indexer_reuses_compilation_when_score_width_changes(
+        self, decode_compile_calls, batch
+    ):
+        torch.manual_seed(79)
+        device = torch.device("cuda", torch.cuda.current_device())
+        head_dim, page_size, pages_per_request = 192, 64, 3
+        num_pages = batch * pages_per_request
+        keys = torch.randn(num_pages, page_size, head_dim, device=device, dtype=torch.bfloat16)
+        query = torch.randn(batch, head_dim, device=device, dtype=torch.bfloat16)
+        table = (
+            torch.randperm(num_pages, device=device).view(batch, pages_per_request).to(torch.int32)
+        )
+        logical_keys = keys[table.long()].reshape(batch, -1, head_dim)
+
+        # Start at width one (ambiguous strides), cross tile/page boundaries, then
+        # shrink. Different request lengths also exercise writes to invalid slots.
+        for width in (1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 7):
+            lengths = torch.tensor(
+                [max(width - 2 * i, 0) for i in range(batch)], device=device, dtype=torch.int32
+            )
+            output = torch.full((batch, width), torch.nan, device=device, dtype=torch.float32)
+            decode_kernels.dsa_gqa_decode_indexer_score(query, keys, table, lengths, out=output)
+            expected = torch.einsum("bd,bkd->bk", query.float(), logical_keys[:, :width].float())
+            expected.masked_fill_(
+                torch.arange(width, device=device)[None, :] >= lengths[:, None], -torch.inf
+            )
+            torch.testing.assert_close(output, expected, atol=2e-4, rtol=2e-4)
+
+        assert len(decode_compile_calls) == 1
+        assert len(decode_kernels._COMPILED) == 1
+
+    def test_short_decode_reuses_both_kernels(self, monkeypatch, decode_compile_calls):
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa
+
+        decode_steps = 2
+        deepselect_calls = []
+        if dsa_gqa._deepselect_decode_supported(torch.device("cuda"), 512):
+            original_topk = dsa_gqa.deep_select.topk
+            original_score = decode_kernels.dsa_gqa_decode_indexer_score
+            score_buffers = []
+
+            def capture_score(*args, **kwargs):
+                score_buffers.append(kwargs["out"].data_ptr())
+                return original_score(*args, **kwargs)
+
+            def capture_topk(scores, *args, **kwargs):
+                # The production score kernel must already provide aligned rows.
+                assert scores.dtype == torch.float32
+                assert scores.data_ptr() == score_buffers[-1]
+                assert (
+                    scores.stride(0)
+                    * scores.element_size()
+                    % (dsa_gqa.deep_select.get_stride_requirement()[0])
+                    == 0
+                )
+                deepselect_calls.append(1)
+                return original_topk(scores, *args, **kwargs)
+
+            monkeypatch.setattr(decode_kernels, "dsa_gqa_decode_indexer_score", capture_score)
+            monkeypatch.setattr(dsa_gqa.deep_select, "topk", capture_topk)
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=4096,
+            num_attention_heads=32,
+            num_query_groups=1,
+            kv_channels=192,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_indexer_n_heads=1,
+            dsa_indexer_head_dim=192,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=0.1,
+        )
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                max_requests=1,
+                max_tokens=64,
+                block_size_tokens=64,
+                buffer_size_gb=0.05,
+                num_cuda_graphs=None,
+            ),
+        )
+        context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.tensor([1]),
+                sampling_params=SamplingParams(num_tokens_to_generate=decode_steps + 1),
+            )
+        )
+        context.initialize_attention_state()
+
+        attention = DSGroupedSelfAttention(
+            config=config,
+            submodules=dsa_stack_spec.submodules.attention_layer.submodules.self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).eval()
+
+        # One prefill, then two decodes to check compilation and score-buffer reuse.
+        for step in range(decode_steps + 1):
+            hidden = torch.randn(
+                context.padded_active_token_count, 1, 4096, device="cuda", dtype=torch.bfloat16
+            )
+            with torch.inference_mode(), InferenceMode.active():
+                attention(hidden_states=hidden, attention_mask=None, inference_context=context)
+            if step < decode_steps:
+                context.update_requests(
+                    active_requests_mask=torch.ones(1, dtype=torch.int32),
+                    new_tokens=torch.tensor([step + 2]),
+                )
+                context.initialize_attention_state()
+
+        assert len(decode_compile_calls) == 2
+        assert len(decode_kernels._COMPILED) == 1
+        assert len(decode_kernels._ATTENTION_COMPILED) == 1
+        if dsa_gqa._deepselect_decode_supported(torch.device("cuda"), 512):
+            assert len(deepselect_calls) == decode_steps
+
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("fused", [False, True])
+    def test_dynamic_query_rope_uses_token_positions_with_padding(self, packed, fused):
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=2, apply_rope_fusion=fused
+        )
+        device = torch.device("cuda", torch.cuda.current_device())
+        query = torch.randn(8, 1, 2, 64, device=device, dtype=torch.bfloat16)
+        # Two decodes followed by a three-token prefill and three padding tokens.
+        positions = torch.tensor([13, 9, 0, 1, 2, 0, 0, 0], device=device)
+        cu_lengths = torch.tensor([0, 1, 2, 5], device=device, dtype=torch.int32)
+        cp_group = parallel_state.get_context_parallel_group()
+        rope = RotaryEmbedding(64, rotary_percent=1.0, cp_group=cp_group)
+        frequencies = rope(16)
+        selected = frequencies[positions]
+        first, second = query.float().chunk(2, dim=-1)
+        expected = (
+            query.float() * selected.cos() + torch.cat((-second, first), dim=-1) * selected.sin()
+        ).to(torch.bfloat16)
+        context = SimpleNamespace(
+            padded_active_token_count=8, gpu_view=SimpleNamespace(token_to_pos_ids=positions)
+        )
+        actual = DynamicInferenceContext.apply_rotary_emb_query(
+            context,
+            query.squeeze(1) if packed else query,
+            frequencies,
+            config,
+            cu_lengths if packed else None,
+            cp_group,
+        )
+        torch.testing.assert_close(
+            actual, expected.squeeze(1) if packed else expected, atol=2e-2, rtol=2e-2
+        )
+
+    @pytest.mark.parametrize(
+        "prefill_backend,use_rope,provide_packed_metadata,index_topk",
+        [
+            ("reference", False, False, 8),
+            ("reference", False, True, 32),
+            ("reference", True, False, 32),
+            ("min-memory-triton", False, True, 8),
+            ("min-memory-triton", True, False, 8),
+            ("min-memory-triton", True, True, 32),
+        ],
+    )
+    def test_mixed_prefill_reuses_training_and_decode_uses_cute(
+        self, monkeypatch, prefill_backend, use_rope, provide_packed_metadata, index_topk
+    ):
+        dtype = torch.bfloat16
+        hidden_size = 4096
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden_size,
+            ffn_hidden_size=16384,
+            num_attention_heads=16,
+            num_query_groups=1,
+            kv_channels=256,
+            params_dtype=dtype,
+            bf16=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_kernel_backend=prefill_backend,
+            dsa_indexer_n_heads=1,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=index_topk,
+            dsa_indexer_loss_coeff=0.1,
+            tensor_model_parallel_size=1,
+            sequence_parallel=False,
+        )
+        inference_context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                max_requests=3,
+                max_tokens=64,
+                block_size_tokens=64,
+                buffer_size_gb=0.05,
+                unified_memory_level=0,
+                num_cuda_graphs=None,
+                use_flashinfer_fused_rope=False,
+            ),
+        )
+        token_offset = 0
+        for request_id, prompt_length in enumerate((13, 9)):
+            inference_context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=torch.arange(
+                        token_offset, token_offset + prompt_length, dtype=torch.long, device="cpu"
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=2),
+                )
+            )
+            token_offset += prompt_length
+        inference_context.initialize_attention_state()
+
+        attention = DSGroupedSelfAttention(
+            config=config,
+            submodules=dsa_stack_spec.submodules.attention_layer.submodules.self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        attention.eval()
+        rope = RotaryEmbedding(
+            config.kv_channels, rotary_percent=1.0, cp_group=attention.pg_collection.cp
+        )
+
+        def rotary(seq_len):
+            return rope(seq_len) if use_rope else None
+
+        def run_step() -> tuple[torch.Tensor, torch.Tensor]:
+            hidden_states = torch.randn(
+                inference_context.padded_active_token_count,
+                1,
+                hidden_size,
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+            )
+            with torch.inference_mode(), InferenceMode.active():
+                output, bias = attention(
+                    hidden_states=hidden_states,
+                    attention_mask=None,
+                    inference_context=inference_context,
+                    packed_seq_params=(
+                        _dynamic_packed_seq_params(inference_context)
+                        if provide_packed_metadata
+                        else None
+                    ),
+                    rotary_pos_emb=rotary(128),
+                )
+            assert bias is None
+            return output, hidden_states
+
+        prefill_output, prompt_hidden_states = run_step()
+        assert prefill_output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
+
+        inference_context.update_requests(
+            active_requests_mask=torch.ones(2, dtype=torch.int32),
+            new_tokens=torch.tensor([100, 101], dtype=torch.long),
+        )
+        inference_context.add_request(
+            DynamicInferenceRequest(
+                request_id=2,
+                prompt_tokens=torch.arange(
+                    token_offset, token_offset + 5, dtype=torch.long, device="cpu"
+                ),
+                sampling_params=SamplingParams(num_tokens_to_generate=2),
+            )
+        )
+        inference_context.initialize_attention_state()
+        assert inference_context.num_decode_requests == 2
+        assert inference_context.num_prefill_requests == 1
+
+        indexer_calls = []
+        attention_calls = []
+        original_indexer = decode_kernels.dsa_gqa_decode_indexer_score
+        original_attention = decode_kernels.dsa_gqa_decode_attention
+
+        def capture_indexer(*args, **kwargs):
+            indexer_calls.append(tuple(args[0].shape))
+            return original_indexer(*args, **kwargs)
+
+        def capture_attention(*args, **kwargs):
+            attention_calls.append((tuple(args[0].shape), tuple(args[4].shape)))
+            return original_attention(*args, **kwargs)
+
+        monkeypatch.setattr(decode_kernels, "dsa_gqa_decode_indexer_score", capture_indexer)
+        monkeypatch.setattr(decode_kernels, "dsa_gqa_decode_attention", capture_attention)
+        core_attention = attention.core_attention
+        training_forward = core_attention.forward
+        prefill_calls = []
+
+        def capture_prefill(*args, **kwargs):
+            prefill_calls.append(kwargs["query"].size(0))
+            return training_forward(*args, **kwargs)
+
+        monkeypatch.setattr(core_attention, "forward", capture_prefill)
+        mixed_output, mixed_hidden_states = run_step()
+
+        assert indexer_calls == [(2, 128)]
+        assert attention_calls == [((2, 16, 256), (2, index_topk))]
+        assert prefill_calls == [5]
+        assert mixed_output.shape == (inference_context.padded_active_token_count, 1, hidden_size)
+        assert mixed_output.dtype == dtype
+
+        monkeypatch.setattr(core_attention, "forward", training_forward)
+        prompt_start = 0
+        for request_idx, prompt_length in enumerate((13, 9)):
+            request_hidden_states = torch.cat(
+                (
+                    prompt_hidden_states[prompt_start : prompt_start + prompt_length],
+                    mixed_hidden_states[request_idx : request_idx + 1],
+                )
+            )
+            with torch.inference_mode():
+                training_output, bias = attention(
+                    hidden_states=request_hidden_states,
+                    attention_mask=None,
+                    rotary_pos_emb=rotary(request_hidden_states.size(0)),
+                )
+            assert bias is None
+            torch.testing.assert_close(
+                mixed_output[request_idx], training_output[-1], rtol=2e-2, atol=2e-2
+            )
+            prompt_start += prompt_length
+
+        # All three requests now decode, exercising cache reuse across a second step.
+        inference_context.update_requests(
+            active_requests_mask=torch.ones(3, dtype=torch.int32),
+            new_tokens=torch.tensor([102, 103, 104], dtype=torch.long),
+        )
+        inference_context.initialize_attention_state()
+        assert inference_context.num_decode_requests == 3
+        assert inference_context.num_prefill_requests == 0
+        monkeypatch.setattr(core_attention, "forward", capture_prefill)
+        prefill_calls.clear()
+        decode_output, decode_hidden_states = run_step()
+        assert prefill_calls == []
+        assert indexer_calls[-1] == (3, 128)
+        assert attention_calls[-1] == ((3, 16, 256), (3, index_topk))
+        monkeypatch.setattr(core_attention, "forward", training_forward)
+        histories = [
+            torch.cat((prompt_hidden_states[:13], mixed_hidden_states[:1])),
+            torch.cat((prompt_hidden_states[13:22], mixed_hidden_states[1:2])),
+            mixed_hidden_states[2:7],
+        ]
+        for request_idx, history in enumerate(histories):
+            full_prefix = torch.cat((history, decode_hidden_states[request_idx : request_idx + 1]))
+            with torch.inference_mode():
+                expected, _ = attention(
+                    hidden_states=full_prefix,
+                    attention_mask=None,
+                    rotary_pos_emb=rotary(full_prefix.size(0)),
+                )
+            torch.testing.assert_close(
+                decode_output[request_idx], expected[-1], rtol=2e-2, atol=2e-2
+            )
+
+    @pytest.mark.parametrize("backend", ["reference", "min-memory-triton"])
+    @pytest.mark.parametrize("topk", [8, 512])
+    @pytest.mark.parametrize(
+        "head_dim,index_head_dim,rotary_base,rotary_percent",
+        [(128, 128, 10000, 1.0), (192, 128, 500000, 0.5), (256, 64, 1000000, 0.5)],
+    )
+    def test_decode_logprobs_match_training(
+        self, monkeypatch, backend, topk, head_dim, index_head_dim, rotary_base, rotary_percent
+    ):
+        """The same weights and token histories give close full-vocabulary logprobs."""
+        torch.manual_seed(53)
+        vocab_size, decode_steps = 1024, 8
+        prompt_lengths = (31, 63, 513)
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=512,
+            ffn_hidden_size=1024,
+            num_attention_heads=4,
+            num_query_groups=1,
+            kv_channels=head_dim,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            is_hybrid_model=True,
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            dsa_kernel_backend=backend,
+            dsa_indexer_n_heads=1,
+            dsa_indexer_head_dim=index_head_dim,
+            dsa_indexer_topk=topk,
+            dsa_indexer_loss_coeff=0.1,
+        )
+        # Match the model-wide settings passed to the indexer by argument_utils.
+        config.rope_type = "rope"
+        config.rotary_base = rotary_base
+        config.rotary_percent = rotary_percent
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=dsa_stack_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=640,
+            hybrid_layer_pattern="*-*-",
+            position_embedding_type="rope",
+            rotary_base=rotary_base,
+            rotary_percent=rotary_percent,
+            parallel_output=False,
+        ).cuda()
+        tokens = [
+            torch.randint(vocab_size, (length + decode_steps + 1,), device="cuda")
+            for length in prompt_lengths
+        ]
+
+        # Exercise the actual training branch: gradients enabled, dropout disabled,
+        # indexer loss enabled, and no inference context. Causal attention lets one
+        # teacher-forced forward supply references for every later decode step.
+        model.train()
+        training_logprobs = []
+        with torch.enable_grad():
+            for sequence in tokens:
+                inputs = sequence[:-1].unsqueeze(0)
+                logits = model(
+                    input_ids=inputs,
+                    position_ids=torch.arange(inputs.size(1), device="cuda").unsqueeze(0),
+                    attention_mask=None,
+                    runtime_gather_output=True,
+                )
+                assert logits.requires_grad
+                training_logprobs.append(logits.detach().float().log_softmax(-1)[0])
+                del logits
+
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=640,
+                max_requests=3,
+                max_tokens=1024,
+                block_size_tokens=64,
+                buffer_size_gb=0.05,
+                unified_memory_level=0,
+                num_cuda_graphs=None,
+                materialize_only_last_token_logits=True,
+                use_flashinfer_fused_rope=False,
+            ),
+        )
+        for request_id, length in enumerate(prompt_lengths):
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=tokens[request_id][:length].cpu(),
+                    sampling_params=SamplingParams(num_tokens_to_generate=decode_steps + 1),
+                )
+            )
+
+        decode_calls = []
+        original_decode = decode_kernels.dsa_gqa_decode_attention
+
+        def capture_decode(*args, **kwargs):
+            decode_calls.append(1)
+            return original_decode(*args, **kwargs)
+
+        monkeypatch.setattr(decode_kernels, "dsa_gqa_decode_attention", capture_decode)
+        model.eval()
+        errors = []
+        with torch.inference_mode(), InferenceMode.active():
+            for step in range(decode_steps + 1):
+                context.initialize_attention_state()
+                input_ids, position_ids = context.current_input_and_position_ids()
+                # Allocating a new KV page can reorder active requests. Align both
+                # references and teacher-forced tokens with the current request IDs.
+                assert context.paused_request_count == 0
+                request_ids = context.request_ids[: context.total_request_count].tolist()
+                if step:
+                    expected_positions = torch.tensor(
+                        [prompt_lengths[request_id] - 1 + step for request_id in request_ids],
+                        device="cuda",
+                    )
+                    expected_inputs = torch.stack(
+                        [
+                            tokens[request_id][prompt_lengths[request_id] - 1 + step]
+                            for request_id in request_ids
+                        ]
+                    )
+                    torch.testing.assert_close(position_ids[0], expected_positions)
+                    torch.testing.assert_close(input_ids[0], expected_inputs)
+                logits = model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=None,
+                    inference_context=context,
+                    runtime_gather_output=True,
+                )
+                assert logits.shape == (1, len(prompt_lengths), vocab_size)
+                actual = logits[0].float().log_softmax(-1)
+                expected = torch.stack(
+                    [
+                        training_logprobs[request_id][prompt_lengths[request_id] - 1 + step]
+                        for request_id in request_ids
+                    ]
+                )
+                # Check every request and vocabulary token at every step. An absolute
+                # tolerance of 0.01 nats allows about 1% probability error per element.
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    rtol=0,
+                    atol=1e-2,
+                    msg=lambda message: f"Step {step}, request IDs {request_ids}:\n{message}",
+                )
+                delta = (actual - expected).abs()
+                errors.append(delta)
+                if step < decode_steps:
+                    # Feed the training tokens, so sampling cannot change the histories.
+                    targets = torch.stack(
+                        [
+                            tokens[request_id][prompt_lengths[request_id] + step]
+                            for request_id in request_ids
+                        ]
+                    )
+                    context.update_requests(
+                        active_requests_mask=torch.ones(len(tokens), dtype=torch.int32),
+                        new_tokens=targets.cpu(),
+                    )
+
+        assert len(decode_calls) == 2 * decode_steps
+        # Keep the aggregate error budget in addition to the elementwise checks above.
+        mean_abs_error = torch.stack(errors).mean().item()
+        assert mean_abs_error <= 2e-3, f"Mean logprob error: {mean_abs_error} nats"
