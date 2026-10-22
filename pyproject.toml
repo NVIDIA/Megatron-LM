@@ -105,7 +105,7 @@ dev = [
     "nemo-lens",
     "megatron-energon[av_decode]~=7.0",
     "av",
-    "Pillow",
+    "Pillow>=13.0.0",
     "flashinfer-python>=0.5.0,<0.7.0",
     "nvidia-cudnn-frontend[cutedsl]==1.29.1",
     "wget",
