@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""BF16 CuTeDSL paged decode kernels for simplified DSA/NVSA.
+"""BF16 CuTeDSL paged decode kernels for DSA-GQA with a simplified indexer.
 
 The kernel computes one FP32 score row per decode request. The indexer head
 dimension is specialized as a ``cutlass.Constexpr``. K is read directly from
