@@ -44,6 +44,10 @@ DENSE_CASES = [
         prompt_length=273,
         warm_prefix=True,
     ),
+    Case(
+        "sink",
+        model={"window_size": (8, 0), "window_attn_skip_freq": 1, "softmax_type": "off-by-one"},
+    ),
     Case("decode-graph", context={"num_cuda_graphs": 4, "max_tokens": 128}),
     Case(
         "decode-graph-linear",

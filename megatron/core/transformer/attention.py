@@ -1151,6 +1151,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    return_lse=need_lse,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1298,6 +1299,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        return_lse=need_lse,
                         **softcap_kwargs,
                     )
                     if need_lse:

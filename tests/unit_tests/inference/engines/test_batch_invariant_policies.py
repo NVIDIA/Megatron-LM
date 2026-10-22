@@ -10,7 +10,7 @@ from tests.unit_tests.inference.engines import batch_invariant_test_utils as f
 REF_ZERO = PrefixCachingEvictionPolicy.REF_ZERO
 
 
-@pytest.mark.parametrize("policy", ["exp", "bounded", "all-prefill", "ref-zero"])
+@pytest.mark.parametrize("policy", ["exp", "bounded", "all-prefill", "ref-zero", "learnable"])
 def test_batch_invariant_policy(policy, monkeypatch):
     options, all_prefill = {}, policy == "all-prefill"
     if policy in ("exp", "bounded", "all-prefill"):
