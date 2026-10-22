@@ -4182,6 +4182,12 @@ class TransformerConfig(ModelParallelConfig):
                 "Batch invariant mode supports BF16 model parameters only; "
                 f"got {self.params_dtype}."
             )
+            # Current tensorwise scaling uses an activation amax across batch
+            # rows, so neighbors change quantized target values before GEMM.
+            assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.tensorwise), (
+                "Batch invariant mode does not support tensorwise FP8: current "
+                "activation scaling depends on neighboring batch rows."
+            )
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention (--attention-backend flash)"
