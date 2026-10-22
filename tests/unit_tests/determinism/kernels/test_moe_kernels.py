@@ -8,7 +8,7 @@ and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-
 the router gating GEMM, and virtual-expert planning against a CPU oracle in eager and CUDA
 graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
-the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
+the all-gather and all-to-all dispatchers (plus the flex/DeepEP and NCCL-EP dispatchers from
 ``fused_a2a.py`` when the dependency and the GPUs are available).
 """
 
@@ -56,14 +56,14 @@ from tests.unit_tests.determinism.kernels.harness import (
     deterministic_algorithms,
     seeded,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
-from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
+from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2, nccl_ep_finalize
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
 
@@ -824,6 +824,10 @@ class _InQuantizationContext(torch.nn.Module):
 
 class TestMoEModules:
     def teardown_method(self, method):
+        # NCCL-EP borrows its communicator from the model-parallel process group.
+        # Finalize it before destroying that group, including after a failed replay.
+        if getattr(self, "_uses_nccl_ep", False):
+            nccl_ep_finalize()
         Utils.destroy_model_parallel()
 
     def _init(self, ep=1):
@@ -1327,11 +1331,21 @@ class TestMoEModules:
                 id="flex-deepepv2-ep2",
                 marks=pytest.mark.skipif(not HAVE_DEEP_EP_V2, reason="DeepEP v2 not installed"),
             ),
+            pytest.param(
+                "flex",
+                2,
+                {"moe_flex_dispatcher_backend": "ncclep"},
+                id="flex-ncclep-ep2",
+                marks=pytest.mark.skipif(
+                    not is_nccl_ep_available(), reason="Compatible TE NCCL-EP API not available"
+                ),
+            ),
         ],
     )
     def test_moe_layer_replays(self, dispatcher, ep, extra):
         if Utils.world_size % ep != 0 or (ep > 1 and Utils.world_size < ep):
             pytest.skip(f"needs a world size divisible by EP={ep}")
+        self._uses_nccl_ep = extra.get("moe_flex_dispatcher_backend") == "ncclep"
         self._init(ep=ep)
         seeded()
         config = _moe_config(
