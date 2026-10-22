@@ -123,10 +123,6 @@ COPY megatron/rl/__init__.py /workspace/megatron/rl/
 ARG IMAGE_TYPE=dev
 ENV IMAGE_TYPE=${IMAGE_TYPE}
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
-# cuDNN Frontend is replaced after the sync below with this ref of NVIDIA/cudnn-frontend
-# (feat/1.29.0-megatron). Docker-only: outside pyproject.toml and uv.lock. Set empty to keep the
-# locked PyPI wheel. Skipped for the LTS image.
-ARG CUDNN_FRONTEND_GIT_REF=8924d4b41fd678ba1b98cd7f98bb78b222637573
 # Preserve Ampere support unless a caller selects narrower TE build targets.
 ARG NVTE_CUDA_ARCHS="80;90;100"
 # TE compiles each source's GPU targets one after another by default (nvcc --threads 1), so
@@ -214,11 +210,6 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     cp /workspace/mamba-cxx20.patch /opt/mamba-build-info/
     rm -rf "${MAMBA_BUILD_DIR}"
     trap - EXIT
-
-    if [ -n "$CUDNN_FRONTEND_GIT_REF" ] && [ "$IMAGE_TYPE" != "lts" ]; then
-        uv pip install --no-deps --reinstall \
-            "nvidia-cudnn-frontend @ git+https://github.com/NVIDIA/cudnn-frontend.git@${CUDNN_FRONTEND_GIT_REF}"
-    fi
 EOF
 
 # Reuse the wheel without copying a second archive into the final image.

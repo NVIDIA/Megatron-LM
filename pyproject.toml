@@ -33,6 +33,9 @@ include = [
     "megatron.training.*",
 ]
 
+[tool.setuptools.package-data]
+"megatron.core.allocator" = ["csrc/*.cpp"]
+
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
 readme = { file = "README.md", content-type = "text/markdown" }
@@ -122,7 +125,7 @@ dev = [
     "av",
     "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.29.0",
+    "nvidia-cudnn-frontend[cutedsl]==1.29.1",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
