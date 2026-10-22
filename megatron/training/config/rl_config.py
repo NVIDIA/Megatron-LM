@@ -306,28 +306,29 @@ class RLConfig:
                 "micro batch increase the sequence length."
             )
 
-        if global_batch_size is None:
-            raise ValueError("global_batch_size must be resolved before validating the RL run.")
-        # Ensure that the number of samples we collect is a multiple of the global batch size.
-        samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
-        if samples_per_inference_iteration % global_batch_size != 0:
-            raise ValueError(
-                "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
-                "global_batch_size"
-            )
-        # For now only exit/checkpoint on iterations where we generate data. We don't currently
-        # have a way to checkpoint the generated data.
-        iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
-        if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
-            raise ValueError(
-                "exit_interval should be divisible by number of global batches per inference "
-                "iteration."
-            )
-        if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
-            raise ValueError(
-                "save_interval should be divisible by number of global batches per inference "
-                "iteration."
-            )
+        # A native config can leave this default unresolved during user validation.
+        # Framework finalization repeats these checks with the resolved batch size.
+        if global_batch_size is not None:
+            # Ensure that collected samples are a multiple of the global batch size.
+            samples_per_inference_iteration = self.grpo_samples_per_iteration * self.grpo_iterations
+            if samples_per_inference_iteration % global_batch_size != 0:
+                raise ValueError(
+                    "grpo_group_size * grpo_prompts_per_step * grpo_iterations should be divisible by "
+                    "global_batch_size"
+                )
+            # Only exit/checkpoint on iterations where we generate data: generated
+            # data cannot currently be checkpointed.
+            iterations_per_inference_iteration = samples_per_inference_iteration // global_batch_size
+            if exit_interval is not None and exit_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "exit_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
+            if save_interval is not None and save_interval % iterations_per_inference_iteration != 0:
+                raise ValueError(
+                    "save_interval should be divisible by number of global batches per inference "
+                    "iteration."
+                )
 
         # In inference-only mode the optimizer is created only when it is loaded.
         if skip_train and not load_optim and self.rl_offload_optimizer_during_inference:
