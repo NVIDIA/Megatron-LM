@@ -542,8 +542,12 @@ class OptimizerConfig:
             )
 
         if self.overlap_param_gather:
+            # finalize_optimizer_config() may already have turned use_distributed_optimizer into
+            # use_layer_wise_distributed_optimizer (muon / dist_muon), which shares the same
+            # param-gather overlap, so accept either form.
             assert (
                 self.use_distributed_optimizer
+                or self.use_layer_wise_distributed_optimizer
                 or ddp_config.use_megatron_fsdp
                 or self.optimizer == 'dist_muon'
             ), (
