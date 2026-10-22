@@ -233,7 +233,7 @@ def _worker_gtp_blockwise(rank, world_size, port):
 def _worker_padded_distributed_parity(
     rank, world_size, port, tp_size, gtp_remat_size, logical_m, partition_dim, padding_value
 ):
-    """Bad padded momentum must not affect distributed NS or its shape-based scaling."""
+    """Reject bad padded momentum on every NS participant without changing the input."""
     _init_model_parallel(tp_size, gtp_remat_size)
     try:
         pgc = ProcessGroupCollection.use_mpu_process_groups()
@@ -283,12 +283,28 @@ def _worker_padded_distributed_parity(
         momentum = local.clone()
         logical_rows = logical_m // ts if partition_dim == 0 else logical_m
         local_valid_rows = min(shard_rows, max(0, logical_rows - gr * shard_rows))
-        momentum[local_valid_rows:].fill_(padding_value)
+        # Poison only one rank so clean GTP/TP peers must learn about its failure.
+        if rank == world_size - 1:
+            momentum[local_valid_rows:].fill_(padding_value)
+        original_momentum = momentum.clone()
+
+        if padding_value != 0:
+
+            def unexpected_ns(*args, **kwargs):
+                raise AssertionError("Bad padding reached a momentum gather or Newton-Schulz")
+
+            opt.scaled_orthogonalize_fn = unexpected_ns
+            opt._all_gather_tensor = unexpected_ns
+            with pytest.raises(
+                ValueError, match="Nonzero padding in distributed GTP Muon momentum"
+            ):
+                opt.scaled_orthogonalize_fn_with_gtp_remat(local, momentum, pgc.tp, partition_dim)
+            torch.testing.assert_close(momentum, original_momentum, atol=0, rtol=0, equal_nan=True)
+            return
 
         out = opt.scaled_orthogonalize_fn_with_gtp_remat(local, momentum, pgc.tp, partition_dim)
         torch.testing.assert_close(out, expected, atol=_ATOL, rtol=_RTOL)
-        # Valid momentum is unchanged and all padding is restored to exact zero.
-        torch.testing.assert_close(momentum, local, atol=0, rtol=0)
+        torch.testing.assert_close(momentum, original_momentum, atol=0, rtol=0)
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
@@ -325,6 +341,7 @@ class TestGTPMuonDistributedNS:
         [
             pytest.param(0.0, id="zero"),
             pytest.param(7.0, id="nonzero"),
+            pytest.param(1e-30, id="tiny-nonzero"),
             pytest.param(float("nan"), id="nan"),
             pytest.param(float("inf"), id="positive-inf"),
             pytest.param(float("-inf"), id="negative-inf"),

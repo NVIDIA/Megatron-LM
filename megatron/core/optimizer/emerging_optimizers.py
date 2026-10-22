@@ -413,8 +413,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         GTP_remat may pad dim 0 for alignment (see gtp_remat_shard_dim0). blockwise and
         duplicated strip the padding before calling scaled_orthogonalize_fn and restore it
         after, since every rank holds a uniform, fully-reconstructed tensor by then.
-        distributed zeros the local momentum's padded rows before its collectives and
-        applies Muon's scale factor using the unpadded logical matrix shape.
+        distributed requires the padded momentum rows to be zero and applies Muon's
+        scale factor using the unpadded logical matrix shape.
 
         ``qkv_split_shapes`` (when set) runs Newton-Schulz on q, k and v separately. The
         split needs the whole matrix, so under GTP it is available on the duplicated path
@@ -545,6 +545,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # QKV splitting has already fallen back to this unsplit fused layout above, so
         # pad_length describes grad's full dim-0 layout here. Keep the physical rows for
         # the collective, but exclude them from Muon's shape-based scale.
+        needs_two_step_communication = (
+            partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
+        )
         scale_shape = None
         if pad_length:
             if grad.shape != p.shape:
@@ -552,28 +555,37 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     "Distributed GTP Muon padding requires the momentum and parameter "
                     f"layouts to match, got grad={tuple(grad.shape)} and p={tuple(p.shape)}"
                 )
-            # Stale padded momentum must not enter NS normalization or its Gram all-reduce.
-            # Zero it before either TP/GTP collective, including fully padded shards. The
-            # bounds use only metadata; no tensor-value checks or host synchronization.
+            # Validate every rank's padding, including fully padded shards. Propagate a
+            # failure over both sharding axes so all NS participants raise before any
+            # momentum gather, normalization, or Gram all-reduce.
             shard_rows = grad.size(0)
             ranks_from_end = gtp_remat_size - 1 - gtp_rank
             local_pad_length = min(shard_rows, max(0, pad_length - ranks_from_end * shard_rows))
-            if local_pad_length:
-                grad[-local_pad_length:].zero_()
+            padded_momentum = grad.narrow(0, shard_rows - local_pad_length, local_pad_length)
+            nonzero_padding = torch.count_nonzero(padded_momentum)
+            torch.distributed.all_reduce(
+                nonzero_padding, op=torch.distributed.ReduceOp.MAX, group=gtp_remat_group
+            )
+            if needs_two_step_communication:
+                torch.distributed.all_reduce(
+                    nonzero_padding, op=torch.distributed.ReduceOp.MAX, group=tp_group
+                )
+            # A Python ValueError requires a host-visible result, synchronizing CUDA.
+            if nonzero_padding:
+                raise ValueError(
+                    "Nonzero padding in distributed GTP Muon momentum "
+                    f"for {getattr(p, '_debug_name', '<unnamed>')}: "
+                    "padded rows must be exactly zero"
+                )
             size = [grad.size(-2) * gtp_remat_size - pad_length, grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
             scale_shape = (size[0], size[1])
 
-        # A momentum with both TP and GTP as sharding axes takes two communication steps: an
-        # all-gather that eliminates one axis, then the Gram all-reduce that distributes NS over
-        # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
-        # communication needed. partition_dim is what says whether TP is a sharding axis here,
+        # With both TP and GTP as sharding axes, NS first all-gathers one axis, then
+        # distributes its iterations over the other. With GTP alone, NS operates directly
+        # on the local row shard. partition_dim identifies whether TP is a sharding axis,
         # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
-        needs_two_step_communication = (
-            partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
-        )
-
         if not needs_two_step_communication:
             # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
             return self.scaled_orthogonalize_fn(
