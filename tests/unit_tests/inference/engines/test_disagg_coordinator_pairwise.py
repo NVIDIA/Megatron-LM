@@ -111,6 +111,7 @@ async def _stop_services(engine, control, clients):
         pytest.param(AsyncScheduleMode.LEGACY, False, False, False, id="eager"),
         pytest.param(AsyncScheduleMode.ASYNC, True, False, False, id="async-streaming"),
         pytest.param(AsyncScheduleMode.LEGACY, False, True, False, id="abort-capacity-deferred"),
+        pytest.param(AsyncScheduleMode.LEGACY, False, False, True, id="native-import-failure"),
     ],
 )
 def test_two_coordinator_nixl_handoff(
