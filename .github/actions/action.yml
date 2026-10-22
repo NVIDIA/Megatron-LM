@@ -155,7 +155,7 @@ runs:
 
     - name: Compute unit Testmon cache identity
       id: unit-testmon-identity
-      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'baseline') && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py'
+      if: inputs.is_unit_test == 'true' && (inputs.unit_testmon_mode == 'enforce' || inputs.unit_testmon_mode == 'baseline') && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
       shell: bash -e -u -o pipefail {0}
       continue-on-error: true
       env:
@@ -197,7 +197,7 @@ runs:
     # from the default branch; the sentinel primary key is never saved.
     - name: Restore unit Testmon baseline
       id: restore-unit-testmon
-      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success' && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py'
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success' && inputs.test_case != 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && !(startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))
       uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
       continue-on-error: true
       with:
@@ -231,8 +231,8 @@ runs:
       if: inputs.is_unit_test == 'true'
       shell: bash -e -u -o pipefail {0}
       env:
-        # These tiny precision profiles always run in full, in separate processes.
-        REQUESTED_MODE: ${{ inputs.test_case == 'tests/unit_tests/inference/test_batch_invariant_fp8.py' && 'full' || inputs.unit_testmon_mode }}
+        # Precision profiles and disaggregation collectives must always run in full.
+        REQUESTED_MODE: ${{ (inputs.test_case == 'tests/unit_tests/inference/test_batch_invariant_fp8.py' || (startsWith(inputs.test_case, 'tests/unit_tests/inference/') && contains(inputs.test_case, '/test_disagg_'))) && 'full' || inputs.unit_testmon_mode }}
         IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
         RESTORE_OUTCOME: ${{ steps.restore-unit-testmon.outcome }}
         MATCHED_KEY: ${{ steps.restore-unit-testmon.outputs.cache-matched-key }}

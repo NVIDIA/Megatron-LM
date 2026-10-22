@@ -62,17 +62,24 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    if [[ "$BUCKET" == "tests/unit_tests/inference/test_batch_invariant_fp8.py" ]]; then
+    case "$BUCKET" in
+      tests/unit_tests/inference/test_batch_invariant_fp8.py)
         bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
           h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
-    else
+        ;;
+      tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
+        bash "$TEST_PATH/tests/test_utils/run_disagg_pairwise.sh" \
+          "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "$BUCKET" "{assets_dir}/logs/1/"
+        ;;
+      *)
         bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
           --tag $TAG \
           --environment $ENVIRONMENT \
           --bucket $BUCKET \
           --unit-test-repeat $UNIT_TEST_REPEAT \
           --log-dir {assets_dir}/logs/1/
-    fi
+        ;;
+    esac
 
     ls -al 
 
@@ -209,6 +216,20 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/test_hybrid_moe.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
