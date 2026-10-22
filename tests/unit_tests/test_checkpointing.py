@@ -1282,9 +1282,7 @@ def _make_metadata_args(
 ):
     # The metadata builder reads the optimizer flags from the run config, the rest from args.
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
-    run_config.optimizer.use_layer_wise_distributed_optimizer = (
-        use_layer_wise_distributed_optimizer
-    )
+    run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
     args = SimpleNamespace()
     args.ckpt_format = ckpt_format
     args.dist_ckpt_optim_fully_reshardable = dist_ckpt_optim_fully_reshardable
@@ -1312,8 +1310,7 @@ class TestBuildShardedStateDictMetadata:
 
     def test_distributed_optimizer_fully_reshardable_flag(self, run_config):
         args = _make_metadata_args(
-            run_config,
-            use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+            run_config, use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
@@ -1337,7 +1334,8 @@ class TestBuildShardedStateDictMetadata:
     def test_layer_wise_with_fully_reshardable(self, run_config):
         args = _make_metadata_args(
             run_config,
-            use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+            use_layer_wise_distributed_optimizer=True,
+            dist_ckpt_optim_fully_reshardable=True,
         )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
