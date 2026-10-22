@@ -151,13 +151,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            K + "test_shortcut_inference_kernels.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
-        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale.",
+        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
+        "The dynamic staged adapter and committed KV cache are replayed in "
+        "test_shortcut_inference_kernels.py.",
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
@@ -373,9 +379,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_experts",
         sources=("megatron/core/transformer/moe/experts.py",),
-        tests=(K + "test_moe_kernels.py",),
+        tests=(K + "test_moe_kernels.py", K + "test_shortcut_inference_kernels.py"),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert; "
+        "the capped Shortcut expert adapter replays BF16 weights and reduction with changing live tokens.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -611,11 +618,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/moe/fused_moe.py",
             "megatron/core/inference/quantization/mxfp8_quantize.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_shortcut_inference_kernels.py"),
         kind="triton",
         training_path=False,
         notes="Batch-invariant paths replay bit-exactly; the atomic default unpermute is the negative control. "
-        "ordered_reduce_scatter_v (multi-rank) is not replayed here.",
+        "ordered_reduce_scatter_v (multi-rank) is not replayed here. The Shortcut expert adapter "
+        "covers capped vLLM preparation, GEMMs and reduction in a graph with changing live tokens.",
     ),
     KernelEntry(
         name="batch_invariant_kernels",
@@ -698,7 +706,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="ssm_gated_delta_product",
         sources=("megatron/core/ssm/gated_delta_product.py",),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_shortcut_inference_kernels.py"),
         kind="dispatch",
         notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
         "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
@@ -706,7 +714,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
-        "as outputs. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",
+        "as outputs. The staged GDP adapter and its cache updates are replayed in "
+        "test_shortcut_inference_kernels.py.",
     ),
     KernelEntry(
         name="rope_dispatch",
