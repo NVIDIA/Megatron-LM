@@ -228,7 +228,7 @@ _CASES = (
         _owned_scenario(
             "mtp-depth-one",
             "mtp2-rejection",
-            config={"num_speculative_tokens": 2},
+            config={"num_speculative_tokens": 2, "position_embedding_type": "rope"},
             signals=("chunked", "gpt", "mtp"),
         ),
         chunk_counters=("module-forward:gpt",),

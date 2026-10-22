@@ -3088,7 +3088,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             enable_chunked_prefill=feature == "chunked",
             num_speculative_tokens=2 if feature == "mtp" else 0,
             materialize_only_last_token_logits=feature != "mtp",
-            position_embedding_type="rope" if feature == "fused-rope" else None,
+            position_embedding_type=(
+                "rope" if feature in ("fused-rope", "mtp") else "learned_absolute"
+            ),
             # Use the smallest head width handled by FlashInfer's dedicated
             # cos/sin-cache RoPE kernel rather than its generic fallback.
             hidden_size=256 if feature == "fused-rope" else None,
@@ -3128,11 +3130,30 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             "pipeline_forwards": 0,
             "moe_dispatches": 0,
             "moe_request_ids": set(),
+            "mtp_decode_request_batches": [],
             "fused_rope_calls": 0,
             "mamba_restores": 0,
             "gdp_prefills": 0,
         }
         model = engine.controller.inference_wrapped_model.model
+
+        if feature == "mtp":
+            controller = engine.controller
+            context = engine.context
+            original_mtp = controller._compute_serial_mtp_and_sample
+
+            def traced_mtp(*args, **kwargs):
+                active_start = context.paused_request_count
+                decode_ids = context.request_ids[
+                    active_start : active_start + context.num_decode_requests
+                ].tolist()
+                result = original_mtp(*args, **kwargs)
+                evidence["mtp_decode_request_batches"].append(
+                    tuple(int(request_id) for request_id in decode_ids if request_id >= 0)
+                )
+                return result
+
+            controller._compute_serial_mtp_and_sample = traced_mtp
 
         if feature == "tp":
 
@@ -3324,6 +3345,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 feature_before = evidence[feature_key] if feature_key is not None else None
                 mamba_restores_before = evidence["mamba_restores"]
                 mtp_before = int(engine._spec_tokens_proposed_per_pos.sum())
+                mtp_batch_count_before = len(evidence["mtp_decode_request_batches"])
                 result = engine.step_modern()
                 step_count += 1
                 newly_cached_ids = {
@@ -3352,12 +3374,17 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
                 # MTP intentionally starts after prefill, so its request-specific
                 # witness belongs to a later decode step rather than the hit step.
-                # A cached request whose generated length grows in a step that
-                # records proposals necessarily contributed to the MTP counter.
+                # Require the cached request to have entered decode before this step
+                # and to be among the request IDs observed by the real MTP draft loop.
                 mtp_after = int(engine._spec_tokens_proposed_per_pos.sum())
                 if case["feature"] == "mtp" and mtp_after > mtp_before:
+                    step_mtp_decode_batches = evidence["mtp_decode_request_batches"][
+                        mtp_batch_count_before:
+                    ]
                     mtp_seen_for_cached_decode |= any(
                         request.request_id in cached_request_ids
+                        and any(request.request_id in batch for batch in step_mtp_decode_batches)
+                        and generated_before[request.request_id] > 0
                         and len(request.generated_tokens) > generated_before[request.request_id]
                         for request in requests
                     )

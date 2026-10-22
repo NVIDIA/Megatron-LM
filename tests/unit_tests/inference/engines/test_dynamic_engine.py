@@ -964,6 +964,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
+    mtp_num_layers: Optional[int] = None
     # A repeated (rather than per-depth) MTP head is one of the gates on
     # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
     mtp_use_repeated_layer: bool = False
@@ -1003,6 +1004,11 @@ class DynamicEngineTestConfig:
             self.position_embedding_type = (
                 "none" if self.num_speculative_tokens else "learned_absolute"
             )
+
+        # Preserve the historical test-harness behavior while allowing tests to
+        # build dormant or repeated MTP layers independently of active speculation.
+        if self.mtp_num_layers is None:
+            self.mtp_num_layers = self.num_speculative_tokens
 
         # Compute max_sequence_length.
         if self.max_sequence_length is None:
@@ -1199,7 +1205,7 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1290,7 +1296,7 @@ class DynamicInferenceEngineTestBase:
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
-            if test_config.num_speculative_tokens > 0:
+            if test_config.mtp_num_layers > 0:
                 use_te = test_config.fp8 or test_config.transformer_impl == "transformer_engine"
                 mtp_block_spec = get_gpt_mtp_block_spec(
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
@@ -1318,7 +1324,7 @@ class DynamicInferenceEngineTestBase:
                 num_layers=(
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
-                mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 moe_pad_experts_for_cuda_graph_inference=(
                     test_config.moe_pad_experts_for_cuda_graph_inference
@@ -1379,9 +1385,9 @@ class DynamicInferenceEngineTestBase:
             )
 
             # Hybrid model.
-            # When speculative tokens are configured, append MTP depth sections
+            # When MTP layers are configured, append their depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
+            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.mtp_num_layers
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
