@@ -220,6 +220,52 @@ async def test_engine_disconnect_fails_owned_request_and_ignores_late_reply(coor
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["plain", "kv-handoff", "deserialize"])
+async def test_no_engines_fails_submission_but_keeps_loop_alive(coordinator_runtime, kind):
+    runtime = coordinator_runtime
+    client = _start_client(runtime, deserialize=kind == "deserialize")
+    engine = _EnginePeer(runtime.address, b"unreachable-engine")
+    try:
+        await runtime.wait_for_engine(engine)
+        old = client.add_request([7, 8], SamplingParams(num_tokens_to_generate=1))
+        old_server_id = engine.receive_request()
+        await _eventually(
+            lambda: runtime.coordinator.request_id_to_rank.get(old_server_id) == engine.identity,
+            "old request unowned",
+        )
+        engine.close()
+        engine = None
+        await runtime.wait_for_disconnect()
+        params = SamplingParams(num_tokens_to_generate=1)
+        if kind == "kv-handoff":
+            future = client.add_request_with_kv_handoff([1, 2], params, {}, [])
+        else:
+            future = client.add_request([1, 2], params)
+        resolved = []
+        for pending in (old, future):
+            pending.add_done_callback(resolved.append)
+        replies = [await asyncio.wait_for(future, 5.0), await asyncio.wait_for(old, 5.0)]
+        for reply in replies:
+            _assert_reply(reply)
+        assert Counter(resolved) == Counter([old, future])
+        assert client.socket.replies == {0: 1, 1: 1}
+        runtime.assert_requests_retired()
+        engine = _EnginePeer(runtime.address, b"replacement-engine")
+        await runtime.wait_for_engine(engine)
+        future = client.add_request([3, 4], SamplingParams(num_tokens_to_generate=1))
+        server_request_id = engine.receive_request()
+        engine.send_reply(server_request_id)
+        reply = await asyncio.wait_for(future, timeout=5.0)
+        _assert_reply(reply, Status.COMPLETED)
+        assert client.socket.replies == {0: 1, 1: 1, 2: 1}
+        runtime.assert_requests_retired()
+    finally:
+        client.stop()
+        if engine is not None:
+            engine.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["partial", "final"])
 async def test_closed_client_delivery_does_not_disrupt_live_client(coordinator_runtime, delivery):
     runtime = coordinator_runtime

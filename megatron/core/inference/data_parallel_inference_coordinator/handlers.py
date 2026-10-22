@@ -143,7 +143,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         preparer and payload stager, None when the client sent none. It is
         unbounded, so it is forwarded verbatim and never decoded here.
 
-    Returns True (stopping the loop) if no engines are reachable.
+    If no engines are reachable, resolves the request as failed and leaves the
+    loop running so a replacement engine can register.
     """
     # Message from a known client
     if sender_identity not in coordinator.known_clients:
@@ -261,12 +262,11 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         ):
             break
     else:
-        # If all engines have died, we are in an abnormal state, and must exit cleanly.
         logging.error("Coordinator: no reachable engines for request %d", request_id)
-        del coordinator.request_id_to_client_id[request_id]
-        del coordinator.request_id_to_client_request_id[request_id]
-        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        return True
+        coordinator._fail_request(
+            request_id, "no reachable engines", sampling_params=sampling_params
+        )
+        return
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
@@ -363,10 +363,10 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
             break
     else:
         logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
-        del coordinator.request_id_to_client_id[request_id]
-        del coordinator.request_id_to_client_request_id[request_id]
-        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        return True
+        coordinator._fail_request(
+            request_id, "no reachable engines", sampling_params=sampling_params
+        )
+        return
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
