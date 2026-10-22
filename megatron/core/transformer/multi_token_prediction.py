@@ -1769,6 +1769,21 @@ def _vocab_parallel_argmax(
     return winning_rank * vocab_shard_size + winning_local_argmax  # [s, b]
 
 
+def _row_argmax_live_rows(logits: torch.Tensor) -> torch.Tensor:
+    """``argmax(logits, dim=-1)``; under a padding-aware live-row bound only the live rows are
+    scanned (padding rows get -1, which no label matches)."""
+    from megatron.core.fusions.fused_padding_aware_elementwise import HAVE_TRITON as _have_triton
+    from megatron.core.fusions.fused_padding_aware_elementwise import padding_aware_row_argmax
+    from megatron.core.fusions.padding_aware_switches import padding_aware_feature_disabled
+    from megatron.core.transformer.padding_aware_gemm import current_live_rows_for
+
+    if _have_triton and logits.is_cuda and logits.dim() == 3 and logits.stride(-1) == 1:
+        bound = current_live_rows_for(logits.shape[0] * logits.shape[1])
+        if bound is not None and not padding_aware_feature_disabled("argmax"):
+            return padding_aware_row_argmax(logits, bound)
+    return torch.argmax(logits, dim=-1)
+
+
 def _compute_mtp_acceptance_counts(
     mtp_logits: Tensor,
     mtp_labels: Tensor,
@@ -1791,7 +1806,7 @@ def _compute_mtp_acceptance_counts(
         if tp_size > 1:
             preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
         else:
-            preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
+            preds = _row_argmax_live_rows(mtp_logits)  # [s, b]
 
         labels_match = mtp_labels.transpose(0, 1).contiguous()  # [b, s] => [s, b]
         mask_match = loss_mask.transpose(0, 1).contiguous()  # [b, s] => [s, b]

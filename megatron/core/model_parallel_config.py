@@ -388,7 +388,7 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear', 'triton'] = 'native'
     """
     Specifies the implementation of cross-entropy loss fusion.
 
@@ -396,6 +396,10 @@ class ModelParallelConfig:
     - 'native': Uses MCore-based cross-entropy loss fusion (default).
     - 'te': Uses the parallel cross-entropy loss implementation from the Transformer Engine library.
     - 'linear': Uses a linear-cross-entropy fusion approach.
+    - 'triton': MCore's single-pass Triton cross entropy (bf16/fp32 logits read once in the
+      forward, softmax recomputed from the logits in the backward, no fp32 copies; vocab-parallel
+      aware). When a padding-aware live-row bound is published for the logits, the padding rows
+      are skipped.
     """
 
     tp_comm_overlap_disable_qkv: bool = False

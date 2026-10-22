@@ -22,6 +22,7 @@ from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
 )
+from megatron.core.transformer.padding_aware_gemm import with_padding_aware_dense_linears
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
@@ -773,6 +774,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
+    # The mHC wrapper drives the inner layer's attention / MLP helpers directly, so the
+    # live-row bound for padding-aware TE linears is published here (graph-safe: a captured
+    # forward reads it from its static ``padding_mask`` input).
+    @with_padding_aware_dense_linears
     def forward(
         self,
         hidden_states: Tensor,

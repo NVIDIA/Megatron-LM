@@ -19,6 +19,11 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_cross_entropy import (
     fused_vocab_parallel_cross_entropy as _fused_ce,
 )
+from megatron.core.fusions.fused_padding_aware_cross_entropy import (
+    padding_aware_cross_entropy_available,
+    triton_cross_entropy,
+    triton_cross_entropy_available,
+)
 from megatron.core.tensor_parallel.cross_entropy import unfused_cross_entropy
 from megatron.core.tensor_parallel.inference_layers import (
     InferenceColumnParallelLinear,
@@ -34,6 +39,7 @@ from megatron.core.transformer.moe.experts import (
     SequentialMLP,
 )
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
+from megatron.core.transformer.padding_aware_gemm import current_live_rows_for
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
@@ -68,6 +74,26 @@ def require(requirement: str, requested_by: str = "This backend", instead: str =
         raise ImportError(f"{message} {instead}".strip())
 
 
+def _triton_ce(
+    logits: torch.Tensor, labels: torch.Tensor, tp_group: Optional[torch.distributed.ProcessGroup]
+) -> torch.Tensor:
+    """``cross_entropy_fusion_impl='triton'``: one Triton pass over the bf16 logits (fp32 math
+    like the native fused path, no fp32 copies of the logits). When the padding-aware context
+    publishes a live-row bound for this THD buffer, the padding rows are skipped (device-side
+    bound, CUDA-graph capturable); ``MCORE_PADDING_AWARE_SKIP=ce`` keeps the kernel on every row.
+    """
+    if not triton_cross_entropy_available(logits, labels):
+        raise RuntimeError(
+            "cross_entropy_fusion_impl='triton' needs Triton and CUDA bf16/fp32 logits "
+            f"[s, b, V] with unit last stride; got {logits.dtype} {tuple(logits.shape)} on "
+            f"{logits.device}"
+        )
+    live_rows = current_live_rows_for(logits.shape[0] * logits.shape[1])
+    if live_rows is not None and not padding_aware_cross_entropy_available(logits, labels):
+        live_rows = None
+    return triton_cross_entropy(logits, labels, tp_group, live_rows)
+
+
 def select_cross_entropy(
     cross_entropy_loss_fusion: bool = False,
     cross_entropy_fusion_impl: str = "native",
@@ -78,10 +104,10 @@ def select_cross_entropy(
     Shared by every provider: the choice depends on the config, not on which backend supplies
     the rest of the model, which is how it behaved before this was a provider decision.
     """
-    if cross_entropy_fusion_impl not in ("native", "te", "linear"):
+    if cross_entropy_fusion_impl not in ("native", "te", "linear", "triton"):
         raise ValueError(
             f"unknown cross_entropy_fusion_impl={cross_entropy_fusion_impl!r}. "
-            "Valid choices: native, te, linear"
+            "Valid choices: native, te, linear, triton"
         )
     # Linear + CE fusion is performed by the output layer, before this logits-only
     # target is called. Keep an unfused target for separately materialized logits;
@@ -90,6 +116,8 @@ def select_cross_entropy(
         return unfused_cross_entropy
     if cross_entropy_fusion_impl == "native":
         return _fused_ce
+    if cross_entropy_fusion_impl == "triton":
+        return _triton_ce
 
     # Full-iteration CUDA graphs capture the loss too, which TE only supports from 2.7.0.
     capturable = cuda_graph_impl == "full_iteration"
