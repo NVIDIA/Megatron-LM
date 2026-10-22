@@ -115,15 +115,7 @@ class GlobalLayout:
                 )
 
     def validate_for_row_atomic(self, *, block_size: int = 1) -> None:
-        """Check that no rank boundary splits a row (or ``block_size``-row block).
-
-        Both the padded, equal-size layout of ``layout_builder.build_for_row_atomic`` and
-        the padding-free, unequal layout of ``layout_builder.build_for_row_atomic_unpadding``
-        satisfy this; segment sizes themselves are unconstrained. A boundary that falls
-        strictly inside a tensor must be an integral number of rows/blocks from that
-        tensor's start so every rank's slice of the tensor keeps dim-0 rows and blocks
-        completely.
-        """
+        """Check that no rank boundary splits a row (or ``block_size``-row block)."""
         if block_size <= 0:
             raise ValueError(f"Block size must be positive, got {block_size}.")
         for tensor_id, (shape, start) in enumerate(
@@ -189,38 +181,7 @@ class GlobalLayout:
         coordinates = (mesh.mesh == rank).nonzero(as_tuple=False)
         if coordinates.size(0) == 0:
             raise ValueError(f"Global rank {rank} is not in the device mesh.")
-        return self._get_coordinate_range(mesh, placements, coordinates[0].tolist())
-
-    def get_peer_ranges(
-        self, mesh: DeviceMesh, placements: Iterable[Placement], mesh_axis: int
-    ) -> list[Range]:
-        """Return the element range of every rank in this rank's ``mesh_axis`` group.
-
-        The ranges are in process-group rank order, which on a DeviceMesh is the order
-        of the coordinates along ``mesh_axis`` with every other coordinate fixed to this
-        rank's. DBuffer slices its buffers with them for the list-based collectives
-        (``dist.all_gather`` / ``dist.reduce_scatter``) that unequal segments require.
-
-        Args:
-            mesh: The device mesh defining the distribution.
-            placements: Per-mesh-axis placements under which the peers hold their ranges.
-            mesh_axis: Mesh axis of the process group.
-        """
-        coordinate = mesh.get_coordinate()
-        if coordinate is None:
-            raise ValueError(f"Global rank {mesh.get_rank()} is not in the device mesh.")
-        ranges = []
-        for peer in range(mesh.size(mesh_axis)):
-            peer_coordinate = list(coordinate)
-            peer_coordinate[mesh_axis] = peer
-            ranges.append(self._get_coordinate_range(mesh, placements, peer_coordinate))
-        return ranges
-
-    def _get_coordinate_range(
-        self, mesh: DeviceMesh, placements: Iterable[Placement], coordinate: Iterable[int]
-    ) -> Range:
-        """Return the global buffer element range for a given rank coordinate of the mesh."""
-        coordinate = tuple(coordinate)
+        coordinate = coordinates[0].tolist()
         placements = tuple(placements)
         # Innermost Shard axis is the most significant digit of the shard index.
         shard_index = 0

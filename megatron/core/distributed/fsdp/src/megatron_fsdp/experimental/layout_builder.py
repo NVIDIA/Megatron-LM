@@ -22,6 +22,18 @@ from collections.abc import Iterable
 import torch
 
 from .layout import GlobalLayout, Shape, non_leading_numel
+from .placement import ShardLayout
+
+
+def build_row_atomic_layout(
+    shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1, shard_layout: ShardLayout
+) -> GlobalLayout:
+    """Build a RowAtomic/BlockAtomic layout with the builder selected by ``shard_layout``."""
+    if shard_layout is ShardLayout.PADDED:
+        return build_for_row_atomic(shapes, dp_size=dp_size, block_size=block_size)
+    if shard_layout is ShardLayout.UNPADDED:
+        return build_for_row_atomic_unpadding(shapes, dp_size=dp_size, block_size=block_size)
+    raise ValueError(f"Unsupported shard layout: {shard_layout!r}.")
 
 
 def build_for_row_atomic(
@@ -68,20 +80,8 @@ def build_for_row_atomic(
 
     if dp_size <= 0:
         raise ValueError(f"DP size must be positive, got {dp_size}.")
-    if block_size <= 0:
-        raise ValueError(f"Block size must be positive, got {block_size}.")
-
     tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
-    chunk_size = 1
-    for shape in tensor_shapes:
-        row_size = non_leading_numel(shape)
-        if row_size <= 0:
-            raise ValueError(f"Cannot compute a layout for zero-sized non-leading dims: {shape}.")
-        if shape[0] % block_size != 0:
-            raise ValueError(
-                f"Tensor dim 0 ({shape[0]}) must be divisible by block size {block_size}."
-            )
-        chunk_size = math.lcm(chunk_size, block_size * row_size)
+    chunk_size = math.lcm(1, *_row_atomic_alignments(tensor_shapes, block_size))
 
     # chunk_size is the packing granularity. Since every tensor row size divides it,
     # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
@@ -176,13 +176,11 @@ def build_for_row_atomic_unpadding(
 ) -> GlobalLayout:
     """Build padding-free, generally unequal rank segments for RowAtomic or BlockAtomic.
 
-    Unlike ``build_for_row_atomic``, this never pads. Tensors are packed back to
-    back in tensor-id order, so ``size`` is the sum of all tensor numels.
-    Each rank boundary is then placed as close as possible to an even
-    ``size / dp_size`` split while landing on a row (or ``block_size``-row)
-    boundary of the tensor it falls in, so every rank still owns whole rows
-    or blocks. Segment sizes therefore differ by at most one row or block,
-    and DBuffer uses list-based (uneven) collectives.
+    Here, tensors are packed back to back in tensor-id order, so ``size`` is the sum
+    of all tensor numels. Each rank boundary is then placed as close as possible to
+    an even ``size / dp_size`` split while landing on a row (or ``block_size``-row)
+    boundary of the tensor it falls in, so every rank still owns whole rows or
+    blocks. Segment sizes therefore differ by at most one row or block.
 
     For example, with shapes P0=(2, 6), P1=(4, 4), P2=(1, 2) on 2 ranks, the even
     split at 15 is rounded to P1's row boundary at 16:
@@ -207,25 +205,17 @@ def build_for_row_atomic_unpadding(
     """
     if dp_size <= 0:
         raise ValueError(f"DP size must be positive, got {dp_size}.")
-    if block_size <= 0:
-        raise ValueError(f"Block size must be positive, got {block_size}.")
-
     tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
+    alignments = _row_atomic_alignments(tensor_shapes, block_size)
+
     tensor_to_offset: list[int] = []
     # (start, end, alignment) of every nonempty tensor, in ascending start order.
     aligned_spans: list[tuple[int, int, int]] = []
     next_offset = 0
-    for shape in tensor_shapes:
-        row_size = non_leading_numel(shape)
-        if row_size <= 0:
-            raise ValueError(f"Cannot compute a layout for zero-sized non-leading dims: {shape}.")
-        if shape[0] % block_size != 0:
-            raise ValueError(
-                f"Tensor dim 0 ({shape[0]}) must be divisible by block size {block_size}."
-            )
+    for shape, alignment in zip(tensor_shapes, alignments):
         tensor_to_offset.append(next_offset)
         if shape.numel() > 0:
-            aligned_spans.append((next_offset, next_offset + shape.numel(), block_size * row_size))
+            aligned_spans.append((next_offset, next_offset + shape.numel(), alignment))
         next_offset += shape.numel()
     size = next_offset
 
@@ -324,6 +314,25 @@ def build_for_tensor_atomic(
     )
     layout.validate_for_tensor_atomic()
     return layout
+
+
+def _row_atomic_alignments(
+    tensor_shapes: tuple[torch.Size, ...], block_size: int
+) -> tuple[int, ...]:
+    """Return each tensor's row/block alignment, ``block_size * row_size``, in elements."""
+    if block_size <= 0:
+        raise ValueError(f"Block size must be positive, got {block_size}.")
+    alignments = []
+    for shape in tensor_shapes:
+        row_size = non_leading_numel(shape)
+        if row_size <= 0:
+            raise ValueError(f"Cannot compute a layout for zero-sized non-leading dims: {shape}.")
+        if shape[0] % block_size != 0:
+            raise ValueError(
+                f"Tensor dim 0 ({shape[0]}) must be divisible by block size {block_size}."
+            )
+        alignments.append(block_size * row_size)
+    return tuple(alignments)
 
 
 def _pad_to_multiple(value: int, multiple: int) -> int:

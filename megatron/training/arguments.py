@@ -1035,11 +1035,7 @@ def validate_args(args, defaults={}):
         if args.megatron_fsdp_version == 2:
             assert not args.use_distributed_optimizer, \
                 '--megatron-fsdp-version 2 is not compatible with --use-distributed-optimizer'
-            assert not (args.megatron_fsdp_uneven_shards and args.nccl_ub), \
-                '--megatron-fsdp-uneven-shards is not compatible with --use-nccl-ub'
         else:
-            assert not args.megatron_fsdp_uneven_shards, \
-                '--megatron-fsdp-uneven-shards requires --megatron-fsdp-version 2'
             # Megatron-FSDP v1 requires the DistributedOptimizer.
             if not args.use_distributed_optimizer:
                 warn_rank_0(
@@ -3616,11 +3612,12 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
-    group.add_argument('--megatron-fsdp-uneven-shards', action='store_true', default=False,
-                       dest='megatron_fsdp_uneven_shards',
-                       help='Megatron-FSDP v2 only. Pack each parameter group without padding and '
-                       'split it into generally unequal per-rank shards at row boundaries (32-row '
-                       'block boundaries for MXFP8), instead of padding every group to equal shards.')
+    group.add_argument("--no-megatron-fsdp-padded-shards", action="store_false", default=True,
+                       dest="megatron_fsdp_padded_shards",
+                       help="Megatron-FSDP v2 only. Pack each parameter group without padding and "
+                       "split it into generally unequal per-rank shards at row boundaries (32-row "
+                       "block boundaries for MXFP8), instead of padding every group to equal shards. "
+                       "Not compatible with --use-nccl-ub.")
     group.add_argument(
             '--megatron-fsdp-enable-fine-grained-param-gather',
             action='store_true',
