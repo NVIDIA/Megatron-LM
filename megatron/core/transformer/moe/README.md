@@ -931,6 +931,10 @@ branch. MCore retains routing, native expert parameters, DDP, optimizer, and
 checkpoints. Dist-MoE executes routed dispatch, SwiGLU, combine, and backward,
 accumulating WGRAD directly into the native `main_grad` buffers. Shared experts
 run through the ordinary MCore module, including its optional output gate.
+The MCore autograd bridge calls `dist_moe.functional.forward` / `backward` and
+completes the native parameter hooks after direct accumulation. Dist-MoE receives
+borrowed weights and gradient buffers; parameter ownership and DDP completion
+remain in MCore, including during local CUDA Graph replay.
 
 Enable `bf16`, `moe_grouped_gemm`, `moe_use_grouped_tensor`,
 `moe_single_grouped_weight`, and `gradient_accumulation_fusion`; disable linear

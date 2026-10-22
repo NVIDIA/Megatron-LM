@@ -12,7 +12,48 @@ from functools import wraps
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer.moe.megakernel.parameter_bridge import main_grad_buffer
+from megatron.core.transformer.moe.megakernel.parameter_bridge import (
+    finish_weight_gradient,
+    main_grad_buffer,
+)
+
+
+class _DistMoEAutograd(torch.autograd.Function):
+    """Connect native MCore parameter edges to Dist's functional execution."""
+
+    @staticmethod
+    def forward(ctx, module, x, ids, scores, *owners):
+        from dist_moe import functional
+
+        output, state = functional.forward(
+            x, ids, scores, *module._prepared, module.context, save_for_backward=module._live
+        )
+        if module._live:
+            ctx.module = module
+            ctx.state = state
+            ctx.save_for_backward(x, ids, scores, *owners)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        from dist_moe import functional
+
+        if torch.is_grad_enabled():
+            raise RuntimeError("dist_moe supports only first-order gradients")
+        module = ctx.module
+        if module is None:
+            raise RuntimeError("dist_moe supports one backward per forward")
+        grad_w13, grad_w2 = module._check_backward_bindings()
+        # Trigger input version checks, but complete the canonical parameters:
+        # saved-tensor hooks may unpack aliases without native DDP metadata.
+        _ = ctx.saved_tensors
+        dx, dscores = functional.backward(
+            ctx.state, grad_output.contiguous(), grad_w13=grad_w13, grad_w2=grad_w2
+        )
+        owner_grads = tuple(finish_weight_gradient(owner) for owner in module.owners)
+        module._live = False
+        ctx.module = ctx.state = None
+        return None, dx, None, dscores, *owner_grads
 
 
 @dataclass(frozen=True)

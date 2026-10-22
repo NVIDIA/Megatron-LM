@@ -8,13 +8,10 @@ from types import MethodType
 import torch
 
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
-from megatron.core.transformer.moe.megakernel.parameter_bridge import (
-    finish_weight_gradient,
-    main_grad_buffer,
-)
+from megatron.core.transformer.moe.megakernel.parameter_bridge import main_grad_buffer
 from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 
-from .runtime import DistMoEBackendOptions, storage_signature, validate_config
+from .runtime import DistMoEBackendOptions, _DistMoEAutograd, storage_signature, validate_config
 from .weights import prepare_weight
 
 
@@ -95,15 +92,7 @@ class DistMoEMegakernel(MegakernelBackend):
     def _check_backward_bindings(self):
         if self._weight_signature() != self._weight_binding:
             raise RuntimeError("dist_moe parameter storage/version changed during backward")
-        self._grads()
-
-    def _complete(self, owners):
-        if any(actual is not expected for actual, expected in zip(owners, self.owners)):
-            raise RuntimeError("dist_moe gradient owner changed during backward")
-        self._check_backward_bindings()
-        result = tuple(finish_weight_gradient(param) for param in owners)
-        self._live = False
-        return result
+        return self._grads()
 
     def _prepare_weights(self, first_microbatch=False):
         binding = self._weight_signature()
@@ -176,8 +165,6 @@ class DistMoEMegakernel(MegakernelBackend):
         """Execute with borrowed payloads and direct optimizer-visible accumulation."""
         if self.context is None:
             raise RuntimeError("call initialize_dist_moe_runtime after wrapping the model in DDP")
-        import dist_moe
-
         if self._live:
             raise RuntimeError("dist_moe requires each microbatch backward before its next forward")
         capturing = torch.cuda.is_current_stream_capturing()
@@ -196,21 +183,9 @@ class DistMoEMegakernel(MegakernelBackend):
             self._prepare_weights(first_microbatch=self.is_first_microbatch)
         elif not self._graph_bound or self._graph_storage_binding() != self._graph_binding:
             raise RuntimeError("dist_moe capture requires stable, prepared graph operands")
-        integration = dist_moe.WgradIntegration(
-            owners=self.owners,
-            destinations=self._grads(),
-            completion_fn=self._complete,
-            graph_runner=self._graph_bound,
-        )
+        self._grads()
         self._live = torch.is_grad_enabled()
-        output = dist_moe.routed_experts(
-            x,
-            ids,
-            scores,
-            *self._prepared,
-            self.context,
-            options=dist_moe.ExecutionOptions(wgrad_integration=integration),
-        )
+        output = _DistMoEAutograd.apply(self, x, ids, scores, *self.owners)
         return output.view(shape)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
