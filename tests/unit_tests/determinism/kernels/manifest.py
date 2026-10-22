@@ -700,10 +700,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/ssm/gated_delta_product.py",),
         tests=(K + "test_ssm_kernels.py",),
         kind="dispatch",
-        notes="Dispatches FLA chunk_gated_delta_product / l2_norm, the CuTeDSL gdp_attn kernel "
-        "(gdp_cutedsl_kernel; not in the CI container, uncovered), causal_conv1d and the Megatron "
+        notes="Dispatches FLA chunk_gated_delta_product / l2_norm, causal_conv1d and the Megatron "
         "GDP forks (chunk_gated_delta_product_varlen, fused_recurrent_gated_delta_rule_update), all "
-        "replayed in test_ssm_kernels.py. ssm_decode also drives the speculative-decoding path, "
+        "replayed in test_ssm_kernels.py. cuDNN Frontend GDP (gdp_cudnn_kernel) is tested upstream. "
+        "ssm_decode also drives the speculative-decoding path, "
         "where causal_conv1d_update and the fused recurrence take several draft tokens per step and "
         "fill the conv / SSM rollback snapshot buffers; both are replayed there with the snapshots "
         "as outputs. No module-level replay yet (HYBRID_CONFIGS has no GDP cell).",

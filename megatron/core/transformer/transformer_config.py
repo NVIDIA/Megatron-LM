@@ -1545,17 +1545,14 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Controls usage of the memory efficient path for Mamba layers."""
 
-    gdp_cutedsl_kernel: bool = False
-    """Whether to use the CuTeDSL kernel for the GatedDeltaProduct mixer."""
+    gdp_cudnn_kernel: bool = False
+    """Whether to use cuDNN Frontend CuTeDSL kernels for the GatedDeltaProduct mixer."""
 
-    gdp_num_chunk_states_to_recompute: int = 2
-    """Checkpoint-coarsening ratio N in [0, 64] for the CuTeDSL GatedDeltaProduct kernel.
-    N=0 checkpoints every chunk state for the backward pass (dense, no recompute). N>=1
-    stores one checkpoint per group of N+1 chunks (1/(N+1) the checkpoint memory) and the
-    backward recomputes each group's N missing chunk states, trading recompute time for
-    activation memory monotonically in N (sweet spot N=2..3). Only honored by kernel
-    builds that expose ``recompute_chunk_num`` or the legacy
-    ``num_chunk_states_to_recompute`` argument."""
+    gdp_checkpoint_every_n_tokens: int = 192
+    """cuDNN FE GDP checkpoint interval in expanded sub-token rows, a positive multiple of 64.
+    An interval of 64 saves every chunk in the input dtype; larger intervals save
+    fewer states in FP32 and require backward recomputation. Only used with
+    gdp_cudnn_kernel."""
 
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
@@ -2918,10 +2915,13 @@ class TransformerConfig(ModelParallelConfig):
                         f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
                     )
 
-        if self.gdp_cutedsl_kernel:
-            assert 0 <= self.gdp_num_chunk_states_to_recompute <= 64, (
-                "gdp_num_chunk_states_to_recompute must be in range [0, 64], got "
-                f"{self.gdp_num_chunk_states_to_recompute}."
+        if self.gdp_cudnn_kernel:
+            assert (
+                self.gdp_checkpoint_every_n_tokens > 0
+                and self.gdp_checkpoint_every_n_tokens % 64 == 0
+            ), (
+                "gdp_checkpoint_every_n_tokens must be a positive multiple of 64, got "
+                f"{self.gdp_checkpoint_every_n_tokens}."
             )
 
         if self.gtp_remat_opt_in_modules:
