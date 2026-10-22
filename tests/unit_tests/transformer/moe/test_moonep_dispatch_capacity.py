@@ -39,6 +39,10 @@ def _manager(monkeypatch, factor=None, alignment=256):
     manager.num_experts = 16
     manager.num_local_experts = 4
     manager.group = None
+    manager.router_topk = 2
+    manager.capacity_factor = None
+    manager.use_dense_routing_for_bool_map = False
+    manager.dense_routing_supported = False
     manager.drop_and_pad = False
     manager.pad_multiple = None
     manager.moe_expert_rank_capacity_factor = factor
@@ -144,7 +148,11 @@ def test_real_hybridep_quantization_padding(distributed_world):
     """Fixed capacity includes independently rounded expert segments, not just routes."""
     assert dist.get_world_size() == 4
     config = replace(
-        parity._config("replica_peer_tma"), fp8="e4m3", fp8_recipe=Fp8Recipe.mxfp8, fp8_param=True
+        parity._config("replica_peer_tma"),
+        fp8="e4m3",
+        fp8_recipe=Fp8Recipe.mxfp8,
+        fp8_param=True,
+        moe_router_padding_for_quantization=True,
     )
     # Two destinations per token, four runtime experts per rank. Uneven expert
     # segments force padding while the rank totals remain exactly N * topk.

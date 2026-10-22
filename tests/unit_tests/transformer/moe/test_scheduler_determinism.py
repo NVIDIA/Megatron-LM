@@ -95,7 +95,8 @@ def test_scheduler_planner_and_probability_backward_replay(distributed_world, pl
 
 @pytest.mark.parametrize("backend", [PeerTmaTransport, NcclP2PTransport], ids=["peer_tma", "nccl"])
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
-def test_scheduler_replica_transport_replay(distributed_world, backend, precision):
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_scheduler_replica_transport_replay(distributed_world, backend, precision, cancellation):
     """Reuse storage and replay weights, FP8 scales, and additive owner gradients."""
     from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
@@ -137,7 +138,10 @@ def test_scheduler_replica_transport_replay(distributed_world, backend, precisio
                     assert torch.all(value == projection * 20 + i * 5)
                     observed[f"weight/{i}/{projection}/{slot}"] = value.clone()
                 native[projection].fill_(0.125)
-                grads.fill_((rank + 1) / 8)
+                # Large/small opposite-sign contributions make changes in the
+                # accumulation order observable; exact fractions alone cannot.
+                contributions = (16777216.0, 1.0, -16777216.0, 0.25)
+                grads.fill_(contributions[rank % 4] if cancellation else (rank + 1) / 8)
                 handle = transport.start_grad_reduce(
                     native_grads=destinations, plan=plan, projections=(projection,)
                 )
@@ -145,7 +149,9 @@ def test_scheduler_replica_transport_replay(distributed_world, backend, precisio
                 expected = torch.full_like(native[projection], 0.125)
                 if rank == 0:
                     expected[0] += cfg.world_size * (cfg.world_size + 1) / 8
-                torch.testing.assert_close(native[projection], expected, rtol=0, atol=0)
+                if not cancellation:
+                    torch.testing.assert_close(native[projection], expected, rtol=0, atol=0)
+                assert torch.isfinite(native[projection]).all()
                 observed[f"gradient/{i}/{projection}"] = native[projection].clone()
         return observed
 
