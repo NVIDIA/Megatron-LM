@@ -19,7 +19,7 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA KDA is not installed.")
 @pytest.mark.parametrize("variant", ["kda", "kda_direct", "gdn"])
-def test_gate_parameter_precision_through_bf16_wrapper(variant):
+def test_gate_parameter_precision_through_bf16_wrapper(variant, monkeypatch):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(123)
@@ -95,7 +95,14 @@ def test_gate_parameter_precision_through_bf16_wrapper(variant):
                 assert torch.isfinite(tensor.grad).all()
 
         if variant.startswith("kda"):
-            assert layer.use_gate_in_kernel == (variant == "kda_direct")
+            gated_delta_rule = layer.gated_delta_rule
+            gate_in_kernel_calls = []
+
+            def record_gated_delta_rule(*args, **kwargs):
+                gate_in_kernel_calls.append(kwargs.get("use_gate_in_kernel"))
+                return gated_delta_rule(*args, **kwargs)
+
+            monkeypatch.setattr(layer, "gated_delta_rule", record_gated_delta_rule)
             hidden = torch.randn(
                 260, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
             )
@@ -111,6 +118,8 @@ def test_gate_parameter_precision_through_bf16_wrapper(variant):
             separate_output = torch.cat(
                 [layer(segment, attention_mask=None)[0] for segment in hidden.split([129, 131])]
             )
+            # Both KDA variants compute the decay gate inside the recurrence kernel.
+            assert gate_in_kernel_calls == [True, True, True]
             torch.testing.assert_close(packed_output, separate_output, rtol=0.03, atol=0.002)
             packed_output.float().square().mean().backward()
             assert hidden.grad is not None and torch.isfinite(hidden.grad).all()

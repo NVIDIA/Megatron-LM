@@ -15,12 +15,15 @@ from megatron.core.models.common.embeddings.rope_utils import (
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.layers.utils import Symbols, create_layer_config
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
+from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2, HAVE_FLA_KDA, KimiDeltaAttention
+from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
     make_test_packed_seq_params,
     make_test_packed_seq_params_with_padding,
@@ -471,6 +474,160 @@ def test_kda_layer_config_preserves_settings(explicit_settings):
     assert set(expected) <= {field.name for field in fields(KDALayerConfig)}
     for name, value in expected.items():
         assert getattr(layer_config, name) == value
+
+
+def test_kda_fp8_opt_out_is_scoped_to_kda_config():
+    """A copied stack attribute must not disable FP8 for GDN layer configs."""
+    stack_config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    stack_config.kda_disable_fp8 = True
+    kda_config = KDALayerConfig.from_config(stack_config)
+    gdn_config = GDNLayerConfig.from_config(stack_config)
+
+    assert _kda_fp8_disabled(kda_config)
+    assert not _kda_fp8_disabled(gdn_config)
+
+
+def _make_fp8_stack_config(two_stage_gates, **overrides):
+    settings = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=16,
+        linear_num_value_heads=16,
+        normalization="RMSNorm",
+        activation_func=F.silu,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        fp8="hybrid",
+        fp8_param=True,
+        use_cpu_initialization=False,
+        is_hybrid_model=True,
+    )
+    settings.update(overrides)
+    config = TransformerConfig(**settings)
+    config.kda_disable_fp8 = True
+    config.kda_two_stage_gates = two_stage_gates
+    return config
+
+
+def _build_copied_fp8_layer(stack_config, symbol, variant):
+    config = create_layer_config(stack_config, symbol)
+    assert config.kda_disable_fp8 is True
+    spec = getattr(hybrid_stack_spec.submodules, f"{variant}_layer").submodules.self_attention
+    return spec.module(
+        config=config,
+        submodules=spec.submodules,
+        layer_number=1,
+        pg_collection=ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        ),
+    ).cuda()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+@pytest.mark.parametrize(
+    "gdn_variant",
+    ["gdn", pytest.param("gdn2", marks=pytest.mark.skipif(not HAVE_FLA_GDN2, reason="No GDN2"))],
+)
+def test_kda_fp8_opt_out_preserves_gdn_primary_weights(two_stage_gates, gdn_variant):
+    """Copied stack flags leave GDN/GDN2 quantized while KDA projections stay BF16."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        stack_config = _make_fp8_stack_config(two_stage_gates)
+        with get_fp8_context(stack_config, is_init=True):
+            gdn = _build_copied_fp8_layer(stack_config, Symbols.GDN, gdn_variant)
+            kda = _build_copied_fp8_layer(stack_config, Symbols.KDA, "kda")
+
+        for name in ("in_proj", "out_proj"):
+            assert is_float8tensor(getattr(gdn, name).weight), name
+        projections = ["in_proj", "out_proj", "beta_proj"]
+        if two_stage_gates:
+            projections += ["f_a_proj", "f_b_proj", "g_a_proj", "g_b_proj"]
+        for name in projections:
+            weight = getattr(kda, name).weight
+            assert not is_float8tensor(weight), name
+            assert weight.dtype == torch.bfloat16, name
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+@pytest.mark.parametrize(
+    "gdn_variant",
+    ["gdn", pytest.param("gdn2", marks=pytest.mark.skipif(not HAVE_FLA_GDN2, reason="No GDN2"))],
+)
+def test_kda_fp8_opt_out_preserves_gdn_alignment_check(two_stage_gates, gdn_variant):
+    """An inherited KDA flag cannot bypass a misaligned GDN/GDN2 in_proj assertion."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        stack_config = _make_fp8_stack_config(
+            two_stage_gates,
+            linear_key_head_dim=30,
+            linear_value_head_dim=30,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+        )
+        with get_fp8_context(stack_config, is_init=True):
+            with pytest.raises(AssertionError, match="input projection output tensor"):
+                _build_copied_fp8_layer(stack_config, Symbols.GDN, gdn_variant)
+            kda = _build_copied_fp8_layer(stack_config, Symbols.KDA, "kda")
+        assert kda.in_proj_dim % 16 != 0
+        assert not is_float8tensor(kda.in_proj.weight)
+        assert kda.in_proj.weight.dtype == torch.bfloat16
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("two_stage_gates", [False, True])
+@pytest.mark.parametrize(
+    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
+    [
+        (False, 2, True, 1, "headwise"),
+        (True, 1, False, 2, "headwise"),
+        (True, 2, True, 2, "headwise"),
+        (True, 1, False, 2, "chunkwise"),
+        (True, 2, True, 2, "chunkwise"),
+    ],
+)
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.skipif(Utils.world_size < 4, reason="Requires four GPUs for TP2+CP2.")
+def test_parallel_kda_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode, two_stage_gates, run_config
+):
+    """Reshard a TP1 checkpoint into TP/SP/CP and compare KDA forward and backward."""
+    layout = "contiguous" if linear_cp_mode == "chunkwise" else "zigzag"
+    config = _make_config(
+        two_stage_gates=two_stage_gates, linear_cp_mode=linear_cp_mode, linear_cp_layout=layout
+    )
+    _test_parallel_attention_correctness(
+        transformer_config=config,
+        transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=1e-2,
+        rtol=1e-2,
+        # BF16 parallel reductions need a separate input-gradient tolerance, as on dev.
+        input_grad_atol=_KDA_INPUT_GRAD_ATOL,
+        input_grad_rtol=1e-2,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=42,
+        sequence_length=128,
+        # Three packed sequences put the CP2 boundary inside the middle sequence.
+        micro_batch_size=3 if linear_cp_mode == "chunkwise" else 2,
+        sequence_packing=sequence_packing,
+        cp_partition_mode=layout,
+    )
 
 
 @pytest.mark.parametrize("recompute_module", ["gdn_norm_out", "gdn"])

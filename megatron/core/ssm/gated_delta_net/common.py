@@ -22,6 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -93,11 +94,16 @@ def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return _TorchL2Norm.apply(x, eps)
 
 
+def _kda_fp8_disabled(config: TransformerConfig) -> bool:
+    # Copied GDN layer configs can carry KDA settings from the stack config too.
+    return isinstance(config, KDALayerConfig) and config.kda_disable_fp8
+
+
 def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
     """Build a KDA projection without quantized parameter initialization when requested."""
     init_context = (
         get_fp8_disabled_context(fp8_config, is_init=True)
-        if getattr(fp8_config, "kda_disable_fp8", False)
+        if _kda_fp8_disabled(fp8_config)
         else nullcontext()
     )
     with init_context:
@@ -257,7 +263,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8 and not getattr(self.config, "kda_disable_fp8", False):
+        if self.config.fp8 and not _kda_fp8_disabled(self.config):
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN layer "
