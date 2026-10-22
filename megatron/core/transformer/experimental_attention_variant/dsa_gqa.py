@@ -1068,8 +1068,6 @@ class DSGQACoreAttention(MegatronModule):
                 indexer=self.indexer,
                 softmax_scale=self.softmax_scale,
                 use_indexer_rope=use_indexer_rope,
-                query_chunk_size=None,
-                key_chunk_size=None,
                 simplified_input_norm=indexer_input_norm,
                 cache_indexer_k=_dsa_caches_indexer_k(self.config),
                 use_triton=dsa_kernel_backend == "min-memory-triton",

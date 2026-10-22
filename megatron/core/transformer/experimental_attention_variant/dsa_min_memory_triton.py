@@ -1174,15 +1174,17 @@ def _dsa_sparse_attention_forward_kernel(
             mask=valid[:, None] & (offs_dv[None, :] < VALUE_DIM),
             other=0.0,
         )
+        # Match the reference attention and decode: round probabilities to the
+        # value dtype before PV, regardless of which hardware path computes it.
+        if VALUE_DTYPE == 1:
+            probs_for_value = probs.to(tl.float16)
+        elif VALUE_DTYPE == 2:
+            probs_for_value = probs.to(tl.bfloat16)
+        else:
+            probs_for_value = probs
         if USE_DOT_MMA:
             # Fast path (Hopper sm_90 and earlier): pad `probs` into a 16-row
             # matrix and use tl.dot (tensor-core MMA) for the weighted value sum.
-            if VALUE_DTYPE == 1:
-                probs_for_value = probs.to(tl.float16)
-            elif VALUE_DTYPE == 2:
-                probs_for_value = probs.to(tl.bfloat16)
-            else:
-                probs_for_value = probs
             dot_rows = tl.arange(0, 16)
             probs_for_dot = tl.where(dot_rows[:, None] == 0, probs_for_value[None, :], 0.0)
             if VALUE_DTYPE == 1:
@@ -1196,7 +1198,7 @@ def _dsa_sparse_attention_forward_kernel(
             # through the TMEM/tcgen05 path and hits a Triton 3.7 automatic-
             # warp-specialization / SSA dominance bug. Express the matvec as an
             # elementwise reduction (no MMA, no warp-spec); numerically identical.
-            out_acc += tl.sum(probs[:, None] * v.to(tl.float32), axis=0)
+            out_acc += tl.sum(probs_for_value.to(tl.float32)[:, None] * v.to(tl.float32), axis=0)
 
     tl.store(
         output_ptr
