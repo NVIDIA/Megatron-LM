@@ -35,6 +35,10 @@ Paths:
 The ordered all-reduce of large messages is ordered reduce-scatter + all-gather.
 Only forward reductions use these paths; backward keeps the stock collectives.
 
+With ``batch_invariant_tp_shards`` (see the last section) the partials are those of fixed
+reduction-dim shards rather than of TP ranks, so the bits do not depend on the TP size either.
+A rank that owns several shards passes one partial per shard to the paths above.
+
 ``batch_invariant_collective="multimem"`` (the EP combine's exact-sum setting) switches every
 path to an fp64 accumulator with one rounding to fp32 before the final cast. All paths stay
 bitwise identical to each other in either setting.
@@ -55,6 +59,20 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.utils import null_decorator
+
+try:
+    import fused_weight_gradient_mlp_cuda
+
+    HAVE_GRAD_ACCUM_FUSION = True
+except ImportError:
+    HAVE_GRAD_ACCUM_FUSION = False
+
+try:
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 try:
     import triton
@@ -234,7 +252,7 @@ def _push_chunk(
     C: tl.constexpr = 1,
     src_part_stride=0,
 ):
-    """Store this rank's partial(s) of output chunk [block_start, +BLOCK) into every peer's staging."""
+    """Store this rank's C partials of chunk [block_start, +BLOCK) into every peer's staging."""
     offs = block_start + lane
     mask = offs < n
     stage_base = ((slot * nb + pid) * WORLD_SIZE * C).to(tl.int64) * BLOCK
@@ -456,9 +474,9 @@ def _push_staging_bytes(world_size: int, num_parts: int = 1) -> int:
 def _push_staging(group, tensor: torch.Tensor, num_parts: int = 1):
     """The symmetric staging handle for the push reduce-scatter on ``group``, or None.
 
-    The staging is fixed-size: 2 x max_num_blocks x TP x 32 KiB per rank (32 MiB at TP 4,
-    64 MiB at TP 8), independent of the message size. It is allocated (collectively) on
-    the first eligible call; outside of a CUDA-graph capture.
+    The staging is fixed-size: 2 x max_num_blocks x TP x num_parts x 32 KiB per rank (32 MiB
+    at TP 4 with one partial, 64 MiB at TP 8), independent of the message size. It is
+    allocated (collectively) on the first eligible call; outside of a CUDA-graph capture.
     """
     if not (
         USE_SYMM_PUSH
@@ -770,8 +788,10 @@ def ordered_reduce_scatter_shards(
     """Reduce-scatter along dim 1 of every rank's shard partials, folded in global shard order.
 
     ``parts`` is ``[c, M, ...]``: this rank's c shard partials. Returns ``[M / TP, ...]``.
-    Per rank: one copy of the partials into destination order, one all-to-all of
-    c x (TP-1)/TP of the output size, and one fold over TP x c partials.
+    A rank sends c x (TP-1)/TP of one partial's size (c times a reduce-scatter): the fold
+    order cannot be pre-combined per rank without changing the bits. With symmetric memory
+    the push kernel folds the TP x c partials; otherwise one batch of NCCL sends/receives
+    and a fold pass.
     """
     c = parts.shape[0]
     world_size = 1 if group is None else group.size()
@@ -837,27 +857,21 @@ def _accumulate_wgrad(weight: torch.Tensor, grad_out2d: torch.Tensor, input2d: t
     main_grad = getattr(weight, "main_grad", None)
     if main_grad is None:
         return grad_out2d.t().matmul(input2d)
-    try:
-        import fused_weight_gradient_mlp_cuda
-
-        if main_grad.dtype == torch.float32:
-            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(input2d, grad_out2d, main_grad)
-        else:
-            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(input2d, grad_out2d, main_grad)
-    except ImportError:
+    if HAVE_GRAD_ACCUM_FUSION and main_grad.dtype == torch.float32:
+        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(input2d, grad_out2d, main_grad)
+    elif HAVE_GRAD_ACCUM_FUSION and main_grad.dtype in (torch.float16, torch.bfloat16):
+        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(input2d, grad_out2d, main_grad)
+    else:
         main_grad.add_(grad_out2d.t().matmul(input2d).to(main_grad.dtype))
     if not hasattr(weight, "grad_added_to_main_grad"):
         return None
     weight.grad_added_to_main_grad = True
     # A dummy gradient keeps the DDP backward hooks on the main backprop thread.
-    try:
-        from transformer_engine.pytorch.module.base import get_dummy_wgrad
-
-        return get_dummy_wgrad(
-            list(main_grad.shape), input2d.dtype, zero=getattr(weight, "zero_out_wgrad", False)
-        )
-    except ImportError:
-        return torch.zeros(main_grad.shape, dtype=input2d.dtype, device=input2d.device)
+    zero = getattr(weight, "zero_out_wgrad", False)
+    if HAVE_TE:
+        return get_dummy_wgrad(list(main_grad.shape), input2d.dtype, zero=zero)
+    factory = torch.zeros if zero else torch.empty
+    return factory(main_grad.shape, dtype=input2d.dtype, device=input2d.device)
 
 
 class _TPShardRowLinear(torch.autograd.Function):
@@ -870,6 +884,7 @@ class _TPShardRowLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad):
+        """Shard partials of x @ weight.T, reduced (SP: reduce-scattered) in shard order."""
         parts = row_parallel_shard_partials(x, weight, num_shards)
         if sequence_parallel:
             out = ordered_reduce_scatter_shards(parts, group)
@@ -883,6 +898,7 @@ class _TPShardRowLinear(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Stock row-parallel backward (all-gather under SP, full local-K GEMMs)."""
         x, weight = ctx.saved_tensors
         group = ctx.group
         world_size = 1 if group is None else group.size()
@@ -941,4 +957,3 @@ def symm_ordered_reduce_scatter_shards(
         symm_mem_hdl, byte_offset // elem + symm_mem_hdl.rank * n_out, span, parts.dtype
     )
     return _launch_pull(views, output, symm_mem_hdl, exact, num_parts=c, part_stride=part_numel)
-

@@ -1404,13 +1404,13 @@ class TELinear(te.pytorch.Linear):
         # its bits do not depend on the TP size (tensor_parallel/ordered_reduce.py). With one
         # shard per rank that is the ordered TP reduction below; with several, forward() computes
         # the rank's shards itself (the backward stays the stock row-parallel one).
-        tp_shards = getattr(self.config, "batch_invariant_tp_shards", None)
+        tp_shards = self.config.batch_invariant_tp_shards
         self._bi_tp_local_shards = (
             divide(tp_shards, tp_size)
             if (
                 tp_shards
                 and parallel_mode == "row"
-                and not explicit_expert_comm
+                and not is_expert
                 and self.config.batch_invariant_mode
             )
             else 1

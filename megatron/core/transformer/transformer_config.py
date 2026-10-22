@@ -1458,7 +1458,8 @@ class TransformerConfig(ModelParallelConfig):
     same bits, so training and inference can use different TP sizes. At TP equal to this
     value each rank owns one shard and the reduction is the ordered TP reduction; at a
     smaller TP each rank computes its shards in one batched GEMM and sends one partial per
-    shard. None (default) keeps the reduction tied to the TP size."""
+    shard (BF16 only); the backward is the stock row-parallel one. None (default) keeps the
+    reduction tied to the TP size."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -4180,7 +4181,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.batch_invariant_tp_shards is not None:
-            assert self.batch_invariant_mode, "batch_invariant_tp_shards requires batch_invariant_mode"
+            assert (
+                self.batch_invariant_mode
+            ), "batch_invariant_tp_shards requires batch_invariant_mode"
             assert self.batch_invariant_tp_shards >= 1 and (
                 self.batch_invariant_tp_shards % self.tensor_model_parallel_size == 0
             ), (

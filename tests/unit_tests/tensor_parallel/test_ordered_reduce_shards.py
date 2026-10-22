@@ -178,3 +178,36 @@ class TestTERowParallelShards:
                 if grad:
                     out.float().square().sum().backward()
                     assert xg.grad is not None and layer.weight.grad is not None
+
+    def test_expert_row_parallel_keeps_its_reduction(self):
+        """Routed-expert linears are not split into shards (their reduction is not covered)."""
+        from megatron.core.extensions.transformer_engine import TERowParallelLinear
+        from megatron.core.transformer.enums import AttnBackend
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        Utils.initialize_model_parallel(2, 1, expert_tensor_parallel_size=1)
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            batch_invariant_mode=True,
+            batch_invariant_tp_shards=4,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        kw = dict(
+            config=cfg,
+            init_method=lambda w: None,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=True,
+        )
+        assert TERowParallelLinear(1024, 256, is_expert=False, **kw)._bi_tp_local_shards == 2
+        assert TERowParallelLinear(1024, 256, is_expert=True, **kw)._bi_tp_local_shards == 1

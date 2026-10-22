@@ -29,8 +29,8 @@ from megatron.core.tensor_parallel.ordered_reduce import (
     can_use_symm_pull,
     ordered_reduce_scatter_shards,
     row_parallel_shard_partials,
-    symm_ordered_reduce_scatter_shards,
     symm_ordered_reduce_scatter,
+    symm_ordered_reduce_scatter_shards,
     use_ordered_tp_reduce,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -474,6 +474,8 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         it will revert to torch.dist (NCCL) reduce-scatter.
         """
         use_mxfp8 = isinstance(self.weight, MXFP8Tensor)
+        if self._bi_tp_local_shards > 1:
+            return self._matmul_shards_reduce(x, use_mxfp8)
         symm_mem_buffer_dims = list(x.size())
         if use_mxfp8:
             # Remove seq_len dimension for MXFP8 (mm_mxfp8 squeezes internally)
@@ -482,8 +484,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(symm_mem_buffer_dims, dtype=x.dtype)
 
-        if self._bi_tp_local_shards > 1:
-            return self._matmul_shards_reduce(x, use_mxfp8)
         if use_ordered_tp_reduce(self.tp_group, x.dtype):
             return self._matmul_ordered_reduce_scatter(x, symm_mem_buffer, use_mxfp8)
 
