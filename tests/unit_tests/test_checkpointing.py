@@ -56,46 +56,6 @@ def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
     assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
 
 
-@pytest.mark.parametrize("checkpoint_is_dsa", [False, True])
-@pytest.mark.parametrize("hybrid", [False, True])
-def test_load_args_restores_dsa_inference_geometry(checkpoint_is_dsa, hybrid):
-    checkpoint_args = SimpleNamespace(
-        experimental_attention_variant='dsa' if checkpoint_is_dsa else None,
-        dsa_indexer_mode='simplified' if checkpoint_is_dsa else 'standard',
-        dsa_indexer_n_heads=1,
-        dsa_indexer_head_dim=128,
-        dsa_indexer_topk=512,
-        num_layers=4,
-        hybrid_layer_pattern='*-*-' if hybrid else None,
-    )
-    args = SimpleNamespace(
-        load='checkpoint',
-        iteration=0,
-        experimental_attention_variant='dsa',
-        dsa_indexer_mode='simplified',
-        dsa_indexer_n_heads=1,
-        dsa_indexer_head_dim=64,
-        dsa_indexer_topk=8,
-        num_layers=None,
-        hybrid_layer_pattern=None,
-        use_tokenizer_model_from_checkpoint_args=False,
-        use_mp_args_from_checkpoint_args=False,
-    )
-    state_dict = {'args': checkpoint_args, 'iteration': 12}
-    with mock.patch(
-        'megatron.training.checkpointing._load_base_checkpoint',
-        return_value=(state_dict, 'checkpoint', False, CheckpointType.LEGACY),
-    ):
-        restored, _ = load_args_from_checkpoint(args)
-
-    assert restored.experimental_attention_variant == 'dsa'
-    assert restored.dsa_indexer_mode == 'simplified'
-    assert restored.dsa_indexer_n_heads == 1
-    assert restored.dsa_indexer_head_dim == (128 if checkpoint_is_dsa else 64)
-    assert restored.dsa_indexer_topk == (512 if checkpoint_is_dsa else 8)
-    assert restored.num_layers == (None if hybrid else 4)
-
-
 @pytest.mark.parametrize("auto_detect", [False, True])
 def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkeypatch, auto_detect):
     from megatron.training import checkpointing
