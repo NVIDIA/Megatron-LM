@@ -583,6 +583,8 @@ class ModelParallelConfig:
                 )
             if self.min_dynamic_context_parallel_size < 1:
                 raise ValueError("min_dynamic_context_parallel_size must be at least 1")
+            if self.deterministic_mode:
+                raise ValueError("Dynamic context parallelism does not support deterministic_mode")
         elif self.sequence_packing_scheduler == 'default_dynamic_cp':
             raise ValueError(
                 "sequence_packing_scheduler='default_dynamic_cp' requires "

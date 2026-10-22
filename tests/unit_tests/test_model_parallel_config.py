@@ -31,6 +31,31 @@ def test_default_dynamic_cp_scheduler_requires_dynamic_cp():
         )
 
 
+@pytest.mark.parametrize("use_legacy_alias", [False, True])
+def test_dynamic_cp_rejects_deterministic_mode(use_legacy_alias):
+    options = {"hybrid_context_parallel" if use_legacy_alias else "dynamic_context_parallel": True}
+    if use_legacy_alias:
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            with pytest.raises(ValueError, match="does not support deterministic_mode"):
+                ModelParallelConfig(
+                    **options, deterministic_mode=True, max_seqlen_per_dp_cp_rank=4096
+                )
+    else:
+        with pytest.raises(ValueError, match="does not support deterministic_mode"):
+            ModelParallelConfig(**options, deterministic_mode=True, max_seqlen_per_dp_cp_rank=4096)
+
+
+def test_static_packing_preserves_deterministic_mode():
+    config = ModelParallelConfig(
+        sequence_packing_scheduler="dp_balanced",
+        deterministic_mode=True,
+        max_seqlen_per_dp_cp_rank=4096,
+    )
+
+    assert config.deterministic_mode
+    assert not config.dynamic_context_parallel
+
+
 def test_hybrid_cp_alias_normalizes_to_dynamic_cp():
     with pytest.warns(DeprecationWarning, match="deprecated"):
         config = ModelParallelConfig(hybrid_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
