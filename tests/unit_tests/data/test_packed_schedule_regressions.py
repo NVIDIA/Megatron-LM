@@ -96,7 +96,7 @@ def test_cp_slice_respects_pipeline_field_ownership(
         pg_collection=ProcessGroupCollection(
             tp=_group(1), pp=_group(3, pp_rank), cp=cp, dynamic_cp={2: cp}
         ),
-        config=SimpleNamespace(),
+        config=SimpleNamespace(sequence_parallel=False),
     )
     expected = torch.tensor([0, 1, 6, 7] if cp_rank == 0 else [2, 3, 4, 5]).view(1, -1)
     for key, tensor in zip(
