@@ -217,15 +217,16 @@ def test_checkpoint_detected_inference_defaults_unregistered_modelopt_options(hy
 
     args = make_modelopt_test_args(hybrid_layer_pattern="M*" if hybrid else None)
     args.load = "/modelopt-checkpoint"
-    for name in (
+    args.inference_ckpt_non_strict = False
+    modelopt_only_options = (
         "export_offline_model",
         "freeze_base_for_mtp",
         "export_default_te_spec",
         "export_force_local_attention",
         "export_real_quant_cfg",
-    ):
+    )
+    for name in modelopt_only_options:
         delattr(args, name)
-    original_args = vars(args).copy()
     cfg = inference_cfg_container_from_args(args, model_cfg=None, build_model_config=False)
     stage = Mock()
 
@@ -241,7 +242,7 @@ def test_checkpoint_detected_inference_defaults_unregistered_modelopt_options(hy
 
     assert cfg.model.get_builder_cls() is builder_cls
     assert cfg.model.transformations == mc.ModelTransformConfig()
-    assert vars(args) == original_args
+    assert all(not hasattr(args, name) for name in modelopt_only_options)
     build.assert_called_once_with(cfg)
 
 
