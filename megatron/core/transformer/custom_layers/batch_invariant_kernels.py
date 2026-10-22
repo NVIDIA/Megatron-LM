@@ -542,11 +542,25 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             f"The DeepGEMM batch-invariant backend requires bf16 inputs "
             f"(got {a.dtype}); use backend='triton' for fp16/fp32."
         )
+    # TMA descriptors require 16-byte outer strides, not padded logical shapes.
+    stride_alignment = 16 // a.element_size()
+
+    def _align_outer_stride(t: torch.Tensor) -> torch.Tensor:
+        if t.stride(0) % stride_alignment == 0:
+            return t
+        outer_stride = (t.shape[1] + stride_alignment - 1) // stride_alignment * stride_alignment
+        aligned = t.new_empty_strided(t.shape, (outer_stride, 1))
+        aligned.copy_(t)
+        return aligned
+
+    a = _align_outer_stride(a)
+    b = _align_outer_stride(b)
     M = a.shape[0]
     N = b.shape[1]
-    d = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    output_stride = (N + stride_alignment - 1) // stride_alignment * stride_alignment
+    d = a.new_empty_strided((M, N), (output_stride, 1))
     deep_gemm.bf16_gemm_nn(a, b, d)
-    return d
+    return d.contiguous()
 
 
 def mm_batch_invariant(a, b):

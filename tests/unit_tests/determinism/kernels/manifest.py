@@ -625,6 +625,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_inference_kernels.py",
             K + "test_te_wrappers.py",
             "tests/unit_tests/transformer/test_te_layers_batch_invariant.py",
+            "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
     ),
