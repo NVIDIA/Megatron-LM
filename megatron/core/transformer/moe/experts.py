@@ -21,7 +21,10 @@ from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -383,6 +386,15 @@ class TEGroupedMLP(MegatronModule):
             and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
             and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
         )
+        # Routed expert inputs use the same alignment via get_align_size_for_quantization.
+        # Probe once here to keep signature inspection out of the first forward pass.
+        # Older TE versions select fusion through the legacy environment variable instead.
+        self._grouped_linear_kwargs = {}
+        if self._with_fused_impl:
+            if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
+                self._grouped_linear_kwargs["split_alignment"] = (
+                    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+                )
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
@@ -594,8 +606,7 @@ class TEGroupedMLP(MegatronModule):
             return False
 
         # TE can execute GroupedLinear -> activation -> GroupedLinear without a fused kernel.
-        # Leave CuTeDSL enablement and layout checks to TE's fusion matcher so disabling
-        # NVTE_CUTEDSL_FUSED_GROUPED_MLP does not disable the basic op-fuser path.
+        # Leave CuTeDSL eligibility and layout checks to TE's fusion matcher.
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
@@ -669,6 +680,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
+            **self._grouped_linear_kwargs,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
@@ -778,6 +790,7 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc2_delay_wgrad_compute,
             # Preserve p * (FC2(x) + bias) after the scaled activation moves p before FC2.
             **fc2_bias_kwargs,
+            **self._grouped_linear_kwargs,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
@@ -876,8 +889,8 @@ class TEGroupedMLP(MegatronModule):
             pass
         # Regular AllToAll normally reaches this branch because its permutation does not insert
         # the padding needed by the fused grouped-MLP contract. FP8/FP4 require recipe-specific
-        # alignment, while the TE operation-fuser grouped-tensor path currently uses 256-token
-        # expert segments.
+        # alignment, while the TE operation-fuser grouped-tensor path requires expert segments
+        # aligned to TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT.
         elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
@@ -906,8 +919,6 @@ class TEGroupedMLP(MegatronModule):
                 "The Transformer Engine operation-fuser MoE path requires "
                 "moe_use_grouped_tensor=True."
             )
-        # if the number of tokens is 0, pad the hidden states to 256
-
         if self.config.moe_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
             max_num_tokens = permuted_local_hidden_states.shape[0]

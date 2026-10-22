@@ -763,6 +763,19 @@ class TestArgumentGroupFactoryHelpers:
         result = factory._extract_type(Optional[str])
         assert result == {"type": str}
 
+    @pytest.mark.parametrize('annotation', [int | None, None | int, Union[None, int]])
+    def test_extract_type_optional_order(self, annotation):
+        factory = ArgumentGroupFactory(DummyConfig)
+        assert factory._extract_type(annotation) == {"type": int}
+
+    @pytest.mark.parametrize(
+        'annotation', [int | list[int | None] | None, int | None | list[int | None]]
+    )
+    def test_extract_type_ambiguous_union_needs_metadata(self, annotation):
+        factory = ArgumentGroupFactory(DummyConfig)
+        with pytest.raises(TypeInferenceError, match="Unions not supported by argparse"):
+            factory._extract_type(annotation)
+
     def test_extract_type_list(self):
         """Test type extraction for list types."""
         factory = ArgumentGroupFactory(DummyConfig)
@@ -1061,6 +1074,19 @@ class TestArgumentGroupFactoryArgparseMeta:
 
         with pytest.raises(ArgumentError, match="invalid choice"):
             args = parser.parse_args(['--unsupported-with-metadata', 'baz'])
+
+    def test_eval_iters_cli_remains_scalar(self, capsys):
+        from megatron.training.config import ValidationConfig
+
+        parser = ArgumentParser(exit_on_error=False)
+        ArgumentGroupFactory(ValidationConfig).build_group(parser)
+
+        assert parser.parse_args([]).eval_iters == 100
+        assert parser.parse_args(['--eval-iters', '7']).eval_iters == 7
+        with pytest.raises(ArgumentError, match="invalid int value"):
+            parser.parse_args(['--eval-iters', 'invalid'])
+        assert ValidationConfig(eval_iters=[7, None]).eval_iters == [7, None]
+        assert 'Inferring the appropriate argparse argument type' not in capsys.readouterr().out
 
 
 class TestMegatronNetworkArgumentGeneration:

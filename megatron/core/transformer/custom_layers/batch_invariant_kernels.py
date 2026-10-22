@@ -1672,7 +1672,7 @@ def te_supports_batch_invariant_grouped_gemm(device: int | None = None) -> bool:
     """Whether TE device-metadata GEMM has been validated on this GPU/library pair.
 
     This path cannot use workspace starvation. Keep the numerical validation
-    boundary explicit; 256-row expert padding alone does not guarantee invariance.
+    boundary explicit; aligned expert padding alone does not guarantee invariance.
     """
     import transformer_engine_torch as tex
 
