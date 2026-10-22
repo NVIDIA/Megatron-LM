@@ -1,10 +1,10 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Protocol
 
 import torch
@@ -23,6 +23,11 @@ from megatron.core.transformer.moe.megakernel import (
     prepare_megakernel_shared_expert_config,
 )
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
+from megatron.core.transformer.moe.moe_scheduler import (
+    MoEScheduler,
+    SchedulerContext,
+    validate_scheduler_environment,
+)
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -205,6 +210,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.config = config
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
+        self.pg_collection = pg_collection
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.attn_tp_group = pg_collection.tp
@@ -213,8 +219,18 @@ class BaseMoELayer(MegatronModule, ABC):
         assert ep_size > 0, "Expected non-negative expert parallel size"
 
         assert self.config.num_moe_experts % ep_size == 0
-        self.num_local_experts = self.config.num_moe_experts // ep_size
+        self.num_logical_experts = self.config.num_moe_experts
+        self.num_local_home_experts = self.num_logical_experts // ep_size
+        self.num_idle_experts = (
+            self.config.moe_scheduler_num_idle_experts or 0
+            if self.config.moe_enable_scheduler
+            else 0
+        )
+        self.num_physical_experts = self.num_logical_experts + self.num_idle_experts
+        assert self.num_physical_experts % ep_size == 0
+        self.num_local_experts = self.num_physical_experts // ep_size
         local_expert_indices_offset = ep_rank * self.num_local_experts
+        local_home_expert_indices_offset = ep_rank * self.num_local_home_experts
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
@@ -222,11 +238,17 @@ class BaseMoELayer(MegatronModule, ABC):
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
-        assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+        self.local_home_expert_indices = [
+            local_home_expert_indices_offset + i for i in range(self.num_local_home_experts)
+        ]
+        self.home_expert_indices = list(range(self.num_local_home_experts))
+        self.idle_expert_indices = list(range(self.num_local_home_experts, self.num_local_experts))
+        assert all(map(lambda x: x < self.num_physical_experts, self.local_expert_indices))
         self.router: RouterInterface = None
         self.experts = None
         self.shared_experts = None
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
+        self.moe_scheduler: Optional[MoEScheduler] = None
         self.layer_number = layer_number
 
     @abstractmethod
@@ -269,6 +291,8 @@ class MoELayer(BaseMoELayer):
         # Initialize process groups with the global parallel_state.
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
+        if config.moe_enable_scheduler:
+            validate_scheduler_environment(config, pg_collection)
         super(MoELayer, self).__init__(
             config=config,
             layer_number=layer_number,
@@ -299,6 +323,7 @@ class MoELayer(BaseMoELayer):
         if layer_number is not None:
             self.router.set_layer_number(layer_number)
         self.tp_group = pg_collection.tp
+        self._token_dispatcher_config = self._get_token_dispatcher_config()
 
         # Initialize latent projections.
         if self.config.moe_latent_size:
@@ -392,21 +417,21 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher = MoEAllGatherTokenDispatcher(
                     self.num_local_experts,
                     self.local_expert_indices,
-                    config=self.config,
+                    config=self._token_dispatcher_config,
                     pg_collection=pg_collection,
                 )
             elif config.moe_token_dispatcher_type == "alltoall":
                 self.token_dispatcher = MoEAlltoAllTokenDispatcher(
                     self.num_local_experts,
                     self.local_expert_indices,
-                    config=self.config,
+                    config=self._token_dispatcher_config,
                     pg_collection=pg_collection,
                 )
             elif config.moe_token_dispatcher_type == "flex":
                 self.token_dispatcher = MoEFlexTokenDispatcher(
                     self.num_local_experts,
                     self.local_expert_indices,
-                    config=self.config,
+                    config=self._token_dispatcher_config,
                     pg_collection=pg_collection,
                 )
             else:
@@ -414,13 +439,23 @@ class MoELayer(BaseMoELayer):
                     f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
                 )
 
+        self._moe_scheduler_context_cache: dict[bool, SchedulerContext] = {}
+        self.moe_scheduler = self._build_moe_scheduler(pg_collection)
+
         # Initialize experts
+        expert_module_num_local_experts = (
+            self.num_local_home_experts
+            if self.config.moe_enable_scheduler
+            else self.num_local_experts
+        )
         self.experts = self.submodules.experts(
-            self.num_local_experts,
+            expert_module_num_local_experts,
             self.config,
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        if self.moe_scheduler is not None:
+            self.moe_scheduler.bind_experts(self.experts)
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -504,6 +539,70 @@ class MoELayer(BaseMoELayer):
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
 
+    def _get_token_dispatcher_config(self) -> TransformerConfig:
+        """Return the config view used by token dispatchers.
+
+        Router/planner operate on logical experts. Token dispatchers operate after
+        MoEScheduler has expanded the route map to physical experts, so their config
+        needs the physical expert count.
+        """
+        if not self.config.moe_enable_scheduler:
+            return self.config
+        return replace(
+            self.config,
+            num_moe_experts=self.num_physical_experts,
+            moe_enable_scheduler=False,
+            # The enclosing layer owns graph capture. This physical-layout
+            # config constructs only the token dispatcher, not another MoE
+            # layer or graph. Retaining the logical layer's capture policy
+            # would incorrectly validate it as a standalone, scheduler-free
+            # dropless MoE. Dispatcher kernels still run in the outer graph.
+            cuda_graph_impl="none",
+            cuda_graph_modules=[],
+        )
+
+    def _build_moe_scheduler(self, pg_collection: ProcessGroupCollection) -> Optional[MoEScheduler]:
+        """Instantiate MoEScheduler from TransformerConfig."""
+        if not self.config.moe_enable_scheduler:
+            return None
+        return MoEScheduler.from_config(self.config, pg_collection)
+
+    def _build_scheduler_context(self) -> SchedulerContext:
+        """Build the logical expert context consumed by MoEScheduler."""
+        cached_context = self._moe_scheduler_context_cache.get(self.training)
+        if cached_context is not None:
+            return cached_context
+
+        context = SchedulerContext(
+            layer_number=self.layer_number,
+            num_logical_experts=self.num_logical_experts,
+            num_local_experts=self.num_local_home_experts,
+            local_expert_indices=tuple(self.local_home_expert_indices),
+            ep_size=utils.get_pg_size(self.ep_group),
+            ep_rank=utils.get_pg_rank(self.ep_group),
+            router_topk=self.config.moe_router_topk,
+            training=self.training,
+            config=self.config,
+            pg_collection=self.pg_collection,
+        )
+        self._moe_scheduler_context_cache[self.training] = context
+        return context
+
+    def _maybe_schedule_moe(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply MoEScheduler and return token-dispatcher-ready probs/routing_map."""
+        if self.moe_scheduler is None:
+            return probs, routing_map
+
+        context = self._build_scheduler_context()
+        probs, routing_map = self.moe_scheduler.schedule(probs, routing_map, self.experts, context)
+        self.token_dispatcher.set_dispatch_route_bound(
+            self.moe_scheduler.max_dispatch_routes_per_rank,
+            padded_tokens=self.moe_scheduler.max_dispatch_padded_tokens_per_rank,
+        )
+        return probs, routing_map
+
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher.
 
@@ -522,7 +621,7 @@ class MoELayer(BaseMoELayer):
         self._inference_token_dispatcher = dispatcher_cls(
             self.num_local_experts,
             self.local_expert_indices,
-            config=self.config,
+            config=self._token_dispatcher_config,
             pg_collection=pg_collection,
         )
 
@@ -745,11 +844,19 @@ class MoELayer(BaseMoELayer):
             local_balanced_count = local_balanced_count / tp_ep_world_size
         local_balanced = torch.empty((), device=dispatched_input.device, dtype=torch.float32)
         local_balanced.fill_(local_balanced_count)
+        # Nested MTP blocks restart their layer numbering. Use the same MTP
+        # logging offset as the router so their records cannot alias the decoder.
+        logging_layer_number = self.layer_number
+        if self.is_mtp_layer:
+            mtp_layer_number = getattr(self.router, "mtp_layer_number", None) or self.layer_number
+            if self.config.mtp_num_layers is not None:
+                mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
+            logging_layer_number = self.config.num_layers + mtp_layer_number
         return record_dispatch_token_counts(
             tensor=dispatched_input,
             tokens_per_expert=tokens_per_expert,
             local_balanced_token_count=local_balanced,
-            layer_number=self.layer_number,
+            layer_number=logging_layer_number,
         )
 
     @internal_api
@@ -907,6 +1014,8 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
+                    if self.moe_scheduler is not None:
+                        hidden_states = self.moe_scheduler.wrap_layer_input(hidden_states)
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     if self.config.log_moe_overload_factor and self.training:
                         self._overload_log_num_local_tokens = (
@@ -915,6 +1024,7 @@ class MoELayer(BaseMoELayer):
                     probs, routing_map = self.route(
                         hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
                     )
+                    probs, routing_map = self._maybe_schedule_moe(hidden_states, probs, routing_map)
                     hidden_states, probs = self.preprocess(
                         hidden_states, probs, routing_map, padding_mask
                     )
@@ -934,12 +1044,20 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                if self.moe_scheduler is not None:
+                    hidden_states = self.moe_scheduler.before_token_dispatch(hidden_states)
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+                if self.moe_scheduler is not None:
+                    dispatched_input = self.moe_scheduler.after_token_dispatch(dispatched_input)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                if self.moe_scheduler is not None:
+                    output = self.moe_scheduler.before_token_combine(output)
                 output = self.combine(output)
+                if self.moe_scheduler is not None:
+                    output = self.moe_scheduler.after_token_combine(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias

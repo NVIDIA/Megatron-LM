@@ -109,11 +109,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
-    # Own generator: otherwise _BaseDataLoaderIter draws _base_seed from the default CPU generator
-    # on ITERATOR creation, after load_checkpoint has restored it. initial_seed() reads the seed
-    # without consuming a draw.
-    loader_generator = torch.Generator()
-    loader_generator.manual_seed(torch.initial_seed())
+    # DataLoader draws a worker base seed when creating each iterator, even
+    # with zero workers. Keep that draw off the training RNG: rebuilding an
+    # iterator after checkpoint restore must not advance the restored state.
+    # Clone the current state so worker seeding retains the caller's seed/rank
+    # context without sharing ownership of the default CPU generator.
+    loader_generator = torch.Generator().set_state(torch.get_rng_state())
     if args.sequence_packing_scheduler is not None and args.num_workers > 0 and not is_eval:
         # Keep a full next global batch in flight for packing schedulers.
         items_per_step = args.global_batch_size // (

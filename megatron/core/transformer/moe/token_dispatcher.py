@@ -1204,6 +1204,9 @@ class _HybridEPManager(_DispatchManager):
             )
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+        self.max_dispatch_routes_per_rank: Optional[int] = None
+        self.max_dispatch_padded_tokens_per_rank: Optional[int] = None
+        self._using_planner_capacity = False
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
         # When runtime token equalization is enabled, HybridEP metadata and hidden
         # states are padded to the group-wide max and trimmed again in combine.
@@ -1218,6 +1221,8 @@ class _HybridEPManager(_DispatchManager):
     ):
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
+        self._using_planner_capacity = False
+        self.num_permuted_tokens = None
 
         padded_num_tokens = num_tokens
         if self.config.moe_hybridep_pad_variable_tokens:
@@ -1299,7 +1304,23 @@ class _HybridEPManager(_DispatchManager):
 
         self.token_probs = probs
 
-        if self.moe_expert_rank_capacity_factor is not None:
+        if (
+            self.max_dispatch_routes_per_rank is not None
+            and self.config.moe_expert_rank_capacity_factor is None
+            and not self.drop_and_pad
+            and not self.config.moe_hybridep_pad_variable_tokens
+        ):
+            # A planner guarantee is distinct from an explicit user budget.
+            # Never re-enable it during PagedStashRunner's explicit-budget retry.
+            alignment = max(1, get_align_size_for_quantization(self.config))
+            capacity = self.max_dispatch_padded_tokens_per_rank
+            if capacity is None:
+                capacity = self.max_dispatch_routes_per_rank + self.num_local_experts * (
+                    alignment - 1
+                )
+            self.num_permuted_tokens = capacity + (-capacity % alignment)
+            self._using_planner_capacity = True
+        elif self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)
             # Static upper bound on permuted tokens passed to HybridEP (dropless EP rank
             # budget). Tokens above this budget are dropped inside HybridEP; dispatch then
@@ -1312,8 +1333,8 @@ class _HybridEPManager(_DispatchManager):
             # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
-        # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
-        # in dispatch) and does not drop tokens or report overflow.
+        # Without a planner guarantee or explicit budget, HybridEP sizes buffers
+        # dynamically (CPU sync in dispatch) without dropping routes.
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = padded_num_tokens * self.config.moe_router_topk
@@ -1370,19 +1391,26 @@ class _HybridEPManager(_DispatchManager):
                 num_of_experts=self.num_experts,
             )
         )
-        if self.moe_expert_rank_capacity_factor is not None:
+        if self.moe_expert_rank_capacity_factor is not None or self._using_planner_capacity:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
             over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
-        # When capacity factor is None, skip overflow tracking (no token drops). Actual
-        # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
+            if self._using_planner_capacity:
+                # This is a violated planner contract, not an undersized user
+                # budget. Fail on the GPU stream before expert compute/update;
+                # do not silently drop routes or add a host sync to every layer.
+                torch._assert_async(
+                    ~over_budget.any(), "MoE planner dispatch capacity guarantee was exceeded"
+                )
+        # Only the fully dynamic path has no overflow tracking. Its actual
+        # permuted size is resolved below for combine's output allocation.
 
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.moe_expert_rank_capacity_factor is not None:
+        if self.moe_expert_rank_capacity_factor is not None or self._using_planner_capacity:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
@@ -2474,6 +2502,31 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         every manager must re-derive it, not just the one that happens to dispatch first."""
         if hasattr(self._comm_manager, '_bootstrapped'):
             self._comm_manager._bootstrapped = False
+
+    def set_dispatch_route_bound(
+        self, max_routes: Optional[int], *, padded_tokens: Optional[int] = None
+    ) -> None:
+        """Pass route and optional already-padded capacity guarantees to HybridEP."""
+        if padded_tokens is not None:
+            if (
+                max_routes is None
+                or not isinstance(padded_tokens, int)
+                or padded_tokens < max_routes
+            ):
+                raise ValueError("Padded capacity must be an integer at least the route bound.")
+        if not isinstance(self._comm_manager, _HybridEPManager):
+            if max_routes is not None:
+                raise ValueError("Planner dispatch capacity requires HybridEP.")
+            return
+        if max_routes is not None:
+            if self.tp_size != 1:
+                raise ValueError(
+                    "Planner dispatch capacity requires expert tensor parallel size 1."
+                )
+            if not isinstance(max_routes, int) or max_routes < 0:
+                raise ValueError("Planner dispatch route bound must be a non-negative integer.")
+        self._comm_manager.max_dispatch_routes_per_rank = max_routes
+        self._comm_manager.max_dispatch_padded_tokens_per_rank = padded_tokens
 
     def reset_over_budget(self):
         """Reset the accumulated over-budget flag on the communication manager."""

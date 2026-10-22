@@ -726,6 +726,12 @@ def save_checkpoint(
     start_ckpt = time()
     args = get_args()
 
+    from megatron.core.transformer.moe.home_expert_training import (
+        validate_home_expert_checkpoint_args,
+    )
+
+    validate_home_expert_checkpoint_args(args)
+
     # Keep the safety invariant even when arguments came through a validation path that does not
     # perform the flat CLI cross-check, or were mutated after startup.
     optimizer_config = getattr(optimizer, "config", None) if optimizer is not None else None
@@ -2396,9 +2402,16 @@ def _load_base_checkpoint(
     elif ckpt_format == 'fsdp_dtensor':
         assert HAVE_MEGATRON_FSDP, 'Should not be called if Megatron-FSDP is not available.'
         if rank0:
-            state_dict = {'args': None, 'iteration': None, 'checkpoint_version': None}
-            torch.distributed.checkpoint.load(state_dict=state_dict, checkpoint_id=checkpoint_name)
-            return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
+            # Ownership/topology must be known before constructing tensor and
+            # optimizer load templates, including for logical initialization.
+            reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
+            metadata = reader.read_metadata().state_dict_metadata
+            common = {
+                key: None for key in ("args", "iteration", "checkpoint_version") if key in metadata
+            }
+            if common:
+                torch.distributed.checkpoint.load(state_dict=common, checkpoint_id=checkpoint_name)
+            return common, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
         state_dict = sharded_state_dict
         raw_optimizer_state_dict = (
@@ -2445,6 +2458,13 @@ def _load_base_checkpoint(
         # 'iteration', etc. don't exist — stash them so DCP doesn't
         # error, then restore placeholder values after load.
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+        for key, value in state_dict.get("model", {}).items():
+            if key.endswith("._planner_state"):
+                for rank_key in value:
+                    if f"model.{key}.{rank_key}" not in state_dict_metadata:
+                        raise RuntimeError(
+                            f"Missing required MoEScheduler checkpoint state: {key}.{rank_key}"
+                        )
         _stashed_keys = {}
         for key in list(state_dict.keys()):
             # Keep the key if it exists as a top-level metadata entry
@@ -2484,7 +2504,10 @@ def _load_base_checkpoint(
             state_dict['optimizer'] = raw_optimizer_state_dict
 
         if raw_model_state_dict is not None:
-            state_dict['model'] = raw_model_state_dict
+            for key, value in state_dict["model"].items():
+                if key.endswith("._planner_state"):
+                    raw_model_state_dict[key] = value
+            state_dict["model"] = raw_model_state_dict
     else:
         raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
 
@@ -2864,7 +2887,11 @@ def load_checkpoint(
     ckpt_format = args.ckpt_format
     state_dict = None
     release = False
-    if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
+    if (
+        args.auto_detect_ckpt_format
+        or ckpt_format in ("torch_dist", "fsdp_dtensor")
+        or getattr(args, "moe_scheduler_home_update_interval", 0)
+    ):
         with _otel_managed_span(
             'load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True
         ):
@@ -2890,6 +2917,26 @@ def load_checkpoint(
         raise NotImplementedError(
             f'model_sharded_state_dict_modifier requires a torch_dist checkpoint, got {ckpt_format}'
         )
+
+    from megatron.core.transformer.moe.home_expert_training import (
+        prepare_home_expert_checkpoint_load,
+    )
+
+    fresh_home_training = False
+    if getattr(args, "moe_scheduler_export_logical_checkpoint", False) and release:
+        raise ValueError(
+            "Logical expert export requires a training checkpoint with optimizer state."
+        )
+    if ckpt_format in ("torch_dist", "fsdp_dtensor") and state_dict is not None:
+        fresh_home_training = prepare_home_expert_checkpoint_load(
+            args, model, state_dict.get("args")
+        )
+        if fresh_home_training:
+            update_num_microbatches(consumed_samples=0, verbose=True)
+            print_rank_0(
+                "Initializing home migration from logical weights: reset optimizer, RNG loading, "
+                "and training progress; homes remain identity until the planner proposes migration."
+            )
 
     load_kwargs = {}
     ignore_rng_state = False
@@ -3079,13 +3126,18 @@ def load_checkpoint(
             and not release
             and not args.finetune
             and 'rerun_state_machine' in state_dict
+            and state_dict['rerun_state_machine'] is not None
         ):
             rerun_state_machine = get_rerun_state_machine()
-            if rerun_state_machine.validate_state_dict(state_dict['rerun_state_machine']):
-                gen_sd_rerun_state = rerun_state_machine.state_dict(
-                    data_iterator=None, ckpt_format=ckpt_format, force=True
-                )
-                ignore_rerun_state = False
+            # Ordinary checkpoints also contain a NOT_RUNNING_YET sentinel
+            # shard to keep save metadata stable. Read it for strict schema
+            # validation even when there is no fault context to restore.
+            gen_sd_rerun_state = rerun_state_machine.state_dict(
+                data_iterator=None, ckpt_format=ckpt_format, force=True
+            )
+            ignore_rerun_state = not rerun_state_machine.validate_state_dict(
+                state_dict['rerun_state_machine']
+            )
         if ckpt_world_size != run_world_size or ckpt_tp_pp != run_tp_pp or ckpt_dp != run_dp:
             print_rank_0('Job sharding has changed: Rerun state will be ignored')
 
@@ -3224,7 +3276,9 @@ def load_checkpoint(
             for param_group, lr in optimizer_lrs:
                 param_group['lr'] = lr
         state_dict['_model'] = model
-        load_kwargs['sharded_state_dict'] = state_dict
+        # This counter is added by save_checkpoint, not generate_state_dict.
+        state_dict["num_floating_point_operations_so_far"] = 0
+        load_kwargs["sharded_state_dict"] = state_dict
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
         load_dir,
@@ -3242,6 +3296,12 @@ def load_checkpoint(
     if state_dict is None:
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
+
+    from megatron.core.transformer.moe.home_expert_training import (
+        validate_home_expert_checkpoint_args,
+    )
+
+    validate_home_expert_checkpoint_args(args, state_dict.get("args"))
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
@@ -3268,6 +3328,8 @@ def load_checkpoint(
                 )
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
+    if fresh_home_training:
+        num_floating_point_operations_so_far = 0
 
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
@@ -3375,6 +3437,12 @@ def load_checkpoint(
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+    if fresh_home_training:
+        from megatron.core.transformer.moe.home_expert_training import (
+            finish_home_expert_checkpoint_load,
+        )
+
+        finish_home_expert_checkpoint_load(model)
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
@@ -3475,6 +3543,12 @@ def load_checkpoint(
                         " > restored optimizer param_group max_lr/min_lr from runtime config "
                         "because --override-opt-param-scheduler is set"
                     )
+            if getattr(args, "moe_scheduler_home_update_interval", 0):
+                from megatron.core.transformer.moe.home_expert_training import (
+                    restore_home_expert_checkpoint_weights,
+                )
+
+                restore_home_expert_checkpoint_weights(optimizer)
         except KeyError as e:
             print_rank_0(
                 'Unable to load optimizer from checkpoint {}. '

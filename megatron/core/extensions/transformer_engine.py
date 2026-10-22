@@ -3278,11 +3278,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 grouped_splits = grouped_split_cache[param_name]
                 return grouped_splits[gemm_idx]
 
-            num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
-            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+            checkpoint_num_gemms = self.num_gemms
+            # Registered grouped-linear parameters contain only physical home
+            # slots. Replica GEMMs live in ReplicaExpertRuntime and never enter
+            # this state dict, so subtracting replica capacity loses home shards.
+
+            num_global_experts = get_pg_size(self._pg_collection.ep) * checkpoint_num_gemms
+            local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * checkpoint_num_gemms
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
-            for gemm_idx in range(self.num_gemms):
+            for gemm_idx in range(checkpoint_num_gemms):
                 global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
                     f"{gemm_idx}.weight": get_gemm_tensor("weight", gemm_idx),

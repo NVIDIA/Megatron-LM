@@ -89,6 +89,12 @@ optimizer.load_state_dict(ckpt["optimizer"])
 
 ## ⚙️ `fully_shard` / `MegatronFSDP` API - Advanced Features
 
+The wrapped root may itself match `fsdp_unit_modules`. `MegatronFSDP.forward`
+invokes it through `Module.__call__`, so its parameter-unshard, reshard, and
+backward-setup hooks execute just like those of nested FSDP units. Calling the
+root's `.forward()` directly would skip these hooks and can expose released
+parameter storage to compute kernels.
+
 Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fine-tuning your model's performance.
 
 - `fsdp_unit_modules` is a list of sub-module classes or `str` import-paths associated with modules that you want `MegatronFSDP` to fully-shard.
