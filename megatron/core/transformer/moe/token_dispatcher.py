@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import os
 import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
@@ -24,9 +23,12 @@ from megatron.core.transformer.moe.fused_a2a import (
     HAVE_HYBRIDEP_DENSE_ROUTING,
     HYBRIDEP_TOKEN_ALIGNMENT,
     alloc_ep_symm_buffer,
+    deepepv2_combine,
+    deepepv2_dispatch,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
+    get_elastic_buffer,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     is_nccl_ep_bootstrapped,
@@ -47,6 +49,7 @@ from megatron.core.transformer.moe.moe_utils import (
     unpermute,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 """ We use the following notation throughout this file:
@@ -215,6 +218,14 @@ class MoETokenDispatcher:
             The final output tensor.
         """
         raise NotImplementedError("combine_postprocess function not implemented.")
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach dispatcher-specific work to the MoE layer input."""
+        return hidden_states
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Attach dispatcher-specific work to the MoE layer output."""
+        return output
 
     def set_shared_experts(self, shared_experts):
         """Set shared expert to the dispatcher."""
@@ -999,6 +1010,14 @@ class _DispatchManager(ABC):
         """Get the restored hidden states by instances."""
         pass
 
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the layer input unchanged."""
+        return hidden_states
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Return the layer output unchanged."""
+        return output
+
 
 class _HybridEPManager(_DispatchManager):
     """
@@ -1207,6 +1226,8 @@ class _HybridEPManager(_DispatchManager):
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
+        *,
+        rank_capacity: Optional[int] = None,
     ) -> torch.Tensor:
         # HybridEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
@@ -1215,6 +1236,13 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
+        # MoonEP supplies its planner-derived budget; ordinary HybridEP uses setup_metadata's
+        # factor-derived budget. Read the factor each call because overflow retries clear it.
+        has_rank_capacity = (
+            rank_capacity is not None or self.moe_expert_rank_capacity_factor is not None
+        )
+        if rank_capacity is not None:
+            self.num_permuted_tokens = rank_capacity
         align_size = get_align_size_for_quantization(self.config)
         if align_size > 0:
             self.pad_multiple = align_size
@@ -1242,19 +1270,18 @@ class _HybridEPManager(_DispatchManager):
                 num_of_experts=self.num_experts,
             )
         )
-        if self.moe_expert_rank_capacity_factor is not None:
+        if has_rank_capacity:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
-            # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
+            # dropped because the receive count exceeded num_permuted_tokens.
             over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
-        # When capacity factor is None, skip overflow tracking (no token drops). Actual
-        # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
+        # Dynamic dispatch resolves the permuted size from tokens_per_expert.sum().
 
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.moe_expert_rank_capacity_factor is not None:
+        if has_rank_capacity:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
@@ -1298,6 +1325,86 @@ class _HybridEPManager(_DispatchManager):
         Get the number of tokens per expert.
         '''
         return self.tokens_per_expert
+
+
+class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager):
+    """Glue virtual-expert load balancing onto the HybridEP transport."""
+
+    def __init__(self, group, num_local_experts: int, num_experts: int, config, router_topk=None):
+        router_topk = router_topk if router_topk is not None else config.moe_router_topk
+        self.initialize_virtual_expert_load_balancer(
+            group=group,
+            num_local_experts=num_local_experts,
+            router_topk=router_topk,
+            num_experts=num_experts,
+            config=config,
+        )
+        # HybridEP transports to the runtime experts: the natives plus the virtual-expert slots.
+        super().__init__(
+            group=group,
+            num_local_experts=self.num_runtime_experts,
+            num_experts=self.ep_size * self.num_runtime_experts,
+            config=config,
+            router_topk=router_topk,
+        )
+        assert (
+            self.dense_routing_supported
+        ), "Virtual experts require HybridEP's dense top-k routing API for runtime experts."
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor, padding_mask=None):
+        """Consume compact router metadata and start the planner and weight push."""
+        if (
+            routing_map.dtype not in (torch.int16, torch.int32, torch.int64)
+            or routing_map.ndim != 2
+            or routing_map.shape[1] != self.router_topk
+            or probs.shape != routing_map.shape
+        ):
+            raise ValueError("MoonEP requires expert IDs and probabilities shaped [tokens, topk].")
+        top_indices = routing_map.long()
+        # ``token_probs`` holds the router's probabilities until dispatch, where the dispatcher's
+        # preprocessing returns them; HybridEP's ``setup_metadata`` then replaces them with the
+        # dense runtime probabilities it transports (a CUDA-graph attribute, so one field).
+        if padding_mask is not None:
+            probs = probs.masked_fill(padding_mask.transpose(0, 1).reshape(-1, 1), 0)
+        self.token_probs = probs
+        self.plan_dispatch(top_indices)
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        hidden_states, runtime_experts = self.prepare_virtual_expert_dispatch(hidden_states)
+        # HybridEP's metadata from the planner's runtime ids and the router's probabilities.
+        # Upstream HybridEP accepts expert IDs with full-width probabilities.
+        runtime_probs = self.token_probs.new_zeros(
+            (runtime_experts.shape[0], self.num_experts)
+        ).scatter(1, runtime_experts.long(), self.token_probs)
+        super().setup_metadata(runtime_experts, runtime_probs)
+
+        return super().dispatch(
+            hidden_states,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+            # Capacity includes each logical expert's final partial alignment block.
+            rank_capacity=self.rank_capacity,
+        )
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        hidden_states = self.prepare_virtual_expert_combine(hidden_states)
+        hidden_states = super().combine(
+            hidden_states,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        self.token_probs = self.routing_map = self.topk_idx = None
+        return hidden_states
 
 
 class _DeepepManager(_DispatchManager):
@@ -1557,6 +1664,116 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _DeepepV2Manager(_DeepepManager):
+    """
+    A manager class for the DeepEP v2 ElasticBuffer backend.
+
+    This keeps the original DeepEP backend isolated under "deepep", while "deepepv2"
+    uses the v2 dispatch/combine APIs.
+    """
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ):
+        # Do not call _DeepepManager.__init__; v2-only images may not ship the v1 Buffer API.
+        self.group = group
+        self.num_local_experts = num_local_experts
+        self.config = config
+
+        self.router_topk = router_topk
+        self.num_experts = num_experts
+        self.router_dtype = config.moe_router_dtype
+        self.capacity_factor = config.moe_expert_capacity_factor
+        self.permute_fusion = config.moe_permute_fusion
+        self.num_sms = (
+            config.moe_flex_dispatcher_num_sms
+            if config.moe_flex_dispatcher_num_sms is not None
+            else 0
+        )
+
+        self.token_indices: Optional[torch.Tensor] = None
+        self.token_probs: Optional[torch.Tensor] = None
+        self.handle = None
+        self.buffer = None
+
+        if deepepv2_dispatch is None:
+            raise ImportError(
+                "DeepEP v2 (deep_ep.ElasticBuffer) is unavailable. Install or upgrade DeepEP "
+                "in your container following https://github.com/deepseek-ai/DeepEP#installation "
+                "and ensure its CUDA, PyTorch, and NCCL requirements are met. "
+                "HybridEP also uses the deep_ep Python module and may need to be uninstalled "
+                "first; replacing it with DeepEP v2 can make the hybridep backend unavailable."
+            )
+
+    def _get_buffer(self, hidden_states: torch.Tensor):
+        self.buffer = get_elastic_buffer(
+            self.group,
+            num_max_tokens_per_rank=hidden_states.shape[0],
+            hidden=hidden_states.shape[1],
+            num_topk=self.token_indices.shape[1],
+        )
+        return self.buffer
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        # DeepEP v2 only supports float32 probs.
+        if self.token_probs.dtype != torch.float32:
+            if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                logger.warning(
+                    "DeepEP v2 only supports float32 probs, please set --moe-router-dtype=fp32"
+                )
+            self.token_probs = self.token_probs.float()
+        buffer = self._get_buffer(hidden_states)
+        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+            deepepv2_dispatch(
+                buffer,
+                hidden_states,
+                self.token_indices,
+                self.token_probs,
+                self.num_experts,
+                num_max_tokens_per_rank=hidden_states.shape[0],
+                expert_alignment=1,
+                num_sms=self.num_sms,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        )
+        self.handle = handle
+        self.tokens_per_expert = num_tokens_per_expert
+        self.dispatched_indices = dispatched_indices
+        self.dispatched_probs = dispatched_probs
+
+        return hidden_states
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        hidden_states, _ = deepepv2_combine(
+            self.buffer,
+            hidden_states,
+            self.handle,
+            num_sms=self.num_sms,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        self.handle = None
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        return hidden_states
+
+
 class _NCCLEPManager(_DispatchManager):
     """A manager class to handle dispatch/combine for MoE models using the NCCL Expert
     Parallelism backend, via TransformerEngine's transformer_engine.pytorch.ep API
@@ -1668,13 +1885,6 @@ class _NCCLEPManager(_DispatchManager):
                         "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
                         "requires an sm100+ (Blackwell+) GPU for the CuTe DSL grouped GEMM; unset "
                         "it to use eager mode on older GPUs."
-                    )
-                if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-                    raise ValueError(
-                        "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
-                        "requires the CuTe DSL grouped GEMM; set "
-                        "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume "
-                        "ragged per-expert counts on device)."
                     )
 
         self.dispatch_fwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_dispatch_fwd_dtype)
@@ -1942,8 +2152,23 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+        elif self.config.moe_flex_dispatcher_backend == "deepepv2":
+            assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
+            self._comm_manager = _DeepepV2Manager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
-            self._comm_manager = _HybridEPManager(
+            manager_cls = (
+                _VirtualExpertHybridEPManager
+                if self.config.moe_virtual_expert_load_balance
+                else _HybridEPManager
+            )
+            self._comm_manager = manager_cls(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
                 num_experts=self.tp_size * self.config.num_moe_experts,
@@ -1968,8 +2193,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
+                "Please set --moe-flex-dispatcher-backend to deepep, deepepv2, hybridep, or ncclep"
             )
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach virtual-expert backward work to the MoE layer input when enabled."""
+        return self._comm_manager.wrap_layer_input(hidden_states)
+
+    def finalize_layer_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Attach virtual-expert backward work to the MoE layer output when enabled."""
+        return self._comm_manager.finalize_layer_output(output)
 
     def get_expert_zero_copy_buffers(self):
         """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the
@@ -2068,7 +2301,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
         # Initialize metadata
-        routing_map, probs = self._initialize_metadata(routing_map, probs)
+        if not self.config.moe_virtual_expert_load_balance:
+            routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         if isinstance(self._comm_manager, _HybridEPManager):
             self._comm_manager.setup_metadata(routing_map, probs, padding_mask=padding_mask)

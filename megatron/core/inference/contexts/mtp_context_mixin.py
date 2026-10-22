@@ -271,7 +271,7 @@ class MTPContextMixin:
     # transfer, so draft forwards never disturb the main step's Mamba/H2D state.
     # ------------------------------------------------------------------
     @contextlib.contextmanager
-    def _mtp_forward_phase(self):
+    def _mtp_forward_phase(self, preserve_step_bookkeeping: bool = False):
         """Scope one step's MTP forwards and undo their effects on the context on the way out.
 
         Every MTP forward republishes the active attention metadata, token counts and CUDA-graph
@@ -280,6 +280,13 @@ class MTPContextMixin:
         values, and a `forward_mode` left set would keep `is_decode_only` False and KV routing on
         the draft plane for the rest of the run. Both are undone on exit, including when a draft
         forward raises.
+
+        Args:
+            preserve_step_bookkeeping (bool): Also restore the step's attention bookkeeping: the
+                GPU bookkeeping buffer and the MHA metadata bounds. MTP forwards stage their draft
+                metadata in that shared buffer, which is only safe once the step's main forward
+                has run. The EP dummy MTP forwards run before it (the async-scheduling primer and
+                the idle-rank step), so they restore it.
         """
         saved = (
             self.active_attn_metadata,
@@ -287,6 +294,15 @@ class MTPContextMixin:
             self.padded_active_token_count,
             self._using_cuda_graph_this_step,
         )
+        if preserve_step_bookkeeping:
+            saved_bookkeeping = self.gpu_view._buf.clone()
+            saved_mha_state = [
+                (mha, mha.state_data, mha._max_seqlen_q, mha._max_seqlen_k)
+                for mha in (
+                    self.graph_attn_metadata["mha_metadata"],
+                    self.non_graph_attn_metadata["mha_metadata"],
+                )
+            ]
         try:
             yield
         finally:
@@ -302,6 +318,12 @@ class MTPContextMixin:
                 self.padded_active_token_count,
                 self._using_cuda_graph_this_step,
             ) = saved
+            if preserve_step_bookkeeping:
+                self.gpu_view._buf.copy_(saved_bookkeeping)
+                for mha, state_data, max_seqlen_q, max_seqlen_k in saved_mha_state:
+                    mha.state_data = state_data
+                    mha._max_seqlen_q = max_seqlen_q
+                    mha._max_seqlen_k = max_seqlen_k
 
     def _mtp_activate_attn_metadata(
         self,

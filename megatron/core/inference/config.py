@@ -3,13 +3,16 @@
 import warnings
 from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
-from typing import List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Sequence, Tuple, Union
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+if TYPE_CHECKING:
+    from megatron.core.inference.shards_spec import InferenceShardSpec
 
 
 @dataclass
@@ -59,8 +62,8 @@ class MambaInferenceStateConfig:
     slice start."""
 
     gdp_num_householder: int = 0
-    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
-    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    """Number of Householder copies of the Gated Delta Product layers, 1 for GDN,
+    or 0 for other mixers. Sizes the chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
     def __post_init__(self):
@@ -538,6 +541,16 @@ class InferenceConfig:
     This is primarily limited by the combination of `buffer_size_gb` and `max_sequence_length`.
     """
 
+    reserve_recurrent_state_dummy_slot: bool = False
+    """
+    Reserve one recurrent-state buffer for expert-parallel dummy forwards.
+
+    Disaggregated handoff can retain every request-owned recurrent-state slot after its request
+    leaves the active batch. An idle EP rank still needs a state buffer for the dummy forward that
+    joins its peers' expert collectives. The reserved entry is outside normal request capacity and
+    is only allocated for hybrid models with expert parallelism.
+    """
+
     max_tokens: Optional[int] = None
     """
     Max number of tokens to use for forward passes. This is primarily limited by prefill activation
@@ -745,6 +758,14 @@ class InferenceConfig:
     smaller ``max_tokens`` (or ``max_requests``) shrinks the scratch and leaves more
     durable cache slots."""
 
+    disaggregation_shards: Optional[Union[str, Sequence["InferenceShardSpec"], Sequence[dict]]] = (
+        None
+    )
+    """Prefill and decode shard topology for native disaggregated inference."""
+
+    kv_transport_backend: Literal["nixl", "nccl"] = "nixl"
+    """Backend for disaggregated KV and recurrent-state transfers."""
+
     # =================================
     # Logging config
     # =================================
@@ -788,7 +809,13 @@ class InferenceConfig:
     ``AsyncScheduleMode.LEGACY`` to disable it."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
-    """Whether returned log-probs are modified by the sampling parameters or not."""
+    """Whether log-probs of engine-sampled tokens are modified by the sampling parameters.
+
+    `'processed_logprobs'` applies each request's temperature, top-k, and top-p to the
+    log-probs of tokens the engine sampled, including the top-N log-probs at those
+    positions. Prompt log-probs and prompt top-N log-probs score tokens the engine did
+    not sample, so they always use the raw distribution in both modes.
+    """
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """

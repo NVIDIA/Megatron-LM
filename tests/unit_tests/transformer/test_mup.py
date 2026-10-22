@@ -640,8 +640,6 @@ class TestMuPMTPLossScaling:
         def output_layer(hidden, weight=None, runtime_gather_output=None):
             return hidden.clone(), None
 
-        output_layer.gather_output = False
-
         def scale_logits_fn(logits):
             return logits * 3.0
 
@@ -658,7 +656,6 @@ class TestMuPMTPLossScaling:
                 loss_mask=loss_mask,
                 output_layer=output_layer,
                 output_weight=None,
-                runtime_gather_output=None,
                 is_training=False,
                 compute_language_model_loss=compute_language_model_loss,
                 config=config,
