@@ -109,7 +109,9 @@ def test_failed_capture_restores_global_state(monkeypatch, has_te_modules, failu
     monkeypatch.setattr(cuda_graphs_module, "HAVE_TE_GRAPHS", True)
     monkeypatch.setattr(_CudagraphGlobalRecord, "_te_capture_started", False)
     te_events = []
-    monkeypatch.setattr(cuda_graphs_module, "te_set_capture_start", lambda: te_events.append("start"))
+    monkeypatch.setattr(
+        cuda_graphs_module, "te_set_capture_start", lambda: te_events.append("start")
+    )
     monkeypatch.setattr(cuda_graphs_module, "te_set_capture_end", lambda: te_events.append("end"))
     # Configuration alone must not cause the outer cleanup to unfreeze GC.
     monkeypatch.setattr(cuda_graphs_module, "FREEZE_GC", True)

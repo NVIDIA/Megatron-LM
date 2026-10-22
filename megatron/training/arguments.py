@@ -2771,7 +2771,7 @@ def _add_training_args(parser):
         ProfilingConfig, exclude=["use_nsys_profiler", "run_workload_inspector_server"]
     )
     prof_group = prof_factory.build_group(parser, "profiling")
-    prof_group.add_argument('--profile', action='store_true', 
+    prof_group.add_argument('--profile', action='store_true',
                        help='Enable nsys profiling. When using this option, nsys '
                        'options should be specified in commandline.')
 
