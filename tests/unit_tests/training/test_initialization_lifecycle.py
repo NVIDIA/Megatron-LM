@@ -13,25 +13,25 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from megatron.training.vocab_utils import (
-    build_tokenizer_and_pad_vocab_size,
-    calculate_padded_vocab_size,
-)
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import (
+    _default_config_from_args,
     gpt_config_from_args,
     hybrid_config_from_args,
     inference_cfg_container_from_args,
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
-    _default_config_from_args,
 )
 from megatron.training.config import DistributedInitConfig
 from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.vocab_utils import (
+    build_tokenizer_and_pad_vocab_size,
+    calculate_padded_vocab_size,
+)
 
 
 @pytest.fixture
