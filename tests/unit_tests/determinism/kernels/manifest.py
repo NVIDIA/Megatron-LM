@@ -452,7 +452,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_mamba2_batch_invariant_decode",
-        sources=("megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",),
+        sources=(
+            "megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",
+            "megatron/core/ssm/ops/mamba2/batch_invariant_decode_rows.py",
+        ),
         tests=("tests/unit_tests/ssm/ops/mamba2/test_batch_invariant_decode.py",),
         kind="triton",
         training_path=False,
@@ -506,7 +509,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
-        "test_ssm_kernels.py.",
+        "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -840,6 +844,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
         "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
+    ),
+    KernelEntry(
+        name="mfsdp_muon_dispatch",
+        sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/muon.py",),
+        tests=("tests/unit_tests/distributed/mfsdp_v2/test_muon.py",),
+        kind="dispatch",
+        notes="FsdpMuon calls Emerging Optimizers Muon on matrices gathered to their owners. "
+        "test_muon_matches_reference checks weights, momentum, and forward outputs bitwise "
+        "against unsharded Muon across multiple steps, including an optimizer-state reload. "
+        "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
