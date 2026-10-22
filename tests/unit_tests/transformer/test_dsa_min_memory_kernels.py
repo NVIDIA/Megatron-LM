@@ -787,3 +787,30 @@ def test_sparse_attention_rejects_partial_qkv_gradients(needs_grad):
     )
     with pytest.raises(RuntimeError, match="all of query, key and value or none"):
         output.sum().backward()
+
+
+@pytest.mark.skipif(
+    not HAVE_TRITON or not torch.cuda.is_available(), reason="CUDA and Triton required"
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sparse_attention_reduction_matches_reference_probability_precision(monkeypatch, dtype):
+    """Cancellation exposes a missing probability cast in the Blackwell PV path."""
+    from megatron.core.transformer.experimental_attention_variant import dsa_min_memory_triton
+
+    monkeypatch.setattr(dsa_min_memory_triton, "_use_dot_mma", lambda device: False)
+    query = torch.zeros(1, 1, 1, 32, device="cuda", dtype=dtype)
+    key = torch.zeros(2, 1, 1, 32, device="cuda", dtype=dtype)
+    query[..., 0] = 1
+    key[1, ..., 0] = 1
+    value = torch.empty_like(key)
+    value[0] = 3
+    value[1] = -1
+    indices = torch.tensor([[[0, 1]]], device="cuda", dtype=torch.int64)
+    probabilities = torch.tensor([0.0, 1.0], device="cuda").softmax(-1).to(dtype)
+    expected = (probabilities @ value[:, 0, 0]).view_as(query)
+    for _ in range(3):
+        actual = dsa_min_memory_triton.triton_sparse_attention_tile(
+            query, key, value, indices, softmax_scale=1.0, q_start=1
+        )
+        assert actual is not None
+        assert torch.equal(actual, expected)

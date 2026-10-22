@@ -8,11 +8,6 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -21,7 +16,6 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import RotaryEmbedding
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import DSGroupedSelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_decode_kernel import (
@@ -29,6 +23,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa_decode_ker
     dsa_gqa_decode_attention,
     dsa_gqa_decode_indexer_score,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import dsa_stack_spec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -229,11 +224,7 @@ class TestDSGQADynamicInference:
         context.initialize_attention_state()
         attention = DSGroupedSelfAttention(
             config=config,
-            submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear,
-                core_attention=TEDotProductAttention,
-                linear_proj=TERowParallelLinear,
-            ),
+            submodules=dsa_stack_spec.submodules.attention_layer.submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         ).eval()
@@ -357,11 +348,7 @@ class TestDSGQADynamicInference:
 
         attention = DSGroupedSelfAttention(
             config=config,
-            submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear,
-                core_attention=TEDotProductAttention,
-                linear_proj=TERowParallelLinear,
-            ),
+            submodules=dsa_stack_spec.submodules.attention_layer.submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
