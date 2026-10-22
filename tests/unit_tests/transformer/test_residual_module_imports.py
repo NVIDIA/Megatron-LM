@@ -15,7 +15,7 @@ import sys
 
 prefix = "megatron.core.transformer."
 first = (
-    ("transformer_layer", "wide_residual_layer")
+    ("transformer_layer",)
     if sys.argv[1] == "legacy-first"
     else (
         "hyper_connection_transformer_layer",
@@ -31,21 +31,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, get_module
 
 aliases = [
     ("transformer_layer", "HyperConnectionTransformerLayer", "hyper_connection_transformer_layer"),
-    ("wide_residual_layer", "LearnedWideResidualRetention", "wide_residual"),
-    ("wide_residual_layer", "StreamwiseSigmoidMap", "wide_residual"),
-    ("wide_residual_layer", "StreamwiseSigmoidResidualReadout", "wide_residual"),
-    ("wide_residual_layer", "StreamwiseSigmoidWideResidualRead", "wide_residual"),
-    ("wide_residual_layer", "_active_vector", "wide_residual"),
-    ("wide_residual_layer", "_make_padded_vector", "wide_residual"),
-    ("wide_residual_layer", "_mark_replicated_tp_parameter", "wide_residual"),
-    ("wide_residual_layer", "_mark_residual_map_parameter", "wide_residual"),
-    ("wide_residual_layer", "_mark_retention_parameter", "wide_residual"),
-    ("wide_residual_layer", "expand_wide_residual_stream", "wide_residual"),
-    ("wide_residual_layer", "build_wide_residual_readout", "wide_residual"),
-    ("wide_residual_layer", "StreamwiseSigmoidWideResidualConnection", "wide_residual"),
-    ("wide_residual_layer", "load_residual_state", "wide_residual"),
-    ("wide_residual_layer", "wide_residual_recompute_enabled", "wide_residual"),
-    ("wide_residual_layer", "WideResidualTransformerLayer", "wide_residual_transformer_layer"),
 ]
 for old_name, symbol, new_name in aliases:
     old_path, new_path = prefix + old_name, prefix + new_name
@@ -58,14 +43,6 @@ for old_name, symbol, new_name in aliases:
     assert pickle.loads(pickle.dumps(canonical)) is canonical
     legacy_pickle = b"c" + old_path.encode() + b"\n" + symbol.encode() + b"\n."
     assert pickle.loads(legacy_pickle) is canonical
-
-for symbol, new_name in (
-    ("_MIN_CONTROLLER_NUMEL", "wide_residual"),
-    ("_RESIDUAL_STATE_PREFIXES", "wide_residual"),
-):
-    legacy = importlib.import_module(prefix + "wide_residual_layer")
-    canonical_module = importlib.import_module(prefix + new_name)
-    assert vars(legacy)[symbol] is vars(canonical_module)[symbol]
 
 package = importlib.import_module("megatron.core.transformer")
 for symbol, new_name in (

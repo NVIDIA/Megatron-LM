@@ -14,16 +14,16 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     LearnedWideResidualRetention,
     StreamwiseSigmoidMap,
     StreamwiseSigmoidResidualReadout,
     StreamwiseSigmoidWideResidualConnection,
     StreamwiseSigmoidWideResidualRead,
-    WideResidualTransformerLayer,
     expand_wide_residual_stream,
 )
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
+from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
 
 
 def _wide_config(
