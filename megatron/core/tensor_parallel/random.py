@@ -109,6 +109,20 @@ _GTP_REMAT_RNG_TRACKER_NAME = 'gtp-remat-rng'
 _EXPERT_GTP_REMAT_RNG_TRACKER_NAME = 'egtp-remat-rng'
 
 
+def _capture_forward_context():
+    """Copy the caller's context for recomputation, without the tensor observer.
+
+    Recomputation suspends observations, so the observer is never called there. Keeping it would
+    let an observer that retains graph tensors close a reference cycle through autograd nodes,
+    which the garbage collector cannot break.
+    """
+    from megatron.core.tensor_observation import _ACTIVE_OBSERVER
+
+    context = copy_context()
+    context.run(_ACTIVE_OBSERVER.set, None)
+    return context
+
+
 def _run_recompute_with_observation_suspended(function, *args):
     """Suppress observations inside the restored forward context, not outside it."""
     # Tensor-observation suspension is itself a ContextVar. Entering the copied
@@ -703,7 +717,7 @@ class CheckpointFunction(torch.autograd.Function):
         # CUDA autograd can recompute on an engine thread whose Python context
         # differs from the caller. Preserve forward execution scopes (including
         # router GEMM row blocks) instead of inheriting that thread's defaults.
-        ctx.forward_context = copy_context()
+        ctx.forward_context = _capture_forward_context()
         ctx.distribute_saved_activations = distribute_saved_activations
 
         # Copy the rng states.
@@ -917,7 +931,7 @@ class _RecomputeRegion:
         # CUDA autograd can rebuild on an engine thread whose Python context differs from the
         # caller. Preserve forward execution scopes (including router GEMM row blocks) instead of
         # inheriting that thread's defaults.
-        self._forward_context = copy_context()
+        self._forward_context = _capture_forward_context()
         self._te_context = _TERecomputeContext(use_te_context)
         self._retained_storage_ptrs = (
             frozenset(t.untyped_storage().data_ptr() for t in self._layout.tensors_of(args))
