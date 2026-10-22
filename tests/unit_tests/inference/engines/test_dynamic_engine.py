@@ -950,6 +950,7 @@ class DynamicEngineTestConfig:
     cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
+    normalization: str = "LayerNorm"
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
     # If False, do not build cuda graphs in the tests, even if
@@ -1275,7 +1276,7 @@ class DynamicInferenceEngineTestBase:
                 normalization=(
                     "RMSNorm"
                     if test_config.transformer_impl == "inference_optimized"
-                    else "LayerNorm"
+                    else test_config.normalization
                 ),
                 softmax_type=test_config.softmax_type,
                 # inference optimized currently only supports RMS Norm
@@ -1290,7 +1291,9 @@ class DynamicInferenceEngineTestBase:
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts, normalization=transformer_config.normalization
+                )
             elif test_config.transformer_impl == "inference_optimized":
                 layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
