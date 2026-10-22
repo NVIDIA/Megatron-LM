@@ -1,22 +1,37 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt import moe_module_specs
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.moe import shared_experts as shared_experts_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
+from megatron.core.transformer.moe.shared_experts import (
+    FusedSharedExpertMLP,
+    SharedExpertMLP,
+    get_shared_expert_alignment,
+    pad_shared_expert_tokens,
+    unpad_shared_expert_tokens,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+
+_HAS_FP8_TE = shared_experts_module.HAVE_TE and is_te_min_version("2.3.0.dev0")
 
 
 class _FakeTELinear(torch.nn.Module):
@@ -377,6 +392,56 @@ def test_backward_dw_dispatches_fused_children_and_original_reduce_hooks(monkeyp
     assert shared_expert.linear_fc2.reduce_hooks_called
 
 
+def _quantization_config(**config_kwargs):
+    config = SimpleNamespace(
+        fp8=None,
+        fp4=False,
+        fp8_recipe="blockwise",
+        fp4_recipe="nvfp4",
+        use_transformer_engine_op_fuser=False,
+        moe_use_grouped_tensor=False,
+    )
+    for key, value in config_kwargs.items():
+        setattr(config, key, value)
+    return config
+
+
+def test_shared_expert_alignment_is_a_noop_without_quantization():
+    """Only a quantized recipe pads the shared-expert token dimension."""
+    assert get_shared_expert_alignment(_quantization_config()) == 1
+    # The dispatcher helper reports the routed experts' 256-token grouping alignment even
+    # without quantization; the shared expert's linears do not need it, so it must stay a
+    # no-op there -- otherwise the BF16 path would pay for padding it never uses.
+    assert (
+        get_shared_expert_alignment(
+            _quantization_config(use_transformer_engine_op_fuser=True, moe_use_grouped_tensor=True)
+        )
+        == 1
+    )
+    assert get_shared_expert_alignment(_quantization_config(fp8="hybrid")) == 16
+    assert get_shared_expert_alignment(_quantization_config(fp8="hybrid", fp8_recipe="mxfp8")) == 32
+
+
+def test_shared_expert_token_padding_restores_shape_and_values():
+    hidden_states = torch.arange(3 * 2 * 5, dtype=torch.float32).reshape(3, 2, 5)
+
+    padded, num_tokens = pad_shared_expert_tokens(hidden_states, 16)
+
+    assert num_tokens == 3
+    assert padded.shape == (16, 2, 5)
+    torch.testing.assert_close(padded[:num_tokens], hidden_states, rtol=0, atol=0)
+    assert not padded[num_tokens:].any(), "padding rows must be zeros"
+    torch.testing.assert_close(
+        unpad_shared_expert_tokens(padded, num_tokens), hidden_states, rtol=0, atol=0
+    )
+
+    # Already aligned / no quantization: the tensor must pass through untouched.
+    for align in (1, 3):
+        unpadded, num_tokens = pad_shared_expert_tokens(hidden_states, align)
+        assert unpadded is hidden_states
+        assert unpad_shared_expert_tokens(unpadded, num_tokens) is hidden_states
+
+
 class TestSharedExperts:
     def setup_method(self, method):
         self.config = TransformerConfig(
@@ -412,6 +477,19 @@ class TestSharedExperts:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def get_te_shared_expert(self, **kargs):
+        """Build a real TE-backed shared expert on tiny dims and return (config, expert)."""
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                num_experts=self.config.num_moe_experts, moe_grouped_gemm=False
+            ).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        config = dataclasses.replace(self.config, **kargs)
+        moe_layer = MoELayer(config, submodules).cuda().to(dtype=torch.bfloat16)
+        assert moe_layer.shared_experts is not None
+        return config, moe_layer.shared_experts
 
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
@@ -687,3 +765,93 @@ class TestSharedExperts:
             "Clamping had no observable effect on shared-expert output; "
             "activation_func_clamp_value may not be plumbed through."
         )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not _HAS_FP8_TE, reason="FP8 blockwise needs Transformer Engine >= 2.3")
+    def test_shared_expert_fp8_pads_unaligned_thd_tokens(self):
+        """An unaligned THD token count is padded for FP8 and restored unchanged."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+        config, shared_expert = self.get_te_shared_expert(
+            fp8="hybrid",
+            fp8_recipe="blockwise",
+            init_method=partial(torch.nn.init.normal_, std=0.5),
+        )
+        seq_len, batch_size = 63, 2  # 63 is not a multiple of the FP8 alignment (16)
+        hidden_states = torch.randn(
+            (seq_len, batch_size, self.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        # The fix's padding rows are zeros, so running the input with that zero row appended
+        # is the same computation without the internal padding: the padded forward must
+        # reproduce it bit for bit, which is what "padding must not change results" means.
+        padded_reference = torch.cat(
+            [hidden_states, hidden_states.new_zeros((1, batch_size, self.config.hidden_size))],
+            dim=0,
+        )
+        with get_fp8_context(config):
+            output = shared_expert(hidden_states)
+            output_padded_reference = shared_expert(padded_reference)
+        # The BF16-equivalent (no autocast) computation on the same unpadded input.
+        output_bf16 = shared_expert(hidden_states)
+
+        assert output.shape == hidden_states.shape
+        torch.testing.assert_close(output, output_padded_reference[:seq_len], rtol=0, atol=0)
+        # FP8 quantizes, so the padded result can only match the BF16-equivalent (no autocast)
+        # computation numerically; a cosine close to 1 proves it is the same function of the
+        # input rather than, say, the wrong token rows after the unpad.
+        cosine = torch.nn.functional.cosine_similarity(
+            output.flatten().float(), output_bf16.flatten().float(), dim=0
+        )
+        assert cosine > 0.99, f"padded FP8 output does not track the BF16 computation: {cosine}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not _HAS_FP8_TE, reason="FP8 blockwise needs Transformer Engine >= 2.3")
+    def test_shared_expert_fp8_overlap_path_pads_unaligned_thd_tokens(self):
+        """The overlapped shared-expert path pads and unpads exactly like the dense one."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+        config, shared_expert = self.get_te_shared_expert(
+            fp8="hybrid", fp8_recipe="blockwise", moe_shared_expert_overlap=True
+        )
+        seq_len, batch_size = 63, 2
+        hidden_states = torch.randn(
+            (seq_len, batch_size, self.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+
+        with get_fp8_context(config):
+            output = shared_expert(hidden_states)
+            shared_expert.pre_forward_comm(hidden_states)
+            shared_expert.linear_fc1_forward_and_act()
+            # FC1 runs on the padded token set ...
+            assert shared_expert.cached_fc2_input.shape[0] == seq_len + 1
+            shared_expert.linear_fc2_forward()
+            # ... and FC2's output is unpadded again before the TP comm and the gated output.
+            assert shared_expert.cached_fc2_output.shape[0] == seq_len
+            shared_expert.post_forward_comm()
+            output_overlap = shared_expert.get_output()
+
+        assert output_overlap.shape == hidden_states.shape
+        torch.testing.assert_close(output_overlap, output, rtol=0, atol=0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_shared_expert_bf16_forward_does_not_pad(self, monkeypatch):
+        """With quantization off the shared expert takes the direct, unpadded path."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+        _, shared_expert = self.get_te_shared_expert()
+        seq_len, batch_size = 63, 2
+        hidden_states = torch.randn(
+            (seq_len, batch_size, self.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        pad_calls = []
+        real_pad = shared_experts_module.F.pad
+
+        def recording_pad(tensor, pad, *args, **kwargs):
+            pad_calls.append(tuple(pad))
+            return real_pad(tensor, pad, *args, **kwargs)
+
+        monkeypatch.setattr(shared_experts_module.F, "pad", recording_pad)
+
+        output = shared_expert(hidden_states)
+        direct_output, _ = MLP.forward(shared_expert, hidden_states)
+
+        assert pad_calls == [], "the BF16 shared expert must not pad the token dimension"
+        assert output.shape == hidden_states.shape
+        torch.testing.assert_close(output, direct_output, rtol=0, atol=0)
