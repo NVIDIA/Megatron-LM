@@ -4,9 +4,47 @@ import math
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.transformer.hyper_connection import HyperConnectionModule, _proj_rms_impl
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_mhc_projection_matches_with_and_without_grad(device, dtype, eps_inside_sqrt):
+    """Full-recompute forward and backward replay must use identical FP32 arithmetic."""
+    torch.manual_seed(10)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=4,
+        mhc_norm_eps_inside_sqrt=eps_inside_sqrt,
+        mhc_keep_mappings_in_fp32=True,
+    )
+    module = HyperConnectionModule(config, layer_number=1).to(device)
+    x = torch.randn(8, 2, 128, device=device, dtype=dtype, requires_grad=True)
+    proj, norm = module._projection_and_get_norm(x)
+    with torch.no_grad():
+        replay_proj, replay_norm = module._projection_and_get_norm(x)
+    assert torch.equal(replay_proj, proj)
+    assert torch.equal(replay_norm, norm)
+
+    expected = module.compute_mappings(x)
+    sum(t.float().square().sum() for t in expected).backward()
+    expected_grads = [x.grad.clone()] + [p.grad.clone() for p in module.parameters()]
+    module.zero_grad(set_to_none=True)
+    replay_x = x.detach().clone().requires_grad_(True)
+    actual = checkpoint(module.compute_mappings, replay_x, use_reentrant=True)
+    for a, e in zip(actual, expected):
+        assert torch.equal(a, e)
+    sum(t.float().square().sum() for t in actual).backward()
+    for a, e in zip([replay_x.grad] + [p.grad for p in module.parameters()], expected_grads):
+        assert torch.equal(a, e)
 
 
 def _plain_proj_rms(x, weight, eps, eps_inside_sqrt):

@@ -71,14 +71,16 @@ def test_mhc_precision(fp32_mixing, input_scale):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
 
 
-def test_mhc_fused_rejects_unsupported_precision():
+@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+def test_mhc_fused_rejects_unsupported_precision(flag):
     config = TransformerConfig(
         num_layers=1,
         hidden_size=32,
         num_attention_heads=4,
         enable_mhc_connections=True,
         use_fused_mhc=True,
-        mhc_keep_mappings_in_fp32=True,
     )
+    # Keep the module-level guard for configs modified after constructor validation.
+    setattr(config, flag, True)
     with pytest.raises(ValueError, match="Fused mHC does not support"):
         HyperConnectionModule(config, layer_number=1)

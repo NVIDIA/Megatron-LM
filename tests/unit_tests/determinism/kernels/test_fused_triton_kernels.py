@@ -611,9 +611,11 @@ def test_contiguous_thd_rope_and_teacher_replay():
     )
 
 
-def test_native_mhc_dtype_casts_replay_fwd_bwd():
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_native_mhc_dtype_casts_replay_fwd_bwd(eps_inside_sqrt):
     """Native mHC reductions and FP32 mapping projections replay bit-exactly."""
     from megatron.core.transformer.hyper_connection import (
+        _proj_rms_impl,
         native_h_aggregate,
         native_h_post_bda,
         native_proj_rms,
@@ -644,8 +646,15 @@ def test_native_mhc_dtype_casts_replay_fwd_bwd():
     projection_input = _mhc_rand(s * b, n * c, dtype=torch.float32)
     projection_weight = _mhc_rand(n * n + 2 * n, n * c, dtype=torch.float32)
     assert_replays_bit_exact(
-        lambda x, weight: native_proj_rms(x, weight, eps_inside_sqrt=True),
+        lambda x, weight: native_proj_rms(x, weight, eps_inside_sqrt=eps_inside_sqrt),
         (projection_input, projection_weight),
         replays=3,
         what="native mHC proj_rms",
+    )
+    # The module uses eager FP32 projection for both the no-grad forward and replay.
+    assert_replays_bit_exact(
+        lambda x, weight: _proj_rms_impl(x, weight, eps_inside_sqrt=eps_inside_sqrt),
+        (projection_input.to(torch.bfloat16).detach().requires_grad_(True), projection_weight),
+        replays=3,
+        what="eager mHC proj_rms with BF16 saved input",
     )
