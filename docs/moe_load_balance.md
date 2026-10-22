@@ -937,3 +937,5 @@ transport buffers. The production-layer cells require four GPUs. This is a
 fixed-topology contract, not a promise of identical results across different
 EP sizes or different planner/transport configurations. Full GPT checkpoint
 continuation remains a separate end-to-end test.
+The GB200 unit-test recipe runs this replay file in its own bucket so pinned
+process-global autotune state does not leak into ordinary MoE tests.
