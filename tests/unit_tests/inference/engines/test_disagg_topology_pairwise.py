@@ -181,6 +181,7 @@ def admit_model_group(engine, failed=False):
         ("nixl", 1, 2, 1, 1),
         ("nccl", 2, 1, 2, 1, "local"),
         ("nccl", 2, 1, 2, 1, "inference_optimized"),
+        ("nccl", 2, 1, 1, 1, "transformer_engine", "hybrid"),
         ("nixl", 2, 1, 2, 1, "transformer_engine", "gpt", True),
     ],
     ids=[
@@ -192,6 +193,7 @@ def admit_model_group(engine, failed=False):
         "nixl-pp2-to-pp1",
         "local-tp2",
         "inference-optimized-tp2",
+        "hybrid-tp2-to-tp1",
         "native-prepare-failure-tp2",
     ],
 )

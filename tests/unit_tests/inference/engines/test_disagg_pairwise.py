@@ -75,6 +75,7 @@ def transport_world():
         ),
         pytest.param("nccl", 33, {"sampling_backend": "flashinfer"}, 7, id="flashinfer"),
         pytest.param("nccl", 33, {}, 1, id="terminal-first-token"),
+        pytest.param("nccl", 33, {"model_provider": "hybrid"}, 7, id="mamba-exact-state"),
         pytest.param(
             "nccl",
             33,
