@@ -767,6 +767,19 @@ def test_kda_gate_jit_path_replays_fwd_bwd():
     assert_replays_bit_exact(fn, (raw_g, beta), replays=3, what="KDA gate JIT path")
 
 
+def test_kda_fp8_opt_out_scope_is_replay_safe():
+    """KDA-only FP8 initialization selection remains stable across the dispatch path."""
+    from megatron.core.ssm.gated_delta_net.common import _kda_fp8_disabled
+    from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+    from megatron.core.ssm.kda_layer_config import KDALayerConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.kda_disable_fp8 = True
+    assert _kda_fp8_disabled(KDALayerConfig.from_config(config))
+    assert not _kda_fp8_disabled(GDNLayerConfig.from_config(config))
+
+
 @pytest.mark.xfail(
     strict=False, reason="FLA chunk_gated_delta_rule is documented non-deterministic; recorded"
 )
