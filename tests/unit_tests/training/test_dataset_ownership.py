@@ -138,7 +138,11 @@ def container_factory(monkeypatch):
     )
 
     def build(argv, *, data=False, **kwargs):
-        args = _parse(argv)
+        # finalize() resolves the batch sizes from the registered arguments (upstream #8149):
+        # a micro batch and the batch-parallel size validate_args derives from the world size.
+        args = _parse(["--micro-batch-size", "1", *argv])
+        args.batch_parallel_size = 1
+        monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
         if data:
             kwargs["data_cfg"] = gpt_data_config_from_args(args)
         return args, pretrain_cfg_container_from_args(args, **kwargs)
@@ -401,9 +405,12 @@ def test_container_keeps_a_caller_supplied_data_section(container_factory):
     assert cfg.data.dataset.random_seed == 7 and cfg.rng.seed == 1234  # independent seeds
 
 
-def test_run_config_fixture_is_loader_only(run_config):
+def test_run_config_fixture_is_loader_only(run_config, monkeypatch):
     assert run_config.data.dataset is None
     run_config.validate()
+    # finalize() resolves the batch sizes from the registered arguments (upstream #8149).
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
+    run_config.train.micro_batch_size = 1
     run_config.finalize()
 
 
@@ -690,8 +697,8 @@ def test_runtime_services_prepare_a_finalized_dataset_config(
 def test_set_global_variables_finalizes_a_dataset_section(
     container_factory, monkeypatch, tokenizer
 ):
-    """The compatibility bootstrap: a container with a dataset section is finalized before the
-    runtime services bind the tokenizer; a loader-only container is validated only, as before."""
+    """The compatibility bootstrap finalizes the container before the runtime services bind the
+    tokenizer (every PretrainConfigContainer, loader-only ones included, since upstream #8149)."""
     globals_ = ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE")
     for name in globals_:
         monkeypatch.setattr(global_vars, name, None)
@@ -707,6 +714,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", lambda args: None)
     args, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = None
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)  # the bootstrap registers them
     global_vars.set_global_variables(args, cfg)
     assert global_vars.get_run_config() is cfg and cfg._finalized
     assert cfg.data.dataset.is_prepared and cfg.data.dataset.tokenizer is tokenizer
@@ -715,5 +723,6 @@ def test_set_global_variables_finalizes_a_dataset_section(
     for name in globals_:
         monkeypatch.setattr(global_vars, name, None)
     args, loader_only = container_factory(["--seq-length", "64"])
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     global_vars.set_global_variables(args, loader_only, build_tokenizer=False)
-    assert global_vars.get_run_config() is loader_only and not loader_only._finalized
+    assert global_vars.get_run_config() is loader_only and loader_only._finalized

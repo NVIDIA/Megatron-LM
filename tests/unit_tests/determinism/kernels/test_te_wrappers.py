@@ -801,6 +801,78 @@ class TestTEWrappers:
                 pytest.skip(f"TE has no {backend} attention backend here: {error}")
             raise
 
+    @pytest.mark.parametrize("backend", ["fused", "flash"])
+    def test_te_dot_product_attention_softmax_scale_replays(self, backend, monkeypatch):
+        """The config-derived scale MLA hands to its core attention replays bit-exactly."""
+        seeded()
+        # conftest forces both TE attention backends off per test; pick one explicitly.
+        clear_nvte_env_vars()
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1" if backend == "fused" else "0")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1" if backend == "flash" else "0")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        # TE caches its backend choice per AttentionParams and only re-selects when the params
+        # change, so an env flip alone would replay the previously chosen backend.
+        from transformer_engine.pytorch.attention.dot_product_attention import (
+            dot_product_attention as te_dpa,
+        )
+
+        monkeypatch.setattr(
+            te_dpa,
+            "_attention_backends",
+            {
+                "attention_params": None,
+                "use_flash_attention": None,
+                "flash_attention_backend": None,
+                "use_fused_attention": None,
+                "fused_attention_backend": None,
+                "use_unfused_attention": None,
+                "backend_selection_requires_update": False,
+            },
+        )
+
+        def build(softmax_scale):
+            return TEDotProductAttention(
+                _config(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type="self",
+                softmax_scale=softmax_scale,
+            ).cuda()
+
+        s, b, h, hkv, d = 512, 2, 16, 4, 128
+        q = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def fn(module):
+
+            def run(q, k, v):
+                return module(q, k, v, None, AttnMaskType.causal)
+
+            return run
+
+        try:
+            default = assert_replays_bit_exact(
+                fn(build(None)),
+                (q, k, v),
+                replays=3,
+                contention=True,
+                what=f"TEDotProductAttention[{backend}, default softmax_scale]",
+            )
+            scaled = assert_replays_bit_exact(
+                fn(build(0.25)),
+                (q, k, v),
+                replays=3,
+                contention=True,
+                what=f"TEDotProductAttention[{backend}, config softmax_scale]",
+            )
+        except (RuntimeError, AssertionError) as error:
+            if "backend" in str(error).lower() and "avail" in str(error).lower():
+                pytest.skip(f"TE has no {backend} attention backend here: {error}")
+            raise
+        assert len(scaled[1]) == 3  # Replay covers dQ, dK, and dV.
+        assert not bytes_equal(default[0]["out"], scaled[0]["out"])
+
 
 # --- fused RoPE --------------------------------------------------------------------------------
 

@@ -165,23 +165,28 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct training runtime services.
+    """Register caller-provided args/config and construct their runtime services."""
 
-    A container that carries a dataset section (``cfg.data.dataset``) is finalized here, as
-    ``initialize_megatron`` does, because the runtime services bind the tokenizer to the finalized
-    section; every other container is validated only, as before.
-    """
+    from megatron.training.config import PretrainConfigContainer
 
     assert args is not None
     assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    training = isinstance(cfg_container, PretrainConfigContainer)
     cfg_container.validate()
-    if getattr(getattr(cfg_container, "data", None), "dataset", None) is not None:
-        cfg_container.finalize()
     set_run_config(cfg_container)
     set_args(args)
-    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=True)
+    if training:
+        cfg_container.finalize()
+    initialize_runtime_services(
+        args,
+        build_tokenizer=build_tokenizer,
+        training=training,
+    )
+    if not training:
+        # Legacy checkpoint converters preserve progress without training services.
+        _set_train_state()
 
 
 def initialize_runtime_services(
@@ -210,20 +215,21 @@ def initialize_runtime_services(
 
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
-    if args.step_batch_size_schedule is not None:
+    cfg = get_run_config()
+    if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
         from megatron.training.utils import print_rank_0
-        print_rank_0(f'> using step batch size schedule: {args.step_batch_size_schedule}')
+        print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
         rank=args.rank,
-        global_batch_size=args.global_batch_size,
-        micro_batch_size=args.micro_batch_size,
+        global_batch_size=cfg.train.global_batch_size,
+        micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
         data_parallel_size=get_batch_parallel_size(args),
-        decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-        step_batch_size_schedule=args.step_batch_size_schedule,
+        decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
+        step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
     _set_tensorboard_writer(args)
@@ -233,10 +239,10 @@ def initialize_training_runtime_services(args: Namespace) -> None:
     _set_energy_monitor(args)
     _set_train_state()
 
-    if args.exit_signal_handler:
-        _set_signal_handler(args.exit_signal)
+    if cfg.train.exit_signal_handler:
+        _set_signal_handler(cfg.train.exit_signal)
 
-    if args.exit_signal_handler_for_training:
+    if cfg.train.exit_signal_handler_for_training:
         signal.signal(signal.SIGINT, _graceful_shutdown)
         signal.signal(signal.SIGTERM, _graceful_shutdown)
 
