@@ -100,21 +100,19 @@ def test_packed_padding_config_rejects_invalid_alignment(alignment):
         ModelParallelConfig(pad_packed_seq_alignment=alignment, max_seqlen_per_dp_cp_rank=128)
 
 
-def test_unpack_drops_prompt_only_truncated_tail():
+def test_unpack_keeps_prompt_only_sub_samples():
+    # Dropping them could leave too few sub-samples to fill every DP rank. With no
+    # supervised tokens they contribute nothing to the loss.
     batch = _batch()
     batch.pop('padding_mask')
     batch.pop('cu_seqlens_padded')
     batch['cu_seqlens'] = torch.tensor([0, 4, 9, 9], dtype=torch.int32)
     batch['loss_mask'][4:] = 0
     unpacked = _unpack_batch([batch])
-    assert len(unpacked) == 1
+    assert len(unpacked) == 2
     torch.testing.assert_close(unpacked[0]['tokens'], torch.tensor([11, 12, 13, 0]))
-
-
-def test_unpack_all_prompt_only_samples_leaves_empty_local_batch():
-    batch = _batch()
-    batch['loss_mask'].zero_()
-    assert _unpack_batch([batch]) == []
+    torch.testing.assert_close(unpacked[1]['tokens'], torch.tensor([21, 22, 23, 24, 25]))
+    assert not unpacked[1]['loss_mask'].any()
 
 
 def test_empty_source_rank_receives_rerouted_samples(monkeypatch):
