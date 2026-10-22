@@ -174,6 +174,7 @@ from megatron.training.logging.dsa_flops import _dsa_kpool_attention_scale
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
+    DcpStatsAccumulator,
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
@@ -4588,6 +4589,7 @@ def train_step(
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     tensor_metric_observer: _TensorMetricObserverCallback | None = None,
+    schedule_stats: Optional[Dict] = None,
 ):
     """Single training step.
 
@@ -4604,6 +4606,9 @@ def train_step(
     args = get_args()
     timers = get_timers()
     num_microbatches = get_num_microbatches()
+    if schedule_stats is not None:
+        schedule_stats.clear()
+    pending_schedule_stats = {} if schedule_stats is not None else None
 
     optimizer_config = getattr(optimizer, 'config', None)
     chunked_optimizer_state_offload = bool(
@@ -4772,6 +4777,11 @@ def train_step(
                     config,
                     get_num_microbatches(),
                     pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+                    **(
+                        {'schedule_stats': pending_schedule_stats}
+                        if pending_schedule_stats is not None
+                        else {}
+                    ),
                 )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
@@ -4984,6 +4994,9 @@ def train_step(
     else:
         skipped_iter = 1
 
+    if schedule_stats is not None and not skipped_iter:
+        schedule_stats.update(pending_schedule_stats)
+
     # Empty unused memory.
     if cfg.train.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
@@ -5118,6 +5131,7 @@ def training_log(
     model=None,
     callback_manager: CallbackManager | None = None,
     packed_sequence_stats: Optional[Dict[str, float]] = None,
+    dcp_stats: Optional[DcpStatsAccumulator] = None,
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
@@ -5471,6 +5485,16 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % cfg.logger.log_interval == 0 or is_first_iteration:
+        if dcp_stats is not None:
+            dcp_metrics = dcp_stats.metrics(reset=should_reset)
+            if iteration % cfg.logger.log_interval == 0:
+                if writer:
+                    for key, value in dcp_metrics.items():
+                        writer.add_scalar(key, value, iteration)
+                if wandb_writer:
+                    wandb_writer.log(dcp_metrics, iteration)
+        else:
+            dcp_metrics = {}
         should_prof_rank = (
             cfg.profiling.profile_ranks == [] or safe_get_rank() in cfg.profiling.profile_ranks
         )  # [] is all ranks
@@ -5509,6 +5533,8 @@ def training_log(
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, cfg.train.train_iters)
+        for key, value in dcp_metrics.items():
+            log_string += f' {key}: {value:.6f} |'
         if cfg.train.train_samples:
             log_string += ' consumed samples: {:12d}/{:12d} ({:.2f}%) |'.format(
                 train_state.consumed_train_samples,
@@ -6297,6 +6323,7 @@ def train(
 
     # Tracking loss.
     total_loss_dict = {}
+    dcp_stats = DcpStatsAccumulator() if cfg.logger.log_dcp_stats else None
 
     # Iterations.
     iteration = train_state.iteration
@@ -6703,6 +6730,9 @@ def train(
         # The data hook may replace the iterator each iteration; the dataloader path keeps it.
         train_data_iterator = next_train_iterator(iteration, train_data_iterator)
 
+        # Keep pending stats local to this attempt: exceptions/early exits cannot
+        # leak into another step, and train_step's packed iterator is reused on rerun.
+        schedule_stats = {} if dcp_stats is not None else None
         if run_train_loop_without_updates:
             # Rollout-only: the data hook collected this iteration's rollouts; no optimizer step.
             loss_dict = {}
@@ -6784,6 +6814,7 @@ def train(
                     pg_collection=pg_collection,
                     p2p_communicator=p2p_communicator,
                     tensor_metric_observer=tensor_metric_observer,
+                    schedule_stats=schedule_stats,
                 )
                 ft_integration.on_training_step_end()
                 if _maybe_raise_workload_exception is not None and iteration != start_iteration:
@@ -6903,6 +6934,8 @@ def train(
             consume_seqlen_stats_in_iteration()
         )
         packed_sequence_stats = None
+        if dcp_stats is not None:
+            dcp_stats.update(schedule_stats, skipped=skipped_iter)
         if getattr(args, 'log_packed_sequence_stats', False):
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
         (
@@ -6988,6 +7021,7 @@ def train(
                     model=model,
                     callback_manager=callback_manager,
                     packed_sequence_stats=packed_sequence_stats,
+                    dcp_stats=dcp_stats,
                     num_microbatches=scheduled_num_microbatches,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;

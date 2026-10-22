@@ -11,6 +11,109 @@
 
 This guide covers how Megatron's data pipeline works and how to configure it for efficient training at 256 nodes and beyond. At this scale, the primary bottlenecks are **index building** and **barrier synchronization** -- not raw data bandwidth.
 
+## Observing packed schedules and dynamic context parallelism
+
+Add `--log-dcp-stats` to a training run using `--sequence-packing-scheduler`
+(including `--dynamic-context-parallel`). It defaults to off. The final packed
+schedule is observed **after VPP alignment**, without changing packing or
+scheduling decisions. At the existing `--log-interval`, stdout, TensorBoard and
+W&B emit the metrics below through their existing rank/writer ownership. No new
+monitoring dependency is required. The first-iteration stdout diagnostic retains
+the current window until the regular interval boundary.
+
+For microbatch $m$, let $S_{m,r}$ be the IDs assigned to DP×CP rank $r$,
+$L_i$ the dataset's **padded** sequence length, and
+$c_{m,i}=|\{r:i\in S_{m,r}\}|$ its actual CP size in that microbatch. Then
+
+$$
+W_{m,r}=\sum_{i\in S_{m,r}}\frac{L_i^2}{c_{m,i}},\qquad
+E=\frac{\sum_m\sum_r W_{m,r}}{R\sum_m\max_r W_{m,r}},
+$$
+
+where $R$ is the number of DP×CP ranks, excluding TP and PP replicas. For
+example, $W=[8,8,4,4]$ gives $E=24/(4\times8)=0.75$. Multiple packed samples
+contribute their **individual squares**, not the square of their total length.
+Taking the maximum before summing over microbatches preserves alternating rank
+hotspots. The sum of rank work in each legal microbatch equals the sum of $L_i^2$
+over its unique logical IDs.
+
+- `dcp/estimated_attention_balance_efficiency` reports $E$, closer to 1 for
+  more balanced estimated work. Empty or zero-work windows omit this undefined
+  ratio rather than reporting 100%.
+- `dcp/cp_size_<c>_sample_fraction` reports the fraction of logical samples
+  assigned CP size $c$. Each ID is counted once per microbatch, including when
+  replicated across CP ranks. Equal-length samples with different IDs remain
+  distinct. Only observed CP sizes are emitted.
+
+Logging windows accumulate the efficiency numerator and denominator and CP
+counts before division. TP/PP copies of the global schedule are never added
+together. Reruns reuse one pending summary; only a successful training step
+commits it. Skipped steps, exceptions, early exits and evaluation do not
+contribute. A restart begins a fresh logging window.
+
+Example output (illustrative):
+
+```text
+iteration 100/1000 | dcp/estimated_attention_balance_efficiency: 0.750000 | dcp/cp_size_1_sample_fraction: 0.666667 | dcp/cp_size_2_sample_fraction: 0.333333 | elapsed time per iteration (ms): ...
+```
+
+`L²/CP` is the scheduler's **attention-work estimate**, not measured GPU
+utilization or elapsed-time efficiency. It excludes communication, MLP work,
+pipeline bubbles, and some additional THD padding applied after scheduling.
+Interpret it alongside existing step timing and effective (unmasked) tokens/s.
+Enabling it performs CPU statistics and extends the existing TP scalar metadata
+broadcast using float64 for squared-length precision. There are no additional
+DP/CP collectives; this still has observation and communication overhead.
+The complete microbatch-by-rank work matrix is available from
+`compute_schedule_stats` in `data_schedule_utils.py`, and on TP source ranks via
+the optional `schedule_stats` output dict of `wrap_data_iterator`. The existing
+four-element return value is preserved. No metrics are computed when the dict
+is `None`.
+
+For a small dense BF16/THD DCP run (requires a backend supporting the selected
+GPU and THD padding metadata):
+
+```bash
+python - <<'PY'
+from pathlib import Path
+# Current MockVarlenDataset shifts away one token. These CSV entries yield
+# aligned valid lengths 1024, 256, 128, 512 for the Ampere FA2 path.
+Path('/tmp/dcp-lengths.csv').write_text(('1025\n257\n129\n129\n513\n257\n129\n129\n') * 24)
+PY
+COMMON=(
+  --use-mcore-models --num-layers 4 --hidden-size 128 --ffn-hidden-size 512
+  --num-attention-heads 4 --seq-length 1024 --max-position-embeddings 1024
+  --transformer-impl transformer_engine --attention-backend flash --bf16
+  --attention-dropout 0 --hidden-dropout 0 --no-gradient-accumulation-fusion
+  --micro-batch-size 1 --global-batch-size 8 --calculate-per-token-loss
+  --context-parallel-size 2 --max-seqlen-per-dp-cp-rank 512
+  --use-varlen-dataset --mock-data --tokenizer-type NullTokenizer --vocab-size 256
+  --null-tokenizer-pad-id 0 --num-workers 0 --dataloader-type single
+  --varlen-mock-dataset-config-json '{"mode":"file","format":"thd","path":"/tmp/dcp-lengths.csv"}'
+  --train-iters 40 --lr-decay-iters 100 --lr 0.00015 --min-lr 0.00001
+  --lr-warmup-iters 0 --seed 1234 --log-interval 1 --eval-iters 0
+)
+python -m torch.distributed.run --standalone --nproc-per-node 2 pretrain_gpt.py \
+  "${COMMON[@]}" --dynamic-context-parallel --log-dcp-stats
+```
+
+For an observation-overhead comparison, run the same command with the flag
+off/on from the same checkpoint, data and seed, exclude warmup, alternate the
+order and repeat measurements. Verify schedules, microbatch counts, losses,
+gradients and parameter updates before interpreting timing. For fixed CP use
+`--sequence-packing-scheduler dp_balanced` in place of
+`--dynamic-context-parallel`. The existing
+`examples/dynamic_context_parallel/benchmark_dcp.sh` also compares fixed CP and
+DCP with steady-state training timers. These are small-model acceptance checks,
+not production-scale convergence or scaling evidence.
+
+Four-GPU topology variants of the command above are TP2×CP2 (add
+`--tensor-model-parallel-size 2 --sequence-parallel`) and PP2×CP2/VPP2 (add
+`--pipeline-model-parallel-size 2 --num-layers-per-virtual-pipeline-stage 1
+--microbatch-group-size-per-virtual-pipeline-stage 2`). The latter has **two DP×CP ranks**,
+not four. Confirm that the workload actually triggers VPP alignment; requesting
+VPP alone does not prove that microbatches were split.
+
 ## How Data Loading Works
 
 Understanding the architecture helps explain why specific flags matter.
