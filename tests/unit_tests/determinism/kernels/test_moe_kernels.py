@@ -1060,6 +1060,7 @@ class TestMoEModules:
                 what="MoELayer[inference, flashinfer per-token NVFP4]",
             )
         assert layer.experts._nvfp4_weights is not None
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
         "offload_modules,offloaded_group",
