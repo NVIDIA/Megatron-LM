@@ -1676,7 +1676,8 @@ class TestHybridBlock:
             mlp_layer.pre_mlp_norm_checkpoint,
         ):
             assert checkpoint in checkpoint.ckpt_manager.checkpoints
-            assert checkpoint.ctx is None
+            region = checkpoint._current_region()
+            assert region is None or not region.awaits_rebuild
             assert checkpoint.outputs is None
 
     @pytest.mark.timeout(60)
@@ -1714,10 +1715,13 @@ class TestHybridBlock:
         assert inner_layer.recompute_pre_mlp_layernorm
         checkpoint = inner_layer.pre_mlp_norm_checkpoint
         assert checkpoint.ckpt_manager is None
-        assert checkpoint.outputs[0].untyped_storage().nbytes() == 0
+        assert checkpoint.outputs is None
+        region = checkpoint._current_region()
+        assert region._output_aliases
+        assert all(alias.untyped_storage().nbytes() == 0 for alias in region._output_aliases)
 
         output.sum().backward()
-        assert checkpoint.ctx is None
+        assert not region.awaits_rebuild
         assert checkpoint.outputs is None
 
     def test_hyper_connection_gpu_forward(self):
