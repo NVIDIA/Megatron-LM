@@ -241,6 +241,10 @@ restriction on models without Q/K normalization.
 storage only once in each direction. Add fused/FlashAttention forward and gradient parity tests,
 including partial offload and CUDA graphs, before removing the current runtime restriction.
 
+The determinism suite covers supported Q/K-normalized and RoPE inputs with partial and full
+offload. It compares logits and parameter gradients bit-for-bit against a resident baseline and
+across warmup/steady-state replays under side-stream contention.
+
 ### CUDA Graph Support
 
 When offloading interacts with CUDA graphs:
