@@ -165,6 +165,7 @@ class StatefulGraphs:
         backend: str = "torch",
         num_warmup_iters: int = 3,
         debug_checks: bool = False,
+        capture_kwargs: Mapping | None = None,
     ) -> None:
         if not hidden.is_cuda or slots < 1:
             raise ValueError("Stateful CUDA graphs require a CUDA sample and positive slot count")
@@ -210,7 +211,11 @@ class StatefulGraphs:
             with self._capture_grad_state(te_graph) as fused:
                 self._callables.append(
                     capture(
-                        wrapper, args, num_warmup_iters=num_warmup_iters, allow_unused_input=True
+                        wrapper,
+                        args,
+                        num_warmup_iters=num_warmup_iters,
+                        allow_unused_input=True,
+                        **(capture_kwargs or {}),
                     )
                 )
             self._fused_grad_params.append(tuple(fused))

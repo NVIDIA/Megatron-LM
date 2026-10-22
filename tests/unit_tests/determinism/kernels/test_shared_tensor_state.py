@@ -21,11 +21,21 @@ from tests.unit_tests.transformer.test_stateful_module import (  # pylint: disab
 
 
 class _Region(nn.Module):
-    def __init__(self):
+    def __init__(self, width=16, dtype=torch.float32, fp8=False):
         super().__init__()
-        self.weight = nn.Parameter(torch.randn(16, device="cuda"))
+        self.weight = nn.Parameter(torch.randn(width, device="cuda", dtype=dtype))
+        self.projection = None
+        if fp8:
+            from transformer_engine.pytorch import Linear
+
+            self.projection = Linear(width, width, bias=False, params_dtype=dtype)
 
     def forward(self, hidden, state):
+        if self.projection is not None:
+            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+            assert FP8GlobalStateManager.is_fp8_enabled()
+            hidden = self.projection(hidden)
         memory = hidden * self.weight + state["memory"]
         return memory.square(), {"memory": memory}
 
@@ -33,11 +43,22 @@ class _Region(nn.Module):
 class _Replay(nn.Module):
     def __init__(self, mode, inputs):
         super().__init__()
-        fields = (TensorField("memory", (64, 2, 16), torch.float32, "contiguous", True),)
-        self.region = StatefulModule(_Region(), fields, fields)
+        sample = inputs[0]
+        fields = (TensorField("memory", tuple(sample.shape), sample.dtype, "contiguous", True),)
+        self.region = StatefulModule(
+            _Region(sample.shape[-1], sample.dtype, fp8=mode == "mxfp8"), fields, fields
+        )
         self.mode = mode
+        options = {}
+        if mode == "mxfp8":
+            from transformer_engine.common.recipe import MXFP8BlockScaling
+
+            mode = "transformer_engine"
+            options = dict(fp8_enabled=True, fp8_recipe=MXFP8BlockScaling())
         self.graphs = (
-            StatefulGraphs(self.region, inputs[0], {"memory": inputs[1]}, backend=mode)
+            StatefulGraphs(
+                self.region, inputs[0], {"memory": inputs[1]}, backend=mode, capture_kwargs=options
+            )
             if mode in ("torch", "transformer_engine")
             else None
         )
@@ -55,11 +76,16 @@ class _Replay(nn.Module):
 
 
 @pytest.mark.usefixtures("te_rng_tracker")
-@pytest.mark.parametrize("mode", ["eager", "checkpoint", "torch", "transformer_engine"])
+@pytest.mark.parametrize("mode", ["eager", "checkpoint", "torch", "transformer_engine", "mxfp8"])
 def test_shared_region_replays_forward_and_all_gradients(mode):
+    if mode == "mxfp8" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 requires SM100")
     Utils.initialize_model_parallel(1, 1)
     seeded()
-    inputs = tuple(torch.randn(64, 2, 16, device="cuda", requires_grad=True) for _ in range(2))
+    width, dtype = (32, torch.bfloat16) if mode == "mxfp8" else (16, torch.float32)
+    inputs = tuple(
+        torch.randn(64, 2, width, device="cuda", dtype=dtype, requires_grad=True) for _ in range(2)
+    )
     module = None
     try:
         module = _Replay(mode, inputs)
