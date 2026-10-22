@@ -184,51 +184,6 @@ class StreamwiseSigmoidWideResidualRead(nn.Module):
         )
 
 
-class StreamwiseSigmoidResidualReadout(nn.Module):
-    """Learned streamwise readout from D' to D before final normalization."""
-
-    def __init__(self, config: TransformerConfig) -> None:
-        super().__init__()
-        if config.wide_residual is None:
-            raise ValueError("StreamwiseSigmoidResidualReadout requires wide_residual config.")
-        wr = config.wide_residual
-        self.input_hidden_size = wr.num_streams * config.hidden_size
-        self.output_hidden_size = config.hidden_size
-        self.exit_map = StreamwiseSigmoidMap(config, map_kind="read")
-
-    def forward(self, hidden_states: Tensor) -> Tensor:
-        """Mix the full-width streams into one backbone-width activation."""
-
-        if hidden_states.shape[-1] != self.input_hidden_size:
-            raise ValueError(
-                "Streamwise sigmoid readout expected hidden size "
-                f"{self.input_hidden_size}, got {hidden_states.shape[-1]}."
-            )
-        return streamwise_sigmoid_read(
-            hidden_states, self.exit_map(return_logits=True), self.exit_map.num_streams
-        )
-
-
-def build_wide_residual_readout(
-    config: TransformerConfig,
-) -> StreamwiseSigmoidResidualReadout | None:
-    """Build the streamwise model-boundary readout when wide residuals are enabled."""
-
-    if config.wide_residual is None:
-        return None
-    return StreamwiseSigmoidResidualReadout(config)
-
-
-def expand_wide_residual_stream(hidden_states: Tensor, num_streams: int) -> Tensor:
-    """Replicate an ordinary-width activation into contiguous residual streams."""
-
-    if num_streams <= 1:
-        raise ValueError(f"num_streams must be greater than one, got {num_streams}.")
-    repeat_shape = [1] * hidden_states.ndim
-    repeat_shape[-1] = num_streams
-    return hidden_states.repeat(*repeat_shape)
-
-
 class StreamwiseSigmoidWideResidualConnection(ResidualConnection):
     """Streamwise residual maps restricted to a read or write at construction."""
 
@@ -425,6 +380,51 @@ def load_residual_state(
             if key.startswith(prefix + legacy):
                 state_dict[prefix + current + key[len(prefix + legacy) :]] = state_dict.pop(key)
                 break
+
+
+class StreamwiseSigmoidResidualReadout(nn.Module):
+    """Learned streamwise readout from D' to D before final normalization."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        if config.wide_residual is None:
+            raise ValueError("StreamwiseSigmoidResidualReadout requires wide_residual config.")
+        wr = config.wide_residual
+        self.input_hidden_size = wr.num_streams * config.hidden_size
+        self.output_hidden_size = config.hidden_size
+        self.exit_map = StreamwiseSigmoidMap(config, map_kind="read")
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """Mix the full-width streams into one backbone-width activation."""
+
+        if hidden_states.shape[-1] != self.input_hidden_size:
+            raise ValueError(
+                "Streamwise sigmoid readout expected hidden size "
+                f"{self.input_hidden_size}, got {hidden_states.shape[-1]}."
+            )
+        return streamwise_sigmoid_read(
+            hidden_states, self.exit_map(return_logits=True), self.exit_map.num_streams
+        )
+
+
+def build_wide_residual_readout(
+    config: TransformerConfig,
+) -> StreamwiseSigmoidResidualReadout | None:
+    """Build the streamwise model-boundary readout when wide residuals are enabled."""
+
+    if config.wide_residual is None:
+        return None
+    return StreamwiseSigmoidResidualReadout(config)
+
+
+def expand_wide_residual_stream(hidden_states: Tensor, num_streams: int) -> Tensor:
+    """Replicate an ordinary-width activation into contiguous residual streams."""
+
+    if num_streams <= 1:
+        raise ValueError(f"num_streams must be greater than one, got {num_streams}.")
+    repeat_shape = [1] * hidden_states.ndim
+    repeat_shape[-1] = num_streams
+    return hidden_states.repeat(*repeat_shape)
 
 
 def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -> bool:
