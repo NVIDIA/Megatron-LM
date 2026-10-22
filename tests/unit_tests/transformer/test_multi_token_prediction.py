@@ -3519,10 +3519,15 @@ class TestMultiTokenPrediction:
         captured = {}
         calls = []
 
-        def capture_metrics(loss, correct, total, *args, **kwargs):
+        def capture_loss(loss_sum, num_tokens, *args, correct=None, total=None, **kwargs):
             captured["correct"], captured["total"] = correct, total
 
-        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+        # Dev records acceptance counts through save_loss_to_tracker while collection is
+        # enabled; pin collection on so tracker state from other tests cannot hide them.
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_loss_to_tracker", capture_loss)
+        monkeypatch.setattr(
+            MTPLossLoggingHelper, "should_collect_acceptance", staticmethod(lambda: True)
+        )
         monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
         config = TransformerConfig(
             mtp_num_layers=1,

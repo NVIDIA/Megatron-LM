@@ -252,7 +252,7 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
 @pytest.mark.parametrize("full_recompute", [False, True])
 def test_hybrid_stack_forwards_layout_specific_ids_only_to_hash_layers(monkeypatch, full_recompute):
     monkeypatch.setattr(
-        recompute_module.tensor_parallel,
+        tensor_parallel,
         "checkpoint",
         lambda function, _distribute_saved_activations, *args: function(*args),
     )

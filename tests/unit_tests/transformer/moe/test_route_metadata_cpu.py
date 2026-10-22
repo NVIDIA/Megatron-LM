@@ -33,6 +33,7 @@ def test_hash_ids_and_padding_use_owning_tp_group(monkeypatch):
     )
     layer.tp_group = group
     layer.router = Router()
+    layer.token_dispatcher = SimpleNamespace(wrap_layer_input=lambda hidden_states: hidden_states)
     mask = torch.tensor([[False, True, False, True]])
     ids = torch.tensor([[11, 12, 13, 14]])
     hidden = torch.zeros(2, 1, 4)

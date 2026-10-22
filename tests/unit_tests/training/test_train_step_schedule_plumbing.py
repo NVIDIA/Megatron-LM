@@ -10,11 +10,13 @@ import pytest
 
 from megatron.core.enums import ModelType
 from megatron.training import training as training_mod
+from megatron.training.state import TrainState
 
 
 @pytest.fixture(autouse=True)
 def training_config(run_config):
     run_config.train.micro_batch_size = 1
+    run_config.train.global_batch_size = 1
 
 
 class _Rerun:
@@ -529,6 +531,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         load=None,
         pretrained_checkpoint=None,
         data_parallel_size=1,
+        gtp_weight_remat_size=1,
         micro_batch_size=1,
         fp16=False,
         ckpt_convert_format=None,
@@ -544,7 +547,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
     cfg = SimpleNamespace(
         model=model_config,
         profiling=mock.Mock(),
-        ddp=SimpleNamespace(use_layer_wise_param_layout=ddp_layout),
+        ddp=SimpleNamespace(use_layer_wise_param_layout=ddp_layout, use_megatron_fsdp=False),
         optimizer=SimpleNamespace(
             overlap_param_gather_with_optimizer_step=False,
             use_layer_wise_distributed_optimizer=True,
@@ -553,6 +556,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         dist=SimpleNamespace(use_megatron_fsdp=False, use_torch_fsdp2=False),
         rng=SimpleNamespace(data_parallel_random_init=False),
         rl=SimpleNamespace(perform_rl_step=False),
+        validation=SimpleNamespace(skip_train=True),
     )
     pg_collection = mock.Mock()
 
@@ -561,6 +565,7 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         mock.patch("megatron.post_training.checkpointing.get_args", return_value=args),
         mock.patch.object(training_mod, "get_timers", return_value=mock.Mock()),
         mock.patch.object(training_mod, "get_one_logger", return_value=None),
+        mock.patch.object(training_mod, "get_train_state", return_value=TrainState()),
         mock.patch.object(training_mod, "unwrap_model", return_value=[unwrapped_model]),
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
         mock.patch.object(training_mod, "get_current_global_batch_size", return_value=1),

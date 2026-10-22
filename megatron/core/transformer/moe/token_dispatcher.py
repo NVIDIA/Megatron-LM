@@ -1329,8 +1329,11 @@ class _HybridEPManager(_DispatchManager):
             # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
-        # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
-        # in dispatch) and does not drop tokens or report overflow.
+        else:
+            # HybridEP sizes buffers dynamically (CPU sync in dispatch) and does not drop
+            # tokens or report overflow. combine() keeps a factor-derived budget for CUDA
+            # graph replay, so drop it once the factor is unset (e.g. a dropless retry).
+            self.num_permuted_tokens = None
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
             num_out_tokens = padded_num_tokens * self.config.moe_router_topk

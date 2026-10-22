@@ -405,6 +405,7 @@ def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
             moe_router_score_function='sigmoid',
             moe_router_topk_scaling_factor=3.16,
             moe_router_load_balancing_type='quantile_balancing',
+            moe_router_quantile_balancing_estimation_scope='micro_batch',
             moe_aux_loss_coeff=0,
             moe_router_dtype='fp32',
             moe_router_fusion=False,
@@ -1237,6 +1238,9 @@ def test_virtual_expert_upstream_router_formats(monkeypatch, mode, compact_suppo
         moe_router_dtype="fp32",
         moe_router_topk_scaling_factor=3.16,
         moe_router_load_balancing_type="quantile_balancing" if quantile else "seq_aux_loss",
+        moe_router_quantile_balancing_estimation_scope=(
+            "micro_batch" if quantile else "global_batch"
+        ),
         moe_aux_loss_coeff=0 if quantile else 1e-4,
         moe_router_fusion=mode in ("fused", "hash-fused"),
         moe_num_hash_layers=int(hash_routing),

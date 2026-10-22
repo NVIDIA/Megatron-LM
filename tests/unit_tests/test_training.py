@@ -17,6 +17,7 @@ from megatron.training.checkpointing import save_grads
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
+from megatron.training.state import TrainState
 from megatron.training.training import (
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
@@ -284,11 +285,14 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
         world_size=1,
     )
     run_config.logger = args
+    run_config.train = TrainingConfig(micro_batch_size=1, global_batch_size=1, train_iters=2)
     timers = mock.MagicMock()
     timers.return_value.elapsed.return_value = 1.0
     log_lines = []
 
     monkeypatch.setattr(training_module, "get_args", lambda: args)
+    train_state = TrainState()
+    monkeypatch.setattr(training_module, "get_train_state", lambda: train_state)
     monkeypatch.setattr(training_module, "get_timers", lambda: timers)
     monkeypatch.setattr(training_module, "get_tensorboard_writer", lambda: None)
     monkeypatch.setattr(training_module, "get_wandb_writer", lambda: None)
@@ -392,8 +396,11 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
         world_size=8,
     )
     run_config.logger = args
+    run_config.train = TrainingConfig(micro_batch_size=args.micro_batch_size)
 
     monkeypatch.setattr(training_module, "get_args", lambda: args)
+    train_state = TrainState()
+    monkeypatch.setattr(training_module, "get_train_state", lambda: train_state)
     monkeypatch.setattr(training_module, "get_timers", mock.MagicMock)
     monkeypatch.setattr(training_module, "get_tensorboard_writer", lambda: None)
     monkeypatch.setattr(training_module, "get_wandb_writer", lambda: None)
