@@ -118,6 +118,57 @@ async def test_routed_stochastic_first_step_distribution(
         h.assert_retired()
 
 
+@pytest.mark.parametrize("interval", [1, 3])
+async def test_routed_stream_holdback_keeps_top_n_scores_aligned(monkeypatch, interval):
+    """Withheld stop-prefix tokens must not leak their top-N scores in a partial."""
+    prompt = list(range(4, 20))
+    params = greedy_params(
+        num_tokens_to_generate=12,
+        return_log_probs=True,
+        skip_prompt_log_probs=True,
+        top_n_logprobs=3,
+        streaming_interval=interval,
+    )
+    async with routed_model(monkeypatch) as h:
+        direct = await h.direct(prompt, params)
+        # Choose a genuine three-token stop pattern absent from the model's output.
+        # Its two-token holdback still executes at every streaming boundary.
+        generated = direct["generated_tokens"]
+        stop = next(
+            [token, token, token]
+            for token in range(h.config.vocab_size)
+            if not any(generated[i : i + 3] == [token] * 3 for i in range(len(generated) - 2))
+        )
+        params.stop_words = [" ".join(map(str, stop))]
+        await h.start()
+        replies = None
+        if h.rank == 0:
+            stream = h.clients[0].add_request_streaming(prompt, params)
+
+            async def collect():
+                return [item async for item in stream]
+
+            replies = await asyncio.wait_for(collect(), timeout=60)
+        box = [replies]
+        torch.distributed.broadcast_object_list(box, src=0)
+        replies = box[0]
+        final = replies[-1]["final"]
+        assert final["generated_tokens"] == generated
+        partials = [r["partial"] for r in replies if "partial" in r]
+        assert partials, "The stop holdback must coexist with real incremental delivery"
+        sent = 0
+        for part in partials:
+            n = len(part["new_tokens"])
+            assert len(part["new_top_n_logprobs"]) == n
+            assert len(part["new_log_probs"]) == n
+            assert part["new_tokens"] == generated[sent : sent + n]
+            assert part["new_top_n_logprobs"] == final["generated_top_n_logprobs"][sent : sent + n]
+            sent += n
+        assert sent <= len(generated) - 2, "Two stop-prefix tokens remain withheld until final"
+        await h.barrier()
+        h.assert_retired()
+
+
 @pytest.mark.parametrize(
     "echo,detokenize,eos",
     [(False, False, False), (True, True, False), (True, False, False), (False, False, True)],
