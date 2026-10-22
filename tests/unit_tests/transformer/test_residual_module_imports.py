@@ -11,20 +11,30 @@ import pytest
 _IMPORT_CHECK = r"""
 import importlib
 import sys
+import typing
 
 prefix = "megatron.core.transformer."
-first = (
-    ("transformer_layer",)
-    if sys.argv[1] == "common-first"
-    else (
+first = {
+    "common-first": ("transformer_layer",),
+    "canonical-first": (
         "hyper_connection_transformer_layer",
         "wide_residual_transformer_layer",
         "wide_residual",
         "residual_recompute",
-    )
-)
+    ),
+    "connection-first": ("residual_connection", "residual_recompute"),
+    "recompute-first": ("residual_recompute", "residual_connection"),
+}[sys.argv[1]]
 for name in first:
     importlib.import_module(prefix + name)
+
+connection = importlib.import_module(prefix + "residual_connection")
+recompute = importlib.import_module(prefix + "residual_recompute")
+for method in (
+    connection.ResidualConnection._checkpoint_read,
+    connection.ResidualConnection._checkpoint_write,
+):
+    assert typing.get_type_hints(method)["context"] is recompute.ResidualStreamRecomputeContext
 
 package = importlib.import_module("megatron.core.transformer")
 for symbol, new_name in (
@@ -37,7 +47,9 @@ for symbol, new_name in (
 """
 
 
-@pytest.mark.parametrize("import_order", ["common-first", "canonical-first"])
+@pytest.mark.parametrize(
+    "import_order", ["common-first", "canonical-first", "connection-first", "recompute-first"]
+)
 def test_residual_import_paths_preserve_identity_in_fresh_interpreter(import_order):
     # A fresh interpreter exercises package initialization rather than cached pytest imports.
     environment = dict(os.environ, PYTHONOPTIMIZE="0", PYTHONDONTWRITEBYTECODE="1")

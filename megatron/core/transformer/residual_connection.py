@@ -4,22 +4,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import (
-    TYPE_CHECKING,
-    Generic,
-    Literal,
-    NamedTuple,
-    Optional,
-    TypeAlias,
-    TypeVar,
-    overload,
-)
+from typing import Generic, Literal, NamedTuple, Optional, TypeAlias, TypeVar, overload
 
 import torch
 from torch import Tensor, nn
 
-if TYPE_CHECKING:
-    from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 
 ResidualBranchOutput: TypeAlias = Tensor | tuple[Tensor, Optional[Tensor]]
 ResidualConnectionState: TypeAlias = tuple[Tensor, ...]
