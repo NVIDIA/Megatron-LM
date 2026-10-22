@@ -4,6 +4,13 @@
 
 from __future__ import annotations
 
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
+
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
+
 import argparse
 from functools import partial
 
@@ -29,7 +36,7 @@ from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.global_vars import set_global_variables
+from megatron.training.global_vars import set_args, set_run_config
 from megatron.training.training import pretrain
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -83,7 +90,10 @@ def _parse_and_validate() -> argparse.Namespace:
 def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
-    set_global_variables(args, build_tokenizer=False)
+    set_args(args)
+    model_cfg = MimoBuildConfig()
+    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(cfg)
     provider = resolve_provider(args)
 
     prefetch_loader = None
@@ -92,7 +102,7 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs, args.high_priority_stream_groups)
+    topology = create_topology(specs, cfg.dist.high_priority_stream_groups)
 
     communicator = provider.build_communicator(args, topology)
 
@@ -111,8 +121,8 @@ def main() -> None:
             return models
 
         hooks.append(capture_model)
-    model_cfg = MimoBuildConfig(_topology=topology, post_wrap_hooks=hooks)
-    cfg = pretrain_cfg_container_from_args(args, model_cfg)
+    model_cfg._topology = topology
+    model_cfg.post_wrap_hooks = hooks
 
     def train_valid_test_data_provider(_train_val_test_num_samples):
         nonlocal prefetch_loader
@@ -148,6 +158,7 @@ def main() -> None:
         skip_model_parallel_init=True,
         p2p_communicator=communicator,
         pg_collection=topology.schedule_pg_collection,
+        build_tokenizer=False,
     )
 
     if prefetch_loader is not None:

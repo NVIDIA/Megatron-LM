@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 import zipfile
-from typing import Dict, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import click
 import jetclient
@@ -260,56 +260,52 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> Optio
     return assets_base_path
 
 
-def extract_torchrunlogs_to_string(logs_path: pathlib.Path) -> Dict[int, List[str]]:
-    logs_dict = {}
+def iter_torchrun_logs(logs_path: pathlib.Path) -> Iterator[str]:
+    """Yield the content of every per-rank stdout/stderr log, one file at a time.
 
+    The per-rank logs of a single job can add up to hundreds of MB (e.g. one warning line per
+    CUDA-graph capture and generator). Holding all of them in memory at once, as lists of lines
+    plus their concatenation, got this launcher OOM-killed on the GitLab runner (exit code 137)
+    after the JET pipeline itself had already succeeded. Stream them instead.
+    """
     # Iterate through all restart folders
-    for restart_dir in logs_path.glob("restart=*"):
-        # Find all stdout.log files
-        for stdout_file in restart_dir.glob("assets/basic/*/logs/*/*/attempt_0/*/std*.log"):
-            # Extract rank from path
-            rank = int(stdout_file.parent.name)
-
-            # Read log file
+    for restart_dir in sorted(logs_path.glob("restart=*")):
+        # Find all stdout.log / stderr.log files
+        for log_file in sorted(restart_dir.glob("assets/basic/*/logs/*/*/attempt_0/*/std*.log")):
             try:
-                with open(stdout_file) as f:
-                    log_content = f.readlines()
-                    if rank not in logs_dict:
-                        logs_dict[rank] = log_content
-                    else:
-                        logs_dict[rank] += log_content
+                with open(log_file, errors="replace") as f:
+                    yield f.read()
             except Exception as e:
-                logger.error(f"Error reading log file {stdout_file}: {e}")
+                logger.error(f"Error reading log file {log_file}: {e}")
                 continue
-    return logs_dict
 
 
-def extract_main_log_to_string(logs_path: pathlib.Path) -> List[str]:
+def any_torchrun_log_matches(logs_path: pathlib.Path, predicate: Callable[[str], bool]) -> bool:
+    """True if `predicate` holds for the content of at least one per-rank log file."""
+    return any(predicate(log) for log in iter_torchrun_logs(logs_path))
+
+
+def extract_main_log_to_string(logs_path: pathlib.Path) -> str:
     logs = []
 
     # Iterate through all restart folders
-    for restart_dir in logs_path.glob("restart=*"):
+    for restart_dir in sorted(logs_path.glob("restart=*")):
         # Find all stdout.log files
         for stdout_file in restart_dir.glob(
             "assets/basic/*/jet_assets/output_logs/output_script-0.log"
         ):
             # Read log file
             try:
-                with open(stdout_file) as f:
-                    log_content = f.readlines()
-                    logs += log_content
+                with open(stdout_file, errors="replace") as f:
+                    logs.append(f.read())
             except Exception as e:
                 logger.error(f"Error reading log file {stdout_file}: {e}")
                 continue
-    return logs
+    return "".join(logs)
 
 
-def parse_failed_job(logs: List[str]) -> Optional[bool]:
-    for log_row in logs[::-1]:
-        match = re.search(r"Job finished with status 'FAILED'", log_row)
-        if match is not None:
-            return True
-    return False
+def parse_failed_job(log: str) -> bool:
+    return "Job finished with status 'FAILED'" in log
 
 
 def telemetrics_and_exit(
@@ -503,8 +499,10 @@ def main(
                 if assets_base_path is None:
                     no_log = True
                     break
-                allranks_logs = extract_torchrunlogs_to_string(logs_path=assets_base_path)
-                mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
+                has_rank_logs = any_torchrun_log_matches(
+                    assets_base_path, lambda log: log.strip() != ""
+                )
+                concat_mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
                 no_log = False
                 break
             except (
@@ -530,11 +528,7 @@ def main(
             n_attempts += 1
             continue
 
-        concat_allranks_logs = "\n".join(
-            ["\n".join(log_lines) for log_lines in allranks_logs.values()]
-        )
-        concat_mainrank_log = "\n".join(mainrank_log)
-        if concat_allranks_logs.strip() == "" and concat_mainrank_log.strip() == "":
+        if not has_rank_logs and concat_mainrank_log.strip() == "":
             logger.error("No logs found. Try again.")
             n_attempts += 1
             continue
@@ -560,7 +554,7 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
-            if not success and is_flaky_failure(concat_allranks_logs):
+            if not success and any_torchrun_log_matches(assets_base_path, is_flaky_failure):
                 logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
@@ -577,7 +571,7 @@ def main(
                     is_integration_test=enable_lightweight_mode,
                 )
 
-            if is_flaky_failure(concat_allranks_logs):
+            if any_torchrun_log_matches(assets_base_path, is_flaky_failure):
                 if n_attempts < 9:
                     logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
@@ -601,15 +595,18 @@ def main(
             )
 
         if test_type == "release":
-            if (
-                "StopIteration" in concat_allranks_logs
-                or "after training is done" in concat_allranks_logs
-                or "exiting program at iteration" in concat_allranks_logs
+            if any_torchrun_log_matches(
+                assets_base_path,
+                lambda log: (
+                    "StopIteration" in log
+                    or "after training is done" in log
+                    or "exiting program at iteration" in log
+                ),
             ):
                 logger.info("Release training finished")
                 sys.exit(int(not success))  # invert for exit 0
 
-            if not success or parse_failed_job(logs=mainrank_log):
+            if not success or parse_failed_job(concat_mainrank_log):
                 logger.error("Release pipeline finished with status %s, retrying.", status.name)
                 n_attempts += 1
                 continue

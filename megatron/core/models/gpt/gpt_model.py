@@ -2,6 +2,7 @@
 
 import logging
 from collections import OrderedDict
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -27,6 +28,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -127,7 +129,35 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             "features. Please reference the migration guide "
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
+        if config.moe_num_hash_layers > 0:
+            raise ValueError(
+                "Hash-routed MoE is supported only by HybridModel because GPTModel does not "
+                "forward token IDs to transformer layers."
+            )
         super().__init__(config=config, pg_collection=pg_collection)
+        # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
+        if self.config.freeze_base_model_for_mtp and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 1
+        ):
+            raise ValueError("freeze_base_model_for_mtp requires mtp_num_layers >= 1.")
+        if self.config.mtp_hsm and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 2
+        ):
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
+        if self.config.mtp_hybrid_override_pattern is not None:
+            raise ValueError(
+                "mtp_hybrid_override_pattern is not supported by GPTModel. "
+                "For GPT models, define MTP layers through mtp_block_spec."
+            )
+        if (
+            self.config.enable_mhc_connections
+            and self.config.pipeline_model_parallel_size > 1
+            and self.config.mtp_num_layers
+        ):
+            raise NotImplementedError(
+                "GPTModel does not support mHC with pipeline parallelism and MTP. "
+                "The decoder contracts the residual before the multi-stream MTP block."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -180,6 +210,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
@@ -239,6 +270,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
+            name="decoder" if self.config.quant_recipe is not None else None,
         )
         if hasattr(self, 'cudagraph_manager') and hasattr(self.decoder, 'cudagraph_manager'):
             del self.decoder.cudagraph_manager
@@ -249,6 +281,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 spec=self.mtp_block_spec,
                 vp_stage=vp_stage,
                 pg_collection=self.pg_collection,
+                name="mtp",
             )
 
             self._setup_mtp_cuda_graphs()
@@ -293,6 +326,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
                 output_dtype=self.logit_dtype,
             )
 
@@ -628,19 +662,25 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
         # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
-            **(extra_block_kwargs or {}),
+        backbone_context = (
+            torch.no_grad()
+            if self.config.freeze_base_model_for_mtp and self.training
+            else nullcontext()
         )
+        with backbone_context:
+            hidden_states = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                **(extra_block_kwargs or {}),
+            )
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -755,7 +795,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     loss_mask=loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
@@ -821,6 +860,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        gather_output = (
+            self.output_layer.gather_output
+            if runtime_gather_output is None
+            else runtime_gather_output
+        )
+        observe_tensor(
+            self.output_layer,
+            "output_logits",
+            "output_logits",
+            logits,
+            tp_shard_dim=None if gather_output else -1,
+            sequence_dim=0,
+            batch_dim=1,
+        )
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -951,8 +1004,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         # Old GPT checkpoints only stored the output layer weight key. So we remove the
         # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
+        data = output_extra_state.data if output_extra_state is not None else None
+        assert data is None or (
+            data.numel() == 0 if isinstance(data, torch.Tensor) else not data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict
