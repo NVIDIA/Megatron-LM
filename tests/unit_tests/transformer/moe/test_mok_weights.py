@@ -59,6 +59,14 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
         {},
         {"moe_token_dispatcher_type": "alltoall"},
         {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"},
+        {
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "sequence_packing_scheduler": "dp_balanced",
+            "max_seqlen_per_dp_cp_rank": 1024,
+            "calculate_per_token_loss": True,
+            "variable_seq_lengths": True,
+        },
         {"moe_shared_expert_gate": True},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {

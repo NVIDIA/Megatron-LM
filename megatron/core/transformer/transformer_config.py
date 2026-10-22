@@ -4344,7 +4344,8 @@ class TransformerConfig(ModelParallelConfig):
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
                 if (
-                    self.moe_token_dispatcher_type == "flex"
+                    self.moe_megakernel_backend is None
+                    and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_uneven_dispatch_inputs
                 ):
