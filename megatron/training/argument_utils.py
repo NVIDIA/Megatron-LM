@@ -869,7 +869,6 @@ def inference_cfg_container_from_args(
         model=model_cfg,
         checkpoint=CheckpointConfig(**ckpt_kwargs),
         inference=inference_cfg_from_args(args),
-        optimizer=_default_config_from_args(OptimizerConfig, args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),

@@ -472,9 +472,8 @@ class InferenceConfigContainer(ConfigContainerBase):
 
     This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
     configs that inference actually needs and is intentionally shaped differently from the
-    training container: there is no LR schedule, train/validation loop, DDP, rerun state
-    machine, or straggler detection. ``OptimizerConfig`` is included only as a settings
-    section; no optimizer is constructed for inference.
+    training container: there is no optimizer, LR schedule, train/validation loop, DDP, rerun
+    state machine, or straggler detection.
 
     Explicitly NOT included (relative to ``PretrainConfigContainer``): ``TrainingConfig``,
     ``SchedulerConfig``, ``ValidationConfig``,
