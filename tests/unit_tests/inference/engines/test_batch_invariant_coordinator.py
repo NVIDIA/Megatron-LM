@@ -95,6 +95,8 @@ async def _shutdown(engine, client, address, comm, context, rank):
     [
         pytest.param(Policy.LONGEST_PREFIX, None, id="longest-prefix"),
         pytest.param(Policy.FIRST_PREFIX_BLOCK, None, id="first-block"),
+        pytest.param(Policy.LONGEST_PREFIX, (False, False, 1), id="ep-async"),
+        pytest.param(Policy.LONGEST_PREFIX, (True, False, 3), id="ep-sync"),
         pytest.param(Policy.LONGEST_PREFIX, (False, True, 1), id="ep-disabled"),
     ],
 )
