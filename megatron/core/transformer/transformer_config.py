@@ -4188,6 +4188,12 @@ class TransformerConfig(ModelParallelConfig):
                 "Batch invariant mode does not support tensorwise FP8: current "
                 "activation scaling depends on neighboring batch rows."
             )
+            # Default NVFP4 shares activation scaling across rows; TE's row-local
+            # alternative cannot retain the required columnwise training storage.
+            assert not (self.fp4 and self.fp4_recipe == Fp4Recipe.nvfp4), (
+                "Batch invariant mode does not support NVFP4: tensor-global "
+                "activation scaling depends on neighboring batch rows."
+            )
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention (--attention-backend flash)"
