@@ -535,6 +535,10 @@ def _compute_indexer_scores_chunk_with_global_rows(
         if seq_lens.ndim != 1 or seq_lens.numel() != sq:
             raise RuntimeError(f"cuDNN DSA score chunk seq_lens must have shape ({sq},).")
         seq_lens = seq_lens.to(device=device, dtype=torch.int64).clamp(max=sk)
+        # cuDNN FE >= 1.27 rejects seqlen_q > seqlen_k * ratio. Explicit seq_lens replace the
+        # kernel's causal mask (see masked_fill below), so any ratio that covers them is valid.
+        # Raise it before computing the offset, which is derived from the ratio the kernel uses.
+        indexer_ratio = max(indexer_ratio, -(-sq // sk))
         # Row i keeps keys [0, (offset + i + 1) // indexer_ratio); cover seq_lens[i].
         row_idx = torch.arange(sq, device=device, dtype=torch.int64)
         offset = (seq_lens * indexer_ratio - row_idx - 1).max().clamp(min=0)

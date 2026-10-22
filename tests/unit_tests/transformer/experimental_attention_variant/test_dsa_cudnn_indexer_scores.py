@@ -41,28 +41,35 @@ def _reference_scores(q, k, w, row_start, ratio, sm_scale, seq_lens):
 
 
 @pytest.mark.parametrize(
-    "kind,sk,row_start,ratio",
+    "kind,sk,row_start,ratio,rows",
     [
-        ("causal", SK, 0, 1),
-        ("causal", SK, 3000, 1),
-        ("causal", SK // 4, 4096, 4),
-        ("causal", SK // 4, 4099, 4),
-        ("pooled", SK // 4, 0, 1),
-        ("pooled_with_empty_rows", SK // 4, 0, 1),
-        ("non_monotonic", SK, 0, 1),
-        ("beyond_sk", SK, 0, 1),
-        ("packed_resets", SK, 0, 1),
+        ("causal", SK, 0, 1, ROWS),
+        ("causal", SK, 3000, 1, ROWS),
+        ("causal", SK // 4, 4096, 4, ROWS),
+        ("causal", SK // 4, 4099, 4, ROWS),
+        ("pooled", SK // 4, 0, 1, ROWS),
+        ("pooled_with_empty_rows", SK // 4, 0, 1, ROWS),
+        ("non_monotonic", SK, 0, 1, ROWS),
+        ("beyond_sk", SK, 0, 1, ROWS),
+        ("packed_resets", SK, 0, 1, ROWS),
+        # More query rows than pooled keys * ratio: cuDNN FE rejects such a ratio as given.
+        ("pooled", 578, 0, 1, 2312),
+        ("non_monotonic", 578, 0, 1, 2312),
+        ("beyond_sk", 578, 0, 1, 2312),
+        ("packed_resets", 578, 0, 1, 2312),
+        ("non_monotonic", 300, 0, 2, 1000),
+        ("pooled", 300, 0, 2, 1000),
     ],
 )
-def test_indexer_scores_match_reference(kind, sk, row_start, ratio):
+def test_indexer_scores_match_reference(kind, sk, row_start, ratio, rows):
     from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
 
     dsa_cudnn_kernels._ensure_dsa_namespace()
     torch.manual_seed(0)
-    q = torch.randn(1, ROWS, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, rows, NUM_HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, sk, 1, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(1, ROWS, NUM_HEADS, device="cuda", dtype=torch.bfloat16)
-    seq_lens = _seq_lens(kind, ROWS, sk)
+    w = torch.randn(1, rows, NUM_HEADS, device="cuda", dtype=torch.bfloat16)
+    seq_lens = _seq_lens(kind, rows, sk)
     sm_scale = dsa_cudnn_kernels._INDEXER_SOFTMAX_SCALE
 
     scores = dsa_cudnn_kernels._compute_indexer_scores_chunk_with_global_rows(
