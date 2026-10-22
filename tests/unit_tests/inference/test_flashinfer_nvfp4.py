@@ -289,6 +289,51 @@ requires_flashinfer_nvfp4 = pytest.mark.skipif(
 )
 
 
+def _build_flashinfer_nvfp4_jit_modules():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import (
+        flashinfer_routed_nvfp4_moe,
+        prepare_routed_nvfp4_weights,
+    )
+
+    experts, hidden_size, tokens = 2, 256, 8
+    device = torch.device("cuda")
+    fc1 = torch.randn(experts, hidden_size, hidden_size, device=device).bfloat16()
+    fc2 = torch.randn(experts, hidden_size, hidden_size, device=device).bfloat16()
+    hidden = torch.randn(tokens, hidden_size, device=device).bfloat16()
+    topk_ids = torch.arange(experts, dtype=torch.int32, device=device).repeat(tokens, 1)
+    topk_weights = torch.full((tokens, experts), 1.0 / experts, device=device)
+    flashinfer_routed_nvfp4_moe(
+        hidden,
+        topk_ids,
+        topk_weights,
+        prepare_routed_nvfp4_weights(fc1, fc2),
+        num_experts=experts,
+        local_expert_offset=0,
+        activation_type=_activation_type(False),
+    )
+    torch.cuda.synchronize()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def build_flashinfer_jit_in_rank_order():
+    """Builds FlashInfer's JIT modules one rank at a time before any test runs.
+
+    A cold build takes minutes and FlashInfer serializes it across processes, so ranks that
+    build inside the tests reach the multi-rank setups minutes apart, while the test
+    rendezvous waits one minute. Taking turns bounds each barrier wait to a single build,
+    and later ranks load the modules from the shared cache.
+    """
+    if Utils.world_size < 2 or not _blackwell_or_newer() or not HAVE_FLASHINFER_ROUTED_NVFP4:
+        yield
+        return
+    Utils.initialize_distributed()
+    for rank in range(Utils.world_size):
+        if rank == Utils.rank:
+            _build_flashinfer_nvfp4_jit_modules()
+        torch.distributed.barrier()
+    yield
+
+
 def _reference_moe(hidden, fc1, fc2, topk_ids, topk_weights):
     """BF16 squared-ReLU MoE, or SwiGLU when FC1 holds MCore's [gate; up] halves."""
     gated = fc1.shape[1] == 2 * fc2.shape[2]
