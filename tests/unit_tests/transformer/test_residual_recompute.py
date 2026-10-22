@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_inference_stack_spec,
     wide_residual_hybrid_stack_spec,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface,
     PipelineOffloadManager,
@@ -834,7 +835,8 @@ class TestResidualStreamRecomputeIntegration:
         ).cuda()
 
         events = []
-        boundary_packed_seq_params = object()
+        # HybridStack reads the runtime CP fields, so the boundary metadata must be real.
+        boundary_packed_seq_params = PackedSeqParams()
         layer_packed_seq_params = object()
 
         class _RecordingCPLayoutState:
@@ -846,11 +848,19 @@ class TestResidualStreamRecomputeIntegration:
                 events.append("cp_prepare")
                 return hidden_states, layer_packed_seq_params
 
+            def get_layer_padding_mask(self, layer_index, default, masks):
+                assert layer_index == 0
+                assert masks is None
+                return default
+
             def finalize_layer(self, layer_index, hidden_states):
                 assert layer_index == 0
                 events.append("cp_finalize")
                 self.finalized_hidden_states = hidden_states + 1.0
                 return self.finalized_hidden_states
+
+            def get_layer_padding_mask(self, layer_index, default, padding_masks_by_layout):
+                return default
 
         cp_layout_state = _RecordingCPLayoutState()
 

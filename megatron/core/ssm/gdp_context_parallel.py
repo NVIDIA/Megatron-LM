@@ -21,6 +21,7 @@ Strategy for householder-multiplied tensors (V, K, b):
     copy is independently partitioned by heads across CP ranks.
 """
 
+import copy
 from typing import Optional
 
 import torch
@@ -104,14 +105,18 @@ class GDPContextParallel:
         self.D_has_hdim = D_has_hdim
         self.sequence_is_contiguous = sequence_is_contiguous
 
-        self.cp_size = self.cp_group.size()
+        self._set_cp_params()
 
-        M = self.num_householder
+    def _set_cp_params(self) -> None:
+        """Recompute dimensions derived from the active CP group."""
+        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
 
         if self.cp_size == 1:
+            self.cp_rank = 0
             self.d_inner_local_tpcp = self.d_inner_local_tp
             self.nheads_local_tpcp = self.nheads_local_tp
             self.ngroups_local_tpcp = self.ngroups_local_tp
+            self.group_repeat_count = 1
             return
 
         self.cp_rank = self.cp_group.rank()
@@ -136,6 +141,23 @@ class GDPContextParallel:
             ), "ngroups must be evenly divisible by tp_size * cp_size"
             self.group_repeat_count = 1
             self.ngroups_local_tpcp = self.ngroups_local_tp // self.cp_size
+
+    def set_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> None:
+        """Set the active context-parallel group."""
+        self.cp_group = cp_group
+        self._set_cp_params()
+
+    def for_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> "GDPContextParallel":
+        """Return a forward-local view configured for ``cp_group``."""
+        if cp_group is self.cp_group:
+            return self
+        runtime_view = copy.copy(self)
+        runtime_view.set_context_parallel_group(cp_group)
+        return runtime_view
 
     def pre_conv_ssm(
         self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
