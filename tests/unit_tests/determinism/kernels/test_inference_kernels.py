@@ -600,6 +600,8 @@ def test_vllm_fused_moe_and_moe_sum_replay():
     fc2 = torch.randn(experts, hidden, ffn, device="cuda", dtype=torch.bfloat16) * 0.02
     valid = _dev_scalar(max_tokens - 100)
 
+    # Ordinary inference applies the routing probabilities in the FC2 GEMM epilogue (fp32
+    # accumulator, before the bf16 store) and then reduces over top-k without weights.
     def fn(h, p):
         out = vllm_fused_moe(
             h, p, fc1, fc2, ActivationType.SQUARED_RELU, experts, 0, valid, routing_map
@@ -612,11 +614,32 @@ def test_vllm_fused_moe_and_moe_sum_replay():
 
     inp = torch.randn(max_tokens * topk, 2688, device="cuda", dtype=torch.bfloat16)
 
-    def moe_sum(inp, p):
-        out = _moe_sum(inp, p, max_tokens, topk, 2688, valid, routing_map, 0, experts)
-        return out[: max_tokens - 100]
+    # The top-k sum both ways: weighted (apply_weights=True) and the unweighted sum that
+    # vllm_fused_moe now uses after the FC2 epilogue has applied the weights.
+    for apply_weights in (True, False):
 
-    assert_replays_bit_exact(moe_sum, (inp, probs), replays=4, backward=False, what="_moe_sum")
+        def moe_sum(inp, p, apply_weights=apply_weights):
+            out = _moe_sum(
+                inp,
+                p,
+                max_tokens,
+                topk,
+                2688,
+                valid,
+                routing_map,
+                0,
+                experts,
+                apply_weights=apply_weights,
+            )
+            return out[: max_tokens - 100]
+
+        assert_replays_bit_exact(
+            moe_sum,
+            (inp, probs),
+            replays=4,
+            backward=False,
+            what=f"_moe_sum(apply_weights={apply_weights})",
+        )
 
 
 def test_vllm_moe_align_block_size_replays():
