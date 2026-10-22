@@ -348,6 +348,7 @@ def setup_model_and_optimizer(
         config.lr = 0.0
     elif optimizer_type == 'lion':
         config.lr = 1e-4
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
@@ -478,6 +479,7 @@ def setup_moe_model_and_optimizer(
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    config.finalize_optimizer_config()
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
