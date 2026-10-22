@@ -256,7 +256,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     args = get_args()
 
     config = MultimodalDatasetConfig(
-        random_seed=cfg.rng.seed,
+        random_seed=cfg.rng.effective_data_seed,
         split=args.split,
         sequence_length=args.dataloader_seq_length,
         tokenizer=get_tokenizer(),

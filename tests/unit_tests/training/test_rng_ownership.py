@@ -37,10 +37,36 @@ def test_tracker_cli_flags_populate_rng_config(enabled):
     config = _default_config_from_args(RNGConfig, args)
     assert asdict(config) == {
         "seed": 1234,
+        "data_seed": None,
         "data_parallel_random_init": False,
         "te_rng_tracker": enabled,
         "inference_rng_tracker": enabled,
     }
+
+
+@pytest.mark.parametrize("data_seed", [None, 5678])
+def test_data_seed_cli_and_config_round_trip(data_seed):
+    from megatron.training.argument_utils import _default_config_from_args
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    argv = ["--seed", "1234"]
+    if data_seed is not None:
+        argv += ["--data-seed", str(data_seed)]
+    config = _default_config_from_args(RNGConfig, parser.parse_args(argv))
+    config.validate()
+    assert config.data_seed == data_seed
+    assert config.effective_data_seed == (1234 if data_seed is None else data_seed)
+    restored = RNGConfig(**asdict(config))
+    assert restored == config
+    restored.seed = 4321
+    assert restored.effective_data_seed == (4321 if data_seed is None else data_seed)
+
+
+@pytest.mark.parametrize("data_seed", [0, -1])
+def test_invalid_data_seed_rejected(data_seed):
+    with pytest.raises(ValueError, match="Data seed must be a positive integer"):
+        RNGConfig(data_seed=data_seed).validate()
 
 
 @pytest.mark.parametrize("model_kind", ["gpt", "hybrid"])
@@ -178,6 +204,7 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
     monkeypatch.setattr(initialize, "_set_random_seed", seed)
     rng = RNGConfig(
         seed=919,
+        data_seed=7331,
         data_parallel_random_init=True,
         te_rng_tracker=te_tracker,
         inference_rng_tracker=inference_tracker,
@@ -276,7 +303,10 @@ def test_checkpoint_policy_retains_current_run_precedence(
     assert not hasattr(args, "seed")
 
 
-def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, run_config):
+@pytest.mark.parametrize("data_seed", [None, 456])
+def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(
+    monkeypatch, run_config, data_seed
+):
     from megatron.training.distillation import utils
 
     args = Namespace(seed=999, seq_length=32, train_samples=16)
@@ -284,10 +314,13 @@ def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, r
     monkeypatch.setattr(utils, "get_args", lambda: args)
     monkeypatch.setattr(utils, "_blend_identifiers", lambda args: {"mock": True})
     run_config.rng.seed = 123
+    run_config.rng.data_seed = data_seed
     first_hash, first_fields = utils.compute_dataset_hash()
     del args.seed
     assert utils.compute_dataset_hash() == (first_hash, first_fields)
-    assert first_fields["seed"] == 123
+    assert first_fields["seed"] == (123 if data_seed is None else data_seed)
     run_config.rng.seed = 124
     second_hash, _ = utils.compute_dataset_hash()
-    assert first_hash != second_hash
+    assert (first_hash != second_hash) is (data_seed is None)
+    run_config.rng.data_seed = 789
+    assert utils.compute_dataset_hash()[0] != second_hash

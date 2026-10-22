@@ -23,6 +23,25 @@ Megatron builds three index arrays for each dataset: a **document index** (shuff
 
 After initialization, data access is **read-only and lock-free**. Each data-parallel rank consumes a disjoint subset of samples, and no cross-rank coordination is needed during training because all ranks derive the same deterministic permutation from a shared random seed.
 
+## Separate Model and Data Seeds
+
+`--seed` controls model initialization and the training RNGs. Set `--data-seed` to a
+positive integer to independently seed dataset construction (including shuffle indices,
+masking, and FIM) and DataLoader workers:
+
+```bash
+torchrun ... pretrain_gpt.py --seed 1234 --data-seed 5678 ...
+```
+
+Hold `--data-seed` fixed while varying `--seed` to compare weight initializations on the
+same data stream. Omitting `--data-seed` preserves the existing behavior: datasets use
+`--seed`, and DataLoader workers use the model-seeded PyTorch RNG's initial seed.
+The cyclic batch sampler's existing epoch-based permutations are unchanged.
+
+Use the same `--data-seed` when preparing caches with `tools/prepare_cache.py` and when
+resuming training. Custom external dataloaders own their seeding; they can use
+`get_run_config().rng.effective_data_seed` to honor this option.
+
 ## The Problem at 256+ Nodes
 
 Three things break down at large node counts:

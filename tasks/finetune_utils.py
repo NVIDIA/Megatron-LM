@@ -75,12 +75,18 @@ def _cross_entropy_forward_step(batch, model):
 def build_data_loader(dataset, micro_batch_size, num_workers, drop_last,
         task_collate_fn=None):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
+    cfg = get_run_config()
 
     # Sampler.
     world_size = mpu.get_data_parallel_world_size()
     rank = mpu.get_data_parallel_rank()
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank)
+
+    # Keep worker RNGs independent of model initialization when explicitly requested.
+    generator = None
+    if cfg.rng.data_seed is not None:
+        generator = torch.Generator().manual_seed(cfg.rng.data_seed)
 
     # Data loader. Note that batch size is the per GPU batch size.
     data_loader = torch.utils.data.DataLoader(dataset,
@@ -90,6 +96,7 @@ def build_data_loader(dataset, micro_batch_size, num_workers, drop_last,
                                               num_workers=num_workers,
                                               drop_last=drop_last,
                                               pin_memory=True,
+                                              generator=generator,
                                               collate_fn=task_collate_fn)
 
     return data_loader
@@ -177,7 +184,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
-        train_dataloader.sampler.set_epoch(cfg.rng.seed + epoch)
+        train_dataloader.sampler.set_epoch(cfg.rng.effective_data_seed + epoch)
 
         # For all the batches in the dataset.
         for iteration_, batch in enumerate(train_dataloader):
