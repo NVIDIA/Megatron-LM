@@ -2683,9 +2683,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 model,
                 config,
                 ddp_config,
-                use_layer_wise_distributed_optimizer=getattr(
-                    args, 'use_layer_wise_distributed_optimizer', False
-                ),
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(
                     args, 'use_layer_wise_param_layout', True
                 ),
@@ -6160,7 +6158,7 @@ def should_disable_forward_pre_hook(args):
         and has_optimizer
         and (
             cfg.optimizer.use_distributed_optimizer
-            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+            or cfg.optimizer.use_layer_wise_distributed_optimizer
         )
         and cfg.optimizer.overlap_param_gather
     )
