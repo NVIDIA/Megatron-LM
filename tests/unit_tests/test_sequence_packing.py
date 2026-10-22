@@ -140,8 +140,12 @@ def test_scheduler_builds_static_cp_layout_views(cp_size, linear_cp_layout):
         def rank(self):
             return self._rank
 
+    def _zigzag(cu_seqlens, total_tokens, cp_size, cp_rank):
+        chunks = torch.arange(total_tokens).reshape(2 * cp_size, -1)
+        return torch.cat((chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]))
+
     static_cp_group = _Group(cp_size)
-    pg_collection = SimpleNamespace(tp=_Group(1), pp=_Group(1), cp=static_cp_group)
+    pg_collection = ProcessGroupCollection(tp=_Group(1), pp=_Group(1), cp=static_cp_group)
     config = SimpleNamespace(
         linear_cp_layout=linear_cp_layout, attention_cp_layout="zigzag", sequence_parallel=False
     )
@@ -162,6 +166,8 @@ def test_scheduler_builds_static_cp_layout_views(cp_size, linear_cp_layout):
         patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
         patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
         patch("megatron.core.datasets.data_schedule.broadcast_tensor"),
+        # Static zigzag views are partitioned per document with TE, which needs CUDA.
+        patch("megatron.core.utils.tex", SimpleNamespace(thd_get_partitioned_indices=_zigzag)),
     ):
         cp_batch = get_batch_on_this_rank_for_sequence_packing(
             iter([batch]),
@@ -196,7 +202,7 @@ def test_packed_params_carry_the_runtime_tp_cp_group(sequence_parallel):
             return self._rank
 
     runtime_cp_group, runtime_tp_cp_group = _Group(1), object()
-    pg_collection = SimpleNamespace(tp=_Group(2), pp=_Group(1), cp=_Group(1))
+    pg_collection = ProcessGroupCollection(tp=_Group(2), pp=_Group(1), cp=_Group(1))
     config = SimpleNamespace(sequence_parallel=sequence_parallel)
     tokens = torch.arange(8, dtype=torch.int64)
     batch = {
