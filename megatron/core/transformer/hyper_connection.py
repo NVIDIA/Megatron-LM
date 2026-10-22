@@ -259,9 +259,9 @@ class HyperConnectionModule(MegatronModule):
         # The fused path computes the projection and compute_h in one op, so
         # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
         # reached on the unfused path.
-        self._proj_rms_op = partial(
-            native_proj_rms, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt
-        )
+        # Full recompute forwards run under no_grad and replay with gradients. Use the
+        # same FP32 arithmetic in both passes; compiling only one changes norm reductions.
+        self._proj_rms_op = partial(_proj_rms_impl, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
 
         if config.use_fused_mhc:
             if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
@@ -319,9 +319,13 @@ class HyperConnectionModule(MegatronModule):
         x_2d = x.reshape(s * b, nC)
         weight = self.mapping_proj.weight
         if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
-            proj_rms = partial(_proj_rms_impl, eps_inside_sqrt=self.config.mhc_norm_eps_inside_sqrt)
             proj, r = checkpoint(
-                proj_rms, x_2d, weight, self.norm_eps, use_reentrant=False, preserve_rng_state=False
+                self._proj_rms_op,
+                x_2d,
+                weight,
+                self.norm_eps,
+                use_reentrant=False,
+                preserve_rng_state=False,
             )
         else:
             proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
