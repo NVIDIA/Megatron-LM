@@ -42,9 +42,6 @@ TRAIN_STATE_KEYS = {
     "skipped_train_samples",
     "consumed_valid_samples",
     "floating_point_operations_so_far",
-    "do_train",
-    "do_valid",
-    "do_test",
     "release",
 }
 
@@ -259,9 +256,6 @@ def test_train_state_values_saved_correctly(
             state_dict["consumed_valid_samples"].item()
             == populated_train_state.consumed_valid_samples
         )
-        assert state_dict["do_train"].item() == populated_train_state.do_train
-        assert state_dict["do_valid"].item() == populated_train_state.do_valid
-        assert state_dict["do_test"].item() == populated_train_state.do_test
 
         # save_checkpoint() overwrites this field with its own running FLOPs counter,
         # which need not match the (independently tracked) TrainState field.
@@ -290,14 +284,17 @@ def test_read_train_state_returns_correct_train_state(
         loaded_state = read_train_state(str(global_train_state_path))
 
         assert isinstance(loaded_state, TrainState)
+        default_values = TrainState()
         assert loaded_state.iteration == populated_train_state.iteration
         assert loaded_state.consumed_train_samples == populated_train_state.consumed_train_samples
         assert loaded_state.skipped_train_samples == populated_train_state.skipped_train_samples
         assert loaded_state.consumed_valid_samples == populated_train_state.consumed_valid_samples
         assert loaded_state.num_floating_point_operations_so_far == num_fp_ops
-        assert loaded_state.do_train == populated_train_state.do_train
-        assert loaded_state.do_valid == populated_train_state.do_valid
-        assert loaded_state.do_test == populated_train_state.do_test
+        # these are no longer saved to checkpoint so the new object created by
+        # read_train_state will just keep the default values
+        assert loaded_state.do_train == default_values.do_train
+        assert loaded_state.do_valid == default_values.do_valid
+        assert loaded_state.do_test == default_values.do_test
 
 
 def test_read_train_state_missing_file_raises(tmp_path):

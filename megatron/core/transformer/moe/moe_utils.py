@@ -11,7 +11,10 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1593,9 +1596,9 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
-    # TE's grouped-tensor and fused grouped-MLP kernels require 256-token alignment.
+    # TE's grouped-tensor and fused grouped-MLP kernels share an expert-token alignment.
     if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
-        return 256
+        return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:
