@@ -309,6 +309,11 @@ class LoggerConfig:
     log_interval: int = 100
     """Report loss and timing interval."""
 
+    log_dcp_stats: bool = False
+    """Log final packed-schedule attention-work balance and CP-size sample fractions
+    at log_interval. These are L²/CP estimates, not GPU utilization measurements.
+    """
+
     tensor_metrics: list[str] = field(default_factory=list)
     """Tensor metric specifications in `NAME:INTERVAL` form, such as
     `layer-param-l2:10`. Multiple specifications may be supplied after one
