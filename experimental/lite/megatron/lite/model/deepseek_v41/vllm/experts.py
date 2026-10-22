@@ -278,24 +278,47 @@ def _write_experts(dst, src, shard, is_scale):
     dst.copy_(src)
 
 
+_EXPERT_QUANT_CHUNK_BYTES = 1 << 30
+_EXPERT_QUANT_MAX_CHUNKS = 128
+
+
+def _quantize_expert_batch(weight):
+    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
+
+    width = weight.shape[-1]
+    flat = weight.view(-1, width)  # caller stacks masters once; no full-tensor copy
+    rows = _EXPERT_QUANT_CHUNK_BYTES // (8 * width)  # bucketize's int64 is largest
+    if rows < 1 or flat.shape[0] > rows * _EXPERT_QUANT_MAX_CHUNKS:
+        raise ValueError("Expert encoding exceeds the bounded quantization workspace")
+    codes = torch.empty((flat.shape[0], width // 2), dtype=torch.int8, device=weight.device)
+    scale = torch.empty(
+        (flat.shape[0], width // 32), dtype=torch.float8_e8m0fnu, device=weight.device
+    )
+    for start in range(0, flat.shape[0], rows):
+        end = min(start + rows, flat.shape[0])
+        block, descale = quantize_mxfp4(flat[start:end])
+        codes[start:end].copy_(block)
+        scale[start:end].copy_(descale)
+    return codes.view(*weight.shape[:-1], width // 2), scale.view(*weight.shape[:-1], width // 32)
+
+
 @torch.no_grad()
 def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
     """Pack fresh masters into native MegaMoE kernel layouts, all local experts at once."""
     from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
-    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
     device = fc1[0].device
     inter, hidden = fc1[0].shape[0] // 2, fc1[0].shape[1]
     w13, s13 = _empty_weight((len(fc1),), 2 * inter, hidden, 2, device)
     w2, s2 = _empty_weight((len(fc2),), hidden, inter, 2, device)
-    up = torch.stack([w.detach() for w in fc1])
-    for shard, part in (("w1", up[:, :inter]), ("w3", up[:, inter:])):
-        codes, scale = quantize_mxfp4(part)
-        _write_experts(w13, codes, shard, False)
-        _write_experts(s13, scale, shard, True)
-    codes, scale = quantize_mxfp4(torch.stack([w.detach() for w in fc2]))
-    _write_experts(w2, codes, "w2", False)
-    _write_experts(s2, scale, "w2", True)
+    # Block boundaries follow a byte budget, not expert ownership or row routing.
+    up, up_scale = _quantize_expert_batch(torch.stack([w.detach() for w in fc1]))
+    for shard, rows in (("w1", slice(None, inter)), ("w3", slice(inter, None))):
+        _write_experts(w13, up[:, rows], shard, False)
+        _write_experts(s13, up_scale[:, rows], shard, True)
+    down, down_scale = _quantize_expert_batch(torch.stack([w.detach() for w in fc2]))
+    _write_experts(w2, down, "w2", False)
+    _write_experts(s2, down_scale, "w2", True)
     s_inter = shared_fc1.shape[0] // 2
     l1, l1s = _empty_weight((), 2 * s_inter, hidden, 1, device)
     l2, l2s = _empty_weight((), hidden, s_inter, 1, device)

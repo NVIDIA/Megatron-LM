@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """#260 MegaMoE backward math (the A/B alternative to the grouped VJP) on CPU."""
+import pytest
 import torch
 
 from megatron.lite.model.deepseek_v41.vllm import moe
@@ -155,7 +156,8 @@ def test_native_grouped_backend_uses_te_layouts_once(monkeypatch):
     assert calls == ['TN', 'NN', 'NT']
 
 
-def test_expert_pack_batches_quantization_and_reads_updated_masters(monkeypatch):
+@pytest.mark.parametrize("chunk_rows", [60, 1 << 20])
+def test_expert_pack_batches_quantization_and_reads_updated_masters(monkeypatch, chunk_rows):
     from megatron.lite.model.deepseek_v41.vllm import experts
     from megatron.lite.primitive.quantization import mxfp4
 
@@ -184,13 +186,24 @@ def test_expert_pack_batches_quantization_and_reads_updated_masters(monkeypatch)
         )  # packed outputs are int8/int32, so equality is exact bytes
         writes.append((shard, is_scale))
 
+    monkeypatch.setattr(experts, '_EXPERT_QUANT_CHUNK_BYTES', chunk_rows * 128 * 8)
     monkeypatch.setattr(mxfp4, 'quantize_mxfp4', quantized)
     monkeypatch.setattr(experts, '_write_experts', checked)
     # Shared-expert layout is unchanged and separately covered by the real CUDA gate.
     monkeypatch.setattr(experts, '_write', lambda *args: None)
     first = experts.kernel_weights(fc1, fc2, *shared)
-    assert calls == [(3, 128, 128)] * 3 and len(writes) == 6
+    count = (768 + chunk_rows - 1) // chunk_rows + (384 + chunk_rows - 1) // chunk_rows
+    assert len(calls) == count and all(r <= chunk_rows and k == 128 for r, k in calls)
+    assert sum(r for r, k in calls) == 1152 and len(writes) == 6
     fc1[0].data.mul_(-2)  # .data writes need not change Tensor._version.
     second = experts.kernel_weights(fc1, fc2, *shared)
-    assert len(calls) == 6 and len(writes) == 12
+    assert len(calls) == 2 * count and len(writes) == 12
     assert not torch.equal(first[0][0], second[0][0])
+
+
+def test_expert_quantization_chunk_bound_rejects_before_allocation(monkeypatch):
+    from megatron.lite.model.deepseek_v41.vllm import experts
+
+    monkeypatch.setattr(experts, '_EXPERT_QUANT_CHUNK_BYTES', 32 * 8)
+    with pytest.raises(ValueError, match='bounded quantization workspace'):
+        experts._quantize_expert_batch(torch.empty(129, 32, device='meta'))
