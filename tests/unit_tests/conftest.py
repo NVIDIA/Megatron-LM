@@ -33,11 +33,13 @@ def pytest_configure(config):
     conftest before initializing their process group.
 
     ``config.deterministic_mode`` is on by default, and Transformer Engine's
-    DotProductAttention then requires ``NVTE_ALLOW_NONDETERMINISTIC_ALGO=0``.
+    DotProductAttention then requires ``NVTE_ALLOW_NONDETERMINISTIC_ALGO=0``, and the SSM
+    mixers require ``CAUSAL_CONV1D_DETERMINISTIC=1`` for a bit-reproducible conv backward.
     """
     os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
     os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    os.environ.setdefault("CAUSAL_CONV1D_DETERMINISTIC", "1")
 
 
 def pytest_addoption(parser):
