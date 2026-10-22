@@ -243,6 +243,75 @@ class TestChunkedPrefillScheduleCharacterization(PrefixCachingTestBase):
         assert (admitted["cache_hits"], admitted["skipped"]) == (1, 8)
 
     @pytest.mark.parametrize(
+        ("length", "cached_blocks", "graph_tokens", "max_requests", "bypass"),
+        [
+            pytest.param(8, 0, None, 3, True, id="full-prefill-fits"),
+            pytest.param(12, 0, None, 3, True, id="full-prefill-exact-budget"),
+            pytest.param(16, 0, None, 3, False, id="partial-prefill-waits"),
+            pytest.param(24, 3, None, 3, True, id="cached-prefix-makes-full-prefill-fit"),
+            pytest.param(13, 0, None, 3, False, id="one-token-tail-waits"),
+            pytest.param(10, 0, 16, 3, False, id="graph-snap-would-make-partial"),
+            pytest.param(8, 0, None, 1, False, id="request-capacity-waits"),
+        ],
+    )
+    def test_prefix_conflict_bypass_finishes_prefill(
+        self, length, cached_blocks, graph_tokens, max_requests, bypass
+    ):
+        context = self._context(max_tokens=20, max_requests=max_requests, prefix=True)
+        engine = self._engine(context)
+        if graph_tokens:
+            engine.cuda_graph_all_prefills = True
+            context.cuda_graph_batch_dimensions_list = [
+                InferenceBatchDimensions(graph_tokens, 2, 0)
+            ]
+        first = self._request(context, 1, 8)
+        conflict = self._request(context, 2, 8)
+        later = self._request(context, 3, length, offset=1000)
+        if cached_blocks:
+            self._prime_prefix(context, later, cached_blocks)
+        for request in (first, conflict, later):
+            self._queue(engine, request)
+
+        engine.schedule_chunked_prefill()
+        state = self._state(engine, later)
+        skipped = cached_blocks * context.block_size_tokens
+        assert state["queue"] == ([2] if bypass else [2, 3])
+        assert state["chunked_id"] == -1 and state["finished"] == 0
+        assert state["active_ids"] == ([1, 3] if bypass else [1])
+        assert state["query_lengths"] == ([8, length - skipped] if bypass else [8])
+        assert state["kv_offsets"] == ([0, skipped] if bypass else [0])
+        assert state["active_tokens"] == (8 + length - skipped if bypass else 8)
+        assert state["remaining"] == (0 if bypass else length)
+        assert state["skipped"] == (skipped if bypass else 0)
+        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
+        assert conflict.finished_chunk_token_count == 0
+        assert len(conflict.remaining_prompt_tokens) == 8 and conflict.num_cached_tokens == 0
+
+        # Finish A's step: B must now lead admission and reuse A's published prefix.
+        self._consume_step(context, survive=False)
+        engine.schedule_chunked_prefill()
+        resumed = self._state(engine, conflict)
+        assert resumed["active_ids"][0] == 2
+        assert resumed["kv_offsets"][0] == 7 and resumed["query_lengths"][0] == 1
+        assert not conflict.remaining_prompt_tokens.numel()
+        assert conflict.num_cached_tokens == 7
+        # Any partial C begins only after B is admitted; drain it with the real lifecycle.
+        for _ in range(4):
+            if not engine.waiting_request_ids:
+                break
+            if context.chunked_prefill_request_id >= 0:
+                assert engine.waiting_request_ids[0] == context.chunked_prefill_request_id == 3
+            self._consume_step(context, survive=False)
+            engine.schedule_chunked_prefill()
+        assert not engine.waiting_request_ids and context.chunked_prefill_request_id == -1
+        assert all(
+            request.remaining_prompt_tokens.numel() == 0 for request in (first, conflict, later)
+        )
+        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
+        self._consume_step(context, survive=False)
+        assert context.total_request_count == context.active_token_count == 0
+
+    @pytest.mark.parametrize(
         ("max_tokens", "length", "graph_tokens", "cached_blocks", "query", "offset", "blocks"),
         [
             pytest.param(10, 20, 6, 0, 6, 0, 2, id="first-chunk-graph-boundary"),

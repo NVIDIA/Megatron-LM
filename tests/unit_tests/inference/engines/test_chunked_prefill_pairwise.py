@@ -1171,3 +1171,53 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             _cleanup()
             _reset_rounder()
             Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("later_length", [128, 384], ids=["bypass", "defer"])
+    @torch.inference_mode()
+    def test_prefix_conflict_bypass_preserves_outputs(self, later_length):
+        case = replace(
+            next(case for case in _CASES if case.name == "prefix-lru-multichunk"), chunk_budget=640
+        )
+        _initialize_topology(case)
+        try:
+            for chunked in (False, True):
+                env = _build_env(case, chunked)
+                admissions = []
+                _install_admission_observer(env.engine.context, admissions)
+                for request_id, length in enumerate((512, 512, later_length), start=1):
+                    offset = 73 if request_id == 3 else 41
+                    env.engine._add_request(
+                        _request(env, case, request_id, _tokens(length, offset), output_length=4)
+                    )
+                completed = []
+                for step in range(32):
+                    result = env.engine.step_modern()
+                    completed.extend(result["finished_requests"])
+                    if chunked and step == 0:
+                        assert [a.request_id for a in admissions] == (
+                            [1, 3] if later_length == 128 else [1]
+                        )
+                        assert list(env.engine.waiting_request_ids) == (
+                            [2] if later_length == 128 else [2, 3]
+                        )
+                        assert env.engine.context.chunked_prefill_request_id == -1
+                    if not env.engine.has_unfinished_requests():
+                        break
+                assert len(completed) == 3
+                completed.sort(key=lambda request: request.request_id)
+                for request in completed:
+                    assert len(request.generated_tokens) == len(request.generated_log_probs) == 4
+                    assert len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+                if chunked:
+                    _assert_request_parity(
+                        completed, reference, case.scenario.atol, exact_top_n=False
+                    )
+                    assert admissions[1].request_id == (3 if later_length == 128 else 2)
+                else:
+                    reference = _snapshot_requests(completed)
+                del env
+                _cleanup()
+        finally:
+            _cleanup()
+            _reset_rounder()
+            Utils.destroy_model_parallel()
