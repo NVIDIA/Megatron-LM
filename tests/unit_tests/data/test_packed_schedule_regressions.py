@@ -243,6 +243,37 @@ def test_wrap_iterator_enables_padding_aware_capacity(
     )
 
 
+def test_static_packing_spans_gtp_remat_peers(monkeypatch, no_global_process_groups):
+    # GTP_remat peers hold distinct micro-batches, so they share the packed global batch.
+    pg = ProcessGroupCollection(
+        dp=_group(2),
+        dp_cp=_group(4),
+        dp_gtp_remat=_group(4),
+        dp_cp_gtp_remat=_group(8),
+        tp=_group(1),
+        pp=_group(1),
+    )
+
+    def run(scheduler, iterator, count, dp_group, tp_group, pp_group, dp_cp_group, *args):
+        assert (scheduler.dp_size, scheduler.cp_size) == (4, 2)
+        assert (dp_group, dp_cp_group) == (pg.dp_gtp_remat, pg.dp_cp_gtp_remat)
+        return None, 0, 0, 0
+
+    monkeypatch.setattr(DpBalancedScheduler, 'run', run)
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    data_schedule.wrap_data_iterator(
+        None,
+        SimpleNamespace(
+            sequence_packing_scheduler='dp_balanced',
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment=None,
+            virtual_pipeline_model_parallel_size=None,
+        ),
+        1,
+        pg_collection=pg,
+    )
+
+
 @pytest.mark.parametrize("local_cp_size", [1, 2, 6])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
 @pytest.mark.parametrize("last_cp_rank", [False, True])
