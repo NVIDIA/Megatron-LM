@@ -29,6 +29,7 @@ from megatron.core.tensor_parallel.ordered_reduce import (
     can_use_symm_pull,
     ordered_reduce_scatter_shards,
     row_parallel_shard_partials,
+    symm_ordered_reduce_scatter_shards,
     symm_ordered_reduce_scatter,
     use_ordered_tp_reduce,
 )
@@ -545,7 +546,20 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         TP 1, the local fold) of the shard partials in global shard order.
         """
         assert not use_mxfp8, "batch_invariant_tp_shards with several shards per rank is BF16 only"
-        parts = row_parallel_shard_partials(x, self.weight, self._bi_tp_local_shards)
+        c = self._bi_tp_local_shards
+        if self.tp_size > 1 and self.triton_nvls_kernels_allowed:
+            buf = SymmetricMemoryManager.get_buffer("tp", process_group=self.tp_group)
+            dims = [c, *x.shape[:-1], self.weight.size(0)]
+            symm = buf.maybe_get_tensor(dims, dtype=x.dtype)
+            if symm["handle"] is not None and can_use_symm_pull(symm["handle"], x):
+                # The GEMM writes the shard partials straight into the symmetric buffer; one
+                # kernel pulls the owned rows of every peer's partials and folds them.
+                parts = row_parallel_shard_partials(x, self.weight, c, out=symm["tensor"])
+                out_dims = list(parts.shape[1:])
+                out_dims[0] //= self.tp_size
+                output = torch.empty(out_dims, dtype=x.dtype, device=x.device)
+                return symm_ordered_reduce_scatter_shards(output, parts, symm["handle"])
+        parts = row_parallel_shard_partials(x, self.weight, c)
         return ordered_reduce_scatter_shards(parts, self.tp_group if self.tp_size > 1 else None)
 
     def _matmul_ordered_reduce_scatter(self, x, symm_mem_buffer, use_mxfp8):
