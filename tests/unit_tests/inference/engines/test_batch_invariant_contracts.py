@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Output, terminal, residency, and explicit unsupported BI contracts."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -85,6 +87,50 @@ def test_batch_invariant_output_contract(output):
             assert request.prompt_tokens[0] == 1 and len(request.prompt_tokens) == 18
         if output == "total-length":
             assert len(request.prompt_tokens) + request.generated_length == 23
+        assert actual[1].sample_steps[0]["requests"] == 65
+
+
+@pytest.mark.parametrize("terminal", ["eos", "stop-kept", "stop-trimmed", "stop-prefix"])
+@pytest.mark.parametrize("skip_prompt", [False, True])
+def test_batch_invariant_terminal_contract(terminal, skip_prompt):
+    case = fixture.Case(
+        "terminal", sampling=dict(top_n_logprobs=3, skip_prompt_log_probs=skip_prompt)
+    )
+    with fixture.invariant_runtime(case) as (backend, version):
+        baseline = fixture.run_order(case, backend, version, "solo")
+        tokens = baseline[0].generated_tokens
+        assert len(tokens) == 6
+        prefix = next((i for i in range(1, len(tokens)) if tokens[i] not in tokens[:i]), None)
+        if terminal == "stop-prefix":
+            assert prefix is not None, "need a real later token with no earlier stop match"
+        if terminal == "eos":
+            params = dict(termination_id=tokens[0])
+        else:
+            # A stop is derived from an unmodified real greedy forward, never by
+            # replacing model logits or forcing the sampler's returned token.
+            stop = tokens[prefix : prefix + 1] if terminal == "stop-prefix" else tokens[:2]
+            params = dict(
+                stop_words=[" ".join(map(str, stop))],
+                detokenize_stop_sequence=terminal == "stop-kept",
+            )
+        limited = replace(case, sampling={**case.sampling, **params})
+        reference = fixture.run_order(limited, backend, version, "solo")
+        actual = fixture.run_order(limited, backend, version, "back")
+        fixture.assert_same_target(reference, actual)
+        fixture.assert_same_target(baseline, actual, require_trajectory=False)
+        expected_count = {"eos": 1, "stop-kept": 2, "stop-trimmed": 0, "stop-prefix": prefix}[
+            terminal
+        ]
+        assert actual[0].succeeded() and len(actual[0].generated_tokens) == expected_count
+        assert len(actual[0].generated_log_probs or []) == expected_count
+        for field in ("generated_tokens", "generated_log_probs", "generated_top_n_logprobs"):
+            assert getattr(actual[0], field) == getattr(baseline[0], field)[:expected_count]
+        for field in ("prompt_log_probs", "prompt_top_n_logprobs"):
+            assert getattr(actual[0], field) == getattr(baseline[0], field)
+            assert len(getattr(actual[0], field) or []) == (0 if skip_prompt else 16)
+        terminal_length = 1 if terminal == "eos" else prefix + 1 if terminal == "stop-prefix" else 2
+        sampled = [step["token"] for step in actual[1].sample_steps]
+        assert sampled[:terminal_length] == tokens[:terminal_length]
         assert actual[1].sample_steps[0]["requests"] == 65
 
 
