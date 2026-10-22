@@ -82,7 +82,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -920,6 +920,8 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    batch_invariant_mode: bool = False
+    batch_invariant_backend: str = "te_native"
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     flash_attention_version: Optional[int] = 2
@@ -1239,6 +1241,12 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
@@ -1341,6 +1349,12 @@ class DynamicInferenceEngineTestBase:
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
+                attention_backend=(
+                    AttnBackend.flash if test_config.batch_invariant_mode else AttnBackend.auto
+                ),
+                attention_dropout=0.0 if test_config.batch_invariant_mode else 0.1,
+                batch_invariant_mode=test_config.batch_invariant_mode,
+                batch_invariant_backend=test_config.batch_invariant_backend,
                 inference_sampling_seed=test_config.random_seed,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
