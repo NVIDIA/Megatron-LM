@@ -108,7 +108,7 @@ def test_native_memory_interval_validation(interval, valid, run_config):
 
 @pytest.mark.parametrize('rank,enabled', [(0, False), (1, True)])
 def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, run_config):
-    run_config.dist.world_size = 2
+    monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 2)
     factory = Mock()
     monkeypatch.setitem(
         sys.modules, 'torch.utils.tensorboard', SimpleNamespace(SummaryWriter=factory)
@@ -125,7 +125,7 @@ def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, 
 
 
 def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, run_config):
-    run_config.dist.world_size = 1
+    monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     wandb = SimpleNamespace(init=Mock())
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
     monkeypatch.setattr(global_vars, '_GLOBAL_WANDB_WRITER', None)
@@ -156,7 +156,7 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
 
 @pytest.mark.parametrize('wandb_project,asynchronous', [(None, False), ('project', True)])
 def test_one_logger_async_policy(monkeypatch, wandb_project, asynchronous, run_config):
-    run_config.dist.world_size = 1
+    monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     factory = Mock()
     monkeypatch.setitem(sys.modules, 'one_logger', SimpleNamespace(OneLogger=factory))
     monkeypatch.setattr(global_vars, '_GLOBAL_ONE_LOGGER', None)
@@ -232,7 +232,7 @@ def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
 
 
 def test_async_worker_telemetry_uses_config(monkeypatch, run_config):
-    run_config.dist.world_size = 8
+    monkeypatch.setattr('megatron.training.async_utils.safe_get_world_size', lambda: 8)
     monkeypatch.delenv('OTEL_SERVICE_NAME', raising=False)
     attrs = Mock(return_value={'test': 'resource'})
     monkeypatch.setattr(global_vars, 'build_telemetry_resource_attrs', attrs)

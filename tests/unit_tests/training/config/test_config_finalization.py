@@ -129,7 +129,6 @@ def test_model_finalization_precedes_optimizer_precision(run_config, model_cls, 
     transformer = DeferredPrecisionConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
     run_config.model = model_cls(transformer=transformer, seq_length=16)
     run_config.rng.te_rng_tracker = True
-    run_config.dist.world_size = 1
     run_config.train.micro_batch_size = 1
     run_config.optimizer = OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
     assert run_config.optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8

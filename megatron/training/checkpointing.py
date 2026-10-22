@@ -31,6 +31,7 @@ except ImportError:
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
@@ -3029,7 +3030,7 @@ def load_checkpoint(
         )
 
         ckpt_world_size = getattr(ckpt_args, 'world_size', 0)
-        run_world_size = cfg.dist.world_size
+        run_world_size = safe_get_world_size()
         ckpt_dp = getattr(ckpt_args, 'data_parallel_size', 0)
         run_dp = cfg.get_data_parallel_size()
         mismatch_msg = '(TP, PP) mismatch after resume ({} vs {} from checkpoint)'.format(

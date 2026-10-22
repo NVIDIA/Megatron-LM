@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from megatron.core import mpu, tensor_parallel, tuning
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
@@ -433,7 +434,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         init_process_group_kwargs = {
             'backend': cfg.dist.distributed_backend,
             'store': store,
-            'world_size': cfg.dist.world_size,
+            'world_size': safe_get_world_size(),
             'rank': args.rank,
             'timeout': timedelta(minutes=cfg.dist.distributed_timeout_minutes),
         }

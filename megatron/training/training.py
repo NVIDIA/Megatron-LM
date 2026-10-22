@@ -43,7 +43,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 from megatron.core import mpu, tensor_parallel
 
 # First-party.
-from megatron.core._rank_utils import safe_get_rank
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -1426,7 +1426,6 @@ def get_start_time_from_progress_log():
     of floating-point operations completed in last saved checkpoint.
     """
     args = get_args()
-    cfg = get_run_config()
     assert args.save is not None
     progress_log_filename = os.path.join(args.save, "progress.txt")
 
@@ -1462,7 +1461,7 @@ def get_start_time_from_progress_log():
                 if latest_num_floating_point_operations_uncommitted is not None:
                     latest_num_floating_point_operations = latest_num_floating_point_operations_uncommitted
                     latest_num_floating_point_operations_uncommitted = None
-            if world_size_in_line != cfg.dist.world_size:
+            if world_size_in_line != safe_get_world_size():
                 # Re-start search if we see a different world size.
                 start_time = None
                 start_num_floating_point_operations = None
@@ -1992,7 +1991,7 @@ def pretrain(
                 f"ExptTP={cfg_container.rl.rl_inference_expert_tensor_model_parallel_size}"
             )
             inference_pg_collection = build_inference_pg_collection(
-                cfg_container.dist.world_size,
+                safe_get_world_size(),
                 tp_size=cfg_container.rl.rl_inference_tensor_model_parallel_size,
                 pp_size=cfg_container.rl.rl_inference_pipeline_model_parallel_size,
                 cp_size=1 if force_cp1_inference_model else None,
@@ -3751,7 +3750,7 @@ def training_log(
     )
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, cfg.dist.world_size, args.seq_length)
+    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), args.seq_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
     if packed_sequence_stats and wandb_writer:
@@ -3792,10 +3791,10 @@ def training_log(
             if wandb_writer:
                 wandb_writer.log({'loss-scale': loss_scale}, iteration)
         if cfg.logger.log_world_size_to_tensorboard:
-            writer.add_scalar('world-size', cfg.dist.world_size, iteration)
-            writer.add_scalar('world-size vs samples', cfg.dist.world_size, train_state.consumed_train_samples)
+            writer.add_scalar('world-size', safe_get_world_size(), iteration)
+            writer.add_scalar('world-size vs samples', safe_get_world_size(), train_state.consumed_train_samples)
             if wandb_writer:
-                wandb_writer.log({'world-size': cfg.dist.world_size}, iteration)
+                wandb_writer.log({'world-size': safe_get_world_size()}, iteration)
         if grad_norm is not None:
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm, train_state.consumed_train_samples)
@@ -3996,7 +3995,7 @@ def training_log(
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
         if cfg.logger.log_energy:
-            energy = (energy_monitor.lap() / total_iterations) / cfg.dist.world_size
+            energy = (energy_monitor.lap() / total_iterations) / safe_get_world_size()
             power = energy / elapsed_time_per_iteration
             log_string += f' energy per GPU (J/iter/GPU): {energy:.1f} |'
             log_string += f' power per GPU (W/GPU): {power:.1f} |'
@@ -4099,7 +4098,7 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
                     cfg, sequence_length=args.seq_length, micro_batch_size=cfg.train.micro_batch_size,
-                    data_parallel_size=cfg.get_data_parallel_size(), world_size=cfg.dist.world_size,
+                    data_parallel_size=cfg.get_data_parallel_size(), world_size=safe_get_world_size(),
                     num_microbatches=num_microbatches, verbose=True,
                 )
             report_memory(

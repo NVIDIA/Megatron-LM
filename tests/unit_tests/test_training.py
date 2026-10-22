@@ -361,7 +361,7 @@ class TestPackedSampleAccounting:
             train_iters=None,
             train_samples=10_000,
         )
-        run_config.dist.world_size = 8
+        monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 8)
         run_config.model.transformer = TransformerConfig(
             num_layers=2,
             hidden_size=32,

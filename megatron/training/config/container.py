@@ -13,6 +13,7 @@ try:
 except ImportError:
     HAVE_YAML = False
 
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.optimizer import OptimizerConfig
@@ -51,10 +52,11 @@ class ConfigContainerBase:
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
+        launch_world_size = safe_get_world_size()
         world_size = getattr(self.model, "training_world_size", None)
         if world_size is None:
-            world_size = self.dist.world_size
-        if not 0 < world_size <= self.dist.world_size:
+            world_size = launch_world_size
+        if not 0 < world_size <= launch_world_size:
             raise ValueError("Training model world size must fit within the global launch")
         return world_size
 

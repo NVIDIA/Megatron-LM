@@ -57,19 +57,34 @@ def _runtime_args():
     )
 
 
-def test_launch_world_size_is_captured_at_config_construction(monkeypatch):
-    from megatron.training.argument_utils import _default_config_from_args
-
+@pytest.mark.parametrize(
+    "source,expected_world_size",
+    [("process_group", 12), ("environment", 8), ("slurm", 16), ("default", 1)],
+)
+def test_batch_finalization_uses_core_world_size(
+    monkeypatch, run_config, source, expected_world_size
+):
+    # The container already exists; launch metadata is resolved at runtime, not captured in it.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: source == "process_group")
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 12)
     monkeypatch.setenv("WORLD_SIZE", "8")
-    launch_config = DistributedInitConfig()
-    monkeypatch.setenv("WORLD_SIZE", "16")
-    assert launch_config.world_size == 8
-    # CLI launch inputs override the environment at the existing config boundary.
-    cli_config = _default_config_from_args(DistributedInitConfig, Namespace(world_size=4))
-    assert cli_config.world_size == 4
-    parser = ArgumentParser()
-    arguments.add_megatron_arguments(parser)
-    assert "world_size" not in vars(parser.parse_args([]))
+    monkeypatch.setenv("SLURM_NTASKS", "16")
+    if source in ("slurm", "default"):
+        monkeypatch.delenv("WORLD_SIZE")
+    if source == "default":
+        monkeypatch.delenv("SLURM_NTASKS")
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    run_config.train.micro_batch_size = 2
+
+    warning = (
+        pytest.warns(UserWarning, match="Defaulting to world size 1")
+        if source == "default"
+        else nullcontext()
+    )
+    with warning:
+        run_config.finalize()
+    assert run_config.train.global_batch_size == 2 * expected_world_size
+    assert run_config.validation.eval_global_batch_size == 2 * expected_world_size
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
@@ -164,8 +179,8 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     args.expert_tensor_parallel_size = 1
     original_args = vars(args).copy()
     # Keep the legacy defaults different so an accidental args read is detected.
+    monkeypatch.setenv("WORLD_SIZE", "4")
     run_config.dist = DistributedInitConfig(
-        world_size=4,
         distributed_backend="gloo",
         distributed_timeout_minutes=37,
         local_rank=1,
@@ -384,7 +399,7 @@ def test_runtime_service_order_and_microbatch_inputs(
 ):
     args = _runtime_args()
     cfg = run_config
-    cfg.dist.world_size = 2
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     cfg.train.global_batch_size = 8
     cfg.train.micro_batch_size = 2
     # Runtime services must use the container even when legacy args disagree.
@@ -533,7 +548,10 @@ def test_training_batch_topology_uses_model_config(
     args.world_size = args.mimo_llm_world_size = 999
     args.data_parallel_size = args.batch_parallel_size = 999
     original_args = vars(args).copy()
-    run_config.dist.world_size = world_size
+    monkeypatch.setattr(
+        "megatron.training.config.container.safe_get_world_size", lambda: world_size
+    )
+    monkeypatch.setattr(global_vars, "safe_get_world_size", lambda: world_size)
     run_config.train.micro_batch_size = 2
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     run_config.model = ModelProviderConfig(
@@ -567,7 +585,6 @@ def test_training_batch_topology_uses_model_config(
     run_config.finalize()
     global_vars.initialize_runtime_services(args, build_tokenizer=False, training=True)
     assert vars(args) == original_args
-    assert run_config.dist.world_size == world_size
     assert run_config.get_model_world_size() == (training_world_size or world_size)
     assert run_config.get_data_parallel_size() == expected_dp
     assert run_config.get_batch_parallel_size() == expected_batch
@@ -757,7 +774,7 @@ def test_model_precision_is_derived_centrally(monkeypatch, run_config):
     from megatron.core.optimizer import OptimizerConfig
 
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
-    run_config.dist.world_size = 1
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 1)
     run_config.train.micro_batch_size = 1
 
     run_config.model = ModelProviderConfig(
@@ -805,7 +822,7 @@ def test_native_batch_defaults_preserve_explicit_eval_sizes(
     run_config.validate()
     run_config.validate()
     assert run_config.to_dict() == before
-    run_config.dist.world_size = 2
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.finalize()
     # Runtime re-entry must not apply derivations a second time.
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
@@ -820,7 +837,7 @@ def test_native_batch_defaults_preserve_explicit_eval_sizes(
 @pytest.mark.parametrize("mode", ["constant", "decrease", "schedule"])
 def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run_config, mode):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
-    run_config.dist.world_size = 2
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.train.micro_batch_size = 2
     run_config.train.global_batch_size = 10
     run_config.train.decrease_batch_size_if_needed = mode == "decrease"
@@ -840,7 +857,7 @@ def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run
 
 @pytest.mark.parametrize("invalid_policy", ["eval", "rl"])
 def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_config, invalid_policy):
-    run_config.dist.world_size = 2
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.train.micro_batch_size = 3
     if invalid_policy == "eval":
         run_config.validation.eval_micro_batch_size = 4
@@ -863,7 +880,9 @@ def test_training_topology_rejects_invalid_rank_counts(
     monkeypatch, run_config, world_size, training_world_size
 ):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
-    run_config.dist.world_size = world_size
+    monkeypatch.setattr(
+        "megatron.training.config.container.safe_get_world_size", lambda: world_size
+    )
     run_config.model.training_world_size = training_world_size
     run_config.train.micro_batch_size = 1
     before = deepcopy(run_config.to_dict())
@@ -897,7 +916,7 @@ def test_training_topology_rejects_invalid_rank_counts(
     ],
 )
 def test_parallel_size_helpers_reject_invalid_topology(monkeypatch, run_config, overrides, error):
-    run_config.dist.world_size = 8
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 8)
     for name, value in overrides.items():
         monkeypatch.setattr(run_config.model.transformer, name, value)
     before = deepcopy(run_config.to_dict())
@@ -1240,6 +1259,7 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     args.padded_vocab_size = 512 if vocabulary == "checkpoint" else None
     args.batch_parallel_size = 2
     args.world_size = 2
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     args.num_layers, args.hidden_size, args.num_attention_heads = 2, 128, 4
     args.params_dtype = torch.float32
     args.micro_batch_size = 2

@@ -11,6 +11,7 @@ from datetime import timedelta
 import torch
 
 from megatron.core import Timers
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.jit import disable_jit_fuser
@@ -343,7 +344,7 @@ def _set_tensorboard_writer(args):
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
                                    'tensorboard writer')
 
-    if cfg.logger.tensorboard_dir and args.rank == (cfg.dist.world_size - 1):
+    if cfg.logger.tensorboard_dir and args.rank == (safe_get_world_size() - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
             print('> setting tensorboard ...')
@@ -361,7 +362,7 @@ def _set_wandb_writer(args):
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
                                    'wandb writer')
-    if cfg.logger.wandb_project and args.rank == (cfg.dist.world_size - 1):
+    if cfg.logger.wandb_project and args.rank == (safe_get_world_size() - 1):
         if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
@@ -396,7 +397,7 @@ def _set_one_logger(args):
     global _GLOBAL_ONE_LOGGER
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
-    if cfg.logger.enable_one_logger and args.rank == (cfg.dist.world_size - 1):
+    if cfg.logger.enable_one_logger and args.rank == (safe_get_world_size() - 1):
         if cfg.logger.one_logger_async or cfg.logger.wandb_project:
             one_logger_async = True
         else:
@@ -652,7 +653,7 @@ def _set_telemetry(args, *, include_training: bool = True):
     )
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
-        config, rank=args.rank, world_size=cfg.dist.world_size,
+        config, rank=args.rank, world_size=safe_get_world_size(),
         resource_attributes=resource_attrs,
     )
 

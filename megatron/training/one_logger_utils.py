@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import time, os
 
+from megatron.core._rank_utils import safe_get_world_size
+
 from .global_vars import get_one_logger, get_args
 from megatron.training.global_vars import get_run_config
 
@@ -289,7 +291,7 @@ def on_pretrain_start():
                 'pipeline_model_parallel_size': cfg.model.transformer.pipeline_model_parallel_size,
                 'tensor_model_parallel_size': cfg.model.transformer.tensor_model_parallel_size,
                 'expert_model_parallel_size' : cfg.model.transformer.expert_model_parallel_size,
-                'world_size': cfg.dist.world_size,
+                'world_size': safe_get_world_size(),
                 'model_seq_length': args.seq_length,
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,
