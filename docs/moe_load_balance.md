@@ -924,3 +924,16 @@ equal to and above home count with real TE, and small budgets force multi-tile
 BF16/MXFP8 transfers and FP32 accumulation. Shared scratch lifetime is tested
 across layers and producer streams. GPU execution results are recorded in the
 accompanying toolkit experiment report; CPU checks alone do not validate NCCL.
+
+### Determinism regression coverage
+
+`tests/unit_tests/transformer/moe/test_scheduler_determinism.py` checks bit-exact
+replay separately from scheduler-disabled numerical parity. It exercises live
+EP placement and probability backward for ECHO, EPLB and MoonEP; BF16/MXFP8
+replica weight/scales and additive owner gradients through Peer-TMA and NCCL;
+and learned routing, HybridEP, grouped experts and two distributed Adam updates.
+Replays use identical inputs with side-stream GEMM contention and include reused
+transport buffers. The production-layer cells require four GPUs. This is a
+fixed-topology contract, not a promise of identical results across different
+EP sizes or different planner/transport configurations. Full GPT checkpoint
+continuation remains a separate end-to-end test.
