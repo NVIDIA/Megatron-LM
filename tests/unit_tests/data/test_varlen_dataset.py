@@ -695,9 +695,9 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
 @pytest.fixture
 def loader_model_config(run_config):
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.models import ModelProviderConfig
+    from megatron.training.models import GPTModelConfig
 
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
         seq_length=64,
     )

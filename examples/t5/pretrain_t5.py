@@ -91,14 +91,13 @@ def model_provider(
         T5Model: The returned T5 model
     """
 
-    args = get_args()
     cfg = get_run_config()
 
     if config is None:
         config = cfg.model.transformer
 
     encoder_config = deepcopy(config)
-    encoder_config.num_layers = args.encoder_num_layers
+    encoder_config.num_layers = cfg.model.encoder_num_layers
 
     if config.pipeline_model_parallel_size > 1:
         raise ValueError("Pipeline parallelism is not supported for T5.")
@@ -134,8 +133,8 @@ def model_provider(
         share_embeddings_and_output_weights=cfg.model.share_embeddings_and_output_weights,
         position_embedding_type=cfg.model.position_embedding_type,
         rotary_percent=cfg.model.rotary_percent,
-        relative_attention_num_buckets=args.relative_attention_num_buckets,
-        relative_attention_max_distance=args.relative_attention_max_distance,
+        relative_attention_num_buckets=cfg.model.relative_attention_num_buckets,
+        relative_attention_max_distance=cfg.model.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
     )
@@ -278,7 +277,11 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
-    full_config = pretrain_cfg_container_from_args(args)
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import T5ModelConfig
+
+    model_cfg = model_config_from_args(args, model_config_cls=T5ModelConfig)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(
         full_config,

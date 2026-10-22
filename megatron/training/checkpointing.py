@@ -410,7 +410,8 @@ def check_checkpoint_args(
             or not getattr(checkpoint_args, 'add_position_embedding', True)
         ) else 'learned_absolute'
     )
-    _compare('position_embedding_type', default=legacy_position_type, config_section='model')
+    if hasattr(cfg.model, 'position_embedding_type'):
+        _compare('position_embedding_type', default=legacy_position_type, config_section='model')
     if cfg.model.transformer.wide_residual is not None or hasattr(
         checkpoint_args, 'wide_residual_num_streams'
     ):

@@ -78,12 +78,12 @@ def run_config(monkeypatch):
         SchedulerConfig,
         TrainingConfig,
     )
-    from megatron.training.models import ModelProviderConfig
+    from megatron.training.models import GPTModelConfig
 
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     container = PretrainConfigContainer(
         train=TrainingConfig(),
-        model=ModelProviderConfig(
+        model=GPTModelConfig(
             transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
             seq_length=16,
             vocab_size=128,

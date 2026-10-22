@@ -14,7 +14,7 @@ import torch
 
 import megatron.training.datasets.data_samplers as data_samplers
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models import ModelProviderConfig
+from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 
 SEED = 1234
@@ -44,7 +44,7 @@ class TestDataLoaderResume:
 
     def test_building_data_iterators_does_not_move_cpu_rng(self, monkeypatch, run_config):
         Utils.initialize_model_parallel(1, 1)
-        run_config.model = ModelProviderConfig(
+        run_config.model = GPTModelConfig(
             transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
             seq_length=16,
         )
@@ -103,7 +103,7 @@ class TestDataLoaderResume:
         Utils.initialize_model_parallel(1, 1)
         run_config.train.micro_batch_size = 1
         run_config.train.global_batch_size = 2 * Utils.world_size
-        run_config.model = ModelProviderConfig(
+        run_config.model = GPTModelConfig(
             transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
             seq_length=16,
         )

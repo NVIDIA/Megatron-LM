@@ -22,7 +22,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
-from megatron.training.models.base import ModelBuilder, ModelProviderConfig, compose_hooks
+from megatron.training.models.base import ModelBuilder, compose_hooks
+from megatron.training.models.mimo import MimoModelConfig as MimoTrainingConfig
 
 _LANGUAGE_SEED_OFFSET = 0
 # Add per-encoder offsets before wiring more than one encoder grid.
@@ -30,7 +31,7 @@ _ENCODER_SEED_OFFSET = 10_000
 
 
 @dataclass(kw_only=True)
-class MimoBuildConfig(ModelProviderConfig):
+class MimoBuildConfig(MimoTrainingConfig):
     """Shared model inputs and runtime topology used by :class:`MimoModelBuilder`.
 
     ``_topology`` is underscore-prefixed so ``ModelConfig`` skips it during serialization;

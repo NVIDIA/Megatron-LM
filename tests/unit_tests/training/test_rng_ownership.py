@@ -13,7 +13,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, checkpointing, global_vars, initialize
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.config.common_config import RNGConfig
-from megatron.training.models import ModelProviderConfig
+from megatron.training.models import GPTModelConfig
 
 
 def _args_without_rng():
@@ -258,7 +258,7 @@ def test_checkpoint_policy_retains_current_run_precedence(
     args = _args_without_rng()
     args.use_dist_ckpt = False
     args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
         seq_length=16,
         vocab_size=128,

@@ -40,7 +40,7 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
-from megatron.training.models import ModelProviderConfig
+from megatron.training.models import BertModelConfig, GPTModelConfig, MimoModelConfig
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -523,7 +523,7 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch(run_config):
     )
     checkpoint_args = SimpleNamespace(**vars(current_args))
     checkpoint_args.wide_residual_num_streams = 4
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -542,12 +542,14 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch(run_config):
         check_checkpoint_args(checkpoint_args)
 
 
-def test_checkpoint_model_checks_use_config_not_stale_args(run_config):
-    run_config.model = ModelProviderConfig(
+@pytest.mark.parametrize("model_cls", [GPTModelConfig, BertModelConfig, MimoModelConfig])
+def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls):
+    kwargs = {"position_embedding_type": "rope"} if model_cls is GPTModelConfig else {}
+    run_config.model = model_cls(
         transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
         seq_length=64,
         vocab_size=128,
-        position_embedding_type='rope',
+        **kwargs,
     )
     args = SimpleNamespace(vocab_file=None, use_dist_ckpt=True, phase_transition_iterations=None)
     saved = run_config.to_dict()
@@ -566,7 +568,7 @@ def test_checkpoint_model_checks_use_config_not_stale_args(run_config):
 def test_checkpoint_model_restore_preserves_cli_precedence_and_data_length(
     run_config, position_type
 ):
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(
             num_layers=2, hidden_size=32, num_attention_heads=4, add_bias_linear=False
         ),
@@ -706,7 +708,7 @@ def test_checkpoint_native_activation_overrides_stale_cli_aliases(run_config, ac
         "quick_gelu": quick_gelu,
     }[activation_name]
     gated = activation_name in ("silu", "quick_gelu")
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(
             num_layers=2,
             hidden_size=32,
@@ -755,7 +757,7 @@ def test_check_checkpoint_args_uses_config_owner(
     monkeypatch, run_config, section, name, current, other, saved_source
 ):
     """Config precedence, old checkpoint fallback and skips share one comparison path."""
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4),
         seq_length=16,
         vocab_size=128,
@@ -845,7 +847,7 @@ def create_args(run_config):
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=1, hidden_size=2, num_attention_heads=1),
         seq_length=16,
         position_embedding_type='rope',
@@ -1346,7 +1348,7 @@ def test_checkpoint_load_without_microbatch_calculator(
         config = TransformerConfig(
             num_layers=1, hidden_size=32, num_attention_heads=4, use_cpu_initialization=True
         )
-        run_config.model = ModelProviderConfig(transformer=config, seq_length=16, vocab_size=32)
+        run_config.model = GPTModelConfig(transformer=config, seq_length=16, vocab_size=32)
 
         def build_model():
             # CPU-initialized DP replicas must match the weights saved by rank 0.

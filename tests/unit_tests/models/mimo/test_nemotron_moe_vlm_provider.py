@@ -26,10 +26,7 @@ from examples.mimo.training.args import add_hetero_grid_args
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import AttnBackend
-from megatron.training.argument_utils import (
-    model_provider_config_from_args,
-    resolve_tokenizer_vocab_size,
-)
+from megatron.training.argument_utils import model_config_from_args, resolve_tokenizer_vocab_size
 from megatron.training.global_vars import get_run_config
 
 pytestmark = pytest.mark.usefixtures("run_config")
@@ -319,7 +316,9 @@ def _parse_validate(argv):
         sys.argv = saved
     validate_args(args)
     cfg = get_run_config()
-    cfg.model = model_provider_config_from_args(args)
+    from megatron.training.models import MimoModelConfig
+
+    cfg.model = model_config_from_args(args, model_config_cls=MimoModelConfig)
     build_tokenizer(args)
     resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
     return args
@@ -651,7 +650,7 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, seque
 
     from examples.mimo.model_providers import nemotron_moe_vlm as provider
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.models import ModelProviderConfig
+    from megatron.training.models import MimoModelConfig
 
     # Deliberately disagree with the grid to catch inheritance of stock CP.
     args = SimpleNamespace(
@@ -664,7 +663,7 @@ def test_language_cp_comes_from_its_grid(monkeypatch, cp_size, use_groups, seque
         hybrid_layer_pattern="*",
         logit_dtype=None,
     )
-    get_run_config().model = ModelProviderConfig(
+    get_run_config().model = MimoModelConfig(
         transformer=TransformerConfig(
             num_layers=1,
             hidden_size=32,

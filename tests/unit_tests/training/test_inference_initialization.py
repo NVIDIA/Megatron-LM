@@ -15,7 +15,7 @@ import torch
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
 from megatron.training.argument_utils import inference_cfg_container_from_args
-from megatron.training.models import ModelProviderConfig
+from megatron.training.models import GPTModelConfig
 
 
 @pytest.mark.parametrize("load_checkpoint", [False, True])
@@ -85,7 +85,7 @@ def test_resume_updates_microbatches_before_setup_validation(
     args.load = "checkpoint"
     args.data_parallel_size = 1
     args.micro_batch_size = 1
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
         seq_length=16,
         vocab_size=128,
@@ -133,7 +133,7 @@ def test_resume_updates_microbatches_before_setup_validation(
 def test_runtime_services_initialize_training_only_when_requested(
     monkeypatch, build_tokenizer, enable_runtime_flags, training_kwargs, run_config
 ):
-    run_config.model = ModelProviderConfig(
+    run_config.model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
         seq_length=16,
         vocab_size=128,
@@ -293,9 +293,9 @@ def test_distributed_training_services_require_explicit_opt_in(
             tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
         )
     else:
-        from megatron.training.argument_utils import model_provider_config_from_args
+        from megatron.training.argument_utils import model_config_from_args
 
-        run_config.model = model_provider_config_from_args(args)
+        run_config.model = model_config_from_args(args)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())

@@ -79,9 +79,9 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
         cfg = argument_utils.inference_cfg_container_from_args(args, build_model_config=False)
     else:
         from megatron.core.transformer import TransformerConfig
-        from megatron.training.models import ModelProviderConfig
+        from megatron.training.models import GPTModelConfig
 
-        model = ModelProviderConfig(
+        model = GPTModelConfig(
             transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
             seq_length=16,
         )

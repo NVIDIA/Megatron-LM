@@ -809,13 +809,16 @@ class LLaVAPipeline(Pipeline):
 
         # Parse args.
         from examples.multimodal.multimodal_args import add_multimodal_extra_args
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import LLaVAModelConfig
 
         args = parse_args(extra_args_provider=add_multimodal_extra_args)
         validate_args(args)
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+        cfg = inference_cfg_container_from_args(args, model_cfg)
         set_global_variables(args, cfg)
 
         # Random seed.

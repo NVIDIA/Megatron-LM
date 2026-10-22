@@ -38,7 +38,7 @@ from megatron.training.config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.models import GPTModelConfig, HybridModelConfig, ModelProviderConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, ModelConfig
 
 # TODO: support arg renames
 
@@ -570,16 +570,16 @@ def resolve_tokenizer_vocab_size(
 
     Args:
         cfg: Previously constructed run configuration. Explicit model
-            vocabulary is preserved; only unresolved GPT/Hybrid sizes are bound.
+            vocabulary is preserved; only unresolved model sizes are bound.
         padded_vocab_size: Final size resolved by tokenizer initialization,
             including any CLI/checkpoint override. None is valid only when the
             model does not require a tokenizer-derived size.
 
     Raises:
-        ValueError: A GPT/Hybrid model's vocabulary remains unresolved.
+        ValueError: A model's vocabulary remains unresolved.
     """
     cfg.tokenizer.padded_vocab_size = padded_vocab_size
-    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig, ModelProviderConfig)) and cfg.model.vocab_size is None:
+    if cfg.model is not None and hasattr(cfg.model, "vocab_size") and cfg.model.vocab_size is None:
         if padded_vocab_size is None:
             raise ValueError('Model vocabulary must be resolved before model construction')
         cfg.model.vocab_size = padded_vocab_size
@@ -773,10 +773,25 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     return ProfilingConfig(**deepcopy(kwargs))
 
 
-def model_provider_config_from_args(
-    args: Namespace, *, model_config_cls: type[ModelProviderConfig] = ModelProviderConfig
-) -> ModelProviderConfig:
-    """Normalize shared model inputs for application-supplied model providers."""
+def model_config_from_args(
+    args: Namespace, *, model_config_cls: type[ModelConfig] | None = None
+) -> ModelConfig:
+    """Build a model-family config at the CLI boundary.
+
+    BERT, T5, LLaVA, and MIMO applications select their config class explicitly.
+    Decoder-only callers use the existing GPT/Hybrid adapters. Model construction
+    remains independent: an explicit provider callback is retained by pretrain.
+    """
+    if model_config_cls is None:
+        model_config_cls = (
+            HybridModelConfig
+            if getattr(args, "hybrid_layer_pattern", None) is not None
+            else GPTModelConfig
+        )
+    if issubclass(model_config_cls, GPTModelConfig):
+        return gpt_config_from_args(args, model_config_cls=model_config_cls)
+    if issubclass(model_config_cls, HybridModelConfig):
+        return hybrid_config_from_args(args, model_config_cls=model_config_cls)
     if args.yaml_cfg is not None:
         from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -786,23 +801,19 @@ def model_provider_config_from_args(
     vocab_size = getattr(args, "padded_vocab_size", None)
     if vocab_size is None and not args.pad_vocab_size:
         vocab_size = args.vocab_size
-    return model_config_cls(
+    kwargs = _default_config_from_args(model_config_cls, args, return_instance=False)
+    aliases = dict(
         transformer=transformer,
         seq_length=args.max_position_embeddings,
         training_world_size=getattr(args, "mimo_llm_world_size", None),
         vocab_size=vocab_size,
-        logit_dtype=getattr(args, "logit_dtype", None),
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        make_vocab_size_divisible_by=args.make_vocab_size_divisible_by,
+        should_pad_vocab=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent,
-        rotary_base=args.rotary_base,
         rope_scaling=args.use_rope_scaling,
-        rope_scaling_factor=args.rope_scaling_factor,
-        hybrid_layer_pattern=args.hybrid_layer_pattern,
-        tp_comm_overlap_cfg=args.tp_comm_overlap_cfg,
     )
+    model_fields = {f.name for f in fields(model_config_cls) if f.init}
+    kwargs.update({name: value for name, value in aliases.items() if name in model_fields})
+    return model_config_cls(**kwargs)
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
@@ -810,7 +821,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
 
     if model_cfg is None:
-        model_cfg = model_provider_config_from_args(args)
+        model_cfg = model_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     ckpt_kwargs["save_optim"] = not args.no_save_optim
@@ -875,20 +886,17 @@ def inference_cfg_container_from_args(
         model_cfg: Optional pre-built model config. If None, a model config is constructed from
             ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
             GPTModelConfig).
-        build_model_config: If False, retain model_cfg (including None) for callers
-            without model inputs. Callback callers with model dimensions receive a
-            ModelProviderConfig, without selecting a GPT or Hybrid builder.
+        build_model_config: If False, allow model_cfg=None for callers without model
+            inputs. Callers with model dimensions still receive a typed model config;
+            application-specific families pass model_cfg explicitly.
     """
     if model_cfg is None and build_model_config:
-        if getattr(args, "hybrid_layer_pattern", None) is not None:
-            model_cfg = hybrid_config_from_args(args)
-        else:
-            model_cfg = gpt_config_from_args(args)
+        model_cfg = model_config_from_args(args)
     elif model_cfg is None and all(
         getattr(args, name, None) is not None
         for name in ("num_layers", "hidden_size", "num_attention_heads")
     ):
-        model_cfg = model_provider_config_from_args(args)
+        model_cfg = model_config_from_args(args)
 
     ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
     # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.

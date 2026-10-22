@@ -91,9 +91,9 @@ def main() -> None:
     """Build the heterogeneous topology and run stock pretraining."""
     args = _parse_and_validate()
     set_args(args)
-    from megatron.training.argument_utils import model_provider_config_from_args
+    from megatron.training.argument_utils import model_config_from_args
 
-    model_cfg = model_provider_config_from_args(args, model_config_cls=MimoBuildConfig)
+    model_cfg = model_config_from_args(args, model_config_cls=MimoBuildConfig)
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(cfg)
     provider = resolve_provider(args)

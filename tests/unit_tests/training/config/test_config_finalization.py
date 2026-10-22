@@ -16,7 +16,14 @@ from megatron.training.config import (
     InferenceSetupConfig,
     RLConfig,
 )
-from megatron.training.models import GPTModelConfig, HybridModelConfig, ModelProviderConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    HybridModelConfig,
+    LLaVAModelConfig,
+    MimoModelConfig,
+    T5ModelConfig,
+)
 
 
 @pytest.mark.parametrize("inference", [False, True])
@@ -98,8 +105,15 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     assert run_config.rng.te_rng_tracker
 
 
-def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
+@pytest.mark.parametrize(
+    "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig]
+)
+def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config, model_cls):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    kwargs = {"encoder_num_layers": 2} if model_cls is T5ModelConfig else {}
+    run_config.model = model_cls(
+        transformer=run_config.model.transformer, seq_length=16, vocab_size=128, **kwargs
+    )
     run_config.train.micro_batch_size = 1
     run_config.finalize()
     serialized = run_config.to_dict()
@@ -112,7 +126,17 @@ def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config):
     assert restored.to_dict() == serialized
 
 
-@pytest.mark.parametrize("model_cls", [GPTModelConfig, HybridModelConfig, ModelProviderConfig])
+@pytest.mark.parametrize(
+    "model_cls",
+    [
+        GPTModelConfig,
+        HybridModelConfig,
+        BertModelConfig,
+        T5ModelConfig,
+        LLaVAModelConfig,
+        MimoModelConfig,
+    ],
+)
 @pytest.mark.parametrize("params_dtype", [torch.float16, torch.bfloat16])
 def test_model_finalization_precedes_optimizer_precision(run_config, model_cls, params_dtype):
     finalizations = []
@@ -127,7 +151,8 @@ def test_model_finalization_precedes_optimizer_precision(run_config, model_cls, 
             self.fp8_recipe = "tensorwise"
 
     transformer = DeferredPrecisionConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
-    run_config.model = model_cls(transformer=transformer, seq_length=16)
+    kwargs = {"encoder_num_layers": 2} if model_cls is T5ModelConfig else {}
+    run_config.model = model_cls(transformer=transformer, seq_length=16, **kwargs)
     run_config.rng.te_rng_tracker = True
     run_config.train.micro_batch_size = 1
     run_config.optimizer = OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")

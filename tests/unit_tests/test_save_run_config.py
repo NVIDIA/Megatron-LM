@@ -31,12 +31,12 @@ class MockFullConfig:
 
     def __init__(self, data):
         from megatron.training.config import LoggerConfig, RNGConfig
-        from megatron.training.models import ModelProviderConfig
+        from megatron.training.models import GPTModelConfig
 
         self._data = data
         self.logger = LoggerConfig()
         self.rng = RNGConfig()
-        self.model = ModelProviderConfig(
+        self.model = GPTModelConfig(
             transformer=TransformerConfig(num_layers=1, kv_channels=1), seq_length=16
         )
 

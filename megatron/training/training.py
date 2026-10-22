@@ -2879,8 +2879,13 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
+    # A typed model config owns inputs without replacing an explicit application callback.
+    use_model_builder = (
+        model_provider_func is None and cfg_container is not None and cfg.model.builder is not None
+    )
+
     def _build_model_wrapper(wrap_with_ddp: bool, transformer_config=None):
-        if cfg_container is not None and cfg_container.model.builder is not None:
+        if use_model_builder:
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
@@ -3032,7 +3037,7 @@ def setup_model_and_optimizer(
 
         # get dense model
         dense_transformer_config = None
-        if cfg_container is None or cfg.model.builder is None:
+        if not use_model_builder:
             # Preserve callback upcycling without mutating the live MoE config.
             # Native-builder upcycling and its legacy policy remain a separate follow-up.
             dense_transformer_config = copy.deepcopy(cfg.model.transformer)

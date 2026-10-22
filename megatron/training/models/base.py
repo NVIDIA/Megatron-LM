@@ -8,12 +8,10 @@ from dataclasses import dataclass, field, is_dataclass
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
-import torch
-
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer import MegatronModule, TransformerConfig
+from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 
 # Hooks and callbacks that each run attaches to the live config. Not to be serialized.
@@ -244,53 +242,6 @@ class ModelConfig:
             result.builder = data["_builder_"]
 
         return result
-
-
-@dataclass(kw_only=True)
-class ModelProviderConfig(ModelConfig):
-    """Model inputs for an application-supplied provider callback.
-
-    The callback remains an explicit runtime argument to ``pretrain``. This config
-    owns the shared model inputs without selecting a GPT or Hybrid builder.
-    ``seq_length`` is position capacity, not the actual data sequence length.
-    """
-
-    transformer: TransformerConfig
-    """Shared transformer architecture, precision, and parallelism settings."""
-    seq_length: int
-    """Maximum position capacity, independent of the actual data sequence length."""
-    training_world_size: int | None = None
-    """Ranks in the training model's grid, or None to use the full launch.
-
-    Heterogeneous applications may reserve other ranks for encoders. This is not
-    the global launch size owned by DistributedInitConfig.
-    """
-    vocab_size: int | None = None
-    """Resolved model vocabulary, or None until tokenizer initialization."""
-    should_pad_vocab: bool = False
-    """Whether the provider should pad the supplied raw vocabulary size."""
-    make_vocab_size_divisible_by: int = 128
-    """Vocabulary alignment factor, multiplied by tensor-parallel size."""
-    logit_dtype: torch.dtype | None = None
-    """Optional output-logit dtype override."""
-    fp16_lm_cross_entropy: bool = False
-    """Compute language-model cross entropy in half precision."""
-    share_embeddings_and_output_weights: bool = True
-    """Tie input embedding and output projection weights."""
-    position_embedding_type: str = "learned_absolute"
-    """Position embedding implementation selected by the application."""
-    rotary_percent: float = 1.0
-    """Fraction of the head dimension using rotary embeddings."""
-    rotary_base: int = 10000
-    """Base period for rotary embeddings."""
-    rope_scaling: bool = False
-    """Enable rotary position scaling."""
-    rope_scaling_factor: float = 8.0
-    """Rotary position scaling factor when enabled."""
-    hybrid_layer_pattern: str | None = None
-    """Optional language-model hybrid layer layout."""
-    tp_comm_overlap_cfg: str | dict[str, Any] | None = None
-    """Transformer Engine user-buffer overrides, as a YAML path or a dictionary."""
 
 
 ModelT = TypeVar("ModelT", bound=MegatronModule)
