@@ -3,6 +3,7 @@
 """Mock length configurations must describe valid tokens after the label shift."""
 
 import json
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,8 @@ import numpy as np
 import pytest
 import torch
 
+from megatron.core.datasets.data_schedule import DefaultDynamicCPScheduler
+from megatron.training.arguments import parse_args, validate_args
 from megatron.training.datasets.sft_dataset import MockSFTDataset, MockSFTLowLevelDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset
 
@@ -26,14 +29,22 @@ def _distribution(length: int) -> dict[str, str | int | float]:
     }
 
 
-def _config(length: int, *, cp: int = 1, pad: int | None = 0) -> SimpleNamespace:
+def _config(
+    length: int,
+    *,
+    cp: int = 1,
+    dp: int = 1,
+    sp: int = 1,
+    dynamic_cp: bool = False,
+    pad: int | None = 0,
+) -> SimpleNamespace:
     return SimpleNamespace(
         tokenizer=SimpleNamespace(eod=0, pad=pad, vocab_size=65537),
         sequence_length=length,
-        dynamic_context_parallel=False,
+        dynamic_context_parallel=dynamic_cp,
         context_parallel_size=cp,
-        data_parallel_size=1,
-        sequence_parallel_size=1,
+        data_parallel_size=dp,
+        sequence_parallel_size=sp,
     )
 
 
@@ -46,6 +57,122 @@ def _dataset(
     dataset.indices = np.array([0])
     dataset.config = config
     return dataset
+
+
+def _packing_args(
+    monkeypatch: pytest.MonkeyPatch,
+    length: int,
+    *,
+    dp: int = 2,
+    cp: int = 1,
+    sp: int = 1,
+    dynamic_cp: bool = True,
+    capacity: int | None = None,
+) -> Namespace:
+    argv = [
+        "test_mock_dataset_lengths.py",
+        "--num-layers",
+        "2",
+        "--hidden-size",
+        "16",
+        "--num-attention-heads",
+        "4",
+        "--max-position-embeddings",
+        str(length),
+        "--seq-length",
+        str(length),
+        "--micro-batch-size",
+        "1",
+        "--context-parallel-size",
+        str(cp),
+        "--tensor-model-parallel-size",
+        str(sp),
+        "--use-varlen-dataset",
+        "--mock-data",
+        "--calculate-per-token-loss",
+    ]
+    if dynamic_cp:
+        argv.append("--dynamic-context-parallel")
+    if sp > 1:
+        argv.append("--sequence-parallel")
+    if capacity is not None:
+        argv.extend(["--max-seqlen-per-dp-cp-rank", str(capacity)])
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", str(dp * cp * sp))
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    # These argument and scheduling contracts do not require physical GPUs.
+    monkeypatch.setattr("megatron.training.arguments.get_device_arch_version", lambda: 9)
+    monkeypatch.setattr("megatron.training.arguments._print_args", lambda *_args: None)
+    return validate_args(parse_args())
+
+
+@pytest.mark.parametrize(
+    "ceiling,length,sp,padded_length,capacity",
+    [(9, 9, 1, 12, 6), (8, 7, 1, 8, 4), (1, 1, 1, 4, 2), (9, 9, 2, 16, 8)],
+)
+def test_dynamic_cp_default_capacity_schedules_padded_mock_samples(
+    monkeypatch: pytest.MonkeyPatch,
+    ceiling: int,
+    length: int,
+    sp: int,
+    padded_length: int,
+    capacity: int,
+) -> None:
+    """CLI defaults must schedule physical samples while preserving every valid target."""
+    args = _packing_args(monkeypatch, ceiling, sp=sp)
+    assert args.data_parallel_size == 2
+    assert args.max_seqlen_per_dp_cp_rank == capacity
+
+    monkeypatch.setattr(MockSFTLowLevelDataset, "size", 2)
+    low_level = MockSFTLowLevelDataset(**_distribution(length))
+    config = _config(ceiling, dp=2, sp=sp, dynamic_cp=True)
+    sample = _dataset(MockVarlenDataset, low_level, config)[0]
+    assert sample["original_seq_len"].item() == length
+    assert sample["padded_seq_len"].item() == padded_length
+    assert sample["tokens"].numel() == sample["labels"].numel() == padded_length
+    assert sample["loss_mask"].sum().item() == length
+    assert sample["labels"][length - 1].item() == config.tokenizer.eod
+    assert sample["loss_mask"][length - 1].item() == 1
+    assert torch.count_nonzero(sample["loss_mask"][length:]).item() == 0
+
+    scheduler = DefaultDynamicCPScheduler(
+        args.max_seqlen_per_dp_cp_rank,
+        cp_size=args.context_parallel_size,
+        dp_size=args.data_parallel_size,
+        microbatch_group_size_per_vp_stage=None,
+    )
+    assert scheduler.get_groups_and_subsamples([(0, padded_length), (1, padded_length)]) == [
+        [[0], [0]],
+        [[1], [1]],
+    ]
+
+
+@pytest.mark.parametrize("sp,capacity", [(1, 5), (2, 7)])
+def test_dynamic_cp_rejects_capacity_smaller_than_padded_sample(
+    monkeypatch: pytest.MonkeyPatch, sp: int, capacity: int
+) -> None:
+    """Insufficient explicit capacity must fail before data scheduling begins."""
+    with pytest.raises(AssertionError, match="padded single sequence max length"):
+        _packing_args(monkeypatch, 9, sp=sp, capacity=capacity)
+
+
+@pytest.mark.parametrize("sp,capacity", [(1, 6), (2, 8)])
+def test_dynamic_cp_accepts_capacity_that_fits_padded_sample(
+    monkeypatch: pytest.MonkeyPatch, sp: int, capacity: int
+) -> None:
+    """A sufficient explicit capacity remains valid across CP and SP alignment."""
+    args = _packing_args(monkeypatch, 9, sp=sp, capacity=capacity)
+    assert args.max_seqlen_per_dp_cp_rank == capacity
+
+
+def test_static_cp_capacity_includes_sequence_parallel_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Static CP capacity must also cover the dataset's CP-times-SP alignment."""
+    args = _packing_args(monkeypatch, 12, dp=1, cp=2, sp=2, dynamic_cp=False)
+    assert args.sequence_packing_scheduler == "dp_balanced"
+    assert args.max_seqlen_per_dp_cp_rank == 8
 
 
 @pytest.mark.parametrize("length", [1, 7, 8, 65536])
