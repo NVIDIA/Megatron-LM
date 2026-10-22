@@ -644,7 +644,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_dsa_gqa_decode.py",
-            "tests/unit_tests/transformer/test_attention_variant_dsa_gqa_logprobs.py",
+            "tests/unit_tests/transformer/test_attention_variant_dsa_gqa_decode.py",
         ),
         kind="cutedsl",
         training_path=False,
