@@ -103,6 +103,7 @@ def get_batch(data_iterator, vp_stage=None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
+        v41 = getattr(args, 'dsv4_version', 'v4') == 'v4.1'
         (
             tokens,
             labels,
@@ -121,6 +122,8 @@ def get_batch(data_iterator, vp_stage=None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
+            cp_layout=config.linear_cp_layout if v41 else 'zigzag',
+            use_logical_qkv_seqlens=v41,
         )
         return ContextParallelBatch.from_single_layout(
             config.linear_cp_layout,
@@ -131,6 +134,7 @@ def get_batch(data_iterator, vp_stage=None):
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
                 "padding_mask": padding_mask,
+                **({"cu_seqlens": packed_seq_params.cu_seqlens_q} if v41 else {}),
             },
             packed_seq_params,
         )
@@ -344,7 +348,8 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        if cu_seqlens is not None:
+        # The packing scheduler already supplies global real-token FLOPs statistics.
+        if cu_seqlens is not None and get_args().sequence_packing_scheduler is None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
     timers('batch-generator').stop()

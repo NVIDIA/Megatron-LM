@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from megatron.core.context_parallel import ContextParallelBatch
@@ -15,7 +16,8 @@ from megatron.training.datasets.v41_pipeline import (
 )
 
 
-def test_packed_plans_preserve_logical_lengths_and_consume_batches_once():
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_packed_plans_preserve_logical_lengths_and_consume_batches_once(scheduled):
     logical = torch.tensor([0, 5, 11], dtype=torch.int32)
     padded = torch.tensor([0, 8, 16], dtype=torch.int32)
     params = PackedSeqParams(
@@ -29,7 +31,10 @@ def test_packed_plans_preserve_logical_lengths_and_consume_batches_once():
         total_tokens=16,
     )
     args = SimpleNamespace(
-        context_parallel_size=2, sft=True, dataloader_inter_document_masking=False
+        context_parallel_size=2,
+        sft=not scheduled,
+        dataloader_inter_document_masking=False,
+        sequence_packing_scheduler='dp_balanced' if scheduled else None,
     )
     batches = []
     for owns_data in (True, False):

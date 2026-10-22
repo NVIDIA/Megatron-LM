@@ -21,11 +21,16 @@ def configure_v41_args(args, kwargs):
     pattern = (args.hybrid_layer_pattern or '').replace('|', '')
     if pattern != 'VE' * (args.num_layers // 2):
         raise ValueError('V4.1 requires a VE pair per logical block, with optional PP separators')
-    if args.hybrid_context_parallel or args.sequence_packing_scheduler is not None:
+    scheduled_varlen = args.use_varlen_dataset and args.sequence_packing_scheduler == 'dp_balanced'
+    if args.hybrid_context_parallel or (
+        args.sequence_packing_scheduler is not None and not scheduled_varlen
+    ):
         raise NotImplementedError(
-            'V4.1 entrypoint currently uses static CP and the packed dataloader'
+            'V4.1 uses static CP with the packed dataloader or dp_balanced varlen scheduling'
         )
-    if args.context_parallel_size > 1 and not (args.sft or args.dataloader_inter_document_masking):
+    if args.context_parallel_size > 1 and not (
+        args.sft or args.dataloader_inter_document_masking or scheduled_varlen
+    ):
         raise ValueError('V4.1 CP requires SFT packing or --dataloader-inter-document-masking')
     if args.create_attention_mask_in_dataloader:
         raise ValueError('V4.1 requires --no-create-attention-mask-in-dataloader')

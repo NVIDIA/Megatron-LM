@@ -61,7 +61,11 @@ def prepare_v41_pipeline_inputs(
     describe = get_attr_wrapped_model(model, 'pipeline_payload_spec')
     vp_stage = get_attr_wrapped_model(model, 'vp_stage')
     load = partial(get_batch, iterator, vp_stage)
-    if not (args.sft or args.dataloader_inter_document_masking):
+    if not (
+        args.sft
+        or args.dataloader_inter_document_masking
+        or getattr(args, 'sequence_packing_scheduler', None) is not None
+    ):
         incoming, outgoing = describe(BatchShape(args.seq_length, args.micro_batch_size))
         return PipelineDataIterator(
             load,
