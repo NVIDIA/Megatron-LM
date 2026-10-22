@@ -1248,7 +1248,9 @@ class TransformerConfig(ModelParallelConfig):
     """CP layout for linear-attention layers."""
 
     attention_cp_layout: CPLayout = "zigzag"
-    """CP layout for softmax-attention layers."""
+    """CP layout for softmax-attention layers. The general Transformer Engine path uses
+    experimental THD all-gather attention without load balancing for contiguous CP;
+    that path does not support RoPE. Custom attention implementations handle it separately."""
 
     ##################
     # Cuda Graphs
@@ -1677,14 +1679,10 @@ class TransformerConfig(ModelParallelConfig):
         """Validate context-parallel layout settings."""
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
-        if (
-            self.context_parallel_size > 1
-            and self.attention_cp_layout == "contiguous"
-            and self.experimental_attention_variant != "dsv4_hybrid"
+        if self.attention_cp_layout == "contiguous" and (
+            self.hybrid_context_parallel or self.sequence_packing_scheduler is not None
         ):
-            raise ValueError(
-                "attention_cp_layout='contiguous' is not yet supported with context parallelism."
-            )
+            raise ValueError("Contiguous attention CP does not support dynamic CP.")
         if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
             raise ValueError(
                 "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
