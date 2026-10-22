@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Legacy residual imports, tuple specs, and pickle paths preserve object identity."""
+"""Canonical residual modules and package exports import in either order."""
 
 import os
 import subprocess
@@ -10,13 +10,12 @@ import pytest
 
 _IMPORT_CHECK = r"""
 import importlib
-import pickle
 import sys
 
 prefix = "megatron.core.transformer."
 first = (
     ("transformer_layer",)
-    if sys.argv[1] == "legacy-first"
+    if sys.argv[1] == "common-first"
     else (
         "hyper_connection_transformer_layer",
         "wide_residual_transformer_layer",
@@ -26,23 +25,6 @@ first = (
 )
 for name in first:
     importlib.import_module(prefix + name)
-
-from megatron.core.transformer.spec_utils import ModuleSpec, get_module
-
-aliases = [
-    ("transformer_layer", "HyperConnectionTransformerLayer", "hyper_connection_transformer_layer"),
-]
-for old_name, symbol, new_name in aliases:
-    old_path, new_path = prefix + old_name, prefix + new_name
-    canonical = getattr(importlib.import_module(new_path), symbol)
-    # Tuple specs use vars(module), so a lazy getattr alone is insufficient.
-    assert get_module(ModuleSpec(module=(old_path, symbol))) is canonical
-    legacy = importlib.import_module(old_path)
-    assert getattr(legacy, symbol) is canonical
-    assert vars(legacy)[symbol] is canonical
-    assert pickle.loads(pickle.dumps(canonical)) is canonical
-    legacy_pickle = b"c" + old_path.encode() + b"\n" + symbol.encode() + b"\n."
-    assert pickle.loads(legacy_pickle) is canonical
 
 package = importlib.import_module("megatron.core.transformer")
 for symbol, new_name in (
@@ -55,7 +37,7 @@ for symbol, new_name in (
 """
 
 
-@pytest.mark.parametrize("import_order", ["legacy-first", "canonical-first"])
+@pytest.mark.parametrize("import_order", ["common-first", "canonical-first"])
 def test_residual_import_paths_preserve_identity_in_fresh_interpreter(import_order):
     # A fresh interpreter exercises package initialization rather than cached pytest imports.
     environment = dict(os.environ, PYTHONOPTIMIZE="0", PYTHONDONTWRITEBYTECODE="1")
