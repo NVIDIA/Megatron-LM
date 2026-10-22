@@ -620,7 +620,8 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
     "backend,mxfp8", [("replica_peer_tma", False), ("replica_nccl", False), ("replica_nccl", True)]
 )
 def test_moe_layer_auto_instantiates_scheduler_from_config(backend, mxfp8):
-    Utils.initialize_model_parallel(1, 1)
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    layer = None
     try:
         model_parallel_cuda_manual_seed(123)
         config = _scheduler_config(
@@ -652,16 +653,18 @@ def test_moe_layer_auto_instantiates_scheduler_from_config(backend, mxfp8):
 
         assert layer.num_logical_experts == 4
         assert layer.num_physical_experts == 6
-        assert layer.num_local_home_experts == 4
-        assert layer.num_local_experts == 6
+        assert layer.num_local_home_experts == 2
+        assert layer.num_local_experts == 3
         assert layer._token_dispatcher_config.num_moe_experts == 6
         assert layer.token_dispatcher.config.num_moe_experts == 6
         assert layer.config.num_moe_experts == 4
         assert layer.moe_scheduler is not None
-        assert layer.home_expert_indices == [0, 1, 2, 3]
-        assert layer.idle_expert_indices == [4, 5]
-        assert layer.experts.num_local_experts == 4
+        assert layer.home_expert_indices == [0, 1]
+        assert layer.idle_expert_indices == [2]
+        assert layer.experts.num_local_experts == 2
         assert layer.experts._replica_expert_runtime is not None
         assert layer.experts._replica_expert_runtime.weight_format == ("mxfp8" if mxfp8 else "bf16")
     finally:
+        if layer is not None:
+            layer.moe_scheduler.expert_dispatch.runtime.destroy()
         Utils.destroy_model_parallel()
