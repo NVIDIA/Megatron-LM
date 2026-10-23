@@ -44,7 +44,6 @@ MODEL_ARGS:
   --num-experts: 4
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --use-mcore-models: true
   --ckpt-format: torch_dist

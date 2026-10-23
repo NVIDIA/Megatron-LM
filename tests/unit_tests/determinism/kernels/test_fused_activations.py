@@ -218,7 +218,7 @@ def test_bias_dropout_add_fused_inference_replays_bit_exactly():
 
 
 class TestFusedCrossEntropy:
-    """``--cross-entropy-loss-fusion`` is rejected by ``--deterministic-mode``; this records
+    """``--cross-entropy-loss-fusion`` is rejected by deterministic mode; this records
     whether the compiled kernel itself replays bit-exactly (op catalog: non-deterministic)."""
 
     def setup_method(self, method):

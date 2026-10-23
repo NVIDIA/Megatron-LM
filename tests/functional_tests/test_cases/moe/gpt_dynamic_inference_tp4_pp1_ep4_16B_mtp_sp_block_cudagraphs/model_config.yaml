@@ -98,7 +98,6 @@ MODEL_ARGS:
   --no-use-tokenizer-model-from-checkpoint-args: true
   --no-load-optim: true
   --inference-ckpt-non-strict: true
-  --deterministic-mode: true
   --save-interval: 2000
   --temperature: 1.0
   --top_k: 1

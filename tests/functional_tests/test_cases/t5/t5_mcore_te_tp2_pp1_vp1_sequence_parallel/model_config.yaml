@@ -49,7 +49,6 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --data-cache-path: ${DATA_CACHE_PATH}
   --sequence-parallel: true
-  --deterministic-mode: true
   --attention-softmax-in-fp32: true
   --ckpt-format: torch
   --attention-backend: unfused

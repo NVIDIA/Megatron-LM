@@ -1599,6 +1599,9 @@ class TestTEGroupedMLP:
             pytest.skip("Installed TE op fuser GroupedLinear lacks `scale_bias` support")
         if single_grouped_bias:
             monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        # The TE grouped dbias Triton kernel uses atomic adds, which TE rejects when
+        # NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 (the unit-test default).
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
 
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
@@ -1735,6 +1738,9 @@ class TestTEGroupedMLP:
             pytest.skip("Installed TE lacks native single grouped bias support")
 
         monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        # The TE grouped dbias Triton kernel uses atomic adds, which TE rejects when
+        # NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 (the unit-test default).
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
 
         def build_experts(single_weight, single_bias):
             config = TransformerConfig(

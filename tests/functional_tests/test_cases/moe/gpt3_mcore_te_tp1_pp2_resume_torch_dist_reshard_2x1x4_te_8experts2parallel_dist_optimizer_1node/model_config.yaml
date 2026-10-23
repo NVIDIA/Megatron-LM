@@ -56,5 +56,6 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
+  --disable-deterministic-mode: true
 TEST_TYPE: ckpt-resume
 LAUNCHER: ft_launcher

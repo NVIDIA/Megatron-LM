@@ -40,7 +40,6 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 4
   --context-parallel-size: 2
   --sequence-parallel: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --fp8-format: hybrid
   --fp8-recipe: tensorwise

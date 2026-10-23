@@ -53,8 +53,9 @@ The following terms appear throughout the reference:
 
 | Term | Meaning |
 | --- | --- |
-| Deterministic mode | Execution with `--deterministic-mode`. The argument validation and environment defaults from `megatron/training/determinism.py`, plus `torch.use_deterministic_algorithms(True)`. The library code selects deterministic branches using `config.deterministic_mode` or `torch.are_deterministic_algorithms_enabled()`. |
-| Default mode | Execution without `--deterministic-mode`. |
+| Deterministic mode | Execution with deterministic mode (on by default). The argument validation and environment defaults from `megatron/training/determinism.py`, plus `torch.use_deterministic_algorithms(True)`. The library code selects deterministic branches using `config.deterministic_mode` or `torch.are_deterministic_algorithms_enabled()`. 
+To disable deterministic mode, use `--disable-deterministic-mode` flag. |
+| Default mode | Execution without `--disable-deterministic-mode`. |
 | Bit-exact / bitwise identical | Byte-identical values for the compared tensors or serialized metrics (refer to "Verification"). |
 | Reproducible | Same result under the same conditions (allocation, caches, environment). This guarantee is weaker than the contract above. A run can repeat within one allocation and still differ on a different physical topology. |
 | Cross-allocation | Comparison of runs on independently assigned resources: a fresh scheduler allocation with generally different physical nodes and network rings. This is the determinism target and the bar a test must meet to count as a determinism certificate. Repeating work inside one allocation exercises less than the contract promises. |

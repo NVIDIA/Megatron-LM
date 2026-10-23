@@ -48,12 +48,12 @@ DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
     "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
     "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
     "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
-    # TRITON_CACHE_AUTOTUNING is deliberately absent: --deterministic-mode pins every
+    # TRITON_CACHE_AUTOTUNING is deliberately absent: deterministic mode pins every
     # autotuner in the megatron.core.tuning scope without timing, and the variable only
     # changes Triton's behaviour for kernels outside it. See apply_determinism_env().
 }
 
-# Accepted NCCL_ALGO tokens under --deterministic-mode. Comma-separated lists
+# Accepted NCCL_ALGO tokens under deterministic mode. Comma-separated lists
 # are valid NCCL syntax; every token in a launcher-supplied ``NCCL_ALGO`` must
 # be in this set.
 #   - ``Ring``          the default; bit-exact by construction, fully verified.
@@ -119,7 +119,7 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
       (non-empty), must start with ``'1'``; unset, the external ``mamba_ssm`` and
       ``causal_conv1d`` packages auto-follow
       :func:`torch.are_deterministic_algorithms_enabled`. Megatron's own Triton
-      kernels do not read them; they follow ``--deterministic-mode``.
+      kernels do not read them; they follow deterministic mode.
     * ``TRITON_CACHE_AUTOTUNING`` — opt-in; if set to ``'1'``, requires
       ``TRITON_CACHE_DIR``. Autotuners inside the ``--triton-autotune-modules``
       scope are pinned without timing either way; the cache only applies to
@@ -142,16 +142,19 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
         assert nccl_algo.strip(), (
             f"NCCL_ALGO={nccl_algo!r} contains only whitespace, which NCCL 2.24 and later fail "
             "to parse. Set NCCL_ALGO to the empty string to let NCCL choose the algorithms, or "
-            f"to a subset of {sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
+            f"to a subset of {sorted(ACCEPTED_NCCL_ALGO_TOKENS)}, or disable deterministic mode "
+            "with --disable-deterministic-mode."
         )
         tokens = [t.strip() for t in nccl_algo.split(",") if t.strip()]
         assert "NVLS" not in tokens or "Ring" in tokens, (
             f"NCCL_ALGO={nccl_algo!r}: NVLS needs Ring in the list, because broadcast and "
-            "reduce run only with Ring. Use 'Ring,NVLS'."
+            "reduce run only with Ring. Use 'Ring,NVLS', or disable deterministic mode with "
+            "--disable-deterministic-mode."
         )
         assert tokens and all(t in ACCEPTED_NCCL_ALGO_TOKENS for t in tokens), (
             f"NCCL_ALGO={nccl_algo!r}: each token must be in "
-            f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}."
+            f"{sorted(ACCEPTED_NCCL_ALGO_TOKENS)}. Or disable deterministic mode with "
+            "--disable-deterministic-mode."
         )
 
     # Exact-match env vars: reject only if the caller supplied a value we
@@ -159,7 +162,8 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     for name, accepted in ACCEPTED_ENV_VAR_VALUES.items():
         val = env.get(name)
         assert val is None or val in accepted, (
-            f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
+            f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}. "
+            "Or disable deterministic mode with --disable-deterministic-mode."
         )
 
     # Mamba SSM and causal_conv1d auto-follow torch when unset; only reject an
@@ -168,18 +172,20 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
         value = env.get(name)
         if value:
             assert value[0] == "1", (
-                f"{name}={value!r} disables SSM determinism under "
-                "--deterministic-mode. Unset it or set to '1'."
+                f"{name}={value!r} disables SSM determinism, which deterministic mode requires. "
+                "Unset it or set to '1', or disable deterministic mode with "
+                "--disable-deterministic-mode."
             )
 
     # Cross-field rule, so it cannot go in ACCEPTED_ENV_VAR_VALUES: caching only makes ranks
     # agree if they share one cache, and unset TRITON_CACHE_DIR means a node-local one.
     if env.get("TRITON_CACHE_AUTOTUNING") == "1":
         assert env.get("TRITON_CACHE_DIR"), (
-            "TRITON_CACHE_AUTOTUNING=1 under --deterministic-mode requires TRITON_CACHE_DIR "
+            "TRITON_CACHE_AUTOTUNING=1 in deterministic mode requires TRITON_CACHE_DIR "
             "(a shared-filesystem path). It only affects autotuners outside the pinned "
             "--triton-autotune-modules scope; add their modules to that scope to pin them "
-            "instead, or unset TRITON_CACHE_AUTOTUNING."
+            "instead, unset TRITON_CACHE_AUTOTUNING, or disable deterministic mode with "
+            "--disable-deterministic-mode."
         )
 
         # print() because this runs from validate_args, before logging is configured.
@@ -239,7 +245,10 @@ def apply_determinism_to_args(args) -> None:
 
     assert (
         not mismatched
-    ), f"--deterministic-mode requires: {', '.join(mismatched)}. Adjust these options to continue."
+    ), (
+        f"Deterministic mode requires: {', '.join(mismatched)}. Adjust these options to "
+        "continue, or disable deterministic mode with --disable-deterministic-mode."
+    )
 
     # --use-flash-attn is intentionally NOT rejected: TE's FlashAttention is
     # deterministic on supported configs and is covered by the bit-exact
@@ -252,11 +261,11 @@ def apply_determinism_to_args(args) -> None:
         from megatron.training.utils import get_device_arch_version
 
         assert get_device_arch_version() != 9, (
-            f"NCCL_ALGO={nccl_algo!r} under --deterministic-mode can let NCCL use NVLS, which "
+            f"NCCL_ALGO={nccl_algo!r} in deterministic mode can let NCCL use NVLS, which "
             "may not be reproducible on Hopper unless the kernel driver and Fabric Manager are "
             "550.144.03 or later in the 550 branch, or 570 or later (the 560 branch has no fix); "
             "their versions are not checked here (NVIDIA/nccl#2360). Unset NCCL_ALGO to use the "
-            "Ring default."
+            "Ring default, or disable deterministic mode with --disable-deterministic-mode."
         )
     if nccl_algo == "":
         from megatron.training.utils import warn_rank_0
@@ -301,5 +310,6 @@ def assert_nccl_algo_still_empty() -> None:
     actual = libc.getenv(b"NCCL_ALGO")
     assert actual == b"", (
         f'NCCL_ALGO was "" but is {actual!r} after process-group creation, so '
-        "PyTorch's NVLS exclusion applied anyway. Unset NCCL_ALGO to use the Ring default."
+        "PyTorch's NVLS exclusion applied anyway. Unset NCCL_ALGO to use the Ring default, "
+        "or disable deterministic mode with --disable-deterministic-mode."
     )

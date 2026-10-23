@@ -227,6 +227,9 @@ class TestMoESingleGroupedWeightNumerics:
         elif precision != "bf16":
             raise ValueError(f"Unknown precision test case: {precision}")
 
+        # Callers may set NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 (TE dbias needs atomic adds),
+        # which deterministic mode rejects.
+        args.deterministic_mode = False
         validate_args(args)
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:

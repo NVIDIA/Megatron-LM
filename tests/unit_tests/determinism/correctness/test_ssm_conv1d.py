@@ -246,7 +246,7 @@ class TestMambaMixerDeterminism:
 def test_guard_accepts_an_enabled_kernel(monkeypatch, env):
     """Both ways the kernel can be enabled: the env var, and the torch flag it falls back to.
 
-    ``None`` is what ``--deterministic-mode`` produces: env unset plus
+    ``None`` is what deterministic mode produces: env unset plus
     ``torch.use_deterministic_algorithms(True)``.
     """
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)

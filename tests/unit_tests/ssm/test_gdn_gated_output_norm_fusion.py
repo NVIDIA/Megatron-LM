@@ -39,6 +39,7 @@ def _config(**overrides):
         experimental_attention_variant="gdn",
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
+        deterministic_mode=False,
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
