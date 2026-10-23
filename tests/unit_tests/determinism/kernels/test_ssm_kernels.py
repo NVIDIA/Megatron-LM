@@ -551,7 +551,7 @@ def test_fused_recurrent_gated_delta_rule_update_padding_replays():
 @pytest.mark.parametrize("S", [1, 4])
 def test_gdp_decode_prepare_replays(S):
     """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
-    from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
+    from megatron.core.ssm.ops.gdp.prepare import gdp_decode_prepare
 
     seeded()
     n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
@@ -567,6 +567,28 @@ def test_gdp_decode_prepare_replays(S):
         replays=4,
         backward=False,
         what=f"gdp_decode_prepare (S={S})",
+    )
+
+
+@pytest.mark.parametrize("T", [1, 4096])
+def test_gdp_prefill_prepare_replays(T):
+    """``T`` is the packed token count of a prefill step."""
+    from megatron.core.ssm.ops.gdp.prepare import gdp_prefill_prepare
+
+    seeded()
+    M, H, G, P, N = 3, 12, 12, 64, 128
+    x = torch.randn(1, T, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
+    # `ba` reaches the kernel as a slice of the input projection, so only its last
+    # dimension is contiguous and the token stride comes from the view, not the width.
+    ba = torch.randn(1, T, 2 * (M * H + H), device="cuda", dtype=torch.bfloat16)[..., : M * H + H]
+    A_log = torch.randn(H, device="cuda")
+    dt_bias = torch.randn(H, device="cuda")
+    assert_replays_bit_exact(
+        lambda x, ba, A_log, dt_bias: gdp_prefill_prepare(x, ba, A_log, dt_bias, M, H, G, P, N),
+        (x, ba, A_log, dt_bias),
+        replays=4,
+        backward=False,
+        what=f"gdp_prefill_prepare (T={T})",
     )
 
 
