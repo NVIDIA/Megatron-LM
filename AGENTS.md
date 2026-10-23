@@ -42,10 +42,9 @@ skill keyword — infer it from the artifact you read.
 
 - Best effort to avoid copying code from other repositories. Implement changes
   independently.
-- Before opening a PR, review the provenance of all proposed changes and complete
-  the PR template's code provenance section. If the proposed changes already
-  contain external code, identify its sources, revisions, affected files,
-  applicable licenses, and required attribution.
+- If copying code is necessary, add the source URL, revision, and license to
+ all headers of files that contain such code. In addition, ensure the
+ "Code provenance" section is filled in within the PR description.
 - Preserve all required license and copyright notices and attribution for any
   external code in the proposed changes.
 

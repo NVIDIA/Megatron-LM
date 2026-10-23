@@ -16,7 +16,7 @@ Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
 
 ## Code provenance
 
-If you copied or adapted code from an external source, provide the following details:
+If you copied or adapted code from an external source, provide the following details and copy to the file header:
 
 - Source URL, revision, and original file(s):
 - Files in this PR containing the copied or adapted code:
