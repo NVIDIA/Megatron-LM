@@ -24,11 +24,18 @@ class TorchSampling(Sampling):
     """Sampling via a bucketed Gumbel-max (exponential-race) draw.
 
     Groups requests into unique buckets by `(temperature, top_k, top_p)` for separate launches.
+
+    Args:
+        rng: Shared generator for requests without a request-local seed.
+        vocab_size: Vocabulary size; sampled ids are clamped to it.
+        fp64_noise: Draw the exponential race noise from 52/53-bit float64 uniforms
+            instead of float32 ones (see `sample_from_logits`).
     """
 
-    def __init__(self, rng: torch.Generator, vocab_size: int) -> None:
+    def __init__(self, rng: torch.Generator, vocab_size: int, fp64_noise: bool = False) -> None:
         self._rng = rng
         self._vocab_size = vocab_size
+        self._fp64_noise = fp64_noise
 
     @staticmethod
     def _modify_logits_for_top_k_filtering(logits: Tensor, top_k: int) -> None:
@@ -91,6 +98,7 @@ class TorchSampling(Sampling):
         vocab_size: Optional[int] = None,
         row_seeds: Optional[List[Optional[int]]] = None,
         row_positions: Optional[List[int]] = None,
+        fp64_noise: bool = False,
     ) -> Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p filtering.
 
@@ -107,6 +115,11 @@ class TorchSampling(Sampling):
             row_positions: Absolute next-token positions paired with row_seeds.
             vocab_size: When provided, asserts `top_k < vocab_size` and clamps the
                 sampled ids to `[0, vocab_size - 1]`.
+            fp64_noise: Run the race in float64 with 52/53-bit uniforms. With float32
+                uniforms the noise spans only about 20 nats, so a token more than about
+                20 nats below the row's top token is never drawn and tokens about 16-20
+                nats below it are drawn at the wrong rate. Float64 noise spans about
+                40 nats. The sampled distribution is still the float32 softmax.
 
         Returns:
             Sampled token ids of shape `[batch_size]`.
@@ -133,6 +146,8 @@ class TorchSampling(Sampling):
         # https://github.com/vllm-project/vllm/blob/7702ee87dba0d8eed7f201e77a0a6613aac738a8/vllm/v1/sample/ops/topk_topp_sampler.py#L464
         # which keeps the two engines' sampling paths aligned; vLLM also uses it to
         # avoid the CPU-GPU sync that `torch.multinomial` incurs.
+        if fp64_noise:
+            probabilities = probabilities.double()
         q = torch.empty_like(probabilities)
         if row_seeds is not None:
             if len(row_seeds) != q.shape[0]:
@@ -304,6 +319,7 @@ class TorchSampling(Sampling):
                     vocab_size=self._vocab_size,
                     row_seeds=None if row_seeds is None else [row_seeds[i] for i in indices],
                     row_positions=None if positions is None else [positions[i] for i in indices],
+                    fp64_noise=self._fp64_noise,
                 )
             )
             indices_list.append(row_indices)

@@ -805,8 +805,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_request_seed_sampling.py",),
         kind="triton",
         training_path=False,
-        notes="Request-local Philox exponential draws replay across batch layouts and "
-        "scalar/batched launches, including under side-stream contention.",
+        notes="Request-local Philox exponential draws (float32 and float64) replay across batch "
+        "layouts and scalar/batched launches, including under side-stream contention.",
     ),
     KernelEntry(
         name="inference_flashinfer_sampling",
