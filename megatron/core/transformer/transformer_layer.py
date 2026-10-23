@@ -33,6 +33,7 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.moe.router_replay import ChunkedRouterReplay
 from megatron.core.transformer.residual_connection import (
     ResidualConnection,
     ResidualConnectionOperation,
@@ -1483,50 +1484,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 **moe_kwargs,
             )
         elif should_chunk_mlp_for_prefill or should_chunk_mlp_for_training:
-            # Chunk input along sequence dimension
-            num_chunks = min(
+            mlp_output_with_bias = self._run_mlp_in_chunks(
+                pre_mlp_layernorm_output,
+                padding_mask,
+                input_ids,
+                packed_seq_params,
                 (
                     self.config.mlp_chunks_for_prefill
                     if should_chunk_mlp_for_prefill
                     else self.config.mlp_chunks_for_training
                 ),
-                pre_mlp_layernorm_output.shape[0],
             )
-
-            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
-            padding_mask_chunks = (
-                padding_mask.chunk(num_chunks, dim=1)
-                if padding_mask is not None
-                else (None,) * num_chunks
-            )
-            input_id_chunks = (
-                input_ids.chunk(num_chunks, dim=1)
-                if self.is_moe_layer and input_ids is not None
-                else (None,) * num_chunks
-            )
-
-            # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
-            outputs = []
-            for chunk, padding_mask_chunk, input_id_chunk in zip(
-                chunks, padding_mask_chunks, input_id_chunks
-            ):
-                chunk_moe_kwargs = {}
-                if input_id_chunk is not None:
-                    chunk_moe_kwargs["input_ids"] = input_id_chunk
-                if self.is_moe_layer:
-                    chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
-                outputs.append(
-                    apply_module(self.mlp)(
-                        chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs
-                    )
-                )
-
-            # Aggregate chunk outputs
-            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
-            bias_chunks = [bias for _, bias in outputs if bias is not None]
-            # elements in bias_chunks are the same for all chunks, so we can just use the first one
-            bias_output = bias_chunks[0] if bias_chunks else None
-            mlp_output_with_bias = (mlp_output, bias_output)
         else:
             if using_fused_tp_inference_kernel:
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
@@ -1538,6 +1506,86 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias
+
+    def _run_mlp_in_chunks(
+        self,
+        hidden_states: Tensor,
+        padding_mask: Tensor | None,
+        input_ids: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        num_chunks: int,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Run the MLP over ``num_chunks`` sequence chunks of ``hidden_states`` ([s, b, h]).
+
+        For an MoE layer, every call runs expert-parallel collectives, so every EP rank must make
+        the same number of calls whatever its local sequence length. The input is therefore
+        always split into exactly ``num_chunks`` non-empty chunks: a sequence shorter than that
+        is padded with masked dummy tokens, whose outputs are dropped. With routing replay, each
+        chunk replays its own tokens' indices (see ``ChunkedRouterReplay``).
+
+        Returns:
+            ``mlp_output_with_bias``: tuple of (mlp_output, mlp_bias).
+        """
+        seq_len, batch_size = hidden_states.shape[:2]
+        pad = 0
+        if self.is_moe_layer:
+            pad = max(0, num_chunks - seq_len)
+        else:
+            num_chunks = min(num_chunks, seq_len)
+        if pad:
+            hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, 0, 0, pad))
+            # Mask the dummy tokens even without a caller mask, so the router leaves them out
+            # of its aux-loss, z-loss and expert-bias token counts.
+            if padding_mask is None:
+                padding_mask = torch.zeros(
+                    (batch_size, seq_len), dtype=torch.bool, device=hidden_states.device
+                )
+            padding_mask = torch.nn.functional.pad(padding_mask, (0, pad), value=True)
+            if input_ids is not None:
+                input_ids = torch.nn.functional.pad(input_ids, (0, pad))
+
+        # tensor_split, unlike chunk, always returns exactly num_chunks pieces.
+        chunks = hidden_states.tensor_split(num_chunks, dim=0)
+        padding_mask_chunks = (
+            padding_mask.tensor_split(num_chunks, dim=1)
+            if padding_mask is not None
+            else (None,) * num_chunks
+        )
+        input_id_chunks = (
+            input_ids.tensor_split(num_chunks, dim=1)
+            if self.is_moe_layer and input_ids is not None
+            else (None,) * num_chunks
+        )
+        router = getattr(self.mlp, "router", None)
+        replay = ChunkedRouterReplay(
+            getattr(router, "router_replay", None),
+            [chunk.shape[0] * batch_size for chunk in chunks],
+            pad * batch_size,
+        )
+
+        # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
+        outputs = []
+        for i, (chunk, padding_mask_chunk, input_id_chunk) in enumerate(
+            zip(chunks, padding_mask_chunks, input_id_chunks)
+        ):
+            chunk_moe_kwargs = {}
+            if input_id_chunk is not None:
+                chunk_moe_kwargs["input_ids"] = input_id_chunk
+            if self.is_moe_layer:
+                chunk_moe_kwargs["packed_seq_params"] = packed_seq_params
+            replay.before_chunk(i)
+            outputs.append(
+                apply_module(self.mlp)(chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs)
+            )
+            replay.after_chunk()
+        replay.finish()
+
+        # Aggregate chunk outputs, dropping the dummy tokens.
+        mlp_output = torch.cat([out for out, _ in outputs], dim=0)[:seq_len]
+        bias_chunks = [bias for _, bias in outputs if bias is not None]
+        # elements in bias_chunks are the same for all chunks, so we can just use the first one
+        bias_output = bias_chunks[0] if bias_chunks else None
+        return mlp_output, bias_output
 
     def _apply_mlp_bda_step(
         self,
