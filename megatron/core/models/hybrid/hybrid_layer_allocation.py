@@ -37,8 +37,9 @@ class MTPSplit:
         raise TypeError("MTPSplit must not be instantiated. Use the bare MTPSplit class instead.")
 
 
-HybridLayerConfigListEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
-MainLayerConfigListEntry: TypeAlias = TransformerConfig | type[PipelineSplit]
+# A hybrid architecture entry is a layer config instance or a bare PipelineSplit/MTPSplit class.
+# Parsing enforces the supported config types and marker placement within each section.
+HybridLayerEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
 
 
 @dataclass
@@ -87,7 +88,7 @@ class ParsedHybridConfigList:
         mtp_num_depths: Number of ``MTPSplit`` sections in the source list.
     """
 
-    main_layer_config_list: tuple[MainLayerConfigListEntry, ...]
+    main_layer_config_list: tuple[HybridLayerEntry, ...]
     mtp_layer_config_list: tuple[TransformerConfig, ...] | None
     mtp_num_depths: int
 
@@ -120,7 +121,7 @@ def _validate_layer_config_sequence(
 
 
 def parse_hybrid_layer_config_list(
-    hybrid_layer_config_list: Sequence[HybridLayerConfigListEntry],
+    hybrid_layer_config_list: Sequence[HybridLayerEntry],
     expected_num_layers: int | None = None,
     expected_mtp_num_layers: int | None = None,
 ) -> ParsedHybridConfigList:
@@ -142,7 +143,7 @@ def parse_hybrid_layer_config_list(
         ValueError: If an entry, marker placement, layer count, or MTP template is invalid.
     """
     source_entries = tuple(hybrid_layer_config_list)
-    main_entries: list[MainLayerConfigListEntry] = []
+    main_entries: list[HybridLayerEntry] = []
     mtp_sections: list[list[TransformerConfig]] = []
     current_mtp_section: list[TransformerConfig] | None = None
 
@@ -651,7 +652,7 @@ def select_pipeline_segment(
 
 
 def select_pipeline_segment_from_config_list(
-    main_layer_config_list: Sequence[MainLayerConfigListEntry],
+    main_layer_config_list: Sequence[HybridLayerEntry],
     pp_group: torch.distributed.ProcessGroup | None,
     vp_stage: int | None,
     virtual_pipeline_model_parallel_size: int | None = None,

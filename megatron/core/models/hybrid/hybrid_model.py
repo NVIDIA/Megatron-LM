@@ -16,7 +16,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.models.hybrid import HybridLayerConfigListEntry
+from megatron.core.models.hybrid import HybridLayerEntry
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -59,7 +59,7 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
 
 
 def _get_hash_moe_layer_threshold(
-    main_pattern: str | Sequence[HybridLayerConfigListEntry] | None, n_hash_layers: int
+    main_pattern: str | Sequence[HybridLayerEntry] | None, n_hash_layers: int
 ) -> int:
     """Convert a leading hash-MoE count to a global hybrid layer-number threshold."""
     if n_hash_layers <= 0:
@@ -160,7 +160,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
         vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
-        hybrid_layer_config_list (Sequence[HybridLayerConfigListEntry], optional): First-class
+        hybrid_layer_config_list (Sequence[HybridLayerEntry], optional): First-class
             decoder, pipeline-split, and MTP configuration sequence. Mutually exclusive with
             ``hybrid_layer_pattern`` and its deprecated alternatives. Defaults to None.
     """
@@ -189,7 +189,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        hybrid_layer_config_list: Optional[Sequence[HybridLayerConfigListEntry]] = None,
+        hybrid_layer_config_list: Optional[Sequence[HybridLayerEntry]] = None,
     ) -> None:
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
