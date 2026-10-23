@@ -141,13 +141,22 @@ _GTP_REMAT_GROUPED_FC1 = f"{_GTP_REMAT_GROUPED_PREFIX}fc1"
 _GTP_REMAT_GROUPED_FC2 = f"{_GTP_REMAT_GROUPED_PREFIX}fc2"
 
 
+def get_graphed_chain_ids() -> tuple[str, ...]:
+    """Return the currently classified captured chain IDs for diagnostics."""
+    return (
+        GTPChain.GRAPHED.value,
+        f"{_GTP_REMAT_GROUPED_FC1}_{_graphness_suffix(True)}",
+        f"{_GTP_REMAT_GROUPED_FC2}_{_graphness_suffix(True)}",
+    )
+
+
 def _graphness_suffix(graphed: bool) -> str:
     """Chain-id suffix encoding the CUDA-graph capture axis."""
     return "graphed" if graphed else "ungraphed"
 
 
 def _chain_is_grouped(chain_id: str) -> bool:
-    """True for the per-role grouped-expert chains (``_GTP_REMAT_GROUPED_FC1`` / ``_FC2``)."""
+    """True for the separate grouped-expert FC1 and FC2 chains."""
     return chain_id.startswith(_GTP_REMAT_GROUPED_PREFIX)
 
 
@@ -209,18 +218,13 @@ def _classify_param_chain(param_name: str) -> str:
     # shared experts never fall in here).
     if ".mlp.experts." in n:
         graphed = _FULL_ITERATION or bool(_CUDA_GRAPH_MODULES and "moe" in _CUDA_GRAPH_MODULES)
-        # The grouped split is an EAGER-only optimization: when MoE is captured, keep grouped
-        # weights in the plain GRAPHED chain so the cross-graph drain — wait_async_comms(
-        # GTPChain.GRAPHED.value) in cuda_graphs.py — still targets them by exact chain id.
-        if graphed:
-            return G
-        eager = _graphness_suffix(False)
+        suffix = _graphness_suffix(graphed)
         if ".linear_fc1." in n:
-            return f"{_GTP_REMAT_GROUPED_FC1}_{eager}"
+            return f"{_GTP_REMAT_GROUPED_FC1}_{suffix}"
         if ".linear_fc2." in n:
-            return f"{_GTP_REMAT_GROUPED_FC2}_{eager}"
+            return f"{_GTP_REMAT_GROUPED_FC2}_{suffix}"
         # Unknown grouped role (e.g. single fused weight): keep it in the general chain.
-        return U
+        return G if graphed else U
 
     if _FULL_ITERATION:
         return G
@@ -435,7 +439,7 @@ def initialize_graph_wgrad_rings() -> None:
         full_iteration=_FULL_ITERATION,
         async_reduction=GTP_CONFIG.async_reduction,
         ring_size=GTP_CONFIG.graph_wgrad_ring_size,
-        graphed_chain_id=GTPChain.GRAPHED.value,
+        chain_is_graphed=_chain_is_graphed,
         stream_key=_stream_key,
     )
 
@@ -970,10 +974,11 @@ class GTPShardHandle:
     and prune the param from _inflight_comm_params when the collective completes.
     """
 
-    def __init__(self, handle, gtp_shards, reduce_scatter=False):
+    def __init__(self, handle, gtp_shards, reduce_scatter=False, *, completion_recorded=False):
         self.handle = handle
         self.gtp_shards = gtp_shards
         self.reduce_scatter = reduce_scatter
+        self.completion_recorded = completion_recorded
         _inflight_comm_params.add(gtp_shards[0])
         param = gtp_shards[0]
         stream = (
@@ -1583,11 +1588,24 @@ class GTPShardedParam(torch.nn.Parameter):
                 nvtx_range_pop(f"{nvtx_label}.gtp_ag")
                 results = [weight_total]
 
+            # Grouped FC1/FC2 share this stream but have independent consumers. Record
+            # this gather's completion before a different chain appends its prefetch.
+            # NCCL Work.wait() enqueues a stream dependency; it does not synchronize
+            # the host in the normal asynchronous NCCL configuration.
+            completion_recorded = async_op and _chain_is_grouped(self.chain_id)
+            if completion_recorded:
+                # TE synchronous fallbacks can return no Work even with async_op=True.
+                if handle is not None:
+                    handle.wait()
+                event = self._recompute_ag_event if recompute else self.ag_event
+                event.record()
+                handle = None
+
         result = results if self.is_routed_expert else results[0]
 
         # 6. Wrap handle.
         if async_op:
-            handle = GTPShardHandle(handle, weights)
+            handle = GTPShardHandle(handle, weights, completion_recorded=completion_recorded)
         else:
             handle = None
 
@@ -1595,18 +1613,20 @@ class GTPShardedParam(torch.nn.Parameter):
         return result, handle
 
     def _wait_param_gather(self):
-        # Enter ag_stream context so handle.wait() + ag_event.record() both
-        # land on ag_stream. That makes ag_event mark ag_stream's tail, which
-        # is what external drains via wait_stream(ag_stream) actually block on.
+        # Grouped chains record completion at issue time: recording at consumption
+        # would also wait for unrelated prefetches appended to the shared AG stream.
+        # Other chains retain their wait-site completion event.
         ag_stream = self._cached_ag_stream
         if ag_stream is None:
             ag_stream = get_ag_stream(self.chain_id, self.group)
             self._cached_ag_stream = ag_stream
         with torch.cuda.stream(ag_stream):
             if self._prefetch_handle is not None:
-                self._prefetch_handle.wait()
+                handle = self._prefetch_handle
+                handle.wait()
                 self._prefetch_handle = None
-                self.ag_event.record()
+                if not getattr(handle, "completion_recorded", False):
+                    self.ag_event.record()
 
     def _all_gather_weight_on_demand(self, fwd, recompute=False, recompute_prev=None):
         # Only pass the recompute kwargs when they apply, so the fwd/bwd path keeps calling
@@ -1732,9 +1752,11 @@ class GTPShardedParam(torch.nn.Parameter):
             self._cached_ag_stream = ag_stream
         with torch.cuda.stream(ag_stream):
             if self._recompute_prefetch_handle is not None:
-                self._recompute_prefetch_handle.wait()
+                handle = self._recompute_prefetch_handle
+                handle.wait()
                 self._recompute_prefetch_handle = None
-                self._recompute_ag_event.record()
+                if not getattr(handle, "completion_recorded", False):
+                    self._recompute_ag_event.record()
 
     def _recompute_prefetch_next(self, target, nvtx_label=None):
         # Issue target's rowwise (fwd) AG into its recompute slot. _all_gather_weight skips the
@@ -2738,7 +2760,7 @@ class GTPWeightCache:
             return
         # Independently replayed graphs may overlap, so a captured RS output must not be recycled
         # into another fixed-address ticket.
-        if slot.chain_id == GTPChain.GRAPHED.value and slot.reduce_scatter:
+        if _chain_is_graphed(slot.chain_id) and slot.reduce_scatter:
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
@@ -2766,6 +2788,8 @@ def wait_async_comms(
     skip_rs: bool = False,
     finalize_after_drain: bool = False,
     params: Optional[List[GTPShardedParam]] = None,
+    *,
+    graphed_only: bool = False,
 ):
     """Drain in-flight GTP asynchronous communication.
 
@@ -2780,6 +2804,8 @@ def wait_async_comms(
 
     Args:
         chain_id: If specified, only drain params on this chain.
+        graphed_only: Drain all captured chains, including separate grouped-expert
+            FC1 and FC2 chains.
         skip_rs:  Drain AG only; leave RS in flight.
         finalize_after_drain: After RS drain, also accumulate wgrad into
                  main_grad. Runs main_grad.add_ on rs_stream (right after
@@ -2796,10 +2822,10 @@ def wait_async_comms(
     """
     comm_params = list(_inflight_comm_params) if params is None else params
     for param in comm_params:
-        if (
-            chain_id is not None
-            and getattr(param, "chain_id", GTPChain.UNGRAPHED.value) != chain_id
-        ):
+        param_chain_id = getattr(param, "chain_id", GTPChain.UNGRAPHED.value)
+        if graphed_only and not _chain_is_graphed(param_chain_id):
+            continue
+        if chain_id is not None and param_chain_id != chain_id:
             continue
         had_ag = param._prefetch_handle is not None
         param._wait_param_gather()

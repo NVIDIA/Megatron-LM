@@ -24,7 +24,7 @@ Usage::
         dsa_stack_spec
 """
 
-import copy
+from dataclasses import replace
 
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -41,17 +41,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
-def _make_indexer_spec() -> ModuleSpec:
-    """Build fresh spec containers while retaining the backend constructor references."""
+def _get_dsa_gqa_indexer_spec() -> ModuleSpec:
+    """Build an independent indexer spec for each derived stack."""
     return ModuleSpec(
         module=SimplifiedDSGQAIndexer,
         submodules=SimplifiedDSGQAIndexerSubmodules(
             linear_q=ModuleSpec(module=TELinear), linear_k=ModuleSpec(module=TELinear)
         ),
     )
-
-
-dsa_gqa_indexer_spec = _make_indexer_spec()
 
 
 def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
@@ -61,31 +58,34 @@ def _with_dsa_gqa_attention(stack_spec: ModuleSpec) -> ModuleSpec:
         stack_spec: A Mamba/hybrid stack spec to derive from. Not modified.
 
     Returns:
-        A copy of the modified attention branch, which builds
-        :class:`DSGroupedSelfAttention` over :class:`DSGQACoreAttention`.
-        Unmodified layer specs and backend constructors retain their identities.
+        A spec whose ``attention_layer`` builds :class:`DSGroupedSelfAttention`
+        over a :class:`DSGQACoreAttention`. Unchanged layers and builders are shared.
     """
-    # Copy each container we modify, not backend constructors. Without TE installed,
-    # some constructors are import placeholders whose closure state cannot be deep-copied.
-    spec = copy.copy(stack_spec)
-    spec.submodules = copy.copy(stack_spec.submodules)
-    spec.submodules.attention_layer = copy.copy(stack_spec.submodules.attention_layer)
-    attention_layer = spec.submodules.attention_layer
-    attention_layer.submodules = copy.copy(attention_layer.submodules)
-    attention_layer.submodules.self_attention = copy.copy(attention_layer.submodules.self_attention)
-    self_attention = spec.submodules.attention_layer.submodules.self_attention
-    self_attention.submodules = copy.copy(self_attention.submodules)
-    self_attention.module = DSGroupedSelfAttention
+    # Copy only the dataclasses on the modified path. Optional-dependency builders
+    # can be mocks containing closure cells, which cannot be deep-copied.
+    attention_layer = stack_spec.submodules.attention_layer
+    self_attention = attention_layer.submodules.self_attention
     # The stack's own dense attention becomes DSA's warmup core (dsa_fwd_use_dense_attn),
     # captured rather than named, so upstream changes to it are inherited.
-    self_attention.submodules.core_attention = ModuleSpec(
+    core_attention = ModuleSpec(
         module=DSGQACoreAttention,
         submodules=DSGQAAttentionSubmodules(
-            indexer=_make_indexer_spec(),
+            indexer=_get_dsa_gqa_indexer_spec(),
             dense_core_attention=self_attention.submodules.core_attention,
         ),
     )
-    return spec
+    self_attention = replace(
+        self_attention,
+        module=DSGroupedSelfAttention,
+        submodules=replace(self_attention.submodules, core_attention=core_attention),
+    )
+    attention_layer = replace(
+        attention_layer,
+        submodules=replace(attention_layer.submodules, self_attention=self_attention),
+    )
+    return replace(
+        stack_spec, submodules=replace(stack_spec.submodules, attention_layer=attention_layer)
+    )
 
 
 dsa_stack_spec = _with_dsa_gqa_attention(hybrid_stack_spec)
