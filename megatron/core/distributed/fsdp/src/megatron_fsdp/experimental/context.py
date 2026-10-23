@@ -31,7 +31,6 @@ class FsdpContext:
     inner_reduction_stream: torch.cuda.Stream
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
-    overlap_outer_communication: bool
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because each parameter group tracks whether model_weight is stale
     # after syncing from main_weight.
@@ -83,7 +82,6 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
-        self.overlap_outer_communication = overlap_outer_communication
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
@@ -188,7 +186,7 @@ class FsdpContext:
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         self.current_stream().wait_stream(self.inner_reduction_stream)
-        if self.overlap_outer_communication:
+        if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
     def post_backward(self) -> None:
