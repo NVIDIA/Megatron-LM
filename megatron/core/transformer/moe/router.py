@@ -459,9 +459,10 @@ class TopKRouter(Router):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply quantile-balancing (QB) routing to the logits tensor.
 
-        Selects top-k experts per token using a dual coordinate-descent update on
-        a per-expert bias ``qb_beta``. Load balance is handled entirely by the bias
-        update; auxiliary losses must be disabled when QB is active.
+        ``micro_batch`` uses the existing exact estimator and ``qb_beta`` state.
+        ``global_batch`` accumulates Kimi K3 margin histograms and updates the shared
+        router ``expert_bias`` at the global-batch boundary. Auxiliary losses must be
+        disabled for either estimator.
 
         Args:
             logits (torch.Tensor): The logits tensor, shape ``[num_tokens, num_experts]``.
@@ -472,6 +473,24 @@ class TopKRouter(Router):
             Tuple[torch.Tensor, torch.Tensor]: Routing probabilities and either a boolean
             map or compact expert IDs, according to ``dense_output``.
         """
+        if self.use_quantile_balancing:
+            # Activation checkpointing runs the original forward under no-grad and its
+            # recompute under enable-grad, so this gate records each token exactly once.
+            accumulate_histogram = (
+                self.training and torch.is_grad_enabled() and not self.frozen_expert_bias
+            )
+            return topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                fused=self.config.moe_router_fusion,
+                qb_histogram=self.qb_histogram if accumulate_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_histogram else None,
+            )
+
         assert (
             not self.config.moe_router_fusion
         ), "Quantile balancing routing does not support moe_router_fusion."

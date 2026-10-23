@@ -59,6 +59,19 @@ def reset_hybrid_ep():
     reset_hybrid_ep_buffer()
 
 
+def _offload_summary_groups(offload_modules):
+    """Map requested offload modules to the group names the offload summary records.
+
+    GroupedMLP offloads "expert_fc1" + "moe_act" together as one "fused_group_mlp" group, so a
+    request naming both is reported under that single name.
+    """
+    groups = list(offload_modules)
+    if "expert_fc1" in groups and "moe_act" in groups:
+        groups = [m for m in groups if m not in ("expert_fc1", "moe_act")]
+        groups.append("fused_group_mlp")
+    return groups
+
+
 def test_offload_summary_uses_explicit_process_group(monkeypatch):
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
 
@@ -904,7 +917,10 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
 
         mgr = PipelineOffloadManager.get_instance()
         expected_offload_bytes = int(
-            sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
+            sum(
+                mgr.offload_summary_bytes.get(k, 0)
+                for k in _offload_summary_groups(offload_modules)
+            )
         )
         expected_offload_mib = expected_offload_bytes / (1024**2)
 
@@ -1172,7 +1188,10 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
 
             mgr = PipelineOffloadManager.get_instance()
             expected_offload_bytes = int(
-                sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
+                sum(
+                    mgr.offload_summary_bytes.get(k, 0)
+                    for k in _offload_summary_groups(offload_modules)
+                )
             )
             expected_offload_mib = expected_offload_bytes / (1024**2)
 
@@ -1586,7 +1605,7 @@ def _run_partial_cg_offload_case(
         }
         eager_loss_values = [item["lm loss"].float().cpu() for item in eager_losses]
         offload_summary = PipelineOffloadManager.get_instance().offload_summary_bytes
-        for offload_module in offload_modules:
+        for offload_module in _offload_summary_groups(offload_modules):
             global_offload_bytes = torch.tensor(
                 offload_summary.get(offload_module, 0), dtype=torch.int64, device="cuda"
             )
