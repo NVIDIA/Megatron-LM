@@ -1376,31 +1376,6 @@ def validate_args(args, defaults={}):
     # data
     assert args.num_dataset_builder_threads > 0
 
-    # Iteration-based training.
-    # Skip these checks when skip_train is set: LR config is irrelevant.
-    if args.train_iters and not args.skip_train:
-        # If we use iteration-based training, make sure the
-        # sample-based options are off.
-        assert args.train_samples is None, 'expected iteration-based training'
-        assert args.lr_decay_samples is None, 'expected iteration-based learning rate decay'
-        assert args.lr_warmup_samples == 0, 'expected iteration-based learning rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert (
-                args.lr_warmup_iters == 0
-            ), 'can only specify one of lr-warmup-fraction and lr-warmup-iters'
-
-    # Sample-based training.
-    if args.train_samples and not args.skip_train:
-        # If we use sample-based training, make sure the
-        # iteration-based options are off.
-        assert args.train_iters is None, 'expected sample-based training'
-        assert args.lr_decay_iters is None, 'expected sample-based learning rate decay'
-        assert args.lr_warmup_iters == 0, 'expected sample-based learnig rate warmup'
-        if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_samples == 0, (
-                'can only specify one of lr-warmup-fraction ' 'and lr-warmup-samples'
-            )
-
     if args.num_layers is not None:
         assert (
             args.encoder_num_layers is None
@@ -1489,26 +1464,6 @@ def validate_args(args, defaults={}):
     if args.moe_grouped_gemm:
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
-
-    if args.no_weight_decay_cond_type is not None:
-        print_rank_0(
-            'WARNING: --no-weight-decay-cond-type is deprecated. Please use --apply-wd-to-qk-layernorm instead.',
-            args.rank,
-        )
-        if args.no_weight_decay_cond_type == "apply_wd_to_qk_layernorm":
-            args.apply_wd_to_qk_layernorm = True
-        else:
-            raise ValueError(f"Invalid no_weight_decay_cond_type: {args.no_weight_decay_cond_type}")
-        args.no_weight_decay_cond_type = None
-
-    if args.weight_decay_incr_style == 'constant':
-        assert args.start_weight_decay is None
-        assert args.end_weight_decay is None
-        args.start_weight_decay = args.weight_decay
-        args.end_weight_decay = args.weight_decay
-    else:
-        assert args.start_weight_decay is not None
-        assert args.end_weight_decay is not None
 
     # Persistent fused layer norm.
     if not is_torch_min_version("1.11.0a0"):
@@ -2217,9 +2172,6 @@ def validate_args(args, defaults={}):
             args.async_save = False
 
     if args.logits_save_dir is not None:
-        assert (
-            args.logits_save_top_k is not None
-        ), '--logits-save-top-k is required when --logits-save-dir is set.'
         assert args.async_save, (
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
@@ -2231,6 +2183,10 @@ def validate_args(args, defaults={}):
                 'when dumping logits during active training; for a frozen-teacher dump pass '
                 '--freeze-all-layers.'
             )
+        assert args.rampup_batch_size is None, (
+            '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
+            'mapping assumes a fixed global batch size.'
+        )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -3738,17 +3694,6 @@ def _add_regularization_args(parser):
         help='Second beta coefficient for Lion optimizer '
         '(used in momentum EMA update). Default: 0.98.',
     )
-
-    group.add_argument(
-        '--no-weight-decay-cond-type',
-        type=str,
-        choices=['apply_wd_to_qk_layernorm'],
-        help='Type of no weight decay condition. Choices: '
-        'None (default): apply weight decay to 1D weights and biases.'
-        '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
-        'qk layernorm as a special case.'
-        'DEPRECATED. Please use --apply-wd-to-qk-layernorm instead. ',
-    )
     return parser
 
 
@@ -4023,7 +3968,7 @@ def _add_initialization_args(parser):
 def _add_learning_rate_args(parser):
     from megatron.training.config import SchedulerConfig
 
-    sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
+    sched_factory = ArgumentGroupFactory(SchedulerConfig)
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
 
     group.add_argument(
@@ -5561,9 +5506,12 @@ def _add_varlen_dataset_args(parser):
 
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')
-
+    # -- Teacher saving --
     group.add_argument(
-        '--logits-save-top-k', type=int, default=None, help='Number of top logits to save.'
+        '--logits-save-dir', type=str, default=None, help='Directory to save logits.'
+    )
+    group.add_argument(
+        '--logits-save-top-k', type=int, default=128, help='Number of top logits to save.'
     )
     group.add_argument(
         '--logits-save-top-p',
@@ -5583,15 +5531,13 @@ def _add_logits_distillation_args(parser):
         'cumulative mass. Default: 1.',
     )
     group.add_argument(
-        '--logits-save-dir', type=str, default=None, help='Directory to save logits.'
-    )
-    group.add_argument(
         '--logits-save-dtype',
         type=str,
         default='fp16',
         choices=['fp16', 'bf16', 'fp32'],
         help='Dtype for on-disk top-K log-probabilities.',
     )
+    # -- Student loading --
     group.add_argument(
         '--logits-load-dir', type=str, default=None, help='Directory to load logits.'
     )
@@ -5601,13 +5547,6 @@ def _add_logits_distillation_args(parser):
         default=4,
         help='Number of decode threads for cached-logits zstd '
         'decompression and torch.load processing.',
-    )
-    group.add_argument(
-        '--logits-load-prefetch-factor',
-        type=int,
-        default=3,
-        help='PyTorch DataLoader prefetch factor for decoded '
-        'cached-logits iterations. (Non-MSC only)',
     )
     group.add_argument(
         '--logits-load-msc-prefetch-depth',
@@ -5630,6 +5569,14 @@ def _add_logits_distillation_args(parser):
         default=False,
         help='When set, KD loss errors are logged as warnings and '
         'training falls back to LM-only loss instead of crashing.',
+    )
+    group.add_argument(
+        '--logits-load-ignore-hash',
+        action='store_true',
+        default=False,
+        help='When set, skip cached-logits tar metadata hash validation. '
+        'Use only when intentionally loading logits saved with an '
+        'older or otherwise incompatible dataset hash.',
     )
     return parser
 

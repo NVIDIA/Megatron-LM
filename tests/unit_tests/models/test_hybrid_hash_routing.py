@@ -431,6 +431,78 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
     assert torch.equal(decoder.kwargs["padding_mask"], padding_mask[:, :2])
 
 
+def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
+    decoder = RecordingDecoder()
+    tp_group = object()
+    embeddings = torch.randn(4, 2, 8)
+    local_embeddings = embeddings[:2].contiguous()
+    embedding = mock.Mock(return_value=embeddings)
+    embedding.scatter_to_sequence_parallel = False
+    inference_context = SimpleNamespace(
+        is_dynamic_batching=mock.Mock(return_value=True),
+        num_speculative_tokens=0,
+        zero_padding_tokens=mock.Mock(),
+    )
+
+    def fake_scatter(tensor, group):
+        assert tensor is embeddings
+        assert group is tp_group
+        return local_embeddings
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.tensor_parallel."
+        "scatter_to_sequence_parallel_region",
+        fake_scatter,
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.InferenceMode.is_active", lambda: True
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.is_using_quantization_scales",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.get_pg_rank",
+        lambda group: 3 if group is tp_group else None,
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_num_hash_layers=0,
+            sequence_parallel=True,
+            freeze_base_model_for_mtp=False,
+        ),
+        decoder=decoder,
+        embedding=embedding,
+        position_embedding_type="none",
+        pre_process=True,
+        post_process=False,
+        share_embeddings_and_output_weights=False,
+        mtp_process=False,
+        vocab_size=128,
+        pg_collection=SimpleNamespace(tp=tp_group),
+    )
+    input_ids = torch.arange(8).reshape(2, 4)
+    position_ids = torch.arange(4).repeat(2, 1)
+
+    output = HybridModel.forward(
+        model,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=None,
+        inference_context=inference_context,
+        runtime_gather_output=True,
+    )
+
+    embedding.assert_called_once_with(input_ids=input_ids, position_ids=position_ids)
+    inference_context.zero_padding_tokens.assert_called_once_with(
+        local_embeddings, sequence_parallel_rank=3
+    )
+    assert output is decoder.kwargs["hidden_states"]
+    assert output.unwrap() is local_embeddings
+
+
 def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
     moe = RecordingMoE()
     layer = SimpleNamespace(
