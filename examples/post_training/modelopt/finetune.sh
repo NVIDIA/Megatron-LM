@@ -13,7 +13,6 @@ export HF_DATASETS_CACHE="/tmp/hf_datasets_cache"
 MLM_DEFAULT_ARGS=" \
     --distributed-timeout-minutes 30 \
     --auto-detect-ckpt-format \
-    --export-te-mcore-model \
     --finetune \
 "
 

@@ -4,18 +4,15 @@
 import os
 import sys
 import warnings
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
-import os
-import sys
 from argparse import Namespace
 from contextlib import nullcontext
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -29,11 +26,15 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.training import get_model, print_rank_0
+from megatron.training import print_rank_0
 from megatron.training.global_vars import set_run_config
 
 try:
-    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+    from megatron.post_training.model_config import (
+        build_inference_models,
+        modelopt_inference_config_from_args,
+    )
+    from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -44,11 +45,11 @@ sys.path.append(
 )
 
 from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training import get_args, get_tokenizer
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
@@ -129,7 +130,13 @@ def main(model_type: str = "gpt"):
             'exit_on_missing_checkpoint': True,
         },
     )
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    use_modelopt = HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args)
+    cfg = (
+        modelopt_inference_config_from_args(args)
+        if use_modelopt
+        else inference_cfg_container_from_args(args, build_model_config=False)
+    )
+    set_run_config(cfg)
     initialize_megatron()
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
@@ -145,12 +152,9 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
-            # ModelOpt path keeps the legacy callable-based builder because the
-            # modelopt hooks have not been ported to the new ``ModelBuilder``
-            # API yet. ``get_model`` also handles the modelopt-checkpoint
-            # auto-detection side effect.
-            model = get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        if use_modelopt:
+            # ModelOpt layer specs and hooks come from the config; the builder is the stock one.
+            model = build_inference_models(cfg)
         else:
             builder = get_model_builder(args, provider=model_type)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -158,7 +162,7 @@ def main(model_type: str = "gpt"):
                 pg_collection=pg_collection, wrap_with_ddp=False
             )
 
-    if args.load is not None:
+    if cfg.checkpoint.load is not None:
         _ = load_checkpoint(model, None, None, strict=False)
 
     assert len(model) == 1, "Above condition should have caught this"

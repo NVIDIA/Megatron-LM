@@ -48,6 +48,6 @@ MODEL_ARGS=" \
     --rotary-base 500000 \
     --rotary-interleaved \
     --no-rope-freq 4 \
-    --export-moe-apply-probs-on-input \
+    --moe-apply-probs-on-input \
     --padded-vocab-size 202048 \
 "

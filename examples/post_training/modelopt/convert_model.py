@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Convert a GPTModel."""
-import functools
 import inspect
 import json
 import os
@@ -14,21 +13,20 @@ import modelopt.torch.speculative as mtsp
 import torch
 from modelopt.torch.export import import_mcore_gpt_from_hf
 
-from megatron.core import mpu
-from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
-from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
+from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 ALGO_TO_CONFIG = {
     "eagle3": mtsp.config.EAGLE3_DEFAULT_CFG,
@@ -73,35 +71,26 @@ def add_convert_args(parser):
     return parser
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
-    """Build the model."""
-    args = get_args()
-    args.model_type = model_type
-    pre_process = mpu.is_pipeline_first_stage()
-    post_process = mpu.is_pipeline_last_stage()
-
-    if args.init_model_with_meta_device:
-        with torch.device("meta"):
-            model = model_provider_func(pre_process=pre_process, post_process=post_process)
-        to_empty_if_meta(model, device="cuda")
-    else:
-        model = model_provider_func(pre_process=pre_process, post_process=post_process)
-
-    model.model_type = model_type
-    return [model]
-
-
-def check_arguments():
+def check_arguments(args=None):
     """Checking user arguments."""
-    args = get_args()
+    args = get_args() if args is None else args
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print_rank_0("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
 
-    if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
-        if not getattr(args, 'export_default_te_spec', False):
-            print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
-            args.moe_grouped_gemm = False
+
+def configure_moe_grouped_gemm(args, cfg):
+    """Disable grouped MoE GEMMs when the selected model spec does not support them."""
+    transformations = cfg.model.transformations
+    if (
+        getattr(args, "moe_grouped_gemm", False)
+        and transformations is not None
+        and not transformations.default_te_spec
+    ):
+        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
+        args.moe_grouped_gemm = False
+        cfg.model.transformer.moe_grouped_gemm = False
+        transformations.moe_grouped_gemm = False
 
 
 if __name__ == "__main__":
@@ -112,9 +101,11 @@ if __name__ == "__main__":
         })
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    check_arguments(args)
+    cfg = modelopt_inference_config_from_args(args)
+    configure_moe_grouped_gemm(args, cfg)
+    set_run_config(cfg)
     initialize_megatron(training=False)
-    check_arguments()
 
     args = get_args()
 
@@ -122,9 +113,7 @@ if __name__ == "__main__":
     # Meta device initialization is used such that models can be materialized in low-precision
     # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
     # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
-    if args.init_model_with_meta_device:
-        args.use_cpu_initialization = True
-    else:
+    if not args.init_model_with_meta_device:
         warnings.warn(
             "--init-model-with-meta-device is not set. If you would like to resume the "
             "model in low-bit directly (low-memory initialization and skipping 16-bit), "
@@ -132,9 +121,7 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(
-        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
-    )
+    model = build_inference_models(cfg, mixed_precision=False)
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
@@ -163,7 +150,7 @@ if __name__ == "__main__":
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
-    elif args.load is not None:
+    elif cfg.checkpoint.load is not None:
         load_checkpoint(model, None, None)
 
     if args.algorithm == "eagle3":

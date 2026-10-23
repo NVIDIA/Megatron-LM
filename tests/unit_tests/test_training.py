@@ -15,6 +15,8 @@ from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
+    _add_model_freeze_pre_wrap_hook,
+    _freeze_all_model_chunks,
     _get_indexer_logging_layer_counts,
     _get_optimizer_param_scheduler_increment,
     _pop_samples_seen,
@@ -66,6 +68,14 @@ def create_test_args():
     args.phase_transition_iterations = None
 
     return args
+
+
+def test_freeze_hook_appended_to_model_config_without_kd():
+    model_config = Mock(pre_wrap_hooks=[])
+    _add_model_freeze_pre_wrap_hook(
+        model_config, freeze_all_layers=True, freeze_base_model_for_mtp=False
+    )
+    assert model_config.pre_wrap_hooks == [_freeze_all_model_chunks]
 
 
 def test_indexer_logging_counts_only_active_legacy_ratios():

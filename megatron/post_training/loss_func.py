@@ -7,6 +7,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.utils import unwrap_model
+from megatron.post_training.utils import is_distillation_model
 from megatron.training import get_args
 
 
@@ -44,8 +45,6 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
         output_tensor (Tensor): The tensor with the losses
         model (GPTModel): The model (can be wrapped)
     """
-    args = get_args()
-
     # Unwrap for both Distillation and LANA
     model = unwrap_model(model)
 
@@ -55,7 +54,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     report = {'lm loss': torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])}
 
-    if args.export_kd_teacher_load:
+    if is_distillation_model(model):
         # [ModelOpt]: Handle knowledge distillation
         losses = model.compute_kd_loss(
             student_loss=loss_lm,

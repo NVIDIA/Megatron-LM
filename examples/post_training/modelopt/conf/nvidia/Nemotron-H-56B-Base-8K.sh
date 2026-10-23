@@ -35,5 +35,4 @@ MODEL_ARGS=" \
     --max-position-embeddings 8192 \
     --tokenizer-type HuggingFaceTokenizer \
     --bf16 \
-    --export-model-type HybridModel \
     "

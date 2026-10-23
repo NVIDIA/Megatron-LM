@@ -6,28 +6,38 @@ import os
 import modelopt
 import modelopt.torch.quantization as mtq
 import torch
+from modelopt.torch.distill import DistillationModel
 from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
 
+from megatron.core.utils import unwrap_model
 
-def maybe_enable_modelopt(args):
-    """Set `args.modelopt_enabled` if a ModelOpt checkpoint or distillation teacher is
-    configured. Idempotent and safe to call multiple times (e.g. once early in
-    `pretrain_gpt.py` before building the model config, and again as a fallback in
-    `training.py` for callers that don't go through that entrypoint).
+
+def is_distillation_model(model) -> bool:
+    """Return whether a model or model-chunk list contains a distillation model."""
+    unwrapped = unwrap_model(model)
+    if isinstance(unwrapped, list):
+        return any(isinstance(model_chunk, DistillationModel) for model_chunk in unwrapped)
+    return isinstance(unwrapped, DistillationModel)
+
+
+def should_use_modelopt_config(args) -> bool:
+    """Return whether CLI inputs require the ModelOpt-aware model configuration.
+
+    ModelOpt is used when ``--modelopt-enabled`` is set, for a checkpoint with ModelOpt
+    state, or for distillation.
     """
-    if getattr(args, "modelopt_enabled", False):
-        return
-
     from megatron.post_training.checkpointing import has_modelopt_state
     from megatron.training import print_rank_0
 
-    if args.load is not None and has_modelopt_state(args.load):
+    if getattr(args, "modelopt_enabled", False):
+        return True
+    if args.load is not None and has_modelopt_state(args.load, args.ckpt_format):
         print_rank_0("ModelOpt checkpoint detected")
-        args.modelopt_enabled = True
-    if getattr(args, "export_kd_teacher_load", None):
-        # For distillation ckpts without ModelOpt state
-        args.modelopt_enabled = True
+        return True
+    if getattr(args, "export_kd_teacher_load", None) is not None:
+        return True
+    return False
 
 
 def modelopt_version_higher_than(target_version: str):
@@ -40,6 +50,7 @@ def modelopt_version_higher_than(target_version: str):
     )
     print(info)
     return Version(modelopt.__version__) > Version(target_version)
+
 
 def modelopt_version_at_least(target_version: str):
     """Check if Model-Optimizer is greater or equal than this version."""
@@ -57,6 +68,7 @@ def function_has_parameter(function, argument_name: str) -> bool:
     """Check if a function has a specific argument."""
     sig = inspect.signature(function)
     return argument_name in sig.parameters
+
 
 def get_current_memory_info():
     """Get current memory usage."""
@@ -93,26 +105,6 @@ def get_mtbench_chat_data():
         "HuggingFaceH4/mt_bench_prompts", split="train", token=os.environ.get("HF_TOKEN", None)
     )
     return dataset.map(mtbench_to_oai_chat)
-
-
-def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=True):
-    """Move tensors to device if not meta device; otherwise materialize with empty_like().
-
-    Args:
-        module: The target module to apply this transformation.
-        device: The desired device of the parameters
-            and buffers in this module.
-        recurse: Whether parameters and buffers of submodules should
-            be recursively moved to the specified device.
-    """
-
-    def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
-        if tensor.device == torch.device("meta"):
-            return torch.empty_like(tensor, device=device)
-        else:
-            return tensor.to(device)
-
-    module._apply(lambda t: _empty_like_if_meta(t, device=device), recurse=recurse)
 
 
 def print_distributed_quant_summary(model, msg=""):

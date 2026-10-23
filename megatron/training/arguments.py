@@ -1475,6 +1475,17 @@ def validate_args(args, defaults={}):
         assert is_te_min_version("2.9.0"), \
             '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
+    # GPT-OSS YaRN RoPE preset
+    if args.enable_gpt_oss:
+        args.position_embedding_type = 'yarn'
+        args.rotary_scaling_factor = 32.0
+        args.yarn_original_max_position_embeddings = 4096
+        args.yarn_beta_fast = 32.0
+        args.yarn_beta_slow = 1.0
+        args.mscale = 1.0
+        args.mscale_all_dim = 0.0
+        args.yarn_correction_range_round_to_int = False
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
@@ -2447,6 +2458,9 @@ def _add_network_size_args(parser):
     group.add_argument('--no-yarn-correction-range-round-to-int', action='store_false',
                        dest='yarn_correction_range_round_to_int',
                        help='Do not round YaRN correction range endpoints to integers.')
+    group.add_argument('--enable-gpt-oss', action='store_true',
+                       help='Use the GPT-OSS YaRN RoPE configuration. Overrides '
+                            '--position-embedding-type and the YaRN arguments.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
     group.add_argument('--relative-attention-max-distance', type=int, default=128,

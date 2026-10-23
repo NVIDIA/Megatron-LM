@@ -48,7 +48,7 @@ MODEL_ARGS=" \
     --use-rope-scaling \
     --sequence-parallel \
     --no-bias-swiglu-fusion \
-    --export-qk-l2-norm \
-    --export-moe-apply-probs-on-input \
+    --qk-l2-norm \
+    --moe-apply-probs-on-input \
     --padded-vocab-size 202048 \
 "

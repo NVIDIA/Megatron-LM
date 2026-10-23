@@ -9,23 +9,17 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-model-type",
         type=str,
-        default="GPTModel",
+        default=None,
         choices=["GPTModel", "HybridModel", "MambaModel"],
-        help='Model type to use in model_provider. Use "HybridModel" for hybrid models '
-        '(formerly MambaModel). "MambaModel" is accepted for backward compatibility but deprecated.',
-    )
-    group.add_argument(
-        "--export-legacy-megatron",
-        action="store_true",
-        help="Export a legacy megatron-lm checkpoint.",
+        help="Deprecated. The model type comes from the entry point (pretrain_gpt.py / "
+        "pretrain_hybrid.py) or, for the post-training scripts, from --hybrid-layer-pattern "
+        "(hybrid iff set). Only needed for a hybrid model without a layer pattern.",
     )
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
-        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
-        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
-        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
+        help="Deprecated and ignored. The ModelOpt-local spec always loads and saves "
+        "layernorms under the fused Transformer-Engine checkpoint keys.",
     )
     group.add_argument(
         "--export-default-te-spec",
@@ -70,7 +64,9 @@ def add_modelopt_args(parser):
         '--export-kd-teacher-model-config',
         type=str,
         default=None,
-        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+        help='Path to teacher model config for distillation, with argparse field names overriding '
+        'the student\'s. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml. '
+        'CLI only: YAML run configs give the teacher as DistillationConfig.teacher_model.',
     )
     group.add_argument(
         '--export-kd-teacher-ckpt-format',
@@ -131,16 +127,18 @@ def add_modelopt_args(parser):
         'use the base learning rate.',
     )
 
-    # Special model architecture option
+    # Deprecated aliases of the core architecture arguments
     group.add_argument(
         '--export-qk-l2-norm',
         action="store_true",
-        help='Use Llama-4 L2Norm instead of normal LayerNorm/RMSNorm for QK normalization.',
+        dest="qk_l2_norm",
+        help='Deprecated alias for --qk-l2-norm.',
     )
     group.add_argument(
         '--export-moe-apply-probs-on-input',
         action="store_true",
-        help='Use Llama-4 expert scaling on input instead of output.',
+        dest="moe_apply_probs_on_input",
+        help='Deprecated alias for --moe-apply-probs-on-input.',
     )
 
     # Speculative decoding
@@ -150,19 +148,11 @@ def add_modelopt_args(parser):
         help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
     )
 
-    # Global state
     group.add_argument(
         '--modelopt-enabled',
         action="store_true",
-        help='Will be set automatically when loading a ModelOpt checkpoint.',
-    )
-
-    # GPT-OSS YaRN RoPE support
-    group.add_argument(
-        '--enable-gpt-oss',
-        action="store_true",
-        help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
-             'configures all YaRN parameters with GPT-OSS defaults.',
+        help='Build the ModelOpt model even when the checkpoint has no ModelOpt state and no '
+        'distillation teacher is given (both of which enable it automatically).',
     )
 
     return parser

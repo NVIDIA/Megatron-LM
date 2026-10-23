@@ -22,9 +22,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
-from megatron.training import get_args
-from megatron.training import get_model as _get_model
-from megatron.training import get_wandb_writer
+from megatron.training import get_args, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import (
     get_checkpoint_name,
@@ -36,7 +34,8 @@ from megatron.training.checkpointing import (
 from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
 
 try:
-    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+    from megatron.post_training.model_config import build_inference_models, build_modelopt_models
+    from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -174,18 +173,23 @@ def get_model_for_inference(
             complete checkpoint view. Defaults to the global process group.
     """
 
-    args = get_args()
+    from megatron.training.global_vars import get_run_config, is_run_config_initialized
 
-    if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+    args = get_args()
+    cfg = get_run_config() if is_run_config_initialized() else None
+    declared_modelopt = (
+        cfg is not None and cfg.model is not None and cfg.model.transformations is not None
+    )
+    use_modelopt = declared_modelopt or (
+        HAS_NVIDIA_MODELOPT and should_use_modelopt_config(args)
+    )
+    if use_modelopt:
+        # The ModelOpt model config is translated with the global parallel sizes.
         if pg_collection is not None:
             raise ValueError(
                 "Custom inference process groups are not supported by the ModelOpt builder"
             )
-        # ModelOpt path keeps the legacy callable-based builder because the
-        # modelopt hooks (custom layer specs, calibration, etc.) have not been
-        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
-        # care of running the modelopt-checkpoint auto-detection side effect.
-        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        model = build_inference_models(cfg) if declared_modelopt else build_modelopt_models(args)
     else:
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()

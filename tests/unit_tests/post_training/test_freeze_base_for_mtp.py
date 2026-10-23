@@ -1,6 +1,6 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the --qad-train-target / --freeze-base-for-mtp feature in model_builder."""
+"""Unit tests for the --qad-train-target / --freeze-base-for-mtp feature in model_hooks."""
 
 import pytest
 import torch
@@ -14,12 +14,12 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.post_training.model_builder import _freeze_base_for_mtp, _freeze_for_qad
+from megatron.post_training.model_hooks import freeze_for_qad
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestFreezeBaseForMTP:
-    """Test that _freeze_base_for_mtp correctly freezes base and keeps MTP trainable."""
+    """Test that freeze_for_qad(..., 'mtp') correctly freezes base and keeps MTP trainable."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -59,7 +59,7 @@ class TestFreezeBaseForMTP:
 
     def test_freeze_only_keeps_mtp_trainable(self):
         """After freezing, only mtp.layers.* params should have requires_grad=True."""
-        _freeze_base_for_mtp(self.model)
+        freeze_for_qad(self.model, "mtp")
 
         trainable_params = []
         frozen_params = []
@@ -88,7 +88,7 @@ class TestFreezeBaseForMTP:
 
     def test_base_params_are_frozen(self):
         """Embedding, decoder, and output_layer params should all be frozen."""
-        _freeze_base_for_mtp(self.model)
+        freeze_for_qad(self.model, "mtp")
 
         for name, param in self.model.named_parameters():
             if 'mtp.layers.' not in name:
@@ -96,10 +96,10 @@ class TestFreezeBaseForMTP:
 
     def test_freeze_is_idempotent(self):
         """Calling freeze twice should produce the same result."""
-        _freeze_base_for_mtp(self.model)
+        freeze_for_qad(self.model, "mtp")
         trainable_1 = {n for n, p in self.model.named_parameters() if p.requires_grad}
 
-        _freeze_base_for_mtp(self.model)
+        freeze_for_qad(self.model, "mtp")
         trainable_2 = {n for n, p in self.model.named_parameters() if p.requires_grad}
 
         assert trainable_1 == trainable_2
@@ -128,7 +128,7 @@ class TestFreezeBaseForMTP:
                 self.mtp.layers.router = _Router()
 
         tree = _Tree()
-        _freeze_base_for_mtp(tree)
+        freeze_for_qad(tree, "mtp")
 
         for name, module in tree.named_modules():
             if hasattr(module, 'expert_bias'):
@@ -143,7 +143,7 @@ class TestFreezeBaseForMTP:
 
     def test_target_base_trains_base_freezes_mtp(self):
         """target='base' trains the base and freezes the MTP heads (the inverse of 'mtp')."""
-        _freeze_for_qad(self.model, "base")
+        freeze_for_qad(self.model, "base")
 
         for name, param in self.model.named_parameters():
             if 'mtp.layers.' in name:
@@ -153,26 +153,16 @@ class TestFreezeBaseForMTP:
 
     def test_target_both_trains_everything(self):
         """target='both' re-enables every parameter, even after a prior freeze."""
-        _freeze_for_qad(self.model, "mtp")
-        _freeze_for_qad(self.model, "both")
+        freeze_for_qad(self.model, "mtp")
+        freeze_for_qad(self.model, "both")
 
         for name, param in self.model.named_parameters():
             assert param.requires_grad, f"Param '{name}' should be trainable with target='both'"
 
-    def test_freeze_base_for_mtp_is_alias_for_target_mtp(self):
-        """The deprecated --freeze-base-for-mtp helper matches target='mtp'."""
-        _freeze_base_for_mtp(self.model)
-        alias = {n for n, p in self.model.named_parameters() if p.requires_grad}
-
-        _freeze_for_qad(self.model, "mtp")
-        target = {n for n, p in self.model.named_parameters() if p.requires_grad}
-
-        assert alias == target
-
     def test_invalid_target_raises(self):
         """An unknown target is rejected."""
         with pytest.raises(ValueError):
-            _freeze_for_qad(self.model, "bogus")
+            freeze_for_qad(self.model, "bogus")
 
     def test_target_base_freezes_mtp_router_expert_bias(self):
         """target='base' pins the MTP routers' expert_bias and frees the base routers."""
@@ -192,7 +182,7 @@ class TestFreezeBaseForMTP:
                 self.mtp.layers.router = _Router()
 
         tree = _Tree()
-        _freeze_for_qad(tree, "base")
+        freeze_for_qad(tree, "base")
 
         for name, module in tree.named_modules():
             if hasattr(module, 'expert_bias'):

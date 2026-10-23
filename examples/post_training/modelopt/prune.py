@@ -5,7 +5,6 @@
 Read more about ModelOpt pruning at https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning
 """
 
-import functools
 import gc
 import json
 import os
@@ -42,15 +41,16 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import report_current_memory_info
-from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
@@ -180,30 +180,25 @@ if __name__ == "__main__":
     )
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    check_arguments(args)
+    cfg = modelopt_inference_config_from_args(args, disable_moe_grouped_gemm=True)
+    set_run_config(cfg)
     initialize_megatron(training=False)
 
     args = get_args()
-    check_arguments(args)
 
     tokenizer = get_hf_tokenizer()
     # Pruning operates on per-expert linears (which only exist as separate modules under
     # SequentialMLP, not the packed-tensor TEGroupedMLP). `disable_moe_grouped_gemm=True`
     # forces the export spec to SequentialMLP so mtp.prune can act on individual experts.
     # Other example scripts (quantize.py, generate.py, finetune.py) keep the default.
-    prune_builder = functools.partial(
-        modelopt_gpt_hybrid_builder, disable_moe_grouped_gemm=True
-    )
-    model = get_model(
-        functools.partial(model_provider, prune_builder),
-        wrap_with_ddp=False,
-    )
+    model = build_inference_models(cfg)
     unwrapped_model = unwrap_model(model)[0]
     print_rank_0(f"Original Model: {unwrapped_model}")
 
     report_current_memory_info()
 
-    if args.load is not None:
+    if cfg.checkpoint.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 

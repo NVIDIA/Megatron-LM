@@ -226,7 +226,7 @@ except ImportError:
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
-    from megatron.post_training.utils import maybe_enable_modelopt
+    from megatron.post_training.utils import is_distillation_model
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -2521,9 +2521,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if expt_dp_ag is not None:
                 print_rank_0(">   including expert parallelism AG group")
 
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
-
     # Build model.
     def build_model():
         if (
@@ -2835,9 +2832,6 @@ def setup_model_and_optimizer(
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
-
     def _build_model_wrapper(wrap_with_ddp: bool):
         if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
             from megatron.training.utils import start_memory_history_recording
@@ -2866,6 +2860,8 @@ def setup_model_and_optimizer(
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
+                checkpoint=cfg.checkpoint,
+                distillation=cfg.distillation,
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
@@ -3081,7 +3077,11 @@ def setup_model_and_optimizer(
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
 
-        load_kd_teacher_checkpoint(model)
+        load_kd_teacher_checkpoint(
+            model,
+            getattr(cfg_container, "distillation", None),
+            student_checkpoint=getattr(cfg_container, "checkpoint", None),
+        )
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
@@ -3277,8 +3277,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
-        if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-            # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
+        if has_nvidia_modelopt and is_distillation_model(model):
+            # Pipeline-parallel distillation stacks student and teacher tensors.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
@@ -5627,7 +5627,7 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+    if has_nvidia_modelopt and is_distillation_model(model):
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,

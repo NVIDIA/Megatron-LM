@@ -37,6 +37,5 @@ MODEL_ARGS=" \
     --use-mcore-models \
     --rotary-percent 0.5 \
     --rotary-base 500000 \
-    --export-model-type HybridModel \
 "
 #    --rotary-base 10000 \

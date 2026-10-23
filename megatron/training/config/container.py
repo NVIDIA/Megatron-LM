@@ -38,7 +38,8 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
+from megatron.training.models.distillation import DistillationConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -54,6 +55,14 @@ class ConfigContainerBase:
 
     def validate(self) -> None:
         """Check sub-configs without mutation; callers may validate repeatedly."""
+        distillation = getattr(self, "distillation", None)
+        if distillation is not None:
+            model = getattr(self, "model", None)
+            if model is not None:
+                distillation.validate_student(model)
+            train = getattr(self, "train", None)
+            if train is not None and train.manual_gc:
+                raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
         for config_field in dataclass_fields(self):
             config = getattr(self, config_field.name)
             validate = getattr(config, "validate", None)
@@ -80,7 +89,7 @@ class ConfigContainerBase:
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))
-    
+
     @classmethod
     def from_dict(
         cls: Type[T],
@@ -294,6 +303,8 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None

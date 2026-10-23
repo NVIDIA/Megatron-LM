@@ -45,17 +45,64 @@ from dataclasses import dataclass
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 
 
+def _modelopt_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
+    """Build the decoder spec declared by ``ModelTransformConfig``."""
+    options = config.transformations
+    assert options is not None
+    transformer_cfg = config.transformer
+    if transformer_cfg.heterogeneous_block_specs:
+        return get_gpt_heterogeneous_layer_spec(
+            config=transformer_cfg,
+            use_te=transformer_cfg.transformer_impl == "transformer_engine",
+        )
+    if options.default_te_spec:
+        return get_gpt_layer_with_transformer_engine_spec(
+            transformer_cfg.num_moe_experts,
+            options.moe_grouped_gemm,
+            transformer_cfg.qk_layernorm,
+            transformer_cfg.multi_latent_attention,
+            transformer_cfg.experimental_attention_variant,
+            qk_l2_norm=transformer_cfg.qk_l2_norm,
+        )
+    if transformer_cfg.context_parallel_size > 1:
+        from megatron.training import print_rank_0
+
+        print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
+        local_core_attention = False
+    else:
+        local_core_attention = options.force_local_attention
+    return get_gpt_modelopt_spec(
+        config=transformer_cfg,
+        local_core_attention=local_core_attention,
+        remap_te_layernorm=True,
+        real_quant_cfg=options.real_quant_cfg,
+        use_arbitrary_attention_mask=False,
+    )
+
+
+def _modelopt_mtp_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
+    """Keep MTP on the standard decoder spec independently of ModelOpt quantization."""
+    transformer_cfg = config.transformer
+    return get_gpt_decoder_layer_specs(
+        transformer_cfg,
+        use_transformer_engine=transformer_cfg.transformer_impl == "transformer_engine",
+    )[-1]
+
+
 def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
-    if (
+    if config.transformations is not None:
+        return _modelopt_layer_spec(config)
+    elif (
         transformer_cfg.transformer_impl == "inference_optimized"
         and transformer_cfg.num_moe_experts is None
     ):
@@ -158,6 +205,9 @@ class GPTModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.gpt.GPTModelBuilder"
     transformer: TransformerConfig
     transformer_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
+
+    mtp_layer_spec: ModuleSpec | Callable[["GPTModelConfig"], ModuleSpec] | None = None
+    """Optional independent transformer layer spec for MTP. Defaults to the decoder spec."""
 
     ### vocab padding related ###
     vocab_size: int | None = None
@@ -353,10 +403,15 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = True,
-        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        mixed_precision_wrapper: (
+            Callable[[Any, MegatronModule], MegatronModule] | None
+        ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
+        device: torch.device | str | None = None,
+        checkpoint=None,
+        distillation=None,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -369,6 +424,9 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             use_torch_fsdp2: Whether to use Torch FSDP 2.0
             wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
             data_parallel_random_init: Whether to use data parallel random initialization
+            device: Explicit final device, including for meta materialization; None keeps the default.
+            checkpoint: Run-owned checkpoint config used for pre-wrap transformation restoration.
+            distillation: Run-owned ModelOpt ``DistillationConfig``; converts the student for KD.
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -379,7 +437,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
-        composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
+        composed_pre_wrap_hook = self.pre_wrap_hook(checkpoint, distillation)
         model_list = unimodal_build_distributed_models(
             self.build_model,
             transformer_config,
@@ -395,6 +453,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
             use_layer_wise_param_layout=use_layer_wise_param_layout,
+            device=device,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
@@ -430,7 +489,13 @@ def mtp_block_spec(
     if config.transformer.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
-        if isinstance(transformer_layer_spec, TransformerBlockSubmodules):
+        if config.mtp_layer_spec is not None:
+            spec = config.mtp_layer_spec
+            if not isinstance(spec, ModuleSpec) and callable(spec):
+                spec = spec(config)
+        elif config.transformations is not None:
+            spec = _modelopt_mtp_layer_spec(config)
+        elif isinstance(transformer_layer_spec, TransformerBlockSubmodules):
             if transformer_layer_spec.layer_specs:
                 # Reuse the resolved spec: the generic decoder builder rejects experimental attention.
                 spec = transformer_layer_spec.layer_specs[-1]

@@ -518,8 +518,8 @@ def _apply_yarn_config_from_args(config, args) -> None:
     etc.) with no default, so the attributes must exist whenever
     ``position_embedding_type == 'yarn'``. The CLI exposes some of these without a
     ``yarn_`` prefix (``--rotary-scaling-factor``, ``--mscale``, ``--mscale-all-dim``),
-    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML or a
-    ModelOpt GPT-OSS builder) are preserved. Defaults mirror ``YarnRotaryEmbedding``.
+    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML) are
+    preserved. Defaults mirror ``YarnRotaryEmbedding``.
     """
     if getattr(args, 'position_embedding_type', None) != 'yarn':
         return
@@ -589,15 +589,10 @@ def resolve_tokenizer_vocab_size(
 def gpt_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
-    model_config_cls: type = GPTModelConfig,
     *,
     vocab_size_from_tokenizer: bool = True,
 ) -> Any:
-    """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
-
-    `model_config_cls` lets callers reuse this same arg-derivation logic for
-    subclasses that only override metadata (e.g. `builder`) and add no new fields,
-    such as `ModelOptModelConfig`.
+    """Create a GPTModelConfig from the `args` Namespace.
 
     ``vocab_size_from_tokenizer`` uses the tokenizer-derived padded vocabulary
     when padding is enabled. A size already resolved by CLI/checkpoint arguments
@@ -605,8 +600,6 @@ def gpt_config_from_args(
     Set this to False to explicitly convert a raw ``args.vocab_size`` without
     waiting for tokenizer initialization.
     """
-    assert issubclass(model_config_cls, GPTModelConfig)
-
     kwargs = {}
     if config is None:
         if args.yaml_cfg is not None:
@@ -651,7 +644,7 @@ def gpt_config_from_args(
         kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return model_config_cls(**kwargs)
+    return GPTModelConfig(**kwargs)
 
 
 def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> ModuleSpec | None:
@@ -684,23 +677,16 @@ def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> Module
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
-    model_config_cls: type = HybridModelConfig,
     *,
     vocab_size_from_tokenizer: bool = True,
 ) -> Any:
-    """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
-
-    `model_config_cls` lets callers reuse this same arg-derivation logic for
-    subclasses that only override metadata (e.g. `builder`) and add no new fields,
-    such as `ModelOptHybridModelConfig`.
+    """Create a HybridModelConfig from the `args` Namespace.
 
     Vocabulary resolution follows ``gpt_config_from_args``: tokenizer-derived
     vocabulary is the default when padding is enabled, and an already resolved
     padded size takes precedence. Set ``vocab_size_from_tokenizer=False`` for
     explicit raw-vocabulary conversion without tokenizer initialization.
     """
-    assert issubclass(model_config_cls, HybridModelConfig)
-
     kwargs = {}
     if config is None:
         transformer_cfg = core_transformer_config_from_args(args)
@@ -755,7 +741,7 @@ def hybrid_config_from_args(
         kwargs["vocab_size"] = None if vocab_size_from_tokenizer and args.pad_vocab_size else args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return model_config_cls(**kwargs)
+    return HybridModelConfig(**kwargs)
 
 
 def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
