@@ -256,6 +256,7 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
+    num_distributed_optimizer_instances=1,
     muon_scalar_optimizer='adam',
     cp=1,
     ep=1,
@@ -315,6 +316,7 @@ def setup_model_and_optimizer(
         mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        mock_args.num_distributed_optimizer_instances = num_distributed_optimizer_instances
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
         model = get_model(
