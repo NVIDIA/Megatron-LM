@@ -36,13 +36,19 @@ def _base(**overrides):
 
 
 def test_construction_needs_no_tokenizer_and_derives_the_sources():
-    """The blend / split rules, and the fields that follow from them (mock, split_matrix, the even
-    split of a mock config), need no tokenizer and run at construction as before; what needs the
-    tokenizer waits for validate()."""
+    """The blend / split rules need no tokenizer and run at construction as before; mock and
+    split_matrix follow from the sources (read-only properties, nothing is assigned); what needs
+    the tokenizer waits for validate()."""
     mock = _config()
     assert mock.tokenizer is None and mock.token_dtype_code is None
-    assert mock.mock is True and mock.split == "1,1,1"
-    assert mock.split_matrix == _base().split_matrix
+    assert mock.mock is True and mock.split is None  # the even split is derived, not written
+    assert mock.split_matrix == _base().split_matrix == _base(split="1,1,1").split_matrix
+    assert not {"mock", "split_matrix", "token_dtype_code"} & set(
+        GPTDatasetConfig.__dataclass_fields__
+    )
+    for name, value in (("mock", False), ("split_matrix", None), ("token_dtype_code", 4)):
+        with pytest.raises(AttributeError):
+            setattr(mock, name, value)
     real = _config(blend=BLEND, split="9,1,0")
     assert (
         real.mock is False and real.split_matrix == _base(blend=BLEND, split="9,1,0").split_matrix
@@ -59,20 +65,21 @@ def test_construction_needs_no_tokenizer_and_derives_the_sources():
         GPTDatasetConfig(sequence_length=16, **BOOLS)
 
 
-def test_validate_needs_the_tokenizer_and_derives_from_it(tokenizer):
-    """What __post_init__ asserted and derived before: run once the config is complete.
-    Idempotent, and it refreshes the derived fields of a config edited after construction."""
+def test_validate_needs_the_tokenizer_and_asserts_only(tokenizer):
+    """What __post_init__ asserted before: run once the config is complete. Assertions only and
+    idempotent; token_dtype_code follows the tokenizer and mock / split_matrix follow the sources,
+    so a config completed after construction needs no refresh."""
     cfg = _config()
     with pytest.raises(AssertionError):
         cfg.validate()  # no tokenizer
     cfg.tokenizer = tokenizer
+    assert cfg.token_dtype_code == 8  # from the tokenizer, before any validate()
     cfg.validate()
-    assert cfg.token_dtype_code == 8 and cfg.mock is True
     cfg.validate()
     assert cfg.token_dtype_code == 8 and cfg.mock is True
     cfg.blend, cfg.split = BLEND, "9,1,0"  # completed after construction
-    cfg.validate()
     assert cfg.mock is False and cfg.split_matrix == _base(blend=BLEND, split="9,1,0").split_matrix
+    cfg.validate()
     for missing in ("reset_position_ids", "reset_attention_mask", "eod_mask_loss"):
         with pytest.raises(AssertionError):
             _config(tokenizer=tokenizer, **{missing: None}).validate()

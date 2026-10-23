@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -71,9 +71,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        Check --per-dataset-sequences-path
     """
 
-    token_dtype_code: Optional[int] = field(init=False, default=None)
-    """The dtype code for the token ids. 4 for int32, 8 for uint16."""
-
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
@@ -111,11 +108,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     parity in CI."""
 
     def validate(self) -> None:
-        """Validate the config and derive ``token_dtype_code``; needs the tokenizer.
+        """Validate the config; needs the tokenizer. Assertions only.
 
-        What ``__post_init__`` did before: a config can be constructed before its tokenizer exists
-        and completed later, so run this once it is complete (``BlendedMegatronDatasetBuilder`` runs
-        it before building).
+        What ``__post_init__`` asserted before: a config can be constructed before its tokenizer
+        exists and completed later, so run this once it is complete
+        (``BlendedMegatronDatasetBuilder`` runs it before building). ``token_dtype_code`` follows
+        from the tokenizer.
         """
         super().validate()
 
@@ -131,16 +129,20 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
                 "--hybrid-context-parallel (SBHD mode is not packed)."
             )
 
-        self.token_dtype_code = (
-            None
-            if self.tokenizer.vocab_size is None
-            else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
-        )
         if self.sequences_per_dataset is not None:
             assert (
                 self.token_dtype_code is not None
             ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
             fix the tokenizer."
+
+    @property
+    def token_dtype_code(self) -> Optional[int]:
+        """The dtype code for the token ids, 4 for int32 and 8 for uint16, from the tokenizer's
+        vocabulary size; None without a tokenizer or a vocabulary size."""
+        vocab_size = None if self.tokenizer is None else self.tokenizer.vocab_size
+        if vocab_size is None:
+            return None
+        return 4 if vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8
 
 
 class GPTDataset(MegatronDataset):

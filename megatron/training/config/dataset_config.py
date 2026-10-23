@@ -129,10 +129,8 @@ def classify_dataset_class(dataset_type: Any) -> tuple[str, bool]:
 
 
 def has_data_source(dataset: GPTDatasetConfig) -> bool:
-    """Whether a blend is declared (Megatron Core's rule for ``mock``, inverted)."""
-    if dataset.blend is not None:
-        return True
-    return dataset.blend_per_split is not None and any(dataset.blend_per_split)
+    """Whether a blend is declared: the inverse of Megatron Core's ``mock``."""
+    return not dataset.mock
 
 
 def is_packed_sequence(dataset_type: type, dataset: GPTDatasetConfig) -> bool:
@@ -277,8 +275,8 @@ class DataConfig:
 
         The dataset config is written with every constructor field except the tokenizer and the
         fields other sections own (``CONTAINER_WRITTEN_FIELDS``, recorded once, in their owning
-        sections); Megatron Core's ``init=False`` fields (``split_matrix``, ``mock``,
-        ``token_dtype_code``) are derived and never written.
+        sections); Megatron Core's derived values (``mock``, ``split_matrix``, ``token_dtype_code``)
+        are read-only properties, not fields, and are never written.
         """
         from megatron.training.config.container import ConfigContainerBase
 

@@ -98,8 +98,9 @@ def test_validate_args_keeps_the_legacy_data_normalizations(warnings_log):
     assert dataset.sft_mock_dataset_config_json == args.sft_mock_dataset_config_json
     section = data.to_cfg_dict()["dataset"]
     assert section["sft_mock_dataset_config_json"] == args.sft_mock_dataset_config_json
-    # Megatron Core sets the even split of a mock config at construction; the arguments carry none.
-    assert args.split is None and dataset.split == "1,1,1"
+    # The arguments carry no split for a mock run and neither does the section: Megatron Core
+    # derives the even split (split_matrix) from the absence of a source.
+    assert args.split is None and dataset.split is None and dataset.split_matrix is not None
     assert data.dataloader.dataloader_type == "single"
     assert not hasattr(dataset, "phase_transition_iterations")
     varlen = _validated(["--use-varlen-dataset", "--mock-data", "--calculate-per-token-loss"])

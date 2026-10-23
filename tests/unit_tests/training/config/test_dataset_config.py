@@ -76,14 +76,14 @@ def tokenizer():
 
 def test_the_section_holds_megatron_cores_config(tokenizer):
     """No wrapper class: cfg.data.dataset is Megatron Core's GPTDatasetConfig, constructed before
-    the tokenizer exists (Core derives mock and split_matrix at construction; its validate() needs
-    the tokenizer and runs when the section binds it)."""
+    the tokenizer exists (Core's mock and split_matrix follow from the sources; its validate()
+    needs the tokenizer and runs when the section binds it)."""
     assert not hasattr(config_package, "GPTDatasetConfig")
     assert not hasattr(config_package, "GPTFIMDatasetConfig")
     data = DataConfig(dataset=_dataset())
     assert type(data.dataset) is GPTDatasetConfig
     assert data.dataset.tokenizer is None and data.dataset.token_dtype_code is None
-    assert data.dataset.mock is True and data.dataset.split == "1,1,1"
+    assert data.dataset.mock is True and data.dataset.split is None  # the even split is derived
     assert data.dataset.split_matrix is not None
     data.validate()  # the section's own checks need no tokenizer
     data.finalize()
@@ -211,9 +211,9 @@ def test_to_cfg_dict_omits_tokenizer_owned_and_derived_fields(tokenizer):
     assert fim["_target_"] == "megatron.core.datasets.gpt_fim_dataset.GPTFIMDatasetConfig"
     assert fim["fim_extra_tokens"] == FIM_TOKENS
     assert type(instantiate(fim, mode=InstantiationMode.STRICT)) is GPTFIMDatasetConfig
-    # A mock section records the even split Megatron Core chose at construction: the saved file is
-    # a snapshot of the effective inputs.
-    assert DataConfig(dataset=_dataset()).to_cfg_dict()["dataset"]["split"] == "1,1,1"
+    # A mock section carries no split: Megatron Core derives the even split (split_matrix) from
+    # the absence of a source and writes nothing back.
+    assert DataConfig(dataset=_dataset()).to_cfg_dict()["dataset"]["split"] is None
     assert DataConfig().to_cfg_dict()["dataset"] is None
 
 
@@ -351,3 +351,15 @@ def test_dataloader_config_validation():
     loader.validate()
     loader.finalize()
     assert loader.dataloader_type == "single" and loader.persistent_workers is True
+
+
+def test_legacy_derived_keys_are_dropped_on_load():
+    """Files written while mock, split_matrix and token_dtype_code were fields carry them as keys;
+    the loader drops them (they are read-only properties now) and the section loads."""
+    section = DataConfig(dataset=_dataset(blend=BLEND, split="9,1,0")).to_cfg_dict()
+    section["dataset"].update(
+        mock=False, split_matrix=[[0.0, 0.9], [0.9, 1.0], None], token_dtype_code=8
+    )
+    restored = instantiate(sanitize_dataclass_config(section), mode=InstantiationMode.STRICT)
+    assert type(restored.dataset) is GPTDatasetConfig and restored.dataset.mock is False
+    assert restored.dataset.split_matrix == _dataset(blend=BLEND, split="9,1,0").split_matrix
