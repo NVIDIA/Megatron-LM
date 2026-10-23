@@ -416,7 +416,7 @@ def test_losses_match_baseline(
 
     Gradients reduce-scatter within DP-inner every backward and accumulate into main_grad;
     the DP-outer reduction (all-reduce for HSDP, reduce-scatter for HFSDP) runs only on the
-    last microbatch. overlap_dp_outer_communication moves that reduction to its own stream,
+    last microbatch. overlap_outer_communication moves that reduction to its own stream,
     which changes where it executes, not what it computes -- so losses stay bit-identical to
     the serialized path. Both zero_grad modes are covered.
     """
@@ -438,7 +438,7 @@ def test_losses_match_baseline(
     model.load_state_dict(baseline.state_dict())
 
     with fully_shard_context(
-        FsdpContext(device=device, overlap_dp_outer_communication=overlap)
+        FsdpContext(device=device, overlap_outer_communication=overlap)
     ) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, shard_layout=shard_layout)
