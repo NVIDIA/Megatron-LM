@@ -145,6 +145,64 @@ def test_capture_replay_and_validation(context):
     assert prefetched == ["a", "b", "b", "b", "b", "a", "a", "a", "a"]
 
 
+@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine", "full_iteration"])
+def test_cuda_graph_demands_preserve_order_outside_scheduler(context, cuda_graph_impl):
+    """Graph warmups may revisit units outside the scheduler's iteration boundary."""
+    a, b = _Unit(context), _Unit(context)
+    for module in (a, b):
+        module.config.cuda_graph_impl = cuda_graph_impl
+    order = context.iteration_order
+    for module, phase in ((a, "forward"), (b, "forward"), (b, "backward"), (a, "backward")):
+        order.append((ref(module), phase))
+    order.backward_start = 2
+    original = list(order), order.position
+    events = [(a, "forward")] * 2 + [(b, "forward")] * 2
+    events += [(b, "backward")] * 2 + [(a, "backward")] * 2
+    gathers = Mock()
+    gathers.attach_mock(a._unshard_parameter_groups, "a")
+    gathers.attach_mock(b._unshard_parameter_groups, "b")
+
+    @with_mfsdp_iteration
+    def run(model):
+        for module, phase in events:
+            module.unshard(phase)
+        assert order.mode == "demand" and not order.active
+
+    for _ in range(2):
+        gathers.reset_mock()
+        run([a, b])
+        assert [call[0] for call in gathers.mock_calls] == [
+            "a" if module is a else "b" for module, _ in events
+        ]
+        # Local/TE graph creation also calls units after the scheduler returns.
+        b.unshard("forward")
+        b.unshard("backward")
+        assert (list(order), order.position) == original
+        assert not order.captured and not order.active
+
+    # Combined hooks retain their root stream dependency without an active scope.
+    a.is_root = Mock(return_value=True)
+    context.allgather_stream.wait_stream.reset_mock()
+    _make_unshard_forward_hook(a)(None, (), {})
+    context.allgather_stream.wait_stream.assert_called_once_with(context.current_stream())
+
+
+def test_nested_graph_scheduler_preserves_explicit_iteration(context):
+    """A nested wrapper must not change the strategy of an already active scope."""
+    module = _Unit(context)
+    module.config.cuda_graph_impl = "full_iteration"
+
+    @with_mfsdp_iteration
+    def run(model):
+        assert context.iteration_order.mode == "record_replay"
+        assert context.iteration_order.active
+        model.unshard("forward")
+
+    with iteration(context):
+        run(module)
+    assert context.iteration_order.captured
+
+
 def test_static_recompute_and_manual_unshard_preserve_cursor(context):
     """Only execution demands consume static order; its phase selects the budget."""
     a, b = _Unit(context), _Unit(context)

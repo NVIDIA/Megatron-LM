@@ -16,8 +16,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 def _mfsdp_iteration(model, forward_only=False):
     """Manage one shared context across a complete scheduler invocation.
 
-    Nested calls join the active scope. CUDA graph schedules bypass capture
-    because their replay does not execute Python hooks.
+    Nested calls join the active scope. CUDA graph schedules gather on demand
+    because graph construction can invoke hooks outside the scheduler scope.
     """
     chunks = model if isinstance(model, list) else [model]
     # PP constructs every VPP chunk inside the same fully_shard_context.
@@ -34,7 +34,12 @@ def _mfsdp_iteration(model, forward_only=False):
         yield
         return
     config = getattr(chunks[0], "config", None)
-    if getattr(config, "cuda_graph_impl", "none") != "none" or context.iteration_order.active:
+    if context.iteration_order.active:
+        yield
+        return
+    if getattr(config, "cuda_graph_impl", "none") != "none":
+        # Keep graph warmups outside this scope off the construction-order cursor too.
+        context.iteration_order.mode = "demand"
         yield
         return
     forward_only = forward_only or not torch.is_grad_enabled()

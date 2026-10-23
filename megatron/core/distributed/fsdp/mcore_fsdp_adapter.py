@@ -709,7 +709,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     "caller_managed_grad_sync=True."
                 )
             construction_context = nullcontext(active_context)
-        with construction_context:
+        with construction_context as context:
+            if config.cuda_graph_impl != "none":
+                # Graph construction can invoke individual FSDP units outside a
+                # scheduler iteration. Keep those calls off the static cursor.
+                context.iteration_order.mode = "demand"
             if expert_dp_mesh is not None:
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
