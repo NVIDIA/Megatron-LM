@@ -138,6 +138,61 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+def test_batch_invariant_decode_step_replays():
+    """One buffered batch-invariant decode step (chunk scan in target-rows mode, gated by the
+    current token's z) replays bit-exact, including a slot that crosses a chunk boundary."""
+    from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
+        BatchInvariantDecodeBuffers,
+        batch_invariant_decode_buffered_scan,
+    )
+
+    seeded()
+    slots, nheads, headdim, ngroups, dstate, chunk = 8, 16, 64, 2, 128, 128
+    bufs = BatchInvariantDecodeBuffers.allocate(
+        slots, chunk, nheads, headdim, ngroups, dstate, torch.device("cuda"), torch.float32
+    )
+    rows = (bufs.x, bufs.dt, bufs.B, bufs.C)
+    for t in rows:
+        t.normal_()
+    num_buffered = torch.randint(0, chunk, (slots,), dtype=torch.int32, device="cuda")
+    num_buffered[0] = chunk - 1  # this step fills slot 0's chunk
+    batch_indices = torch.arange(slots, dtype=torch.int32, device="cuda")
+    step = [
+        torch.randn(slots, 1, *shape, device="cuda")
+        for shape in ((nheads, headdim), (nheads, headdim), (nheads,), (ngroups, dstate))
+    ]
+    C = torch.randn(slots, 1, ngroups, dstate, device="cuda")
+    A = -torch.rand(nheads, device="cuda") - 0.5
+    D = torch.randn(nheads, device="cuda")
+    dt_bias = torch.rand(nheads, device="cuda")
+    ssm_state = torch.randn(slots, nheads, headdim, dstate, device="cuda")
+
+    def fn(x_buf, dt_buf, B_buf, C_buf, num_buffered, x, z, dt, B, C, ssm_state):
+        buffers = BatchInvariantDecodeBuffers(
+            x=x_buf,
+            dt=dt_buf,
+            B=B_buf,
+            C=C_buf,
+            num_buffered=num_buffered,
+            out=torch.empty(slots, nheads, headdim, device="cuda"),
+            target_rows=torch.empty(slots, dtype=torch.int32, device="cuda"),
+            chunk_flags=torch.empty(slots, dtype=torch.int32, device="cuda"),
+            chunk_starts=torch.empty(slots, dtype=torch.int32, device="cuda"),
+        )
+        y = batch_invariant_decode_buffered_scan(
+            buffers, x, z, dt, B, C, A, D, dt_bias, batch_indices, ssm_state
+        )
+        return y, ssm_state, num_buffered
+
+    assert_replays_bit_exact(
+        fn,
+        (*rows, num_buffered, *step, C, ssm_state),
+        replays=4,
+        backward=False,
+        what="batch_invariant_decode_buffered_scan",
+    )
+
+
 def test_selective_state_update_replays():
     from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 
@@ -287,11 +342,11 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
-def _gdp_case():
+def _gdp_case(M=2):
     from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 
     seeded()
-    T, H, K, V, M = 4096, 16, 128, 128, 2
+    T, H, K, V = 4096, 16, 128, 128
     bounds = [0, 1000, 2500, 4096]
     q = torch.randn(1, T, H, K, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, T * M, H, K, device="cuda", dtype=torch.bfloat16)
@@ -341,10 +396,11 @@ def test_chunk_gated_delta_product_varlen_is_pinned(monkeypatch):
     "elements, max |diff| 3.6e-2 bf16; final state ~0.13%, 2.9e-4). Recorded for the hybrid "
     "model owners; not gated until root-caused.",
 )
-def test_chunk_gated_delta_product_varlen_replays():
-    fn, args = _gdp_case()
+@pytest.mark.parametrize("M", [1, 2])  # M=1 is GDN's dynamic-inference prefill
+def test_chunk_gated_delta_product_varlen_replays(M):
+    fn, args = _gdp_case(M)
     assert_replays_bit_exact(
-        fn, args, replays=4, backward=False, what="chunk_gated_delta_product_varlen"
+        fn, args, replays=4, backward=False, what=f"chunk_gated_delta_product_varlen (M={M})"
     )
 
 
