@@ -90,6 +90,16 @@ class BlendedMegatronDatasetConfig:
         Only this class's checks run here: they need no tokenizer. The subclasses' ``validate()``
         needs one, so it is not called from here; ``BlendedMegatronDatasetBuilder`` calls it before
         building. Nothing is assigned: ``mock`` and ``split_matrix`` follow from the fields.
+
+        TODO: remove this method once Megatron-Bridge no longer calls it. Megatron-LM itself does
+        not need a post-init anymore: ``validate()`` holds these checks and the builder runs it.
+        What keeps it is Megatron-Bridge's ``GPTDatasetConfig.finalize()``, which calls
+        ``super(MCoreGPTDatasetConfig, self).__post_init__()`` explicitly (an ``AttributeError``
+        without this method, since its loader mix-in defines none), and the Megatron Core
+        subclasses ``MaskedWordPieceDatasetConfig`` (BERT and T5 through it) and
+        ``MultimodalDatasetConfig``, which chain to it with ``super().__post_init__()``; those
+        four calls go in the same change. The construction-time rejection of an inconsistent
+        blend / split goes with it: the builder's ``validate()`` reports it instead.
         """
         BlendedMegatronDatasetConfig.validate(self)
         if self.blend_per_split is not None and any(self.blend_per_split):
