@@ -340,6 +340,7 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
 
     grouped_mlp = SimpleNamespace(
         _uses_mxfp8_weights=False,
+        _nvfp4_weights=None,
         _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
         _flashinfer_activation_type=object(),
