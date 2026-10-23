@@ -159,6 +159,32 @@ def test_expert_bias_dense_counts_match_bool_path(padding, deterministic):
     assert torch.equal(count(bool_map), expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_checkpointed_forward_routes_like_its_recompute():
+    """A checkpointed forward runs without grad and its recompute with grad: same top-k, bitwise."""
+    from megatron.core.tensor_parallel import random as tp_random
+
+    torch.manual_seed(0)
+    logits = torch.randn(4096, 128, device="cuda", dtype=torch.float32)
+
+    def route():
+        return moe_utils.topk_routing_with_score_function(
+            logits, 22, score_function="softmax", dense_output=True
+        )
+
+    tp_random._set_checkpointing()
+    try:
+        with torch.no_grad():
+            forward_probs, forward_indices = route()
+    finally:
+        tp_random._unset_checkpointing()
+    recompute_probs, recompute_indices = route()
+    assert torch.equal(forward_indices, recompute_indices)
+    assert torch.equal(
+        forward_probs.contiguous().view(torch.uint8), recompute_probs.contiguous().view(torch.uint8)
+    )
+
+
 class _ProcessGroup:
     def __init__(self, size):
         self._size = size

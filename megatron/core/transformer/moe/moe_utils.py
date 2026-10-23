@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel import (
     get_expert_parallel_rng_tracker_name,
 )
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.random import is_checkpointing
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
@@ -953,12 +954,16 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            # Sorting top-k turned off during inference
+            # Sorting top-k turned off during inference. A checkpointed forward runs without
+            # grad but must select like its recompute, which runs with grad: the top-k order
+            # sets the order of the probability normalization and of the expert-output sums.
             return torch.topk(
                 scores,
                 k=topk,
                 dim=1,
-                sorted=torch.is_grad_enabled() or is_batch_invariant_mode_enabled(),
+                sorted=torch.is_grad_enabled()
+                or is_checkpointing()
+                or is_batch_invariant_mode_enabled(),
             )
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):

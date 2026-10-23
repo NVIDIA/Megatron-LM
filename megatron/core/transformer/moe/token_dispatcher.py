@@ -72,6 +72,9 @@ class MoETokenDispatcher:
     MoE Token Dispatcher
     """
 
+    # Whether token_combine honors skip_combine_forward_comm.
+    supports_skip_combine_forward_comm = False
+
     def __init__(
         self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
@@ -86,6 +89,10 @@ class MoETokenDispatcher:
         self.shared_experts: Optional[SharedExpertMLP] = None
         # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
         self.use_nccl_stream = False  # Will be set to True when shared_experts is set.
+        # Set by the MoE layer while its checkpointed forward is re-run for the backward pass:
+        # the combine then returns zeros without communicating (its backward still
+        # communicates). Only read by dispatchers with supports_skip_combine_forward_comm.
+        self.skip_combine_forward_comm = False
 
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
@@ -250,6 +257,8 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     Note that this allgather spans the communication domain of TP*EP:
     """
 
+    supports_skip_combine_forward_comm = True
+
     def __init__(
         self,
         num_local_experts: int,
@@ -377,7 +386,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
+                hidden_states.to(self.local_probs.dtype),
+                group=self.tp_ep_group,
+                skip_forward=self.skip_combine_forward_comm,
             ).to(hidden_states.dtype)
         return hidden_states
 
@@ -399,6 +410,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     (6) token combine: A2A(EP)
     (7) combine postprocess: unpermute tokens
     """
+
+    supports_skip_combine_forward_comm = True
 
     # DtoH copies are performed on this stream for overlapping with the main stream.
     cuda_dtoh_stream = None
@@ -844,6 +857,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 hidden_states.to(self.probs.dtype),
                 group=self.tp_group,
                 input_split_sizes=input_split_sizes,
+                skip_forward=self.skip_combine_forward_comm,
             ).to(hidden_states.dtype)
 
         return hidden_states
@@ -881,6 +895,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.input_splits,
             self.output_splits,
             use_nccl_stream=self.use_nccl_stream,
+            skip_forward=self.skip_combine_forward_comm,
         )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
