@@ -590,6 +590,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
         cp_size_runtime = cp_group.size()
+        self._validate_max_cp_size(cp_size_runtime)
         back_to_input_converter = None
         if self.config.linear_cp_mode == "chunkwise":
             hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(

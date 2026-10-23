@@ -224,7 +224,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         assert pg_collection is not None, "pg_collection must be provided for a GDN-family layer"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
-        # Static/max CP size from model construction. Runtime dynamic CP paths must resolve
+        # Static CP size from model construction. Runtime dynamic CP paths must resolve
         # the effective group from packed_seq_params instead of using this value.
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
@@ -246,7 +246,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
         # Headwise CP shards heads over the CP group; chunkwise CP keeps heads local.
-        if self.config.linear_cp_mode == "headwise":
+        if self.config.dynamic_context_parallel and self.config.max_cp_size is not None:
+            self._validate_max_cp_size(self.config.max_cp_size)
+        elif self.config.linear_cp_mode == "headwise":
             num_key_heads_per_tp = self.num_key_heads // self.tp_size
             num_value_heads_per_tp = self.num_value_heads // self.tp_size
             assert num_key_heads_per_tp % self.cp_size == 0, (
@@ -375,6 +377,42 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
+
+    def _validate_max_cp_size(self, runtime_cp_size: int) -> None:
+        """Check the explicit DCP cap without changing static groups or parameter layouts."""
+        max_cp_size = self.config.max_cp_size
+        if not self.config.dynamic_context_parallel or max_cp_size is None:
+            return
+        if any(
+            heads <= 0 or heads % self.tp_size
+            for heads in (self.num_key_heads, self.num_value_heads)
+        ):
+            raise ValueError(
+                "GDN-family key/value head counts must be positive and divisible by the "
+                f"actual TP size: TP={self.tp_size}, key_heads={self.num_key_heads}, "
+                f"value_heads={self.num_value_heads}. GDN-family layers do not replicate heads."
+            )
+        if runtime_cp_size > max_cp_size:
+            raise ValueError(
+                f"GDN-family runtime CP size {runtime_cp_size} exceeds "
+                f"max_cp_size={max_cp_size}; static_cp_size={self.cp_size}. "
+                "Use runtime groups within this cap."
+            )
+        if self.config.linear_cp_mode == "headwise":
+            key_heads = self.num_key_heads // self.tp_size
+            value_heads = self.num_value_heads // self.tp_size
+            if any(
+                heads % max_cp_size or heads % runtime_cp_size for heads in (key_heads, value_heads)
+            ):
+                raise ValueError(
+                    "linear_cp_mode='headwise' requires TP-local key/value head counts "
+                    "to be divisible by max_cp_size and the effective CP group size. "
+                    f"TP={self.tp_size}, local_key_heads={key_heads}, "
+                    f"local_value_heads={value_heads}, static_cp_size={self.cp_size}, "
+                    f"max_cp_size={max_cp_size}, effective_cp_size={runtime_cp_size}. "
+                    "Choose a compatible max_cp_size or TP configuration, "
+                    "or explicitly select linear_cp_mode='chunkwise'."
+                )
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor

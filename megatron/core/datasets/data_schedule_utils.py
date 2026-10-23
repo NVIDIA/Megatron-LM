@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from collections import Counter
 from math import ceil, lcm, log2
 from typing import Dict, List, Literal, Optional, Sequence, Tuple, TypeVar
 
@@ -739,6 +740,46 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
 # =============================================================================
 
 
+def _validate_dynamic_cp_max_size(
+    max_cp_size: int | None, min_cp_size: int, total_gpus: int
+) -> None:
+    """Validate an explicit CP cap against the actual DPxCP rank count."""
+    if max_cp_size is None:
+        return
+    if type(max_cp_size) is not int or max_cp_size < 1 or max_cp_size & (max_cp_size - 1):
+        raise ValueError(f"max_cp_size must be a positive power of two, got {max_cp_size!r}.")
+    if max_cp_size > total_gpus or total_gpus % max_cp_size:
+        raise ValueError(
+            f"max_cp_size={max_cp_size} must divide DPxCP size={total_gpus} and not exceed it."
+        )
+    if type(min_cp_size) is not int or min_cp_size < 1 or min_cp_size & (min_cp_size - 1):
+        raise ValueError(
+            "min_cp_size must be a positive power of two when max_cp_size is set, "
+            f"got {min_cp_size!r}."
+        )
+    if min_cp_size > max_cp_size:
+        raise ValueError(f"min_cp_size={min_cp_size} exceeds max_cp_size={max_cp_size}.")
+
+
+def _validate_dynamic_cp_output(
+    sample_id_groups: List[List[List[int]]], max_cp_size: int | None, stage: str
+) -> None:
+    """Reject a final schedule that expanded beyond an explicit CP cap."""
+    if max_cp_size is None:
+        return
+    for sample_ids_per_gpu in sample_id_groups:
+        rank_counts = Counter(sid for ids in sample_ids_per_gpu for sid in set(ids))
+        effective_cp_size = max(rank_counts.values(), default=0)
+        if effective_cp_size > max_cp_size:
+            raise ValueError(
+                f"DCP {stage} produced effective_cp_size={effective_cp_size} above "
+                f"max_cp_size={max_cp_size}: known CP expansion issue. "
+                "Raise or remove the cap only if the model supports it. If head divisibility "
+                "limits pure a2a or GDN headwise CP, explicitly select p2p or chunkwise, "
+                "respectively, before increasing the cap."
+            )
+
+
 def next_hdp_group_packing_aware(
     sample_seqlens: List[Tuple[int, int]],
     total_gpus: int,
@@ -746,6 +787,7 @@ def next_hdp_group_packing_aware(
     min_cp_size: int = 1,
     cp_group_sizes: Optional[Sequence[int]] = None,
     pad_sequences: bool = False,
+    max_cp_size: int | None = None,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -759,7 +801,8 @@ def next_hdp_group_packing_aware(
     The scheduler keeps the legacy invariant that each returned microbatch has
     no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank.
+    every rank. An explicit ``max_cp_size`` bounds candidate groups; an existing
+    fill or expansion path that exceeds it is rejected before returning.
     """
     valid_group_sizes: List[int] = get_valid_dynamic_context_parallel_group_sizes(total_gpus)
     if cp_group_sizes is None:
@@ -779,6 +822,8 @@ def next_hdp_group_packing_aware(
         )
     enabled_cp_sizes = tuple(size for size in cp_group_sizes if size >= min_cp_size)
 
+    _validate_dynamic_cp_max_size(max_cp_size, min_cp_size, total_gpus)
+    cp_limit = total_gpus if max_cp_size is None else max_cp_size
     if not sample_seqlens:
         return (
             [[] for _ in range(total_gpus)],
@@ -818,6 +863,15 @@ def next_hdp_group_packing_aware(
 
     sample_id, seq_len = sample_seqlens[0]
     cp_size = cp_min_fn(seq_len)
+    if max_cp_size is not None and cp_size > cp_limit:
+        raise ValueError(
+            f"Cannot schedule seq_len={seq_len}: required_cp_size={cp_size}, "
+            f"max_cp_size={max_cp_size}, DPxCP size={total_gpus}, "
+            f"max_seq_len_per_rank={max_seq_len_per_rank}. The available GPUs or explicit "
+            "CP cap (possibly limited by A2A/headwise heads) cannot fit this sequence at "
+            "the current per-rank token limit. Increase the token limit, shorten the "
+            "sequence, or increase the cap only if the model and available GPUs permit it."
+        )
     assert cp_size <= total_gpus, (
         f"Sequence length {seq_len} requires CP size {cp_size}, "
         f"but only {total_gpus} DPxCP ranks are available."
@@ -841,6 +895,8 @@ def next_hdp_group_packing_aware(
         best = None
 
         for cp_size in enabled_cp_sizes:
+            if cp_size > cp_limit:
+                break
             if cp_size < min_needed or per_rank_length(seq_len, cp_size) > max_seq_len_per_rank:
                 continue
             per_gpu_cost = workload(seq_len, cp_size)
@@ -1031,6 +1087,7 @@ def next_hdp_group_packing_aware(
             fill_with_full_dpxcp_group()
             break
 
+    _validate_dynamic_cp_output([sample_ids_per_gpu], max_cp_size, "packing/fill")
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 

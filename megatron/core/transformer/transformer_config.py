@@ -2661,10 +2661,47 @@ class TransformerConfig(ModelParallelConfig):
             # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank. GDN2 has no
             # chunkwise path and always splits its heads across CP ranks.
             linear_head_parallel_size = self.tensor_model_parallel_size
-            if self.context_parallel_size > 1 and (
+            linear_cp_size = self.context_parallel_size
+            if self.dynamic_context_parallel and self.max_cp_size is not None:
+                # Hybrid/custom layer layouts are checked by the actual GDN constructor.
+                # Do not impose GDN's CP constraint on an all-SDPA GPT pattern.
+                has_linear_layers = not self.is_hybrid_model and (
+                    (
+                        isinstance(self.linear_attention_freq, int)
+                        and self.linear_attention_freq > 1
+                        and self.num_layers > 0
+                    )
+                    or (
+                        isinstance(self.linear_attention_freq, list)
+                        and 1 in self.linear_attention_freq
+                    )
+                )
+                linear_cp_size = self.max_cp_size if has_linear_layers else 1
+            if linear_cp_size > 1 and (
                 self.linear_cp_mode == "headwise" or self.experimental_attention_variant == "gdn2"
             ):
-                linear_head_parallel_size *= self.context_parallel_size
+                linear_head_parallel_size *= linear_cp_size
+            if (
+                self.dynamic_context_parallel
+                and self.max_cp_size is not None
+                and linear_cp_size == self.max_cp_size
+                and self.linear_cp_mode == "headwise"
+                and (
+                    self.linear_num_key_heads % linear_head_parallel_size
+                    or self.linear_num_value_heads % linear_head_parallel_size
+                )
+            ):
+                raise ValueError(
+                    "GDN-family headwise DCP requires key/value heads divisible by "
+                    f"TP * max_cp_size ({linear_head_parallel_size}). "
+                    f"Got key_heads={self.linear_num_key_heads}, "
+                    f"value_heads={self.linear_num_value_heads}, "
+                    f"TP={self.tensor_model_parallel_size}, max_cp_size={self.max_cp_size}, "
+                    f"static context_parallel_size={self.context_parallel_size}. "
+                    "DCP schedules runtime groups up to max_cp_size, independently of static CP. "
+                    "Choose a compatible max_cp_size/TP or linear_cp_mode='chunkwise'; "
+                    "cp_comm_type='p2p' does not disable GDN headwise A2A."
+                )
             assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "

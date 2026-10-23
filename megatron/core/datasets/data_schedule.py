@@ -9,6 +9,8 @@ import torch
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.datasets.data_schedule_utils import (
+    _validate_dynamic_cp_max_size,
+    _validate_dynamic_cp_output,
     align_sample_id_groups,
     broadcast_scalars,
     broadcast_tensor,
@@ -437,8 +439,13 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
     """Balance packed samples while selecting a runtime CP size per microbatch."""
 
     def __init__(
-        self, *args, min_cp_size: int = 1, cp_group_sizes: Sequence[int] | None = None, **kwargs
-    ):
+        self,
+        *args,
+        min_cp_size: int = 1,
+        cp_group_sizes: Sequence[int] | None = None,
+        max_cp_size: int | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.total_dpxcp_ranks = self.dp_size * self.cp_size
@@ -457,6 +464,8 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 f"{self.total_dpxcp_ranks}; expected one of {list(self.cp_group_sizes)}"
             )
         self.min_cp_size = min_cp_size
+        _validate_dynamic_cp_max_size(max_cp_size, min_cp_size, self.total_dpxcp_ranks)
+        self.max_cp_size = max_cp_size
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda item: item[1], reverse=True)
@@ -471,6 +480,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 min_cp_size=self.min_cp_size,
                 cp_group_sizes=self.cp_group_sizes,
                 pad_sequences=self.pad_sequences,
+                max_cp_size=self.max_cp_size,
             )
             sample_id_groups.append(sample_ids)
 
@@ -487,6 +497,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 pad_sequences=self.pad_sequences,
             )
 
+        _validate_dynamic_cp_output(sample_id_groups, self.max_cp_size, "final/VPP alignment")
         return sample_id_groups
 
 
@@ -570,6 +581,11 @@ def wrap_data_iterator(
         # (dynamic_context_parallel=False), which the config keeps legal. Initialization creates
         # no runtime CP groups in that mode, so the scheduler derives its candidate sizes from
         # the DPxCP grid and the consumer keeps the static CP group.
+        scheduler_kwargs["max_cp_size"] = (
+            getattr(config, "max_cp_size", None)
+            if getattr(config, "dynamic_context_parallel", False)
+            else None
+        )
 
     capacity = config.max_seqlen_per_dp_cp_rank
     alignment, pad_enabled = get_packed_sequence_alignment(config, tp_group.size())
