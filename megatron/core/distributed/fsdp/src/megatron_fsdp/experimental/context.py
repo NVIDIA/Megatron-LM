@@ -21,7 +21,6 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .dbuffer import DBuffer
 from .execution_order import ExecutionOrder
 
 _FSDP_CONTEXT = ContextVar["FsdpContext | None"]("mfsdp_context", default=None)
@@ -57,10 +56,6 @@ class FsdpContext:
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
     _post_backward_hook_registered: bool
-    # Fused-wgrad reduce-scatter inputs whose reductions may still be running. They are dropped
-    # only after the current stream has waited for the reduce-scatter stream, so each buffer is
-    # freed on the stream that allocated it without record_stream().
-    _pending_fused_grad_buffers: list[DBuffer]
 
     def __init__(
         self,
@@ -107,7 +102,6 @@ class FsdpContext:
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
-        self._pending_fused_grad_buffers = []
         # Construction-only; empty after finalization.
         self._registered_modules: list[nn.Module] = []
         self._roots = WeakKeyDictionary()
@@ -198,18 +192,6 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    def defer_fused_grad_buffer(self, buffer: DBuffer) -> None:
-        """Keep a fused gradient buffer alive until its reduce-scatter has completed."""
-        self._pending_fused_grad_buffers.append(buffer)
-
-    def release_fused_grad_buffers(self) -> None:
-        """Drop deferred fused gradient buffers.
-
-        Callers must first make the current stream wait for the reduce-scatter stream, so the
-        compute stream that allocated these buffers can safely reuse their memory.
-        """
-        self._pending_fused_grad_buffers.clear()
-
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
         if self.caller_managed_grad_sync or self._post_backward_hook_registered:
@@ -227,11 +209,8 @@ class FsdpContext:
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
-        It also releases deferred fused gradient buffers, which the current stream can
-        reuse once it has waited for their reductions.
         """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
-        self.release_fused_grad_buffers()
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""

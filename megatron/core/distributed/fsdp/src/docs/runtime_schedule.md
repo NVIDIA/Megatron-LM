@@ -63,18 +63,27 @@ with a record-and-replay mechanism.
 ## Fused Weight Gradients
 
 Transformer Engine modules built with `fuse_wgrad_accumulation=True` write their weight
-gradients into `weight.main_grad` during backward instead of returning them to autograd. For
-parameter groups with such weights, the reduce-scatter input is allocated and zeroed on the
-compute stream when the module's own backward starts (not while a checkpointed region is
-recomputed), and its views are exposed as `main_grad`. Post-backward adds any autograd
-gradients, removes `main_grad`, and hands the buffer to the reduce-scatter stream as before.
-Because the buffer was allocated on the compute stream, it is released only after the compute
-stream's next wait on the reduce-scatter stream (the next module's reduction or
-`finish_grad_sync()` at the end of backward), so allocation and deallocation stay on one stream
-without `record_stream`. Up to two such buffers are alive at once: one being reduced and one
-being filled. With delayed weight-gradient computation (`delay_wgrad_compute=True`), a module's
-buffer instead lives until its `backward_dw()` has run and the next reduction or
-`finish_grad_sync()` after that has waited for it.
+gradients into `weight.main_grad` during backward instead of returning them to autograd, so
+their reduce-scatter input must exist before the module's backward starts and there is no
+CI\_i to wait on AI\_i. To keep Bwd\_i overlapping RS\_{i+1}, AI\_{i-1} moves into the
+backward prefetch: when layer i's backward starts, besides prefetching AG\_{i-1}, it allocates
+and zeroes layer i-1's reduce-scatter input on the reduce-scatter stream and records an
+event. That is queued before RS\_i, so the buffer is freed right after RS\_{i-1}, like any
+other reduce-scatter input. Only the next module's buffer is allocated, whatever the prefetch
+budget, so at most two are alive: one being filled and one being reduced.
+
+When layer i-1's backward starts, the compute stream waits for that event and then exposes
+the buffer's views as `main_grad`. In the layer-to-layer schedule this wait lands where the
+copy path waits before CI. It is needed even when the order is right: the backward order lists
+a parent before its children, and nothing guarantees that a post-backward wait runs between a
+parent's allocation for its last child and that child's backward. The first module in backward
+order has no predecessor and allocates its own buffer the same way. Post-backward adds any
+autograd gradients (biases, LayerNorm, unfused weights) into the buffer, removes `main_grad`
+and launches the reduce-scatter.
+
+A checkpointed region is recomputed before its modules' backward; recomputation sets no
+`main_grad`. With delayed weight-gradient computation (`delay_wgrad_compute=True`), a
+module's buffer lives until its `backward_dw()` has run.
 
 # Alternatives considered
 

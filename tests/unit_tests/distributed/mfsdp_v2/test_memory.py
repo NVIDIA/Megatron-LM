@@ -391,7 +391,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_
     "caller_managed_grad_sync", [False, True], ids=["autograd_callback", "caller_managed"]
 )
 def test_fused_wgrad_releases_buffers(distributed_setup, caller_managed_grad_sync):
-    """No fused gradient buffer outlives the gradient synchronization that follows its backward."""
+    """No fused gradient buffer outlives its backward, whoever synchronizes gradients."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = nn.Sequential(
@@ -414,7 +414,9 @@ def test_fused_wgrad_releases_buffers(distributed_setup, caller_managed_grad_syn
         if caller_managed_grad_sync:
             context.finish_grad_sync()
         optimizer.step()
-        assert context._pending_fused_grad_buffers == []
+        assert all(
+            group._fused_grad_buffer is None for layer in model for group in layer.parameter_groups
+        )
         torch.cuda.synchronize(device)
         allocated.append(torch.cuda.memory_allocated(device))
     assert allocated[1] == allocated[2]

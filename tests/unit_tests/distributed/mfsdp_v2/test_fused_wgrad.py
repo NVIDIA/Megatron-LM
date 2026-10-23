@@ -95,26 +95,29 @@ def _fused_layer_norm_linear_group(distributed_setup):
     return model, group, unsharded
 
 
-def test_fused_grad_buffer_prepare_and_take(distributed_setup):
-    """prepare exposes zeroed fused views; take packs autograd gradients and drops main_grad."""
+def test_fused_grad_buffer_allocate_set_and_take(distributed_setup):
+    """allocate zeroes the buffer, set exposes fused views, take packs grads and drops main_grad."""
     _model, group, unsharded = _fused_layer_norm_linear_group(distributed_setup)
     unfused_names = ("layer_norm_weight", "layer_norm_bias", "bias")
 
-    group.prepare_fused_grad_buffer()
+    with pytest.raises(RuntimeError, match="not allocated"):
+        group.set_fused_main_grads()
+    group.allocate_fused_grad_buffer()
+    buffer = group._fused_grad_buffer
+    # A second allocation before the buffer is taken, e.g. from another unshard(), keeps it.
+    group.allocate_fused_grad_buffer()
+    assert group._fused_grad_buffer is buffer
+    group.set_fused_main_grads()
     main_grad = unsharded["weight"].main_grad
     assert main_grad.shape == unsharded["weight"].shape
     assert main_grad.dtype == group.grad_comm_dtype
     assert torch.count_nonzero(main_grad) == 0
     assert not any(hasattr(unsharded[name], "main_grad") for name in unfused_names)
 
-    # A second prepare in the same backward, e.g. from another unshard(), keeps the buffer.
-    group.prepare_fused_grad_buffer()
-    assert unsharded["weight"].main_grad is main_grad
-
     main_grad.fill_(1.0)  # Stands in for TE's fused wgrad GEMM.
     for name in unfused_names:
         unsharded[name].grad = torch.full_like(unsharded[name], 2.0)
-    buffer = group.take_fused_grad_buffer()
+    assert group.take_fused_grad_buffer() is buffer
 
     assert not any(hasattr(parameter, "main_grad") for parameter in unsharded.values())
     assert all(parameter.grad is None for parameter in unsharded.values())
@@ -125,14 +128,15 @@ def test_fused_grad_buffer_prepare_and_take(distributed_setup):
     torch.testing.assert_close(views["weight"], torch.ones_like(views["weight"]))
     for name in unfused_names:
         torch.testing.assert_close(views[name], torch.full_like(views[name], 2.0))
-    with pytest.raises(RuntimeError, match="not prepared"):
+    with pytest.raises(RuntimeError, match="not allocated"):
         group.take_fused_grad_buffer()
 
 
 def test_fused_grad_buffer_requires_unfused_gradients(distributed_setup):
     """An unfused parameter without a gradient is an error, as on the copy path."""
     _model, group, unsharded = _fused_layer_norm_linear_group(distributed_setup)
-    group.prepare_fused_grad_buffer()
+    group.allocate_fused_grad_buffer()
+    group.set_fused_main_grads()
     unsharded["layer_norm_weight"].grad = torch.ones_like(unsharded["layer_norm_weight"])
     unsharded["layer_norm_bias"].grad = torch.ones_like(unsharded["layer_norm_bias"])
     with pytest.raises(RuntimeError, match="Missing gradient"):
@@ -302,18 +306,16 @@ def test_fused_wgrad_main_grad_only_exists_during_backward(distributed_setup):
     assert with_main_grad("") == set()
     loss.backward()
 
-    # When the second layer's backward starts, only its own fused weight is exposed; prefetching
-    # the first layer must not prepare its buffer.
+    # When the second layer's backward starts, only its own fused weight is exposed: prefetching
+    # allocates the first layer's buffer, but main_grad is set only when that backward starts.
     assert seen["second"] == {"second.weight"}
     assert seen["first"] == {"first.weight"}
     assert with_main_grad("") == set()
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
-def test_fused_wgrad_recompute_prepares_each_buffer_at_its_backward(
-    distributed_setup, use_reentrant
-):
-    """Recomputing a checkpointed region prepares no buffer before its module's backward."""
+def test_fused_wgrad_recompute_sets_main_grad_at_each_backward(distributed_setup, use_reentrant):
+    """Recomputing a checkpointed region sets no main_grad before its module's backward."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = _FusedWgradModel(device, torch.float32, fuse_first=True, fuse_second=True)
@@ -334,14 +336,14 @@ def test_fused_wgrad_recompute_prepares_each_buffer_at_its_backward(
     ]
 
     # The second layer's bias gradient lands after the region's recompute and before the first
-    # layer's backward starts, so the first layer's buffer must not exist yet.
-    first_prepared = []
+    # layer's backward starts, so the first layer's main_grad must not be set yet.
+    first_has_main_grad = []
     second_bias.register_post_accumulate_grad_hook(
-        lambda _parameter: first_prepared.append(hasattr(first_weight, "main_grad"))
+        lambda _parameter: first_has_main_grad.append(hasattr(first_weight, "main_grad"))
     )
     x = torch.randn(4, 16, device=device, requires_grad=True)
     checkpoint(model, x, use_reentrant=use_reentrant).square().mean().backward()
-    assert first_prepared == [False]
+    assert first_has_main_grad == [False]
 
 
 def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
