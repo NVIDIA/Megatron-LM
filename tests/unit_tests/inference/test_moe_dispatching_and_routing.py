@@ -1273,6 +1273,7 @@ class TestNVLSAllGatherVDispatcher:
         assert value_passes["value"] == 1, "training did not run the FlashInfer value pass"
         torch.testing.assert_close(training_output, inference_output, atol=0, rtol=0)
 
+
 # ──────────────────────────────────────────────────────────────────────
 # symmetric-memory collective ordering (explicit barrier-before-reuse)
 # ──────────────────────────────────────────────────────────────────────

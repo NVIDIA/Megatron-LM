@@ -872,9 +872,7 @@ class MoELayer(BaseMoELayer):
                         # wrong answer. The NCCL dispatcher sizes itself from the
                         # tensor and tolerates the dense form, but would then be
                         # gathering something generation never gathers.
-                        routing_map, probs = self.experts._dense_routing_to_topk(
-                            routing_map, probs
-                        )
+                        routing_map, probs = self.experts._dense_routing_to_topk(routing_map, probs)
                     hidden_states, probs = self.preprocess(
                         layer_input, probs, routing_map, padding_mask
                     )

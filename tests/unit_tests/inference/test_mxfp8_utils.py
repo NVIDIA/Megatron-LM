@@ -1234,7 +1234,9 @@ def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features, num_exper
     linear = torch.nn.Module()
     for expert in range(num_experts):
         weight = torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16)
-        setattr(linear, f"weight{expert}", torch.nn.Parameter(quantizer(weight), requires_grad=False))
+        setattr(
+            linear, f"weight{expert}", torch.nn.Parameter(quantizer(weight), requires_grad=False)
+        )
     return linear
 
 
@@ -1312,12 +1314,8 @@ def test_training_mxfp8_stack_matches_generation():
     assert training.scale.shape == generation.scale.shape
     # A mismatch here means the value pass feeds the kernel different weights
     # than generation, which is the parity claim failing at its root.
-    torch.testing.assert_close(
-        as_bytes(training.data), as_bytes(generation.data), atol=0, rtol=0
-    )
-    torch.testing.assert_close(
-        as_bytes(training.scale), as_bytes(generation.scale), atol=0, rtol=0
-    )
+    torch.testing.assert_close(as_bytes(training.data), as_bytes(generation.data), atol=0, rtol=0)
+    torch.testing.assert_close(as_bytes(training.scale), as_bytes(generation.scale), atol=0, rtol=0)
 
 
 @pytest.mark.launch_on_gb200
