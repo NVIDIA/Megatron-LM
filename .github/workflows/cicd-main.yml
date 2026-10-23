@@ -209,7 +209,6 @@ jobs:
       h100_gpu_runs_on: ${{ steps.configure.outputs.h100_gpu_runs_on }}
       h100_registry: ${{ steps.configure.outputs.h100_registry }}
       h100_use_gcp: ${{ steps.configure.outputs.h100_use_gcp }}
-      gb200_container_image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ steps.resolve-sha.outputs.sha }}-gb-gpu
       dev:            ${{ steps.configure.outputs.dev }}
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
@@ -938,17 +937,17 @@ jobs:
       source-sha: ${{ needs.configure.outputs.sha }}
       lts: ${{ needs.configure.outputs.lts == 'true' }}
 
-  cicd-unit-tests-latest:
+  cicd-parse-unit-tests:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
     needs:
-      - is-not-external-contributor
       - pre-flight
       - configure
       - cicd-wait-in-queue
       - cicd-container-build
-    name: Unit tests (H100)
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
-      && needs.pre-flight.result != 'cancelled'
+      needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -959,8 +958,43 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-latest:
+    needs:
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests
+    name: Unit tests (H100)
+    if: |
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-parse-unit-tests.result != 'cancelled'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
     uses: ./.github/workflows/_unit-tests.yml
     with:
+      buckets: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests }}
       runner: ${{ needs.configure.outputs.h100_gpu_runs_on }}
       container-image: ${{ format('{0}/megatron-lm:{1}-{2}', needs.configure.outputs.h100_registry, needs.configure.outputs.sha, needs.configure.outputs.h100_cloud) }}
       sha: ${{ needs.configure.outputs.sha }}
@@ -968,17 +1002,19 @@ jobs:
       unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
       unit_test_pr_files_artifact_id: ${{ needs.configure.outputs.unit_test_pr_files_artifact_id }}
 
-  cicd-unit-tests-latest-gb200:
+  cicd-parse-unit-tests-gb200:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
+      container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
     needs:
       - is-not-external-contributor
       - pre-flight
       - configure
       - cicd-wait-in-queue
       - cicd-container-build
-    name: Unit tests (GB200)
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
-      && needs.pre-flight.result != 'cancelled'
+      needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
@@ -991,10 +1027,47 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
+          echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-latest-gb200:
+    needs:
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests-gb200
+    name: Unit tests (GB200)
+    if: |
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-parse-unit-tests-gb200.result == 'success'
+      && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && vars.ENABLE_GB200_TESTING == 'true'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
     uses: ./.github/workflows/_unit-tests.yml
     with:
+      buckets: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 }}
       runner: ${{ toJSON(needs.is-not-external-contributor.outputs.selected_runner_gb200) }}
-      container-image: ${{ needs.configure.outputs.gb200_container_image }}
+      container-image: ${{ needs.cicd-parse-unit-tests-gb200.outputs.container-image }}
       platform: dgx_gb200
       sha: ${{ needs.configure.outputs.sha }}
       unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
@@ -1436,7 +1509,7 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-unit-tests-latest, cicd-unit-tests-latest-gb200]
+    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
@@ -1470,8 +1543,8 @@ jobs:
         id: coverage
         env:
           SELECTIVE: ${{ needs.configure.outputs.unit_testmon_eligible }}
-          H100_BUCKETS: ${{ needs.cicd-unit-tests-latest.outputs.unit-tests || '[]' }}
-          GB200_BUCKETS: ${{ needs.cicd-unit-tests-latest-gb200.outputs.unit-tests || '[]' }}
+          H100_BUCKETS: ${{ needs.cicd-parse-unit-tests.outputs.unit-tests || '[]' }}
+          GB200_BUCKETS: ${{ needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200 || '[]' }}
           SOURCE_SHA: ${{ needs.configure.outputs.sha }}
         run: |
           python - <<'PY'

@@ -4,11 +4,11 @@ name: Unit tests
 
 on:
   workflow_call:
-    outputs:
-      unit-tests:
-        description: Complete recipe bucket list for coverage validation
-        value: ${{ jobs.select.outputs.unit-tests }}
     inputs:
+      buckets:
+        description: JSON-encoded recipe bucket list
+        type: string
+        required: true
       platform:
         type: string
         default: dgx_h100
@@ -38,12 +38,12 @@ permissions:
 
 jobs:
   select:
-    name: ${{ inputs.unit_testmon_mode == 'enforce' && 'unit tests selection' || 'Parse unit tests' }}
+    name: unit tests selection
+    if: inputs.unit_testmon_mode == 'enforce'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      unit-tests: ${{ steps.parse-unit-tests.outputs.unit-tests }}
       matrix: ${{ steps.plan.outputs.matrix }}
       has_tests: ${{ steps.plan.outputs.has_tests }}
     steps:
@@ -54,24 +54,14 @@ jobs:
         with:
           ref: ${{ inputs.sha }}
 
-      - name: Parse unit tests
-        id: parse-unit-tests
-        env:
-          RECIPE_PLATFORM: ${{ inputs.platform }}
-        run: |
-          cat "tests/test_utils/recipes/${RECIPE_PLATFORM#dgx_}/unit-tests.yaml" | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
-          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
-
       - name: Setup Python
         id: python
-        if: inputs.unit_testmon_mode == 'enforce'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
       - name: Install selection dependencies
         id: dependencies
-        if: inputs.unit_testmon_mode == 'enforce'
         run: |
           python -m pip install 'pytest-testmon==2.2.0' PyYAML
           npm install --prefix "$RUNNER_TEMP/testmon" --no-package-lock --ignore-scripts --no-audit --no-fund \
@@ -79,7 +69,6 @@ jobs:
 
       - name: Match the baseline cache compression
         id: cache-compression
-        if: inputs.unit_testmon_mode == 'enforce'
         shell: bash -e -u -o pipefail {0}
         run: |
           # GPU runners publish gzip caches. actions/cache includes compression
@@ -92,7 +81,6 @@ jobs:
 
       - name: Prepare PR file download
         id: pr-files-directory
-        if: inputs.unit_testmon_mode == 'enforce'
         shell: bash -e -u -o pipefail {0}
         run: |
           PR_FILES_DIR=$(mktemp -d "$RUNNER_TEMP/unit-test-pr-files.XXXXXX")
@@ -100,7 +88,7 @@ jobs:
 
       - name: Download PR files for mandatory unit tests
         id: pr-files
-        if: inputs.unit_testmon_mode == 'enforce' && inputs.unit_test_pr_files_artifact_id != ''
+        if: inputs.unit_test_pr_files_artifact_id != ''
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         continue-on-error: true
         with:
@@ -110,10 +98,9 @@ jobs:
 
       - name: Select affected tests for all buckets
         id: plan
-        if: inputs.unit_testmon_mode == 'enforce'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
-          BUCKETS: ${{ steps.parse-unit-tests.outputs.unit-tests }}
+          BUCKETS: ${{ inputs.buckets }}
           RECIPE_PLATFORM: ${{ inputs.platform }}
           SOURCE_SHA: ${{ inputs.sha }}
           TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
@@ -145,11 +132,11 @@ jobs:
     needs: select
     # CPU failures stop GPU dispatch; empty selections never allocate a GPU.
     # Explicit full-suite requests bypass selective planning.
-    if: ${{ !cancelled() && needs.select.result == 'success' && (inputs.unit_testmon_mode != 'enforce' || needs.select.outputs.has_tests == 'true') }}
+    if: ${{ !cancelled() && (inputs.unit_testmon_mode != 'enforce' || (needs.select.result == 'success' && needs.select.outputs.has_tests == 'true')) }}
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.select.outputs.matrix || needs.select.outputs.unit-tests) }}
+        include: ${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 60
     env:
