@@ -1042,7 +1042,7 @@ def test_generated_mock_tokens_stay_within_tokenizer_vocab(
     low_level_dataset = dataset_cls.build_low_level_dataset("", config)
     tokens = low_level_dataset[0]
 
-    assert tokens.size == 19
+    assert tokens.size == 20
     assert tokens.min() >= 1
     assert tokens.max() < tokenizer.vocab_size
     assert tokens[:9].tolist() == [1, 2, 3, 4, 5, 6, 7, 1, 2]
@@ -1358,11 +1358,11 @@ def test_mock_getitem_truncates_long_sample():
     tok = _FakeTokenizer(eod=0, pad=None)
     ds = _make_mock_varlen([np.arange(1, 10, dtype=np.int64)], _make_config(tok, seq_length=4))
     out = ds[0]
-    # Keeps sequence_length - 1 ids plus EOD, then applies the next-token shift.
-    assert out["tokens"].tolist() == [1, 2, 3]
-    assert out["labels"].tolist() == [2, 3, 0]
-    assert out["loss_mask"].tolist() == [1.0, 1.0, 1.0]
-    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 3
+    # Keeps sequence_length content ids plus EOD before the next-token shift.
+    assert out["tokens"].tolist() == [1, 2, 3, 4]
+    assert out["labels"].tolist() == [2, 3, 4, 0]
+    assert out["loss_mask"].tolist() == [1.0, 1.0, 1.0, 1.0]
+    assert int(out["original_seq_len"].item()) == int(out["padded_seq_len"].item()) == 4
 
 
 # ----------------------------------------------------------------------------
