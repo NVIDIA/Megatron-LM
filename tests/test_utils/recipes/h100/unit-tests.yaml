@@ -51,6 +51,9 @@ spec:
     # test_gtp_muon.py/test_gtp_muon_qkv.py, and will skip here instead).
     if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" ]]; then
         export GPUS_PER_NODE=4
+    elif [[ "$BUCKET" == "tests/unit_tests/inference/engines/test_batch_invariant_handoff.py" ]]; then
+        # One prefill worker and one decode worker exchange a real NIXL handoff.
+        export GPUS_PER_NODE=2
     fi
 
     if [[ "$TAG" == "latest" ]]; then
@@ -59,12 +62,24 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    case "$BUCKET" in
+      tests/unit_tests/inference/test_batch_invariant_fp8.py)
+        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
+          h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
+        ;;
+      tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
+        bash "$TEST_PATH/tests/test_utils/run_disagg_pairwise.sh" \
+          "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "$BUCKET" "{assets_dir}/logs/1/"
+        ;;
+      *)
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+        ;;
+    esac
 
     ls -al 
 
@@ -78,6 +93,23 @@ spec:
     fi
 
 products:
+  # Run the two-worker handoff separately; the broad inference bucket excludes it.
+  - test_case: [tests/unit_tests/inference/engines/test_batch_invariant_handoff.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  # This file runs in isolated one-rank processes; other buckets exclude it.
+  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ops/**/*.py]
     products:
       - environment: [lts, dev]
@@ -184,6 +216,20 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/inference/test_hybrid_moe.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]

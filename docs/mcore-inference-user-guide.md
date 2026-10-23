@@ -454,6 +454,12 @@ prompt top-N log-probs, are always raw in both modes, because prompt tokens were
 not sampled from the processed distribution.
 `'processed_logprobs'` is not yet supported with speculative decoding.
 
+With prefix caching, prompt log-probs are cached on the KV blocks of the
+tokens that produced them, so a request that returns prompt log-probs can
+still skip a cached prefix. It skips only the blocks whose cached rows cover
+its `top_n_logprobs`, and computes the rest. Requests with `top_n_logprobs`
+above 100 share cached KV but compute every prompt token.
+
 ### Engine Configuration
 
 `InferenceConfig` configures the engine, KV-cache, and CUDA-graph behavior and is
