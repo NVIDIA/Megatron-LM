@@ -302,9 +302,11 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
 @trace_async_exceptions
 async def run_text_generation_server(
     engine: DynamicInferenceEngine,
-    coordinator_port: int,
+    coordinator_port: int | None,
     server_port: int,
     hostname: str | None = None,
+    parsers: list[str] | None = None,
+    verbose: bool = False,
     chat_template: str | None = None,
     default_temperature: float | None = None,
     default_top_p: float | None = None,
@@ -329,6 +331,7 @@ async def run_text_generation_server(
         eval_mode (bool): Whether to use evaluation response defaults.
     """
 
+    args = get_args()
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
@@ -367,10 +370,10 @@ async def run_text_generation_server(
             url = start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
-                parsers=args.parsers,
+                parsers=parsers or [],
                 rank=rank,
                 server_port=0 if getattr(args, 'frontend_on_all_ranks', False) else server_port,
-                verbose=args.inference_text_gen_server_logging,
+                verbose=verbose,
                 num_replicas=num_replicas,
                 hostname=hostname,
                 chat_template=chat_template,
@@ -423,8 +426,12 @@ def _load_chat_template(value):
             return f.read()
     return value
 
-
-if __name__ == "__main__":
+def main(
+    exit_on_missing_checkpoint: bool = False,
+    force_return_log_probs: bool = True,
+    force_prompt_log_probs: bool = False,
+):
+    """Run the dynamic text generation server."""
     with torch.inference_mode():
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
@@ -461,6 +468,10 @@ if __name__ == "__main__":
         # prompt log-probs can be computed for lm-eval / MCQ likelihood scoring.
         if "return_log_probs" not in user_passed_attrs:
             _defaults.append("--return-log-probs")
+        # A store_true flag parses as False rather than None, so validate_args
+        # would ignore it as an args_defaults entry; it has to go through argv.
+        if exit_on_missing_checkpoint:
+            _defaults.append("--exit-on-missing-checkpoint")
         sys.argv[1:1] = _defaults
 
         args, is_vlm = parse_args_and_detect_vlm(
@@ -479,9 +490,13 @@ if __name__ == "__main__":
         if (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler) and cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(True)
 
-        # Already requested via --return-log-probs default above; keep this
-        # explicit assignment for clarity / belt-and-braces with the engine.
-        args.return_log_probs = True
+        # Enable return_log_probs to allow prompt logprobs computation for echo=True requests.
+        # This sets materialize_only_last_token_logits=False in the inference context when
+        # prompt logprobs are not skipped, which is required for loglikelihood evaluation tasks.
+        if force_return_log_probs:
+            args.return_log_probs = True
+        if force_prompt_log_probs:
+            args.skip_prompt_log_probs = False
 
         chat_template = _load_chat_template(getattr(args, 'chat_template', None))
 
@@ -494,6 +509,8 @@ if __name__ == "__main__":
                     args.inference_coordinator_port,
                     args.port,
                     args.host,
+                    args.parsers,
+                    args.inference_text_gen_server_logging,
                     chat_template=chat_template,
                     default_temperature=args.default_temperature,
                     default_top_p=args.default_top_p,
@@ -508,3 +525,7 @@ if __name__ == "__main__":
             # Clean up PyTorch distributed groups properly
             if torch.distributed.is_initialized():
                 torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
