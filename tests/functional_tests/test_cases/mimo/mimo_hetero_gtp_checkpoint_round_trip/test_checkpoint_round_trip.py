@@ -426,7 +426,7 @@ def test_hetero_mimo_20l_checkpoint_round_trip_is_exact():
 
     scratch = None
     try:
-        scratch = Path(tempfile.mkdtemp(prefix="mimo_e2e_", dir=_REPO_ROOT))
+        scratch = Path(tempfile.mkdtemp(prefix="mimo_e2e_"))
         source_root = scratch / "source"
         round_trip_root = scratch / "round-trip"
         padding_manifest_dir = scratch / "padding-manifest"
