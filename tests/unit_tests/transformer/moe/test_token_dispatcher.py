@@ -897,16 +897,19 @@ def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch
 
 @pytest.mark.parametrize("flex", [False, True])
 def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex):
-    """MoELayer.preprocess hands the batch-first mask to the flex dispatcher (whose backend
-    decides whether padded rows are excluded); the other dispatchers keep their 3-arg call."""
+    """MoELayer.preprocess hands the batch-first mask and the packed-sequence metadata to the
+    flex dispatcher (whose backend decides what to do with them); the other dispatchers keep
+    their 3-arg call."""
     calls = []
 
     class _FlexSpy(MoEFlexTokenDispatcher):
         def __init__(self):
             pass
 
-        def dispatch_preprocess(self, hidden_states, routing_map, probs, padding_mask=None):
-            calls.append(padding_mask)
+        def dispatch_preprocess(
+            self, hidden_states, routing_map, probs, padding_mask=None, packed_seq_params=None
+        ):
+            calls.append((padding_mask, packed_seq_params))
             return hidden_states, probs
 
     class _OtherSpy:
@@ -923,11 +926,15 @@ def test_moe_layer_preprocess_forwards_padding_mask_only_to_flex_dispatcher(flex
     probs = torch.zeros(4, 2)
     routing_map = torch.zeros(4, 2, dtype=torch.bool)
     padding_mask = torch.tensor([[False, True], [False, False]])
+    packed_seq_params = PackedSeqParams(qkv_format="thd")
 
-    layer.preprocess(hidden_states, probs, routing_map, padding_mask)
+    layer.preprocess(
+        hidden_states, probs, routing_map, padding_mask, packed_seq_params=packed_seq_params
+    )
 
     if flex:
-        assert len(calls) == 1 and calls[0] is padding_mask
+        assert len(calls) == 1
+        assert calls[0][0] is padding_mask and calls[0][1] is packed_seq_params
     else:
         assert calls == ["no-mask"]
 
