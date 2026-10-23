@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,8 +14,11 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.transformer.moe.fused_a2a import is_nccl_ep_bootstrapped, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
+from megatron.core.transformer.moe.ops.paged_stash import GLOBAL_BLOCK_SIZE, GLOBAL_MAX_BLOCKS
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashBuffer,
     PagedStashManager,
+    PagedTensor,
     _stash_buffer_dtype,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
@@ -43,6 +47,55 @@ def reset_paged_stash_manager():
     """The manager's state machine never returns to 'begin' on its own."""
     yield
     PagedStashManager.STASH_MGR = None
+
+
+@pytest.mark.parametrize("eager", [False, True])
+def test_nccl_ep_dispatch_ignores_stale_zero_copy_buffers(monkeypatch, eager):
+    """A prior zero-copy dispatcher must not lend its receive buffer to ordinary dispatch."""
+    from megatron.core.transformer.moe import token_dispatcher
+
+    manager = token_dispatcher._NCCLEPManager.__new__(token_dispatcher._NCCLEPManager)
+    manager.router_topk = 2
+    manager._max_tokens_per_rank = 64
+    manager._recv_capacity = None if eager else 32
+    manager.hidden_dim = 8
+    manager.num_local_experts = 2
+    manager.alignment = 0
+    manager.dispatch_fwd_quant_recipe = None
+    manager.combine_bwd_quant_recipe = None
+    manager._zc_quant = False
+    manager.eager = eager
+    manager.token_indices = torch.zeros(4, 2, dtype=torch.int64)
+    manager.token_probs = torch.full((4, 2), 0.5)
+    manager.over_budget = torch.tensor(False)
+    manager.required_recv = torch.tensor(0, dtype=torch.int64)
+    monkeypatch.setattr(manager, "_ensure_bootstrap", lambda: None)
+
+    # Deliberately use a different capacity, as when switching models or dispatch modes.
+    stale_weights = torch.ones(128)
+    monkeypatch.setattr(token_dispatcher._NCCLEPManager, "_zc_recv_topk_weights_buf", stale_weights)
+
+    class Buffer:
+        total_recv_tokens = torch.tensor(4, dtype=torch.int64)
+
+    monkeypatch.setattr(token_dispatcher, "new_nccl_ep_buffer", lambda **kwargs: Buffer())
+
+    def dispatch(buffer, tokens, indices, weights, *, recv_tokens, recv_topk_weights):
+        if eager:
+            assert recv_tokens is None and recv_topk_weights is None
+        rows = 4 if eager else manager._recv_capacity
+        output = torch.zeros(rows, manager.hidden_dim)
+        probs = torch.zeros(rows) if recv_topk_weights is None else recv_topk_weights
+        # TE enforces one receive weight for each received-token slot.
+        assert probs.numel() == output.shape[0]
+        return output, torch.tensor([2, 2]), probs
+
+    monkeypatch.setattr(token_dispatcher, "nccl_ep_dispatch", dispatch)
+    output = manager.dispatch(torch.zeros(4, manager.hidden_dim))
+
+    assert manager.dispatched_probs.shape == (output.shape[0],)
+    assert token_dispatcher._NCCLEPManager._zc_recv_topk_weights_buf is stale_weights
+    assert torch.equal(stale_weights, torch.ones(128))
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
@@ -90,6 +143,77 @@ class TestStashBufferDtype:
             _stash_buffer_dtype(torch.complex64)
 
 
+@pytest.mark.parametrize("capability", [(10, 7), (10, 0), (10, 3), (9, 0), (12, 0)])
+@pytest.mark.parametrize("with_config", [False, True])
+def test_paged_stash_copy_device_sizes(monkeypatch, capability, with_config):
+    manager = SimpleNamespace(iteration=0, status="begin")
+    monkeypatch.setattr(PagedStashManager, "get_instance", lambda: manager)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    stash_config = SimpleNamespace(moe_paged_stash_page_size=64) if with_config else None
+    paged_stash_reset(config=stash_config)
+    expected = (4096, 8192) if capability == (10, 7) else (1024, 2048)
+    assert (manager.copy_block_size, manager.copy_max_blocks) == expected
+
+
+def test_disabled_paged_stash_does_not_query_device(monkeypatch):
+    manager = SimpleNamespace(iteration=0)
+    monkeypatch.setattr(PagedStashManager, "get_instance", lambda: manager)
+
+    def unexpected_device_query():
+        pytest.fail("Disabled paged stashing must not query the CUDA device")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_device_query)
+    paged_stash_reset(enabled=False)
+    assert not manager.enabled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+class TestPagedTensorRoundTrip:
+    """Stash -> reload through the copy/pop kernels under different launch configurations."""
+
+    @pytest.mark.parametrize(
+        "block_size,max_blocks", [(GLOBAL_BLOCK_SIZE, GLOBAL_MAX_BLOCKS), (4096, 8192)]
+    )
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16])
+    # 64: one unmasked block per row; 1000 and 7168: masked tail of the last block.
+    @pytest.mark.parametrize("hidden_size", [64, 1000, 7168])
+    # With more rows than programs, each program loops over several rows.
+    @pytest.mark.parametrize("more_rows_than_programs", [False, True])
+    def test_round_trip_is_bit_exact(
+        self, block_size, max_blocks, dtype, hidden_size, more_rows_than_programs
+    ):
+        device = torch.device("cuda")
+        page_size = 64
+        num_tokens = 2 * max_blocks + 100 if more_rows_than_programs else 300
+        max_num_tokens = 2 * num_tokens
+        if dtype == torch.uint8:
+            src = torch.randint(0, 256, (max_num_tokens, hidden_size), dtype=dtype, device=device)
+        else:
+            src = torch.randn(max_num_tokens, hidden_size, device=device).to(dtype)
+        overflow = torch.zeros(1, dtype=torch.int64, device=device)
+        host_spill = torch.zeros(1, dtype=torch.int64, device=device)
+        stash = PagedStashBuffer(
+            max_num_tokens, hidden_size, page_size, device, overflow, host_spill, dtype
+        )
+        # Pages come back in arbitrary order after earlier stash/reload rounds.
+        stash.free_list_cuda.copy_(torch.randperm(stash.num_cuda_pages, device=device))
+        paged = PagedTensor(
+            src.clone(),
+            num_tokens_tensor=torch.tensor([num_tokens], dtype=torch.int64, device=device),
+            max_num_tokens=max_num_tokens,
+            hidden_size=hidden_size,
+            page_size=page_size,
+        )
+
+        paged.offload_to_stash(stash, block_size=block_size, max_blocks=max_blocks)
+        paged._tensor = torch.zeros_like(src)
+        paged.reload_from_stash(stash, block_size=block_size, max_blocks=max_blocks)
+        torch.cuda.synchronize()
+
+        assert overflow.item() == 0
+        assert torch.equal(paged._tensor[:num_tokens], src[:num_tokens])
+
+
 class MoEModelTestContainer:
     def __init__(
         self,
@@ -124,6 +248,7 @@ class MoEModelTestContainer:
         )
         _set_random_seed(seed_=123, data_parallel_random_init=data_parallel_random_init)
         self.config = TransformerConfig(
+            params_dtype=test_dtype,
             tensor_model_parallel_size=tp_size,
             expert_model_parallel_size=ep_size,
             pipeline_model_parallel_size=pp_size,

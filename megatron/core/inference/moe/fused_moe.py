@@ -21,8 +21,11 @@ from megatron.core.inference.moe.permute import (
     permute_tokens,
     unpermute_tokens,
 )
-from megatron.core.inference.quantization.mxfp8_quantize import MXFP8_SCALE_ROW_BLOCK
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_SCALE_ROW_BLOCK,
+    mxfp8_quantize_rows,
+)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
 
 from . import batch_invariant
 
@@ -108,6 +111,23 @@ def _get_activation_func(
         raise ValueError(f"Unsupported activation type: {activation_type}")
 
 
+def _quantize_mxfp8_used_rows(x: torch.Tensor, n_used: Optional[torch.Tensor]) -> MXFP8Tensor:
+    """MXFP8-quantize the expert-grouped buffer, only its first ``n_used`` rows if given.
+
+    The permuted buffers are sized for the worst case (max_tokens x EP x topk rows) so
+    that CUDA graphs see static shapes, but only rows ``[0, n_used)`` (``n_used`` =
+    inclusive_expert_offsets[-1], read on device) feed the grouped GEMMs. Quantizing the
+    whole buffer made the batch-invariant MXFP8 path cost O(max_tokens) per step. The
+    quantized rows are bitwise identical to ``MXFP8Tensor.from_bf16``.
+    """
+    if n_used is None:
+        return MXFP8Tensor.from_bf16(x, backend="triton")
+    data, scale = mxfp8_quantize_rows(x, n_used)
+    return MXFP8Tensor(
+        data=data, scale=ensure_mxfp8_scale_dtype(scale), backend="triton", dtype=x.dtype
+    )
+
+
 def mcore_fused_moe(
     hidden_states: torch.Tensor,
     probs: torch.Tensor,
@@ -124,9 +144,9 @@ def mcore_fused_moe(
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
-    Outside batch-invariant mode, MXFP8 squared-ReLU uses fused kernels that
-    combine permute/activation with quantization unless
-    ``disable_fused_quant_kernels=True``. Other MXFP8 paths quantize separately.
+    Batch-invariant MXFP8 and non-batch-invariant squared-ReLU fuse input permutation
+    with quantization unless ``disable_fused_quant_kernels=True``. Outside
+    batch-invariant mode, squared-ReLU additionally fuses activation and quantization.
 
     Args:
         hidden_states: [max_tokens, hidden_size] BF16 input. max_tokens =
@@ -162,14 +182,14 @@ def mcore_fused_moe(
     max_tokens = hidden_states.shape[0]
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     batch_invariant_mode = batch_invariant.enabled()
-    # Batch-invariant unpermute needs the inverse map produced by the ordinary
-    # permutation path. Quantization remains row-local, so doing it immediately
-    # afterwards preserves the MXFP8 values without tying them to batch layout.
-    use_fused_quant = (
+    use_fused_activation_quant = (
         use_mxfp8
         and activation_type == ActivationType.SQUARED_RELU
         and not disable_fused_quant_kernels
         and not batch_invariant_mode
+    )
+    use_fused_permute_quant = use_fused_activation_quant or (
+        use_mxfp8 and batch_invariant_mode and not disable_fused_quant_kernels
     )
     mm_fn: Callable[[Any, Any, torch.Tensor], torch.Tensor]
 
@@ -193,15 +213,14 @@ def mcore_fused_moe(
 
     activation_func = _get_activation_func(
         activation_type,
-        fused_quant=use_fused_quant,
+        fused_quant=use_fused_activation_quant,
         activation_kwargs={"clamp_scale": activation_clamp_scale},
     )
 
     # --- Pre-processing: permute ---
-    if use_fused_quant:
+    if use_fused_permute_quant:
         # Fused permute + MXFP8 quantize: single kernel produces MXFP8Tensor
-        batch_invariant_inverse_map = None
-        hidden_states, permuted_probs, permutation_map, offs = permute_and_quantize_mxfp8(
+        permuted = permute_and_quantize_mxfp8(
             hidden_states,
             probs,
             routing_map,
@@ -209,7 +228,11 @@ def mcore_fused_moe(
             num_local_experts,
             valid_tokens,
             alignment=expert_alignment,
+            zero_padding=batch_invariant_mode,
+            return_batch_invariant_inverse_map=batch_invariant_mode,
         )
+        hidden_states, permuted_probs, permutation_map, offs = permuted[:4]
+        batch_invariant_inverse_map = permuted[4] if batch_invariant_mode else None
     else:
         permuted = permute_tokens(
             hidden_states,
@@ -232,7 +255,9 @@ def mcore_fused_moe(
     # Quantize if MXFP8 path and hidden_states not already quantized (fused permute+quant
     # produces MXFP8Tensor directly).
     if use_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):
-        hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
+        hidden_states = _quantize_mxfp8_used_rows(
+            hidden_states, offs[-1:] if batch_invariant_mode else None
+        )
     fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
     # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total
@@ -262,7 +287,9 @@ def mcore_fused_moe(
         activation_out = activation_func(fc1_output, permutation_map, n_used)
     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.
     if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
-        activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
+        activation_out = _quantize_mxfp8_used_rows(
+            activation_out, n_used if batch_invariant_mode else None
+        )
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
     # --- Post-processing: unpermute ---

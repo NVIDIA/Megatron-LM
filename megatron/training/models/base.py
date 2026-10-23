@@ -162,6 +162,8 @@ class ModelConfig:
 
                 if is_dataclass(value):
                     result[f.name] = _as_dict(value)  # recurse on nested dataclasses
+                elif hasattr(value, "as_dict"):
+                    result[f.name] = value.as_dict()
                 else:
                     result[f.name] = value
 

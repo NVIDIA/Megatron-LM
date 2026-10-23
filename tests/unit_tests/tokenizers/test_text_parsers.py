@@ -475,6 +475,23 @@ def test_parser_mapping_registers_both_qwen3_coder_tool_parsers():
     assert combined.streaming_markers == strict.streaming_markers
 
 
+@pytest.mark.parametrize("parser", [DeepSeekR1ReasoningParser, NemotronV3ReasoningParser])
+@pytest.mark.parametrize("text", ["", "</think>", "<think></think>"])
+def test_empty_reasoning_metadata_preserves_parser_result(parser, text):
+    assert parser.parse(text) == ("", {"reasoning": ""})
+
+
+@pytest.mark.parametrize("text", ["", "</think>", "<think></think>"])
+@pytest.mark.parametrize("kwargs", [{"enable_thinking": False}, {"force_nonempty_content": True}])
+def test_empty_reasoning_explicit_fallback_clears_reasoning_marker(text, kwargs):
+    assert NemotronV3ReasoningParser.parse(text, chat_template_kwargs=kwargs) == ("", {})
+
+
+@pytest.mark.parametrize("parser", [DeepSeekR1ReasoningParser, NemotronV3ReasoningParser])
+def test_empty_reasoning_before_final_content_preserves_parser_result(parser):
+    assert parser.parse("<think></think>answer") == ("answer", {"reasoning": ""})
+
+
 @pytest.mark.parametrize("name", ["t", " t", "t ", " t ", "\n\tt\t\n"])
 def test_qwen3_coder_normalizes_function_name_before_schema_lookup(name):
     text = (
