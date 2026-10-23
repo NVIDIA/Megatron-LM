@@ -427,15 +427,11 @@ def _load_chat_template(value):
     return value
 
 def main(
-    args_defaults: dict | None = None,
+    exit_on_missing_checkpoint: bool = False,
     force_return_log_probs: bool = True,
     force_prompt_log_probs: bool = False,
 ):
     """Run the dynamic text generation server."""
-    default_args = {"no_load_rng": True, "no_load_optim": True}
-    if args_defaults:
-        default_args.update(args_defaults)
-
     with torch.inference_mode():
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
@@ -472,11 +468,15 @@ def main(
         # prompt log-probs can be computed for lm-eval / MCQ likelihood scoring.
         if "return_log_probs" not in user_passed_attrs:
             _defaults.append("--return-log-probs")
+        # A store_true flag parses as False rather than None, so validate_args
+        # would ignore it as an args_defaults entry; it has to go through argv.
+        if exit_on_missing_checkpoint:
+            _defaults.append("--exit-on-missing-checkpoint")
         sys.argv[1:1] = _defaults
 
         args, is_vlm = parse_args_and_detect_vlm(
             extra_args_provider=add_text_generation_server_args,
-            args_defaults=default_args,
+            args_defaults={'no_load_rng': True, 'no_load_optim': True},
             user_passed_attrs=user_passed_attrs,
         )
 

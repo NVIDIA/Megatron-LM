@@ -3,9 +3,10 @@
 import pytest
 
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.raw_completions import (
-    _first_single_token_stop,
+    _get_non_none,
     _parse_stop_token_sequences,
     _parse_top_n_logprobs,
+    _single_token_stops,
     _trim_at_stop_sequences,
     _truncate_top_logprobs,
 )
@@ -15,7 +16,18 @@ def test_parse_stop_token_sequences_accepts_token_zero():
     assert _parse_stop_token_sequences(
         {"stop_token_ids": [0, 3], "stop_token_id_sequences": [[4, 5]]}
     ) == [[0], [3], [4, 5]]
-    assert _first_single_token_stop([[0]]) == 0
+
+
+def test_single_token_stops_collects_every_single_token_sequence():
+    assert _single_token_stops([[0], [4, 5], [3]]) == [0, 3]
+    assert _single_token_stops([[4, 5]]) is None
+    assert _single_token_stops([]) is None
+
+
+def test_get_non_none_treats_null_as_omitted():
+    assert _get_non_none({"temperature": None}, "temperature", 0.6) == 0.6
+    assert _get_non_none({}, "temperature", 0.6) == 0.6
+    assert _get_non_none({"temperature": 0.0}, "temperature", 0.6) == 0.0
 
 
 @pytest.mark.parametrize(
@@ -93,3 +105,7 @@ def test_truncate_top_logprobs_preserves_requested_candidates():
         {"20": -0.2, "21": -1.2},
     ]
     assert _truncate_top_logprobs(top_logprobs, 0) is None
+
+
+def test_truncate_top_logprobs_passes_through_missing_positions():
+    assert _truncate_top_logprobs([None, {"10": -2.0, "11": -0.5}], 1) == [None, {"11": -0.5}]

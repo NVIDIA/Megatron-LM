@@ -66,7 +66,7 @@ def detokenize_top_n_keys(top_n_logprobs, tokenizer):
     ]
 
 
-def _top_logprob_entries(top_logprobs, tokenizer):
+def _top_logprob_entries(top_logprobs):
     if not isinstance(top_logprobs, dict):
         return []
     return [
@@ -75,25 +75,30 @@ def _top_logprob_entries(top_logprobs, tokenizer):
             "logprob": json_safe_logprob(logprob),
             "bytes": list(token.encode("utf-8")),
         }
-        for token, logprob in detokenize_top_n_keys([top_logprobs], tokenizer)[0].items()
+        for token, logprob in top_logprobs.items()
     ]
 
 
 def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_offset):
+    # Re-key each position once; both the chat and completions shapes reuse it.
+    string_top_log_probs = detokenize_top_n_keys(
+        [
+            top_log_probs[i] if top_log_probs is not None and i < len(top_log_probs) else None
+            for i in range(len(token_ids))
+        ],
+        tokenizer,
+    )
     entries = []
     offsets = []
     offset = start_offset
     for i, token_id in enumerate(token_ids):
         token = tokenizer.detokenize([token_id])
-        token_top_logprobs = (
-            top_log_probs[i] if top_log_probs is not None and i < len(top_log_probs) else None
-        )
         entries.append(
             {
                 "token": token,
                 "logprob": json_safe_logprob(log_probs[i]) if i < len(log_probs) else None,
                 "bytes": list(token.encode("utf-8")),
-                "top_logprobs": _top_logprob_entries(token_top_logprobs, tokenizer),
+                "top_logprobs": _top_logprob_entries(string_top_log_probs[i]),
             }
         )
         offsets.append(offset)
@@ -103,19 +108,7 @@ def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_
     return {
         "tokens": [entry["token"] for entry in entries],
         "token_logprobs": [entry["logprob"] for entry in entries],
-        "top_logprobs": json_safe_top_n_logprobs(
-            detokenize_top_n_keys(
-                [
-                    (
-                        top_log_probs[i]
-                        if top_log_probs is not None and i < len(top_log_probs)
-                        else None
-                    )
-                    for i in range(len(entries))
-                ],
-                tokenizer,
-            )
-        ),
+        "top_logprobs": json_safe_top_n_logprobs(string_top_log_probs),
         "text_offset": offsets,
     }
 

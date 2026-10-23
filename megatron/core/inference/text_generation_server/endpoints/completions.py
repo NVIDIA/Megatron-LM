@@ -30,7 +30,11 @@ def _detokenize_top_n_keys(top_n_logprobs, tokenizer):
     here; use /raw_completions when exact token identity matters.
     """
     return [
-        {tokenizer.detokenize([int(token_id)]): logprob for token_id, logprob in entry.items()}
+        (
+            {tokenizer.detokenize([int(token_id)]): logprob for token_id, logprob in entry.items()}
+            if isinstance(entry, dict)
+            else entry
+        )
         for entry in top_n_logprobs
     ]
 

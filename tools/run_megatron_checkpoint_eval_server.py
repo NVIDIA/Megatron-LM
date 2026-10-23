@@ -16,8 +16,4 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.
 from tools.run_dynamic_text_generation_server import main
 
 if __name__ == "__main__":
-    main(
-        args_defaults={'exit_on_missing_checkpoint': True},
-        force_return_log_probs=True,
-        force_prompt_log_probs=True,
-    )
+    main(exit_on_missing_checkpoint=True, force_return_log_probs=True, force_prompt_log_probs=True)

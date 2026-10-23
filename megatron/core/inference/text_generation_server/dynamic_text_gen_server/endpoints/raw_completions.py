@@ -9,6 +9,13 @@ from typing import Any
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
+from .common import (
+    abort_requests,
+    generation_config_sampling_defaults,
+    generation_finish_reason,
+    resolve_sampling_default,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,11 +72,15 @@ def _trim_at_stop_sequences(
     return token_ids[:earliest], None if token_data is None else token_data[:earliest], True
 
 
-def _first_single_token_stop(stop_sequences: list[list[int]]) -> int | None:
-    for sequence in stop_sequences:
-        if len(sequence) == 1:
-            return sequence[0]
-    return None
+def _single_token_stops(stop_sequences: list[list[int]]) -> list[int] | None:
+    stops = [sequence[0] for sequence in stop_sequences if len(sequence) == 1]
+    return stops or None
+
+
+def _get_non_none(req: dict[str, Any], key: str, default: Any) -> Any:
+    """Treat an explicit JSON null the same as an omitted field."""
+    value = req.get(key)
+    return default if value is None else value
 
 
 def _parse_top_n_logprobs(
@@ -95,8 +106,13 @@ def _truncate_top_logprobs(
 ) -> list[dict[str, float]] | None:
     if top_logprobs is None or requested_count == 0:
         return None
+    # A position with no top-n entry arrives as None, not {}.
     return [
-        dict(sorted(entry.items(), key=lambda item: item[1], reverse=True)[:requested_count])
+        (
+            dict(sorted(entry.items(), key=lambda item: item[1], reverse=True)[:requested_count])
+            if entry is not None
+            else None
+        )
         for entry in top_logprobs
     ]
 
@@ -115,6 +131,7 @@ try:
         ids and receive generated token ids plus optional sampled logprobs.
         """
         client = current_app.config["client"]
+        cfg = current_app.config
 
         req = await request.get_json(force=True)
         if req is None:
@@ -138,10 +155,33 @@ try:
             prompt_tokens = _parse_token_ids(req.get("prompt"), "prompt")
             stop_sequences = _parse_stop_token_sequences(req)
 
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            max_tokens = int(req.get("max_tokens", 16))
+            # Same precedence as /completions for omitted fields: configured server
+            # default, then the model's generation_config.json, then the hardcoded value.
+            gen_defaults = generation_config_sampling_defaults(cfg.get("tokenizer"))
+            temperature = float(
+                _get_non_none(
+                    req,
+                    "temperature",
+                    resolve_sampling_default(
+                        cfg, gen_defaults, "temperature", "default_temperature", 1.0
+                    ),
+                )
+            )
+            top_p = float(
+                _get_non_none(
+                    req,
+                    "top_p",
+                    resolve_sampling_default(cfg, gen_defaults, "top_p", "default_top_p", 1.0),
+                )
+            )
+            top_k = int(
+                _get_non_none(
+                    req,
+                    "top_k",
+                    resolve_sampling_default(cfg, gen_defaults, "top_k", "default_top_k", 0),
+                )
+            )
+            max_tokens = int(_get_non_none(req, "max_tokens", 16))
             if max_tokens < 0:
                 return "'max_tokens' must be non-negative", 400
 
@@ -157,15 +197,8 @@ try:
                 req, prompt_logprobs, logprobs
             )
 
-            termination_id = None
-            if bool(req.get("ignore_eos", False)):
-                termination_id = -1
-            else:
-                stop_token_id = _first_single_token_stop(stop_sequences)
-                if stop_token_id is not None:
-                    termination_id = stop_token_id
-
             sampling_params = SamplingParams(
+                seed=req.get("seed"),
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -173,18 +206,31 @@ try:
                 top_n_logprobs=top_n_logprobs,
                 skip_prompt_log_probs=not prompt_logprobs,
                 num_tokens_to_generate=max_tokens,
-                termination_id=termination_id,
+                # Single-token stops end generation in the engine, alongside EOS
+                # unless ignore_eos is set. Multi-token sequences are only trimmed
+                # after generation finishes.
+                stop_token_ids=_single_token_stops(stop_sequences),
+                termination_id=-1 if bool(req.get("ignore_eos", False)) else None,
+                # This endpoint returns token ids only, so skip detokenization on
+                # the coordinator.
+                detokenize_generations=False,
             )
-        except ValueError as e:
+        except (TypeError, ValueError) as e:
             return str(e), 400
 
         if current_app.config["verbose"]:
             start_time = time.perf_counter()
 
+        # add_request_with_id, not add_request, so that a client disconnect can
+        # abort the engine request instead of leaving it to run to max_tokens.
+        request_id = None
         try:
-            completed_request = await asyncio.gather(
-                client.add_request(prompt_tokens, sampling_params)
-            )
+            request_id, future = client.add_request_with_id(prompt_tokens, sampling_params)
+            record = await future
+        except asyncio.CancelledError:
+            if request_id is not None:
+                abort_requests(client, [request_id], "client disconnected")
+            raise
         except Exception as e:
             return f"Error during inference: {e}", 500
 
@@ -193,7 +239,6 @@ try:
                 "Raw completion request processed in " f"{time.perf_counter() - start_time:.2f}s"
             )
 
-        record = completed_request[0]
         if record.get("status") == "FAILED":
             events = record.get("events", [])
             error_events = [
@@ -234,9 +279,7 @@ try:
             prompt_top_logprobs = list(prompt_top_logprobs)
         prompt_top_logprobs = _truncate_top_logprobs(prompt_top_logprobs, prompt_top_n)
         generated_top_logprobs = _truncate_top_logprobs(generated_top_logprobs, generation_top_n)
-        finish_reason = "stop" if stop_hit else "length"
-        if max_tokens == 0 or len(generated_tokens) < max_tokens:
-            finish_reason = "stop"
+        finish_reason = "stop" if stop_hit else generation_finish_reason(result)
 
         completion_tokens = len(generated_tokens)
         prompt_tokens_count = len(prompt_tokens_result)

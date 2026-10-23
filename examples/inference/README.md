@@ -125,7 +125,10 @@ The server exposes `/v1/health`, `/v1/completions`, `/v1/chat/completions`,
 `/v1/raw_completions`, and their non-`/v1` aliases. Prefer
 `/v1/raw_completions` for Megatron checkpoint evals: callers send prompt token
 ids and receive generated token ids plus optional sampled logprobs, so
-tokenization and decoding stay in the eval client.
+tokenization and decoding stay in the eval client. Single-token stops
+(`stop_token_ids`) end generation in the engine; multi-token
+`stop_token_id_sequences` are only trimmed from the output afterwards, so those
+requests still generate up to `max_tokens`.
 
 ### Advanced examples
 
