@@ -805,7 +805,6 @@ def model_config_from_args(
     aliases = dict(
         transformer=transformer,
         seq_length=args.max_position_embeddings,
-        training_world_size=getattr(args, "mimo_llm_world_size", None),
         vocab_size=vocab_size,
         should_pad_vocab=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,

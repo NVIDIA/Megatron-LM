@@ -35,7 +35,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import Serializable
+from megatron.training.models import MimoModelConfig, Serializable
 from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
@@ -53,7 +53,9 @@ class ConfigContainerBase:
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
         launch_world_size = safe_get_world_size()
-        world_size = getattr(self.model, "training_world_size", None)
+        world_size = (
+            self.model.mimo_llm_world_size if isinstance(self.model, MimoModelConfig) else None
+        )
         if world_size is None:
             world_size = launch_world_size
         if not 0 < world_size <= launch_world_size:

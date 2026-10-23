@@ -20,7 +20,7 @@ class MimoModelConfig(ModelConfig):
     """Language-grid architecture, precision, and parallelism."""
     seq_length: int
     """Language-model position capacity, not the data sequence length."""
-    training_world_size: int | None = None
+    mimo_llm_world_size: int | None = None
     """Language-grid rank count, or None to use the full launch."""
     vocab_size: int | None = None
     """Language-model vocabulary, or None until tokenizer initialization."""

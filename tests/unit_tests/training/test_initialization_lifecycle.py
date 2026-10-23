@@ -495,7 +495,7 @@ def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_g
 
 
 @pytest.mark.parametrize(
-    "world_size, training_world_size, parallel_kwargs, expected_dp, expected_batch",
+    "world_size, mimo_llm_world_size, parallel_kwargs, expected_dp, expected_batch",
     [
         (8, None, {"tensor_model_parallel_size": 2}, 4, 4),
         (16, 8, {"tensor_model_parallel_size": 2}, 4, 4),
@@ -545,11 +545,13 @@ def test_training_batch_topology_uses_model_config(
     monkeypatch,
     run_config,
     world_size,
-    training_world_size,
+    mimo_llm_world_size,
     parallel_kwargs,
     expected_dp,
     expected_batch,
 ):
+    from examples.mimo.training.builder import MimoBuildConfig
+
     args = _runtime_args()
     args.world_size = args.mimo_llm_world_size = 999
     args.data_parallel_size = args.batch_parallel_size = 999
@@ -560,13 +562,13 @@ def test_training_batch_topology_uses_model_config(
     monkeypatch.setattr(global_vars, "safe_get_world_size", lambda: world_size)
     run_config.train.micro_batch_size = 2
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
-    run_config.model = MimoModelConfig(
+    run_config.model = MimoBuildConfig(
         transformer=TransformerConfig(
             num_layers=2, hidden_size=32, num_attention_heads=4, **parallel_kwargs
         ),
         seq_length=32,
         vocab_size=128,
-        training_world_size=training_world_size,
+        mimo_llm_world_size=mimo_llm_world_size,
     )
     microbatches = Mock()
     monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)
@@ -591,7 +593,7 @@ def test_training_batch_topology_uses_model_config(
     run_config.finalize()
     global_vars.initialize_runtime_services(args, build_tokenizer=False, training=True)
     assert vars(args) == original_args
-    assert run_config.get_model_world_size() == (training_world_size or world_size)
+    assert run_config.get_model_world_size() == (mimo_llm_world_size or world_size)
     assert run_config.get_data_parallel_size() == expected_dp
     assert run_config.get_batch_parallel_size() == expected_batch
     assert microbatches.call_args.kwargs['data_parallel_size'] == expected_batch
@@ -622,6 +624,7 @@ def test_callback_model_config_owns_shared_inputs(
     transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
     convert = Mock(return_value=transformer)
     monkeypatch.setattr(adapters, "core_transformer_config_from_args", convert)
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 16)
 
     model = model_config_from_args(args, model_config_cls=model_cls)
     convert.assert_called_once_with(args)
@@ -636,9 +639,11 @@ def test_callback_model_config_owns_shared_inputs(
     assert cfg.model.transformer is transformer
     assert cfg.model.seq_length == 2048
     if model_cls is MimoModelConfig:
-        assert cfg.model.training_world_size == 8
+        assert cfg.model.mimo_llm_world_size == 8
+        assert cfg.get_model_world_size() == 8
     else:
-        assert not hasattr(cfg.model, "training_world_size")
+        assert not hasattr(cfg.model, "mimo_llm_world_size")
+        assert cfg.get_model_world_size() == 16
     if model_cls is BertModelConfig:
         assert cfg.model.bert_binary_head == args.bert_binary_head
         assert not hasattr(cfg.model, "hybrid_layer_pattern")
@@ -964,9 +969,9 @@ def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_conf
     assert not run_config._finalized
 
 
-@pytest.mark.parametrize("world_size, training_world_size", [(0, None), (-1, None), (4, 8), (4, 0)])
+@pytest.mark.parametrize("world_size, mimo_llm_world_size", [(0, None), (-1, None), (4, 8), (4, 0)])
 def test_training_topology_rejects_invalid_rank_counts(
-    monkeypatch, run_config, world_size, training_world_size
+    monkeypatch, run_config, world_size, mimo_llm_world_size
 ):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     monkeypatch.setattr(
@@ -975,7 +980,7 @@ def test_training_topology_rejects_invalid_rank_counts(
     run_config.model = MimoModelConfig(
         transformer=run_config.model.transformer,
         seq_length=run_config.model.seq_length,
-        training_world_size=training_world_size,
+        mimo_llm_world_size=mimo_llm_world_size,
     )
     run_config.train.micro_batch_size = 1
     before = deepcopy(run_config.to_dict())
