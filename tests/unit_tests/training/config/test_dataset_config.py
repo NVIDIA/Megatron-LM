@@ -85,7 +85,7 @@ def test_the_section_holds_megatron_cores_config(tokenizer):
     assert data.dataset.tokenizer is None and data.dataset.token_dtype_code is None
     assert data.dataset.mock is True and data.dataset.split is None  # the even split is derived
     assert data.dataset.split_matrix is not None
-    data.validate()  # the section's own checks need no tokenizer
+    data.validate()  # the section's checks and Core's tokenizer-free ones
     data.finalize()
     assert data.dataset_type is MockGPTDataset
     with pytest.raises(RuntimeError, match="no tokenizer bound"):
@@ -120,10 +120,10 @@ def test_bind_tokenizer_runs_megatron_cores_checks(tokenizer):
     )
     with pytest.raises(AssertionError, match="vocab size"):
         counts.bind_tokenizer(SimpleNamespace(vocab_size=None))
-    with pytest.raises(AssertionError, match="split must be provided"):
-        _dataset(blend=BLEND)
+    with pytest.raises(AssertionError, match="split must be provided"):  # Core's, at validate()
+        DataConfig(dataset=_dataset(blend=BLEND)).validate()
     with pytest.raises(AssertionError, match="equal in number"):
-        _dataset(blend=(["a", "b"], [1.0]), split="1,1,1")
+        DataConfig(dataset=_dataset(blend=(["a", "b"], [1.0]), split="1,1,1")).validate()
     with pytest.raises(TypeError, match="random_seed"):  # Core's requirement, unchanged
         GPTDatasetConfig(sequence_length=16, **BOOLS)
     for overrides in (

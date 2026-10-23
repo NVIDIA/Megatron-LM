@@ -1,15 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
-import logging
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from megatron.core.datasets.utils import Split, log_single_rank, normalize
+from megatron.core.datasets.utils import Split, normalize
 from megatron.core.tokenizers import MegatronTokenizerBase
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -84,46 +81,13 @@ class BlendedMegatronDatasetConfig:
        Requires all the dataset caches to be built.
     """
 
-    def __post_init__(self) -> None:
-        """Check the blend and split at construction, as before.
-
-        Only this class's checks run here: they need no tokenizer. The subclasses' ``validate()``
-        needs one, so it is not called from here; ``BlendedMegatronDatasetBuilder`` calls it before
-        building. Nothing is assigned: ``mock`` and ``split_matrix`` follow from the fields.
-
-        TODO: remove this method once Megatron-Bridge no longer calls it. Megatron-LM itself does
-        not need a post-init anymore: ``validate()`` holds these checks and the builder runs it.
-        What keeps it is Megatron-Bridge's ``GPTDatasetConfig.finalize()``, which calls
-        ``super(MCoreGPTDatasetConfig, self).__post_init__()`` explicitly (an ``AttributeError``
-        without this method, since its loader mix-in defines none), and the Megatron Core
-        subclasses ``MaskedWordPieceDatasetConfig`` (BERT and T5 through it) and
-        ``MultimodalDatasetConfig``, which chain to it with ``super().__post_init__()``; those
-        four calls go in the same change. The construction-time rejection of an inconsistent
-        blend / split goes with it: the builder's ``validate()`` reports it instead.
-        """
-        BlendedMegatronDatasetConfig.validate(self)
-        if self.blend_per_split is not None and any(self.blend_per_split):
-            for split in Split:
-                if self.blend_per_split[split.value] is None:
-                    log_single_rank(
-                        logger, logging.INFO, f"blend not provided for {split.name} split"
-                    )
-        else:
-            if self.mock:
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    "Let mock = True, as both blend and blend_per_split are None",
-                )
-            log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
-
     def validate(self) -> None:
         """Check the blend and split: assertions only, idempotent.
 
-        A config can be constructed before its tokenizer exists and completed later: run this once
-        it is complete. ``BlendedMegatronDatasetBuilder`` runs it before building, so a config
-        handed complete to the builder needs no explicit call. Subclasses add the checks that need
-        the tokenizer.
+        Nothing runs at construction. A config can be constructed before its tokenizer exists and
+        completed later: run this once it is complete. ``BlendedMegatronDatasetBuilder`` runs it
+        before building, so a config handed complete to the builder needs no explicit call.
+        Subclasses add the checks that need the tokenizer.
         """
         if self.fast_cache_load:
             assert (

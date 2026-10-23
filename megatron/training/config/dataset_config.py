@@ -23,6 +23,7 @@ nothing here runs for them.
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
 
@@ -221,10 +222,13 @@ class DataConfig:
     def validate(self) -> None:
         """Check the loader settings and the class / config agreement; no mutation.
 
-        Megatron Core checks the dataset config itself: the blend and split rules at construction,
-        the rest in ``validate()``, which needs the tokenizer and runs in ``bind_tokenizer()``.
+        Megatron Core's tokenizer-free checks (the blend and split rules) run here too, so a YAML
+        or Python section fails at ``cfg.validate()``; the checks that need the tokenizer run in
+        ``bind_tokenizer()`` and in the builder.
         """
         self.dataloader.validate()
+        if self.dataset is not None:
+            BlendedMegatronDatasetConfig.validate(self.dataset)
         resolve_dataset_class(self.dataset, self.dataset_type)
 
     def finalize(self) -> None:

@@ -36,9 +36,9 @@ def _base(**overrides):
 
 
 def test_construction_needs_no_tokenizer_and_derives_the_sources():
-    """The blend / split rules need no tokenizer and run at construction as before; mock and
-    split_matrix follow from the sources (read-only properties, nothing is assigned); what needs
-    the tokenizer waits for validate()."""
+    """Construction runs no checks and needs no tokenizer; mock and split_matrix follow from the
+    sources (read-only properties, nothing is assigned); the blend / split rules and what needs
+    the tokenizer are validate()'s, which the builder runs."""
     mock = _config()
     assert mock.tokenizer is None and mock.token_dtype_code is None
     assert mock.mock is True and mock.split is None  # the even split is derived, not written
@@ -56,11 +56,11 @@ def test_construction_needs_no_tokenizer_and_derives_the_sources():
     per_split = _config(blend_per_split=[(["a"], None), None, (["b"], None)])
     assert per_split.mock is False and per_split.split_matrix is None
     with pytest.raises(AssertionError, match="split must be provided"):
-        _config(blend=BLEND)
+        _config(blend=BLEND).validate()
     with pytest.raises(AssertionError, match="incompatible"):
-        _config(blend=BLEND, split="9,1,0", blend_per_split=[(["a"], None), None, None])
+        _config(blend=BLEND, split="9,1,0", blend_per_split=[(["a"], None), None, None]).validate()
     with pytest.raises(AssertionError, match="data-cache-path"):
-        _config(fast_cache_load=True)
+        _config(fast_cache_load=True).validate()
     with pytest.raises(TypeError, match="random_seed"):
         GPTDatasetConfig(sequence_length=16, **BOOLS)
 
