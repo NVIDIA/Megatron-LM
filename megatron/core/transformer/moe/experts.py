@@ -340,6 +340,15 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
+        self.activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "moe_act" in self.config.recompute_modules
+        )
+        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+
+            set_save_original_input(self.linear_fc2)
+
         # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
         # autocast state, so they would ignore a --te-precision-config-file override and quantize
         # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
@@ -384,15 +393,6 @@ class TEGroupedMLP(MegatronModule):
             self.offload_fused_group_mlp = False
             self.offload_expert_fc1 = True
             self.offload_moe_act = True
-
-        self.activation_recompute = (
-            self.config.recompute_granularity == 'selective'
-            and "moe_act" in self.config.recompute_modules
-        )
-        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
-            from megatron.core.extensions.transformer_engine import set_save_original_input
-
-            set_save_original_input(self.linear_fc2)
 
         # This is to avoid the CPU overhead of multiple d2h copies
         use_mxfp8 = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.mxfp8
@@ -730,7 +730,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight=fc1_single_grouped_weight,
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
-            **self._grouped_linear_kwargs,
+            **getattr(self, "_grouped_linear_kwargs", {}),
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
@@ -858,7 +858,7 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc2_delay_wgrad_compute,
             # Preserve p * (FC2(x) + bias) after the scaled activation moves p before FC2.
             **fc2_bias_kwargs,
-            **self._grouped_linear_kwargs,
+            **getattr(self, "_grouped_linear_kwargs", {}),
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset

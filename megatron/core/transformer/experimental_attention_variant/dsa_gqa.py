@@ -513,6 +513,8 @@ def _simplified_qk_topk_naive(
 class DSGQACoreAttention(MegatronModule):
     """Token-level DSA core attention for grouped-query attention."""
 
+    logs_dsa_indexer_loss = True
+
     def __init__(
         self,
         config: TransformerConfig,

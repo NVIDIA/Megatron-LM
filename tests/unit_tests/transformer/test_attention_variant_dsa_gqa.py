@@ -14,6 +14,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+    DSGQAAttentionSubmodules,
     DSGQACoreAttention,
     DSGroupedSelfAttention,
     SimplifiedDSGQAIndexer,
@@ -32,10 +33,16 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs im
     dsa_stack_spec,
     gdp_dsa_stack_spec,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
+    DSAIndexerLossLoggingHelper,
+    get_dsa_metric_tracker_size,
+    initialize_dsa_metric_tracker,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
 )
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -1056,3 +1063,105 @@ def test_transformer_config_accepts_min_memory_sparse_forward_dense_loss():
 
         assert not config.dsa_fwd_use_dense_attn
         assert not config.dsa_indexer_use_sparse_loss
+
+
+class _PlainIndexerLinear(torch.nn.Linear):
+    """Single-rank stand-in for the TE linear that the DSA-GQA layer spec builds."""
+
+    def __init__(self, input_size, output_size, *, bias=False, **_kwargs):
+        super().__init__(input_size, output_size, bias=bias)
+
+    def forward(self, hidden_states):
+        return super().forward(hidden_states), None
+
+
+def _dsa_gqa_core_attention(indexer_loss_coeff, layer_number):
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        add_bias_linear=False,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="reference",
+        dsa_indexer_loss_coeff=indexer_loss_coeff,
+    )
+    # The indexer reads its RoPE settings as dynamic attributes that megatron/training copies from
+    # args, so a config built directly has to provide them.
+    config.rotary_percent = 0.0
+    linear = ModuleSpec(module=_PlainIndexerLinear)
+    indexer = ModuleSpec(
+        module=SimplifiedDSGQAIndexer,
+        submodules=SimplifiedDSGQAIndexerSubmodules(linear_q=linear, linear_k=linear),
+    )
+    return DSGQACoreAttention(
+        config,
+        DSGQAAttentionSubmodules(indexer=indexer),
+        layer_number=layer_number,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        pg_collection=SimpleNamespace(tp=_DummyTPGroup(), cp=None),
+    )
+
+
+def _run_dsa_gqa_training_forward(core):
+    seqlen, batch_size = 8, 2
+    query = torch.randn(seqlen, batch_size, 4, 8, device="cuda")
+    key = torch.randn(seqlen, batch_size, 1, 8, device="cuda")
+    value = torch.randn(seqlen, batch_size, 1, 8, device="cuda")
+    hidden_states = torch.randn(seqlen, batch_size, 32, device="cuda")
+    core.train()
+    with torch.enable_grad():
+        return core(query, key, value, None, hidden_states, attn_mask_type=AttnMaskType.causal)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for DSA metric storage.")
+def test_dsa_gqa_core_attention_writes_into_fixed_capacity_metric_tracker(monkeypatch):
+    """Training fixes the metric capacity from discovered writers before the first GQA forward."""
+    helper = DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    torch.manual_seed(123)
+
+    try:
+        core = _dsa_gqa_core_attention(indexer_loss_coeff=0.1, layer_number=2).cuda()
+
+        assert get_dsa_metric_tracker_size(core) == 2
+        assert initialize_dsa_metric_tracker(core, SimpleNamespace(pp=object())) == 2
+
+        output = _run_dsa_gqa_training_forward(core)
+
+        assert output.shape == (8, 2, 32)
+        values = helper.tracker["values"]
+        assert values.shape == (2,)
+        assert values[0].item() == 0.0
+        assert values[1].item() != 0.0
+        torch.testing.assert_close(helper.tracker["raw_values"][1], values[1] / 0.1)
+    finally:
+        helper.tracker.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for DSA metric storage.")
+def test_dsa_gqa_core_attention_without_indexer_loss_keeps_zero_metric_capacity(monkeypatch):
+    """A DSA-GQA layer with no indexer loss is not a metric writer and leaves no metric."""
+    helper = DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    torch.manual_seed(123)
+
+    try:
+        core = _dsa_gqa_core_attention(indexer_loss_coeff=0.0, layer_number=2).cuda()
+
+        assert get_dsa_metric_tracker_size(core) == 0
+        assert initialize_dsa_metric_tracker(core, SimpleNamespace(pp=object())) == 0
+
+        output = _run_dsa_gqa_training_forward(core)
+
+        assert output.shape == (8, 2, 32)
+        assert helper.tracker["agreed_size"] == 0
+        assert "values" not in helper.tracker
+    finally:
+        helper.tracker.clear()
