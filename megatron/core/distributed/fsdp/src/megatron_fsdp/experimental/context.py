@@ -117,13 +117,12 @@ class FsdpContext:
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self._context_token: Token[FsdpContext | None] | None = None
-        self.allgather_stream = torch.cuda.Stream(device)
-        if not overlap_allgather_reduction:
-            # A unified stream lets an all-gather reuse the storage released by a
-            # preceding reduce-scatter.
-            self.inner_reduction_stream = self.allgather_stream
-        else:
-            self.inner_reduction_stream = torch.cuda.Stream(device)
+        self.inner_reduction_stream = torch.cuda.Stream(device)
+        self.allgather_stream = (
+            torch.cuda.Stream(device)
+            if overlap_allgather_reduction
+            else self.inner_reduction_stream
+        )
         self.outer_reduction_stream = (
             torch.cuda.Stream(device)
             if overlap_outer_communication
