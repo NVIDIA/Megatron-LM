@@ -148,8 +148,6 @@ def parse_hybrid_layer_config_list(
                 raise ValueError(
                     f"PipelineSplit at index {index} is not allowed after the first MTPSplit"
                 )
-            main_entries.append(PipelineSplit)
-            continue
 
         if entry is MTPSplit:
             if current_mtp_section is not None:
