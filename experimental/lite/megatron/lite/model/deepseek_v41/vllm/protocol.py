@@ -15,11 +15,16 @@ from megatron.lite.model.deepseek_v41.lite.protocol import (
 class ImplConfig(native.ImplConfig):
     attention_core: str = "flashmla"
     head_dtype: str = "float32"
+    attention_deterministic_backward: bool = True
 
 
 def validate_impl_cfg_keys(values):
     native.validate_impl_cfg_keys(
-        {k: v for k, v in values.items() if k not in ("attention_core", "head_dtype")}
+        {
+            k: v
+            for k, v in values.items()
+            if k not in ("attention_core", "head_dtype", "attention_deterministic_backward")
+        }
     )
 
 

@@ -108,9 +108,16 @@ class _SWAInsert(torch.autograd.Function):
         )
 
 
+def _sparse_gradients(ctx, dq, dkv, dsink):
+    # Preserve legacy direct calls without the optional backward-policy input.
+    return (dq, dkv, dsink, None, None, None, None)[: getattr(ctx, 'sparse_inputs', 6)]
+
+
 class _Sparse(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, kv, sink, indices, lengths, scale):
+    def forward(ctx, q, kv, sink, indices, lengths, scale, deterministic_backward=True):
+        ctx.attention_deterministic_backward = deterministic_backward
+        ctx.sparse_inputs = len(ctx.needs_input_grad)
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
         heads = q.shape[1]
@@ -135,13 +142,8 @@ class _Sparse(torch.autograd.Function):
     def backward(ctx, grad):
         q, kv, sink, indices = ctx.saved_tensors
         if q.shape[0] == 0:
-            return (
-                torch.zeros_like(q),
-                torch.zeros_like(kv),
-                torch.zeros_like(sink),
-                None,
-                None,
-                None,
+            return _sparse_gradients(
+                ctx, torch.zeros_like(q), torch.zeros_like(kv), torch.zeros_like(sink)
             )
         if not q.is_cuda or q.shape[-1] != 512:
             # CPU/small-width common-activation reference; production accepts D512.
@@ -155,11 +157,8 @@ class _Sparse(torch.autograd.Function):
                 logits = torch.cat((logits, bias[None, :, None].expand(q.shape[0], -1, 1)), -1)
                 out = logits.softmax(-1)[..., :-1] @ gathered
                 grads = torch.autograd.grad(out, (query, values, bias), grad.float())
-            return (
-                *(value.to(source.dtype) for value, source in zip(grads, (q, kv, sink))),
-                None,
-                None,
-                None,
+            return _sparse_gradients(
+                ctx, *(value.to(source.dtype) for value, source in zip(grads, (q, kv, sink)))
             )
         # Replay exact FlashMLA statistics for the whole-query cuDNN adjoint.
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
@@ -193,25 +192,27 @@ class _Sparse(torch.autograd.Function):
             indices,
             softmax_scale=ctx.scale,
             topk_length=lengths,
-            **sparse._deterministic_sparse_bwd_kwargs(
-                query,
-                kv,
-                output,
-                lse,
-                bias,
-                indices,
-                lengths,
-                ctx.scale,
-                requested=torch.are_deterministic_algorithms_enabled(),
+            **(
+                sparse._deterministic_sparse_bwd_kwargs(
+                    query,
+                    kv,
+                    output,
+                    lse,
+                    bias,
+                    indices,
+                    lengths,
+                    ctx.scale,
+                    requested=torch.are_deterministic_algorithms_enabled(),
+                )
+                if getattr(ctx, 'attention_deterministic_backward', True)
+                else {'deterministic': False}
             ),
         )
-        return (
+        return _sparse_gradients(
+            ctx,
             result["dq"][:, :heads],
             result["dkv"].to(kv.dtype),
             result["d_sink"][:heads].to(sink.dtype),
-            None,
-            None,
-            None,
         )
 
 
@@ -406,7 +407,9 @@ class _PagedSparse(_Sparse):
     on the gathered KV and indices (no bitwise requirement)."""
 
     @staticmethod
-    def forward(ctx, q, kv, sink, indices, lengths, scale, attend):
+    def forward(ctx, q, kv, sink, indices, lengths, scale, attend, deterministic_backward=True):
+        ctx.attention_deterministic_backward = deterministic_backward
+        ctx.sparse_inputs = len(ctx.needs_input_grad) - 1
         ctx.save_for_backward(q, kv, sink, indices)
         ctx.scale = scale
         return attend()
@@ -690,9 +693,26 @@ def swa_forward(
                 attention.config.csa_window_size,
             )
 
-        out = _PagedSparse.apply(q, kv, sink, indices, lens, scale, attend)
+        out = _PagedSparse.apply(
+            q,
+            kv,
+            sink,
+            indices,
+            lens,
+            scale,
+            attend,
+            getattr(attention, 'attention_deterministic_backward', True),
+        )
     else:
-        out = _Sparse.apply(q, kv, sink, indices, lens, scale)
+        out = _Sparse.apply(
+            q,
+            kv,
+            sink,
+            indices,
+            lens,
+            scale,
+            getattr(attention, 'attention_deterministic_backward', True),
+        )
     emit('core_attn', out)
     if not project:
         return out

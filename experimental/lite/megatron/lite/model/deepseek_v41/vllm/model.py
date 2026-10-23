@@ -99,6 +99,9 @@ class DeepseekV41Model(NativeModel):
     def _build_attention(self, config, index):
         attention = build_attention(config, index, self.context)
         attention.attention_core = getattr(self.impl, "attention_core", "flashmla")
+        attention.attention_deterministic_backward = getattr(
+            self.impl, "attention_deterministic_backward", True
+        )
         return attention
 
     def _build_mlp(self, config, release, index):
