@@ -136,6 +136,7 @@ def index_topk(q, w, keys, rope, ratio, emit, candidates=None, *, m=None):
     from vllm.models.deepseek_v41.common.ops import fused_indexer_q_rope_quant
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits, mqa_logits_mx_inputs
 
+    observer, emit = emit, emit or (lambda *_: None)
     rows = q.shape[0]
     positions = (
         torch.arange(rows, device=q.device, dtype=torch.int64) if m is None else m.query_positions
@@ -169,10 +170,11 @@ def index_topk(q, w, keys, rope, ratio, emit, candidates=None, *, m=None):
         ),
         row_ends,
     )
-    emit(
-        'indexer_logits_valid',
-        logits[torch.arange(logits.shape[1], device=q.device)[None] < row_ends[:, None]],
-    )
+    if observer is not None:
+        emit(
+            'indexer_logits_valid',
+            logits[torch.arange(logits.shape[1], device=q.device)[None] < row_ends[:, None]],
+        )
     starts = torch.zeros_like(row_ends)
     if candidates is not None:
         candidates(logits, starts, row_ends)
@@ -190,6 +192,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
     globally ordered compressed rows (decoded, cache records and the pre-RoPE latent of
     the group-boundary rows) and document-local top-k per query. Reuses Lite's
     source-state lifetime and native parameter ownership."""
+    observer, emit = emit, emit or (lambda *_: None)
     core = attention.core_attention
     context, policy = core.context, core.policy
     state, layer = context.state, core.layer
@@ -277,7 +280,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
             q = q.reshape(-1, 32, 128)
             w = linear(x.detach(), weights[1], fp8=False).bfloat16()
             values, scales = keys
-            return index_topk(q, w, keys, rope, ratio, emit, candidates(x.shape[0]), m=m)
+            return index_topk(q, w, keys, rope, ratio, observer, candidates(x.shape[0]), m=m)
 
     topk = state.resolve(layer, policy.index, ('vllm_index', geometry), select)
     emit('compressed_kv_decoded', decoded)

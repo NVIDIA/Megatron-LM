@@ -969,16 +969,14 @@ class SWAAttention(DS41SelfAttention):
         def sources(x, qr, qa):
             from .compressed import source
 
-            decoded, topk, records, _ = source(
-                self, x, qr, qa, self._deployment_rope, layout, lambda *_: None
-            )
+            decoded, topk, records, _ = source(self, x, qr, qa, self._deployment_rope, layout, None)
             return decoded, topk, self._dsv4_compress_ratio, records
 
         if getattr(self, 'attention_core', 'flashmla') == 'mega':
             from .compressed import source
 
             def boundary_sources(x, qr, qa):
-                return source(self, x, qr, qa, self._deployment_rope, layout, lambda *_: None)
+                return source(self, x, qr, qa, self._deployment_rope, layout, None)
 
             return mega_forward(self, hidden_states, layout, layout.host_cu, boundary_sources), None
 
