@@ -4,6 +4,25 @@ import warnings
 from dataclasses import dataclass
 from typing import List, Optional
 
+# Floor applied to temperature everywhere it divides logits to avoid inf/NaN.
+MIN_SAMPLING_TEMPERATURE = 1e-6
+
+
+def is_no_op_top_k(top_k):
+    """True where a top-k value does not truncate (top_k <= 0 is the disabled sentinel).
+
+    Works on Python scalars and torch tensors alike.
+    """
+    return top_k <= 0
+
+
+def is_no_op_top_p(top_p):
+    """True where a top-p value does not truncate (0.0 sentinel, or >= 1.0 = full mass).
+
+    Works on Python scalars and torch tensors alike.
+    """
+    return (top_p <= 0.0) | (top_p >= 1.0)
+
 
 @dataclass
 class SamplingParams:
@@ -27,6 +46,8 @@ class SamplingParams:
     num_tokens_to_generate: int = None
     num_tokens_total: Optional[int] = None  # Cannot set both this and num_tokens_to_generate
     termination_id: Optional[int] = None
+    # Explicit token stops remain active even when model EOS stopping is disabled.
+    stop_token_ids: Optional[List[int]] = None
     top_n_logprobs: int = 0
     return_prompt_top_n_logprobs: bool = False  # Deprecated field for backwards compatibility
     add_BOS: bool = False
@@ -47,14 +68,37 @@ class SamplingParams:
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
     do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.
 
+    # Optional request-local RNG; independent of dynamic batch position.
+    seed: Optional[int] = None
+
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.
 
         Sets return_prompt_top_n_logprobs based on skip_prompt_log_probs and top_n_logprobs:
         - return_prompt_top_n_logprobs = not skip_prompt_log_probs and top_n_logprobs > 0
         """
+        if self.stop_token_ids is not None:
+            if not isinstance(self.stop_token_ids, list) or any(
+                isinstance(token, bool) or not isinstance(token, int) or token < 0
+                for token in self.stop_token_ids
+            ):
+                raise ValueError("stop_token_ids must be a list of nonnegative integers")
+            self.stop_token_ids = sorted(set(self.stop_token_ids))
+        self._validate_seed()
+        self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()
+
+    def _validate_seed(self):
+        if self.seed is not None and (type(self.seed) is not int or not 0 <= self.seed < 2**63):
+            raise ValueError("seed must be a nonnegative int64 or null")
+
+    def _normalize_filters(self):
+        """Map no-op filter values to the disabled sentinels (top_k=0, top_p=0.0)."""
+        if is_no_op_top_p(self.top_p):
+            self.top_p = 0.0
+        if is_no_op_top_k(self.top_k):
+            self.top_k = 0
 
     def _sync_prompt_logprobs_fields(self):
         """Synchronize return_prompt_top_n_logprobs with skip_prompt_log_probs."""
@@ -96,6 +140,8 @@ class SamplingParams:
             setattr(self, key, value)
 
         # Synchronize fields after setting attributes
+        self._validate_seed()
+        self._normalize_filters()
         self._sync_prompt_logprobs_fields()
         self._validate_streaming_interval()
 

@@ -240,8 +240,19 @@ class MXFP8ReshardTransform(ReshardTransform):
             # allocation.  This halves the BF16 overhead for 1D-scale params.
             if buf.scale.ndim == 1:
                 if buf_key not in self._pending_1d:
+                    is_full_slice = len(dst_slice) == buf.data.ndim and all(
+                        isinstance(dim, slice)
+                        and dim.start is None
+                        and dim.stop is None
+                        and dim.step is None
+                        for dim in dst_slice
+                    )
+                    # A complete receive overwrites every element, so avoid a
+                    # redundant full-weight zero fill. Partial accumulation
+                    # remains zero-initialized for deterministic missing slices.
+                    allocate = torch.empty if is_full_slice else torch.zeros
                     self._pending_1d[buf_key] = [
-                        torch.zeros(buf.data.shape, dtype=torch.bfloat16, device=buf.data.device),
+                        allocate(buf.data.shape, dtype=torch.bfloat16, device=buf.data.device),
                         0,
                     ]
                 accum_view = self._pending_1d[buf_key][0][dst_slice]

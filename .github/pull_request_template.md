@@ -3,7 +3,7 @@
 # What does this PR do?
 <!-- Add a one line overview of what this PR aims to accomplish. -->
 
-:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact @NVIDIA/mcore-oncall.
+:warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact `@NVIDIA/mcore-oncall`.
 
 ## Issue tracking
 
@@ -20,13 +20,14 @@ Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
 
 - [ ] I have added relevant unit tests
 - [ ] I have added relevant functional tests
+- [ ] If this PR adds or changes a GPU kernel (Triton, `jit_fuser`/`torch.compile`, CUDA extension, TE or external-library dispatch, or a scatter/index accumulation), I have added or updated its bit-exact determinism test and registered it in `tests/unit_tests/determinism/kernels/manifest.py` ([guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/determinism/testing.md))
 - [ ] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)
 - [ ] I have added relevant documentation
 - [ ] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR
 
 ### Code review
 
-Feel free to message or comment @NVIDIA/mcore-oncall to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
+Feel free to message or comment `@NVIDIA/mcore-oncall` to help accelerate your merge into main. The less complex your PR is, the faster it will be approved and merged!
 
 All PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.
 

@@ -46,7 +46,6 @@ spec:
     ls
     cd /opt/megatron-lm
 
-    NAME=$(echo {test_case}_{environment} | sed 's/dgx_gb200/dgx_a100/g')
     export GPUS_PER_NODE={gpus}
 
     ARGUMENTS=(
@@ -228,8 +227,8 @@ products:
         scope: [mr-broken]
         platforms: [dgx_gb200]
 
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2]
+  - test_case: [deepseek_proxy_mfsdp_v1_ep2]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [nightly]
         platforms: [dgx_gb200]

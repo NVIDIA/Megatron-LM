@@ -7,6 +7,9 @@ from unittest.mock import MagicMock
 import torch
 
 from megatron.core.inference.communication.torch_symm_triton.barrier import symm_mem_sync
+from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
+    SYMM_MEM_KERNEL_CONFIG,
+)
 from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
@@ -64,27 +67,48 @@ def _squared_relu_with_probs_kernel(
     probs_ptr,
     hidden_size,
     max_rows,
+    clamp_scale,
+    CLAMP: tl.constexpr,
+    ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
-    """Apply squared ReLU and router probabilities in training order."""
+    """Apply squared ReLU and router probabilities in training order.
+
+    Matches the training fused weighted-squared-relu rounding, clamped (CLAMP) and
+    unclamped alike: the square and the routing probability are applied in FP32 with a
+    single BF16 round at the end. Rounding the square first, as the BF16 input dtype
+    invites, costs a routed element its last bit.
+    """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
     if pid >= n_used:
         return
 
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
-            if tl.load(permutation_map_ptr + row) >= 0:
-                prob = tl.load(probs_ptr + row)
+            row_i64 = row.to(tl.int64)
+            if tl.load(permutation_map_ptr + row_i64) >= 0:
+                prob = tl.load(probs_ptr + row_i64)
                 for offset in tl.range(0, hidden_size, BLOCK_SIZE):
                     cols = offset + tl.arange(0, BLOCK_SIZE)
                     mask = cols < hidden_size
-                    value = tl.load(input_ptr + row * hidden_size + cols, mask=mask).to(tl.float32)
+                    value = tl.load(input_ptr + row_i64 * hidden_size + cols, mask=mask).to(
+                        tl.float32
+                    )
                     value = tl.maximum(value, 0.0)
-                    value = (value * value).to(tl.bfloat16)
-                    value = (value.to(tl.float32) * prob).to(tl.bfloat16)
-                    tl.store(output_ptr + row * hidden_size + cols, value, mask=mask)
+                    if CLAMP:
+                        value = clamp_scale * libdevice.tanh(value / clamp_scale)
+                    value = value * value
+                    value = (value * prob).to(tl.bfloat16)
+                    tl.store(output_ptr + row_i64 * hidden_size + cols, value, mask=mask)
+            elif ZERO_PADDING:
+                for offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                    cols = offset + tl.arange(0, BLOCK_SIZE)
+                    tl.store(
+                        output_ptr + row_i64 * hidden_size + cols, 0.0, mask=cols < hidden_size
+                    )
 
 
 @triton.jit
@@ -96,6 +120,7 @@ def _swiglu_with_probs_kernel(
     probs_ptr,
     ffn_size,  # output width; input row width is 2*ffn_size (gate | up)
     max_rows,
+    ZERO_PADDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
 ):
@@ -112,25 +137,43 @@ def _swiglu_with_probs_kernel(
         return
     two_n = 2 * ffn_size
 
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+    # Bounded by the live row count, not the worst-case buffer (CUDA-graph safe).
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
         if row < n_used:
-            if tl.load(permutation_map_ptr + row) >= 0:
-                prob = tl.load(probs_ptr + row)
+            row_i64 = row.to(tl.int64)
+            if tl.load(permutation_map_ptr + row_i64) >= 0:
+                prob = tl.load(probs_ptr + row_i64)
                 for offset in tl.range(0, ffn_size, BLOCK_SIZE):
                     cols = offset + tl.arange(0, BLOCK_SIZE)
                     mask = cols < ffn_size
-                    gate = tl.load(input_ptr + row * two_n + cols, mask=mask).to(tl.float32)
-                    up = tl.load(input_ptr + row * two_n + ffn_size + cols, mask=mask).to(
+                    gate = tl.load(input_ptr + row_i64 * two_n + cols, mask=mask).to(tl.float32)
+                    up = tl.load(input_ptr + row_i64 * two_n + ffn_size + cols, mask=mask).to(
                         tl.float32
                     )
-                    value = gate * tl.sigmoid(gate) * up * prob
-                    tl.store(output_ptr + row * ffn_size + cols, value.to(tl.bfloat16), mask=mask)
+                    # Match training's fused SiLU instruction order. Multiplying
+                    # by sigmoid can round differently before MXFP8 quantization.
+                    value = (gate / (1.0 + libdevice.exp(-gate))) * up * prob
+                    tl.store(
+                        output_ptr + row_i64 * ffn_size + cols, value.to(tl.bfloat16), mask=mask
+                    )
+            elif ZERO_PADDING:
+                for offset in tl.range(0, ffn_size, BLOCK_SIZE):
+                    cols = offset + tl.arange(0, BLOCK_SIZE)
+                    tl.store(output_ptr + row_i64 * ffn_size + cols, 0.0, mask=cols < ffn_size)
 
 
 def swiglu_with_probs(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, probs: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor,
+    zero_padding: bool = False,
 ) -> torch.Tensor:
-    """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models)."""
+    """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models).
+
+    ``zero_padding`` initializes aligned dummy rows because MXFP8 quantization and
+    grouped GEMM have no permutation map with which to skip them.
+    """
     num_rows, two_ffn = x.shape
     ffn_size = two_ffn // 2
     out = torch.empty(num_rows, ffn_size, dtype=x.dtype, device=x.device)
@@ -144,6 +187,7 @@ def swiglu_with_probs(
         probs,
         ffn_size,
         num_rows,
+        ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
     )
@@ -168,7 +212,7 @@ def _weighted_silu_mul_bounded_kernel(
     """
     xbound = tl.load(bound_ptr)
     num_progs = tl.num_programs(0)
-    xoffset = tl.program_id(0) * XBLOCK
+    xoffset = tl.program_id(0).to(tl.int64) * XBLOCK
     while xoffset < xbound:
         xindex = xoffset + tl.arange(0, XBLOCK)[:]
         xmask = (xindex < xbound) & (xindex < xnumel)
@@ -225,9 +269,21 @@ def weighted_silu_mul_bounded(
 
 
 def squared_relu_with_probs(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, probs: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor,
+    clamp_scale: Optional[float] = None,
+    zero_padding: bool = False,
 ) -> torch.Tensor:
-    """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply."""
+    """Match training's BF16 squared-ReLU rounding before the FP32 probability multiply.
+
+    Args:
+        clamp_scale: config.activation_func_tanh_clamp_scale. If set, precondition the
+            input with the tanh soft clamp ``s * tanh(x / s)``.
+        zero_padding: initialize aligned dummy rows because MXFP8 quantization and
+            grouped GEMM have no permutation map with which to skip them.
+    """
     num_rows, hidden_size = x.shape
     out = torch.empty_like(x)
     block_size = min(triton.next_power_of_2(hidden_size), 1024)
@@ -240,6 +296,9 @@ def squared_relu_with_probs(
         probs,
         hidden_size,
         num_rows,
+        clamp_scale if clamp_scale is not None else 0.0,
+        CLAMP=clamp_scale is not None,
+        ZERO_PADDING=zero_padding,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
     )
@@ -332,10 +391,14 @@ def ordered_reduce_scatter_v(
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
 
-    max_num_blocks = kwargs.get("max_num_blocks", 128)
-    block_size = min(triton.next_power_of_2(hidden_size), 1024)
-    num_warps = max(1, block_size // 32)
+    # Do not autotune the number of blocks with Triton: every rank must launch the same grid
+    # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
+    # See torch_symm_triton/kernel_config.py.
+    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    block_size = min(triton.next_power_of_2(hidden_size), SYMM_MEM_KERNEL_CONFIG.max_block_size)
+    num_warps = max(1, block_size // SYMM_MEM_KERNEL_CONFIG.warp_size)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _ordered_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
         output_tensor,
@@ -361,30 +424,38 @@ def _unpermute_tokens_in_expert_order_kernel(
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens
     output_ptr,  # [num_tokens, hidden_dim] fp32 output buffer
     hidden_dim,
+    num_tokens,
     num_local_experts: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
 ):
     """Token-local batch-invariant unpermute.
 
-    Each program owns one output token and one hidden tile. Contributions are
-    accumulated in fp32 by increasing local expert id, avoiding atomic-add order.
+    Each program owns a strided set of output tokens and one hidden tile. Contributions
+    are accumulated by increasing local expert id, avoiding atomic-add order, in fp64
+    and rounded once to the fp32 rank partial, as training's batch-invariant
+    unpermute does. An fp32 accumulator drops small contributions next to a large one.
+    The fixed grid walks only the valid tokens (read on device), so the work scales with
+    the live tokens rather than the worst-case buffer while staying CUDA-graph safe.
     """
-    tok = tl.program_id(0)
+    pid = tl.program_id(0)
     block_h = tl.program_id(1)
     valid_tokens = tl.load(valid_tokens_ptr)
     offsets = block_h * BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = offsets < hidden_dim
 
-    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-    if tok < valid_tokens:
+    for tok in tl.range(pid, tl.minimum(valid_tokens, num_tokens), NUM_PROGRAMS):
+        tok_i64 = tok.to(tl.int64)
+        acc = tl.zeros([BLOCK_H], dtype=tl.float64)
         for lid in tl.range(0, num_local_experts):
-            pos = tl.load(inverse_map_ptr + tok * num_local_experts + lid)
+            pos = tl.load(inverse_map_ptr + tok_i64 * num_local_experts + lid)
             if pos >= 0:
-                vals = tl.load(expert_out_ptr + pos * hidden_dim + offsets, mask=mask_h).to(
-                    tl.float32
+                pos_i64 = pos.to(tl.int64)
+                vals = tl.load(expert_out_ptr + pos_i64 * hidden_dim + offsets, mask=mask_h).to(
+                    tl.float64
                 )
                 acc += vals
-        tl.store(output_ptr + tok * hidden_dim + offsets, acc, mask=mask_h)
+        tl.store(output_ptr + tok_i64 * hidden_dim + offsets, acc.to(tl.float32), mask=mask_h)
 
 
 def unpermute_tokens_in_expert_order(
@@ -400,14 +471,17 @@ def unpermute_tokens_in_expert_order(
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
 
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
-    grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_H))
+    num_programs = max(1, min(num_tokens, 1024))
+    grid = (num_programs, triton.cdiv(hidden_dim, BLOCK_H))
     _unpermute_tokens_in_expert_order_kernel[grid](
         expert_output,
         inverse_map,
         valid_tokens,
         out,
         hidden_dim,
+        num_tokens,
         num_local_experts,
         BLOCK_H=BLOCK_H,
+        NUM_PROGRAMS=num_programs,
     )
     return out

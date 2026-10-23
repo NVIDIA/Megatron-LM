@@ -116,9 +116,9 @@ class MegatronLLM(_MegatronLLMBase):
         if any(per_prompt_multi_modal_data):
             raise ValueError("multi_modal_data is only supported with use_coordinator=True.")
         # Direct mode: bypass _generate_impl (which would use to_thread,
-        # pointless for sync). Call the engine directly and merge.
-        records = self._engine.generate(normalized, sampling_params)
-        return [r.merge() for r in records]
+        # pointless for sync). Finalize the flat engine results here.
+        requests = self._engine.generate(normalized, sampling_params)
+        return [request.finalize_text(self._controller.tokenizer) for request in requests]
 
     def pause(self) -> None:
         """Transition the engine to ``PAUSED``. Coordinator mode only.

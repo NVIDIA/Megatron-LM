@@ -1,0 +1,1038 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Bit-exact replay of the Transformer Engine wrappers in ``megatron/core/extensions/``.
+
+These are the kernels that carry almost every FLOP of a training step: cuBLASLt GEMMs (with
+heuristic algorithm selection under the pinned workspace), fused LayerNorm/RMSNorm forward
+and backward (cross-row dgamma reduction), grouped GEMMs over uneven expert loads, fused
+attention with GQA (dK/dV accumulate across query groups), fused RoPE, and the DSA indexer's
+BF16-input/FP32-output projection. Each wrapper is replayed standalone under side-stream
+contention; the bare TE modules are what the model-level suite composes, so a regression here
+localises to one kernel family.
+"""
+
+import inspect
+import os
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from megatron.core import parallel_state
+from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.quant_config import RecipeConfig
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    set_batch_invariant_mode,
+    te_supports_batch_invariant_grouped_gemm,
+)
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    _compute_index_scores,
+    _dsa_weights_proj_forward_gemm,
+    _DSAWeightsProjection,
+)
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import init_method_normal
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
+    bytes_equal,
+    seeded,
+)
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and HAVE_TE), reason="needs a GPU and Transformer Engine"
+)
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TEGroupedLinear,
+        TELayerNormColumnParallelLinear,
+        TELMHeadColumnParallelLinear,
+        TENorm,
+        TERowParallelGroupedLinear,
+        TERowParallelLinear,
+        te_cross_entropy,
+    )
+
+HIDDEN, FFN, TOKENS = 2048, 8192, 8192
+_IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+def _config(**overrides):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=HIDDEN,
+        ffn_hidden_size=FFN,
+        num_attention_heads=16,
+        num_query_groups=4,
+        kv_channels=128,
+        use_cpu_initialization=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        deterministic_mode=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize("parallel_mode", ["column", "row"])
+@pytest.mark.parametrize("singleton_local_shards", [False, True])
+@pytest.mark.parametrize(
+    "quantized",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=[
+                pytest.mark.internal,
+                pytest.mark.launch_on_gb200,
+                pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameters need Blackwell"),
+            ],
+        ),
+    ],
+    ids=["bf16", "mxfp8"],
+)
+def test_te_grouped_linear_virtual_expert_checkpoint(
+    parallel_mode, singleton_local_shards, quantized
+):
+    """Runtime replicas preserve owned initialization and the upstream checkpoint layout."""
+    Utils.initialize_distributed()
+    if torch.distributed.get_world_size() % 2:
+        pytest.skip("requires a world size divisible by EP=2")
+    Utils.initialize_model_parallel(expert_model_parallel_size=2)
+    pg = ProcessGroupCollection.use_mpu_process_groups()
+    config = _config(
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_grouped_gemm=True,
+        moe_single_grouped_weight=False,
+        fp8="e4m3" if quantized else None,
+        fp8_recipe=Fp8Recipe.mxfp8,
+        fp8_param=quantized,
+    )
+    linear = (
+        TEColumnParallelGroupedLinear if parallel_mode == "column" else TERowParallelGroupedLinear
+    )
+
+    def build(num_virtual_experts):
+        with get_fp8_context(config, 0, is_init=True):
+            return linear(
+                2,
+                128,
+                256,
+                num_virtual_experts=num_virtual_experts,
+                config=config,
+                init_method=init_method_normal(0.02),
+                bias=False,
+                skip_bias_add=False,
+                is_expert=True,
+                pg_collection=pg,
+            ).cuda()
+
+    def assert_weight_equal(actual, expected):
+        if is_mxfp8tensor(actual):
+            actual = actual.dequantize()
+        if is_mxfp8tensor(expected):
+            expected = expected.dequantize()
+        assert bytes_equal(actual, expected)
+
+    try:
+        model_parallel_cuda_manual_seed(123)
+        owned, following_owned = build(0), build(0)
+        model_parallel_cuda_manual_seed(123)
+        virtual, following_virtual = build(2), build(0)
+        for module in (owned, following_owned, virtual, following_virtual):
+            assert is_mxfp8tensor(module.weight0) is quantized
+        assert virtual.num_gemms == 4
+        assert set(dict(virtual.named_parameters())) == {"weight0", "weight1"}
+        assert virtual.state_dict().keys() == owned.state_dict().keys()
+        for index in range(2):
+            assert_weight_equal(
+                getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}")
+            )
+            assert_weight_equal(
+                getattr(following_virtual, f"weight{index}"),
+                getattr(following_owned, f"weight{index}"),
+            )
+
+        metadata = {"dp_cp_group": pg.dp_cp, "singleton_local_shards": singleton_local_shards}
+        expected = owned.sharded_state_dict(prefix="experts.", metadata=metadata)
+        actual = virtual.sharded_state_dict(prefix="experts.", metadata=metadata)
+        assert actual.keys() == expected.keys()
+        for index in range(2):
+            global_expert = torch.distributed.get_rank(pg.ep) * 2 + index
+            shard = actual[f"experts.weight{index}"]
+            reference = expected[f"experts.weight{index}"]
+            assert shard.key == reference.key
+            assert shard.global_shape == reference.global_shape
+            assert shard.global_offset == reference.global_offset
+            assert_weight_equal(shard.data, reference.data)
+            if singleton_local_shards:
+                assert shard.key == f"{global_expert}.experts.weight"
+                assert shard.global_shape == (256, 128)
+                assert shard.global_offset == (0, 0)
+            else:
+                assert shard.global_shape == (4, 256, 128)
+                assert shard.global_offset == (global_expert, 0, 0)
+
+        # Distributed checkpoint loading presents one extra-state object per owned expert.
+        restored = build(2)
+        restored.load_state_dict(
+            {name.removeprefix("experts."): shard.data for name, shard in actual.items()},
+            strict=True,
+        )
+        for index in range(2):
+            assert_weight_equal(
+                getattr(restored, f"weight{index}"), getattr(virtual, f"weight{index}")
+            )
+        if quantized:
+            assert restored.fp8_meta["num_gemms"] == restored.num_gemms
+
+        # Loading in either direction must work regardless of the runtime slot count.
+        with torch.no_grad():
+            for index, parameter in enumerate(virtual.parameters()):
+                parameter.fill_(torch.distributed.get_rank(pg.ep) * 2 + index + 1)
+        owned.load_state_dict(virtual.state_dict(), strict=True)
+        for index in range(2):
+            assert_weight_equal(
+                getattr(owned, f"weight{index}"), getattr(virtual, f"weight{index}")
+            )
+        with torch.no_grad():
+            for parameter in virtual.parameters():
+                parameter.zero_()
+        virtual.load_state_dict(owned.state_dict(), strict=True)
+        for index in range(2):
+            assert_weight_equal(
+                getattr(virtual, f"weight{index}"), getattr(owned, f"weight{index}")
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+class TestTEWrappers:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_te_column_parallel_linear_replays(self):
+        seeded()
+        module = TEColumnParallelLinear(
+            HIDDEN,
+            FFN,
+            config=_config(),
+            init_method=init_method_normal(0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        x = torch.randn(
+            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what="TEColumnParallelLinear"
+        )
+
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell")
+    def test_te_lm_head_two_uses_replays(self):
+        """The MXFP8 LM head used twice in one backward pass, as by the main and MTP heads, with
+        its weight gradient accumulated into main_grad. TE versions that read
+        ``zero_tensor_dummy_wgrad`` hand autograd ZeroTensor dummies, whose sum is free."""
+        seeded()
+        config = _config(
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_output_proj=True,
+            gradient_accumulation_fusion=True,
+        )
+        head = TELMHeadColumnParallelLinear(
+            HIDDEN, 4096, config=config, init_method=init_method_normal(0.02), bias=False
+        ).cuda()
+        assert head.weight.zero_tensor_dummy_wgrad
+        # Called twice per microbatch: as for MTP's repeated layers, TE gets no
+        # is_first_microbatch, so neither call overwrites main_grad.
+        head.is_repeated_layer = True
+        head.weight.main_grad = torch.zeros_like(head.weight, dtype=torch.float32)
+        head.weight.grad_added_to_main_grad = False
+
+        class TwoUses(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = head
+
+            def forward(self, x, y):
+                return self.head(x)[0] + self.head(y)[0]
+
+        x, y = (
+            torch.randn(1024, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for _ in range(2)
+        )
+        module = TwoUses()
+        assert_module_replays_bit_exact(
+            module, (x, y), replays=3, contention=True, what="TELMHeadColumnParallelLinear x2"
+        )
+        from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+        if "zero_tensor" in inspect.signature(get_dummy_wgrad).parameters:
+            assert head.weight.grad._is_zerotensor()
+
+    @pytest.mark.parametrize(
+        "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
+    )
+    def test_dsa_indexer_fp32_weights_projection_replays_fwd_bwd(self, backend):
+        """Replay the DSA BF16-operand/FP32-output projection and its custom backward."""
+        seeded()
+        x = torch.randn(4096, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        weight = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        grad_output = torch.randn(4096, 2, 64, device="cuda", dtype=torch.float32)
+        linear = SimpleNamespace()
+
+        te_gemm_supported = False
+        if backend == "te":
+            with torch.no_grad():
+                _, te_gemm_supported = _dsa_weights_proj_forward_gemm(
+                    x.detach(), weight.detach(), None
+                )
+            if te_gemm_supported is not True:
+                pytest.skip("TE BF16-input/FP32-output general_gemm is not supported")
+        indexer = SimpleNamespace(_weights_proj_te_gemm_supported=te_gemm_supported)
+
+        def project(actual_x, actual_weight):
+            return _DSAWeightsProjection.apply(actual_x, actual_weight, linear, indexer)
+
+        outputs, gradients = assert_replays_bit_exact(
+            project,
+            (x, weight),
+            replays=3,
+            backward=True,
+            grad_outputs={"out": grad_output},
+            contention=True,
+            what=f"DSA weights projection[{backend}]",
+        )
+        assert outputs["out"].dtype is torch.float32
+        assert gradients["in[0]"].dtype is torch.bfloat16
+        assert gradients["in[1]"].dtype is torch.bfloat16
+        assert indexer._weights_proj_te_gemm_supported is te_gemm_supported
+
+    @pytest.mark.parametrize("use_relu", [False, True], ids=["no-relu", "relu"])
+    @pytest.mark.parametrize("grad", [False, True], ids=["no-grad", "grad"])
+    def test_dsa_indexer_compute_index_scores_replays(self, grad, use_relu):
+        """Replay the chunked DSA index-score path (no-grad in-place vs grad-collect)."""
+        seeded()
+        sq, batch, n_heads, head_dim, sk = 9, 2, 4, 8, 7
+        q = torch.randn(sq, batch, n_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(sk, batch, head_dim, device="cuda", dtype=torch.bfloat16)
+        weights = torch.randn(sq, batch, n_heads, device="cuda", dtype=torch.bfloat16)
+        if grad:
+            q.requires_grad_(True)
+            weights.requires_grad_(True)
+            k.requires_grad_(True)
+
+        def score(query, head_w, key):
+            return _compute_index_scores(query, head_w, key, use_relu=use_relu)
+
+        if grad:
+            grad_output = torch.randn(batch, sq, sk, device="cuda", dtype=torch.float32)
+            outputs, gradients = assert_replays_bit_exact(
+                score,
+                (q, weights, k),
+                replays=3,
+                backward=True,
+                grad_outputs={"out": grad_output},
+                contention=True,
+                what=f"DSA index scores[relu={use_relu}, grad={grad}]",
+            )
+            assert outputs["out"].dtype is torch.float32
+            assert gradients["in[0]"].dtype is torch.bfloat16
+            assert gradients["in[1]"].dtype is torch.bfloat16
+            assert gradients["in[2]"].dtype is torch.bfloat16
+        else:
+            outputs, _ = assert_replays_bit_exact(
+                score,
+                (q, weights, k),
+                replays=3,
+                backward=False,
+                contention=True,
+                what=f"DSA index scores[relu={use_relu}, grad={grad}]",
+            )
+            assert outputs["out"].dtype is torch.float32
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])
+    @pytest.mark.parametrize(
+        "k,n", [(256, 512), (2048, 1536), (768, 2048), (2688, 1856), (1856, 2688)]
+    )
+    def test_device_metadata_batch_invariant_training(self, monkeypatch, quantized, k, n):
+        """Exercise actual grouped TN/NN/NT dispatch, co-batches, and graph replay."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+        from transformer_engine.pytorch.module import grouped_linear
+
+        from megatron.core.extensions.transformer_engine import (
+            _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+        )
+
+        if (
+            not _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
+            or not te_supports_batch_invariant_grouped_gemm()
+        ):
+            pytest.skip("Requires TE grouped-tensor API, SM100, and cuBLASLt 13.5.1")
+        monkeypatch.delenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", raising=False)
+        calls = set()
+        original_mm = grouped_linear.general_grouped_gemm_for_grouped_tensor
+
+        def counted_mm(*args, **kwargs):
+            calls.add(kwargs.get("layout", "TN"))
+            return original_mm(*args, **kwargs)
+
+        monkeypatch.setattr(grouped_linear, "general_grouped_gemm_for_grouped_tensor", counted_mm)
+        seeded()
+        config = _config(
+            moe_use_grouped_tensor=True,
+            moe_grouped_gemm=True,
+            num_moe_experts=4,
+            fp8="hybrid" if quantized else None,
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_param=quantized,
+        )
+        with get_fp8_context(config, 0, is_init=True):
+            module = (
+                TEGroupedLinear(
+                    4,
+                    k,
+                    n,
+                    parallel_mode=None,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=True,
+                )
+                .cuda()
+                .train()
+            )
+        target = torch.randn(k, device="cuda", dtype=torch.bfloat16)
+        baseline = None
+
+        def check(fn, sizes, row, *, single_token=False):
+            nonlocal baseline
+            x = torch.randn(sum(sizes), k, device="cuda", dtype=torch.bfloat16)
+            if single_token:
+                x.zero_()
+            offset = 0
+            for size in sizes:
+                if size:
+                    x[offset + size - 32 : offset + size].zero_()
+                offset += size
+            x[row] = target
+            x.requires_grad_(True)
+            splits = torch.tensor(sizes, device="cuda", dtype=torch.int64)
+            with get_fp8_context(config, 0):
+                output, _ = fn(x, splits)
+                actual = output[row].detach().clone()
+                output[row].float().sum().backward()
+            if baseline is None:
+                baseline = actual
+            torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+            assert torch.isfinite(x.grad).all()
+            assert all(
+                p.grad is not None and torch.isfinite(p.grad).all() for p in module.parameters()
+            )
+            module.zero_grad(set_to_none=True)
+            return actual
+
+        with set_batch_invariant_mode(True, backend="te_native"):
+            check(module, [256, 256, 256, 256], 0, single_token=True)
+            check(module, [512, 256, 0, 768], 73)
+            check(module, [1024, 2048, 256, 0], 17)
+            sample = torch.randn(2048, k, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            splits = torch.tensor([512, 512, 512, 512], device="cuda", dtype=torch.int64)
+            with get_fp8_context(config, 0):
+                assert_module_replays_bit_exact(
+                    module,
+                    (sample, splits),
+                    replays=3,
+                    contention=True,
+                    what="TE device-metadata fixed-batch forward/backward",
+                )
+            graphed = te.make_graphed_callables(
+                module,
+                (sample, splits),
+                num_warmup_iters=3,
+                enabled=quantized,
+                recipe=MXFP8BlockScaling(),
+            )
+            for sizes, row in (
+                ([512, 512, 512, 512], 0),
+                ([256, 1024, 768, 0], 73),
+                ([1024, 256, 0, 768], 17),
+            ):
+                assert_replays_bit_exact(
+                    lambda: check(graphed, sizes, row),
+                    (),
+                    replays=3,
+                    backward=False,
+                    contention=True,
+                    what="TE device-metadata co-batch",
+                )
+        assert calls == {"TN", "NN", "NT"}
+
+    def test_te_row_parallel_linear_replays(self):
+        seeded()
+        module = TERowParallelLinear(
+            FFN,
+            HIDDEN,
+            config=_config(),
+            init_method=init_method_normal(0.02),
+            bias=True,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        x = torch.randn(
+            TOKENS // 2, 2, FFN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what="TERowParallelLinear"
+        )
+
+    @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+    @pytest.mark.parametrize("zero_centered_gamma", [False, True])
+    def test_te_layernorm_column_parallel_linear_replays(self, normalization, zero_centered_gamma):
+        seeded()
+        config = _config(
+            normalization=normalization, layernorm_zero_centered_gamma=zero_centered_gamma
+        )
+        module = TELayerNormColumnParallelLinear(
+            HIDDEN,
+            3 * HIDDEN,
+            config=config,
+            init_method=init_method_normal(0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        # 16k rows stress the cross-row dgamma/dbeta reduction of the norm backward.
+        x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        assert_module_replays_bit_exact(
+            module,
+            (x,),
+            replays=3,
+            contention=True,
+            what=f"TELayerNormColumnParallelLinear[{normalization}]",
+        )
+
+    @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+    def test_te_norm_replays(self, normalization):
+        seeded()
+        module = TENorm(_config(normalization=normalization), HIDDEN, eps=1e-5).cuda()
+        x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
+        )
+
+    @pytest.mark.skipif(TEFusedMLP is None, reason="TE operation-based MLP is unavailable")
+    @pytest.mark.parametrize("hash_threshold", [None, 0])
+    def test_te_fused_mlp_builder_replays(self, hash_threshold):
+        seeded()
+        module = TEFusedMLP.as_mlp_submodule(
+            submodules=MLPSubmodules(
+                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            ),
+            config=_config(normalization="RMSNorm", gradient_accumulation_fusion=False),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+            is_mtp_layer=False,
+            hash_moe_layer_threshold=hash_threshold,
+        ).cuda()
+        x = torch.randn(
+            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            module, (x,), replays=3, contention=True, what=f"TEFusedMLP[hash={hash_threshold}]"
+        )
+
+    def test_te_grouped_linear_replays_on_uneven_splits(self):
+        seeded()
+        module = TEGroupedLinear(
+            8,
+            HIDDEN,
+            FFN,
+            parallel_mode=None,
+            config=_config(),
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+        ).cuda()
+        m_splits = [4096, 13, 0, 2048, 1, 8191, 33, 1999]
+        x = torch.randn(
+            sum(m_splits), HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
+    @pytest.mark.parametrize(
+        ("recipe_storage", "global_recipe", "transformer_impl", "middle_uses_mxfp8"),
+        [
+            ({}, Fp8Recipe.mxfp8, "inference_optimized", True),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "inference_optimized", True),
+            ({"fp8_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({"inherit_model_init_context": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({"fp4_param": False}, Fp8Recipe.mxfp8, "inference_optimized", False),
+            ({}, Fp8Recipe.tensorwise, "inference_optimized", False),
+            ({}, Fp8Recipe.mxfp8, "transformer_engine", False),
+            ({"inherit_model_init_context": True}, Fp8Recipe.mxfp8, "transformer_engine", True),
+        ],
+        ids=[
+            "automatic-inheritance",
+            "explicit-inheritance",
+            "explicit-bf16-override",
+            "explicit-no-inheritance",
+            "explicit-fp4-storage-option",
+            "mismatched-global-recipe",
+            "training-default-unchanged",
+            "training-explicit-inheritance",
+        ],
+    )
+    def test_per_module_mxfp8_recipe_model_init_policy(
+        self, recipe_storage, global_recipe, transformer_impl, middle_uses_mxfp8
+    ):
+        """Only inference inherits MXFP8 storage automatically; explicit choices win."""
+        training_recipe = {"fp8_quantization_recipe": "mxfp8", "override_quantized_autocast": True}
+        training_recipe.update(recipe_storage)
+        recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": training_recipe,
+                    },
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {},
+                    },
+                },
+                "matchers": {
+                    "routed_expert_fc1": {
+                        "config": "mxfp8",
+                        "type": "glob",
+                        "pattern": "*mlp.experts.linear_fc1",
+                        "enabled": True,
+                    },
+                    "all_other_modules": {
+                        "config": "bf16",
+                        "type": "glob",
+                        "pattern": "*",
+                        "enabled": True,
+                    },
+                },
+            }
+        )
+        config = _config(
+            num_layers=3,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            num_query_groups=4,
+            kv_channels=32,
+            num_moe_experts=2,
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            add_bias_linear=False,
+            fp8="hybrid",
+            fp8_recipe=global_recipe,
+            fp8_param=True,
+            transformer_impl=transformer_impl,
+            normalization="RMSNorm",
+            moe_router_dtype="fp32",
+            quant_recipe=recipe,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=1,
+            num_layers_at_end_in_bf16=1,
+        )
+
+        def build(layer_number, module_path="mlp.experts.linear_fc1"):
+            name = f"decoder.layers.{layer_number}.{module_path}"
+            with get_fp8_context(config, layer_number, is_init=True):
+                return TEGroupedLinear(
+                    2,
+                    128,
+                    256,
+                    parallel_mode=None,
+                    config=config,
+                    init_method=init_method_normal(0.02),
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=True,
+                    name=name,
+                )
+
+        edge = build(0)
+        middle = build(1)
+        assert not is_mxfp8tensor(edge.weight0)
+        assert is_mxfp8tensor(middle.weight0) is middle_uses_mxfp8
+
+        # The catch-all recipe allocates BF16 directly even inside an MXFP8 layer.
+        # Checkpoint loading must preserve the parameter object and its exact BF16 values.
+        other = build(1, "mlp.shared_experts.linear_fc1")
+        for module in (edge, build(2), other):
+            parameter = module.weight0
+            assert not is_mxfp8tensor(parameter)
+            checkpoint = module.state_dict()
+            expected = torch.randn_like(parameter)
+            checkpoint["weight0"] = expected
+            module.load_state_dict(checkpoint)
+            assert module.weight0 is parameter
+            assert torch.equal(module.weight0, expected)
+
+    @pytest.mark.parametrize("return_argmax", [False, True])
+    def test_te_fused_cross_entropy_replays(self, return_argmax):
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(
+            tokens, 1, 32768, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        assert_replays_bit_exact(
+            lambda l, t: te_cross_entropy(l, t, tp_group, return_argmax=return_argmax),
+            (logits, target),
+            replays=4,
+            what="te_fused_cross_entropy",
+        )
+
+    @pytest.mark.parametrize("backend", ["fused", "flash"])
+    def test_te_dot_product_attention_replays(self, backend, monkeypatch):
+        """GQA causal attention; TE must pick a deterministic backward (NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)."""
+        seeded()
+        # conftest forces both TE attention backends off per test; pick one explicitly.
+        clear_nvte_env_vars()
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1" if backend == "fused" else "0")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1" if backend == "flash" else "0")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        # TE caches its backend choice per AttentionParams and only re-selects when the
+        # params change, so an env flip alone would replay the previously chosen backend.
+        from transformer_engine.pytorch.attention.dot_product_attention import (
+            dot_product_attention as te_dpa,
+        )
+
+        monkeypatch.setattr(
+            te_dpa,
+            "_attention_backends",
+            {
+                "attention_params": None,
+                "use_flash_attention": None,
+                "flash_attention_backend": None,
+                "use_fused_attention": None,
+                "fused_attention_backend": None,
+                "use_unfused_attention": None,
+                "backend_selection_requires_update": False,
+            },
+        )
+        config = _config()
+        module = TEDotProductAttention(
+            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type="self"
+        ).cuda()
+        s, b, h, hkv, d = 4096, 2, 16, 4, 128
+        q = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        cp_group = parallel_state.get_context_parallel_group()
+        assert cp_group.size() == 1
+        runtime_cp1 = PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, local_cp_size=1)
+        assert module.cp_group is None
+        reference = None
+
+        try:
+            # Runtime CP1 retains its singleton metadata but must dispatch the same
+            # CP-off kernels as the legacy path, including after metadata is removed.
+            for packed_seq_params in (None, runtime_cp1, None):
+
+                def fn(q, k, v):
+                    output = module(
+                        q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params
+                    )
+                    assert module.cp_group is None
+                    return output
+
+                result = assert_replays_bit_exact(
+                    fn,
+                    (q, k, v),
+                    replays=4,
+                    contention=True,
+                    what=f"TEDotProductAttention[{backend},runtime_cp1={packed_seq_params is not None}]",
+                )
+                assert len(result[1]) == 3  # Replay covers dQ, dK, and dV.
+                assert runtime_cp1.cp_group is cp_group
+                assert runtime_cp1.local_cp_size == 1
+                assert module.cp_group is None
+                if reference is None:
+                    reference = result
+                for expected, actual in zip(reference, result):
+                    assert actual.keys() == expected.keys()
+                    for name in expected:
+                        assert torch.isfinite(actual[name]).all()
+                        assert bytes_equal(expected[name], actual[name]), name
+        except (RuntimeError, AssertionError) as error:
+            if "backend" in str(error).lower() and "avail" in str(error).lower():
+                pytest.skip(f"TE has no {backend} attention backend here: {error}")
+            raise
+
+    @pytest.mark.parametrize("backend", ["fused", "flash"])
+    def test_te_dot_product_attention_softmax_scale_replays(self, backend, monkeypatch):
+        """The config-derived scale MLA hands to its core attention replays bit-exactly."""
+        seeded()
+        # conftest forces both TE attention backends off per test; pick one explicitly.
+        clear_nvte_env_vars()
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "1" if backend == "fused" else "0")
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1" if backend == "flash" else "0")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        # TE caches its backend choice per AttentionParams and only re-selects when the params
+        # change, so an env flip alone would replay the previously chosen backend.
+        from transformer_engine.pytorch.attention.dot_product_attention import (
+            dot_product_attention as te_dpa,
+        )
+
+        monkeypatch.setattr(
+            te_dpa,
+            "_attention_backends",
+            {
+                "attention_params": None,
+                "use_flash_attention": None,
+                "flash_attention_backend": None,
+                "use_fused_attention": None,
+                "fused_attention_backend": None,
+                "use_unfused_attention": None,
+                "backend_selection_requires_update": False,
+            },
+        )
+
+        def build(softmax_scale):
+            return TEDotProductAttention(
+                _config(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type="self",
+                softmax_scale=softmax_scale,
+            ).cuda()
+
+        s, b, h, hkv, d = 512, 2, 16, 4, 128
+        q = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(s, b, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+        def fn(module):
+
+            def run(q, k, v):
+                return module(q, k, v, None, AttnMaskType.causal)
+
+            return run
+
+        try:
+            default = assert_replays_bit_exact(
+                fn(build(None)),
+                (q, k, v),
+                replays=3,
+                contention=True,
+                what=f"TEDotProductAttention[{backend}, default softmax_scale]",
+            )
+            scaled = assert_replays_bit_exact(
+                fn(build(0.25)),
+                (q, k, v),
+                replays=3,
+                contention=True,
+                what=f"TEDotProductAttention[{backend}, config softmax_scale]",
+            )
+        except (RuntimeError, AssertionError) as error:
+            if "backend" in str(error).lower() and "avail" in str(error).lower():
+                pytest.skip(f"TE has no {backend} attention backend here: {error}")
+            raise
+        assert len(scaled[1]) == 3  # Replay covers dQ, dK, and dV.
+        assert not bytes_equal(default[0]["out"], scaled[0]["out"])
+
+
+# --- fused RoPE --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+def test_te_fused_rope_replays_fwd_bwd(layout):
+    from megatron.core.models.common.embeddings import rope_utils
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+
+    if (
+        rope_utils.fused_apply_rotary_pos_emb is None
+        and rope_utils.fused_apply_rotary_pos_emb_thd is None
+    ):
+        pytest.skip("TE fused RoPE unavailable")
+    Utils.initialize_model_parallel()
+    try:
+        seeded()
+        config = _config(apply_rope_fusion=True)
+        s, b, h, d = 4096, 2, 32, 128
+        freqs = RotaryEmbedding(kv_channels=d, rotary_percent=1.0)(s)
+        if layout == "sbhd":
+            t = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            cu_seqlens = None
+        else:
+            t = torch.randn(s, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            cu_seqlens = torch.tensor([0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda")
+
+        def fn(t):
+            return rope_utils.apply_rotary_pos_emb(t, freqs, config, cu_seqlens=cu_seqlens)
+
+        assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_te_fused_mla_kv_rope_mxfp8_replays():
+    """The fused MLA key/value split + key RoPE + MXFP8 quantization that MLA dispatches with
+    use_fused_mla_kv_rope_quant (its backward is the replayed Triton key/value split RoPE)."""
+    from megatron.core.transformer import multi_latent_attention as mla
+
+    if not _IS_BLACKWELL or mla.fused_mla_kv_rope_mxfp8 is None:
+        pytest.skip("needs Transformer Engine's fused_mla_kv_rope_mxfp8 on SM100+")
+    seeded()
+    s, b, h = 2048, 2, 16
+    kv = torch.randn(s, b, h, 256, device="cuda", dtype=torch.bfloat16)
+    kv_down = torch.randn(s, b, 512 + 64, device="cuda", dtype=torch.bfloat16)
+    k_pos_emb = kv_down[..., 512:].unsqueeze(-2)
+    cos = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
+
+    def fn(kv, k_pos_emb, cos, sin):
+        key, value = mla.fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, 128)
+        return tuple(
+            getattr(t, name)
+            for t in (key, value)
+            for name in (
+                "_rowwise_data",
+                "_rowwise_scale_inv",
+                "_columnwise_data",
+                "_columnwise_scale_inv",
+            )
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (kv, k_pos_emb, cos, sin),
+        replays=3,
+        backward=False,
+        contention=True,
+        what="TE fused MLA key/value RoPE + MXFP8",
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_te_quantile_balancing_histogram_replays(dtype):
+    """Exercise the QB-capable TE dispatch, including its atomic histogram output."""
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function_supports_qb,
+    )
+    from megatron.core.transformer.moe.moe_utils import topk_routing_with_score_function
+
+    if not fused_topk_with_score_function_supports_qb:
+        pytest.skip("requires the Transformer Engine QB fused-router API")
+    seeded()
+    num_tokens, num_experts = 8192, 64
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=dtype, requires_grad=True)
+    bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
+    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, 128, device="cuda", dtype=torch.int32)
+
+    def fn(logits, histogram):
+        outputs = []
+        for microbatch in logits.chunk(2):
+            outputs.append(
+                topk_routing_with_score_function(
+                    microbatch,
+                    topk=8,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    fused=True,
+                    qb_histogram=histogram,
+                    qb_bin_bounds=bounds,
+                )
+            )
+        return (
+            torch.cat([output[0] for output in outputs]),
+            torch.cat([output[1] for output in outputs]),
+            histogram,
+        )
+
+    outputs, grads = assert_replays_bit_exact(
+        fn,
+        (logits, histogram),
+        grad_outputs={"out[0]": torch.randn(num_tokens, num_experts, device="cuda")},
+        replays=3,
+        contention=True,
+        what=f"TE quantile balancing[{dtype}]",
+    )
+    assert torch.all(outputs["out[2]"].sum(dim=-1) == num_tokens)
+    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    assert grads["in[0]"].abs().sum() > 0
+
+
+# --- fused top-k router with dense indices ------------------------------------------------------
+
+
+@pytest.mark.parametrize("indices_dtype", [torch.int64, torch.int16], ids=["int64", "int16"])
+def test_te_fused_topk_dense_indices_replays(indices_dtype):
+    """The fused router wrapper can write dense [tokens, topk] expert ids into a caller-provided
+    tensor (flex deepep/ncclep: int64, HybridEP: int16) instead of the bool routing map."""
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_topk_indices,
+    )
+
+    if fused_topk_with_score_function is None:
+        pytest.skip("TE fused router unavailable")
+    if not fused_topk_with_score_function_supports_topk_indices:
+        pytest.skip("TE fused router does not support topk_indices")
+    seeded()
+    num_tokens, num_experts, topk = 8192, 256, 8
+    logits = torch.randn(num_tokens, num_experts, device="cuda", requires_grad=True)
+    expert_bias = torch.randn(num_experts, device="cuda") * 0.01
+
+    def fn(logits):
+        topk_indices = torch.empty(num_tokens, topk, dtype=indices_dtype, device="cuda")
+        probs, routing_map = fused_topk_with_score_function(
+            logits=logits,
+            topk=topk,
+            use_pre_softmax=False,
+            num_groups=None,
+            group_topk=None,
+            scaling_factor=2.5,
+            score_function="sigmoid",
+            expert_bias=expert_bias,
+            topk_indices=topk_indices,
+        )
+        assert routing_map.dtype == indices_dtype and routing_map.shape == (num_tokens, topk)
+        return probs, routing_map
+
+    assert_replays_bit_exact(
+        fn, (logits,), replays=3, what=f"TE fused topk dense indices[{indices_dtype}]"
+    )

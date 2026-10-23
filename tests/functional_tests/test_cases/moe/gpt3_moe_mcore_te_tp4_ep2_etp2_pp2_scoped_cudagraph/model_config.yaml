@@ -44,6 +44,9 @@ MODEL_ARGS:
   --moe-router-topk: 2
   --moe-router-dtype: fp32
   --moe-router-fusion: true
+  # --deterministic-mode refuses the fused aux loss: TE's kernel is non-deterministic.
+  # Fused TopK routing above has no such report against it, so it stays on.
+  --no-moe-router-aux-loss-fusion: true
   --moe-router-enable-expert-bias: true
   --moe-router-score-function: sigmoid
   --moe-router-pre-softmax: true

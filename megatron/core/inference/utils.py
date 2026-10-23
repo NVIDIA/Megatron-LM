@@ -6,15 +6,79 @@ import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
 import torch
 
-from megatron.core.utils import get_model_config
+from megatron.core.utils import accepts_parameter, get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
+
+
+def detokenize_tokens(
+    tokenizer: Any, tokens: list[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+) -> str:
+    """Convert token IDs to text using the inference detokenization policy.
+
+    Args:
+        tokenizer: Tokenizer that supplies ``detokenize`` and optionally ``eod``.
+        tokens: Token IDs to detokenize.
+        remove_EOD: Remove trailing end-of-sequence tokens before detokenization: every id in
+            ``model_eos_token_ids``, which also stops generation.
+        skip_special_tokens: Pass special-token removal through when supported.
+
+    Returns:
+        The decoded text.
+    """
+    if not tokens:
+        return ""
+
+    if remove_EOD:
+        eos_token_ids = model_eos_token_ids(tokenizer)
+        while tokens and tokens[-1] in eos_token_ids:
+            tokens = tokens[:-1]
+    if not tokens:
+        return ""
+
+    if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
+        return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+    return tokenizer.detokenize(tokens)
+
+
+def get_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the language model: the one a multimodal wrapper holds, or the model itself.
+
+    Multimodal wrappers (e.g. LLaVAModel) keep the language model under ``language_model``.
+    Inference code that reads language-model state (vocab size, MTP block, embedding) resolves
+    it here rather than checking for a specific wrapper class.
+    """
+    language_model = getattr(model, "language_model", None)
+    return model if language_model is None else language_model
+
+
+def model_eos_token_ids(tokenizer: Any) -> frozenset:
+    """Return the model-level EOS token IDs.
+
+    Honors `generation_config.eos_token_id` (which HF may declare as a LIST, e.g.
+    `[2, 11]`) in addition to the tokenizer's single `eod`. The generation_config is
+    read off the tokenizer if present (HF tokenizers attach it; other tokenizers
+    won't).
+    """
+    ids = set()
+    eod = getattr(tokenizer, "eod", None)
+    if eod is not None:
+        ids.add(int(eod))
+    gen_cfg = getattr(tokenizer, "generation_config", None)
+    if isinstance(gen_cfg, dict):
+        eos = gen_cfg.get("eos_token_id")
+        if isinstance(eos, int) and not isinstance(eos, bool):
+            ids.add(eos)
+        elif isinstance(eos, (list, tuple)):
+            ids.update(int(e) for e in eos if isinstance(e, int) and not isinstance(e, bool))
+    return frozenset(ids)
 
 
 class InferenceMode:

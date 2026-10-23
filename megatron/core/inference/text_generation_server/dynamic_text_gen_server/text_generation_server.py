@@ -19,14 +19,21 @@ except ImportError as e:
     HAS_BACKEND = False
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
-from megatron.core.inference.config import MultimodalPromptConfig
+from megatron.core.inference.config import MultimodalPromptConfig, PrefixCachingCoordinatorPolicy
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
+
+from .endpoints.common import apply_optional_sampling_default
 
 logger = logging.getLogger(__name__)
 
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
+# The policy worker is a live Ray/CUDA process with background threads by the
+# time it starts HTTP replicas. Forking it copies locks and runtime state
+# without the threads that own them, which can leave a child alive but unable
+# to make progress. Every frontend must therefore start from a clean interpreter.
+_SERVER_PROCESS_CONTEXT = mp.get_context("spawn")
 
 
 @contextmanager
@@ -52,10 +59,12 @@ async def _run_text_gen_server(
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -65,7 +74,15 @@ async def _run_text_gen_server(
         raise RuntimeError(f"Web backend framework (Quart) not available")
 
     # Create and start the client locally inside this process
-    inference_client = InferenceClient(coordinator_addr, deserialize=False)
+    # The client hashes prompts for prefix-affinity routing so the coordinator
+    # does not have to on its single serial loop. It is the only place holding
+    # both the tokens and, for multimodal, the media key that salts them.
+    inference_client = InferenceClient(
+        coordinator_addr,
+        deserialize=False,
+        block_size_tokens=block_size_tokens,
+        prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
+    )
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
@@ -95,9 +112,12 @@ async def _run_text_gen_server(
         app.config['multimodal_prompt_config'] = (
             multimodal_prompt_config or MultimodalPromptConfig()
         )
-        app.config['default_temperature'] = default_temperature
-        app.config['default_top_p'] = default_top_p
-        app.config['default_top_k'] = default_top_k
+        # Only set when the operator actually configured a value -- see
+        # apply_optional_sampling_default's docstring for why unconditional
+        # assignment here would break resolve_sampling_default's precedence.
+        apply_optional_sampling_default(app.config, 'default_temperature', default_temperature)
+        apply_optional_sampling_default(app.config, 'default_top_p', default_top_p)
+        apply_optional_sampling_default(app.config, 'default_top_k', default_top_k)
         app.config['eval_mode'] = eval_mode
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
@@ -156,10 +176,12 @@ def _server_process_worker(
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -180,6 +202,8 @@ def _server_process_worker(
                 default_top_p,
                 default_top_k,
                 eval_mode,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
             )
         )
     except KeyboardInterrupt:
@@ -237,10 +261,12 @@ def start_text_gen_server(
     sock: Optional[socket.socket] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
-    default_temperature: float = 1.0,
-    default_top_p: float = 1.0,
-    default_top_k: int = 0,
+    default_temperature: Optional[float] = None,
+    default_top_p: Optional[float] = None,
+    default_top_k: Optional[int] = None,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -288,7 +314,7 @@ def start_text_gen_server(
         server_port = _reserve_port(hostname)
 
     for i in range(num_replicas):
-        p = mp.Process(
+        p = _SERVER_PROCESS_CONTEXT.Process(
             target=_server_process_worker,
             args=(
                 coordinator_addr,
@@ -304,6 +330,8 @@ def start_text_gen_server(
                 default_top_p,
                 default_top_k,
                 eval_mode,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
             ),
             daemon=True,
         )
