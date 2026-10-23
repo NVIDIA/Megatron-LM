@@ -18,6 +18,7 @@ from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_pari
 )
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     run_absorbed_mla_dsa_parity,
+    run_fused_dsa_fp8_integration,
 )
 
 
@@ -41,6 +42,15 @@ def test_fused_absorbed_mla_dsa_matches_native(
         use_sparse_loss=use_sparse_loss,
         num_iterations=10,
     )
+
+
+# Same real-kernel cuDNN/flash_mla caveat as above: disabled in dev/LTS CI, run in-container.
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
+@pytest.mark.parametrize("rope_fp32", [False, True], ids=["bf16_preproc", "fp32_preproc"])
+def test_fused_absorbed_mla_dsa_fp8_scoring(rope_fp32: bool) -> None:
+    """FP8 indexer scoring is threaded through the full-fusion forward + backward path."""
+    run_fused_dsa_fp8_integration(seqlen=128, rope_fp32=rope_fp32)
 
 
 # Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
@@ -1613,6 +1623,7 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        scoring_precision="bf16",
     ):
         del (
             single_packed_thd_sequence,
@@ -2603,6 +2614,7 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scoring_precision="bf16",
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -2693,6 +2705,7 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scoring_precision="bf16",
     ):
         seen["loss_coeff"] = loss_coeff
         seen["sparse_loss"] = sparse_loss
@@ -2780,6 +2793,7 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scoring_precision="bf16",
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -2931,6 +2945,7 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scoring_precision="bf16",
     ):
         seen["called"] = True
         seen["varlen_starts"] = varlen_starts

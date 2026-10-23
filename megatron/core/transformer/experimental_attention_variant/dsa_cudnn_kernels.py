@@ -296,6 +296,7 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         tp_group=getattr(pg_collection, "tp", None),
+        scoring_precision=getattr(config, "dsa_indexer_scoring_precision", "bf16"),
         **packed_thd_kwargs,
     )
 
@@ -2279,6 +2280,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        scoring_precision: str = "bf16",
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -2316,6 +2318,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            scoring_precision=scoring_precision,
         )
 
         prepared_topk_length = (
@@ -2478,13 +2481,15 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         #   use_local_indexer_varlen, single_packed_thd_sequence,
         #   local_packed_cp_rank, local_packed_cp_query_start,
         #   local_packed_cp_query_len, packed_cu_seqlens_q, packed_cu_seqlens_k,
-        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group.
+        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group,
+        #   scoring_precision.
         return (
             grad_query,
             grad_kv_full,
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -2773,6 +2778,7 @@ def fused_indexer_sparse_attn(
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
     tp_group=None,
+    scoring_precision: str = "bf16",
 ) -> Tuple[Tensor, Tensor]:
     """Fused DSv3.2 indexer, sparse attention, and optional indexer loss.
 
@@ -2822,6 +2828,7 @@ def fused_indexer_sparse_attn(
         packed_max_seqlen_k,
         packed_cp_size,
         tp_group,
+        scoring_precision,
     )
 
 
