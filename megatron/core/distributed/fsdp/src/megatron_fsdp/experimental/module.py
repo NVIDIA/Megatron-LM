@@ -521,9 +521,15 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool, int | None], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (effective_dtype(parameter), parameter.requires_grad)
+        dtype = effective_dtype(parameter)
+        # MXFP8 layouts align each DP shard to 32 rows of every tensor in the
+        # group. Mixing row widths takes their LCM, which can pad a replicated
+        # compute-weight buffer to many times its logical size on a large mesh.
+        # Equal-width groups retain block alignment without that LCM inflation.
+        row_size = parameter.shape[1:].numel() if dtype == torch.uint8 else None
+        key = (dtype, parameter.requires_grad, row_size)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 

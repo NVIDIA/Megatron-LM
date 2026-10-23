@@ -20,11 +20,44 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+    layout_builder,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import _group_parameters
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
+
+
+def test_mxfp8_grouping_bounds_deepseek_dense_buffer_padding():
+    """A 256-rank DeepSeek layer must not inflate its replicated weights tenfold."""
+    # MXFP8 groups expose uint8 to layout planning. Meta stand-ins exercise the
+    # full model dimensions without allocating the multi-GiB weight buffers.
+    shapes = {
+        "qkv_down": (2112, 7168),
+        "q_up": (24576, 1536),
+        "kv_up": (32768, 512),
+        "out": (7168, 16384),
+        "shared_fc1": (4096, 7168),
+        "shared_fc2": (7168, 2048),
+    }
+    parameters = {
+        name: nn.Parameter(
+            torch.empty(shape, dtype=torch.uint8, device="meta"), requires_grad=False
+        )
+        for name, shape in shapes.items()
+    }
+    layouts = [
+        layout_builder.build_for_row_atomic(
+            (parameter.shape for parameter in group.values()), dp_size=256, block_size=32
+        )
+        for group in _group_parameters(parameters)
+    ]
+    logical_numel = sum(parameter.numel() for parameter in parameters.values())
+    padded_numel = sum(layout.size for layout in layouts)
+    # Per-width block alignment needs some tail padding, but remains below 2x.
+    # A single mixed-width group instead pads this layer to 2,818,572,288 elements.
+    assert logical_numel <= padded_numel < 2 * logical_numel
 
 
 class MultiChildModel(nn.Module):

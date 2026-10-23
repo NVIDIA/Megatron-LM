@@ -63,15 +63,17 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements):
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=placements)
 
-    # MLP weights share one quantized group; biases use a regular DBuffer.
-    [weight_group] = [
+    # Different weight row widths use separate quantized groups to bound padding;
+    # biases still share a regular DBuffer.
+    weight_groups = [
         g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
     ]
-    assert len(weight_group.fsdp_parameters) == 2
+    assert len(weight_groups) == 2
+    assert sum(len(group.fsdp_parameters) for group in weight_groups) == 2
     if isinstance(placements.optimizer[0], Shard):
-        assert weight_group.main_weight.placements == (BlockAtomic(32),)
-    [bias_group] = [g for g in model.parameter_groups if g is not weight_group]
-    assert isinstance(bias_group.model_weight, DBuffer)
+        assert all(group.main_weight.placements == (BlockAtomic(32),) for group in weight_groups)
+    [bias_group] = [g for g in model.parameter_groups if isinstance(g.model_weight, DBuffer)]
+    assert len(bias_group.fsdp_parameters) == 2
 
     optimizer = FusedAdam(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
