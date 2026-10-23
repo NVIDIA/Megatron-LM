@@ -65,18 +65,24 @@ def _compute_norm_2(params_list):
     return torch.zeros((1,), dtype=torch.float32, device='cuda')
 
 
-def _get_param_data(param, force_create_fp32_copy, bf16):
+def _get_param_data(param, force_create_fp32_copy, bf16, main_param_getter=None):
     """Extract the appropriate data tensor from a param for norm computation.
 
     Returns (data_tensor, is_sharded) where is_sharded indicates the param has
-    a sharded main_param from the distributed optimizer.
+    a sharded main_param from the distributed optimizer. data_tensor is None if this rank
+    holds no shard of the param.
+
+    With the precision-aware optimizer the FP32 masters live inside the optimizer, so
+    param.main_param is None whether or not this rank owns a shard. Pass the optimizer's
+    get_main_param_shard as main_param_getter to resolve that; it returns None for params this
+    rank does not own.
     """
     if bf16:
         if not force_create_fp32_copy and hasattr(param, 'main_param'):
             if getattr(param, 'main_param_sharded', False):
-                if param.main_param is not None:
-                    return param.main_param, True
-                return None, True
+                if main_param_getter is not None:
+                    return main_param_getter(param), True
+                return param.main_param, True
             return param.main_param, False
         return param.data.float(), False
     return param.data, False
@@ -89,8 +95,14 @@ def calc_params_l2_norm(
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
     return_squared_tensor=False,
     trainable_only=False,
+    main_param_getter=None,
 ):
-    """Calculate the parameter L2 norm using global, single-model, or multi-module groups."""
+    """Calculate the parameter L2 norm using global, single-model, or multi-module groups.
+
+    main_param_getter: optional callable mapping a model param to the FP32 main param shard held
+    by this rank (or None), typically the optimizer's get_main_param_shard. Required for the
+    precision-aware optimizer, where param.main_param is not populated.
+    """
     if not isinstance(model, list):
         model = [model]
 
@@ -100,6 +112,7 @@ def calc_params_l2_norm(
             pg_collection,
             force_create_fp32_copy=force_create_fp32_copy,
             return_squared_tensor=return_squared_tensor,
+            main_param_getter=main_param_getter,
         )
 
     args = get_args()
@@ -185,7 +198,9 @@ def calc_params_l2_norm(
             if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                data, is_sharded = _get_param_data(
+                    param, force_create_fp32_copy, args.bf16, main_param_getter
+                )
                 if data is None:
                     continue
                 if is_gtp:
@@ -195,7 +210,9 @@ def calc_params_l2_norm(
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
-                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                    data, is_sharded = _get_param_data(
+                        param, force_create_fp32_copy, args.bf16, main_param_getter
+                    )
                     if data is None:
                         continue
                     if is_gtp:
@@ -273,6 +290,7 @@ def _calc_mimo_params_l2_norm(
     *,
     force_create_fp32_copy=False,
     return_squared_tensor=False,
+    main_param_getter=None,
 ):
     """Calculate a combined parameter L2 norm across MIMO model grids."""
     model_chunks = [unwrap_model(model_chunk) for model_chunk in model]
@@ -297,6 +315,7 @@ def _calc_mimo_params_l2_norm(
             pg_collection=pg_collection[name],
             return_squared_tensor=True,
             trainable_only=True,
+            main_param_getter=main_param_getter,
         )
         norm_sq[index].copy_(module_norm_sq.reshape(()))
 

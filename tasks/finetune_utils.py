@@ -197,7 +197,9 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
             # Logging.
             params_norm = None
             if cfg.logger.log_params_norm:
-                params_norm = calc_params_l2_norm(model)
+                params_norm = calc_params_l2_norm(
+                    model, main_param_getter=getattr(optimizer, 'get_main_param_shard', None)
+                )
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
                                               train_state.iteration,

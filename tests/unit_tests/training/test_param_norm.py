@@ -68,6 +68,54 @@ def _fill_parameters_with_ones(model: GPTModel) -> None:
             param.fill_(1.0)
 
 
+def _param_with(**attrs) -> torch.Tensor:
+    param = torch.ones(4, dtype=torch.bfloat16)
+    for name, value in attrs.items():
+        setattr(param, name, value)
+    return param
+
+
+def test_get_param_data_uses_main_param_getter_when_main_param_is_none():
+    """With the precision-aware optimizer main_param is None because TE owns the masters; the
+    norm must come from the optimizer's main param shard instead of dropping the param."""
+    shard = torch.full((2,), 3.0)
+    param = _param_with(main_param=None, main_param_sharded=True)
+    data, is_sharded = common_utils._get_param_data(param, False, True, lambda p: shard)
+    assert is_sharded and data is shard
+
+
+def test_get_param_data_skips_param_when_getter_returns_none():
+    """Params owned by other DP ranks (getter returns None) are still skipped."""
+    param = _param_with(main_param=None, main_param_sharded=True)
+    assert common_utils._get_param_data(param, False, True, lambda p: None) == (None, True)
+
+
+def test_get_param_data_without_getter_uses_main_param():
+    main = torch.full((2,), 2.0)
+    param = _param_with(main_param=main, main_param_sharded=True)
+    data, is_sharded = common_utils._get_param_data(param, False, True)
+    assert is_sharded and data is main
+    param = _param_with(main_param=None, main_param_sharded=True)
+    assert common_utils._get_param_data(param, False, True) == (None, True)
+
+
+def test_get_param_data_force_fp32_copy_ignores_getter():
+    param = _param_with(main_param=None, main_param_sharded=True)
+    data, is_sharded = common_utils._get_param_data(
+        param, True, True, lambda p: pytest.fail("getter must not be called")
+    )
+    assert not is_sharded and data.shape == param.shape
+
+
+def test_get_param_data_getter_ignored_for_params_without_main_param():
+    """FP32 params and params of non-distributed optimizers have no main_param attribute."""
+    param = _param_with()
+    data, is_sharded = common_utils._get_param_data(
+        param, False, True, lambda p: pytest.fail("getter must not be called")
+    )
+    assert not is_sharded and data.dtype == torch.float32
+
+
 def test_mimo_param_norm_skips_frozen_pp1_module(monkeypatch):
     class _ProcessGroup:
         def size(self):
@@ -115,6 +163,35 @@ def test_mimo_param_norm_skips_frozen_pp1_module(monkeypatch):
     assert all(call[0] == [model.language_model] for call in calls)
     assert all(call[2]["trainable_only"] for call in calls)
     assert all_reduce_calls == 1
+
+    # The optimizer's main param getter reaches the per-module norms, as without it the
+    # precision-aware optimizer's params would all be skipped.
+    calls.clear()
+    getter = lambda param: None
+    common_utils._calc_mimo_params_l2_norm([model], pg_collection, main_param_getter=getter)
+    assert calls and all(call[2]["main_param_getter"] is getter for call in calls)
+
+
+def test_calc_params_l2_norm_forwards_main_param_getter_to_mimo(monkeypatch):
+    pg_collection = object.__new__(common_utils.MultiModuleProcessGroupCollection)
+    captured = {}
+
+    def _mimo_norm(model, pg, **kwargs):
+        captured.update(kwargs, model=model, pg=pg)
+        return 1.0
+
+    monkeypatch.setattr(common_utils, "_calc_mimo_params_l2_norm", _mimo_norm)
+    getter = lambda param: None
+    model = torch.nn.Linear(1, 1)
+
+    assert (
+        common_utils.calc_params_l2_norm(
+            model, pg_collection=pg_collection, main_param_getter=getter
+        )
+        == 1.0
+    )
+    assert captured["main_param_getter"] is getter
+    assert captured["model"] == [model] and captured["pg"] is pg_collection
 
 
 @pytest.mark.parametrize(
