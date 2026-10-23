@@ -6,7 +6,6 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from megatron.training.argument_utils import tokenizer_config_from_args
 import pytest
 import torch
 
@@ -23,6 +22,7 @@ from megatron.core.inference.shards_spec import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import unwrap_model
+from megatron.training.argument_utils import tokenizer_config_from_args
 from megatron.training.config import RLConfig
 from tests.unit_tests.test_utilities import Utils
 
