@@ -7,8 +7,9 @@ inference depend on them replaying bit-exactly. Covered here: KV-cache tensor op
 fused KV append, the inference MoE activations and MXFP8 quantisation, the inference MoE
 permute/unpermute (batch-invariant path bit-exact; the atomic default path is the negative
 control), the vLLM-derived fused MoE GEMM and top-k sum, the batch-invariant GEMM /
-log-softmax / mean kernels, and the CUDA-graph routing-map padding mask. Multi-rank NVLS
-symmetric-memory collectives are exempted in the manifest (they need NVLink peers).
+log-softmax / mean kernels, the CUDA-graph routing-map padding mask, and the zeroing of
+padding-token rows. Multi-rank NVLS symmetric-memory collectives are exempted in the
+manifest (they need NVLink peers).
 """
 
 import pytest
@@ -740,6 +741,20 @@ def test_mask_routing_padding_replays():
         return routing_map
 
     assert_replays_bit_exact(fn, (routing_map,), backward=False, what="mask_routing_padding")
+
+
+def test_zero_padding_rows_replays():
+    from megatron.core.inference.contexts.zero_padding_rows_kernel import zero_padding_rows
+
+    seeded()
+    activations = torch.randn(2048, 1, 1024, device="cuda", dtype=torch.bfloat16)
+    real = _dev_scalar(37 + 2048)
+
+    def fn(activations):
+        zero_padding_rows(activations, real, first_token_idx=2048)
+        return activations
+
+    assert_replays_bit_exact(fn, (activations,), backward=False, what="zero_padding_rows")
 
 
 @pytest.mark.launch_on_gb200
