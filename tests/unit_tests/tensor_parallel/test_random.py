@@ -1,12 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
+from contextvars import ContextVar, copy_context
+
 import pytest
 import torch
 
+from megatron.core.tensor_observation import capture_tensor_observations, observe_tensor
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
     CudaRNGStatesTracker,
+    _run_recompute_with_observation_suspended,
     checkpoint,
     convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
@@ -400,3 +405,140 @@ def test_checkpoint_without_output_retain_input_tensors(use_manager):
         assert torch.allclose(ref_input_grad, input2.grad)
     finally:
         Utils.destroy_model_parallel()
+
+
+def _te_recompute_queue():
+    """Transformer Engine's queue of first-pass recompute state, or None if unavailable."""
+    try:
+        from transformer_engine.pytorch.distributed import activation_recompute_forward
+    except ImportError:
+        return None
+    return getattr(activation_recompute_forward, "_is_first_fp8_module", None)
+
+
+@pytest.mark.parametrize("mode", ["no_grad", "input_without_grad"])
+def test_checkpoint_without_output_plain_call_without_backward(mode):
+    """With grad disabled, or no input that requires grad, checkpoint() is a plain call.
+
+    Nothing is discarded, no Transformer Engine recompute state is left behind, and parameters
+    used inside the function still receive gradients.
+    """
+    Utils.initialize_model_parallel()
+    try:
+        linear = torch.nn.Linear(8, 8)
+        reference = torch.nn.Linear(8, 8)
+        reference.load_state_dict(linear.state_dict())
+        x = torch.randn(4, 8)
+        queue = _te_recompute_queue()
+        queue_len = None if queue is None else len(queue)
+
+        checkpoint = CheckpointWithoutOutput()
+        with torch.no_grad() if mode == "no_grad" else contextlib.nullcontext():
+            hidden = checkpoint.checkpoint(linear, x)
+            output = hidden * 2
+            checkpoint.discard_output_and_register_recompute(output)
+
+        assert hidden.untyped_storage().size() > 0
+        if queue is not None:
+            assert len(queue) == queue_len
+        if mode == "input_without_grad":
+            output.sum().backward()
+            (reference(x) * 2).sum().backward()
+            assert torch.equal(linear.weight.grad, reference.weight.grad)
+            assert torch.equal(linear.bias.grad, reference.bias.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_output_multiple_hook_tensors():
+    """Discarding with several hook tensors on parallel consumers recomputes only once."""
+    grad_enabled_per_call = []
+
+    def gelu(x):
+        grad_enabled_per_call.append(torch.is_grad_enabled())
+        return torch.nn.functional.gelu(x)
+
+    Utils.initialize_model_parallel()
+    try:
+        input1 = torch.randn(6, 8, requires_grad=True)
+        weight_a1 = torch.randn(8, 8, requires_grad=True)
+        weight_b1 = torch.randn(8, 8, requires_grad=True)
+        input2, weight_a2, weight_b2 = (
+            t.detach().clone().requires_grad_(True) for t in (input1, weight_a1, weight_b1)
+        )
+
+        checkpoint = CheckpointWithoutOutput()
+        hidden = checkpoint.checkpoint(gelu, input1)
+        out_a, out_b = hidden @ weight_a1, hidden @ weight_b1
+        checkpoint.discard_output_and_register_recompute(out_a)
+        checkpoint.discard_output_and_register_recompute(out_b)
+        (out_a.sum() + 2 * out_b.sum()).backward()
+        assert grad_enabled_per_call == [False, True]
+
+        hidden_ref = torch.nn.functional.gelu(input2)
+        ((hidden_ref @ weight_a2).sum() + 2 * (hidden_ref @ weight_b2).sum()).backward()
+        assert torch.allclose(input1.grad, input2.grad)
+        assert torch.allclose(weight_a1.grad, weight_a2.grad)
+        assert torch.allclose(weight_b1.grad, weight_b2.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+_FORWARD_SCOPE: ContextVar[str] = ContextVar("test_checkpoint_forward_scope", default="default")
+
+
+@pytest.mark.parametrize("without_output", [False, True])
+def test_checkpoint_recompute_restores_forward_context(without_output):
+    """Recompute on the CUDA autograd thread sees the forward scope, observed exactly once."""
+    scopes = []
+    observed = []
+
+    def run_function(x):
+        scopes.append(_FORWARD_SCOPE.get())
+        observe_tensor(None, "x", "test", x)
+        return x * x
+
+    Utils.initialize_model_parallel()
+    try:
+        x = torch.arange(1.0, 5.0, device="cuda", requires_grad=True)
+        token = _FORWARD_SCOPE.set("forward")
+        try:
+            with capture_tensor_observations(
+                lambda *args: observed.append(args), frozenset({"test"})
+            ):
+                if without_output:
+                    ckpt = CheckpointWithoutOutput()
+                    y = ckpt.checkpoint(run_function, x)
+                    out = y * x
+                    ckpt.discard_output_and_register_recompute(out)
+                else:
+                    out = checkpoint(run_function, False, x) * x
+        finally:
+            _FORWARD_SCOPE.reset(token)
+
+        # Backward runs outside both scopes; only the saved forward context can supply them.
+        out.sum().backward()
+        assert scopes == ["forward", "forward"]
+        assert len(observed) == 1
+        assert _FORWARD_SCOPE.get() == "default"
+        torch.testing.assert_close(x.grad, 3 * x.detach() ** 2)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_recompute_restores_context_without_duplicate_observations():
+    observed = []
+    shared_scope = ContextVar("test_shared_scope", default=None)
+    token = shared_scope.set("shared-forward")
+    with capture_tensor_observations(lambda *args: observed.append(args), frozenset({"test"})):
+        saved_context = copy_context()
+    shared_scope.reset(token)
+
+    def recompute():
+        observe_tensor(None, "test", "test", torch.ones(1))
+        return shared_scope.get()
+
+    value = saved_context.copy().run(_run_recompute_with_observation_suspended, recompute)
+    assert value == "shared-forward"
+    assert observed == []
+    assert shared_scope.get() is None

@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import os
 import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
@@ -1886,13 +1885,6 @@ class _NCCLEPManager(_DispatchManager):
                         "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
                         "requires an sm100+ (Blackwell+) GPU for the CuTe DSL grouped GEMM; unset "
                         "it to use eager mode on older GPUs."
-                    )
-                if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-                    raise ValueError(
-                        "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
-                        "requires the CuTe DSL grouped GEMM; set "
-                        "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume "
-                        "ragged per-expert counts on device)."
                     )
 
         self.dispatch_fwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_dispatch_fwd_dtype)

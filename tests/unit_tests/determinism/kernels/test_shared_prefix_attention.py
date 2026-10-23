@@ -191,11 +191,13 @@ def _validated_attention(*, tp=1, cp=1, kv_heads=1, checkpoint_core_attention=Fa
     from unittest.mock import Mock
 
     from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
 
     def group(size):
         return SimpleNamespace(size=lambda: size)
 
     module = Mock(spec=SelfAttention)
+    module.core_attention = Mock(spec=DotProductAttention)
     module.checkpoint_core_attention = checkpoint_core_attention
     module.pg_collection = SimpleNamespace(tp=group(tp), cp=group(cp))
     module.num_query_groups_per_partition = kv_heads
@@ -236,6 +238,16 @@ def test_attention_validation_rejects_unsupported_modules(attention, overrides, 
     """Unsupported attention features and mismatched process groups fail before any layer runs."""
     module, config = _validated_attention(**overrides)
     with pytest.raises(error, match=message):
+        attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
+
+
+def test_attention_validation_rejects_non_dense_core_attention(attention):
+    """A SelfAttention variant with its own core attention (e.g. DSA over GQA) is not bypassed."""
+    from unittest.mock import Mock
+
+    module, config = _validated_attention()
+    module.core_attention = Mock()
+    with pytest.raises(NotImplementedError, match="requires dot-product core attention"):
         attention.validate_shared_prefix_attention(module, config, tp_size=1, cp_size=1)
 
 
