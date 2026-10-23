@@ -40,7 +40,7 @@ skill keyword — infer it from the artifact you read.
 
 ### Code Provenance
 
-- Do not copy or adapt code from other repositories. Implement changes
+- Best effort to avoid copying code from other repositories. Implement changes
   independently.
 - Before opening a PR, review the provenance of all proposed changes and complete
   the PR template's code provenance section. If the proposed changes already
