@@ -43,6 +43,9 @@ RUN bash -ex <<"EOF"
     install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uv" /usr/local/bin/uv
     install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uvx" /usr/local/bin/uvx
     rm -rf "/tmp/${UV_ARCHIVE}" "/tmp/uv-${UV_ARCH}-unknown-linux-gnu"
+    mkdir -p "${XDG_CONFIG_HOME:-$HOME}"/.config/uv
+    # Allow `uv self update`.
+    echo '{"binaries":["uv","uvx"],"binary_aliases":{},"cdylibs":[],"cstaticlibs":[],"install_layout":"unspecified","install_prefix":"/usr/local/bin","modify_path":false,"provider":{"source":"cargo-dist","version":"0.32.0"},"source":{"app_name":"uv","name":"uv","owner":"astral-sh","release_type":"github"},"version":"0.13.5"}' > "${XDG_CONFIG_HOME:-$HOME}"/.config/uv/uv-receipt.json
 EOF
 
 # Cache the MoK wheel independently of the other dev dependencies. The shared base
