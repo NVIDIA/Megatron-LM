@@ -60,6 +60,7 @@ class CapturingTransformerConfig:
     moe_use_norm_before_up_proj: bool = False
     hash_moe_vocab_size: int | None = None
     wide_residual: object = None
+    deterministic_mode: bool = True
 
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)

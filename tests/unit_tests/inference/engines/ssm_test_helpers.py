@@ -46,7 +46,8 @@ def hybrid_mixer_kwargs(ssm_mixer):
     """TransformerConfig kwargs selecting the hybrid stack's linear-attention mixer.
 
     GDP needs its head/group/state dims spelled out, plus the Householder count
-    that sizes its chunk descriptors.
+    that sizes its chunk descriptors. GDN dynamic inference needs the FLA kernel backend, which
+    deterministic mode (on by default) rejects, so GDN turns it off.
     """
     if ssm_mixer == "gdp":
         return dict(
@@ -56,6 +57,8 @@ def hybrid_mixer_kwargs(ssm_mixer):
             mamba_num_groups=8,
             mamba_state_dim=64,
         )
+    if ssm_mixer == "gdn":
+        return dict(mamba_num_heads=16, deterministic_mode=False)
     return dict(mamba_num_heads=16)
 
 

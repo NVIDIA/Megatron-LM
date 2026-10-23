@@ -550,10 +550,16 @@ def test_thd_format(tc: TestCase):
     B = len(seqlens)
     pad_to_max = tc.pad_thd_to_max
 
-    # Deterministic mode for bitwise tests
+    # Deterministic mode for bitwise tests. The unit-test default is
+    # NVTE_ALLOW_NONDETERMINISTIC_ALGO=0, which makes TE's deterministic fused-attention
+    # backward allocate a huge workspace (OOM on the long-seq case), so similarity tests
+    # explicitly allow non-deterministic algorithms.
+    prev_nondeterministic = os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO")
     if tc.forward_bitwise or tc.backward_bitwise:
         os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
         torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "1"
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
@@ -646,4 +652,7 @@ def test_thd_format(tc: TestCase):
     Utils.destroy_model_parallel()
     if tc.forward_bitwise or tc.backward_bitwise:
         torch.use_deterministic_algorithms(False)
+    if prev_nondeterministic is None:
         os.environ.pop("NVTE_ALLOW_NONDETERMINISTIC_ALGO", None)
+    else:
+        os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = prev_nondeterministic

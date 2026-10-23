@@ -701,7 +701,13 @@ TWO_STAGE_ATTENTION_CASES = [
     pytest.param(
         Symbols.GDN,
         hybrid_stack_spec,
-        {"bf16": True, "params_dtype": torch.bfloat16, "activation_func": torch.nn.functional.silu},
+        {
+            "bf16": True,
+            "params_dtype": torch.bfloat16,
+            "activation_func": torch.nn.functional.silu,
+            # Deterministic mode (default) requires gdn_kernel_backend="torch"; this case uses FLA.
+            "deterministic_mode": False,
+        },
         marks=pytest.mark.skipif(not HAVE_GDN, reason="FLA is not installed"),
         id="gdn",
     ),
@@ -1358,7 +1364,7 @@ class TestHybridBlock:
         while * creates a TransformerLayer wrapping SelfAttention.
         """
         layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
-        block = self.get_hybrid_block(layer_pattern)
+        block = self.get_hybrid_block(layer_pattern, deterministic_mode=False)
         layers = block.layers
         assert isinstance(layers[0], TransformerLayer)
         assert isinstance(layers[0].self_attention, GatedDeltaNet)
@@ -1381,6 +1387,7 @@ class TestHybridBlock:
             num_attention_heads=4,
             use_cpu_initialization=True,
             activation_func=torch.nn.functional.silu,
+            deterministic_mode=False,
         )
         layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
         modules = hybrid_stack_spec.submodules
