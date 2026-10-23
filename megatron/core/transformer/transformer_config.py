@@ -66,6 +66,56 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def _validate_dsa_index_share_pipeline_layout(
+    layout: PipelineParallelLayerLayout, num_layers: int, topk_freq: int, skip_topk_offset: int
+) -> None:
+    """Reject a pipeline layout whose model chunks would start on a DSA index-sharing layer.
+
+    With ``dsa_indexer_topk_freq > 1`` a skip layer reuses the top-k of the most recent
+    computing layer through the forward-sharing state of one model chunk's forward, so that
+    computing layer must run earlier in the same (PP rank, VPP stage) chunk. The model
+    builders check each local chunk once the model is built; this checks every chunk of the
+    layout at configuration time, so an invalid PP or VPP layout fails on every rank alike
+    and without a GPU.
+
+    Decoder layers are numbered 1..``num_layers`` in the layout's execution order (VPP stage
+    major, then PP rank) and MTP layers continue from ``num_layers + 1``. Within a chunk the
+    numbers are consecutive, so a chunk is valid exactly when its first DSA layer computes
+    its own top-k: every later skip layer of the chunk then finds its source inside the chunk.
+    """
+    # Lazy import: the DSA module imports this one.
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        is_dsa_skip_topk_layer,
+        source_dsa_compute_layer,
+    )
+
+    next_decoder_layer = 1
+    for vp_stage in range(layout.virtual_pipeline_model_parallel_size):
+        for pp_rank in range(layout.pipeline_model_parallel_size):
+            chunk = layout.layout[pp_rank][vp_stage]
+            num_decoder_layers = chunk.count(LayerType.decoder)
+            if num_decoder_layers > 0:
+                first_layer = next_decoder_layer
+                next_decoder_layer += num_decoder_layers
+            elif LayerType.mtp in chunk:
+                first_layer = num_layers + 1
+            else:
+                continue
+            if not is_dsa_skip_topk_layer(first_layer, skip_topk_offset, topk_freq):
+                continue
+            source_layer = source_dsa_compute_layer(first_layer, skip_topk_offset, topk_freq)
+            kind = "decoder" if num_decoder_layers > 0 else "MTP"
+            raise ValueError(
+                f"pipeline_model_parallel_layout {layout!r} is invalid for DSA top-k sharing: "
+                f"the chunk at PP rank {pp_rank}, VPP stage {vp_stage} starts on {kind} layer "
+                f"{first_layer}, which reuses the top-k of layer {source_layer} from an earlier "
+                "chunk. Cross-layer top-k sharing does not cross PP/VPP chunk boundaries, so "
+                "every chunk must start on a layer that computes its own top-k "
+                f"(dsa_indexer_topk_freq={topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={skip_topk_offset})."
+            )
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -3950,6 +4000,13 @@ class TransformerConfig(ModelParallelConfig):
                 # The base config cannot see layout-derived standalone MTP. Warn once when this
                 # post-layout transition makes the fixed-shape flag a no-op.
                 self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
+            if self.experimental_attention_variant == "dsa" and self.dsa_indexer_topk_freq > 1:
+                _validate_dsa_index_share_pipeline_layout(
+                    self.pipeline_model_parallel_layout,
+                    num_layers=self.num_layers,
+                    topk_freq=self.dsa_indexer_topk_freq,
+                    skip_topk_offset=self.dsa_indexer_skip_topk_offset,
+                )
 
         # Uneven PP
         elif (
