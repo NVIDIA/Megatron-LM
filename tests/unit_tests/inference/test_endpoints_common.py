@@ -456,6 +456,7 @@ async def test_sampling_params_are_parsed_from_the_request(path, body, app_confi
 
 # Fields the HTTP layer sets from the request body (chat also reads add_BOS) ...
 _REQUEST_CONTROLLED_FIELDS = {
+    "seed",
     "temperature",
     "top_k",
     "top_p",
@@ -464,6 +465,7 @@ _REQUEST_CONTROLLED_FIELDS = {
     "skip_prompt_log_probs",
     "num_tokens_to_generate",
     "stop_words",
+    "stop_token_ids",
     "detokenize_stop_sequence",
     "termination_id",
     "streaming_interval",
@@ -486,6 +488,7 @@ _ENGINE_OWNED_FIELDS = {
     "do_kv_handoff",
 }
 _EVERY_FIELD_REQUEST = {
+    "seed": 42,
     "temperature": 0.5,
     "top_p": 0.9,
     "top_k": 40,
@@ -496,6 +499,7 @@ _EVERY_FIELD_REQUEST = {
     "skip_prompt_log_probs": True,
     "max_tokens": 200,
     "stop": ["END"],
+    "stop_token_ids": [7],
     "include_stop_str_in_output": True,
     "add_BOS": True,
     "ignore_eos": True,

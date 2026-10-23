@@ -38,6 +38,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
+    get_pg_rank,
     is_using_quantization_scales,
     log_single_rank,
 )
@@ -314,6 +315,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
         )
 
+        if self.config.enable_mhc_connections and self.mtp_process and not self.post_process:
+            raise ValueError(
+                "mHC Hybrid MTP must run on the final post_process pipeline chunk. "
+                "Standalone MTP stages do not preserve the multi-stream decoder contract."
+            )
+
         # Validate TP communication overlap after determining whether this rank builds MTP,
         # before constructing the decoder or MTP modules.
         layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
@@ -588,21 +595,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                # The embedding skips SP scatter for models whose outer wrapper scatters instead
+                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
+
             # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
+            # quantization scales to avoid corrupting amax calculations. Under sequence
+            # parallelism, decoder_input holds this rank's shard of the tokens.
             if (
                 in_inference_mode
                 and inference_context is not None
                 and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
-                decoder_input[inference_context.padding_slice] = 0.0
-
-            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
-                # The embedding skips SP scatter for models whose outer wrapper scatters instead
-                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
-                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
-                    decoder_input, group=self.pg_collection.tp
+                inference_context.zero_padding_tokens(
+                    decoder_input,
+                    sequence_parallel_rank=(
+                        get_pg_rank(self.pg_collection.tp) if self.config.sequence_parallel else 0
+                    ),
                 )
         else:
             # intermediate stage of pipeline
@@ -742,6 +755,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_input_mask=mtp_input_mask,
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
+                padding_mask=padding_mask,
             )
             if mtp_inputs.decoder_input is None:
                 assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
@@ -760,6 +774,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 embedding=self.embedding,
                 decoder_input=mtp_inputs.decoder_input,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
+                padding_mask=mtp_inputs.padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )
@@ -793,7 +808,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     loss_mask=mtp_inputs.loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,

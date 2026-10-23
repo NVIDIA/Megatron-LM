@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -112,9 +113,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    eval_iters: int | None = 100
+    eval_iters: int | list[int | None] | None = field(
+        default=100, metadata={"argparse_meta": {"type": int}}
+    )
     """Number of iterations to run for evaluation. Used for both validation and test. If not set,
-    evaluation will not run."""
+    evaluation will not run. Full/multiple validation resolves this to per-dataset counts."""
 
     eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
@@ -140,9 +143,6 @@ class ValidationConfig:
 
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
-
-    test_mode: bool = False
-    """Run all real-time test alongside the experiment."""
 
     full_validation: bool = False
     """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""
@@ -227,17 +227,61 @@ class SchedulerConfig:
     weight_decay_incr_style: Literal["constant", "linear", "cosine"] = "constant"
     """Weight decay increment function."""
 
-    no_weight_decay_cond_type: Literal["qwen3_next"] | None = None
-    """Type of no weight decay condition. Choices:
-    None (default): param no weight decay if and only if it is 1D; or it is bias;
-    or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
-
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+    def validate_run(
+        self,
+        *,
+        train_iters: int | None,
+        train_samples: int | None,
+        skip_train: bool,
+        weight_decay: float | None,
+    ) -> None:
+        """Check this section against the rest of the run it belongs to."""
+        if train_iters and not skip_train:
+            # If we use iteration-based training, make sure the
+            # sample-based options are off.
+            assert train_samples is None, \
+                'expected iteration-based training'
+            assert self.lr_decay_samples is None, \
+                'expected iteration-based learning rate decay'
+            assert self.lr_warmup_samples == 0, \
+                'expected iteration-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_iters == 0, \
+                    'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+
+        # Sample-based training.
+        if train_samples and not skip_train:
+            # If we use sample-based training, make sure the
+            # iteration-based options are off.
+            assert train_iters is None, \
+                'expected sample-based training'
+            assert self.lr_decay_iters is None, \
+                'expected sample-based learning rate decay'
+            assert self.lr_warmup_iters == 0, \
+                'expected sample-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_samples == 0, \
+                    'can only specify one of lr-warmup-fraction ' \
+                    'and lr-warmup-samples'
+
+        if self.weight_decay_incr_style == "constant":
+            for w in (self.start_weight_decay, self.end_weight_decay):
+                assert w is None or w == weight_decay
+        else:
+            assert self.start_weight_decay is not None
+            assert self.end_weight_decay is not None
+
+    def finalize_scheduler_config(self, weight_decay: float | None) -> None:
+        """Finalize the scheduler configuration after validation and before training starts."""
+        if self.weight_decay_incr_style == "constant":
+            self.start_weight_decay = weight_decay
+            self.end_weight_decay = weight_decay
 
 
 @dataclass(kw_only=True)
@@ -682,6 +726,17 @@ class CheckpointConfig:
 
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
+
+    stream_ckpt_dequant: bool = False
+    """Inference-only load path for models with quantized params (--fp8-param-gather or
+    --fp4-param-gather). The distributed checkpoint load quantizes each destination param in place
+    from a per-tensor high-precision scratch, instead of dequantizing the entire state dict to high
+    precision before the load starts, which allocates a full high-precision replica of the model
+    and can OOM on large models. The loaded state dict then holds the quantized params themselves,
+    so it is weights-only: it requires --no-load-optim, refuses --finetune,
+    --load-main-params-from-ckpt and any optimizer. Supports the tensorwise, mxfp8, blockwise and
+    nvfp4 recipes (not delayed scaling) and, with --ckpt-fully-parallel-load, only the broadcast
+    exchange algorithm. Pass it explicitly on the inference command line."""
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support
