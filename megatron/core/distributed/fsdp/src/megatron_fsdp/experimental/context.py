@@ -63,9 +63,9 @@ class FsdpContext:
         device: torch.device | None = None,
         use_symmetric_memory: bool = False,
         overlap_allgather_reduction: bool = True,
+        overlap_outer_communication: bool = False,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
-        overlap_outer_communication: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -77,6 +77,9 @@ class FsdpContext:
             overlap_allgather_reduction: Whether all-gathers and reductions use separate
                 communication streams. Disable to reduce peak transient memory. See
                 https://github.com/NVIDIA/Megatron-LM/issues/6471.
+            overlap_outer_communication: Run the last-microbatch DP-outer reduction
+                on a separate stream to overlap inner-DP communication, independently
+                of overlap_allgather_reduction.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
@@ -86,9 +89,6 @@ class FsdpContext:
                 retaining automatic weight cleanup. The caller must
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
-            overlap_outer_communication: Run the last-microbatch DP-outer reduction
-                on a separate stream to overlap inner-DP communication, independently
-                of overlap_allgather_reduction.
         """
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
@@ -113,6 +113,16 @@ class FsdpContext:
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self._context_token: Token[FsdpContext | None] | None = None
+        # The two overlap options independently split streams from the inner
+        # reduction stream. With (overlap_allgather_reduction,
+        # overlap_outer_communication), the assignments are:
+        #   (False, False): all-gather and both reductions share one stream.
+        #   (True, False):  all-gather is separate; both reductions share a stream.
+        #   (False, True):  all-gather and inner reduction share; outer is separate.
+        #   (True, True):   all-gather, inner reduction, and outer reduction each
+        #                  have a separate stream.
+        # Outer all-gather separation is not implemented yet; the outer option
+        # currently affects only reduction.
         self.inner_reduction_stream = torch.cuda.Stream(device)
         self.allgather_stream = (
             torch.cuda.Stream(device)
