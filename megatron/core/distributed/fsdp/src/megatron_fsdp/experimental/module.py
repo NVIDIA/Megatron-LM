@@ -441,7 +441,7 @@ class FsdpModule:
             # the reduce-scatter stream falls back to a raw cudaMalloc, which is
             # illegal during capture. Later modules are covered by the post-copy
             # fork each preceding module issues before its collective.
-            context.reduce_scatter_stream.wait_stream(current_stream)
+            context.inner_reduction_stream.wait_stream(current_stream)
             # The DP-outer reduction stream needs no fork here: it never allocates (the
             # finalize reuses the persistent main_grad and its view), and it joins any
             # capture via its wait on the reduce-scatter stream before each finalize in
@@ -466,21 +466,21 @@ class FsdpModule:
         """
         with self._nvtx_range("reduce_gradients"):
             context = self.context
-            reduce_scatter_stream = context.reduce_scatter_stream
+            inner_reduction_stream = context.inner_reduction_stream
             current_stream = context.current_stream()
 
             for group in self._parameter_groups:
                 if not group.requires_grad:
                     continue
 
-                with torch.cuda.stream(reduce_scatter_stream):
+                with torch.cuda.stream(inner_reduction_stream):
                     partial_grad = group.allocate_partial_grad_buffer()
 
-                current_stream.wait_stream(reduce_scatter_stream)
+                current_stream.wait_stream(inner_reduction_stream)
                 group.copy_gradients_to_partial_buffer(partial_grad)
 
-                reduce_scatter_stream.wait_stream(current_stream)
-                with torch.cuda.stream(reduce_scatter_stream):
+                inner_reduction_stream.wait_stream(current_stream)
+                with torch.cuda.stream(inner_reduction_stream):
                     group.reduce_dp_inner_gradients(partial_grad)
 
                 if not context.is_last_microbatch:
@@ -488,11 +488,11 @@ class FsdpModule:
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the
                 # persistent accumulator and its optimizer-layout view stay alive across
-                # the handoff. When disabled the stream aliases reduce_scatter_stream and
+                # the handoff. When disabled the stream aliases inner_reduction_stream and
                 # this stays serialized.
-                if context.dp_outer_communication_stream is not reduce_scatter_stream:
-                    context.dp_outer_communication_stream.wait_stream(reduce_scatter_stream)
-                with torch.cuda.stream(context.dp_outer_communication_stream):
+                if context.outer_reduction_stream is not inner_reduction_stream:
+                    context.outer_reduction_stream.wait_stream(inner_reduction_stream)
+                with torch.cuda.stream(context.outer_reduction_stream):
                     group.finalize_dp_outer_reduction()
 
     @property

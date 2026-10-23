@@ -28,9 +28,9 @@ class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
     allgather_stream: torch.cuda.Stream
-    reduce_scatter_stream: torch.cuda.Stream
-    # Aliases the inner reduction stream unless DP-outer overlap is enabled.
-    dp_outer_communication_stream: torch.cuda.Stream
+    inner_reduction_stream: torch.cuda.Stream
+    # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
+    outer_reduction_stream: torch.cuda.Stream
     overlap_dp_outer_communication: bool
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because each parameter group tracks whether model_weight is stale
@@ -108,13 +108,13 @@ class FsdpContext:
         if self.unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
             # preceding reduce-scatter.
-            self.reduce_scatter_stream = self.allgather_stream
+            self.inner_reduction_stream = self.allgather_stream
         else:
-            self.reduce_scatter_stream = torch.cuda.Stream(device)
-        self.dp_outer_communication_stream = (
+            self.inner_reduction_stream = torch.cuda.Stream(device)
+        self.outer_reduction_stream = (
             torch.cuda.Stream(device)
             if overlap_dp_outer_communication
-            else self.reduce_scatter_stream
+            else self.inner_reduction_stream
         )
 
     @property
@@ -196,9 +196,9 @@ class FsdpContext:
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
-        self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.overlap_dp_outer_communication:
-            self.current_stream().wait_stream(self.dp_outer_communication_stream)
+            self.current_stream().wait_stream(self.outer_reduction_stream)
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
