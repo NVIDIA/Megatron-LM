@@ -37,7 +37,7 @@ class FsdpContext:
     # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
-    unify_communication_stream: bool
+    overlap_allgather_reduction: bool
     caller_managed_grad_sync: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
@@ -58,7 +58,6 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        overlap_outer_communication: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -72,16 +71,9 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            overlap_outer_communication: Run the last-microbatch DP-outer reduction
-                on a separate stream to overlap inner-DP reductions. Mutually exclusive
-                with unify_communication_stream.
         """
-        unify_communication_stream = runtime_policy.unify_communication_stream
-        if unify_communication_stream and overlap_outer_communication:
-            raise ValueError(
-                "overlap_outer_communication needs a separate DP-outer stream and is "
-                "incompatible with unify_communication_stream."
-            )
+        overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
+        overlap_outer_communication = runtime_policy.overlap_outer_communication
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
@@ -89,7 +81,7 @@ class FsdpContext:
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
-        self.unify_communication_stream = runtime_policy.unify_communication_stream
+        self.overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.overlap_outer_communication = overlap_outer_communication
         self.forward_order = ExecutionOrder()
@@ -105,7 +97,7 @@ class FsdpContext:
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
         self.allgather_stream = torch.cuda.Stream(device)
-        if self.unify_communication_stream:
+        if not overlap_allgather_reduction:
             # A unified stream lets an all-gather reuse the storage released by a
             # preceding reduce-scatter.
             self.inner_reduction_stream = self.allgather_stream

@@ -709,9 +709,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 FsdpContext(
                     device=device,
                     runtime_policy=RuntimePolicy(
-                        use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
-                    overlap_outer_communication=ddp_config.overlap_outer_communication,
                 )
             )
         else:

@@ -20,6 +20,7 @@ from torch.utils.checkpoint import checkpoint
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -438,7 +439,7 @@ def test_losses_match_baseline(
     model.load_state_dict(baseline.state_dict())
 
     with fully_shard_context(
-        FsdpContext(device=device, overlap_outer_communication=overlap)
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(overlap_outer_communication=overlap))
     ) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, shard_layout=shard_layout)

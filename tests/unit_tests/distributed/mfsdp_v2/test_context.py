@@ -347,3 +347,20 @@ def test_microbatch_scopes_context(distributed_setup):
         assert not context.is_last_microbatch
 
     assert context.is_last_microbatch
+
+
+@pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
+@pytest.mark.parametrize("overlap_outer_communication", [False, True])
+def test_communication_stream_assignment(
+    distributed_setup, overlap_allgather_reduction, overlap_outer_communication
+):
+    """All-gather/reduction and inner/outer stream separation are independent."""
+    context = FsdpContext(runtime_policy=RuntimePolicy(overlap_allgather_reduction=overlap_allgather_reduction, overlap_outer_communication=overlap_outer_communication))
+    assert (
+        context.allgather_stream != context.inner_reduction_stream
+    ) == overlap_allgather_reduction
+    assert (
+        context.outer_reduction_stream != context.inner_reduction_stream
+    ) == overlap_outer_communication
+    if overlap_outer_communication:
+        assert context.outer_reduction_stream != context.allgather_stream
