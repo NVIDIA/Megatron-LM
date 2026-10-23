@@ -65,7 +65,10 @@ class SinkhornKnopp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
         """Run Sinkhorn iterations and save inputs for backward recomputation."""
-        M = _sinkhorn_iterations(input_logits, num_iterations, eps)
+        # This forward is always no-grad. Canonicalize the input's requires_grad flag
+        # too, so checkpointing reuses the same compiled specialization even when
+        # Dynamo's cache is full instead of mixing compiled and eager arithmetic.
+        M = _sinkhorn_iterations(input_logits.detach(), num_iterations, eps)
         ctx.save_for_backward(input_logits)
         ctx.num_iterations = num_iterations
         ctx.eps = eps
