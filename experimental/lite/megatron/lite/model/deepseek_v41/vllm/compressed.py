@@ -6,6 +6,8 @@ import torch
 
 from .linear import linear
 
+INDEXER_LOGITS_BYTES = 512 * 1024**2
+
 
 def metadata(lengths, ratio, device):
     """Packed compression metadata computed without per-document CUDA launches."""
@@ -159,29 +161,44 @@ def index_topk(q, w, keys, rope, ratio, emit, candidates=None, *, m=None):
     )
     row_ends = ((positions + 1) // ratio).int()
     ends = starts + row_ends
-    logits = as_fp32_logits(
-        fp8_fp4_mqa_logits(
-            (qvalues.view(torch.int8), qscales),
-            (values.view(torch.int8), scales.view(torch.int32).squeeze(-1)),
-            w,
-            starts,
-            ends,
-            values.shape[0] if m is None else max(m.counts, default=0),
-        ),
-        row_ends,
-    )
-    if observer is not None:
-        emit(
-            'indexer_logits_valid',
-            logits[torch.arange(logits.shape[1], device=q.device)[None] < row_ends[:, None]],
-        )
-    starts = torch.zeros_like(row_ends)
-    if candidates is not None:
-        candidates(logits, starts, row_ends)
+    width = values.shape[0] if m is None else max(m.counts, default=0)
+    chunk_rows = max(1, INDEXER_LOGITS_BYTES // max(4 * width, 1))
     topk = torch.full((rows, 512), -1, device=q.device, dtype=torch.int32)
-    top_k_per_row_prefill_index_order(
-        logits, starts, row_ends, topk, rows, logits.stride(0), logits.stride(1), 512
-    )
+    diagnostics = []
+    # Bound the query dimension; every row still sees its complete key interval.
+    for lo in range(0, rows, chunk_rows):
+        span = slice(lo, min(lo + chunk_rows, rows))
+        logits = as_fp32_logits(
+            fp8_fp4_mqa_logits(
+                (qvalues[span].view(torch.int8), None if qscales is None else qscales[span]),
+                (values.view(torch.int8), scales.view(torch.int32).squeeze(-1)),
+                w[span],
+                starts[span],
+                ends[span],
+                width,
+            ),
+            row_ends[span],
+        )
+        if observer is not None:
+            diagnostics.append(
+                logits[torch.arange(logits.shape[1], device=q.device)[None] < row_ends[span, None]]
+            )
+        zero_starts = torch.zeros_like(row_ends[span])
+        if candidates is not None:
+            candidates(logits, zero_starts, row_ends[span], offset=lo)
+        top_k_per_row_prefill_index_order(
+            logits,
+            zero_starts,
+            row_ends[span],
+            topk[span],
+            logits.shape[0],
+            logits.stride(0),
+            logits.stride(1),
+            512,
+        )
+        del logits
+    if observer is not None:
+        emit('indexer_logits_valid', torch.cat(diagnostics))
     return topk
 
 
@@ -246,7 +263,9 @@ def source(attention, x, qr, qa, rope, documents, emit):
             select_candidate_blocks,
         )
 
-        def apply(logits, starts, ends):
+        def apply(logits, starts, ends, *, offset=0):
+            rows = logits.shape[0]
+
             def publish():
                 out = torch.full(
                     (rows, release.candidate_topk_blocks), -1, dtype=torch.int32, device=x.device
@@ -261,7 +280,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
                 )
                 return out
 
-            key = ('vllm_candidate', (rows,) + geometry)
+            key = ('vllm_candidate', (rows, offset) + geometry)
             blocks = state.resolve(layer, owner, key, publish)
             if layer != owner:
                 apply_candidate_mask(logits, starts, ends, blocks, release.candidate_block_size)
