@@ -599,9 +599,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer, MoE transformer, and Mamba layers are used.
-                Shortcut MoE blocks are always units; their directly invoked attention
-                layer, MoE layer, and MoE MLP are owned by the block instead.
+                unspecified, transformer, MoE transformer, Mamba layers, and shortcut
+                MoE blocks are used. An explicit list replaces these defaults.
+                Directly invoked shortcut helper layers remain owned by their enclosing
+                FSDP unit.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -632,9 +633,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         self.ddp_config = ddp_config
 
         if fsdp_unit_modules is None:
-            fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
-
-        fsdp_unit_types: tuple[Type[torch.nn.Module], ...] = (ShortcutMoEBlock, *fsdp_unit_modules)
+            fsdp_unit_modules = [
+                TransformerLayer,
+                MoETransformerLayer,
+                MambaLayer,
+                ShortcutMoEBlock,
+            ]
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -730,7 +734,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # ShortcutMoEBlock calls compute_layer.forward_pre_attn_and_core_attn(),
             # moe_layer._pre_mlp_layernorm_and_residual(), and mlp.route()/dispatch()
             # directly. Their __call__ hooks never run, so these modules must not own
-            # FSDP shards. The block gathers their weights around its own forward/backward.
+            # FSDP shards. Their enclosing FSDP unit gathers their weights.
             # Experts keep their expert-DP units above; other explicitly selected children
             # (e.g. a norm called through __call__) can still be separate units.
             shortcut_inner_modules = {
@@ -746,7 +750,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
-                if isinstance(submodule, fsdp_unit_types):
+                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                     if config.init_model_with_meta_device:
                         _materialize_owned_meta_modules(submodule, device)
                     fully_shard(

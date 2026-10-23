@@ -181,6 +181,7 @@ class TestMcoreMoE:
         fsdp_unit_modules = None
         if custom_units:
             fsdp_unit_modules = [
+                ShortcutMoEBlock,
                 TransformerLayer,
                 MoETransformerLayer,
                 MoELayer,
@@ -287,7 +288,17 @@ class TestMcoreMoE:
         assert losses[-1] < losses[0]
         torch.testing.assert_close(losses, reference_losses)
 
-    def test_shortcut_ownership_and_weight_lifetime(self):
+    @pytest.mark.parametrize(
+        "unit_modules, shard_shortcut",
+        [
+            (None, True),
+            ([ShortcutMoEBlock], True),
+            ([TransformerLayer, MoETransformerLayer, MoELayer], False),
+            ([], False),
+        ],
+        ids=["default", "explicit-shortcut", "other-types", "root-only"],
+    )
+    def test_shortcut_ownership_and_weight_lifetime(self, unit_modules, shard_shortcut):
         """The ordinary module traversal must match shortcut calls without order overrides."""
         config = TransformerConfig(
             num_layers=2,
@@ -334,10 +345,11 @@ class TestMcoreMoE:
                 fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
+            fsdp_unit_modules=unit_modules,
             pg_collection=self.process_group_collection,
         )
         assert set(model.module.state_dict()) == names_before
-        assert isinstance(block, FsdpModule)
+        assert isinstance(block, FsdpModule) == shard_shortcut
         assert not isinstance(block.compute_layer, FsdpModule)
         assert not isinstance(block.moe_layer, FsdpModule)
         assert isinstance(block.moe_layer.mlp.experts, FsdpModule)
