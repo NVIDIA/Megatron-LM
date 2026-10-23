@@ -1482,8 +1482,9 @@ class TransformerConfig(ModelParallelConfig):
     """ Random seed to use for sampling during inference. """
 
     symmetric_ar_type: Optional[Literal['two_shot', "one_shot", "multimem_all_reduce"]] = None
-    """What type of symmetric all reduce to use. The default is None
-    which is no use of symmetric memory.
+    """What type of symmetric all reduce to use. The default None disables symmetric
+    memory, except for dense TE row-parallel layers in batch-invariant mode with TP > 1
+    and sequence parallelism disabled, where it automatically selects ``two_shot``.
     """
 
     nccl_all_reduce_for_prefill: bool = False

@@ -2083,6 +2083,17 @@ class TERowParallelLinear(TELinear):
         self._tp_group = tp_group
         gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
+        symmetric_ar_type = config.symmetric_ar_type
+        if (
+            config.batch_invariant_mode
+            and not config.sequence_parallel
+            and not is_expert
+            and get_pg_size(tp_group) > 1
+            and symmetric_ar_type is None
+        ):
+            # NCCL SUM can change its floating-point reduction order with batch size.
+            symmetric_ar_type = "two_shot"
+
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -2099,7 +2110,7 @@ class TERowParallelLinear(TELinear):
             # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
-            symmetric_ar_type=config.symmetric_ar_type,
+            symmetric_ar_type=symmetric_ar_type,
             tp_group=tp_group,
             name=name,
             gtp_remat_group=gtp_remat_group,
