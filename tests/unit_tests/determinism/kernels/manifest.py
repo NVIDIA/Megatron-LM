@@ -784,7 +784,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_inference_kernels.py (MoELayer level in "
         "test_inference_nvfp4_moe_layer_replays) and checked for batch invariance across batch "
         "sizes in test_flashinfer_nvfp4_moe_is_batch_invariant; all need FlashInfer >= 0.7.0 "
-        "on Blackwell.",
+        "on Blackwell and are not replayed in CI.",
     ),
     KernelEntry(
         name="inference_request_seed_sampling",

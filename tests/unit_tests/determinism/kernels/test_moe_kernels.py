@@ -1001,7 +1001,6 @@ class TestMoEModules:
             what="TEGroupedMLP",
         )
 
-    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
     def test_inference_nvfp4_moe_layer_replays(self, gated):
         """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""

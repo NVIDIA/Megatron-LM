@@ -876,7 +876,6 @@ def _nvfp4_expert_weights(num_experts, hidden_size, intermediate_size, gated):
     return prepare_routed_nvfp4_weights(fc1.bfloat16(), fc2.bfloat16())
 
 
-@pytest.mark.launch_on_gb200
 def test_per_token_nvfp4_quantize_replays():
     from megatron.core.inference.moe.flashinfer_nvfp4 import quantize_routed_nvfp4_input
 
@@ -898,7 +897,6 @@ def _nvfp4_activation_type(gated):
     return (ActivationType.Swiglu if gated else ActivationType.Relu2).value
 
 
-@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
 def test_flashinfer_nvfp4_moe_replays(gated):
     """Batch-invariant mode selects an order-fixed top-k combine, so replays are exact."""
@@ -932,7 +930,6 @@ def test_flashinfer_nvfp4_moe_replays(gated):
         assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="FlashInfer NVFP4 MoE")
 
 
-@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
 def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
     """A routed token must be bitwise stable as the batch and its expert loads change.
