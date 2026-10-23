@@ -450,10 +450,6 @@ def _slice_merged_segments(segments, attr: str, start: int, end: int) -> list:
     return out
 
 
-class _SharedEncodeLayoutError(ValueError):
-    """A wrapper's image or embedding tensor layout cannot be concatenated or split."""
-
-
 @dataclass(kw_only=True)
 class RequestEntry:
     """Entry in the engine's `self.requests` dict."""
@@ -815,9 +811,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Set when an image request is admitted without its encode; lets
         # _encode_waiting_images return at once on text-only or fully-encoded queues.
         self._has_deferred_image_encodes = False
-        # Set once a shared encode returned a layout the engine cannot split; from then on
-        # image requests are encoded at admission again instead of retrying every step.
-        self._shared_image_encode_disabled = False
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
@@ -996,39 +989,23 @@ class DynamicInferenceEngine(AbstractEngine):
             error_subject=f"Refreshed request {request.request_id}",
         )
 
-    def _deferred_image_embedding_count(
-        self,
+    @staticmethod
+    def _can_defer_image_encode(
         *,
         imgs: Tensor,
         num_tiles: Optional[Tensor],
         imgs_sizes: Optional[Tensor],
         num_frames: Optional[Tensor],
-    ) -> Optional[int]:
-        """Return the embedding count of a dynamic-resolution image request whose encode can
-        wait until prefill scheduling, or None when the request must be encoded at admission.
+    ) -> bool:
+        """Whether a request's image encode can wait until prefill scheduling.
 
-        Only image requests with per-image sizes and a concatenable patch layout (``[P, F]``
-        or ``[1, P, F]``) qualify, and only when the wrapper reports per-image embedding counts
-        (``dynamic_image_embedding_counts``); videos, static tiling, other layouts and wrappers
-        without that hook keep the per-request encode in ``_build_vlm_request``.
+        Only dynamic-resolution images with a concatenable patch layout (``[P, F]`` or
+        ``[1, P, F]``) qualify; videos, static tiling and other layouts keep the per-request
+        encode in ``_build_vlm_request``.
         """
         if imgs_sizes is None or num_tiles is not None or num_frames is not None:
-            return None
-        if not (imgs.ndim == 2 or (imgs.ndim == 3 and imgs.shape[0] == 1)):
-            return None
-        if self._shared_image_encode_disabled:
-            return None
-        wrapper = self.controller.inference_wrapped_model
-        counts_fn = getattr(wrapper, "dynamic_image_embedding_counts", None)
-        counts = counts_fn(imgs_sizes) if counts_fn is not None else None
-        if not isinstance(counts, list):
-            return None
-        if len(counts) != len(imgs_sizes):
-            raise ValueError(
-                f"{type(wrapper).__name__}.dynamic_image_embedding_counts returned "
-                f"{len(counts)} count(s) for {len(imgs_sizes)} image(s)."
-            )
-        return int(sum(counts))
+            return False
+        return imgs.ndim == 2 or (imgs.ndim == 3 and imgs.shape[0] == 1)
 
     def _encode_waiting_images(self) -> None:
         """Encode the images of waiting requests whose admission deferred the encode.
@@ -1084,11 +1061,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 aliased_ids.add(request.request_id)
                 continue
             key = request.media_cache_key
-            if key and key in first_request_by_key:
-                duplicates.append((request, first_request_by_key[key]))
-                continue
             if key:
-                first_request_by_key[key] = request.request_id
+                if key in first_request_by_key:
+                    duplicates.append((request, first_request_by_key[key]))
+                    continue
+                else:
+                    first_request_by_key[key] = request.request_id
             pending.append((request, request.deferred_image_embedding_count))
 
         budget = int(self.context.max_tokens)
@@ -1102,21 +1080,14 @@ class DynamicInferenceEngine(AbstractEngine):
             group_total += item[1]
 
         for group in groups:
-            if len(group) > 1 and not self._shared_image_encode_disabled:
+            if len(group) > 1:
                 try:
-                    encoded.update(self._encode_image_requests_together(group))
+                    encoded.update(self._batched_request_image_encode(group))
                     continue
-                except _SharedEncodeLayoutError as error:
-                    # The wrapper's tensor layout is not one the engine can concatenate or
-                    # split: stop deferring instead of paying a wasted shared call every step.
-                    self._shared_image_encode_disabled = True
-                    logger.warning(
-                        "shared vision encoding disabled, encoding per request from now on: %s",
-                        error,
-                    )
                 except Exception as error:  # pylint: disable=broad-except
-                    # Includes out-of-memory: as for the admission-time encode, the failure is
-                    # handled per request below instead of taking the engine down.
+                    # Includes out-of-memory and an output that does not match the expected
+                    # counts: the group is encoded per request below, so a request whose own
+                    # count is wrong fails alone instead of taking the engine down.
                     logger.warning(
                         "shared vision encoding of %d requests failed, encoding per request: %s",
                         len(group),
@@ -1140,8 +1111,18 @@ class DynamicInferenceEngine(AbstractEngine):
             if embeddings is None or request.request_id in failed:
                 continue
             try:
-                self._attach_image_embeddings(
-                    request, embeddings, cache=request.request_id not in aliased_ids
+                self._register_image_embeddings(
+                    request,
+                    embeddings,
+                    request.image_token_mask,
+                    expected_count=request.deferred_image_embedding_count,
+                    modality="image",
+                    imgs=request.imgs,
+                    num_tiles=None,
+                    imgs_sizes=request.imgs_sizes,
+                    num_frames=None,
+                    error_subject=f"Request {request.request_id}",
+                    cache=request.request_id not in aliased_ids,
                 )
             except Exception as error:  # pylint: disable=broad-except
                 failed[request.request_id] = error
@@ -1151,7 +1132,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.remove(request_id)
             self._handle_failed_request(request_id, stage="encode its images before prefill")
 
-    def _encode_image_requests_together(
+    def _batched_request_image_encode(
         self, group: List[Tuple[DynamicVLMInferenceRequest, int]]
     ) -> Dict[int, Tensor]:
         """Run one vision-encoder call over the images of several requests and split it back.
@@ -1170,7 +1151,7 @@ class DynamicInferenceEngine(AbstractEngine):
         elif ndims == {3} and all(tensor.shape[0] == 1 for tensor in imgs):
             patch_dim = 1
         else:
-            raise _SharedEncodeLayoutError(
+            raise ValueError(
                 f"cannot concatenate image tensors of shapes {[tuple(t.shape) for t in imgs]}"
             )
         imgs_sizes = torch.cat([request.imgs_sizes.to(device=device) for request, _ in group])
@@ -1189,7 +1170,7 @@ class DynamicInferenceEngine(AbstractEngine):
         elif embeddings.ndim >= 2 and embeddings.shape[0] == 1 and embeddings.shape[1] == total:
             split_dim = 1
         else:
-            raise _SharedEncodeLayoutError(
+            raise ValueError(
                 f"shared vision encode of {len(group)} requests produced shape "
                 f"{tuple(embeddings.shape)}, expected {total} embeddings on a leading dim"
             )
@@ -1211,24 +1192,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 num_image_tiles=None,
                 imgs_sizes=request.imgs_sizes.to(device=device),
             )
-
-    def _attach_image_embeddings(
-        self, request: DynamicVLMInferenceRequest, embeddings: Tensor, *, cache: bool = True
-    ) -> None:
-        """Validate and register the embeddings of a request whose encode was deferred."""
-        self._register_image_embeddings(
-            request,
-            embeddings,
-            request.image_token_mask,
-            expected_count=request.deferred_image_embedding_count,
-            modality="image",
-            imgs=request.imgs,
-            num_tiles=None,
-            imgs_sizes=request.imgs_sizes,
-            num_frames=None,
-            error_subject=f"Request {request.request_id}",
-            cache=cache,
-        )
 
     def _register_image_embeddings(
         self,
@@ -2807,15 +2770,14 @@ class DynamicInferenceEngine(AbstractEngine):
             media_cache_key = compute_media_cache_key(modality, media_inputs)
 
         device = torch.cuda.current_device()
-        # Decided from the host-side imgs_sizes, before the device move below, so deferring
-        # the encode costs no D2H sync at admission.
-        deferred_embedding_count = (
-            self._deferred_image_embedding_count(
+        defer_image_encode = (
+            imgs is not None
+            and cached_vision_entry is None
+            and self._can_defer_image_encode(
                 imgs=imgs, num_tiles=num_tiles, imgs_sizes=imgs_sizes, num_frames=num_frames
             )
-            if imgs is not None and cached_vision_entry is None
-            else None
         )
+        deferred_embedding_count = None
         num_tiles = num_tiles.to(device=device) if num_tiles is not None else None
         imgs_sizes = imgs_sizes.to(device=device) if imgs_sizes is not None else None
         num_frames = num_frames.to(device=device) if num_frames is not None else None
@@ -2941,20 +2903,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Retrieve or compute the vision embedding.
             image_embeddings = self._get_cached_vision_embedding(media_cache_key)
-            if image_embeddings is not None:
-                deferred_embedding_count = None
-            if deferred_embedding_count is not None:
+            if image_embeddings is None and defer_image_encode:
                 # The encode runs together with the other waiting image requests right
-                # before they are scheduled for prefill (_encode_waiting_images). The count
-                # is checked here so an invalid prompt still fails at admission, and the
-                # media moves to the device now, as on the encode-at-admission path.
-                if deferred_embedding_count != expected_embedding_count:
-                    prompt_kind = "Pre-expanded" if media_tokens_preexpanded else "Expanded"
-                    raise ValueError(
-                        f"{prompt_kind} prompt has {expected_embedding_count} media-token "
-                        f"position(s), but the vision encoder would produce "
-                        f"{deferred_embedding_count} embedding(s)."
-                    )
+                # before they are scheduled for prefill (_encode_waiting_images), and its
+                # output is split back by the embedding count the prompt expansion expects.
+                deferred_embedding_count = expected_embedding_count
                 imgs = imgs.to(device=device)
                 self._has_deferred_image_encodes = True
             elif image_embeddings is None and imgs is not None:

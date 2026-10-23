@@ -194,15 +194,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
         return mask
 
-    def dynamic_image_embedding_counts(self, imgs_sizes: torch.Tensor) -> Optional[list[int]]:
-        """Projected embedding count per dynamic-resolution image, or None if not derivable.
-
-        The dynamic engine uses these counts to encode the images of several requests with one
-        vision-encoder call and split the result back per request. Wrappers that cannot report
-        them keep the per-request encode path.
-        """
-        return None
-
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
         """Prepares the inference input data.

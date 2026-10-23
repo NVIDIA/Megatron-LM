@@ -153,7 +153,6 @@ def _build_mock_vlm_engine(image_embeddings):
     engine._get_cached_vision_embedding = mock.Mock(return_value=None)
     engine._cache_vision_embedding = mock.Mock()
     engine._has_deferred_image_encodes = False
-    engine._shared_image_encode_disabled = False
     engine.waiting_request_ids = deque()
     return engine, wrapper
 
@@ -258,16 +257,33 @@ def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
     wrapper.build_preexpanded_media_token_mask.assert_called_once_with(tokens, "image")
 
 
-def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
+def _run_deferred_encode(engine, request):
+    """Run the encode admission deferred, as schedule_waiting_requests does before prefill."""
+    engine.waiting_request_ids.append(request.request_id)
+    engine.get_request = lambda request_id: request
+    engine.context.max_tokens = 4096
+    engine._handle_failed_request = mock.Mock()
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        engine._encode_waiting_images()
+
+
+def test_build_vlm_request_fails_preexpanded_embedding_count_mismatch_at_encode():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(1, 4))
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
         [-1, 0, 1, -1], dtype=torch.int64
     )
 
-    with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
-        _call_build_vlm_request(
-            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
-        )
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+    )
+    request.add_event_error_nontransient = mock.Mock()
+    _run_deferred_encode(engine, request)
+
+    (error,), _ = request.add_event_error_nontransient.call_args
+    assert "2 media-token position" in str(error) and "1 embedding" in str(error)
+    engine._handle_failed_request.assert_called_once_with(
+        request.request_id, stage="encode its images before prefill"
+    )
 
 
 def test_build_vlm_request_validates_cached_embedding_count_once():
@@ -293,12 +309,18 @@ def test_build_vlm_request_keeps_compact_expansion_path():
     request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
 
     wrapper.expand_image_tokens.assert_called_once()
+    wrapper._forward_vision_encoder.assert_not_called()  # deferred to prefill scheduling
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+    _run_deferred_encode(engine, request)
+
     encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
     assert torch.equal(encoder_args[0], torch.ones(1, 2, 4))
     assert encoder_kwargs["num_image_tiles"] is None
     assert torch.equal(encoder_kwargs["imgs_sizes"], torch.tensor([[2, 2]]))
-    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
-    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    assert request.image_embeddings is not None
+    engine._handle_failed_request.assert_not_called()
 
 
 def test_build_vlm_request_stitches_expanded_multimodal_prefix():
@@ -879,7 +901,6 @@ def _build_waiting_engine(requests, *, max_tokens=4096):
     engine.get_request = lambda request_id: by_id[request_id]
     engine.waiting_request_ids = deque(by_id)
     engine._has_deferred_image_encodes = True
-    engine._shared_image_encode_disabled = False
     engine.vision_embedding_cache_max_bytes = 0
     engine._get_cached_vision_embedding = mock.Mock(return_value=None)
     engine._cache_vision_embedding = mock.Mock()
@@ -892,9 +913,8 @@ def _encode_waiting(engine):
         engine._encode_waiting_images()
 
 
-def test_build_vlm_request_defers_encode_when_wrapper_reports_embedding_counts():
+def test_build_vlm_request_defers_encode_with_the_expected_embedding_count():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    wrapper.dynamic_image_embedding_counts.return_value = [2]
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     request = _call_build_vlm_request(
@@ -910,44 +930,6 @@ def test_build_vlm_request_defers_encode_when_wrapper_reports_embedding_counts()
     assert engine._has_deferred_image_encodes is True
     _, kwargs = engine.context.add_vlm_request_data.call_args
     assert kwargs["image_embeddings"] is None
-
-
-def test_build_vlm_request_still_rejects_count_mismatch_when_deferring():
-    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    wrapper.dynamic_image_embedding_counts.return_value = [3]
-    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
-
-    with pytest.raises(ValueError, match="2 media-token position.*3 embedding"):
-        _call_build_vlm_request(
-            engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
-        )
-    wrapper._forward_vision_encoder.assert_not_called()
-
-
-@pytest.mark.parametrize("counts", [None, "not-a-list"])
-def test_build_vlm_request_encodes_at_admission_without_usable_counts(counts):
-    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    wrapper.dynamic_image_embedding_counts.return_value = counts
-    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
-
-    request = _call_build_vlm_request(
-        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
-    )
-
-    wrapper._forward_vision_encoder.assert_called_once()
-    assert request.image_embeddings is not None
-    assert request.deferred_image_embedding_count is None
-
-
-def test_build_vlm_request_rejects_wrapper_counts_of_the_wrong_length():
-    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    wrapper.dynamic_image_embedding_counts.return_value = [1, 1]  # two counts for one image
-    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
-
-    with pytest.raises(ValueError, match="returned 2 count"):
-        _call_build_vlm_request(
-            engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
-        )
 
 
 def test_encode_waiting_images_does_not_recache_a_cache_hit():
@@ -994,7 +976,7 @@ def test_encode_waiting_images_keeps_the_flag_when_a_pass_is_interrupted():
     assert engine._has_deferred_image_encodes is True  # the next pass retries them
 
 
-def test_encode_waiting_images_disables_deferral_after_a_layout_mismatch(caplog):
+def test_encode_waiting_images_falls_back_per_request_after_a_count_mismatch(caplog):
     requests = [_waiting_image_request(1, [[4, 4]]), _waiting_image_request(2, [[2, 4]])]
     engine, wrapper = _build_waiting_engine(requests)
     wrapper._forward_vision_encoder.side_effect = (
@@ -1008,32 +990,13 @@ def test_encode_waiting_images_disables_deferral_after_a_layout_mismatch(caplog)
     with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
         _encode_waiting(engine)
 
-    assert "shared vision encoding disabled" in caplog.text
-    assert engine._shared_image_encode_disabled is True
+    assert "shared vision encoding of 2 requests failed" in caplog.text
     assert all(request.image_embeddings is not None for request in requests)
-    # From now on admission encodes immediately instead of deferring.
-    assert (
-        engine._deferred_image_embedding_count(
-            imgs=torch.ones(1, 4, 3),
-            num_tiles=None,
-            imgs_sizes=torch.tensor([[4, 4]]),
-            num_frames=None,
-        )
-        is None
+    engine._handle_failed_request.assert_not_called()
+    # Only this group fell back: later image requests are still deferred and batched.
+    assert engine._can_defer_image_encode(
+        imgs=torch.ones(1, 4, 3), num_tiles=None, imgs_sizes=torch.tensor([[4, 4]]), num_frames=None
     )
-
-
-def test_build_vlm_request_encodes_at_admission_for_duck_typed_wrapper():
-    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    del wrapper.dynamic_image_embedding_counts  # a wrapper without the hook at all
-    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
-
-    request = _call_build_vlm_request(
-        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
-    )
-
-    wrapper._forward_vision_encoder.assert_called_once()
-    assert request.deferred_image_embedding_count is None
 
 
 def test_refresh_leaves_a_waiting_deferred_request_to_the_shared_encode():
@@ -1053,7 +1016,6 @@ def test_refresh_leaves_a_waiting_deferred_request_to_the_shared_encode():
 
 def test_build_vlm_request_encodes_at_admission_for_non_concatenable_layout():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    wrapper.dynamic_image_embedding_counts.return_value = [2]
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
     params = SamplingParams(num_tokens_to_generate=1, termination_id=0)
 
@@ -1284,7 +1246,6 @@ def test_encode_waiting_images_falls_back_per_request_on_mixed_layouts(caplog):
     assert "cannot concatenate image tensors" in caplog.text
     assert wrapper._forward_vision_encoder.call_count == 2
     assert all(request.image_embeddings is not None for request in requests)
-    assert engine._shared_image_encode_disabled is True
 
 
 def test_encode_waiting_images_fails_duplicates_of_a_failed_primary():
@@ -1320,8 +1281,9 @@ def test_encode_waiting_images_fails_only_the_member_whose_count_disagrees():
 
     _encode_waiting(engine)
 
-    # The shared call used the admission counts (3 + 2 = 5 rows) and split accordingly; the
-    # first request's 3 rows are then rejected against its mask (4 positions) and only it fails.
+    # The shared call returns 4 + 2 = 6 rows against the 3 + 2 = 5 the counts expect, so the
+    # group is encoded per request: the first request's 4 rows disagree with its count of 3 and
+    # only it fails.
     engine._handle_failed_request.assert_called_once_with(
         1, stage="encode its images before prefill"
     )
