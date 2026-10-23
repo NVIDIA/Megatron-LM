@@ -795,3 +795,72 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+
+def _hybrid_gdn_config(**overrides):
+    return TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        is_hybrid_model=True,
+        experimental_attention_variant="gated_delta_net",
+        **overrides,
+    )
+
+
+def test_repeated_post_init_keeps_derived_linear_cp_fields():
+    """A second __post_init__ must not read its own filled-in defaults as explicit choices."""
+    config = _hybrid_gdn_config()
+    assert (config.linear_cp_mode, config.linear_cp_layout) == ("chunkwise", "zigzag")
+    for _ in range(2):
+        config.__post_init__()
+        assert (config.linear_cp_mode, config.linear_cp_layout) == ("chunkwise", "zigzag")
+        assert config._linear_cp_mode_was_default is True
+        assert config._linear_cp_layout_explicit is False
+
+
+def test_repeated_post_init_keeps_gdn2_headwise_default():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="gdn2",
+        linear_attention_freq=1,
+        context_parallel_size=2,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+    )
+    config.__post_init__()
+    assert (config.linear_cp_mode, config.linear_cp_layout) == ("headwise", "zigzag")
+    assert config._linear_cp_layout_explicit is False
+
+
+def test_repeated_post_init_preserves_explicit_linear_cp_fields():
+    config = _hybrid_gdn_config(linear_cp_mode="chunkwise", linear_cp_layout="contiguous")
+    for _ in range(2):
+        config.__post_init__()
+    assert (config.linear_cp_mode, config.linear_cp_layout) == ("chunkwise", "contiguous")
+    assert config._linear_cp_mode_was_default is False
+    assert config._linear_cp_layout_explicit is True
+
+
+def test_repeated_post_init_honors_linear_cp_layout_set_between_passes():
+    config = _hybrid_gdn_config()
+    config.linear_cp_layout = "contiguous"
+    config.__post_init__()
+    assert config.linear_cp_layout == "contiguous"
+    assert config._linear_cp_layout_explicit is True
+
+
+def test_repeated_post_init_honors_linear_cp_mode_set_between_passes():
+    config = _hybrid_gdn_config()
+    config.linear_cp_mode = "headwise"
+    config.__post_init__()
+    assert (config.linear_cp_mode, config.linear_cp_layout) == ("headwise", "zigzag")
+    assert config._linear_cp_mode_was_default is False
+    assert config._linear_cp_layout_explicit is False
+
+
+def test_explicit_chunkwise_with_non_contiguous_layout_is_still_rejected():
+    with pytest.raises(ValueError, match="requires linear_cp_layout='contiguous'"):
+        _hybrid_gdn_config(linear_cp_mode="chunkwise", linear_cp_layout="zigzag")
