@@ -23,6 +23,7 @@ import contextlib
 
 import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
@@ -494,6 +495,35 @@ def test_mhc_sinkhorn_replays_fwd_bwd(backend):
         replays=3,
         what=f"mhc sinkhorn[{backend}]",
     )
+
+
+@pytest.mark.parametrize("compile_cache_limit", [1, 8])
+def test_native_mhc_sinkhorn_checkpoint_replays_with_limited_compile_cache(compile_cache_limit):
+    """Checkpointing must reuse the forward arithmetic even after compiler fallback."""
+    from megatron.core.transformer.hyper_connection import native_sinkhorn
+
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(cache_size_limit=compile_cache_limit):
+            seeded()
+            logits = _mhc_rand(8, 2, 4, 4, dtype=torch.float32)
+            grad_output = torch.randn_like(logits)
+
+            def run(x):
+                # Mapping operations produce logits with requires_grad=False in the
+                # checkpoint's no-grad forward, unlike the original forward.
+                return native_sinkhorn(x * 1.0, 20, 1e-6)
+
+            expected = run(logits)
+            # At limit=1, this backward hits the recompile limit for a new grad-mode guard.
+            expected.backward(grad_output)
+            replay_logits = logits.detach().clone().requires_grad_(True)
+            actual = checkpoint(run, replay_logits, use_reentrant=True)
+            assert bytes_equal(actual, expected)
+            actual.backward(grad_output)
+            assert bytes_equal(replay_logits.grad, logits.grad)
+    finally:
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("backend", _MHC_BACKENDS)
