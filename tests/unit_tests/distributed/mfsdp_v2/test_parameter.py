@@ -12,6 +12,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    microbatch,
 )
 
 
@@ -234,3 +235,38 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group.main_grad is not None
     assert group._unsharded_model_weight is not None
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
+
+
+def test_frozen_weights_without_input_gradients(distributed_setup):
+    """Keep frozen weights available until internal backward has consumed them."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    # This is the simplest setup where an FSDP unit owns only frozen weights and
+    # has no grad-requiring inputs, but still allows backward(): a separately
+    # sharded trainable child keeps the backward graph alive.
+    trainable_linear = nn.Linear(4, 4, bias=False)
+    frozen_linear = nn.Linear(4, 4, bias=False).requires_grad_(False)
+    model = nn.Sequential(trainable_linear, frozen_linear).to(device)
+    nn.init.ones_(frozen_linear.weight)
+    frozen_weight = frozen_linear.weight
+    with fully_shard_context(device=device) as context:
+        fully_shard(trainable_linear, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    def unpack(tensor):
+        # Suppress traceback tensor formatting, which would also read freed storage.
+        if tensor.untyped_storage().nbytes() == 0:
+            pytest.fail("Frozen weight was resharded before backward consumed it", pytrace=False)
+        return tensor
+
+    # Report early weight release as a test failure before CUDA reads freed memory.
+    with torch.autograd.graph.saved_tensors_hooks(
+        pack_hook=lambda tensor: tensor, unpack_hook=unpack
+    ):
+        for is_last in (False, True):
+            with microbatch(context, is_last=is_last):
+                model(torch.ones(2, 4, device=device)).sum().backward()
+            assert frozen_weight.untyped_storage().nbytes() == 0
+    torch.testing.assert_close(
+        trainable_linear.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
+    )

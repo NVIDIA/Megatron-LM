@@ -1398,9 +1398,10 @@ class OffloadedRequestPayload:
     def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
         """Copy the payload off a finished (merged) request as plain host-side values.
 
-        Side effect: replaces ``request.prompt_tokens`` with its host copy when it is a
-        tensor, so one device-to-host copy serves both this payload and every later
-        host-side read of the finished request (its reply and the caller's result).
+        Side effect: replaces ``request.prompt_tokens`` and ``request.media_tensors`` with
+        their host copies, so one device-to-host copy serves both this payload and every
+        later host-side read of the finished request (its reply and the caller's result),
+        and a finished request kept alive while its payload is staged holds no device memory.
         """
 
         def to_plain_list(value):
@@ -1413,21 +1414,20 @@ class OffloadedRequestPayload:
         if isinstance(request.prompt_tokens, torch.Tensor):
             # One device-to-host copy serves both the payload and the wire reply.
             request.prompt_tokens = request.prompt_tokens.cpu()
+        if request.media_tensors is not None:
+            # VLM media (e.g. ``imgs``) stays on the device after the vision encoder ran.
+            request.media_tensors = {
+                name: tensor.detach().cpu()
+                for name, tensor in request.media_tensors.items()
+                if tensor is not None
+            }
         return cls(
             prompt_token_ids=to_plain_list(request.prompt_tokens),
             generated_token_ids=list(request.generated_tokens),
             generated_log_probs=to_plain_list(request.generated_log_probs),
             prompt_log_probs=to_plain_list(request.prompt_log_probs),
             routing_indices=request.routing_indices,
-            media_tensors=(
-                None
-                if request.media_tensors is None
-                else {
-                    name: tensor.detach().cpu()
-                    for name, tensor in request.media_tensors.items()
-                    if tensor is not None
-                }
-            ),
+            media_tensors=(None if request.media_tensors is None else dict(request.media_tensors)),
         )
 
 
@@ -1439,7 +1439,19 @@ class RequestPayloadStageResult:
 
 
 class RequestPayloadStager(Protocol):
-    """Protocol to handle offloading of request payloads to a storage backend."""
+    """Protocol to handle offloading of request payloads to a storage backend.
+
+    The engine calls ``stage()`` on a worker thread (``asyncio.to_thread``), one call
+    per completed request, so implementations must follow these rules:
+
+    * Calls run concurrently with each other, so ``stage()`` must be thread-safe.
+    * Calls share the event loop's default thread pool. A write that blocks for a long
+      time holds a pool thread, so many slow writes can use up the pool and delay other
+      ``to_thread`` work.
+    * ``stage()`` must use only its arguments and the stager's own state. It must not
+      touch engine state, the engine's ZMQ sockets, or anything else owned by the engine
+      loop's thread.
+    """
 
     def stage(
         self,

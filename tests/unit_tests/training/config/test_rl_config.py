@@ -198,7 +198,11 @@ RUN = dict(
             dict(skip_train=True, load_optim=False),
             "no optimizer to offload",
         ),
-        (dict(), dict(global_batch_size=None), "must be resolved"),
+        (
+            dict(rl_offload_optimizer_during_inference=True),
+            dict(global_batch_size=None, skip_train=True, load_optim=False),
+            "no optimizer to offload",
+        ),
     ],
 )
 def test_validate_run_rejects_runs_inconsistent_with_the_section(rl_kwargs, run_overrides, match):
@@ -226,6 +230,8 @@ def test_validate_run_at_every_call_site():
     cfg.validate_run(**{**RUN, "save_interval": 4, "exit_interval": 2})
     cfg.validate_run(**{**RUN, "cuda_graph_impl": None})
     RLConfig(rl_use_sequence_packing=True).validate_run(**{**RUN, "micro_batch_size": 4})
+
+    cfg.validate_run(**{**RUN, "global_batch_size": None})
 
     # Through the container: the sections supply the inputs.
     # The CUDA-graph rule reads the model's transformer section; skipped for a model without one.
@@ -374,13 +380,15 @@ def test_ddp_finalization_preserves_subclass_fields():
 def test_model_setup_uses_owned_ddp_config(
     monkeypatch, run_config, native_builder, perform_rl_step
 ):
-    from megatron.training import arguments, training
+    from megatron.training import arguments, global_vars, training
 
     parser = argparse.ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     # The container, not legacy args, owns the RL policy.
     args.perform_rl_step = not perform_rl_step
+    args.batch_parallel_size = 1
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     run_config.rl = RLConfig(
         perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
     )

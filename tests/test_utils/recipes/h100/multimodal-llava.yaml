@@ -8,7 +8,7 @@ spec:
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 8
-  platforms: dgx_a100
+  platforms: dgx_h100
   time_limit:
   n_repeat:
   test_case:

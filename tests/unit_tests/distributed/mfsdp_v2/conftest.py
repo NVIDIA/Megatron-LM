@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.distributed_c10d import _world
+from torch.distributed.tensor.debug import _clear_sharding_prop_cache
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,6 +71,11 @@ def distributed_setup() -> Iterator[DistributedSetup]:
         # reinitialization. Later test teardown also uses WORLD, so leave its destruction
         # to session cleanup.
         # https://docs.pytorch.org/docs/stable/distributed.html#reinitialization
+        #
+        # TODO(#7322): Remove this workaround when runtime parameters become local tensors.
+        # DeviceMesh equality ignores process groups, so DTensor's sharding-propagation cache
+        # can hand a later test this test's meshes, whose groups are destroyed below.
+        _clear_sharding_prop_cache()
         for group in list(_world.pg_map):
             if group is not dist.group.WORLD:
                 dist.destroy_process_group(group)
