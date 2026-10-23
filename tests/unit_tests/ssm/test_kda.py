@@ -341,8 +341,9 @@ def test_kda_selective_recompute(recompute_module, two_stage_gates):
         )
         # The checkpointed forward runs the fused BF16 recurrence under no_grad, which can
         # select a different reduction path from the eager forward.  Keep this to one BF16
-        # ULP while still checking that recomputation preserves the result and input gradient.
-        recompute_tolerance = dict(atol=1e-3, rtol=1e-3)
+        # BF16 ULPs grow with the exponent; allow one ULP across the normal output range
+        # while still checking that recomputation preserves the result and input gradient.
+        recompute_tolerance = dict(atol=2e-3, rtol=1e-2)
         torch.testing.assert_close(recompute_output, base_output, **recompute_tolerance)
         torch.testing.assert_close(recompute_input_grad, base_input_grad, **recompute_tolerance)
         assert recompute_grads.keys() == base_grads.keys()
