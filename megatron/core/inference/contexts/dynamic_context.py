@@ -471,8 +471,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Expert tensor-and-model-parallel (tp_ep) group: the group the inference MoE
         # dispatchers gather/scatter tokens over. Equals the EP group when ETP == 1.
         if pg_collection is not None:
-            # getattr: non-MoE callers may build a pg_collection without tp_ep.
-            self.expert_tensor_and_model_parallel_group = getattr(pg_collection, "tp_ep", None)
+            # getattr: callers may build a pg_collection without tp_ep; fall back to the EP
+            # group (identical when ETP == 1), matching the engine's fallback.
+            self.expert_tensor_and_model_parallel_group = getattr(
+                pg_collection, "tp_ep", self.expert_model_parallel_group
+            )
         else:
             # Migration fallback for callers that do not pass a pg_collection; mirrors
             # the EP fallback above. None (size 1) when MPU is not initialized.
