@@ -60,7 +60,7 @@ from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
-from .kv_block_allocator import KVBlockAllocator
+from .kv_block_allocator import MAX_CACHED_PROMPT_TOP_N_LOGPROBS, KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .mtp_context_mixin import MTPContextMixin
 from .routing_metadata import RoutingMetadata
@@ -275,6 +275,27 @@ class PrefixMatch:
     effective_prefill_chunk_length: int
     backed_off_blocks: int = 0
     speculative_reserve_blocks: int = 0
+
+
+@dataclass
+class PromptLogprobsWrite:
+    """Where one request's prompt log-prob rows from one step will be cached.
+
+    Args:
+        request_index (int): Active-request index of the rows in the step's output.
+        num_rows (int): Number of leading rows that score prompt tokens.
+        top_n (int): Top-N width of the rows.
+        block_ids (Tensor): Block holding each row's source token.
+        slots (Tensor): Position of each row's source token within its block.
+        next_token_ids (Tensor): Token each row scores.
+    """
+
+    request_index: int
+    num_rows: int
+    top_n: int
+    block_ids: Tensor
+    slots: Tensor
+    next_token_ids: Tensor
 
 
 class DynamoHelper:
@@ -1510,6 +1531,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.chunked_prefill_next_prompt_token = torch.empty(
             (), dtype=torch.int64, device=torch.cuda.current_device()
         )
+        self.chunked_prefill_next_prompt_token_id = -1
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
         # GPU via the matching region of ContextGPUView._buf). Populated per
@@ -3280,6 +3302,14 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         is_cached = torch.isin(block_hashes, cached_hashes)
         return int(is_cached.nonzero()[-1].item()) + 1 if is_cached.any() else 0
 
+    @staticmethod
+    def _prompt_logprobs_top_n(req: DynamicInferenceRequest) -> Optional[int]:
+        """Return the top-N width of the prompt log-probs `req` needs, or None."""
+        sampling_params = req.sampling_params
+        if not sampling_params.return_log_probs or sampling_params.skip_prompt_log_probs:
+            return None
+        return sampling_params.top_n_logprobs
+
     def _compute_prefix_match(
         self,
         req: DynamicInferenceRequest,
@@ -3330,9 +3360,27 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         num_matched = len(matched_block_ids)
 
+        # A skipped token's prompt log-prob must come from its block, so a request
+        # that needs prompt log-probs may skip only blocks that have them cached.
+        num_skippable = num_matched
+        prompt_logprobs_top_n = self._prompt_logprobs_top_n(req)
+        if prompt_logprobs_top_n is not None and num_matched > 0:
+            num_skippable = (
+                self.kv_block_allocator.match_prompt_logprob_blocks(
+                    matched_block_ids,
+                    already_allocated_blocks,
+                    req.prompt_tokens,
+                    prompt_logprobs_top_n,
+                )
+                if prompt_logprobs_top_n <= MAX_CACHED_PROMPT_TOP_N_LOGPROBS
+                else 0
+            )
+
         block_aligned = finished % self.block_size_tokens == 0
-        if num_matched > 0 and block_aligned:
-            prefix_skip_tokens = min(num_matched * self.block_size_tokens, prefill_chunk_length - 1)
+        if num_skippable > 0 and block_aligned:
+            prefix_skip_tokens = min(
+                num_skippable * self.block_size_tokens, prefill_chunk_length - 1
+            )
         else:
             prefix_skip_tokens = 0
 
@@ -3344,13 +3392,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             num_mamba_matched = self._find_mamba_match_count(
                 req=req,
                 start_block=already_allocated_blocks,
-                end_block=already_allocated_blocks + num_matched,
+                end_block=already_allocated_blocks + num_skippable,
             )
             if record_mamba_match:
                 req._mamba_num_matched_blocks = num_mamba_matched
             assert (
-                num_mamba_matched <= num_matched
-            ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
+                num_mamba_matched <= num_skippable
+            ), f"Mamba match ({num_mamba_matched}) > skippable KV match ({num_skippable})"
             if num_mamba_matched > 0 and block_aligned:
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
@@ -3393,9 +3441,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             speculative_reserve_blocks=speculative_reserve_blocks,
         )
 
-    def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
+    def check_availability(
+        self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None
+    ) -> Tuple[bool, bool, bool]:
         """
         Check if the request can be added to the context.
+
+        Args:
+            req (DynamicInferenceRequest): Request to check.
+            prefill_chunk_length (Optional[int]): Prompt tokens in the chunk to admit.
+                Defaults to the whole remaining prompt.
         """
         # Note that for hybrid models checking the total request count is sufficient
         # because we allocate a single set of Mamba state tensors for each request.
@@ -3407,7 +3462,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
             request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
-        match = self._compute_prefix_match(req, req.remaining_prompt_length)
+        if prefill_chunk_length is None:
+            prefill_chunk_length = req.remaining_prompt_length
+
+        match = self._compute_prefix_match(req, prefill_chunk_length)
         matched_block_ids = match.matched_block_ids
         num_blocks_from_pool = match.num_blocks_from_pool
 
@@ -3506,6 +3564,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.chunked_prefill_next_prompt_token.copy_(
                 req.remaining_prompt_tokens[prefill_chunk_length]
             )
+            self.chunked_prefill_next_prompt_token_id = int(
+                req.remaining_prompt_tokens[prefill_chunk_length]
+            )
 
         # =========================================================================
         # Block allocation + prefix matching + prefill skipping
@@ -3555,6 +3616,23 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
             req.num_cached_tokens += prefix_skip_tokens
+
+        # Skipped tokens produce no log-prob rows, so hand the request their cached rows.
+        prompt_logprobs_top_n = self._prompt_logprobs_top_n(req)
+        if prompt_logprobs_top_n is not None and prefix_skip_tokens > 0:
+            start = req.finished_chunk_token_count
+            req.cached_prompt_log_probs.append(
+                (
+                    start,
+                    *self.kv_block_allocator.read_prompt_logprobs(
+                        matched_block_ids,
+                        already_allocated_blocks,
+                        start,
+                        start + prefix_skip_tokens,
+                        prompt_logprobs_top_n,
+                    ),
+                )
+            )
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -5165,6 +5243,108 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # Convert each log prob tensor into a list
         return [lp.tolist() for lp in selected_log_probs_list], log_probs
+
+    def capture_prompt_logprob_writes(self) -> List[PromptLogprobsWrite]:
+        """Record where this step's prompt log-prob rows will be cached, and pin those blocks.
+
+        Must run before `update_requests`, while the active layout still describes
+        the forward that produced the rows. The pin keeps a finished request's
+        blocks from being evicted and reused before `commit_prompt_logprob_writes`
+        stores the rows, which under async scheduling happens after admission.
+
+        Returns:
+            List[PromptLogprobsWrite]: One entry per prefill request with prompt rows.
+        """
+        if not self.enable_prefix_caching:
+            return []
+        n_active = self.total_request_count - self.paused_request_count
+        metadata = self.active_request_metadata
+        top_n = metadata["top_n_logprobs"][:n_active]
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        caches_prompt_logprobs = (
+            metadata["return_log_probs"][:n_active]
+            & ~metadata["skip_prompt_log_probs"][:n_active]
+            & (top_n <= MAX_CACHED_PROMPT_TOP_N_LOGPROBS)
+            & (self.request_in_prefill_status_tensor[active_slice] == 1)
+        )
+        if not caches_prompt_logprobs.any():
+            return []
+
+        query_lengths = self.request_query_lengths[active_slice]
+        row_offsets = (query_lengths.cumsum(0) - query_lengths).tolist()
+        chunked_index = self.get_index_of_chunked_prefill_request(safe=True)
+        writes = []
+        for request_index in caches_prompt_logprobs.nonzero().flatten().tolist():
+            first_row = row_offsets[request_index]
+            num_rows = int(query_lengths[request_index])
+            is_partial_chunk = request_index == chunked_index - self.paused_request_count
+            # A completed prompt's final row scores the first generated token.
+            num_prompt_rows = num_rows if is_partial_chunk else num_rows - 1
+            if num_prompt_rows <= 0:
+                continue
+            rows = slice(first_row, first_row + num_prompt_rows)
+            positions = self.token_to_position_in_request[rows]
+            next_token_ids = self.token_to_input_ids[first_row + 1 : first_row + num_rows].clone()
+            if is_partial_chunk:
+                next_token_ids = torch.cat(
+                    (next_token_ids, torch.tensor([self.chunked_prefill_next_prompt_token_id]))
+                )
+            writes.append(
+                PromptLogprobsWrite(
+                    request_index=request_index,
+                    num_rows=num_prompt_rows,
+                    top_n=int(top_n[request_index]),
+                    block_ids=self.request_to_kv_block_ids[
+                        self.paused_request_count + request_index
+                    ][positions // self.block_size_tokens].clone(),
+                    slots=positions % self.block_size_tokens,
+                    next_token_ids=next_token_ids,
+                )
+            )
+        if writes:
+            self.kv_block_allocator.retain_memory_blocks(
+                torch.cat([write.block_ids for write in writes]).unique().tolist()
+            )
+        return writes
+
+    def commit_prompt_logprob_writes(
+        self,
+        writes: List[PromptLogprobsWrite],
+        log_probs: Optional[List[List[float]]],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
+    ) -> None:
+        """Cache captured prompt log-prob rows on their blocks and release the pins.
+
+        Args:
+            writes: Destinations returned by `capture_prompt_logprob_writes`.
+            log_probs: Selected log-probs per active request for the same step.
+            top_n_logprobs: Top-N values and token IDs per active request and row.
+        """
+        if not writes:
+            return
+        allocator = self.kv_block_allocator
+        try:
+            for write in writes:
+                rows = log_probs[write.request_index][: write.num_rows]
+                if write.top_n > 0:
+                    top_n_rows = top_n_logprobs[write.request_index][: write.num_rows]
+                    top_n_values = torch.stack([values for values, _ in top_n_rows])
+                    top_n_ids = torch.stack([token_ids for _, token_ids in top_n_rows])
+                else:
+                    top_n_values = torch.empty((write.num_rows, 0), dtype=torch.float32)
+                    top_n_ids = torch.empty((write.num_rows, 0), dtype=torch.int64)
+                allocator.store_prompt_logprobs(
+                    block_ids=write.block_ids.numpy(),
+                    slots=write.slots.numpy(),
+                    log_probs=torch.tensor(rows, dtype=torch.float32).numpy(),
+                    top_n_log_probs=top_n_values.float().numpy(),
+                    top_n_token_ids=top_n_ids.long().numpy(),
+                    next_token_ids=write.next_token_ids.numpy(),
+                )
+        finally:
+            allocator.release_memory_blocks(
+                torch.cat([write.block_ids for write in writes]).unique()
+            )
 
     def get_kvcache_utilization_stats(self) -> dict:
         """Compute KV cache buffer utilization stats for the current step.

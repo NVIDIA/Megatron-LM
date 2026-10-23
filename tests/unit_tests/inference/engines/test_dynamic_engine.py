@@ -2424,6 +2424,81 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     )
 
 
+@pytest.mark.parametrize("scored_before", [0, 2])
+def test_cached_prompt_log_probs_wait_for_preceding_scores(scored_before):
+    """Cached rows for a later chunk are placed only after the scores before them."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(
+        tokenizer=types.SimpleNamespace(detokenize=lambda token_ids: f"tok_{token_ids[0]}")
+    )
+    start = scored_before + 2
+    request = types.SimpleNamespace(
+        prompt_log_probs=[-float(i) for i in range(scored_before)] or None,
+        prompt_top_n_logprobs=[{f"tok_{i}": -float(i)} for i in range(scored_before)] or None,
+        sampling_params=types.SimpleNamespace(top_n_logprobs=1),
+        cached_prompt_log_probs=[
+            (
+                start,
+                torch.tensor([-start, -start - 1.0]).numpy(),
+                torch.tensor([[-start], [-start - 1.0]]).numpy(),
+                torch.tensor([[start], [start + 1]]).numpy(),
+            )
+        ],
+    )
+
+    # The two computed rows before the cached run have not arrived yet.
+    engine._place_cached_prompt_log_probs(request)
+    assert len(request.prompt_log_probs or []) == scored_before
+
+    request.prompt_log_probs = (request.prompt_log_probs or []) + [
+        -float(scored_before),
+        -float(scored_before + 1),
+    ]
+    request.prompt_top_n_logprobs = (request.prompt_top_n_logprobs or []) + [{}, {}]
+    engine._place_cached_prompt_log_probs(request)
+    assert request.prompt_log_probs == [-float(i) for i in range(start + 2)]
+    assert request.prompt_top_n_logprobs[start:] == [
+        {f"tok_{start}": -float(start)},
+        {f"tok_{start + 1}": -float(start + 1)},
+    ]
+    assert not request.cached_prompt_log_probs
+
+
+def test_recomputed_prompt_scores_repair_the_original_segment():
+    """Scores lost to a checkpoint are restored from the first complete recomputation."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    original = DynamicInferenceRequest(
+        request_id=3,
+        prompt_tokens=torch.arange(9),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=4,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=3,
+        ),
+    )
+    # The request was checkpointed after one generated token, before its scores arrived.
+    original.generated_tokens = [9]
+    record = DynamicInferenceRequestRecord.from_request(original)
+    record.checkpoint()
+    recomputed = record[-1]
+    entry = RequestEntry(record=record, future=mock.Mock())
+
+    # A partial recomputation leaves the original segment untouched.
+    recomputed.prompt_log_probs = [-float(i) for i in range(4)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(4)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs is None
+
+    # The recomputed prompt includes the generated token, so it has one extra row.
+    recomputed.prompt_log_probs = [-float(i) for i in range(9)]
+    recomputed.prompt_top_n_logprobs = [{"t": -float(i)} for i in range(9)]
+    engine._promote_recomputed_prompt_scores(entry)
+    assert original.prompt_log_probs == recomputed.prompt_log_probs[:8]
+    assert original.prompt_top_n_logprobs == recomputed.prompt_top_n_logprobs[:8]
+    assert original.prompt_log_probs is not recomputed.prompt_log_probs
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
