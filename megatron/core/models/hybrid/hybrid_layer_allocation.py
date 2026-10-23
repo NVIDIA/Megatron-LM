@@ -645,7 +645,7 @@ def select_pipeline_segment(
 
 
 def select_pipeline_segment_from_config_list(
-    main_layer_config_list: Sequence[HybridLayerEntry],
+    parsed_config_list: ParsedHybridConfigList,
     pp_group: torch.distributed.ProcessGroup | None,
     vp_stage: int | None,
     virtual_pipeline_model_parallel_size: int | None = None,
@@ -654,7 +654,7 @@ def select_pipeline_segment_from_config_list(
     tp_group: torch.distributed.ProcessGroup | None = None,
     dp_cp_group: torch.distributed.ProcessGroup | None = None,
 ) -> Tuple[List[TransformerConfig], int]:
-    """Select and clone this rank's decoder configs from a first-class config list.
+    """Select and clone this rank's decoder configs from a parsed hybrid config list.
 
     The PP/VPP segment ordering is VPP-major, matching ``select_pipeline_segment`` and
     ``PipelineParallelLayerLayout``. Without ``PipelineSplit``, PP uses the existing contiguous
@@ -662,7 +662,7 @@ def select_pipeline_segment_from_config_list(
     segments must exactly equal the configured PP x VPP topology.
 
     Args:
-        main_layer_config_list: Parsed main-decoder configs and optional ``PipelineSplit`` classes.
+        parsed_config_list: Validated architecture returned by ``parse_hybrid_layer_config_list``.
         pp_group: Pipeline-parallel process group, or ``None`` for one PP rank.
         vp_stage: Current virtual-pipeline stage, or ``None`` without VPP.
         virtual_pipeline_model_parallel_size: Configured VPP size, or ``None`` without VPP.
@@ -674,14 +674,8 @@ def select_pipeline_segment_from_config_list(
     Returns:
         Independent physical config clones for this segment and its global decoder-layer offset.
     """
-    source_entries = tuple(main_layer_config_list)
-    for index, entry in enumerate(source_entries):
-        if entry is MTPSplit:
-            raise ValueError(
-                f"MTPSplit at index {index} is not valid in a parsed main layer config list"
-            )
+    source_entries = parsed_config_list.main_layer_config_list
     source_configs = [entry for entry in source_entries if entry is not PipelineSplit]
-    _validate_layer_config_sequence(source_configs, "main decoder")
 
     pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
     pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1

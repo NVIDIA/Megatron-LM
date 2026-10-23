@@ -15,9 +15,11 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
     get_layer_maps_from_layer_type_list,
+    parse_hybrid_layer_config_list,
     parse_hybrid_pattern,
     pattern_from_ratios,
     select_pipeline_segment,
+    select_pipeline_segment_from_config_list,
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -55,6 +57,37 @@ _DSV4_COMPRESS_RATIOS = {Symbols.CSA: 4, Symbols.HCA: 128, Symbols.WINDOW: 0}
 def test_split_sentinels_cannot_be_instantiated(sentinel):
     with pytest.raises(TypeError, match=f"Use the bare {sentinel.__name__} class instead"):
         sentinel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("explicit_splits", [False, True])
+def test_select_pipeline_segment_from_parsed_config_list(explicit_splits):
+    layer = MLPLayerConfig(num_layers=3, hidden_size=64, num_attention_heads=4)
+    mtp_layer = MLPLayerConfig.from_config(layer)
+    mtp_layer.ffn_hidden_size *= 2
+    entries = [layer, PipelineSplit, layer, layer] if explicit_splits else [layer] * 3
+    parsed = parse_hybrid_layer_config_list([*entries, MTPSplit, mtp_layer], expected_num_layers=3)
+
+    with patch("megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage"):
+        configs, offset = select_pipeline_segment_from_config_list(
+            parsed,
+            pp_group=None,
+            vp_stage=1 if explicit_splits else None,
+            virtual_pipeline_model_parallel_size=2 if explicit_splits else None,
+        )
+        if explicit_splits:
+            with pytest.raises(ValueError, match="PP x VPP topology"):
+                select_pipeline_segment_from_config_list(parsed, pp_group=None, vp_stage=None)
+
+    assert offset == (1 if explicit_splits else 0)
+    assert len(configs) == (2 if explicit_splits else 3)
+    assert len({id(config) for config in configs}) == len(configs)
+    assert all(type(config) is MLPLayerConfig for config in configs)
+    assert all(config is not layer and config is not mtp_layer for config in configs)
+    assert all(config.ffn_hidden_size == layer.ffn_hidden_size for config in configs)
+    assert all(config.is_hybrid_model for config in configs)
+    assert not layer.is_hybrid_model
+    assert parsed.mtp_layer_config_list == (mtp_layer,)
 
 
 def _make_transformer_config() -> TransformerConfig:

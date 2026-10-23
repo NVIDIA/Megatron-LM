@@ -357,7 +357,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.config.is_hybrid_model = True
 
             layer_config_list, layer_offset = select_pipeline_segment_from_config_list(
-                parsed_config_list.main_layer_config_list,
+                parsed_config_list,
                 self.pg_collection.pp,
                 vp_stage,
                 virtual_pipeline_model_parallel_size=(
