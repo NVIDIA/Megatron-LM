@@ -10,7 +10,6 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import internal_api
@@ -99,11 +98,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
             )
 
-            # clear the lru_cache for the forward method. If not cleared, the cache of forward
-            # method causes a memory leak in NeMo-RL.
-            self.forward.cache_clear()
+            # The constructor only needs the cos/sin buffers, not the intermediate embedding.
+            self.clear_cache()
 
-    def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
+    def get_emb(self, max_seq_len: int, offset: int = 0) -> tuple[Tensor, float]:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
@@ -156,7 +154,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         return emb, _mscale
 
-    @lru_cache(maxsize=32)
+    def _get_emb_and_scale(self, max_seq_len: int, offset: int) -> tuple[Tensor, float]:
+        return self.get_emb(max_seq_len, offset)
+
     @internal_api
     def forward(
         self,
@@ -164,7 +164,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, float]:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
@@ -177,14 +177,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
         """
-        emb, _mscale = self.get_emb(max_seq_len, offset)
-        if cp_group is None:
-            cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
-        return emb, _mscale
+        return self._get_cached_emb(max_seq_len, offset, packed_seq, cp_group)
 
     def _set_cos_sin_cache(
         self, seq_len, offset, dtype, packed_seq=False, cp_group=None, mscale=None
