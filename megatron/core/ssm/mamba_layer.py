@@ -5,10 +5,8 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -28,16 +26,12 @@ from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadat
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.residual_connection import ResidualConnectionState
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
-
-if TYPE_CHECKING:
-    from megatron.core.ssm.gated_delta_product import GDPInferenceDecodeState
 
 
 @dataclass
@@ -62,15 +56,6 @@ class MambaLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class MambaInferenceProjection:
-    """Projection and residual state held across one staged inference schedule."""
-
-    projected: Tensor
-    residual: Tensor
-    connection_state: ResidualConnectionState | None
 
 
 class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
@@ -259,64 +244,6 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         """Return an optional architecture-owned connection around the Mamba mixer."""
 
         return None
-
-    def inference_project(
-        self, hidden_states: Tensor, inference_context: BaseInferenceContext
-    ) -> MambaInferenceProjection:
-        """Read and normalize the residual stream, then project for dynamic inference.
-
-        This is separate from the training-only two-stage methods. The saved
-        residual and connection state are consumed exactly once by
-        ``inference_post`` after the cache-aware mixer core completes.
-        """
-        if not InferenceMode.is_active() or not self.supports_staged_inference(inference_context):
-            raise NotImplementedError("Staged Mamba-layer inference requires dynamic GDP inference")
-
-        normalized, residual, connection_state, _ = self._prepare_mixer_state(hidden_states)
-        projected = self.mixer.inference_project(normalized, inference_context)
-        return MambaInferenceProjection(projected, residual, connection_state)
-
-    def supports_staged_inference(
-        self, inference_context: BaseInferenceContext | None = None
-    ) -> bool:
-        """Whether this layer has the GDP adapter used by inference overlap.
-
-        The capability is intentionally specific to GDP. Other Mamba mixers may
-        have training two-stage methods, but those do not preserve inference
-        cache semantics. The optional context lets callers reject static
-        batching before selecting the staged path.
-        """
-        from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
-
-        mixer = self.mixer
-        return (
-            isinstance(mixer, GatedDeltaProductMixer)
-            and (inference_context is None or inference_context.is_dynamic_batching())
-            and not mixer.chunkwise_context_parallel
-            and mixer.cp is not None
-            and mixer.cp.cp_size == 1
-            and not mixer.config.gdp_cutedsl_kernel
-            and not mixer.config.batch_invariant_mode
-        )
-
-    def inference_core(
-        self, projection: MambaInferenceProjection, inference_context: BaseInferenceContext
-    ) -> GDPInferenceDecodeState:
-        """Run cache-aware GDP for the packed inference batch."""
-        if not self.supports_staged_inference(inference_context):
-            raise NotImplementedError("Staged Mamba-layer inference requires dynamic GDP inference")
-        return self.mixer.inference_core(projection.projected, inference_context)
-
-    def inference_post(
-        self, projection: MambaInferenceProjection, core_output: GDPInferenceDecodeState
-    ) -> Tensor:
-        """Project the core result and apply the ordinary residual write/BDA."""
-        if not self.supports_staged_inference():
-            raise NotImplementedError("Staged Mamba-layer inference requires a GDP mixer")
-        mixer_output_with_bias = self.mixer.inference_post(core_output)
-        return self._apply_mixer_update(
-            mixer_output_with_bias, projection.residual, projection.connection_state, None
-        )
 
     def forward(
         self,

@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGath
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
 
@@ -453,11 +454,10 @@ class ShortcutMoEBlock(MegatronModule):
     ):
         """Run independent mixer and routed-expert branches until their outputs join.
 
-        Prefill and mixed use the predecessor's atomic cache-aware forward.
-        Decode exposes its projection, unsplit core and output phases only to
-        order their launches around expert preparation and compute. The routed
-        branch runs entirely on the side stream in every phase. CUDA graphs
-        capture the input-ready fork and the join before the residual write.
+        Every phase uses the predecessor's ordinary cache-aware forward on the
+        main stream. Routing, dispatch, experts and combine run on the MoE
+        stream. CUDA graphs capture the input-ready fork and the join before
+        the residual write.
         """
         if attn_recompute_context is not None or moe_recompute_context is not None:
             raise RuntimeError("Shortcut MoE inference cannot use residual-stream recomputation")
@@ -468,21 +468,13 @@ class ShortcutMoEBlock(MegatronModule):
         if self.config.mlp_chunks_for_prefill > 1 and not inference_context.is_decode_only():
             raise RuntimeError("Shortcut MoE inference overlap requires mlp_chunks_for_prefill=1")
         shortcut_hidden = hidden_states
-        staged_gdp = isinstance(
-            self.compute_layer, MambaLayer
-        ) and self.compute_layer.supports_staged_inference(inference_context)
-        supports_attention = getattr(self.compute_layer, "supports_staged_dynamic_inference", None)
-        staged_attention = callable(supports_attention) and supports_attention(inference_context)
-        if not (staged_gdp or staged_attention):
+        if not isinstance(self.compute_layer, (MambaLayer, TransformerLayer)):
             raise RuntimeError(
-                "Shortcut MoE inference overlap requires a staged GDP or dynamic "
-                "FlashAttention predecessor; "
-                f"got {type(self.compute_layer).__name__}"
+                "Shortcut MoE inference overlap requires a Mamba or Transformer layer"
             )
         if not isinstance(self.moe_layer.mlp.token_dispatcher, NVLSAllGatherVDispatcher):
             raise RuntimeError("Shortcut MoE inference overlap requires the active NVLS dispatcher")
 
-        decode_only = inference_context.is_decode_only()
         main_stream = torch.cuda.current_stream()
         shortcut_stream = self._get_moe_overlap_stream()
         # Fork before the shortcut read/router. Protect the original pair input
@@ -507,60 +499,27 @@ class ShortcutMoEBlock(MegatronModule):
                     route_input, route_probs, async_op=False
                 )
 
-        if decode_only:
-            with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
-                if staged_gdp:
-                    projection = self.compute_layer.inference_project(
-                        hidden_states, inference_context
-                    )
-                else:
-                    projection = self.compute_layer.forward_inference_project(
-                        hidden_states,
-                        attention_mask,
-                        inference_context=inference_context,
-                        rotary_pos_emb=rotary_pos_emb,
-                        sequence_len_offset=sequence_len_offset,
-                        packed_seq_params=packed_seq_params,
-                        padding_mask=padding_mask,
-                    )
-
-        with torch.cuda.stream(shortcut_stream):
-            with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
-                prepared = self.moe_layer.mlp.experts.prepare_shortcut_overlap(
+                # NVLS dispatch/combine preprocessing is pass-through. Call the
+                # ordinary expert forward with a cap only for this overlap pair.
+                routed_output, _ = self.moe_layer.mlp.experts(
                     dispatched_input,
+                    None,
                     dispatched_probs,
-                    self.moe_layer.mlp.token_dispatcher.routing_map,
-                    max_blocks=self.config.inference_shortcut_moe_expert_max_blocks,
+                    routing_map=self.moe_layer.mlp.token_dispatcher.routing_map,
+                    inference_max_blocks=self.config.inference_shortcut_moe_expert_max_blocks,
                 )
-
-        if decode_only:
-            with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
-                core_output = (
-                    self.compute_layer.inference_core(projection, inference_context)
-                    if staged_gdp
-                    else self.compute_layer.forward_inference_core(projection)
-                )
-        with torch.cuda.stream(shortcut_stream):
-            with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
-                computed = self.moe_layer.mlp.experts.compute_shortcut_overlap(prepared)
-                routed_output, _ = self.moe_layer.mlp.experts.finish_shortcut_overlap(computed)
                 combined_output = self._launch_combine(routed_output, async_op=False)
 
         with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
-            if not decode_only:
-                compute_output = self._forward_compute_atomic(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    inference_context=inference_context,
-                    rotary_pos_emb=rotary_pos_emb,
-                    sequence_len_offset=sequence_len_offset,
-                    packed_seq_params=packed_seq_params,
-                    padding_mask=padding_mask,
-                )
-            elif staged_gdp:
-                compute_output = self.compute_layer.inference_post(projection, core_output)
-            else:
-                compute_output, _ = self.compute_layer.forward_inference_post_core(core_output)
+            compute_output = self._forward_compute_atomic(
+                hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
 
         with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
             shared_expert_output, moe_unflatten_mbs, residual, mlp_state = self._moe_shared_experts(

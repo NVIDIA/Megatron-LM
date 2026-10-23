@@ -167,14 +167,6 @@ class GatedDeltaProductMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-@dataclass(frozen=True)
-class GDPInferenceDecodeState:
-    """Full-batch recurrence output held until the decode output gate runs."""
-
-    z: torch.Tensor
-    output: torch.Tensor
-
-
 class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
     """Gated Delta Product (GDP) sequence mixer for hybrid models.
 
@@ -600,62 +592,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
         return self.out_proj(y)
-
-    def inference_project(
-        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
-    ) -> torch.Tensor:
-        """Project a dynamic inference batch before its cache-dependent GDP work.
-
-        The staged inference path shares the serial path's input
-        projection. Static batching and training continue through ``forward``.
-        """
-        if context is None or not context.is_dynamic_batching():
-            raise NotImplementedError("GDP overlap requires dynamic batching")
-        if self.chunkwise_context_parallel or self.cp is None or self.cp.cp_size != 1:
-            raise NotImplementedError("GDP overlap requires context parallel size one")
-        if self.config.gdp_cutedsl_kernel or self.config.batch_invariant_mode:
-            raise NotImplementedError(
-                "GDP overlap does not support CuTeDSL inference or batch-invariant mode"
-            )
-        ok, reason = check_fla_sequence_packing_support()
-        if not ok:
-            raise RuntimeError(reason)
-        projected, _ = self.in_proj(hidden_states)
-        return projected
-
-    def inference_core(
-        self, projected: torch.Tensor, context: DynamicInferenceContext
-    ) -> GDPInferenceDecodeState:
-        """Update decode caches with one full-batch recurrence.
-
-        Decode defers only the output gate until ``inference_post``. Convolution,
-        preparation and the recurrent kernel each execute once for the full batch.
-        """
-        if not context.is_decode_only():
-            raise NotImplementedError("GDP staged core requires pure decode; prefill uses forward")
-        batch_size = context.padded_batch_dimensions.decode_req_count
-        if context.num_speculative_tokens:
-            raise NotImplementedError("GDP overlap does not support speculative decode")
-        if (
-            projected.ndim != 3
-            or projected.shape[:2] != (batch_size, 1)
-            or context.padded_batch_dimensions.token_count != batch_size
-        ):
-            raise ValueError("GDP overlap requires one token per padded decode request")
-        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
-        return self._decode_core(
-            projected, conv_state, ssm_state, context.mamba_metadata.batch_indices_decode
-        )
-
-    def inference_post(
-        self, core_output: GDPInferenceDecodeState
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Finish the decode gate and apply the ordinary full-batch output projection."""
-        postprocessed = self._decode_post(core_output)
-        # Canonical singleton strides are required by the output GEMM.
-        # Transposing [1, batch, dim] selects a much slower cuBLAS algorithm.
-        output = postprocessed.reshape(postprocessed.shape[1], 1, postprocessed.shape[2])
-        return self.out_proj(output)
 
     def _packed_metadata(
         self, packed_seq_params: PackedSeqParams | None
@@ -1219,26 +1155,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             "a rollback needs both halves of the recurrent state"
         )
 
-        prepared = self._decode_core(
-            zVKQba,
-            conv_state,
-            ssm_state,
-            batch_indices,
-            intermediate_conv_state,
-            intermediate_ssm_state,
-        )
-        return self._decode_post(prepared).transpose(0, 1)
-
-    def _decode_core(
-        self,
-        zVKQba: torch.Tensor,
-        conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
-        batch_indices: torch.Tensor | None,
-        intermediate_conv_state: torch.Tensor | None = None,
-        intermediate_ssm_state: torch.Tensor | None = None,
-    ) -> GDPInferenceDecodeState:
-        """Run one cache-aware full-batch recurrence, retaining its output gate input."""
         # Keep the sequence dimension so the shared helpers apply: their (b, l, ...)
         # reshapes give exactly the layouts the fla recurrent kernel wants here, i.e.
         # "b (l m) h p" is "n (s m) h p". ``_preprocess`` takes the sequence-first
@@ -1296,12 +1212,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             intermediate_states=intermediate_ssm_state,
             steps_per_token=self.num_householder,
         )
-        return GDPInferenceDecodeState(z=z, output=core_attn_out)
-
-    def _decode_post(self, prepared: GDPInferenceDecodeState) -> torch.Tensor:
-        """Select the final Householder output and apply the full-batch output gate."""
         core_attn_out = rearrange(
-            prepared.output, "n (t m) h d -> n t m h d", m=self.num_householder
+            core_attn_out, "n (t m) h d -> n t m h d", m=self.num_householder
         )[
             ..., -1, :, :
         ].contiguous()  # [n, 1, h, d]
@@ -1309,9 +1221,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         # No scatter: the kernel above already wrote each request's final state into
         # its cache slot in place.
         #
-        # ``_postprocess`` returns sequence-first [1, batch, dim]. Its context
-        # parallel postprocessing is a no-op because decode requires CP=1.
-        return self._postprocess(core_attn_out, prepared.z)
+        # ``_postprocess`` returns the sequence-first layout, so transpose back to the
+        # batch-first [n, seq_len, d_inner] this method contracts to return; the
+        # transpose is free at l == 1. post_conv_ssm inside it is a no-op here: decode
+        # only runs at cp_size == 1.
+        return self._postprocess(core_attn_out, z).transpose(0, 1)
 
     def ssm_prefill(
         self,

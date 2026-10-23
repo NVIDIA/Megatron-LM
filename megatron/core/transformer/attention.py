@@ -285,19 +285,6 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
-@dataclass(frozen=True)
-class InferenceProjectedAttention:
-    """QKV and cache state held between a dynamic attention projection and core step."""
-
-    query: Tensor
-    key: Tensor
-    value: Tensor
-    packed_seq_params: Optional[PackedSeqParams]
-    block_table: Optional[Tensor]
-    gate: Optional[Tensor]
-    inference_context: BaseInferenceContext
-
-
 class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     """Attention layer abstract class.
 
@@ -1402,130 +1389,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """Specialized attention subclasses retain their atomic forward path."""
         return type(self).forward is Attention.forward
 
-    def supports_staged_dynamic_inference(
-        self, inference_context: BaseInferenceContext | None
-    ) -> bool:
-        """Whether this attention can use the cache-aware staged inference path.
-
-        This query only reads Python module/configuration state, so callers may
-        use it while selecting a CUDA graph capture path.
-        """
-        return (
-            InferenceMode.is_active()
-            and not self.training
-            and inference_context is not None
-            and inference_context.is_dynamic_batching()
-            and self.attention_type == "self"
-            and self.supports_two_stage_attention()
-            and type(self)._get_core_attention_extra_kwargs
-            is Attention._get_core_attention_extra_kwargs
-            and not isinstance(self.config, MLATransformerConfig)
-            and not self.batch_invariant_mode
-            and not self.config.flash_decode
-            and self.config.tensor_model_parallel_size == 1
-            and self.config.context_parallel_size == 1
-            and not self.offload_qkv_linear
-            and not self.offload_core_attention
-            and not self.offload_attn_proj
-        )
-
-    def _validate_staged_dynamic_inference(self, inference_context: BaseInferenceContext) -> None:
-        """Apply the same capability check used to select the staged schedule."""
-        if not self.supports_staged_dynamic_inference(inference_context):
-            raise RuntimeError(
-                "Staged attention requires evaluation-mode dynamic self-attention with TP=CP=1; "
-                "MLA, batch-invariant mode, flash decode and activation offloading are unsupported."
-            )
-
-    def forward_inference_project(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor | None,
-        *,
-        inference_context: BaseInferenceContext,
-        rotary_pos_emb: Tensor | Tuple[Tensor, Tensor] | None = None,
-        rotary_pos_cos: Tensor | None = None,
-        rotary_pos_sin: Tensor | None = None,
-        rotary_pos_cos_sin: Tensor | None = None,
-        attention_bias: Tensor | None = None,
-        packed_seq_params: PackedSeqParams | None = None,
-        sequence_len_offset: int | None = None,
-    ) -> InferenceProjectedAttention:
-        """Project QKV and update inference cache before the attention kernel runs."""
-        return self.forward_pre_attn_and_core_attn(
-            hidden_states,
-            attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            project_only=True,
-        )
-
-    def _run_dynamic_inference_core(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        inference_context: BaseInferenceContext,
-        block_table: Optional[Tensor],
-    ) -> Tensor:
-        """Run the existing dynamic FlashAttention kernel for atomic and staged forwards."""
-        cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-        cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
-
-        core_attn_out = self.flash_decode_and_prefill(
-            query,
-            key,
-            value,
-            max_seqlen_q,
-            max_seqlen_k,
-            cu_query_lengths,
-            cu_kv_lengths,
-            kv_lengths,
-            block_table,
-            inference_context.is_decode_only(),
-            softmax_offset=self._get_inference_softmax_offset(),
-        )
-        core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-
-        # Padding rows must not enter amax calculations for quantized inference.
-        if is_using_quantization_scales(self.config):
-            core_attn_out[inference_context.padding_slice] = 0.0
-        return core_attn_out
-
-    def forward_inference_core(self, projected: InferenceProjectedAttention) -> Tensor:
-        """Run dynamic FlashAttention on QKV produced by ``forward_inference_project``."""
-        if not isinstance(projected, InferenceProjectedAttention):
-            raise TypeError("Expected InferenceProjectedAttention from forward_inference_project.")
-        self._validate_staged_dynamic_inference(projected.inference_context)
-        nvtx_range_push(suffix="core_attention")
-        core_attn_manager = off_interface(False, projected.query, "core_attn")
-        core_attn_out = self._run_dynamic_inference_core(
-            projected.query,
-            projected.key,
-            projected.value,
-            projected.inference_context,
-            projected.block_table,
-        )
-        core_attn_out = core_attn_manager.group_offload(
-            core_attn_out, forced_released_tensors=[projected.query, projected.key, projected.value]
-        )
-        packed_seq_params = projected.packed_seq_params
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
-        nvtx_range_pop(suffix="core_attention")
-
-        if projected.gate is not None:
-            nvtx_range_push(suffix="output_gate")
-            core_attn_out = self._apply_output_gate(core_attn_out, projected.gate)
-            nvtx_range_pop(suffix="output_gate")
-        return core_attn_out
-
     def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
@@ -1542,8 +1405,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_sequence_cp_metadata=None,
-        project_only: bool = False,
-    ) -> Union[Tensor, InferenceProjectedAttention]:
+    ) -> Tensor:
         """
         Run the QKV input projection and core attention, stopping before linear_proj.
 
@@ -1582,8 +1444,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             rotary_pos_emb = None
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        if project_only:
-            self._validate_staged_dynamic_inference(inference_context)
 
         if inference_context and inference_context.is_dynamic_batching():
             assert (
@@ -1803,21 +1663,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
-        if project_only:
-            # A dynamic inference context forces split QKV, so this captures the same
-            # post-cache and post-RoPE tensors consumed by the atomic core path.
-            if not split_qkv:
-                raise RuntimeError("Staged dynamic attention requires separate QKV tensors.")
-            return InferenceProjectedAttention(
-                query=query,
-                key=key,
-                value=value,
-                packed_seq_params=packed_seq_params,
-                block_table=block_table,
-                gate=gate,
-                inference_context=inference_context,
-            )
-
         # ==================================
         # core attention computation
         # ==================================
@@ -1885,9 +1730,29 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     )
                 else:
                     # Dynamic batching attention kernel.
-                    core_attn_out = self._run_dynamic_inference_core(
-                        query, key, value, inference_context, block_table
+                    q, k, v = (query, key, value)
+                    cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                    cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                        softmax_offset=self._get_inference_softmax_offset(),
                     )
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+
+                    # Clear the outputs for padding tokens when using quantization scales
+                    # to avoid corrupting amax calculations
+                    if is_using_quantization_scales(self.config):
+                        core_attn_out[inference_context.padding_slice] = 0.0
 
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=[query, key, value]

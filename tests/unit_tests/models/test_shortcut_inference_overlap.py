@@ -32,10 +32,7 @@ def shortcut_norm(monkeypatch):
 
 @pytest.mark.parametrize(
     "failure,message",
-    [
-        ("unsupported", "staged GDP or dynamic FlashAttention"),
-        ("dispatcher", "active NVLS dispatcher"),
-    ],
+    [("unsupported", "Mamba or Transformer layer"), ("dispatcher", "active NVLS dispatcher")],
 )
 def test_overlap_rejects_unsupported_execution_before_dispatch(monkeypatch, failure, message):
     config = _shortcut_config()
@@ -49,7 +46,8 @@ def test_overlap_rejects_unsupported_execution_before_dispatch(monkeypatch, fail
 
     monkeypatch.setattr(shortcut_module, "NVLSAllGatherVDispatcher", Dispatcher)
     compute = _FakeCompute(config)
-    compute.supports_staged_dynamic_inference = lambda context: failure != "unsupported"
+    if failure != "unsupported":
+        monkeypatch.setattr(shortcut_module, "TransformerLayer", _FakeCompute)
     block = ShortcutMoEBlock(compute, _FakeMoE(config), overlap_a2a=False).eval()
     block.moe_layer.mlp.token_dispatcher = Dispatcher() if failure == "unsupported" else object()
     context = SimpleNamespace(
@@ -80,7 +78,7 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
     """Real stream/event capture replays both branches with changing padded inputs.
 
     Lightweight tensor operations isolate the block's fork/join and cache
-    ownership. Actual kernel coverage lives in the consolidated adapter tests;
+    ownership. Actual expert kernel coverage lives in the capped-GEMM test;
     distributed NVLS coverage uses the checkpoint replay verifier.
     """
     config = _shortcut_config()
@@ -99,33 +97,11 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
     )
 
     class Compute(_FakeCompute):
-        def supports_staged_inference(self, context):
-            return True
-
-        supports_staged_dynamic_inference = supports_staged_inference
-
-        def inference_project(self, hidden_states, context):
-            return SimpleNamespace(projected=hidden_states + 1, residual=hidden_states)
-
-        def forward_inference_project(self, hidden_states, attention_mask, **kwargs):
-            return self.inference_project(hidden_states, kwargs["inference_context"])
-
-        def inference_core(self, projection, context=None):
-            cache.add_(projection.projected * live_rows.view(rows, 1, 1))
-            updates.add_(live_rows)
-            return SimpleNamespace(output=projection.projected * 2, residual=projection.residual)
-
-        forward_inference_core = inference_core
-
-        def inference_post(self, projection, core):
-            return core.output + core.residual
-
-        def forward_inference_post_core(self, core):
-            return self.inference_post(None, core), None
-
         def forward(self, hidden_states, **kwargs):
-            projection = self.inference_project(hidden_states, kwargs["inference_context"])
-            output = self.inference_post(projection, self.inference_core(projection))
+            projected = hidden_states + 1
+            cache.add_(projected * live_rows.view(rows, 1, 1))
+            updates.add_(live_rows)
+            output = projected * 2 + hidden_states
             return output if predecessor == "gdp" else (output, None)
 
     class Dispatcher:
@@ -133,6 +109,9 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
 
     monkeypatch.setattr(
         shortcut_module, "MambaLayer", Compute if predecessor == "gdp" else type(None)
+    )
+    monkeypatch.setattr(
+        shortcut_module, "TransformerLayer", Compute if predecessor == "attention" else type(None)
     )
     monkeypatch.setattr(shortcut_module, "NVLSAllGatherVDispatcher", Dispatcher)
     block = ShortcutMoEBlock(Compute(config), _FakeMoE(config), overlap_a2a=False).eval().cuda()
@@ -150,15 +129,6 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
     def dispatch(hidden, probs, *, async_op=False):
         assert not async_op
         return hidden * 2, probs
-
-    def compute(prepared):
-        hidden, probs = prepared
-        return hidden + probs * 5
-
-    def prepare(hidden, probs, routing_map, *, max_blocks):
-        assert max_blocks == 304
-        assert routing_map is block.moe_layer.mlp.token_dispatcher.routing_map
-        return hidden, probs
 
     def combine(output, *, async_op=False):
         assert not async_op
@@ -178,15 +148,15 @@ def test_overlap_graph_replay_preserves_inputs_and_updates_live_cache_once(
         lambda combined_output, shared_expert_output, *args, **kwargs: combined_output
         + shared_expert_output,
     )
-    block.moe_layer.mlp.routed_experts_compute = lambda hidden, probs: (
-        compute((hidden, probs)),
-        None,
-    )
-    block.moe_layer.mlp.experts = SimpleNamespace(
-        prepare_shortcut_overlap=prepare,
-        compute_shortcut_overlap=compute,
-        finish_shortcut_overlap=lambda output: (output, None),
-    )
+
+    class Experts(torch.nn.Module):
+        def forward(self, hidden, tokens_per_expert, probs, *, routing_map, inference_max_blocks=0):
+            assert inference_max_blocks == 304
+            assert routing_map is block.moe_layer.mlp.token_dispatcher.routing_map
+            return hidden + probs * 5, None
+
+    block.moe_layer.mlp.experts = Experts()
+    block.moe_layer.mlp.routed_experts_compute = lambda hidden, probs: (hidden + probs * 5, None)
     kwargs = dict(
         hidden_states=hidden,
         attention_mask=None,

@@ -95,13 +95,6 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     prepare_routed_mxfp8_weights,
     require_flashinfer_routed_mxfp8,
 )
-from megatron.core.inference.moe.vllm_fused_moe import (
-    ComputedVllmMoE,
-    PreparedVllmMoE,
-    compute_vllm_moe,
-    finish_vllm_moe,
-    prepare_vllm_moe,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -1633,98 +1626,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
-    def prepare_shortcut_overlap(
-        self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
-        *,
-        max_blocks: int = 0,
-    ) -> PreparedVllmMoE:
-        """Prepare local expert indirection after NVLS dispatch on the caller's stream.
-
-        Args:
-            hidden_states: Gathered BF16 input buffer from the NVLS dispatcher.
-            probs: Gathered routing probabilities.
-            routing_map: Gathered global expert assignments.
-            max_blocks: Static GEMM CTA limit for overlap inference; zero
-                preserves the ordinary uncapped launch grids.
-
-        Returns:
-            GPU-resident expert inputs and routing metadata. The caller owns
-            stream dependencies and keeps this state alive through reduction.
-        """
-        if (
-            not InferenceMode.is_active()
-            or self.training
-            or not getattr(self.config, "inference_shortcut_moe_overlap", False)
-            or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.VLLM
-            or not self._nvls_dispatcher
-        ):
-            raise RuntimeError(
-                "Shortcut experts require evaluation-mode inference with the vllm "
-                "grouped-GEMM backend and NVLS overlap enabled"
-            )
-        if max_blocks < 0:
-            raise ValueError("Shortcut expert max_blocks must be nonnegative")
-        InferenceGroupedMLP._ensure_concatenated_weights(self)
-        if any(
-            not isinstance(weight, torch.Tensor) or weight.dtype != torch.bfloat16
-            for weight in (self._fc1_weight, self._fc2_weight)
-        ):
-            raise RuntimeError("Shortcut expert overlap currently requires BF16 weights")
-        valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens()
-        if valid_tokens is None:
-            raise RuntimeError("The inference dispatcher has no valid-token metadata tensor")
-        return prepare_vllm_moe(
-            hidden_states,
-            probs,
-            self._fc1_weight,
-            self._fc2_weight,
-            self._mcore_activation_type,
-            self.num_local_experts,
-            self.ep_group.rank() * self.num_local_experts,
-            valid_tokens,
-            routing_map,
-            num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
-            activation_clamp_scale=self._activation_clamp_scale,
-            grid_size_limit=max_blocks,
-        )
-
-    def compute_shortcut_overlap(self, prepared: PreparedVllmMoE) -> ComputedVllmMoE:
-        """Run local expert GEMMs on the caller's current stream.
-
-        Args:
-            prepared: GPU routing buffers from ``prepare_shortcut_overlap``.
-
-        Returns:
-            Expert outputs and routing metadata retained for reduction.
-        """
-        return compute_vllm_moe(prepared)
-
-    def finish_shortcut_overlap(
-        self, computed: ComputedVllmMoE
-    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
-        """Reduce local expert outputs into the NVLS combine buffer.
-
-        Args:
-            computed: Expert outputs from ``compute_shortcut_overlap``.
-
-        Returns:
-            The reduce-scatter input buffer and no output bias.
-        """
-        return finish_vllm_moe(computed, out=NVLSAllGatherVDispatcher._get_rsv_tensor()), None
-
-    def _ensure_concatenated_weights(self) -> None:
-        """Build contiguous expert weights once after checkpoint loading."""
-        if not self._concatenated_weights_built:
-            if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
-                self._build_concatenated_mxfp8_weights()
-            else:
-                self._build_concatenated_weights()
-            self._concatenated_weights_built = True
-
-    def _vllm_forward(self, hidden_states, probs, routing_map):
+    def _vllm_forward(self, hidden_states, probs, routing_map, inference_max_blocks=0):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = vllm_fused_moe(
@@ -1740,6 +1642,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
+            grid_size_limit=inference_max_blocks,
         )
         return output, None
 
@@ -1749,6 +1652,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         tokens_per_expert: Optional[torch.Tensor],
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
+        *,
+        inference_max_blocks: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass with backend-selected inference grouped GEMMs:
 
@@ -1766,6 +1671,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             permuted_probs: [num_tokens, topk] routing probabilities.
             routing_map: [num_tokens, topk] token-to-expert assignment indices.
                 Required for the FlashInfer CUDA-graphed path, None otherwise.
+            inference_max_blocks: vLLM GEMM CTA cap for an overlapping Shortcut pair.
+                Defaults to uncapped for serial inference, unpaired layers and training.
         """
 
         if not InferenceMode.is_active():
@@ -1775,7 +1682,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
-        InferenceGroupedMLP._ensure_concatenated_weights(self)
+        if not self._concatenated_weights_built:
+            if InferenceGroupedMLP._expert_weights_use_mxfp8(self):
+                self._build_concatenated_mxfp8_weights()
+            else:
+                self._build_concatenated_weights()
+            self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
@@ -1796,7 +1708,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     permuted_local_hidden_states, permuted_probs, routing_map=routing_map
                 )
             return self._vllm_forward(
-                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+                permuted_local_hidden_states,
+                permuted_probs,
+                routing_map=routing_map,
+                inference_max_blocks=inference_max_blocks,
             )
         raise ValueError(
             f"Unsupported inference grouped-GEMM backend: {self.inference_grouped_gemm_backend}"
