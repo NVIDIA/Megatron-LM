@@ -779,6 +779,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "flashinfer on Blackwell and are not replayed in CI.",
     ),
     KernelEntry(
+        name="inference_flashinfer_nvfp4_moe",
+        sources=("megatron/core/inference/moe/flashinfer_nvfp4.py",),
+        tests=(
+            K + "test_inference_kernels.py",
+            K + "test_moe_kernels.py",
+            "tests/unit_tests/inference/test_flashinfer_nvfp4.py",
+        ),
+        kind="dispatch",
+        training_path=False,
+        notes="FlashInfer nvfp4_quantize (per-expert weights and per-token activations) feeding "
+        "CuteDslMoEWrapper (Relu2 or SwiGLU; two-stage finalize under deterministic algorithms or "
+        "batch_invariant_mode). The quantizer and the MoE are replayed in "
+        "test_inference_kernels.py (MoELayer level in "
+        "test_inference_nvfp4_moe_layer_replays) and checked for batch invariance across batch "
+        "sizes in test_flashinfer_nvfp4_moe_is_batch_invariant; all need FlashInfer >= 0.7.0 "
+        "on Blackwell and are not replayed in CI.",
+    ),
+    KernelEntry(
         name="inference_request_seed_sampling",
         sources=(
             "megatron/core/inference/sampling/torch_sampling.py",
