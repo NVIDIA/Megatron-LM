@@ -60,6 +60,22 @@ assert DownstreamHyperConnectionLayer.__bases__ == (canonical.HyperConnectionTra
 """
 
 
+def test_legacy_hyper_connection_export_preserves_identity():
+    from megatron.core.transformer import transformer_layer
+    from megatron.core.transformer.hyper_connection_transformer_layer import (
+        HyperConnectionTransformerLayer as CanonicalHyperConnectionTransformerLayer,
+    )
+    from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
+
+    assert HyperConnectionTransformerLayer is CanonicalHyperConnectionTransformerLayer
+    assert (
+        transformer_layer.HyperConnectionTransformerLayer
+        is CanonicalHyperConnectionTransformerLayer
+    )
+    with pytest.raises(AttributeError, match="_missing_residual_symbol"):
+        getattr(transformer_layer, "_missing_residual_symbol")
+
+
 @pytest.mark.parametrize(
     "import_order", ["common-first", "canonical-first", "connection-first", "recompute-first"]
 )
