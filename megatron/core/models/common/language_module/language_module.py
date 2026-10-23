@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import functools
 import inspect
 import logging
 from typing import Optional, Tuple, Union
@@ -339,9 +338,9 @@ class LanguageModule(MegatronModule):
             return self.output_layer.weight
         return None
 
-    @functools.cached_property
+    @property
     def lm_head_can_emit_fp32(self) -> bool:
-        """Whether the LM head emits fp32 logits natively; fixed once the model is built."""
+        """Whether the LM head can emit fp32 logits; reads the batch-invariant mode flag live."""
         return lm_head_can_emit(self.output_layer, torch.float32)
 
     @torch.inference_mode()
@@ -398,8 +397,8 @@ class LanguageModule(MegatronModule):
             runtime_gather_output=True,
             output_dtype=torch.float32 if self.lm_head_can_emit_fp32 else None,
         )
-        logits = logits.float()
-        logits = self._scale_logits(logits)
+        # MuP scaling first: a bf16 head scales in bf16, as training does, then the upcast.
+        logits = self._scale_logits(logits).float()
 
         return mtp_hidden, logits
 
