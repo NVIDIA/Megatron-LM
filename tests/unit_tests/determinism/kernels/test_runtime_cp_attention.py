@@ -183,6 +183,7 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
                     max_seqlen_kv=max(lengths),
                     local_cp_size=runtime_size,
                     cp_group=None if runtime_size is None else group,
+                    tp_cp_group=None if runtime_size is None else group,
                 )
                 local = _zigzag_shard(hidden, lengths, group.size(), group.rank())
                 inputs = dict(
@@ -199,6 +200,7 @@ def test_packed_attention_runtime_cp_replays(build_cp_size, fused_rope, monkeypa
                     what=f"packed attention build CP{build_cp_size}, runtime CP{runtime_size}",
                 )
                 assert_restored()
+                assert packed.tp_cp_group is (None if runtime_size is None else group)
                 assert "in.hidden_states" in result[1]
                 assert any("linear_qkv" in name for name in result[1])
                 assert any("linear_proj" in name for name in result[1])
