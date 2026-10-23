@@ -443,6 +443,14 @@ class TestStepBatchSizeScheduleIterationHorizon:
             data_parallel_size=data_parallel_size,
             step_batch_size_schedule=schedule,
         )
+        from megatron.training.config.container import PretrainConfigContainer
+        from megatron.training.config.training_config import SchedulerConfig
+
+        run_config.scheduler = SchedulerConfig()
+        for key, value in vars(args).items():
+            if hasattr(run_config.scheduler, key):
+                setattr(run_config.scheduler, key, value)
+        PretrainConfigContainer._resolve_scheduler_step_fields(run_config)
         optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
         scheduler = training.get_optimizer_param_scheduler(optimizer)
         # Building the scheduler leaves the calculator at the start of the schedule.

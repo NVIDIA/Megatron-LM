@@ -157,7 +157,7 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.config import FaultInjectorConfig, TrainingConfig
-from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.container import PretrainConfigContainer, update_train_iters
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
@@ -2259,50 +2259,6 @@ def pretrain(
     _end_otel_job_spans()
 
 
-def update_train_iters(train: TrainingConfig) -> None:
-    """Resolve the sample-based training horizon on the supplied training config."""
-    # For iteration-based training, we don't need to do anything
-    if train.train_iters:
-        return
-
-    if train.step_batch_size_schedule is not None:
-        # Sample based training with step batch size schedule.
-        iterations = 0
-        consumed_samples = 0
-        while consumed_samples < train.train_samples:
-            update_num_microbatches(consumed_samples, consistency_check=False)
-            consumed_samples += get_current_global_batch_size()
-            iterations += 1
-        # Reset
-        update_num_microbatches(0, consistency_check=False)
-        train.train_iters = iterations
-    else:
-        # Constant batch size with sample-based training.
-        train.train_iters = train.train_samples // train.global_batch_size
-
-    print_rank_0(f'setting training iterations to {train.train_iters}')
-
-
-def _get_samples_for_iterations(num_iterations: float) -> float:
-    """Return the samples consumed by the first ``num_iterations`` training iterations.
-
-    Walks the global num-microbatches calculator like ``update_train_iters``, then resets it
-    to sample 0. The fractional part of ``num_iterations`` uses the next iteration's batch and
-    a negative count uses the first batch, so a one-entry schedule gives
-    ``num_iterations * global_batch_size``.
-    """
-    full_iterations = max(int(num_iterations), 0)
-    consumed_samples = 0
-    for _ in range(full_iterations):
-        update_num_microbatches(consumed_samples, consistency_check=False)
-        consumed_samples += get_current_global_batch_size()
-    update_num_microbatches(consumed_samples, consistency_check=False)
-    consumed_samples += (num_iterations - full_iterations) * get_current_global_batch_size()
-    # Reset
-    update_num_microbatches(0, consistency_check=False)
-    return consumed_samples
-
-
 def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
     """Resolve the absolute DDP grad-bucket size.
 
@@ -2755,72 +2711,25 @@ def get_optimizer_param_scheduler(optimizer):
     cfg = get_run_config()
     args = get_args()
 
-    # Iteration-based training with a step batch size schedule.
-    if cfg.train.train_iters and cfg.train.step_batch_size_schedule is not None:
-        if args.lr_decay_iters is None:
-            args.lr_decay_iters = cfg.train.train_iters
-        # Each step advances the scheduler by the scheduled global batch size, so convert
-        # iteration counts into the samples the schedule consumes over those iterations.
-        lr_decay_steps = _get_samples_for_iterations(args.lr_decay_iters)
-        wd_incr_steps = _get_samples_for_iterations(cfg.train.train_iters)
-        wsd_decay_steps = None
-        if args.lr_wsd_decay_iters is not None:
-            # The WSD anneal covers the last lr_wsd_decay_iters iterations of the decay.
-            wsd_decay_steps = lr_decay_steps - _get_samples_for_iterations(
-                args.lr_decay_iters - args.lr_wsd_decay_iters
-            )
-        if args.lr_warmup_fraction is not None:
-            lr_warmup_iters = args.lr_warmup_fraction * args.lr_decay_iters
-        else:
-            lr_warmup_iters = args.lr_warmup_iters
-        lr_warmup_steps = _get_samples_for_iterations(lr_warmup_iters)
-    # Iteration-based training.
-    elif cfg.train.train_iters:
-        if args.lr_decay_iters is None:
-            args.lr_decay_iters = cfg.train.train_iters
-        lr_decay_steps = args.lr_decay_iters * cfg.train.global_batch_size
-        wd_incr_steps = cfg.train.train_iters * cfg.train.global_batch_size
-        wsd_decay_steps = None
-        if args.lr_wsd_decay_iters is not None:
-            wsd_decay_steps = args.lr_wsd_decay_iters * cfg.train.global_batch_size
-        if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
-        else:
-            lr_warmup_steps = args.lr_warmup_iters * cfg.train.global_batch_size
-    # Sample-based training.
-    elif cfg.train.train_samples:
-        # We need to set training iters for later use. Technically
-        # we need to adjust the training samples too (due to last
-        # batch being incomplete) but we leave it as is for now.
-        update_train_iters(cfg.train)
-        if args.lr_decay_samples is None:
-            args.lr_decay_samples = cfg.train.train_samples
-        lr_decay_steps = args.lr_decay_samples
-        wd_incr_steps = cfg.train.train_samples
-        wsd_decay_steps = args.lr_wsd_decay_samples
-        if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
-        else:
-            lr_warmup_steps = args.lr_warmup_samples
-    else:
+    if cfg.train.train_iters is None and cfg.train.train_samples is None:
         raise Exception('either train-iters or train-samples should be provided.')
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
-        init_lr=args.lr_warmup_init,
+        init_lr=cfg.scheduler.lr_warmup_init,
         max_lr=args.lr,
         min_lr=args.min_lr,
-        lr_warmup_steps=lr_warmup_steps,
-        lr_decay_steps=lr_decay_steps,
-        lr_decay_style=args.lr_decay_style,
-        start_wd=args.start_weight_decay,
-        end_wd=args.end_weight_decay,
-        wd_incr_steps=wd_incr_steps,
-        wd_incr_style=args.weight_decay_incr_style,
-        use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=args.override_opt_param_scheduler,
-        wsd_decay_steps=wsd_decay_steps,
-        lr_wsd_decay_style=args.lr_wsd_decay_style,
+        lr_warmup_steps=cfg.scheduler.lr_warmup_steps,
+        lr_decay_steps=cfg.scheduler.lr_decay_steps,
+        lr_decay_style=cfg.scheduler.lr_decay_style,
+        start_wd=cfg.scheduler.start_weight_decay,
+        end_wd=cfg.scheduler.end_weight_decay,
+        wd_incr_steps=cfg.scheduler.wd_incr_steps,
+        wd_incr_style=cfg.scheduler.weight_decay_incr_style,
+        use_checkpoint_opt_param_scheduler=cfg.scheduler.use_checkpoint_opt_param_scheduler,
+        override_opt_param_scheduler=cfg.scheduler.override_opt_param_scheduler,
+        wsd_decay_steps=cfg.scheduler.wsd_decay_steps,
+        lr_wsd_decay_style=cfg.scheduler.lr_wsd_decay_style,
     )
 
     return opt_param_scheduler

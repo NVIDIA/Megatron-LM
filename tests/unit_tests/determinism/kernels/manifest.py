@@ -318,7 +318,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
         "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
-        "replayed through packed SelfAttention in test_runtime_cp_attention.py.",
+        "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
+        "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
     ),
     KernelEntry(
         name="kitchen_extension",
@@ -347,7 +348,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_moe_kernels.py",),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
-        "router gating GEMM, TE fused permutation/router kernels.",
+        "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
+        "histogram accumulation and bias updates.",
     ),
     KernelEntry(
         name="moe_router",
@@ -452,7 +454,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_mamba2_batch_invariant_decode",
-        sources=("megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",),
+        sources=(
+            "megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",
+            "megatron/core/ssm/ops/mamba2/batch_invariant_decode_rows.py",
+        ),
         tests=("tests/unit_tests/ssm/ops/mamba2/test_batch_invariant_decode.py",),
         kind="triton",
         training_path=False,
@@ -479,9 +484,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/gdp/chunk_o.py",
             "megatron/core/ssm/ops/gdp/common.py",
             "megatron/core/ssm/ops/gdp/cumsum.py",
-            "megatron/core/ssm/ops/gdp/decode_prepare.py",
             "megatron/core/ssm/ops/gdp/fused_recurrent.py",
             "megatron/core/ssm/ops/gdp/metadata.py",
+            "megatron/core/ssm/ops/gdp/prepare.py",
             "megatron/core/ssm/ops/gdp/scaled_dot_kkt.py",
             "megatron/core/ssm/ops/gdp/solve_tril.py",
             "megatron/core/ssm/ops/gdp/wy_fast.py",
@@ -490,9 +495,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_ssm_kernels.py",),
         kind="triton",
         notes="Gated Delta Product varlen chunk scan (drives cumsum/l2norm/kkt/solve_tril/wy_fast/chunk_h/chunk_o), "
-        "fused recurrent decode and decode-prepare kernels. The decode kernels are replayed both "
-        "for one token per request and for a speculative step of several draft tokens, where the "
-        "recurrence also writes per-draft-token state snapshots for rollback.",
+        "fused recurrent decode, and the decode- and prefill-prepare kernels. The decode kernels are "
+        "replayed both for one token per request and for a speculative step of several draft "
+        "tokens, where the recurrence also writes per-draft-token state snapshots for rollback; "
+        "prefill-prepare is replayed for a single token and for a full 4096-token step.",
     ),
     KernelEntry(
         name="gated_delta_net",
