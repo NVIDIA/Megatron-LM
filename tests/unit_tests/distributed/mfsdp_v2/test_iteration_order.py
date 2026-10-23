@@ -230,6 +230,45 @@ def test_static_recompute_and_manual_unshard_preserve_cursor(context):
     a._unshard_parameter_groups.assert_not_called()
 
 
+@pytest.mark.parametrize("deviation", ["repeated", "reordered", "phase", "exhausted"])
+def test_static_deviation_falls_back_to_demand(context, deviation):
+    """Construction order is advisory; explicit capture can replace the fallback."""
+    a, b, c = _Unit(context), _Unit(context), _Unit(context)
+    order = context.iteration_order
+    order.append((ref(a), "forward"))
+    order.append((ref(b), "forward"))
+    a.unshard("forward")
+    assert order.position == 1 and order.mode == "static"
+
+    if deviation == "exhausted":
+        b.unshard("forward")
+    module, phase = {
+        "repeated": (a, "forward"),
+        "reordered": (c, "forward"),
+        "phase": (b, "backward"),
+        "exhausted": (a, "forward"),
+    }[deviation]
+    position = order.position
+    for unit in (a, b, c):
+        unit._unshard_parameter_groups.reset_mock()
+    module.unshard(phase)
+    assert order.mode == "demand" and order.position == position
+    module._unshard_parameter_groups.assert_called_once_with()
+    for other in (a, b, c):
+        if other is not module:
+            other._unshard_parameter_groups.assert_not_called()
+    b.unshard("backward")
+    assert order.position == position
+
+    for _ in range(2):
+        with iteration(context):
+            a.unshard("forward")
+            a.unshard("forward")
+            b.unshard("backward")
+        assert context.iteration_order.mode == "record_replay"
+        assert context.iteration_order.captured
+
+
 @pytest.mark.parametrize("captured", [False, True], ids=["capturing", "replaying"])
 def test_manual_unshard_preserves_iteration_order(context, captured):
     """Parameter inspection must neither record demands nor consume the saved trace."""

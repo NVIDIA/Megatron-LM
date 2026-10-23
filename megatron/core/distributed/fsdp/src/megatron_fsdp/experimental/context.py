@@ -201,6 +201,20 @@ class FsdpContext:
                 order.append((ref(module), phase))
         elif phase not in ("forward", "backward"):
             return None
+        if order.mode == "static":
+            # Construction order is only a prediction: shared or conditional
+            # modules can execute differently. Keep gathering on demand until
+            # an explicit iteration scope records their actual call pattern.
+            if order.position < len(order):
+                expected, expected_phase = order[order.position]
+                owner = expected()
+                if owner is None:
+                    raise RuntimeError("A module in the FSDP execution order was destroyed.")
+                if owner is module and expected_phase == phase:
+                    order.advance()
+                    return order
+            order.mode = "demand"
+            return None
         expected, expected_phase = order.advance()
         if expected_phase != phase:
             raise RuntimeError("FSDP module phase diverged from the expected execution order.")
