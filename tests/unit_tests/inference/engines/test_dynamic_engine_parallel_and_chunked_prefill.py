@@ -1395,8 +1395,7 @@ CHUNKED_CG_MAX_SEQ_LEN = 2048
 class TestChunkedPrefillCudaGraphs:
     """Verify chunked prefill against an unchunked baseline, eagerly and under CUDA graphs.
 
-    Each test runs an unchunked baseline engine on the same model and compares a
-    chunked engine's output against it.
+    Each test runs an unchunked baseline engine and compares a chunked engine's output against it.
     """
 
     @classmethod
@@ -1618,14 +1617,26 @@ class TestChunkedPrefillCudaGraphs:
 
         clear_nvte_env_vars()
 
-        random.seed(123)
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
-        )
+        # One model per engine: CUDA-graph runners live on the model's layers,
+        # and a second graphed engine on the same model would be handed the first engine's runners.
+        # Reseeding before each build gives both models identical weights.
+        def build_model():
+            random.seed(123)
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(
+                seed=123,
+                inference_rng_tracker=True,
+                use_cudagraphable_rng=False,
+                force_reset_rng=True,
+            )
+            return self._create_model(model_provider, num_cuda_graphs=2, ssm_mixer=ssm_mixer)
 
-        # Create model with CUDA graph support so it can be used for both CG and non-CG engines.
-        model = self._create_model(model_provider, num_cuda_graphs=2, ssm_mixer=ssm_mixer)
+        baseline_model = build_model()
+        test_model = build_model()
+        for (name, p), (_, q) in zip(
+            baseline_model.named_parameters(), test_model.named_parameters()
+        ):
+            assert torch.equal(p, q), f"reseeded rebuild differs at {name}"
 
         # 3 prompts of 512 tokens each, disjoint token ranges (no prefix sharing).
         device = torch.cuda.current_device()
@@ -1640,7 +1651,7 @@ class TestChunkedPrefillCudaGraphs:
 
         # Baseline: no chunked prefill, same CG config (CG padding can flip fp32 near-tie argmax).
         baseline_engine = self._build_engine(
-            model,
+            baseline_model,
             enable_chunked_prefill=False,
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=None,
@@ -1651,7 +1662,7 @@ class TestChunkedPrefillCudaGraphs:
 
         # Test config.
         test_engine = self._build_engine(
-            model,
+            test_model,
             enable_chunked_prefill=chunked_prefill,
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=context_max_tokens,
