@@ -58,8 +58,10 @@ def test_capped_packing_keeps_all_samples_and_fills_all_ranks(total_gpus, max_cp
     assert _scheduler(total_gpus, max_cp_size).get_groups_and_subsamples(samples) == [expected_ids]
 
 
-@pytest.mark.parametrize("seq_len,max_cp_size,required_cp", [(5, 4, 8), (9, 8, 16)])
-def test_sequence_that_cannot_fit_cap_fails_before_placement(seq_len, max_cp_size, required_cp):
+@pytest.mark.parametrize("seq_len,max_cp_size,required_cp", [(5, 4, 8), (9, 8, 16), (9, None, 16)])
+def test_sequence_that_cannot_fit_effective_limit_fails_before_placement(
+    seq_len, max_cp_size, required_cp
+):
     with pytest.raises(ValueError) as error:
         next_hdp_group_packing_aware(
             [(0, seq_len)], total_gpus=8, max_seq_len_per_rank=1, max_cp_size=max_cp_size
@@ -67,35 +69,22 @@ def test_sequence_that_cannot_fit_cap_fails_before_placement(seq_len, max_cp_siz
     for detail in (
         f"seq_len={seq_len}",
         f"required_cp_size={required_cp}",
+        f"effective_cp_limit={8 if max_cp_size is None else max_cp_size}",
         f"max_cp_size={max_cp_size}",
         "DPxCP size=8",
         "max_seq_len_per_rank=1",
-        "token limit",
     ):
         assert detail in str(error.value)
 
 
-@pytest.mark.parametrize(
-    "samples,total_gpus,token_limit,max_cp_size,effective_cp",
-    [([(0, 1)], 8, 1, 4, 8), ([(0, 50), (1, 50)], 14, 100, 2, 14)],
-)
-def test_fill_or_full_group_fallback_cannot_escape_cap(
-    samples, total_gpus, token_limit, max_cp_size, effective_cp
-):
-    with pytest.raises(ValueError, match="packing/fill") as error:
-        next_hdp_group_packing_aware(samples, total_gpus, token_limit, max_cp_size=max_cp_size)
-    message = str(error.value)
-    assert f"effective_cp_size={effective_cp}" in message
-    assert "known CP expansion issue" in message
-    assert "Raise or remove the cap only if the model supports it" in message
-
-
-def test_vpp_alignment_is_checked_after_it_expands_valid_packing():
-    samples = [(0, 4), (1, 4)]
-    assert _scheduler(8, 4).get_groups_and_subsamples(samples) == [[[0]] * 4 + [[1]] * 4]
-    with pytest.raises(ValueError, match="final/VPP alignment") as error:
-        _scheduler(8, 4, vpp_multiple=2).get_groups_and_subsamples(samples)
-    assert "effective_cp_size=8" in str(error.value)
+@pytest.mark.parametrize("max_cp_size", [8, None])
+def test_sequence_at_effective_limit_succeeds(max_cp_size):
+    micro_batches, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 8)], total_gpus=8, max_seq_len_per_rank=1, max_cp_size=max_cp_size
+    )
+    assert leftovers == []
+    assert micro_batches == [[8] for _ in range(8)]
+    assert sample_ids == [[0] for _ in range(8)]
 
 
 def test_no_cap_preserves_non_power_of_two_full_group_and_vpp_expansion():

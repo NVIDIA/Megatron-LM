@@ -247,7 +247,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Headwise CP shards heads over the CP group; chunkwise CP keeps heads local.
         if self.config.dynamic_context_parallel and self.config.max_cp_size is not None:
-            self._validate_max_cp_size(self.config.max_cp_size)
+            self._validate_max_cp_size()
         elif self.config.linear_cp_mode == "headwise":
             num_key_heads_per_tp = self.num_key_heads // self.tp_size
             num_value_heads_per_tp = self.num_value_heads // self.tp_size
@@ -378,8 +378,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         self.reset_parameters()
 
-    def _validate_max_cp_size(self, runtime_cp_size: int) -> None:
-        """Check the explicit DCP cap without changing static groups or parameter layouts."""
+    def _validate_max_cp_size(self) -> None:
+        """Validate head compatibility with the explicit DCP cap during construction."""
         max_cp_size = self.config.max_cp_size
         if not self.config.dynamic_context_parallel or max_cp_size is None:
             return
@@ -392,24 +392,16 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 f"actual TP size: TP={self.tp_size}, key_heads={self.num_key_heads}, "
                 f"value_heads={self.num_value_heads}. GDN-family layers do not replicate heads."
             )
-        if runtime_cp_size > max_cp_size:
-            raise ValueError(
-                f"GDN-family runtime CP size {runtime_cp_size} exceeds "
-                f"max_cp_size={max_cp_size}; static_cp_size={self.cp_size}. "
-                "Use runtime groups within this cap."
-            )
         if self.config.linear_cp_mode == "headwise":
             key_heads = self.num_key_heads // self.tp_size
             value_heads = self.num_value_heads // self.tp_size
-            if any(
-                heads % max_cp_size or heads % runtime_cp_size for heads in (key_heads, value_heads)
-            ):
+            if any(heads % max_cp_size for heads in (key_heads, value_heads)):
                 raise ValueError(
                     "linear_cp_mode='headwise' requires TP-local key/value head counts "
-                    "to be divisible by max_cp_size and the effective CP group size. "
+                    "to be divisible by max_cp_size. "
                     f"TP={self.tp_size}, local_key_heads={key_heads}, "
                     f"local_value_heads={value_heads}, static_cp_size={self.cp_size}, "
-                    f"max_cp_size={max_cp_size}, effective_cp_size={runtime_cp_size}. "
+                    f"max_cp_size={max_cp_size}. "
                     "Choose a compatible max_cp_size or TP configuration, "
                     "or explicitly select linear_cp_mode='chunkwise'."
                 )

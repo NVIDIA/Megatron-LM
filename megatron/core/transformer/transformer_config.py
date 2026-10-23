@@ -2157,6 +2157,24 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_a2a_max_cp_size(
+        self, cp_comm_type: str | None, local_heads: tuple[int, int, int], tp_size: int
+    ) -> None:
+        """Validate a known layer's TP-local heads against the explicit DCP cap."""
+        if not self.dynamic_context_parallel or self.max_cp_size is None or cp_comm_type != "a2a":
+            return
+        if any(heads <= 0 or heads % self.max_cp_size for heads in local_heads):
+            raise ValueError(
+                "cp_comm_type='a2a' requires TP-local Q/K/V head counts to be positive "
+                "and divisible by max_cp_size. "
+                f"TP={tp_size}, local_q_heads={local_heads[0]}, "
+                f"local_k_heads={local_heads[1]}, local_v_heads={local_heads[2]}, "
+                f"static_cp_size={self.context_parallel_size}, max_cp_size={self.max_cp_size}. "
+                "DCP schedules groups up to max_cp_size, independently of static "
+                "context_parallel_size. Choose a compatible max_cp_size or TP configuration, "
+                "or explicitly select p2p."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -5628,6 +5646,28 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+
+        if (
+            self.dynamic_context_parallel
+            and self.max_cp_size is not None
+            and type(self) is TransformerConfig
+            and not self.is_hybrid_model
+            and not self.heterogeneous_block_specs
+            and not self.multi_latent_attention
+            and self.experimental_attention_variant is None
+        ):
+            # Only this standard layout is known here. Other layouts validate in their
+            # actual attention constructors, after resolving each layer and TP group.
+            cp_comm_types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            if "a2a" in cp_comm_types:
+                tp_size = self.tensor_model_parallel_size
+                local_q_heads = self.num_attention_heads // tp_size
+                local_kv_heads = max(1, self.num_query_groups // tp_size)
+                self._validate_a2a_max_cp_size(
+                    "a2a", (local_q_heads, local_kv_heads, local_kv_heads), tp_size
+                )
 
         assert (
             self.pipeline_model_parallel_size > 0

@@ -86,6 +86,137 @@ def test_dynamic_max_cp_size_cannot_be_less_than_minimum():
         )
 
 
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,tp,max_cp_size", [(32, 4, 2, 2), (8, None, 2, 4), (16, 1, 2, 1)]
+)
+def test_standard_a2a_config_accepts_tp_local_head_divisibility(q_heads, kv_heads, tp, max_cp_size):
+    config = _make_config(
+        dynamic_context_parallel=True,
+        context_parallel_size=8,
+        max_cp_size=max_cp_size,
+        cp_comm_type="a2a",
+        num_attention_heads=q_heads,
+        num_query_groups=kv_heads,
+        tensor_model_parallel_size=tp,
+    )
+    assert config.context_parallel_size == 8
+    assert config.max_cp_size == max_cp_size
+
+
+@pytest.mark.parametrize("q_heads,kv_heads,tp", [(6, 6, 1), (32, 4, 2), (32, 1, 2)])
+def test_standard_a2a_config_rejects_incompatible_local_heads(q_heads, kv_heads, tp):
+    with pytest.raises(ValueError, match="TP-local Q/K/V") as error:
+        _make_config(
+            dynamic_context_parallel=True,
+            max_cp_size=4,
+            cp_comm_type="a2a",
+            num_attention_heads=q_heads,
+            num_query_groups=kv_heads,
+            tensor_model_parallel_size=tp,
+        )
+    message = str(error.value)
+    for detail in (
+        f"TP={tp}",
+        f"local_q_heads={q_heads // tp}",
+        f"local_k_heads={max(1, kv_heads // tp)}",
+        f"local_v_heads={max(1, kv_heads // tp)}",
+        "static_cp_size=1",
+        "max_cp_size=4",
+        "independently of static",
+        "p2p",
+    ):
+        assert detail in message
+
+
+@pytest.mark.parametrize(
+    "comm_type,raises",
+    [
+        (["p2p", "a2a"], True),
+        (["a2a", "p2p"], True),
+        (None, False),
+        ("p2p", False),
+        ("all_gather", False),
+        ("a2a+p2p", False),
+        (["p2p", "a2a+p2p"], False),
+    ],
+)
+def test_standard_config_checks_only_pure_a2a_layers(comm_type, raises):
+    with pytest.raises(ValueError, match="TP-local Q/K/V") if raises else nullcontext():
+        _make_config(
+            dynamic_context_parallel=True,
+            max_cp_size=4,
+            num_attention_heads=32,
+            num_query_groups=4,
+            tensor_model_parallel_size=2,
+            cp_comm_type=comm_type,
+        )
+
+
+@pytest.mark.parametrize("dynamic,max_cp_size", [(False, 4), (True, None)])
+def test_standard_a2a_config_keeps_static_and_unset_behavior(dynamic, max_cp_size):
+    _make_config(
+        dynamic_context_parallel=dynamic,
+        context_parallel_size=8,
+        max_cp_size=max_cp_size,
+        num_attention_heads=32,
+        num_query_groups=4,
+        tensor_model_parallel_size=2,
+        cp_comm_type="a2a",
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(multi_latent_attention=True),
+        dict(is_hybrid_model=True),
+        dict(heterogeneous_block_specs=True),
+        dict(
+            experimental_attention_variant="gdn",
+            linear_cp_mode="chunkwise",
+            linear_attention_freq=[1, 0],
+            cp_comm_type=["a2a", "p2p"],
+        ),
+    ],
+)
+def test_a2a_config_defers_nonstandard_layers_to_actual_constructors(overrides):
+    kwargs = dict(
+        dynamic_context_parallel=True,
+        max_cp_size=4,
+        num_attention_heads=32,
+        num_query_groups=4,
+        tensor_model_parallel_size=2,
+        cp_comm_type="a2a",
+    )
+    kwargs.update(overrides)
+    assert _make_config(**kwargs).max_cp_size == 4
+
+
+def test_a2a_config_defers_subclasses_before_they_resolve_layer_layouts():
+    class CustomTransformerConfig(TransformerConfig):
+        pass
+
+    config = CustomTransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=32,
+        num_query_groups=4,
+        tensor_model_parallel_size=2,
+        max_seqlen_per_dp_cp_rank=128,
+        dynamic_context_parallel=True,
+        max_cp_size=4,
+        cp_comm_type="a2a",
+    )
+    assert config.max_cp_size == 4
+
+
+@pytest.mark.parametrize("local_heads", [(2, 4, 4), (4, 2, 4), (4, 4, 2), (0, 4, 4)])
+def test_a2a_max_validation_checks_each_actual_head_count(local_heads):
+    config = _make_config(dynamic_context_parallel=True, max_cp_size=4)
+    with pytest.raises(ValueError, match="positive and divisible by max_cp_size"):
+        config._validate_a2a_max_cp_size("a2a", local_heads, tp_size=2)
+
+
 @pytest.mark.parametrize("variant", ["gdn", "kda"])
 def test_headwise_dynamic_cp_checks_max_instead_of_static_cp(variant):
     config = _make_config(

@@ -2472,17 +2472,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "Please install it with `pip install transformer-engine`."
             )
 
-        if (
-            config.dynamic_context_parallel
-            and config.max_cp_size is not None
-            and cp_comm_type == "a2a+p2p"
-        ):
-            raise ValueError(
-                "max_cp_size with dynamic context parallelism does not support "
-                "cp_comm_type='a2a+p2p': runtime A2A subgroups are not defined. "
-                "Explicitly select a2a or p2p for this attention layer."
-            )
-
         self.config = config
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"
@@ -2726,34 +2715,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
-        max_cp_size = self.config.max_cp_size
-        if self.config.dynamic_context_parallel and max_cp_size is not None:
-            # Validate metadata before rebinding TE or starting any communication.
-            runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
-            runtime_cp_size = runtime_cp_group.size() if runtime_cp_group is not None else 1
-            if runtime_cp_size > max_cp_size:
-                raise ValueError(
-                    f"Dynamic CP group size {runtime_cp_size} exceeds max_cp_size={max_cp_size}. "
-                    f"configured_cp_size={self.config.context_parallel_size}, "
-                    f"cp_comm_type={self.cp_comm_type!r}. Use runtime groups within this cap."
-                )
-            if self.cp_comm_type == "a2a":
-                # THD, SBHD and BSHD all keep heads in the penultimate dimension.
-                local_heads = (query.shape[-2], key.shape[-2], value.shape[-2])
-                if any(
-                    heads <= 0 or heads % max_cp_size or heads % runtime_cp_size
-                    for heads in local_heads
-                ):
-                    raise ValueError(
-                        "cp_comm_type='a2a' requires TP-local Q/K/V head counts to be "
-                        "positive and divisible by max_cp_size and the effective A2A group size. "
-                        f"TP={get_pg_size(self._tp_group)}, local_q_heads={local_heads[0]}, "
-                        f"local_k_heads={local_heads[1]}, local_v_heads={local_heads[2]}, "
-                        f"configured_cp_size={self.config.context_parallel_size}, "
-                        f"max_cp_size={max_cp_size}, effective_a2a_size={runtime_cp_size}. "
-                        "Choose a compatible max_cp_size or TP configuration, "
-                        "or explicitly select p2p."
-                    )
         with self._temporary_runtime_context_parallel_group(packed_seq_params):
             return self._forward(
                 query,

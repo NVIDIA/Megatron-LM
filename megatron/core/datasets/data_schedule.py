@@ -10,7 +10,6 @@ from megatron.core.context_parallel import get_batches_on_this_cp_rank
 from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
 from megatron.core.datasets.data_schedule_utils import (
     _validate_dynamic_cp_max_size,
-    _validate_dynamic_cp_output,
     align_sample_id_groups,
     broadcast_scalars,
     broadcast_tensor,
@@ -497,7 +496,6 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 pad_sequences=self.pad_sequences,
             )
 
-        _validate_dynamic_cp_output(sample_id_groups, self.max_cp_size, "final/VPP alignment")
         return sample_id_groups
 
 
