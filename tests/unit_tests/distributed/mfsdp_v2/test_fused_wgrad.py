@@ -7,6 +7,9 @@ TE modules built with ``fuse_wgrad_accumulation=True`` write their weight gradie
 ``test_memory.py`` and the buffer dtype in ``test_grad_comm_dtype.py``.
 """
 
+import gc
+import weakref
+
 import pytest
 import torch
 import transformer_engine.pytorch as te
@@ -17,12 +20,16 @@ from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
+)
 
 
 def _default_placements() -> Placements:
@@ -371,3 +378,174 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
         assert layer.phase is FsdpModule.Phase.RESTING
         layer.context.finish_grad_sync()
     torch.testing.assert_close(fused.weight.grad.full_tensor(), copied.weight.grad.full_tensor())
+
+
+# About 0.1 s on an H200: long enough for compute that does not wait to finish first.
+_DELAY_CYCLES = 1 << 28
+
+
+def _delay_reduce_scatter_stream(context):
+    """Return a backward pre-hook that stalls the reduce-scatter stream."""
+
+    def hook(_module, _grad_output):
+        with torch.cuda.stream(context.reduce_scatter_stream):
+            torch.cuda._sleep(_DELAY_CYCLES)
+
+    return hook
+
+
+def _fused_linear_stack(
+    distributed_setup,
+    *,
+    fuse=True,
+    delay_wgrad_compute=False,
+    schedule_policy=SchedulePolicy(),
+    unify_communication_stream=False,
+    caller_managed_grad_sync=False,
+):
+    """Shard three TE Linears, then their parameterless nn.Sequential root, in one context.
+
+    The root is first in backward order and owns no weights, so it allocates the last layer's
+    buffer and its own post-backward only runs after every layer.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234)
+    model = nn.Sequential(
+        *(
+            te.Linear(
+                16,
+                16,
+                bias=not delay_wgrad_compute,
+                device=device,
+                delay_wgrad_compute=delay_wgrad_compute,
+                fuse_wgrad_accumulation=fuse,
+            )
+            for _ in range(3)
+        )
+    )
+    with fully_shard_context(
+        device=device,
+        unify_communication_stream=unify_communication_stream,
+        caller_managed_grad_sync=caller_managed_grad_sync,
+    ) as context:
+        for layer in model:
+            fully_shard(
+                layer, mesh=mesh, placements=_default_placements(), schedule_policy=schedule_policy
+            )
+        fully_shard(
+            model, mesh=mesh, placements=_default_placements(), schedule_policy=schedule_policy
+        )
+    return model, context
+
+
+@pytest.mark.parametrize(
+    "backward_prefetch_size", [None, 0, 1 << 30], ids=["default", "disabled", "unbounded"]
+)
+def test_fused_wgrad_buffer_is_allocated_by_the_previous_module(
+    distributed_setup, backward_prefetch_size
+):
+    """Each backward allocates the next module's fused buffer and no further one.
+
+    The parameterless root allocates the last layer's buffer, and each layer allocates its
+    predecessor's whatever the all-gather prefetch budget, so at most two are alive.
+    """
+    model, _context = _fused_linear_stack(
+        distributed_setup,
+        schedule_policy=SchedulePolicy(backward_prefetch_size=backward_prefetch_size),
+    )
+
+    def allocated() -> list[int]:
+        return [
+            index
+            for index, layer in enumerate(model)
+            if any(group._fused_grad_buffer is not None for group in layer.parameter_groups)
+        ]
+
+    # Registered after fully_shard(), so these run after MFSDP's own backward pre-hooks.
+    seen = {}
+    for index, layer in enumerate(model):
+        layer.register_full_backward_pre_hook(
+            lambda _module, _grad_output, index=index: seen.update({index: allocated()})
+        )
+    x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
+    model(x).square().mean().backward()
+
+    assert seen == {2: [1, 2], 1: [0, 1], 0: [0]}
+    assert allocated() == []
+
+
+def test_fused_wgrad_buffer_is_freed_after_its_reduce_scatter(distributed_setup, monkeypatch):
+    """Like partial_grad, a fused buffer is dropped once its reduce-scatter is launched."""
+    model, _context = _fused_linear_stack(distributed_setup)
+    taken = []
+    original = FsdpParameterGroup.take_fused_grad_buffer
+
+    def spy(self):
+        buffer = original(self)
+        taken.append(weakref.ref(buffer))
+        return buffer
+
+    monkeypatch.setattr(FsdpParameterGroup, "take_fused_grad_buffer", spy)
+    alive_when_first_layer_starts = []
+
+    def record_alive(_module, _grad_output):
+        gc.collect()
+        alive_when_first_layer_starts.append(sum(ref() is not None for ref in taken))
+
+    model[0].register_full_backward_pre_hook(record_alive)
+    x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
+    model(x).square().mean().backward()
+
+    # The last two layers have reduced their buffers before the first layer's backward starts.
+    assert alive_when_first_layer_starts == [0]
+    assert len(taken) == 3
+
+
+@pytest.mark.parametrize(
+    "unify_communication_stream", [False, True], ids=["separate_streams", "unified_stream"]
+)
+def test_fused_wgrad_waits_for_its_buffer_to_be_zeroed(
+    distributed_setup, unify_communication_stream
+):
+    """TE writes a fused wgrad only after its buffer is zeroed on the reduce-scatter stream.
+
+    The parameterless root allocates the last layer's buffer, and no post-backward runs between
+    that allocation and the last layer's backward, so only the wait at the start of that
+    backward orders the zeroing first. Stalling the reduce-scatter stream exposes a missing wait.
+    """
+    grads = {}
+    for fuse in (False, True):
+        model, context = _fused_linear_stack(
+            distributed_setup, fuse=fuse, unify_communication_stream=unify_communication_stream
+        )
+        # prepend=True: stall before MFSDP's pre-hook allocates the last layer's buffer.
+        model.register_full_backward_pre_hook(_delay_reduce_scatter_stream(context), prepend=True)
+        torch.manual_seed(5678)
+        x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
+        model(x).square().mean().backward()
+        grads[fuse] = [parameter.grad.to_local().clone() for parameter in model.parameters()]
+
+    for fused_grad, copied_grad in zip(grads[True], grads[False]):
+        torch.testing.assert_close(fused_grad, copied_grad, rtol=1e-5, atol=1e-5)
+
+
+def test_fused_wgrad_delayed_weight_gradients_in_any_order(distributed_setup):
+    """Delayed fused wgrads computed in the caller's order still wait for their zeroed buffer."""
+    grads = {}
+    for fuse in (False, True):
+        model, context = _fused_linear_stack(
+            distributed_setup, fuse=fuse, delay_wgrad_compute=True, caller_managed_grad_sync=True
+        )
+        model.register_full_backward_pre_hook(_delay_reduce_scatter_stream(context), prepend=True)
+        torch.manual_seed(5678)
+        x = torch.randn(4, 16, device=distributed_setup.device, requires_grad=True)
+        model(x).square().mean().backward()
+        # Forward order, the reverse of backward order.
+        for layer in model:
+            layer.backward_dw()
+        context.finish_grad_sync()
+        grads[fuse] = [layer.weight.grad.to_local().clone() for layer in model]
+
+    for fused_grad, copied_grad in zip(grads[True], grads[False]):
+        torch.testing.assert_close(fused_grad, copied_grad, rtol=1e-5, atol=1e-5)
