@@ -35,6 +35,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
 
     print_rank_0('building BERT model ...')
 
+    cfg = get_run_config()
     args = get_args()
     if config is None:
         config = core_transformer_config_from_args(args)
@@ -51,7 +52,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     model = BertModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         num_tokentypes=num_tokentypes,
         add_binary_head=args.bert_binary_head,

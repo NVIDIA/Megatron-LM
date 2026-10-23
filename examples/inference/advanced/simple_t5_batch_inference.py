@@ -119,7 +119,7 @@ def main():
     args = get_args()
     tokenizer = get_tokenizer()
 
-    inference_engine = get_inference_engine(args, model)
+    inference_engine = get_inference_engine(args, model, tokenizer)
 
     sampling_params = SamplingParams(
         temperature=args.temperature,

@@ -91,6 +91,7 @@ def model_provider(
     """
 
     args = get_args()
+    cfg = get_run_config()
     
     if config is None:
         config = core_transformer_config_from_args(args)
@@ -123,7 +124,7 @@ def model_provider(
         encoder_config=encoder_config,
         transformer_encoder_layer_spec=en_block_spec,
         transformer_decoder_layer_spec=de_block_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,

@@ -747,7 +747,27 @@ class TokenizerConfig:
         "TikTokenizer",
         "NullTokenizer",
         "SFTTokenizer",
-    ] = None
+        ] = field(
+                default=None,
+                metadata={
+                    "argparse_meta": {
+                        "choices": [
+                            "BertWordPieceLowerCase",
+                            "BertWordPieceCase",
+                            "GPT2BPETokenizer",
+                            "SentencePieceTokenizer",
+                            "GPTSentencePieceTokenizer",
+                            "HuggingFaceTokenizer",
+                            "Llama2Tokenizer",
+                            "TikTokenizer",
+                            "MultimodalTokenizer",
+                            "NullTokenizer",
+                            "NullMultimodalTokenizer",
+                            "SFTTokenizer",
+                        ]
+                    }
+                }
+            )
     """What type of tokenizer to use."""
 
     tokenizer_model: str = None
@@ -818,3 +838,6 @@ class MultiModalTokenizerConfig(TokenizerConfig):
 
     force_system_message: bool = False
     """Force a specific system message."""
+
+    tokenizer_keep_history_thinking: bool = False
+    """Preserve thinking traces in conversation history."""
