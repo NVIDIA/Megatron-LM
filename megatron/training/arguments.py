@@ -1842,6 +1842,10 @@ def validate_args(args, defaults={}):
         load_optim=not args.no_load_optim,
         save_interval=args.save_interval,
         exit_interval=args.exit_interval,
+        separate_inference_model=rl_cfg.uses_separate_inference_model(
+            context_parallel_size=args.context_parallel_size,
+            inference_shards=args.inference_shards,
+        ),
     )
 
     # Optimizer CPU offload check

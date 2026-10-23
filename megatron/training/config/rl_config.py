@@ -281,6 +281,22 @@ class RLConfig:
         if self.requires_grad_buffer_offload:
             ddp_config.grad_buffer_offload = True
 
+    def uses_separate_inference_model(
+        self, *, context_parallel_size: int, inference_shards: str | None
+    ) -> bool:
+        """Whether rollouts run on their own copy of the model: disaggregated shards, any
+        --rl-inference-* parallelism override, or CP>1 (RL inference does not support CP)."""
+        from megatron.core.inference.shards_spec import spec_declares_disaggregation
+
+        return (
+            spec_declares_disaggregation(inference_shards)
+            or self.rl_inference_tensor_model_parallel_size is not None
+            or self.rl_inference_pipeline_model_parallel_size is not None
+            or self.rl_inference_expert_model_parallel_size is not None
+            or self.rl_inference_expert_tensor_model_parallel_size is not None
+            or context_parallel_size > 1
+        )
+
     def validate_run(
         self,
         *,
@@ -291,8 +307,13 @@ class RLConfig:
         load_optim: bool,
         save_interval: int | None,
         exit_interval: int | None,
+        separate_inference_model: bool | None,
     ) -> None:
-        """Check this section against the rest of the run it belongs to."""
+        """Check this section against the rest of the run it belongs to.
+
+        separate_inference_model: `uses_separate_inference_model` for the run's deployment; None
+            when the caller does not see the inference shards, which skips that rule.
+        """
         if not self.perform_rl_step:
             return
 
@@ -335,4 +356,12 @@ class RLConfig:
             raise ValueError(
                 "--no-load-optim with --skip-train --perform-rl-step skips the optimizer; "
                 "--rl-offload-optimizer-during-inference is incompatible (no optimizer to offload)."
+            )
+
+        # Offloading inference weights that are the training weights would be a no-op.
+        if separate_inference_model is False and self.rl_offload_inference_model_weights:
+            raise ValueError(
+                "--rl-offload-inference-model-weights requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with "
+                "the training model."
             )

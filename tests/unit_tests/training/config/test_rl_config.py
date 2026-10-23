@@ -182,6 +182,7 @@ RUN = dict(
     load_optim=True,
     save_interval=None,
     exit_interval=None,
+    separate_inference_model=False,
 )
 
 
@@ -203,6 +204,13 @@ RUN = dict(
             dict(global_batch_size=None, skip_train=True, load_optim=False),
             "no optimizer to offload",
         ),
+        (
+            dict(
+                rl_offload_inference_model_weights=True, rl_inference_model_unified_memory_level=1
+            ),
+            dict(),
+            "requires a separate inference model",
+        ),
     ],
 )
 def test_validate_run_rejects_runs_inconsistent_with_the_section(rl_kwargs, run_overrides, match):
@@ -210,6 +218,31 @@ def test_validate_run_rejects_runs_inconsistent_with_the_section(rl_kwargs, run_
     cfg = RLConfig(perform_rl_step=True, **GRPO_4x3, **rl_kwargs)
     with pytest.raises(ValueError, match=match):
         cfg.validate_run(**{**RUN, **run_overrides})
+
+
+@pytest.mark.parametrize(
+    "rl_kwargs, context_parallel_size, inference_shards, separate",
+    [
+        (dict(), 1, None, False),
+        # Shards without roles do not by themselves build a separate model.
+        (dict(), 1, "tp=1+tp=1", False),
+        (dict(), 1, "tp=1,role=prefill+tp=1,role=decode", True),
+        (dict(), 2, None, True),
+        (dict(rl_inference_tensor_model_parallel_size=2), 1, None, True),
+        (dict(rl_inference_pipeline_model_parallel_size=2), 1, None, True),
+        (dict(rl_inference_expert_model_parallel_size=2), 1, None, True),
+        (dict(rl_inference_expert_tensor_model_parallel_size=2), 1, None, True),
+    ],
+)
+def test_uses_separate_inference_model(
+    rl_kwargs, context_parallel_size, inference_shards, separate
+):
+    assert (
+        RLConfig(**rl_kwargs).uses_separate_inference_model(
+            context_parallel_size=context_parallel_size, inference_shards=inference_shards
+        )
+        is separate
+    )
 
 
 def test_validate_run_at_every_call_site():
@@ -230,6 +263,16 @@ def test_validate_run_at_every_call_site():
     cfg.validate_run(**{**RUN, "save_interval": 4, "exit_interval": 2})
     cfg.validate_run(**{**RUN, "cuda_graph_impl": None})
     RLConfig(rl_use_sequence_packing=True).validate_run(**{**RUN, "micro_batch_size": 4})
+    # The weight-offload rule needs the deployment: it passes with a separate model and is skipped
+    # when the caller cannot see the inference shards.
+    offload_weights = RLConfig(
+        perform_rl_step=True,
+        rl_offload_inference_model_weights=True,
+        rl_inference_model_unified_memory_level=1,
+        **GRPO_4x3,
+    )
+    offload_weights.validate_run(**{**RUN, "separate_inference_model": True})
+    offload_weights.validate_run(**{**RUN, "separate_inference_model": None})
 
     cfg.validate_run(**{**RUN, "global_batch_size": None})
 
@@ -287,6 +330,10 @@ def test_validate_run_at_every_call_site():
         explicit_layout_container.validate()
     container(model=TopologyOnlyModelConfig(), rl_training_cuda_graphs=True).validate()
     container(model=TopologyOnlyModelConfig(), rl=RLConfig()).validate()
+    # The container has no inference section, so it leaves the weight-offload rule to validate_args.
+    container(
+        rl_offload_inference_model_weights=True, rl_inference_model_unified_memory_level=1
+    ).validate()
     with pytest.raises(ValueError, match="no CUDA graphs"):
         container(model=TransformerModelConfig(), rl_training_cuda_graphs=True).validate()
     with pytest.raises(ValueError, match="must be 1"):
@@ -301,6 +348,20 @@ def test_validate_run_at_every_call_site():
         "--grpo-group-size 2 --rl-use-sequence-packing"
     ).split()
     with patch("sys.argv", argv), pytest.raises(ValueError, match="must be 1"):
+        validate_args(parse_args())
+    argv = (
+        "test_rl_config.py --num-layers 2 --hidden-size 128 --num-attention-heads 8 "
+        f"--micro-batch-size 1 --global-batch-size {2 * dp} --seq-length 32 "
+        f"--max-position-embeddings 32 --perform-rl-step --grpo-prompts-per-step {dp} "
+        "--grpo-group-size 2 --rl-offload-inference-model-weights "
+        "--rl-inference-model-unified-memory-level 1"
+    ).split()
+    with (
+        patch("sys.argv", argv),
+        pytest.raises(ValueError, match="requires a separate inference model"),
+    ):
+        validate_args(parse_args())
+    with patch("sys.argv", argv + ["--rl-inference-tensor-model-parallel-size", "1"]):
         validate_args(parse_args())
 
 

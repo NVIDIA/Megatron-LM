@@ -88,6 +88,7 @@ class CallbackContext:
         elapsed_time_per_iteration: Seconds per iteration over the log interval. In on_log.
         throughput: TFLOP/s per GPU over the log interval, or None when not logged. In on_log.
         durable_iteration: Iteration of the durable checkpoint. In on_checkpoint_saved.
+        checkpointing_context: The loop's checkpointing context. From on_setup_start onwards.
     """
 
     model: list[MegatronModule] | None
@@ -108,6 +109,7 @@ class CallbackContext:
     elapsed_time_per_iteration: float | None = None
     throughput: float | None = None
     durable_iteration: int | None = None
+    checkpointing_context: dict | None = None
 
 
 class Callback:
