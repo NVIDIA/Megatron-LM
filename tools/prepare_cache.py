@@ -8,13 +8,16 @@ Unsupported configurations:
 
 import argparse
 import json
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.training import get_train_valid_test_num_samples
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import set_args, unset_global_variables
 from megatron.training.training import update_train_iters
@@ -41,6 +44,15 @@ def add_prepare_cache_args(parser: argparse.ArgumentParser) -> argparse.Argument
             "dataset sample counts during cache preparation."
         ),
     )
+    group.add_argument(
+        "--prepare-cache-start-iteration",
+        type=int,
+        default=None,
+        help=(
+            "Optional current training iteration used to select the phase when "
+            "--phase-transition-iterations is set."
+        ),
+    )
     return parser
 
 
@@ -55,11 +67,34 @@ def _normalize_prepare_cache_args(args: Any) -> None:
     """Apply cache-preparation specific argument normalization."""
 
     args.rank = 0
+    args.iteration = getattr(args, "iteration", 0)
+
+    if args.seq_length is None and getattr(args, "encoder_seq_length", None) is None:
+        raise ValueError("--seq-length must be provided for cache preparation")
 
     if args.prepare_cache_world_size is not None:
         if args.prepare_cache_world_size <= 0:
             raise ValueError("--prepare-cache-world-size must be positive")
         args.world_size = args.prepare_cache_world_size
+
+    prepare_cache_start_iteration = getattr(args, "prepare_cache_start_iteration", None)
+    if prepare_cache_start_iteration is not None:
+        if prepare_cache_start_iteration < 0:
+            raise ValueError("--prepare-cache-start-iteration must be non-negative")
+        args.iteration = prepare_cache_start_iteration
+
+    # Offline cache construction does not use model execution parameters, but the shared
+    # training argument validator requires them. Fill minimal values when omitted.
+    if args.micro_batch_size is None:
+        args.micro_batch_size = 1
+    if args.num_layers is None and args.encoder_num_layers is None:
+        args.num_layers = 1
+    if args.hidden_size is None:
+        args.hidden_size = 1
+    if args.num_attention_heads is None:
+        args.num_attention_heads = 1
+    if args.max_position_embeddings is None:
+        args.max_position_embeddings = args.seq_length or args.encoder_seq_length
 
 
 def _validate_prepare_cache_args(args: Any) -> None:
@@ -87,6 +122,59 @@ def _disable_cache_load_only_flags(args: Any) -> Dict[str, bool]:
     args.dataloader_fast_cache_load = False
     args.dataloader_defer_npy_index_mmap = False
     return ignored
+
+
+def _get_prepare_cache_num_samples(args: Any) -> Tuple[Any, Any, Any]:
+    """Return train/validation/test sample targets for offline cache construction."""
+
+    if args.train_samples:
+        train_samples = args.train_samples
+    else:
+        train_samples = args.train_iters * args.global_batch_size
+
+    eval_global_batch_size = getattr(args, "eval_global_batch_size", args.global_batch_size)
+    eval_iters = args.eval_iters or 0
+
+    if args.full_validation:
+        eval_samples = None
+    else:
+        if args.skip_train:
+            validation_eval_iters = eval_iters
+        elif args.eval_interval is None or eval_iters == 0:
+            validation_eval_iters = 0
+        else:
+            assert args.train_iters is not None
+            total_eval_points = args.train_iters // args.eval_interval + 1
+            if args.start_eval_at_iter is not None:
+                skipped_eval_points = args.start_eval_at_iter // args.eval_interval
+                total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            validation_eval_iters = total_eval_points * eval_iters
+        eval_samples = validation_eval_iters * eval_global_batch_size
+
+    test_samples = eval_iters * eval_global_batch_size
+
+    if args.phase_transition_iterations:
+        total_train_samples = (
+            args.train_samples if args.train_samples is not None else train_samples
+        )
+        phase_transition_samples = [
+            0,
+            *[
+                iteration * args.global_batch_size
+                for iteration in args.phase_transition_iterations
+            ],
+            total_train_samples,
+        ]
+        current_sample = args.iteration * args.global_batch_size
+        last_transition_sample = max(
+            sample for sample in phase_transition_samples if sample <= current_sample
+        )
+        next_transition_sample = min(
+            sample for sample in phase_transition_samples if sample > current_sample
+        )
+        train_samples = next_transition_sample - last_transition_sample
+
+    return train_samples, eval_samples, test_samples
 
 
 def _get_dataset_length(dataset: Optional[Any]) -> Optional[Any]:
@@ -169,7 +257,7 @@ def build_dataset_caches(args: Any) -> Dict[str, Any]:
     try:
         # Derive train_iters from --train-samples when needed (pretrain() does the same).
         update_train_iters(args)
-        train_valid_test_num_samples = get_train_valid_test_num_samples()
+        train_valid_test_num_samples = _get_prepare_cache_num_samples(args)
         _print_effective_configuration(args, train_valid_test_num_samples, ignored_flags)
 
         compile_helpers()
