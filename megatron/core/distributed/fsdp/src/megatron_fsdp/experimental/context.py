@@ -39,7 +39,7 @@ class FsdpContext:
     # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
-    unify_communication_stream: bool
+    overlap_allgather_reduction: bool
     caller_managed_grad_sync: bool
     """Leave gradient synchronization to the caller instead of an autograd callback.
 
@@ -64,7 +64,7 @@ class FsdpContext:
         self,
         device: torch.device | None = None,
         use_symmetric_memory: bool = False,
-        unify_communication_stream: bool = False,
+        overlap_allgather_reduction: bool = True,
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
         caller_managed_grad_sync: bool = False,
         overlap_outer_communication: bool = False,
@@ -76,8 +76,8 @@ class FsdpContext:
                 the current CUDA device.
             use_symmetric_memory: Whether modules constructed in this context allocate
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
-            unify_communication_stream: Whether all-gathers and reduce-scatters share one
-                communication stream to reduce peak transient memory. See
+            overlap_allgather_reduction: Whether all-gathers and reductions use separate
+                communication streams. Disable to reduce peak transient memory. See
                 https://github.com/NVIDIA/Megatron-LM/issues/6471.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
@@ -89,14 +89,9 @@ class FsdpContext:
                 call ``finish_grad_sync()`` after all backward work and before reading or
                 modifying gradients.
             overlap_outer_communication: Run the last-microbatch DP-outer reduction
-                on a separate stream to overlap inner-DP reductions. Mutually exclusive
-                with unify_communication_stream.
+                on a separate stream to overlap inner-DP communication, independently
+                of overlap_allgather_reduction.
         """
-        if unify_communication_stream and overlap_outer_communication:
-            raise ValueError(
-                "overlap_outer_communication needs a separate DP-outer stream and is "
-                "incompatible with unify_communication_stream."
-            )
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
@@ -106,7 +101,7 @@ class FsdpContext:
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
-        self.unify_communication_stream = unify_communication_stream
+        self.overlap_allgather_reduction = overlap_allgather_reduction
         self.overlap_outer_communication = overlap_outer_communication
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
@@ -123,7 +118,7 @@ class FsdpContext:
         self._is_finalized = False
         self._context_token: Token[FsdpContext | None] | None = None
         self.allgather_stream = torch.cuda.Stream(device)
-        if unify_communication_stream:
+        if not overlap_allgather_reduction:
             # A unified stream lets an all-gather reuse the storage released by a
             # preceding reduce-scatter.
             self.inner_reduction_stream = self.allgather_stream
