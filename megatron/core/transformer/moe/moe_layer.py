@@ -12,6 +12,7 @@ from megatron.core import utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
+from megatron.core.inference.moe.flashinfer_nvfp4 import require_flashinfer_routed_nvfp4
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
@@ -446,14 +447,18 @@ class MoELayer(BaseMoELayer):
                 fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
                 if config.fp8 and fp8_recipe == "mxfp8":
                     require_flashinfer_routed_mxfp8()
+                if config.inference_moe_nvfp4_recipe is not None:
+                    # Per-token NVFP4 runs CuTe DSL JIT kernels, not the pre-compiled
+                    # CUTLASS kernels shipped in flashinfer-jit-cache.
+                    require_flashinfer_routed_nvfp4()
+                else:
+                    # Verify that pre-compiled FlashInfer CUTLASS kernels are available
+                    # when using the FlashInfer backend. The flashinfer-jit-cache package
+                    # must be installed ahead of time to avoid a multi-minute JIT
+                    # compilation step at runtime.
+                    from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
-                # Verify that pre-compiled FlashInfer CUTLASS kernels are available
-                # when using the FlashInfer backend. The flashinfer-jit-cache package
-                # must be installed ahead of time to avoid a multi-minute JIT
-                # compilation step at runtime.
-                from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
-
-                check_flashinfer_jit_cache_installed()
+                    check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'

@@ -297,6 +297,7 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 | **seq_aux_loss** | Sequence-level auxiliary loss for balancing expert usage on each sequence| `--moe-router-load-balancing-type seq_aux_loss` |
 | **global_aux_loss** | Global auxiliary loss for balancing expert usage on a global batch across all ranks | `--moe-router-load-balancing-type global_aux_loss` |
 | **sinkhorn** | Optimal transport formulation for balancing expert usage | `--moe-router-load-balancing-type sinkhorn` |
+| **quantile_balancing** | Exact micro-batch or Kimi K3 global-batch histogram quantile bias updates | `--moe-router-load-balancing-type quantile_balancing --moe-router-score-function sigmoid --moe-aux-loss-coeff 0` |
 | **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
 | **none** | No load balancing | `--moe-router-load-balancing-type none` |
 
@@ -525,6 +526,8 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe
 
 > **Requirements for EP A2A Overlap**: `expert_model_parallel_size > 1`, CUDA_DEVICE_MAX_CONNECTIONS > 1.
 
+> **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment, so `--recompute-method` and `--recompute-num-layers` carry exactly the same meaning as without `--overlap-moe-expert-parallel-comm`. Both flags are required. This overlap recompute path requires `--cuda-graph-impl none`; CUDA Graph execution, including `full_iteration`, is not supported.
+
 ### Compute Optimization
 
 Fine-grained MoE produces many small operations that can underutilize GPU resources. These optimizations reduce kernel launch overhead and improve GPU utilization.
@@ -722,7 +725,9 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Router Arguments
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-router-load-balancing-type | Load balancing: aux_loss, sinkhorn, seq_aux_loss, none | aux_loss |
+| --moe-router-load-balancing-type | Load balancing: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, quantile_balancing, none | aux_loss |
+| --moe-router-quantile-balancing-estimation-scope | Quantile population: micro_batch or global_batch | micro_batch |
+| --moe-router-qb-num-bins | Uniform histogram bins per expert for global-batch quantile balancing | 1000 |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |
 | --moe-router-pre-softmax | Softmax before top-k | False |

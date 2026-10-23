@@ -314,6 +314,56 @@ def test_decode_ssm_flattens_non_contiguous_output(num_speculative_tokens):
     assert torch.equal(output, projected[..., :2])
 
 
+def test_decode_ssm_zeroes_padding_rows_on_cuda_graph_replay():
+    """With quantization scales on, padding rows are zeroed by the replay-time token count.
+
+    The graph is captured with every row real, as dummy requests fill the graph during
+    capture, so the captured `padding_slice` is empty.
+    """
+    num_requests = 8
+    original = torch.arange(1, num_requests * 4 + 1, dtype=torch.float32, device="cuda").reshape(
+        num_requests, 1, 4
+    )
+    projected = original.clone()
+    mixer = _FakeSSM(projected)
+    # Turns on the zeroing; the fake runs no quantized kernel.
+    mixer.config = types.SimpleNamespace(fp8="hybrid", fp4=False)
+
+    counts = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    counts.gpu_view = types.SimpleNamespace(
+        real_token_count=torch.tensor([num_requests], dtype=torch.int32, device="cuda")
+    )
+    context = types.SimpleNamespace(
+        batch_invariant_mode=False,
+        mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
+        num_speculative_tokens=0,
+        padded_batch_dimensions=InferenceBatchDimensions(
+            token_count=num_requests, prefill_req_count=0, decode_req_count=num_requests
+        ),
+        mamba_metadata=types.SimpleNamespace(
+            batch_indices_decode=torch.arange(num_requests, dtype=torch.int32, device="cuda")
+        ),
+        padding_slice=slice(num_requests, num_requests),
+        zero_padding_tokens=counts.zero_padding_tokens,
+    )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mixer.ssm_dynamic_inference(torch.empty(0), context)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, _ = mixer.ssm_dynamic_inference(torch.empty(0), context)
+
+    for real_token_count in (5, num_requests, 0):
+        projected.copy_(original)
+        counts.gpu_view.real_token_count.fill_(real_token_count)
+        graph.replay()
+        assert torch.equal(output[:real_token_count], original[:real_token_count, :, :2])
+        assert torch.all(output[real_token_count:] == 0)
+
+
 class TestGDPDynamicInference:
     """Static/dynamic GDP inference equivalence against a full-sequence forward.
 
