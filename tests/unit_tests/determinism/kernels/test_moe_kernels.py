@@ -9,7 +9,8 @@ the router gating GEMM, and virtual-expert planning against a CPU oracle in eage
 graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available).
+``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
+``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
 """
 
 import pytest
@@ -661,6 +662,56 @@ def test_topk_routing_replays(case, fused, det_algos):
         )
 
 
+@pytest.mark.parametrize("det_algos", [True, False])
+def test_quantile_balancing_histogram_and_bias_replay(det_algos):
+    """Replay accumulated integer histograms, routing gradients, and the batch update."""
+    seeded()
+    num_tokens, num_experts, num_bins = 8192, 64, 128
+    logits = torch.randn(num_tokens, num_experts, device="cuda", requires_grad=True)
+    bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
+    bounds = torch.tensor([-1.0, 1.0], device="cuda")
+    histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+
+    def fn(logits, histogram):
+        # The harness clones the caller-owned histogram before every replay.
+        outputs = []
+        for microbatch in logits.chunk(2):
+            outputs.append(
+                moe_utils.topk_routing_with_score_function(
+                    microbatch,
+                    topk=8,
+                    score_function="sigmoid",
+                    expert_bias=bias,
+                    qb_histogram=histogram,
+                    qb_bin_bounds=bounds,
+                )
+            )
+        probs = torch.cat([output[0] for output in outputs])
+        routing_map = torch.cat([output[1] for output in outputs])
+        updated_bias, updated_bounds = moe_utils.get_updated_expert_bias_with_quantile(
+            histogram, bounds, bias, topk=8
+        )
+        return probs, routing_map, histogram, updated_bias, updated_bounds
+
+    with deterministic_algorithms(det_algos):
+        outputs, grads = assert_replays_bit_exact(
+            fn,
+            (logits, histogram),
+            grad_outputs={"out[0]": torch.randn_like(logits)},
+            replays=3,
+            contention=True,
+            what="global-batch QB histogram and bias update",
+        )
+    assert torch.equal(
+        outputs["out[2]"].sum(dim=-1),
+        torch.full((num_experts,), num_tokens, device="cuda", dtype=torch.int64),
+    )
+    assert torch.all(outputs["out[1]"].sum(dim=-1) == 8)
+    assert torch.isfinite(outputs["out[3]"]).all()
+    assert torch.isfinite(outputs["out[4]"]).all()
+    assert grads["in[0]"].abs().sum() > 0
+
+
 def test_group_limited_topk_replays():
     seeded()
     scores = torch.rand(8192, 256, device="cuda")
@@ -975,6 +1026,43 @@ class TestMoEModules:
             router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )
 
+    @pytest.mark.parametrize("accumulate", [True, False])
+    def test_global_batch_quantile_router_replays(self, accumulate):
+        """Include the router's nonpersistent histogram in the replay comparison."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=64,
+            moe_router_topk=8,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.train(accumulate)
+        with torch.no_grad():
+            router.expert_bias.copy_(torch.linspace(-0.1, 0.1, 64, device="cuda"))
+        logits = torch.randn(8192, 64, device="cuda", requires_grad=True)
+
+        def fn(logits):
+            router.qb_histogram.zero_()
+            probs, routing_map = router.quantile_balancing(logits)
+            return probs, routing_map, router.qb_histogram.clone()
+
+        outputs, grads = assert_replays_bit_exact(
+            fn,
+            (logits,),
+            grad_outputs={"out[0]": torch.randn_like(logits)},
+            replays=3,
+            contention=True,
+            what=f"global-batch TopKRouter[accumulate={accumulate}]",
+        )
+        assert torch.all(outputs["out[2]"].sum(dim=-1) == (8192 if accumulate else 0))
+        assert grads["in[0]"].abs().sum() > 0
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     def test_te_grouped_mlp_replays_on_uneven_experts(self):
         self._init()
@@ -999,6 +1087,65 @@ class TestMoEModules:
             contention=True,
             what="TEGroupedMLP",
         )
+
+    @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+    def test_inference_nvfp4_moe_layer_replays(self, gated):
+        """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
+        from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden):
+                with InferenceMode.active():
+                    return self.module(hidden)
+
+        self._init(ep=1)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            num_moe_experts=8,
+            moe_ffn_hidden_size=1024,
+            moe_router_topk=2,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            activation_func=F.silu if gated else squared_relu,
+            gated_linear_unit=gated,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_token_dispatcher_type="nccl",
+            inference_moe_nvfp4_recipe="per_token",
+        )
+        NCCLAllGatherDispatcher.allocate_buffers()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                _InInferenceMode(layer),
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="MoELayer[inference, flashinfer per-token NVFP4]",
+            )
+        assert layer.experts._nvfp4_weights is not None
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
