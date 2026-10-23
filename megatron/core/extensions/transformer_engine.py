@@ -2424,6 +2424,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
+        # Runtime groups belong to MCore layout conversion and CP binding, not TE's forward API.
+        self.kept_packed_seq_params.difference_update({"cp_group", "local_cp_size", "tp_cp_group"})
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
@@ -2532,10 +2534,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Run TE attention after the runtime CP binding has been installed."""
-        if packed_seq_params is not None:
-            self.kept_packed_seq_params.discard("cp_group")
-            self.kept_packed_seq_params.discard("local_cp_size")
-
         # Default to constructor-provided num_splits unless explicitly overridden
         if num_splits is None:
             num_splits = self.num_splits

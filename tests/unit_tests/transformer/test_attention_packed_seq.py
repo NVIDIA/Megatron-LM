@@ -354,6 +354,45 @@ class TestAttentionDynamicContextParallel:
         assert captured and all(group is singleton_group for group in captured)
         assert self.parallel_attention.pg_collection.cp is build_time_group
 
+    @pytest.mark.parametrize("runtime_cp_size", [None, 1, 2])
+    def test_te_does_not_forward_runtime_groups(self, monkeypatch, runtime_cp_size):
+        import transformer_engine.pytorch as te_pytorch
+
+        core_attention = self.parallel_attention.core_attention.cuda()
+        packed_seq_params = make_test_packed_seq_params(32)
+        runtime_group = (
+            self._runtime_cp_group(size=runtime_cp_size) if runtime_cp_size is not None else None
+        )
+        tp_cp_group = runtime_group if runtime_group is not None else object()
+        packed_seq_params.cp_group = runtime_group
+        packed_seq_params.tp_cp_group = tp_cp_group
+        packed_seq_params.local_cp_size = runtime_cp_size
+        captured = []
+
+        def backend_forward(self, query, key, value, attention_mask, **kwargs):
+            captured.append(kwargs)
+            assert not {"cp_group", "local_cp_size", "tp_cp_group"}.intersection(kwargs)
+            return query.flatten(start_dim=1)
+
+        monkeypatch.setattr(te_pytorch.DotProductAttention, "forward", backend_forward)
+        query = torch.zeros(32, 4, 16, dtype=torch.bfloat16, device="cuda")
+        core_attention(
+            query,
+            torch.zeros_like(query),
+            torch.zeros_like(query),
+            None,
+            AttnMaskType.padding_causal,
+            packed_seq_params=packed_seq_params,
+        )
+
+        assert len(captured) == 1
+        assert captured[0]["qkv_format"] == "thd"
+        assert captured[0]["cu_seqlens_q"] is packed_seq_params.cu_seqlens_q
+        assert captured[0]["cu_seqlens_kv"] is packed_seq_params.cu_seqlens_kv
+        assert packed_seq_params.cp_group is runtime_group
+        assert packed_seq_params.tp_cp_group is tp_cp_group
+        assert packed_seq_params.local_cp_size == runtime_cp_size
+
     def test_te_cp_stream_lazily_created_for_runtime_cp_group(self, monkeypatch):
         import transformer_engine.pytorch as te_pytorch
 
