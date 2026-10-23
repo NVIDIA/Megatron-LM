@@ -829,6 +829,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
 
 def num_floating_point_operations(
     args,
+    cfg,
     batch_size,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
@@ -1336,7 +1337,7 @@ def num_floating_point_operations(
                 + forward_backward_expansion_factor
                 * fma_expansion_factor
                 * args.hidden_size
-                * args.padded_vocab_size
+                * cfg.tokenizer.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
             # Self Attention (core L^2 part). For BSHD the default
@@ -1417,7 +1418,7 @@ def num_floating_point_operations(
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
-            vocab_size=args.padded_vocab_size,
+            vocab_size=cfg.tokenizer.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         ))
     else:
@@ -3902,6 +3903,7 @@ def training_log(
 
         throughput = num_floating_point_operations(
             args,
+            cfg,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
@@ -4042,7 +4044,7 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
-                    args, num_microbatches=num_microbatches, verbose=True,
+                    cfg, args, num_microbatches=num_microbatches, verbose=True,
                     micro_batch_size=cfg.train.micro_batch_size,
                 )
             report_memory(
@@ -5290,6 +5292,7 @@ def train(
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
+            cfg,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
