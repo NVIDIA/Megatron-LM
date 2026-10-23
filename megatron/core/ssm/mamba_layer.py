@@ -263,6 +263,8 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+        inference_fuse_residual_norm: bool = False,
+        inference_normalized_input: Tensor | None = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -287,6 +289,13 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if inference_fuse_residual_norm:
+            return self._inference_residual_norm.forward(
+                self,
+                hidden_states,
+                inference_context=inference_context,
+                inference_normalized_input=inference_normalized_input,
+            )
 
         # Whole-layer + mixer lens spans, mirroring transformer_layer.py so the hybrid
         # model's Mamba layers aren't a blind spot in the per-layer breakdown (they were
