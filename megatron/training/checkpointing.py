@@ -775,10 +775,11 @@ def save_checkpoint(
     )
 
     # Save distributed optimizer's custom parameter state.
+    can_save_optim = optimizer is not None and hasattr(cfg, "optimizer")
     if (
-        cfg.optimizer.use_distributed_optimizer
+        can_save_optim
+        and cfg.optimizer.use_distributed_optimizer
         and not args.no_save_optim
-        and optimizer is not None
         and ckpt_type == CheckpointType.LEGACY
     ):
         optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(checkpoint_name)
@@ -787,7 +788,7 @@ def save_checkpoint(
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
+    if can_save_optim and getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(
             os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
@@ -845,7 +846,7 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
-            if cfg.optimizer.use_distributed_optimizer:
+            if hasattr(cfg, "optimizer") and cfg.optimizer.use_distributed_optimizer:
                 print_rank_0(
                     f'Storing distributed optimizer sharded state of type'
                     f' {sharded_sd_metadata["distrib_optim_sharding_type"]}'
