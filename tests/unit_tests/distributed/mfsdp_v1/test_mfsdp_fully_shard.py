@@ -34,6 +34,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
     BucketStatus,
     PrefetchOrder,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
+)
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -376,6 +382,91 @@ class TestMegatronFsdpFullyShard:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "shard_strategy,use_fsdp_unit",
+        [
+            (NO_SHARD, False),
+            (NO_SHARD, True),
+            (OPTIM, True),
+            (OPTIM_GRADS, True),
+            (OPTIM_GRADS_PARAMS, True),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("prepare_moe_main_grad", [False, True], ids=["local", "moe-hook"])
+    def test_local_linear_fused_wgrad_accumulation(
+        self, shard_strategy, dtype, use_fsdp_unit, prepare_moe_main_grad
+    ):
+        """Retain every microbatch, then reset the gradient for the next optimization cycle."""
+        device_mesh = build_distributed_environment((1, Utils.world_size, 1, 1))
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=1,
+            params_dtype=dtype,
+            bf16=dtype == torch.bfloat16,
+            use_cpu_initialization=True,
+            gradient_accumulation_fusion=True,
+        )
+        layer = ColumnParallelLinear(
+            16,
+            16,
+            config=config,
+            init_method=torch.nn.init.ones_,
+            bias=False,
+            gather_output=False,
+            tp_group=device_mesh[TP].get_group(),
+        ).cuda()
+        if prepare_moe_main_grad:
+            # Exercise the real MoE preparation helper before a fused wgrad writer reads
+            # FSDP's policy, without requiring the op-fuser's grouped-GEMM backend.
+            layer.fuse_wgrad_accumulation = True
+            layer.register_forward_pre_hook(
+                lambda module, _: TEGroupedMLP._ensure_main_grad(module)
+            )
+        model = fully_shard_model(
+            torch.nn.Sequential(layer),
+            device_mesh=device_mesh,
+            dp_shard_dim=DP_SHARD,
+            tp_dim=TP,
+            fsdp_unit_modules=[ColumnParallelLinear] if use_fsdp_unit else None,
+            zero_dp_strategy=shard_strategy,
+            sync_model_each_microbatch=False,
+            calculate_per_token_loss=True,
+            mixed_precision_policy=MixedPrecisionPolicy(
+                main_params_dtype=torch.float32,
+                main_grads_dtype=torch.float32,
+                grad_comm_dtype=torch.float32,
+            ),
+        )
+        try:
+            for cycle in range(2):
+                model.zero_grad_buffer()
+                expected = torch.zeros(16, 16, device="cuda", dtype=torch.float32)
+                for micro, (length, x_value, dy_value) in enumerate(
+                    ((8, 1, 1), (16, 2 + cycle, 3))
+                ):
+                    with model.no_sync() if micro == 0 else nullcontext():
+                        x = torch.full(
+                            (length, 1, 16),
+                            float(x_value),
+                            device="cuda",
+                            dtype=dtype,
+                            requires_grad=True,
+                        )
+                        output, _ = model(x)
+                        dy = torch.full_like(output, float(dy_value))
+                        expected += dy.flatten(0, 1).float().T @ x.detach().flatten(0, 1).float()
+                        output.backward(dy)
+                model.finish_grad_sync()
+                torch.distributed.all_reduce(expected)
+                actual = uneven_dtensor_to_full_tensor(
+                    model.param_and_grad_buffer.dist_main_grad["0.weight"]
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        finally:
+            destroy_device_mesh(device_mesh)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),

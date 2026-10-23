@@ -334,7 +334,10 @@ def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
         hook(object())
 
 
-def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad():
+@pytest.mark.parametrize("overwrite_main_grad", (False, True, None))
+def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad(
+    overwrite_main_grad,
+):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(self, *, fuse_wgrad_accumulation):
             super().__init__()
@@ -349,12 +352,14 @@ def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad
 
     fc1_main_grad = torch.empty_like(module.linear_fc1.weight)
     module.linear_fc1.weight.get_main_grad = lambda: fc1_main_grad
-    module.linear_fc1.weight.overwrite_main_grad = False
+    if overwrite_main_grad is not None:
+        module.linear_fc1.weight.overwrite_main_grad = overwrite_main_grad
 
     existing_main_grad = torch.empty_like(module.linear_fc1.bias)
     module.linear_fc1.bias.main_grad = existing_main_grad
     module.linear_fc1.bias.get_main_grad = pytest.fail
-    module.linear_fc1.bias.overwrite_main_grad = False
+    if overwrite_main_grad is not None:
+        module.linear_fc1.bias.overwrite_main_grad = overwrite_main_grad
 
     fc2_main_grad = torch.empty_like(module.linear_fc2.weight)
     module.linear_fc2.weight.get_main_grad = lambda: fc2_main_grad
@@ -364,9 +369,9 @@ def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad
     hook(object())
 
     assert module.linear_fc1.weight.main_grad is fc1_main_grad
-    assert module.linear_fc1.weight.overwrite_main_grad is True
+    assert getattr(module.linear_fc1.weight, "overwrite_main_grad", None) is overwrite_main_grad
     assert module.linear_fc1.bias.main_grad is existing_main_grad
-    assert module.linear_fc1.bias.overwrite_main_grad is True
+    assert getattr(module.linear_fc1.bias, "overwrite_main_grad", None) is overwrite_main_grad
     assert getattr(module.linear_fc2.weight, "main_grad", None) is None
     assert module.linear_fc2.weight.overwrite_main_grad is False
 
