@@ -304,11 +304,13 @@ class FsdpModule:
         performs that root sync in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
+            compute_stream = self.context.current_stream()
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
-            for group in self._parameter_groups:
-                group.wait_for_unshard(phase, self.context.current_stream())
+            with torch.cuda.stream(compute_stream):
+                for group in self._parameter_groups:
+                    group.wait_for_unshard(phase)
 
             if not prefetch:
                 return
@@ -366,7 +368,10 @@ class FsdpModule:
         """Return parameters to their sharded resting state after forward compute."""
         is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
-            self._release_unsharded_storage(keep_for_backward=True)
+            groups = tuple(
+                group for group in self._parameter_groups if group.has_forward_only_planes
+            )
+            self._release_unsharded_storage(groups, rowwise_only=True)
         else:
             self.reshard()
         if self.phase is Phase.FORWARD:
@@ -382,16 +387,21 @@ class FsdpModule:
         """Reshard parameter groups and release unsharded storage after compute."""
         for group in self._parameter_groups:
             group.reshard_parameters()
-        self._release_unsharded_storage()
+        self._release_unsharded_storage(self._parameter_groups)
 
-    def _release_unsharded_storage(self, *, keep_for_backward: bool = False) -> None:
-        """Let each group release weights no longer needed after compute."""
-        compute_stream = self.context.current_stream()
+    def _release_unsharded_storage(
+        self, groups: tuple[FsdpParameterGroup, ...], *, rowwise_only: bool = False
+    ) -> None:
+        """Release the selected groups' storage after the current compute finishes."""
+        if not groups:
+            return
+        allgather_stream = self.context.allgather_stream
+        allgather_stream.wait_stream(self.context.current_stream())
         # Release on the all-gather stream where unsharded storage was allocated,
         # so no record_stream() call is required for the storage.
-        with torch.cuda.stream(self.context.allgather_stream):
-            for group in self._parameter_groups:
-                group.release_unsharded_storage(compute_stream, keep_for_backward=keep_for_backward)
+        with torch.cuda.stream(allgather_stream):
+            for group in groups:
+                group.release_unsharded_storage(rowwise_only=rowwise_only)
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
