@@ -4,7 +4,7 @@
 
 The reference is the frozen factory and provider logic of commit 438ef0025
 (``legacy_dataset_factories.py``), run on the same validated arguments as the new path: ``cfg.data``
-built by the one factory, the owned fields written by the container, the config prepared with the run's
+built by the one factory, the owned fields written by the container, the config bound to the run's
 tokenizer and handed to the builder as is. pretrain_gpt.py's legacy factory is the oracle for all
 four entry points; where the other three legacy factories differed from it (fields they never
 forwarded, requests they silently downgraded), the difference is listed here as a documented change.
@@ -21,9 +21,8 @@ import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDataset
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import MockGPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.datasets.utils import Split, compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import argument_utils, global_vars, training
@@ -32,11 +31,8 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.config import GPTDatasetConfig, GPTFIMDatasetConfig
 from megatron.training.config import container as container_module
 from megatron.training.datasets import providers, sft_dataset, varlen_dataset
-from megatron.training.datasets.fim_dataset import GPTFIMDataset
-from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig as RuntimeGPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training import legacy_dataset_factories as legacy
@@ -275,7 +271,7 @@ def _ready(cfg):
     """What pretrain() and initialize_megatron() do before the provider runs."""
     cfg.validate()
     cfg.finalize()
-    global_vars._prepare_dataset_config(cfg)
+    global_vars._bind_dataset_tokenizer(cfg)
     return cfg.data
 
 
@@ -316,21 +312,22 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         return
     args, cfg, tokenizer = _prepare(monkeypatch, extra, overrides, entry_point)
     expected = legacy.legacy_gpt_dataset_config(args)
+    expected.validate()  # Megatron Core's checks and derivations, which the builder runs
     expected_class, expected_packed = legacy.legacy_gpt_dataset_class(args)
     if entry_point == "prepare_cache":
         actual = module.core_gpt_dataset_config_from_args(args)
-        assert actual.is_prepared
+        assert actual.tokenizer is not None
         dataset_class = packed = None
     else:
         data = _ready(cfg)
         dataset_class, actual, packed = data.dataset_build()
-        assert actual is data.dataset and actual.is_prepared and actual.tokenizer is tokenizer
+        assert actual is data.dataset and actual.tokenizer is tokenizer
     if case in MIXED_FIM_CASES:
         # Documented exception: the dataset class and every shared field are unchanged; the unused
         # FIM runtime wrapper pretrain_gpt built around an SFT / varlen dataset is gone.
-        assert isinstance(expected, RuntimeGPTFIMDatasetConfig)
-        assert not isinstance(actual, RuntimeGPTFIMDatasetConfig)
-        names = [f.name for f in fields(MCoreGPTDatasetConfig)]
+        assert isinstance(expected, GPTFIMDatasetConfig)
+        assert not isinstance(actual, GPTFIMDatasetConfig)
+        names = [f.name for f in fields(GPTDatasetConfig)]
     else:
         assert isinstance(actual, type(expected))
         names = [f.name for f in fields(expected)]
@@ -354,7 +351,7 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
     if entry_point != "hybrid_flex":  # its rank predicate has no packed-sequence parameter
         assert packed is expected_packed
     wrapper = module.core_gpt_dataset_config_from_args(args)
-    assert isinstance(wrapper, type(actual)) and wrapper.is_prepared
+    assert isinstance(wrapper, type(actual)) and wrapper.tokenizer is not None
     assert _signature(wrapper, names) == _signature(expected, names)
 
 
@@ -383,14 +380,16 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
     extra, overrides = corpus["forwarded"]
     args, cfg, _ = _prepare(monkeypatch, extra, overrides, entry_point)
     own = LEGACY_OWN[entry_point](args)
+    own.validate()
     if entry_point == "prepare_cache":
         actual = _entry_point(entry_point).core_gpt_dataset_config_from_args(args)
     else:
         _, actual, _ = _ready(cfg).dataset_build()
-    names = [f.name for f in fields(MCoreGPTDatasetConfig) if f.name != "tokenizer"]
+    names = [f.name for f in fields(GPTDatasetConfig) if f.name != "tokenizer"]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     assert changed == LEGACY_OMISSIONS[entry_point]
     expected = legacy.legacy_gpt_dataset_config(args)
+    expected.validate()  # Megatron Core's checks and derivations, which the builder runs
     same = [n for n in names if entry_point != "hybrid_flex" or n not in LAYOUT_FIELDS]
     assert {n: getattr(actual, n) for n in same} == {n: getattr(expected, n) for n in same}
 
@@ -515,8 +514,8 @@ class TestProvidersBuildMockDatasets:
         args, cfg, _ = _prepare(monkeypatch, *corpus[case])
         data = _ready(cfg)
         plain = data.dataset
-        shared = {f.name: getattr(plain, f.name) for f in fields(MCoreGPTDatasetConfig) if f.init}
-        wrapped = RuntimeGPTFIMDatasetConfig(
+        shared = {f.name: getattr(plain, f.name) for f in fields(GPTDatasetConfig) if f.init}
+        wrapped = GPTFIMDatasetConfig(
             **shared,
             fim_rate=0.9,
             fim_spm_rate=0.4,
@@ -587,8 +586,8 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
 def test_legacy_wrapper_is_the_shared_helper(monkeypatch, corpus):
     """pretrain_gpt and pretrain_hybrid expose argument_utils.core_gpt_dataset_config_from_args
     itself; hybrid-flex and the cache tool wrap it (the run's tokenizer; the class pinned to
-    GPTDataset). The helper takes the seed from the arguments, validates, and prepares with the
-    tokenizer it is given."""
+    GPTDataset). The helper takes the seed from the arguments, validates, and binds the tokenizer
+    it is given."""
     shared = argument_utils.core_gpt_dataset_config_from_args
     assert _entry_point("gpt").core_gpt_dataset_config_from_args is shared
     assert _entry_point("hybrid").core_gpt_dataset_config_from_args is shared
@@ -596,6 +595,6 @@ def test_legacy_wrapper_is_the_shared_helper(monkeypatch, corpus):
     cfg.rng.seed = 77  # not the dataset's seed: that is --seed
     own = SimpleNamespace(vocab_size=2048)
     config = shared(args, tokenizer=own)
-    assert config.is_prepared and config.tokenizer is own and config.random_seed == args.seed
+    assert config.tokenizer is own and config.random_seed == args.seed
     with pytest.raises(ValueError, match="GPTDataset needs a data source"):
         shared(_validated(["--mock-data"], {}), dataset_type=GPTDataset)

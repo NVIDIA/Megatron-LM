@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
 import logging
@@ -97,7 +97,27 @@ class BlendedMegatronDatasetConfig:
     """
 
     def __post_init__(self) -> None:
-        """Do asserts and set fields post init"""
+        """Check the blend and split and derive ``mock`` and ``split_matrix`` from them.
+
+        Needs no tokenizer, so it runs at construction; ``validate()`` runs it again, so a config
+        completed after construction is checked and derived afresh. The checks that need a tokenizer
+        belong to the subclasses' ``validate()``.
+        """
+        self._resolve_sources(log=True)
+
+    def validate(self) -> None:
+        """Validate the config and refresh the fields derived from it; idempotent.
+
+        A config can be constructed before its tokenizer exists and completed later: run this once
+        it is complete. ``BlendedMegatronDatasetBuilder`` runs it before building, so a config
+        handed complete to the builder needs no explicit call. Subclasses add the checks, and the
+        derived fields, that need the tokenizer.
+        """
+        self._resolve_sources(log=False)
+
+    def _resolve_sources(self, log: bool) -> None:
+        """The blend / split rules and the fields that follow from them (``mock``, ``split_matrix``,
+        the even split of a mock config); ``log`` reports the derivations once, at construction."""
         if self.fast_cache_load:
             assert (
                 self.path_to_cache is not None
@@ -119,37 +139,43 @@ class BlendedMegatronDatasetConfig:
             ), f"blend_per_split must contain {len(Split)} blends"
             for split in Split:
                 if self.blend_per_split[split.value] is None:
-                    log_single_rank(
-                        logger, logging.INFO, f"blend not provided for {split.name} split"
-                    )
+                    if log:
+                        log_single_rank(
+                            logger, logging.INFO, f"blend not provided for {split.name} split"
+                        )
                 else:
                     assert self.blend_per_split[split.value][1] is None or len(
                         self.blend_per_split[split.value][0]
                     ) == len(
                         self.blend_per_split[split.value][1]
                     ), "blend per split prefixes and weights must be equal in number"
+            self.mock = False
         else:
             if self.blend is not None:
                 assert self.blend[1] is None or len(self.blend[0]) == len(
                     self.blend[1]
                 ), "blend prefixes and weights must be equal in number"
                 assert self.split is not None, "split must be provided when blend is not None"
+                self.mock = False
             else:
                 self.mock = True
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"Let mock = True, as both blend and blend_per_split are None",
-                )
+                if log:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"Let mock = True, as both blend and blend_per_split are None",
+                    )
                 self.split = "1,1,1"
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"Let split = {self.split}, an arbitrarily even split, as mock is True",
-                )
+                if log:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"Let split = {self.split}, an arbitrarily even split, as mock is True",
+                    )
             split_vector = parse_and_normalize_split(self.split)
             self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
-            log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
+            if log:
+                log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
 
 
 def parse_and_normalize_split(split: str) -> List[float]:

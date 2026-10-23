@@ -3,7 +3,7 @@
 
 ``build_gpt_datasets`` is the body of ``train_valid_test_datasets_provider`` in ``pretrain_gpt.py``,
 ``pretrain_hybrid.py`` and ``megatron/elastification/pretrain_hybrid_flex.py``: it takes ``cfg.data``
-(the dataset config prepared with the run's tokenizer, the loader settings and the dataset class)
+(the dataset config bound to the run's tokenizer, the loader settings and the dataset class)
 and hands the dataset config to ``BlendedMegatronDatasetBuilder`` as is. Each script keeps a
 ``train_valid_test_datasets_provider`` of the legacy shape that calls it with its rank predicate:
 ``is_dataset_built_on_rank`` below is the GPT and hybrid rule (a packed dataset is built on every

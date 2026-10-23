@@ -19,6 +19,8 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
@@ -28,8 +30,6 @@ from megatron.training.config import (
     DataConfig,
     DataloaderConfig,
     DistributedInitConfig,
-    GPTDatasetConfig,
-    GPTFIMDatasetConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     LoggerConfig,
@@ -890,7 +890,8 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     validation fields the container writes at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``) are left
     unset for a container; ``standalone=True`` fills them from ``args`` for callers without one
     (``tools/prepare_cache.py``, the legacy ``core_gpt_dataset_config_from_args`` wrappers). The
-    returned config is not prepared: ``prepare(tokenizer)`` runs Megatron Core's post-init.
+    returned config has no tokenizer: ``DataConfig.bind_tokenizer`` binds the run's and runs
+    Megatron Core's ``validate()``.
     """
     family = requested_dataset_family(args)
     blend, blend_per_split, sequences_per_dataset = _resolve_data_sources(args)
@@ -937,21 +938,20 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
 def core_gpt_dataset_config_from_args(
     args: Namespace, *, tokenizer: Any = None, dataset_type: type | None = None
 ) -> GPTDatasetConfig:
-    """A standalone, prepared dataset config from the legacy arguments.
+    """A standalone dataset config from the legacy arguments, with its tokenizer bound.
 
     The call shape the GPT entry points had before ``cfg.data`` existed, kept for scripts that build
     the dataset config outside the container (the providers build from ``cfg.data``): the section of
     ``gpt_data_config_from_args(args, standalone=True)`` (the layout and validation fields and the
-    seed from ``args``), the
-    dataset class pinned to ``dataset_type`` when given (``tools/prepare_cache.py`` builds
-    ``GPTDataset`` whatever the flags name), validated, then prepared with ``tokenizer`` or a
-    tokenizer built from ``args``.
+    seed from ``args``), the dataset class pinned to ``dataset_type`` when given
+    (``tools/prepare_cache.py`` builds ``GPTDataset`` whatever the flags name), validated, then bound
+    to ``tokenizer`` or a tokenizer built from ``args`` (Megatron Core's ``validate()`` runs then).
     """
     data = gpt_data_config_from_args(args, standalone=True)
     if dataset_type is not None:
         data.dataset_type = dataset_type
     data.validate()
-    data.dataset.prepare(build_tokenizer(args) if tokenizer is None else tokenizer)
+    data.bind_tokenizer(build_tokenizer(args) if tokenizer is None else tokenizer)
     return data.dataset
 
 

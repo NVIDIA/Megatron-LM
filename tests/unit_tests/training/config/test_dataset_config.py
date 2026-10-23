@@ -1,10 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""One dataset config object: Megatron Core's GPTDatasetConfig with deferred initialization, the
-dataset-class resolution and the data section lifecycle."""
+"""The data section around Megatron Core's GPTDatasetConfig: the lifecycle (validate, finalize, bind
+the tokenizer, build), the serialization and the dataset-class resolution."""
 
 import copy
-import dataclasses
 from argparse import Namespace
 from dataclasses import fields
 from types import SimpleNamespace
@@ -12,16 +11,11 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from megatron.core.datasets.gpt_dataset import GPTDataset
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import MockGPTDataset
+import megatron.training.config as config_package
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.training.config import (
-    DataConfig,
-    DataloaderConfig,
-    GPTDatasetConfig,
-    GPTFIMDatasetConfig,
-)
+from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.config.dataset_config import (
     CONTAINER_WRITTEN_FIELDS,
@@ -34,8 +28,6 @@ from megatron.training.config.dataset_config import (
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.datasets.fim_dataset import GPTFIMDataset
-from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig as RuntimeGPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
@@ -65,10 +57,6 @@ def _fim(**overrides):
     return GPTFIMDatasetConfig(**kwargs)
 
 
-def _core_values(config):
-    return {f.name: getattr(config, f.name) for f in fields(MCoreGPTDatasetConfig)}
-
-
 @pytest.fixture(scope="module")
 def tokenizer():
     return build_tokenizer(
@@ -83,199 +71,94 @@ def tokenizer():
     )
 
 
-# The class: Megatron Core's fields, deferred initialization.
+# The section holds Megatron Core's config itself.
 
 
-def test_same_fields_as_megatron_core_and_no_eager_post_init():
-    cfg = _dataset()
-    assert isinstance(cfg, MCoreGPTDatasetConfig)
-    assert [f.name for f in fields(cfg) if f.init] == [
-        f.name for f in fields(MCoreGPTDatasetConfig) if f.init
-    ]
-    # No field of its own: names, order and defaults are Core's (random_seed stays required).
-    assert [(f.name, f.default) for f in fields(GPTDatasetConfig)] == [
-        (f.name, f.default) for f in fields(MCoreGPTDatasetConfig)
-    ]
-    with pytest.raises(TypeError, match="random_seed"):
+def test_the_section_holds_megatron_cores_config(tokenizer):
+    """No wrapper class: cfg.data.dataset is Megatron Core's GPTDatasetConfig, constructed before
+    the tokenizer exists (Core derives mock and split_matrix at construction; its validate() needs
+    the tokenizer and runs when the section binds it)."""
+    assert not hasattr(config_package, "GPTDatasetConfig")
+    assert not hasattr(config_package, "GPTFIMDatasetConfig")
+    data = DataConfig(dataset=_dataset())
+    assert type(data.dataset) is GPTDatasetConfig
+    assert data.dataset.tokenizer is None and data.dataset.token_dtype_code is None
+    assert data.dataset.mock is True and data.dataset.split == "1,1,1"
+    assert data.dataset.split_matrix is not None
+    data.validate()  # the section's own checks need no tokenizer
+    data.finalize()
+    assert data.dataset_type is MockGPTDataset
+    with pytest.raises(RuntimeError, match="no tokenizer bound"):
+        data.dataset_build()
+    data.bind_tokenizer(tokenizer)  # runs Core's validate()
+    assert data.dataset.tokenizer is tokenizer and data.dataset.token_dtype_code == 8
+    dataset_type, config, packed = data.dataset_build()
+    assert dataset_type is MockGPTDataset and config is data.dataset and packed is False
+    data.bind_tokenizer(tokenizer)  # idempotent for the same tokenizer
+    with pytest.raises(RuntimeError, match="another tokenizer"):
+        data.bind_tokenizer(SimpleNamespace(vocab_size=2048))
+    assert data.dataset.tokenizer is tokenizer
+    with pytest.raises(ValueError, match="needs a tokenizer"):
+        DataConfig(dataset=_dataset()).bind_tokenizer(None)
+    DataConfig().bind_tokenizer(tokenizer)  # loader-only: nothing to bind
+    eager = DataConfig(dataset=_dataset(tokenizer=tokenizer))  # a Python caller's tokenizer
+    eager.bind_tokenizer(tokenizer)
+    assert eager.dataset.token_dtype_code == 8
+
+
+def test_bind_tokenizer_runs_megatron_cores_checks(tokenizer):
+    """Core's validate() is where a GPT config that needs the tokenizer fails: the asserts its
+    __post_init__ had, once the tokenizer is bound (the blend / split rules fail at construction,
+    as they did)."""
+    with pytest.raises(AssertionError):
+        DataConfig(dataset=_dataset(reset_position_ids=None)).bind_tokenizer(tokenizer)
+    sbhd = DataConfig(dataset=_dataset(varlen_sbhd_validation=True, hybrid_context_parallel=True))
+    with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
+        sbhd.bind_tokenizer(tokenizer)
+    counts = DataConfig(
+        dataset=_dataset(blend=BLEND, split="9,1,0", sequences_per_dataset={"prefix-a": [10, 2]})
+    )
+    with pytest.raises(AssertionError, match="vocab size"):
+        counts.bind_tokenizer(SimpleNamespace(vocab_size=None))
+    with pytest.raises(AssertionError, match="split must be provided"):
+        _dataset(blend=BLEND)
+    with pytest.raises(AssertionError, match="equal in number"):
+        _dataset(blend=(["a", "b"], [1.0]), split="1,1,1")
+    with pytest.raises(TypeError, match="random_seed"):  # Core's requirement, unchanged
         GPTDatasetConfig(sequence_length=16, **BOOLS)
-    assert cfg.tokenizer is None and cfg.split_matrix is None
-    assert cfg.mock is False and cfg.token_dtype_code is None
-    assert not cfg.is_prepared
-    unset = _dataset()
-    assert unset.random_seed == 1234 and unset.context_parallel_size is None
-    # The fields the container writes keep Megatron Core's fields and defaults.
-    assert (unset.data_parallel_size, unset.sequence_parallel_size) == (1, 0)
-    assert unset.hybrid_context_parallel is False
-    assert unset.multiple_validation_sets is None and unset.full_validation is None
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
+    for overrides in (
         {},
         dict(blend=BLEND, split="9,1,0"),
         dict(blend_per_split=[(["a"], None), None, (["b", "c"], [1.0, 2.0])]),
         dict(blend_per_split=[None, None, None]),
-    ],
-)
-def test_prepare_runs_megatron_core_post_init_once(tokenizer, overrides):
-    cfg = _dataset(**overrides)
-    cfg.validate()
-    cfg.prepare(tokenizer)
-    expected = MCoreGPTDatasetConfig(
-        sequence_length=16, random_seed=1234, tokenizer=tokenizer, **BOOLS, **overrides
-    )
-    assert _core_values(cfg) == _core_values(expected)
-    assert cfg.is_prepared and cfg.tokenizer is tokenizer
-    assert cfg.mock is (not has_data_source(expected))
-    assert cfg.token_dtype_code == 8  # split_matrix follows Core: None under blend_per_split
-    derived = (cfg.split_matrix, cfg.token_dtype_code)
-    cfg.prepare(tokenizer)  # same tokenizer: no-op
-    assert (cfg.split_matrix, cfg.token_dtype_code) == derived
-    with pytest.raises(RuntimeError, match="another tokenizer"):
-        cfg.prepare(SimpleNamespace(vocab_size=2048))
+    ):
+        assert _dataset(**overrides).mock is (not has_data_source(_dataset(**overrides)))
 
 
-def test_prepare_needs_a_tokenizer(tokenizer):
-    with pytest.raises(ValueError, match="needs a tokenizer"):
-        _dataset().prepare(None)
-    unset = _dataset(random_seed=7)
-    assert not unset.is_prepared
-    unset.prepare(tokenizer)
-    assert unset.random_seed == 7
-    # Layout fields hold Megatron Core's defaults unless set; set values are kept.
-    assert (unset.data_parallel_size, unset.sequence_parallel_size) == (1, 0)
-    assert unset.hybrid_context_parallel is False and unset.context_parallel_size is None
-    explicit = _dataset(
-        data_parallel_size=4, sequence_parallel_size=2, hybrid_context_parallel=True
-    )
-    explicit.prepare(tokenizer)
-    assert (explicit.data_parallel_size, explicit.sequence_parallel_size) == (4, 2)
-    assert explicit.hybrid_context_parallel is True
+# The FIM config.
 
 
-def test_prepare_applies_megatron_core_checks(tokenizer):
-    # Both rules live in Megatron Core's __post_init__; validate() announces the first one early.
-    sbhd = _dataset(
-        blend=BLEND, split="9,1,0", varlen_sbhd_validation=True, hybrid_context_parallel=True
-    )
-    with pytest.raises(ValueError, match="hybrid_context_parallel"):
-        sbhd.validate()
-    with pytest.raises(AssertionError):
-        sbhd.prepare(tokenizer)
-    assert not sbhd.is_prepared and sbhd.tokenizer is None  # a failed prepare() binds nothing
-    counts = _dataset(blend=BLEND, split="9,1,0", sequences_per_dataset={"prefix-a": [10, 2]})
-    counts.validate()
-    with pytest.raises(AssertionError):
-        counts.prepare(SimpleNamespace(vocab_size=None))
-    assert not counts.is_prepared and counts.tokenizer is None
-    counts.prepare(tokenizer)
-    assert counts.is_prepared and counts.token_dtype_code == 8
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        (dict(sequence_length=0), "sequence_length"),
-        (dict(sequence_length=None), "sequence_length"),
-        (dict(reset_position_ids=None), "reset_position_ids"),
-        (dict(eod_mask_loss=None), "eod_mask_loss"),
-        (dict(num_dataset_builder_threads=0), "num_dataset_builder_threads"),
-        (dict(fast_cache_load=True), "fast_cache_load requires path_to_cache"),
-        (dict(fast_cache_load=True, path_to_cache="/c", blend=BLEND, split="1,1,1"), "cannot be used with blend"),
-        (dict(defer_npy_index_mmap=True), "defer_npy_index_mmap requires"),
-        (dict(blend=BLEND), "split must be provided"),
-        (dict(blend=(["a", "b"], [1.0]), split="1,1,1"), "equal in number"),
-        (dict(blend=BLEND, split="1,1,1", blend_per_split=[(["a"], None), None, None]), "incompatible"),
-        (dict(blend_per_split=[(["a"], None), None, None], split="1,1,1"), "split and blend_per_split"),
-        (dict(blend_per_split=[(["a"], None), None]), "3 blends"),
-        (dict(blend_per_split=[(["a", "b"], [1.0]), None, None]), "equal in number"),
-        (dict(varlen_sbhd_validation=True, hybrid_context_parallel=True), "hybrid_context_parallel"),
-    ],
-)  # fmt: skip
-def test_validate_rejects_what_megatron_core_rejects(overrides, message):
-    cfg = _dataset(**overrides)
-    before = copy.deepcopy(dataclasses.asdict(cfg))
-    with pytest.raises(ValueError, match=message):
-        cfg.validate()
-    assert dataclasses.asdict(cfg) == before
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {},
-        dict(blend=BLEND, split="9,1,0"),
-        dict(blend=(["a"], None), split="1,0,0"),
-        dict(blend_per_split=[(["a"], None), (["b"], None), None]),
-        dict(blend_per_split=[None, None, None]),
-        dict(fast_cache_load=True, defer_npy_index_mmap=True, path_to_cache="/c", blend_per_split=[(["a"], None), None, None]),
-        dict(varlen_sbhd_validation=True, blend=BLEND, split="9,1,0"),
-    ],
-)  # fmt: skip
-def test_validate_accepts_valid_sections(overrides):
-    _dataset(**overrides).validate()
-
-
-def test_a_bound_tokenizer_means_prepared(tokenizer):
-    """Core's invariant: an object holding a tokenizer has run Core's post-init. A tokenizer given
-    to the constructor is bound through prepare(); dataclasses.replace() of a prepared object runs
-    Core's post-init on the copy, as for Core's class; deepcopy() copies the prepared state."""
-    eager = _dataset(blend=BLEND, split="9,1,0", tokenizer=tokenizer)
-    assert eager.is_prepared and eager.tokenizer is tokenizer and eager.token_dtype_code == 8
-    expected = MCoreGPTDatasetConfig(
-        sequence_length=16,
-        random_seed=1234,
-        tokenizer=tokenizer,
-        blend=BLEND,
-        split="9,1,0",
-        **BOOLS,
-    )
-    assert _core_values(eager) == _core_values(expected)
-    with pytest.raises(TypeError, match="random_seed"):  # Core's requirement, unchanged
-        GPTDatasetConfig(sequence_length=16, tokenizer=tokenizer, **BOOLS)
-    cfg = _dataset()
-    cfg.prepare(tokenizer)
-    copied = dataclasses.replace(cfg, blend=BLEND, split="9,1,0")
-    assert copied.is_prepared and copied.tokenizer is tokenizer
-    assert copied.mock is False and copied.split_matrix == expected.split_matrix
-    assert not dataclasses.replace(_dataset()).is_prepared
-    assert copy.deepcopy(cfg).is_prepared
-
-
-# The FIM subclass.
-
-
-def test_fim_subclass_carries_the_runtime_fim_fields(tokenizer):
+def test_fim_config_is_megatron_cores(tokenizer):
     cfg = _fim()
-    assert isinstance(cfg, RuntimeGPTFIMDatasetConfig) and isinstance(cfg, GPTDatasetConfig)
+    assert isinstance(cfg, GPTDatasetConfig)
     assert [f.name for f in fields(cfg) if f.name.startswith("fim_")] == [
         "fim_rate", "fim_spm_rate", "fim_extra_tokens", "fim_split_sample", "fim_fragment_rate", "fim_no_prefix",
     ]  # fmt: skip
     assert not any(f.name.startswith("fim_") for f in fields(GPTDatasetConfig))
-    cfg.validate()
-    with pytest.raises(ValueError, match="fim_rate"):
-        _fim(fim_rate=0).validate()
-    with pytest.raises(ValueError, match="fim_spm_rate"):
-        _fim(fim_spm_rate=None).validate()
-    with pytest.raises(ValueError, match="FIM extra tokens"):
-        _fim(fim_extra_tokens={"prefix": "<p>"}).validate()
-    with pytest.raises(ValueError, match="FIM extra tokens"):
-        _fim(fim_extra_tokens=None).validate()
-    cfg.prepare(tokenizer)
-    expected = RuntimeGPTFIMDatasetConfig(
-        sequence_length=16,
-        random_seed=1234,
-        tokenizer=tokenizer,
-        blend=BLEND,
-        split="9,1,0",
-        fim_rate=0.5,
-        fim_spm_rate=0.5,
-        fim_extra_tokens=dict(FIM_TOKENS),
-        **BOOLS,
-    )
-    names = [f.name for f in fields(RuntimeGPTFIMDatasetConfig)]
-    assert {n: getattr(cfg, n) for n in names} == {n: getattr(expected, n) for n in names}
+    data = DataConfig(dataset=cfg)
+    data.validate()
+    data.finalize()
+    assert data.dataset_type is GPTFIMDataset
+    data.bind_tokenizer(tokenizer)
+    assert data.dataset_build()[0] is GPTFIMDataset
+    for bad, message in (
+        (dict(fim_rate=0), "fim_rate"),
+        (dict(fim_spm_rate=None), "fim_spm_rate"),
+        (dict(fim_extra_tokens={"prefix": "<p>"}), "FIM extra tokens"),
+        (dict(fim_extra_tokens=None), "FIM extra tokens"),
+    ):
+        with pytest.raises(AssertionError, match=message):
+            DataConfig(dataset=_fim(**bad)).bind_tokenizer(tokenizer)
 
 
 # Serialization.
@@ -288,7 +171,7 @@ def test_container_written_fields_are_the_layout_and_the_validation_flags():
         "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
         "hybrid_context_parallel", "multiple_validation_sets", "full_validation",
     )  # fmt: skip
-    defaults = {f.name: f.default for f in fields(MCoreGPTDatasetConfig)}
+    defaults = {f.name: f.default for f in fields(GPTDatasetConfig)}
     assert {name: defaults[name] for name in CONTAINER_WRITTEN_FIELDS} == {
         "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
         "hybrid_context_parallel": False, "multiple_validation_sets": None, "full_validation": None,
@@ -297,34 +180,38 @@ def test_container_written_fields_are_the_layout_and_the_validation_flags():
 
 
 def test_to_cfg_dict_omits_tokenizer_owned_and_derived_fields(tokenizer):
-    cfg = _dataset(blend=BLEND, split="9,1,0", data_parallel_size=4, full_validation=True)
-    before = cfg.to_cfg_dict()
-    assert before["_target_"] == "megatron.training.config.dataset_config.GPTDatasetConfig"
-    assert "tokenizer" not in before and not (set(CONTAINER_WRITTEN_FIELDS) & set(before))
-    assert before["random_seed"] == 1234  # the seed is saved with the section
-    assert not {"split_matrix", "mock", "token_dtype_code"} & set(before)
-    assert before["blend"] == [["prefix-a", "prefix-b"], [0.3, 0.7]] and before["split"] == "9,1,0"
-    cfg.prepare(tokenizer)
-    after = cfg.to_cfg_dict()
-    assert after == before  # the real-data case derives nothing into a constructor field
-    restored = instantiate(
-        sanitize_dataclass_config(copy.deepcopy(after)), mode=InstantiationMode.STRICT
+    data = DataConfig(
+        dataset=_dataset(blend=BLEND, split="9,1,0", data_parallel_size=4, full_validation=True),
+        dataset_type=GPTDataset,
     )
-    assert type(restored) is GPTDatasetConfig and not restored.is_prepared
-    assert restored.tokenizer is None and restored.data_parallel_size == 1
-    assert restored.full_validation is None
-    assert restored.random_seed == 1234
-    assert restored.to_cfg_dict() == after
-    fim = _fim().to_cfg_dict()
+    before = data.to_cfg_dict()
+    assert before["_target_"] == "megatron.training.config.dataset_config.DataConfig"
+    section = before["dataset"]
+    assert section["_target_"] == "megatron.core.datasets.gpt_dataset.GPTDatasetConfig"
+    assert "tokenizer" not in section and not (set(CONTAINER_WRITTEN_FIELDS) & set(section))
+    assert section["random_seed"] == 1234  # the seed is saved with the section
+    assert not {"split_matrix", "mock", "token_dtype_code"} & set(section)
     assert (
-        fim["_target_"].endswith(".GPTFIMDatasetConfig") and fim["fim_extra_tokens"] == FIM_TOKENS
+        section["blend"] == [["prefix-a", "prefix-b"], [0.3, 0.7]] and section["split"] == "9,1,0"
     )
+    assert before["dataset_type"] is GPTDataset and before["dataloader"]["num_workers"] == 2
+    data.bind_tokenizer(tokenizer)
+    assert data.to_cfg_dict() == before  # binding derives nothing into a constructor field
+    restored = instantiate(
+        sanitize_dataclass_config(copy.deepcopy(before)), mode=InstantiationMode.STRICT
+    )
+    assert type(restored) is DataConfig and type(restored.dataset) is GPTDatasetConfig
+    assert restored.dataset.tokenizer is None and restored.dataset.data_parallel_size == 1
+    assert restored.dataset.full_validation is None and restored.dataset.random_seed == 1234
+    assert restored.to_cfg_dict() == before
+    fim = DataConfig(dataset=_fim()).to_cfg_dict()["dataset"]
+    assert fim["_target_"] == "megatron.core.datasets.gpt_fim_dataset.GPTFIMDatasetConfig"
+    assert fim["fim_extra_tokens"] == FIM_TOKENS
     assert type(instantiate(fim, mode=InstantiationMode.STRICT)) is GPTFIMDatasetConfig
-    # A mock run records the split Megatron Core chose: the saved file is a snapshot of the
-    # effective inputs.
-    mock = _dataset()
-    mock.prepare(tokenizer)
-    assert mock.to_cfg_dict()["split"] == "1,1,1"
+    # A mock section records the even split Megatron Core chose at construction: the saved file is
+    # a snapshot of the effective inputs.
+    assert DataConfig(dataset=_dataset()).to_cfg_dict()["dataset"]["split"] == "1,1,1"
+    assert DataConfig().to_cfg_dict()["dataset"] is None
 
 
 def test_data_section_round_trips_through_yaml_with_the_class():
@@ -334,6 +221,7 @@ def test_data_section_round_trips_through_yaml_with_the_class():
         dataset_type=GPTDataset,
     )
     as_dict = ConfigContainerBase._convert_value_to_dict(data)
+    assert as_dict == data.to_cfg_dict()
     with safe_yaml_representers():
         text = yaml.safe_dump(as_dict, default_flow_style=False)
     assert "_call_: false" in text and "gpt_dataset.GPTDataset" in text
@@ -342,7 +230,7 @@ def test_data_section_round_trips_through_yaml_with_the_class():
     assert type(restored) is DataConfig and restored.dataset_type is GPTDataset
     assert restored.dataloader == data.dataloader
     assert type(restored.dataset) is GPTDatasetConfig and restored.dataset.tokenizer is None
-    assert restored.dataset.to_cfg_dict() == data.dataset.to_cfg_dict()
+    assert restored.to_cfg_dict() == data.to_cfg_dict()
     restored.validate()
     restored.finalize()
     assert restored.dataset_type is GPTDataset
@@ -431,15 +319,15 @@ def test_loader_only_section():
         data.dataset_build()
 
 
-def test_finalize_commits_the_class_and_dataset_build_needs_a_prepared_config(tokenizer):
+def test_finalize_commits_the_class_and_dataset_build_needs_the_tokenizer(tokenizer):
     data = DataConfig(dataset=_dataset(), dataloader=DataloaderConfig(dataloader_type="cyclic"))
     data.validate()
     assert data.dataset_type is None  # validation does not write
     data.finalize()
     assert data.dataset_type is MockGPTDataset and data.dataloader.dataloader_type == "cyclic"
-    with pytest.raises(RuntimeError, match="not prepared"):
+    with pytest.raises(RuntimeError, match="no tokenizer bound"):
         data.dataset_build()
-    data.dataset.prepare(tokenizer)
+    data.bind_tokenizer(tokenizer)
     dataset_type, config, packed = data.dataset_build()
     assert dataset_type is MockGPTDataset and config is data.dataset and packed is False
     data.finalize()  # idempotent
@@ -447,7 +335,7 @@ def test_finalize_commits_the_class_and_dataset_build_needs_a_prepared_config(to
     sft = DataConfig(dataset=_dataset(), dataset_type=MockSFTDataset)
     sft.validate()
     sft.finalize()
-    sft.dataset.prepare(tokenizer)
+    sft.bind_tokenizer(tokenizer)
     assert sft.dataset_build()[2] is True
 
 

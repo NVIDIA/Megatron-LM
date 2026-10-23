@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import os
@@ -110,9 +110,14 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     TODO: drop this field once a functional test covers THD-vs-SBHD numerical
     parity in CI."""
 
-    def __post_init__(self) -> None:
-        """Do asserts and set fields post init"""
-        super().__post_init__()
+    def validate(self) -> None:
+        """Validate the config and derive ``token_dtype_code``; needs the tokenizer.
+
+        What ``__post_init__`` did before: a config can be constructed before its tokenizer exists
+        and completed later, so run this once it is complete (``BlendedMegatronDatasetBuilder`` runs
+        it before building).
+        """
+        super().validate()
 
         assert self.tokenizer is not None
 

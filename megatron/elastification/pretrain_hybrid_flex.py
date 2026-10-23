@@ -493,7 +493,7 @@ def flex_data_config_from_args(args, *, standalone=False):
 
 def core_gpt_dataset_config_from_args(args):
     """The legacy call shape for this entry point: the shared
-    ``argument_utils.core_gpt_dataset_config_from_args`` after the varlen check, prepared with the
+    ``argument_utils.core_gpt_dataset_config_from_args`` after the varlen check, bound to the
     run's tokenizer as before (the provider builds from ``cfg.data``)."""
     _reject_varlen(args)
     return argument_utils.core_gpt_dataset_config_from_args(args, tokenizer=get_tokenizer())

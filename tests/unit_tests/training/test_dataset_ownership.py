@@ -13,7 +13,8 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from megatron.core.datasets.gpt_dataset import GPTDataset, MockGPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -30,15 +31,12 @@ from megatron.training.config import (
     CheckpointConfig,
     DataConfig,
     DataloaderConfig,
-    GPTDatasetConfig,
-    GPTFIMDatasetConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     PretrainConfigContainer,
 )
 from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
-from megatron.training.datasets.fim_dataset import GPTFIMDataset
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset
 
@@ -212,7 +210,7 @@ def test_container_from_args_builds_the_core_fields_from_every_data_argument(
     )
     # Runtime state and the fields the container writes are not taken from the arguments by the
     # container factory.
-    assert dataset.tokenizer is None and not dataset.is_prepared
+    assert dataset.tokenizer is None
     assert _written_fields(dataset) == CORE_DEFAULTS
     assert data.dataloader == DataloaderConfig(
         dataloader_type="cyclic", num_workers=0, data_sharding=False
@@ -509,13 +507,13 @@ def test_layout_without_a_model_section_survives_a_reload(
     cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     cfg.finalize()
-    cfg.data.dataset.prepare(tokenizer)
+    cfg.data.bind_tokenizer(tokenizer)
     layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_FIELDS)
     assert layout == (1, None, 0, False)
-    cfg.validate()  # the prepared defaults are not explicit values
+    cfg.validate()  # Core's defaults are not explicit values
     reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
     reloaded.finalize()
-    reloaded.data.dataset.prepare(tokenizer)
+    reloaded.data.bind_tokenizer(tokenizer)
     assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_FIELDS) == layout
 
 
@@ -535,7 +533,7 @@ def test_owned_fields_without_a_model_section(container_factory, tokenizer):
     assert dataset.full_validation is True and dataset.multiple_validation_sets is False
     assert dataset.data_parallel_size == 4 and dataset.context_parallel_size is None
     assert "data_parallel_size" not in cfg.to_dict()["data"]["dataset"]
-    dataset.prepare(tokenizer)  # Core's defaults stay on the rest of the layout
+    cfg.data.bind_tokenizer(tokenizer)  # Core's defaults stay on the rest of the layout
     assert (dataset.sequence_parallel_size, dataset.hybrid_context_parallel) == (0, False)
     cfg.validate()
 
@@ -622,7 +620,7 @@ def test_model_capacity_must_cover_the_sample_length(container_factory):
 # Serialization and loading.
 
 
-def test_full_container_round_trips_before_and_after_prepare(
+def test_full_container_round_trips_before_and_after_binding_the_tokenizer(
     container_factory, files, monkeypatch, tmp_path, tokenizer
 ):
     _, cfg = container_factory(_data_argv(files), data=True)
@@ -638,7 +636,7 @@ def test_full_container_round_trips_before_and_after_prepare(
     assert (
         restored.data.dataset_type is GPTDataset and type(restored.data.dataset) is GPTDatasetConfig
     )
-    assert restored.data.dataset.to_cfg_dict() == cfg.data.dataset.to_cfg_dict()
+    assert restored.data.to_cfg_dict() == cfg.data.to_cfg_dict()
     assert restored.to_dict() == serialized
     path = tmp_path / "run_config.yaml"
     cfg.to_yaml(str(path))
@@ -647,20 +645,20 @@ def test_full_container_round_trips_before_and_after_prepare(
     assert "tokenizer" not in yaml.safe_load(text)["data"]["dataset"]
     from_file = PretrainConfigContainer.from_yaml(str(path))
     assert from_file.data.dataset_type is GPTDataset
-    assert from_file.data.dataset.to_cfg_dict() == cfg.data.dataset.to_cfg_dict()
-    # After finalize() and prepare() the file still carries no runtime state.
+    assert from_file.data.to_cfg_dict() == cfg.data.to_cfg_dict()
+    # After finalize() and binding the tokenizer the file still carries no runtime state.
     cfg.model = None
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 2)
     cfg.finalize()
-    cfg.data.dataset.prepare(tokenizer)
-    assert cfg.data.dataset.is_prepared
+    cfg.data.bind_tokenizer(tokenizer)
+    assert cfg.data.dataset.tokenizer is tokenizer
     after = cfg.to_dict()
     assert (
         "tokenizer" not in after["data"]["dataset"]
         and after["data"]["dataset"] == section["dataset"]
     )
     reloaded = PretrainConfigContainer.from_dict(after)
-    assert not reloaded.data.dataset.is_prepared
+    assert reloaded.data.dataset.tokenizer is None
     assert reloaded.data.dataset.random_seed == cfg.data.dataset.random_seed  # saved with it
     reloaded.validate()
     reloaded.finalize()
@@ -696,7 +694,7 @@ def test_inference_container_is_unaffected():
 # The runtime services bind the tokenizer.
 
 
-def test_runtime_services_prepare_a_finalized_dataset_config(
+def test_runtime_services_bind_the_tokenizer_to_a_finalized_dataset_config(
     container_factory, monkeypatch, tokenizer
 ):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
@@ -704,27 +702,27 @@ def test_runtime_services_prepare_a_finalized_dataset_config(
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", tokenizer)
     with pytest.raises(RuntimeError, match="before the container is finalized"):
-        global_vars._prepare_dataset_config(cfg)  # the owned fields are not written yet
-    assert not cfg.data.dataset.is_prepared
+        global_vars._bind_dataset_tokenizer(cfg)  # the owned fields are not written yet
+    assert cfg.data.dataset.tokenizer is None
     cfg.finalize()
-    global_vars._prepare_dataset_config(cfg)
-    assert cfg.data.dataset.is_prepared and cfg.data.dataset.tokenizer is tokenizer
-    global_vars._prepare_dataset_config(cfg)  # idempotent for the run's tokenizer
-    # A config prepared with another tokenizer is not silently kept: prepare() decides.
+    global_vars._bind_dataset_tokenizer(cfg)
+    assert cfg.data.dataset.tokenizer is tokenizer
+    global_vars._bind_dataset_tokenizer(cfg)  # idempotent for the run's tokenizer
+    # A config bound to another tokenizer is not silently kept: bind_tokenizer() decides.
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", SimpleNamespace(vocab_size=2048))
     with pytest.raises(RuntimeError, match="another tokenizer"):
-        global_vars._prepare_dataset_config(cfg)
+        global_vars._bind_dataset_tokenizer(cfg)
     assert cfg.data.dataset.tokenizer is tokenizer
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", None)
     _, loader_only = container_factory(["--seq-length", "64"])
     loader_only.finalize()
-    global_vars._prepare_dataset_config(loader_only)  # nothing to prepare
+    global_vars._bind_dataset_tokenizer(loader_only)  # nothing to bind
     _, unbound = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     unbound.model = None
     unbound.finalize()
-    global_vars._prepare_dataset_config(unbound)  # no tokenizer (build_tokenizer=False)
-    assert not unbound.data.dataset.is_prepared
-    with pytest.raises(RuntimeError, match="not prepared"):
+    global_vars._bind_dataset_tokenizer(unbound)  # no tokenizer (build_tokenizer=False)
+    assert unbound.data.dataset.tokenizer is None
+    with pytest.raises(RuntimeError, match="no tokenizer bound"):
         unbound.data.dataset_build()
 
 
@@ -751,7 +749,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)  # the bootstrap registers them
     global_vars.set_global_variables(args, cfg)
     assert global_vars.get_run_config() is cfg and cfg._finalized
-    assert cfg.data.dataset.is_prepared and cfg.data.dataset.tokenizer is tokenizer
+    assert cfg.data.dataset.tokenizer is tokenizer
     dataset_type, config, _ = cfg.data.dataset_build()
     assert dataset_type is MockGPTDataset and config is cfg.data.dataset
     for name in globals_:

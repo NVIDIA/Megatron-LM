@@ -1,13 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The ``data`` section of ``PretrainConfigContainer``: one dataset config, the loader settings and
-the dataset class.
+"""The ``data`` section of ``PretrainConfigContainer``: Megatron Core's GPT dataset config, the loader
+settings and the dataset class.
 
-``GPTDatasetConfig`` here *is* Megatron Core's GPT dataset config: the same fields, consumed by
-``BlendedMegatronDatasetBuilder`` as is. It defers Core's ``__post_init__``, which needs a tokenizer,
-until ``prepare(tokenizer)`` runs it in full, once; the container is built from the arguments before
-the tokenizer exists (Megatron-Bridge defers it the same way). It declares no field of its own:
+``DataConfig.dataset`` is ``megatron.core.datasets.gpt_dataset.GPTDatasetConfig`` itself (or its FIM
+subclass), the object ``BlendedMegatronDatasetBuilder`` consumes, constructed from the arguments or
+a YAML file before the tokenizer exists: Core checks the blend and split at construction and keeps
+the checks that need a tokenizer in ``validate()``, which ``DataConfig.bind_tokenizer`` runs once the
+runtime services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Six fields are owned by other container sections (the parallel layout,
+saved with the section. Six Core fields are owned by other container sections (the parallel layout,
 the validation flags): the container writes them at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``)
 and they are not serialized with the section.
 
@@ -22,8 +23,8 @@ nothing here runs for them.
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as MCoreGPTDatasetConfig
-from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig as RuntimeGPTFIMDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
 
 DATALOADER_TYPES = ("single", "cyclic", "external")
 DATASET_FAMILIES = ("gpt", "fim", "varlen", "sft")
@@ -40,7 +41,6 @@ CONTAINER_WRITTEN_FIELDS = (
     "multiple_validation_sets",
     "full_validation",
 )
-_FIM_TOKEN_KEYS = ("prefix", "middle", "suffix", "pad", "eod")
 
 
 @dataclass(kw_only=True)
@@ -87,161 +87,11 @@ class DataloaderConfig:
             self.persistent_workers = False
 
 
-@dataclass(kw_only=True)
-class GPTDatasetConfig(MCoreGPTDatasetConfig):
-    """Megatron Core's GPT dataset config, constructed before the tokenizer exists.
-
-    Same fields as ``megatron.core.datasets.gpt_dataset.GPTDatasetConfig`` (imported as
-    ``MCoreGPTDatasetConfig`` where both are visible), consumed by ``BlendedMegatronDatasetBuilder``
-    as is. Core's ``__post_init__`` asserts a tokenizer and derives ``split_matrix``, ``mock`` and
-    ``token_dtype_code``; here it is deferred: ``prepare(tokenizer)`` binds the tokenizer and runs
-    it in full, once. ``validate()`` gives earlier, tokenizer-free errors for the same rules.
-
-    Core's invariant holds: an object holding a tokenizer has run Core's post-init (``is_prepared``).
-    A tokenizer given to the constructor is bound through ``prepare()`` right away, so a config
-    built the Core way behaves as Core's; without one the object waits for ``prepare()``.
-
-    No field is declared here: ``random_seed`` is Core's required constructor argument (the
-    factory fills it from ``--seed``; it is the dataset's own setting, saved with the section), and
-    the fields other sections own keep Core's fields and defaults until the container writes them.
-    A prepared object is shared by reference with every dataset built from it and is not edited
-    afterwards: build a new object for a differently configured run.
-    """
-
-    def __post_init__(self) -> None:
-        """Deferred: Megatron Core's post-init runs in ``prepare()``. A tokenizer passed to the
-        constructor is bound through it now."""
-        tokenizer, self.tokenizer = self.tokenizer, None
-        if tokenizer is not None:
-            self.prepare(tokenizer)
-
-    @property
-    def is_prepared(self) -> bool:
-        """Whether ``prepare()`` ran: the tokenizer is bound and Core's derived fields are set."""
-        return self.tokenizer is not None
-
-    def validate(self) -> None:
-        """Tokenizer-free checks, as ``ValueError``s; no files, no mutation.
-
-        These restate the rules Megatron Core asserts in ``__post_init__`` (which ``prepare()``
-        runs, and which stays authoritative) so a bad section fails at container validation.
-        """
-        if not isinstance(self.sequence_length, int) or self.sequence_length <= 0:
-            raise ValueError(
-                f"sequence_length must be a positive integer, got {self.sequence_length!r}."
-            )
-        for name in ("reset_position_ids", "reset_attention_mask", "eod_mask_loss"):
-            if getattr(self, name) is None:
-                raise ValueError(f"{name} must be set (True or False).")
-        if self.num_dataset_builder_threads <= 0:
-            raise ValueError("num_dataset_builder_threads must be positive.")
-        if self.fast_cache_load and self.path_to_cache is None:
-            raise ValueError("fast_cache_load requires path_to_cache (--data-cache-path).")
-        if self.fast_cache_load and self.blend is not None:
-            raise ValueError(
-                "fast_cache_load cannot be used with blend (--data-path); declare blend_per_split."
-            )
-        if self.defer_npy_index_mmap and self.path_to_cache is None:
-            raise ValueError("defer_npy_index_mmap requires path_to_cache (--data-cache-path).")
-        if self.varlen_sbhd_validation and self.hybrid_context_parallel:
-            raise ValueError("varlen_sbhd_validation is incompatible with hybrid_context_parallel.")
-        self._validate_sources()
-
-    def _validate_sources(self) -> None:
-        """Megatron Core's blend / split rules, as ``ValueError``s."""
-        if self.blend_per_split is not None and any(self.blend_per_split):
-            if self.blend is not None:
-                raise ValueError("blend and blend_per_split are incompatible.")
-            if self.split is not None:
-                raise ValueError("split and blend_per_split are incompatible.")
-            if len(self.blend_per_split) != 3:
-                raise ValueError("blend_per_split must contain 3 blends (train, valid, test).")
-            for item in self.blend_per_split:
-                _validate_blend(item, "blend_per_split")
-        elif self.blend is not None:
-            _validate_blend(self.blend, "blend")
-            if self.split is None:
-                raise ValueError("split must be provided when blend is set.")
-
-    def prepare(self, tokenizer: Any) -> None:
-        """Bind the tokenizer and run Megatron Core's ``__post_init__`` in full, once.
-
-        Idempotent for the same tokenizer; a different tokenizer is an error (build a new object
-        for a different run). When Core's post-init fails the tokenizer stays unbound: the object
-        is not prepared.
-        """
-        if tokenizer is None:
-            raise ValueError("prepare() needs a tokenizer.")
-        if self.tokenizer is not None:
-            if tokenizer is self.tokenizer:
-                return
-            raise RuntimeError(
-                "This dataset config is already prepared with another tokenizer; build a new "
-                "config for a differently configured run."
-            )
-        self.tokenizer = tokenizer
-        try:
-            MCoreGPTDatasetConfig.__post_init__(self)
-        except Exception:
-            self.tokenizer = None
-            raise
-
-    def to_cfg_dict(self) -> dict[str, Any]:
-        """Serialize the section: every constructor field except the tokenizer and the fields other
-        sections own.
-
-        ``init=False`` fields (``split_matrix``, ``mock``, ``token_dtype_code``) are derived by
-        ``prepare()`` and never written; the fields other sections own
-        (``CONTAINER_WRITTEN_FIELDS``) are recorded once, in their owning sections.
-        """
-        from megatron.training.config.container import ConfigContainerBase
-
-        out: dict[str, Any] = {"_target_": f"{type(self).__module__}.{type(self).__qualname__}"}
-        for f in fields(self):
-            if not f.init or f.name == "tokenizer" or f.name in CONTAINER_WRITTEN_FIELDS:
-                continue
-            out[f.name] = ConfigContainerBase._convert_value_to_dict(getattr(self, f.name))
-        return out
-
-
-def _validate_blend(blend: Any, name: str) -> None:
-    if blend is None:
-        return
-    if len(blend) != 2:
-        raise ValueError(f"{name} must be (prefixes, weights), got {blend!r}.")
-    prefixes, weights = blend
-    if weights is not None and len(prefixes) != len(weights):
-        raise ValueError(f"{name} prefixes and weights must be equal in number.")
-
-
-@dataclass(kw_only=True)
-class GPTFIMDatasetConfig(GPTDatasetConfig, RuntimeGPTFIMDatasetConfig):
-    """``GPTDatasetConfig`` with the six fill-in-the-middle fields of the runtime
-    ``megatron.training.datasets.fim_dataset.GPTFIMDatasetConfig`` (``fim_rate``, ``fim_spm_rate``,
-    ``fim_extra_tokens``, ``fim_split_sample``, ``fim_fragment_rate``, ``fim_no_prefix``), which
-    ``GPTFIMDataset`` reads. On the CLI the five ``--fim-*-token`` flags are folded into
-    ``fim_extra_tokens``."""
-
-    def validate(self) -> None:
-        """The shared checks, then the FIM checks ``validate_args`` applies to ``--fim-data``."""
-        super().validate()
-        if not self.fim_rate:
-            raise ValueError("fim_rate should be specified (--fim-rate).")
-        if not self.fim_spm_rate:
-            raise ValueError("fim_spm_rate should be specified (--fim-spm-rate).")
-        tokens = self.fim_extra_tokens
-        if tokens is None or any(tokens.get(key) is None for key in _FIM_TOKEN_KEYS):
-            raise ValueError(
-                "FIM extra tokens should be specified: fim_extra_tokens needs the keys "
-                f"{_FIM_TOKEN_KEYS}."
-            )
-
-
 def _dataset_class_table() -> dict[str, tuple[type, type | None]]:
     """Family -> (dataset class, mock dataset class). Imported lazily: the dataset modules are not
     part of the config import path."""
     from megatron.core.datasets.gpt_dataset import GPTDataset, MockGPTDataset
-    from megatron.training.datasets.fim_dataset import GPTFIMDataset
+    from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset
     from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
     from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
@@ -278,14 +128,14 @@ def classify_dataset_class(dataset_type: Any) -> tuple[str, bool]:
     )
 
 
-def has_data_source(dataset: MCoreGPTDatasetConfig) -> bool:
+def has_data_source(dataset: GPTDatasetConfig) -> bool:
     """Whether a blend is declared (Megatron Core's rule for ``mock``, inverted)."""
     if dataset.blend is not None:
         return True
     return dataset.blend_per_split is not None and any(dataset.blend_per_split)
 
 
-def is_packed_sequence(dataset_type: type, dataset: MCoreGPTDatasetConfig) -> bool:
+def is_packed_sequence(dataset_type: type, dataset: GPTDatasetConfig) -> bool:
     """Packed (THD) samples: built on every pipeline stage, and get_batch expects cu_seqlens."""
     family, _mock = classify_dataset_class(dataset_type)
     if family == "sft":
@@ -359,7 +209,8 @@ class DataConfig:
     """
 
     dataset: GPTDatasetConfig | None = None
-    """The one dataset config, handed to ``BlendedMegatronDatasetBuilder`` as is."""
+    """Megatron Core's GPT dataset config (or ``GPTFIMDatasetConfig``), handed to
+    ``BlendedMegatronDatasetBuilder`` as is."""
 
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
     """Loader settings."""
@@ -370,11 +221,12 @@ class DataConfig:
     Resolved at ``finalize()`` when unset. In YAML: ``{_target_: <module>.<class>, _call_: false}``."""
 
     def validate(self) -> None:
-        """Check the loader settings, the dataset config and the class / config agreement; no
-        mutation."""
+        """Check the loader settings and the class / config agreement; no mutation.
+
+        Megatron Core checks the dataset config itself: the blend and split rules at construction,
+        the rest in ``validate()``, which needs the tokenizer and runs in ``bind_tokenizer()``.
+        """
         self.dataloader.validate()
-        if self.dataset is not None:
-            self.dataset.validate()
         resolve_dataset_class(self.dataset, self.dataset_type)
 
     def finalize(self) -> None:
@@ -383,16 +235,65 @@ class DataConfig:
         if self.dataset is not None:
             self.dataset_type = resolve_dataset_class(self.dataset, self.dataset_type)
 
+    def bind_tokenizer(self, tokenizer: Any) -> None:
+        """Bind the run's tokenizer to the dataset config and run Megatron Core's ``validate()``.
+
+        The step between ``finalize()`` and the first build: ``initialize_runtime_services`` does it
+        once the tokenizer exists. Idempotent for the same tokenizer; another tokenizer is an error
+        (the datasets built from this config share it by reference: build a new config for a
+        differently configured run). Nothing happens for a loader-only section.
+        """
+        if self.dataset is None:
+            return
+        if tokenizer is None:
+            raise ValueError("bind_tokenizer() needs a tokenizer.")
+        if self.dataset.tokenizer is None:
+            self.dataset.tokenizer = tokenizer
+        elif self.dataset.tokenizer is not tokenizer:
+            raise RuntimeError(
+                "cfg.data.dataset is already bound to another tokenizer; build a new config for a "
+                "differently configured run."
+            )
+        self.dataset.validate()
+
     def dataset_build(self) -> tuple[type, GPTDatasetConfig, bool]:
-        """``(dataset class, prepared dataset config, is_packed_sequence)`` for the builder."""
+        """``(dataset class, dataset config with its tokenizer, is_packed_sequence)`` for the
+        builder."""
         if self.dataset is None or self.dataset_type is None:
             raise ValueError(
                 "cfg.data carries no dataset to build: construct the container with "
                 "data_cfg=gpt_data_config_from_args(args) and finalize it."
             )
-        if not self.dataset.is_prepared:
+        if self.dataset.tokenizer is None:
             raise RuntimeError(
-                "cfg.data.dataset is not prepared (no tokenizer bound): initialize_megatron() with "
-                "build_tokenizer=True prepares it, or call cfg.data.dataset.prepare(tokenizer)."
+                "cfg.data.dataset has no tokenizer bound: initialize_megatron() with "
+                "build_tokenizer=True binds the run's tokenizer, or call "
+                "cfg.data.bind_tokenizer(tokenizer)."
             )
         return self.dataset_type, self.dataset, is_packed_sequence(self.dataset_type, self.dataset)
+
+    def to_cfg_dict(self) -> dict[str, Any]:
+        """Serialize the section.
+
+        The dataset config is written with every constructor field except the tokenizer and the
+        fields other sections own (``CONTAINER_WRITTEN_FIELDS``, recorded once, in their owning
+        sections); Megatron Core's ``init=False`` fields (``split_matrix``, ``mock``,
+        ``token_dtype_code``) are derived and never written.
+        """
+        from megatron.training.config.container import ConfigContainerBase
+
+        convert = ConfigContainerBase._convert_value_to_dict
+        dataset = None
+        if self.dataset is not None:
+            cls = type(self.dataset)
+            dataset = {"_target_": f"{cls.__module__}.{cls.__qualname__}"}
+            for f in fields(self.dataset):
+                if not f.init or f.name == "tokenizer" or f.name in CONTAINER_WRITTEN_FIELDS:
+                    continue
+                dataset[f.name] = convert(getattr(self.dataset, f.name))
+        return {
+            "_target_": f"{type(self).__module__}.{type(self).__qualname__}",
+            "dataset": dataset,
+            "dataloader": convert(self.dataloader),
+            "dataset_type": convert(self.dataset_type),
+        }

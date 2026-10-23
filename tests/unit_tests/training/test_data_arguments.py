@@ -14,10 +14,10 @@ from unittest.mock import patch
 
 import pytest
 
+from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
 from megatron.training import argument_utils, arguments
 from megatron.training.argument_utils import gpt_data_config_from_args
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.config import GPTFIMDatasetConfig
 
 LEGACY = json.loads((Path(__file__).parent / "legacy_data_arguments.json").read_text())
 
@@ -96,10 +96,11 @@ def test_validate_args_keeps_the_legacy_data_normalizations(warnings_log):
     # (here the SFT mock distribution) explicitly, and serializes them as declared values.
     dataset = data.dataset
     assert dataset.sft_mock_dataset_config_json == args.sft_mock_dataset_config_json
-    assert (
-        dataset.to_cfg_dict()["sft_mock_dataset_config_json"] == args.sft_mock_dataset_config_json
-    )
-    assert dataset.split is None and data.dataloader.dataloader_type == "single"
+    section = data.to_cfg_dict()["dataset"]
+    assert section["sft_mock_dataset_config_json"] == args.sft_mock_dataset_config_json
+    # Megatron Core sets the even split of a mock config at construction; the arguments carry none.
+    assert args.split is None and dataset.split == "1,1,1"
+    assert data.dataloader.dataloader_type == "single"
     assert not hasattr(dataset, "phase_transition_iterations")
     varlen = _validated(["--use-varlen-dataset", "--mock-data", "--calculate-per-token-loss"])
     assert (

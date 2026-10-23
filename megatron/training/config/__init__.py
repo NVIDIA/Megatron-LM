@@ -2,12 +2,7 @@
 
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.container import InferenceConfigContainer, PretrainConfigContainer
-from megatron.training.config.dataset_config import (
-    DataConfig,
-    DataloaderConfig,
-    GPTDatasetConfig,
-    GPTFIMDatasetConfig,
-)
+from megatron.training.config.dataset_config import DataConfig, DataloaderConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import TargetAllowlist, target_allowlist
 from megatron.training.config.resilience_config import (
