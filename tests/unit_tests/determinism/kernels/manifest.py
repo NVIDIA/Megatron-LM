@@ -519,9 +519,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="gdn_pre_gated_delta_rule_fusion",
         sources=("megatron/core/fusions/fused_pre_gated_delta_rule.py",),
         kind="triton",
-        exempt_reason="Pre-GDR fusion is explicitly rejected with deterministic_mode=True. "
-        "Its backward uses atomic parameter-gradient reductions and timing-based autotuning; "
-        "numerical parity and the rejection guard are covered by the GDN fusion unit tests.",
+        exempt_reason="Full pre-GDR fusion still rejects deterministic_mode=True. "
+        "Other kernels use timing-based autotuning and convolution backward needs its external "
+        "determinism setting. Gate backward is tested separately; full-path numerical parity "
+        "and the rejection guard remain covered by the GDN fusion unit tests.",
+    ),
+    KernelEntry(
+        name="gdn_pre_gated_delta_rule_gate_backward",
+        sources=("megatron/core/fusions/fused_pre_gated_delta_rule.py",),
+        tests=(K + "test_gdn_gate_backward.py",),
+        kind="triton",
+        notes="Gate backward retains autotuned atomics by default; deterministic execution "
+        "selects a tile through the shared policy and reduces independent FP32 partials. "
+        "Replay checks both policy-selected tiles before the caller's BF16 cast.",
     ),
     KernelEntry(
         name="gdn_gated_output_norm_fusion",
