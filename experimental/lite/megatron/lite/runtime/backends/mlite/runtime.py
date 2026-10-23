@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
@@ -27,11 +28,18 @@ from megatron.lite.runtime.contracts.loss import (
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     """Construct typed impl config, backfilling hf_path + optimizer_config."""
+    validator = getattr(proto, "validate_impl_cfg_keys", None)
+    if validator is not None:
+        validator(rt_cfg.impl_cfg)
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
     # Only forward impl_cfg keys this model's ImplConfig declares: the connector
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
     impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
+    if "initialize_weights" in init_fields:
+        impl_cfg_kwargs.setdefault(
+            "initialize_weights", not (rt_cfg.load_hf_weights and rt_cfg.hf_path)
+        )
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
@@ -81,10 +89,7 @@ def _reset_parameters(module: torch.nn.Module) -> None:
                 )
             if original_local.data_ptr() != replacement_local.data_ptr():
                 original_local.copy_(
-                    replacement_local.to(
-                        device=original_local.device,
-                        dtype=original_local.dtype,
-                    )
+                    replacement_local.to(device=original_local.device, dtype=original_local.dtype)
                 )
             module._parameters[name] = original
 
@@ -414,6 +419,13 @@ class MegatronLiteRuntime(RuntimeBase):
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
+
+        # Complete overlapped DistOpt gathers before publishing updated weights.
+        wrapped = handle._model if isinstance(handle._model, (list, tuple)) else [handle._model]
+        for chunk in {id(c): c for c in [*model_chunks, *wrapped]}.values():
+            sync = getattr(chunk, "start_param_sync", None)
+            if callable(sync):
+                sync(force_sync=True)
 
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)

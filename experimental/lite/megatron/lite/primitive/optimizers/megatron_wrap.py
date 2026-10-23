@@ -159,14 +159,14 @@ def build_dist_opt_stack(
         # distinguish `hasattr(param,'allreduce')` from `getattr(..., True)`.
         wrapped_chunks = list(model_chunks)
     else:
-        ddp_config = DistributedDataParallelConfig(
-            # Core's DDP overlaps the gradient reduce-scatter and the parameter all-gather with compute; mcore's DSv4 configuration
-            # turns both on and hides 174 ms of NCCL per step behind the backward pass.
+        ddp_options = dict(
             use_distributed_optimizer=True,
             overlap_grad_reduce=True,
             overlap_param_gather=True,
             grad_reduce_in_fp32=True,
         )
+        ddp_options.update(getattr(engine_cfg, "ddp_config_overrides", {}))
+        ddp_config = DistributedDataParallelConfig(**ddp_options)
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
             chunk.model_type = ModelType.encoder_or_decoder
@@ -190,7 +190,9 @@ def build_dist_opt_stack(
 
     # Single-source-of-truth OptimizerConfig construction for native lite
     # model protocols.
-    opt_config = build_dist_opt_optimizer_config(opt)
+    opt_config = build_dist_opt_optimizer_config(
+        opt, override_optimizer_config=getattr(engine_cfg, "override_optimizer_config", None)
+    )
 
     # This branch falls back to Megatron-Core mpu globals for the optimizer's process
     # groups. Long term, this primitive should always pass its own
@@ -282,6 +284,7 @@ def _build_transformer_config(model_cfg, engine_cfg):
         moe_ffn_hidden_size=getattr(model_cfg, "moe_intermediate_size", None),
         tensor_model_parallel_size=p.tp,
         pipeline_model_parallel_size=p.pp,
+        pipeline_model_parallel_layout=getattr(p, "pp_layout", None),
         context_parallel_size=p.cp,
         expert_model_parallel_size=p.ep,
         expert_tensor_parallel_size=p.etp if p.etp is not None else 1,
