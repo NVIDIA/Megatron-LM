@@ -85,7 +85,7 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
                 data_parallel_sharding_strategy=inner_strategy,
                 num_distributed_optimizer_instances=outer_dp_size,
                 outer_dp_sharding_strategy=outer_strategy,
-                overlap_dp_outer_communication=overlap,
+                overlap_outer_communication=overlap,
                 # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
                 # params. Capturable FusedAdam in the TE revision under test requires
                 # matching dtypes (https://github.com/NVIDIA/TransformerEngine/issues/3358).
