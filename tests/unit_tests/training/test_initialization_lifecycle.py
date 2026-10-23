@@ -635,7 +635,6 @@ def test_callback_model_config_owns_shared_inputs(
     args.max_position_embeddings = 32
 
     assert type(cfg.model) is model_cls
-    assert cfg.model.builder is None
     assert cfg.model.transformer is transformer
     assert cfg.model.seq_length == 2048
     if model_cls is MimoModelConfig:
@@ -652,7 +651,6 @@ def test_callback_model_config_owns_shared_inputs(
         assert cfg.model.encoder_num_layers == 3
         assert not hasattr(cfg.model, "hybrid_layer_pattern")
     assert cfg.model.vocab_size == (256 if known_vocab is None else known_vocab)
-    assert model_cls.from_dict(model.as_dict()).as_dict() == model.as_dict()
     restored = PretrainConfigContainer.from_dict(cfg.to_dict())
     assert type(restored.model) is model_cls
     assert restored.to_dict() == cfg.to_dict()

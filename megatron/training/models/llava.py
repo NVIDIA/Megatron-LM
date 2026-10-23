@@ -4,11 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.base import ModelConfig
 
 
 @dataclass(kw_only=True)
-class LLaVAModelConfig(ModelConfig):
+class LLaVAModelConfig:
     """LLaVA language-model inputs used by the multimodal provider callbacks.
 
     Vision and projection specialization remains in those applications; this config

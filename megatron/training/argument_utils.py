@@ -38,7 +38,15 @@ from megatron.training.config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.models import GPTModelConfig, HybridModelConfig, ModelConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    HybridModelConfig,
+    LLaVAModelConfig,
+    MimoModelConfig,
+    ModelConfig,
+    T5ModelConfig,
+)
 
 # TODO: support arg renames
 
@@ -774,8 +782,13 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
 
 
 def model_config_from_args(
-    args: Namespace, *, model_config_cls: type[ModelConfig] | None = None
-) -> ModelConfig:
+    args: Namespace,
+    *,
+    model_config_cls: type[
+        ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig
+    ]
+    | None = None,
+) -> ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig:
     """Build a model-family config at the CLI boundary.
 
     BERT, T5, LLaVA, and MIMO applications select their config class explicitly.

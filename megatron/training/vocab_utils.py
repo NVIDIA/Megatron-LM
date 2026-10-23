@@ -7,10 +7,20 @@ from typing import TYPE_CHECKING
 from megatron.training.utils import print_rank_0
 
 if TYPE_CHECKING:
-    from megatron.training.models.base import ModelConfig
+    from megatron.training.models import (
+        BertModelConfig,
+        LLaVAModelConfig,
+        MimoModelConfig,
+        ModelConfig,
+        T5ModelConfig,
+    )
 
 
-def model_vocab_size(model_config: "ModelConfig", *, logging_enabled: bool = False) -> int:
+def model_vocab_size(
+    model_config: "ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig",
+    *,
+    logging_enabled: bool = False,
+) -> int:
     """Return the vocabulary dimension used to construct the configured model."""
     if model_config.vocab_size is None:
         raise ValueError("Model vocabulary must be resolved before model construction or warmup.")

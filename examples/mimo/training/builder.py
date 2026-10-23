@@ -22,7 +22,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.training.global_vars import get_args
-from megatron.training.models.base import ModelBuilder, compose_hooks
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.mimo import MimoModelConfig as MimoTrainingConfig
 
 _LANGUAGE_SEED_OFFSET = 0
@@ -31,7 +31,7 @@ _ENCODER_SEED_OFFSET = 10_000
 
 
 @dataclass(kw_only=True)
-class MimoBuildConfig(MimoTrainingConfig):
+class MimoBuildConfig(MimoTrainingConfig, ModelConfig):
     """Shared model inputs and runtime topology used by :class:`MimoModelBuilder`.
 
     ``_topology`` is underscore-prefixed so ``ModelConfig`` skips it during serialization;

@@ -40,7 +40,13 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import ProfilingConfig
 from megatron.training.global_vars import set_args
-from megatron.training.models import BertModelConfig, GPTModelConfig, MimoModelConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    LLaVAModelConfig,
+    MimoModelConfig,
+    T5ModelConfig,
+)
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -890,6 +896,9 @@ def test_save_checkpoint(
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
+@pytest.mark.parametrize(
+    "model_cls", [GPTModelConfig, BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig]
+)
 @pytest.mark.parametrize("owned_rng", [False, True])
 @pytest.mark.parametrize("iteration", [0, 123])
 @pytest.mark.parametrize(
@@ -904,6 +913,7 @@ def test_load_checkpoint(
     iteration,
     run_config,
     load_kwargs,
+    model_cls,
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
@@ -912,6 +922,11 @@ def test_load_checkpoint(
     args.use_dist_ckpt = ckpt_format != "torch"
     args.fp16 = False
     args.bf16 = False
+    kwargs = {"encoder_num_layers": 1} if model_cls is T5ModelConfig else {}
+    run_config.model = model_cls(transformer=run_config.model.transformer, seq_length=16, **kwargs)
+    # Live runtime callbacks are not part of the saved model configuration.
+    run_config.model.transformer.grad_scale_func = lambda value: value
+    run_config.model.transformer.no_sync_func = [lambda: None]
     rng_config = run_config.rng
     if owned_rng:
         rng_config.seed = 987
@@ -961,9 +976,20 @@ def test_load_checkpoint(
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
             assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
+        restored_config = type(run_config).from_yaml(
+            ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml"
+        )
+        assert type(restored_config.model) is model_cls
+        # The shared YAML comes from rank 0; distributed rank fields differ on other ranks.
+        assert restored_config.to_dict()["model"] == run_config.to_dict()["model"]
+        assert restored_config.model.transformer.grad_scale_func is None
+        assert restored_config.model.transformer.no_sync_func is None
 
         # Create new model, optimizer, and scheduler instances to load into.
         new_model = MockModel(config)
+        with torch.no_grad():
+            new_model.l.weight.zero_()
+            new_model.l.bias.fill_(1)
         new_optimizer = MockState({"optimizer": "dummy1"})
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 

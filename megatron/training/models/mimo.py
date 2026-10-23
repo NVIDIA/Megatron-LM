@@ -6,11 +6,10 @@ from typing import Any
 import torch
 
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.base import ModelConfig
 
 
 @dataclass(kw_only=True)
-class MimoModelConfig(ModelConfig):
+class MimoModelConfig:
     """MIMO language-grid inputs for the shared training lifecycle.
 
     Tower construction and topology remain owned by the MIMO application.

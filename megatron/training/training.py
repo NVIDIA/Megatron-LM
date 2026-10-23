@@ -170,6 +170,7 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
+from megatron.training.models import ModelConfig
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -2881,7 +2882,7 @@ def setup_model_and_optimizer(
 
     # A typed model config owns inputs without replacing an explicit application callback.
     use_model_builder = (
-        model_provider_func is None and cfg_container is not None and cfg.model.builder is not None
+        model_provider_func is None and cfg_container is not None and isinstance(cfg.model, ModelConfig)
     )
 
     def _build_model_wrapper(wrap_with_ddp: bool, transformer_config=None):

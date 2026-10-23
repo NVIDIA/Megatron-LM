@@ -17,6 +17,7 @@ from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer import TransformerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
@@ -35,7 +36,14 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import MimoModelConfig, Serializable
+from megatron.training.config_serialization import serialize_model_dataclass
+from megatron.training.models import (
+    BertModelConfig,
+    LLaVAModelConfig,
+    MimoModelConfig,
+    Serializable,
+    T5ModelConfig,
+)
 from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
@@ -248,6 +256,9 @@ class ConfigContainerBase:
         elif hasattr(value, "to_cfg_dict"):
             # Allow non-Container classes to implement own custom method
             return value.to_cfg_dict()
+        elif isinstance(value, TransformerConfig):
+            # Callback model configs use the same runtime-field exclusions as builder configs.
+            return serialize_model_dataclass(value)
         elif is_dataclass(value) and not isinstance(value, type):
             # Handle regular dataclasses
             result = {}
@@ -321,7 +332,7 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: ModelConfig
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
@@ -436,7 +447,9 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
         super()._finalize()
-        self.model.finalize()
+        finalize_model = getattr(self.model, "finalize", None)
+        if callable(finalize_model):
+            finalize_model()
         optimizer = self.finalize_optimizer_config(self.optimizer)
         (
             self.train.global_batch_size,
@@ -462,7 +475,7 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
-    model: ModelConfig
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoModelConfig
     """Which model to load for inference."""
 
     checkpoint: CheckpointConfig

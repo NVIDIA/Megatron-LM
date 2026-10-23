@@ -4,11 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.base import ModelConfig
 
 
 @dataclass(kw_only=True)
-class T5ModelConfig(ModelConfig):
+class T5ModelConfig:
     """T5 encoder-decoder inputs for the application's model provider."""
 
     transformer: TransformerConfig

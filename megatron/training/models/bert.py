@@ -4,11 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.base import ModelConfig
 
 
 @dataclass(kw_only=True)
-class BertModelConfig(ModelConfig):
+class BertModelConfig:
     """BERT model inputs; construction remains with the application's provider."""
 
     transformer: TransformerConfig

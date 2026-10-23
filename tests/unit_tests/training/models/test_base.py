@@ -353,6 +353,30 @@ class TestComposeHooks:
         assert composed(5) == 20  # 5 * 2 = 10, 10 + 10 = 20
 
 
+def test_mimo_builder_config_round_trip():
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+    from megatron.training.models import MimoModelConfig
+
+    config = MimoBuildConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=16,
+        vocab_size=128,
+        mimo_llm_world_size=2,
+        pre_wrap_hooks=[lambda models: models],
+        post_wrap_hooks=[lambda models: models],
+        _topology=object(),
+    )
+    serialized = config.as_dict()
+    restored = ModelConfig.from_dict(serialized)
+    assert isinstance(restored, MimoModelConfig)
+    assert restored.get_builder_cls() is MimoModelBuilder
+    assert restored.mimo_llm_world_size == 2
+    assert restored.pre_wrap_hooks == []
+    assert restored.post_wrap_hooks == []
+    assert restored._topology is None
+    assert restored.as_dict() == serialized
+
+
 @pytest.mark.parametrize("spec_name", ["hybrid_stack_spec", "gated_delta_product_stack_spec"])
 @pytest.mark.parametrize("yaml_roundtrip", [False, True])
 @pytest.mark.parametrize("customized", [False, True])

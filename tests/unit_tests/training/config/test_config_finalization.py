@@ -102,10 +102,13 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     assert run_config.rng.te_rng_tracker
 
 
+@pytest.mark.parametrize("storage", ["dict", "yaml"])
 @pytest.mark.parametrize(
     "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig]
 )
-def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config, model_cls):
+def test_serialization_starts_a_new_lifecycle(
+    monkeypatch, run_config, model_cls, storage, tmp_path
+):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     kwargs = {"encoder_num_layers": 2} if model_cls is T5ModelConfig else {}
     run_config.model = model_cls(
@@ -113,9 +116,25 @@ def test_serialization_starts_a_new_lifecycle(monkeypatch, run_config, model_cls
     )
     run_config.train.micro_batch_size = 1
     run_config.finalize()
+    # Training attaches live objects to the transformer; checkpoint metadata must omit them.
+    transformer = run_config.model.transformer
+    transformer.timers = object()
+    transformer.grad_scale_func = lambda value: value
+    transformer.no_sync_func = [lambda: None]
     serialized = run_config.to_dict()
     assert "_finalized" not in serialized
-    restored = type(run_config).from_dict(serialized)
+    for name in ("timers", "grad_scale_func", "no_sync_func"):
+        assert name not in serialized["model"]["transformer"]
+    if storage == "yaml":
+        path = tmp_path / "run_config.yaml"
+        run_config.to_yaml(path)
+        restored = type(run_config).from_yaml(path)
+    else:
+        restored = type(run_config).from_dict(serialized)
+    assert type(restored.model) is model_cls
+    assert restored.model.transformer.timers is None
+    assert restored.model.transformer.grad_scale_func is None
+    assert restored.model.transformer.no_sync_func is None
     assert not restored._finalized
     assert restored.to_dict() == serialized
     restored.finalize()
