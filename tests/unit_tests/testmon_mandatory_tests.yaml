@@ -11,6 +11,16 @@
 # bucket's selection. Naming a whole bucket runs that bucket exhaustively.
 mappings:
   - source_dirs:
+      - pyproject.toml
+      - uv.lock
+      - docker/Dockerfile.ci.dev
+      - docker/common/prepare_optional_backends.py
+    test_buckets:
+      dgx_h100:
+        - tests/unit_tests/resharding/test_model_swap.py
+      dgx_gb200:
+        - tests/unit_tests/inference/contexts/test_dynamic_context.py
+  - source_dirs:
       - megatron/core/distributed/fsdp/src/megatron_fsdp/experimental
     test_buckets:
       dgx_h100:

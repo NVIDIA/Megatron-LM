@@ -103,6 +103,19 @@ fi
 # Convert ENVIRONMENT to lowercase for internal use
 ENVIRONMENT=$(echo "$ENVIRONMENT" | tr '[:upper:]' '[:lower:]')
 
+# These dev buckets validate optional backends installed in the CI image.
+# Missing dependencies must fail their tests instead of silently skipping them.
+if [[ "$TAG" == "latest" && "$ENVIRONMENT" == "dev" ]]; then
+    case "$PLATFORM:$BUCKET" in
+    "h100:tests/unit_tests/resharding/**/*.py")
+        export MCORE_REQUIRE_NVSHMEM=1
+        ;;
+    "gb200:tests/unit_tests/inference/**/*.py")
+        export MCORE_REQUIRE_FA4=1
+        ;;
+    esac
+fi
+
 if [[ "$TAG" == "latest" ]]; then
     TEST_PATH="/opt/megatron-lm"
 else

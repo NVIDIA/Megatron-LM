@@ -9,7 +9,6 @@ and event lifecycle.
 
 import logging
 import os
-from importlib import metadata
 from typing import Dict, Optional
 
 from ..compat import ensure_nvshmem_compat, get_cuda_core_device_class
@@ -84,30 +83,28 @@ class GPUResourceManager:
         allow_unsupported_nvshmem = (
             os.environ.get("MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION", "0") == "1"
         )
-        try:
-            nvshmem_pkg_version = metadata.version("nvidia-nvshmem-cu12")
-            version_parts = tuple(int(part) for part in nvshmem_pkg_version.split(".")[:3])
-            if version_parts < min_nvshmem_version:
-                version_msg = (
-                    f"Installed nvidia-nvshmem-cu12=={nvshmem_pkg_version} is older than "
-                    "the recommended minimum 3.6.5. Previous NVSHMEM versions had "
-                    "known bugs with split NVLink-domain PE layouts and could crash "
-                    "in nvshmemi_team_init / nvshmemx_hostlib_init_attr."
-                )
-                if allow_unsupported_nvshmem:
-                    logger.warning(version_msg)
-                else:
-                    raise RuntimeError(
-                        version_msg
-                        + (
-                            " Set MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION=1 "
-                            "if you intentionally want to try an older version."
-                        )
-                    )
-        except metadata.PackageNotFoundError:
-            logger.warning(
-                "Could not determine nvidia-nvshmem-cu12 package version for NVSHMEM safety check."
+        # Query the library loaded by the bindings, not a CUDA-specific wheel's
+        # metadata: CUDA 12/13 wheels or a system library may supply the runtime.
+        # NVSHMEM4Py supports this query before initialization.
+        nvshmem_version = nvshmem.core.get_version().libnvshmem_version
+        version_parts = tuple(int(part) for part in nvshmem_version.split(".")[:3])
+        if version_parts < min_nvshmem_version:
+            version_msg = (
+                f"Loaded NVSHMEM library {nvshmem_version} is older than "
+                "the recommended minimum 3.6.5. Previous NVSHMEM versions had "
+                "known bugs with split NVLink-domain PE layouts and could crash "
+                "in nvshmemi_team_init / nvshmemx_hostlib_init_attr."
             )
+            if allow_unsupported_nvshmem:
+                logger.warning(version_msg)
+            else:
+                raise RuntimeError(
+                    version_msg
+                    + (
+                        " Set MEGATRON_NVSHMEM_ALLOW_UNSUPPORTED_VERSION=1 "
+                        "if you intentionally want to try an older version."
+                    )
+                )
 
         # This path can hang during initialization when the CTA limit is higher.
         max_ctas = os.environ.get("NVSHMEM_MAX_CTAS")

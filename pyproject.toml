@@ -17,6 +17,7 @@ include = [
 
 [tool.setuptools.package-data]
 "megatron.core.allocator" = ["csrc/*.cpp"]
+"megatron.core.resharding.nvshmem_copy_service" = ["kernels/*.cu"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
@@ -121,8 +122,22 @@ dev = [
     "zstandard",
 ]
 
+# CUDA 13 backends used by MCore inference. Keep these requirements published so
+# downstream projects can inherit them without copying CI-only uv overrides.
 inference = [
     "torch-memory-saver",
+    # FA2 2.8.3 also owns flash_attn.cute and can overwrite the FA4 package.
+    "flash-attn>=2.8.2,<2.8.3; sys_platform == 'linux'",
+    "flash-attn-4[cu13]>=4.0.0b36,<4.1; sys_platform == 'linux'",
+    # These DSA kernels also support training.
+    "tilelang>=0.1.12,<0.1.13; sys_platform == 'linux'",
+]
+
+# Optional CUDA 13 train-to-inference weight transfer backend.
+nvshmem = [
+    "nvshmem4py-cu13>=0.4.1,<0.5; sys_platform == 'linux'",
+    "cupy-cuda13x>=14,<15; sys_platform == 'linux'",
+    "nvidia-nvshmem-cu13>=3.6.5,<4; sys_platform == 'linux'",
 ]
 
 otel = [
@@ -201,6 +216,7 @@ default-groups = ["linting", "build", "test"]
 # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
 constraint-dependencies = ["quack-kernels>=0.6.5"]
 no-build-isolation-package = [
+    "flash-attn",
     "causal-conv1d",
     "flash_mla",
     "mamba-ssm",
@@ -221,6 +237,8 @@ override-dependencies = [
     "triton; sys_platform == 'never'",
     "tilelang==0.1.12",
     "apache-tvm-ffi==0.1.11",
+    # Match NGC/DeepEP rather than the older runtime required by PyPI PyTorch.
+    "nvidia-nvshmem-cu13==3.7.1",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]

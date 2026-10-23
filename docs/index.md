@@ -106,6 +106,7 @@ user-guide/observability/extending
 :caption: Developer Guide
 
 developer/contribute
+developer/optional-backends
 developer/submit
 developer/oncall
 developer/generate_docs
