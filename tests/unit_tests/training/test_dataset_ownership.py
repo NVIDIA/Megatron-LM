@@ -1,10 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """The data section is owned by PretrainConfigContainer: construction from the arguments, the
-mirrors the container writes, the lifecycle and the serialization."""
+fields the container writes, the lifecycle and the serialization."""
 
 import copy
 import json
+import re
 from argparse import ArgumentParser, Namespace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -36,7 +37,7 @@ from megatron.training.config import (
     PretrainConfigContainer,
 )
 from megatron.training.config import container as container_module
-from megatron.training.config.dataset_config import LAYOUT_MIRRORS, MIRROR_FIELDS, mirror_is_unset
+from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.fim_dataset import GPTFIMDataset
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset
@@ -48,6 +49,19 @@ MODEL_ARGV = (
 ).split()
 SOURCE = ["--data-path", "prefix-a", "--split", "9,1,0"]
 BLEND = (["prefix-a", "prefix-b"], [0.3, 0.7])
+# The layout fields the container writes from the model config; a run without one keeps them.
+LAYOUT_FIELDS = (
+    "data_parallel_size", "context_parallel_size", "sequence_parallel_size", "hybrid_context_parallel",
+)  # fmt: skip
+# Megatron Core's defaults for the fields the container writes: what an unset field holds.
+CORE_DEFAULTS = {
+    "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
+    "hybrid_context_parallel": False, "multiple_validation_sets": None, "full_validation": None,
+}  # fmt: skip
+
+
+def _written_fields(dataset):
+    return {name: getattr(dataset, name) for name in CONTAINER_WRITTEN_FIELDS}
 
 
 @pytest.fixture(scope="module")
@@ -196,9 +210,10 @@ def test_container_from_args_builds_the_core_fields_from_every_data_argument(
     assert args.phase_transition_iterations == "20,10" and not hasattr(
         dataset, "phase_transition_iterations"
     )
-    # Runtime state and mirrors are not taken from the arguments by the container factory.
+    # Runtime state and the fields the container writes are not taken from the arguments by the
+    # container factory.
     assert dataset.tokenizer is None and not dataset.is_prepared
-    assert all(mirror_is_unset(dataset, name) for name in MIRROR_FIELDS)
+    assert _written_fields(dataset) == CORE_DEFAULTS
     assert data.dataloader == DataloaderConfig(
         dataloader_type="cyclic", num_workers=0, data_sharding=False
     )
@@ -326,7 +341,7 @@ def test_every_data_argument_is_forwarded(files, tmp_path):
         )
 
 
-def test_standalone_config_takes_the_mirrors_from_args():
+def test_standalone_config_takes_the_container_written_fields_from_args():
     args = _validated(
         [
             "--mock-data",
@@ -348,8 +363,11 @@ def test_standalone_config_takes_the_mirrors_from_args():
     )
     assert standalone.hybrid_context_parallel is False
     owned = gpt_data_config_from_args(args).dataset
-    assert all(mirror_is_unset(owned, name) for name in MIRROR_FIELDS)
-    assert owned.random_seed == 99 and owned.full_validation is None  # the seed is no mirror
+    assert _written_fields(owned) == CORE_DEFAULTS
+    assert owned.random_seed == 99  # the seed is the section's own setting
+    assert set(argument_utils._container_written_fields_from_args(args)) == set(
+        CONTAINER_WRITTEN_FIELDS
+    )
 
 
 def test_requested_family_precedence(warnings_log):
@@ -414,10 +432,10 @@ def test_run_config_fixture_is_loader_only(run_config, monkeypatch):
     run_config.finalize()
 
 
-# The mirrors and the cross-section checks.
+# The fields the container writes and the cross-section checks.
 
 
-def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch):
+def test_container_writes_the_owned_fields_at_finalize(container_factory, monkeypatch):
     args, cfg = container_factory(
         ["--seq-length", "64", "--mock-data", "--seed", "99", "--full-validation"], data=True
     )
@@ -429,7 +447,7 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
         sequence_parallel=True,
         hybrid_context_parallel=True,
     )
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     # The owners stay editable after construction: no stale copy on the dataset config. The dataset
     # seed is the section's own setting and does not follow rng.seed.
     cfg.rng.seed = 42
@@ -450,15 +468,15 @@ def test_container_writes_the_mirrors_at_finalize(container_factory, monkeypatch
     assert (dataset.context_parallel_size, dataset.sequence_parallel_size) == (2, 2)
     assert dataset.hybrid_context_parallel is True and dataset.data_parallel_size == 2
     assert cfg.data.dataset_type is MockGPTDataset
-    assert not (set(MIRROR_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
+    assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
     assert cfg.to_dict()["data"]["dataset"]["random_seed"] == 99
     cfg.validate()  # the written values agree with their owners
     dataset.random_seed = 7
     cfg.validate()  # the dataset seed has no owner to agree with
 
 
-def test_a_layout_mirror_at_core_default_carries_no_explicit_value(container_factory, monkeypatch):
-    """The layout mirrors keep Megatron Core's fields and defaults (1, 0, False): a value equal to
+def test_a_layout_field_at_core_default_carries_no_explicit_value(container_factory, monkeypatch):
+    """The layout fields keep Megatron Core's fields and defaults (1, 0, False): a value equal to
     the default is not an explicit value, so it agrees with any layout and is written over; a
     different value must agree with the layout."""
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
@@ -469,7 +487,7 @@ def test_a_layout_mirror_at_core_default_carries_no_explicit_value(container_fac
         sequence_parallel=True,
         hybrid_context_parallel=True,
     )
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     dataset.data_parallel_size, dataset.sequence_parallel_size = 1, 0
     dataset.hybrid_context_parallel = False
     cfg.validate()
@@ -486,47 +504,63 @@ def test_layout_without_a_model_section_survives_a_reload(
     container_factory, monkeypatch, tokenizer
 ):
     """What a run without a model section (pretrain_hybrid_flex.py) saves reproduces its layout
-    mirrors: Megatron Core's defaults."""
+    fields: Megatron Core's defaults."""
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = None
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     cfg.finalize()
     cfg.data.dataset.prepare(tokenizer)
-    layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_MIRRORS)
+    layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_FIELDS)
     assert layout == (1, None, 0, False)
     cfg.validate()  # the prepared defaults are not explicit values
     reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
     reloaded.finalize()
     reloaded.data.dataset.prepare(tokenizer)
-    assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_MIRRORS) == layout
+    assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_FIELDS) == layout
 
 
-def test_mirrors_without_a_model_section(container_factory, monkeypatch, tokenizer):
+def test_owned_fields_without_a_model_section(container_factory, tokenizer):
     """pretrain_hybrid_flex.py builds its container without a model config: the validation flags
-    are written, the layout mirrors have no owner (the seed came with the arguments)."""
+    are written, the layout fields have no owner and keep what they hold (Megatron Core's defaults
+    from the factory; a Python caller's value is used by the run and not saved)."""
     _, cfg = container_factory(
         ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
     )
     cfg.model = None
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: 8)
     dataset = cfg.data.dataset
-    # Without a model config the layout mirrors have no owner: an explicit value is rejected (it
-    # would not be saved with the section); the fields keep Core's defaults.
     dataset.data_parallel_size = 4
-    with pytest.raises(ValueError, match="data_parallel_size=4 is not written .*no model config"):
-        cfg.validate()
-    dataset.data_parallel_size = 1
-    dataset.context_parallel_size = 7
-    with pytest.raises(ValueError, match="context_parallel_size=7 is not written"):
-        cfg.validate()
-    dataset.context_parallel_size = None
+    cfg.validate()
     cfg.finalize()
     assert dataset.random_seed == 1234  # --seed, from construction
     assert dataset.full_validation is True and dataset.multiple_validation_sets is False
-    assert dataset.context_parallel_size is None and dataset.data_parallel_size == 1
-    dataset.prepare(tokenizer)  # Core's defaults stay on the layout
-    assert (dataset.data_parallel_size, dataset.sequence_parallel_size) == (1, 0)
-    cfg.validate()  # Core's defaults are not explicit values
+    assert dataset.data_parallel_size == 4 and dataset.context_parallel_size is None
+    assert "data_parallel_size" not in cfg.to_dict()["data"]["dataset"]
+    dataset.prepare(tokenizer)  # Core's defaults stay on the rest of the layout
+    assert (dataset.sequence_parallel_size, dataset.hybrid_context_parallel) == (0, False)
+    cfg.validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("full_validation", False, "data.dataset.full_validation=False disagrees with validation.full_validation=True"),
+        ("multiple_validation_sets", True, "data.dataset.multiple_validation_sets=True disagrees with validation.multiple_validation_sets=False"),
+        ("context_parallel_size", 4, "data.dataset.context_parallel_size=4 disagrees with model.transformer.context_parallel_size=2"),
+        ("sequence_parallel_size", 1, "data.dataset.sequence_parallel_size=1 disagrees with the model layout"),
+        ("hybrid_context_parallel", True, "data.dataset.hybrid_context_parallel=True disagrees with model.transformer.hybrid_context_parallel=False"),
+    ],
+)  # fmt: skip
+def test_each_owned_field_is_checked_against_its_owner(container_factory, field, value, message):
+    """One explicit check per field: a value given on the dataset config must agree with the
+    section that owns it (data_parallel_size needs the world size and is checked at finalize())."""
+    _, cfg = container_factory(
+        ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
+    )
+    cfg.model = _layout(tensor_model_parallel_size=2, context_parallel_size=2)
+    cfg.validate()
+    setattr(cfg.data.dataset, field, value)
+    with pytest.raises(ValueError, match=re.escape(message)):
+        cfg.validate()
 
 
 @pytest.mark.parametrize(
@@ -598,7 +632,7 @@ def test_full_container_round_trips_before_and_after_prepare(
     assert section["dataset_type"] is GPTDataset
     assert set(section) == {"_target_", "dataset", "dataloader", "dataset_type"}
     assert "tokenizer" not in section["dataset"] and not (
-        set(MIRROR_FIELDS) & set(section["dataset"])
+        set(CONTAINER_WRITTEN_FIELDS) & set(section["dataset"])
     )
     restored = PretrainConfigContainer.from_dict(serialized)
     assert (
@@ -616,7 +650,7 @@ def test_full_container_round_trips_before_and_after_prepare(
     assert from_file.data.dataset.to_cfg_dict() == cfg.data.dataset.to_cfg_dict()
     # After finalize() and prepare() the file still carries no runtime state.
     cfg.model = None
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: 2)
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 2)
     cfg.finalize()
     cfg.data.dataset.prepare(tokenizer)
     assert cfg.data.dataset.is_prepared
@@ -667,10 +701,10 @@ def test_runtime_services_prepare_a_finalized_dataset_config(
 ):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = None
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: 1)
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", tokenizer)
     with pytest.raises(RuntimeError, match="before the container is finalized"):
-        global_vars._prepare_dataset_config(cfg)  # the mirrors are not written yet
+        global_vars._prepare_dataset_config(cfg)  # the owned fields are not written yet
     assert not cfg.data.dataset.is_prepared
     cfg.finalize()
     global_vars._prepare_dataset_config(cfg)
@@ -702,7 +736,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
     globals_ = ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE")
     for name in globals_:
         monkeypatch.setattr(global_vars, name, None)
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: 1)
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
 
     def build(_args):
         global_vars._GLOBAL_TOKENIZER = tokenizer

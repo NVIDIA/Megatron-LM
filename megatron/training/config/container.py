@@ -13,6 +13,7 @@ try:
 except ImportError:
     HAVE_YAML = False
 
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
@@ -22,12 +23,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
-from megatron.training.config.dataset_config import (
-    LAYOUT_MIRRORS,
-    MIRROR_FIELDS,
-    DataConfig,
-    mirror_is_unset,
-)
+from megatron.training.config.dataset_config import DataConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
@@ -280,16 +276,6 @@ class ConfigContainerBase:
 
         return result
 
-def _current_world_size() -> int:
-    """The world size the run is launched with: the initialized process group, else ``WORLD_SIZE``
-    (the source of ``args.world_size``); ``finalize()`` runs before distributed initialization."""
-    import torch
-
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    return int(os.getenv("WORLD_SIZE", "1"))
-
-
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
     """Top-level container holding all configuration objects."""
@@ -458,61 +444,14 @@ class PretrainConfigContainer(ConfigContainerBase):
         )
         return layout.dp
 
-    def _written_mirrors(self) -> tuple[str, ...]:
-        """The dataset mirrors this container writes at ``finalize()``: all of them, less the layout
-        fields when there is no model config to derive them from."""
-        if getattr(self.model, "transformer", None) is None:
-            return tuple(name for name in MIRROR_FIELDS if name not in LAYOUT_MIRRORS)
-        return MIRROR_FIELDS
-
-    def _data_owner_values(self, world_size: int | None = None) -> dict[str, Any]:
-        """The values the other sections own for the mirrors this container writes.
-
-        ``data_parallel_size`` needs the world size as well as the model layout and is left out
-        without one; the other layout fields need the model layout; the validation flags are
-        always available.
-        """
-        if self.data.dataset is None:
-            return {}
-        mirrors = self._written_mirrors()
-        values: dict[str, Any] = {}
-        if "full_validation" in mirrors:
-            values["full_validation"] = self.validation.full_validation
-        if "multiple_validation_sets" in mirrors:
-            values["multiple_validation_sets"] = self.validation.multiple_validation_sets
-        transformer = getattr(self.model, "transformer", None)
-        if "context_parallel_size" in mirrors:
-            values["context_parallel_size"] = transformer.context_parallel_size
-        if "sequence_parallel_size" in mirrors:
-            values["sequence_parallel_size"] = transformer.tensor_model_parallel_size * int(
-                bool(transformer.sequence_parallel)
-            )
-        if "hybrid_context_parallel" in mirrors:
-            values["hybrid_context_parallel"] = bool(
-                getattr(transformer, "hybrid_context_parallel", False)
-            )
-        if "data_parallel_size" in mirrors and world_size is not None:
-            values["data_parallel_size"] = self.get_data_parallel_size(world_size)
-        return values
-
-    @staticmethod
-    def _check_mirror(dataset: Any, name: str, owned: Any) -> None:
-        """An explicit mirror value must agree with the section that owns it; a mirror at Core's
-        default carries no explicit value and is written over."""
-        if mirror_is_unset(dataset, name):
-            return
-        explicit = getattr(dataset, name)
-        if explicit != owned:
-            raise ValueError(
-                f"data.dataset.{name}={explicit!r} disagrees with the section that owns it "
-                f"({owned!r}); the container writes this field at finalize(), leave it unset."
-            )
-
     def _validate_data_section(self) -> None:
-        """Cross-section checks for ``data.dataset``: the model capacity covers the sample length,
-        an explicit mirror agrees with the section that owns it, and a mirror this container does
-        not write is left unset (it is not saved with the section, so a reloaded run could not
-        reproduce it). ``data_parallel_size`` needs the world size and is checked at ``finalize()``.
+        """Cross-section checks for ``data.dataset``, one per field.
+
+        The model capacity covers the sample length. A value given on the dataset config for one
+        of the six fields other sections own (``CONTAINER_WRITTEN_FIELDS``) must agree with that
+        section: the container writes these fields at ``finalize()``, the arguments and the saved
+        file leave them at Megatron Core's defaults, so a differing explicit value is a mistake.
+        ``data_parallel_size`` needs the world size as well and is checked at ``finalize()``.
         """
         dataset = self.data.dataset
         if dataset is None:
@@ -525,16 +464,55 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "--max-position-embeddings) must be greater than or equal to "
                     f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
                 )
-        for name, owned in self._data_owner_values().items():
-            self._check_mirror(dataset, name, owned)
-        written = self._written_mirrors()
-        for name in MIRROR_FIELDS:
-            if name in written or mirror_is_unset(dataset, name):
-                continue
+        validation = self.validation
+        if (
+            dataset.full_validation is not None
+            and dataset.full_validation != validation.full_validation
+        ):
             raise ValueError(
-                f"data.dataset.{name}={getattr(dataset, name)!r} is not written by this container "
-                "(there is no model config to derive the layout from) and is not saved with the "
-                "section: leave it unset."
+                f"data.dataset.full_validation={dataset.full_validation} disagrees with "
+                f"validation.full_validation={validation.full_validation}; the container writes "
+                "this field at finalize(), leave it unset."
+            )
+        if (
+            dataset.multiple_validation_sets is not None
+            and dataset.multiple_validation_sets != validation.multiple_validation_sets
+        ):
+            raise ValueError(
+                f"data.dataset.multiple_validation_sets={dataset.multiple_validation_sets} "
+                "disagrees with "
+                f"validation.multiple_validation_sets={validation.multiple_validation_sets}; the "
+                "container writes this field at finalize(), leave it unset."
+            )
+        transformer = getattr(self.model, "transformer", None)
+        if transformer is None:
+            return  # no model config (pretrain_hybrid_flex.py): the layout fields have no owner
+        if (
+            dataset.context_parallel_size is not None
+            and dataset.context_parallel_size != transformer.context_parallel_size
+        ):
+            raise ValueError(
+                f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
+                "with model.transformer.context_parallel_size="
+                f"{transformer.context_parallel_size}; the container writes this field at "
+                "finalize(), leave it unset."
+            )
+        sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+            bool(transformer.sequence_parallel)
+        )
+        if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
+            raise ValueError(
+                f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
+                "with the model layout (tensor_model_parallel_size * sequence_parallel = "
+                f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
+                "it unset."
+            )
+        hybrid_context_parallel = bool(getattr(transformer, "hybrid_context_parallel", False))
+        if dataset.hybrid_context_parallel and not hybrid_context_parallel:
+            raise ValueError(
+                "data.dataset.hybrid_context_parallel=True disagrees with "
+                "model.transformer.hybrid_context_parallel=False; the container writes this field "
+                "at finalize(), leave it unset."
             )
 
     def _finalize(self) -> None:
@@ -542,13 +520,19 @@ class PretrainConfigContainer(ConfigContainerBase):
         from megatron.training import get_args
 
         dataset = self.data.dataset
-        owned: dict[str, Any] = {}
-        if dataset is not None:
-            # With the world size known, data_parallel_size gets the agreement check as well,
-            # before anything is written.
-            owned = self._data_owner_values(world_size=_current_world_size())
-            for name, value in owned.items():
-                self._check_mirror(dataset, name, value)
+        transformer = getattr(self.model, "transformer", None)
+        data_parallel_size = None
+        if dataset is not None and transformer is not None:
+            # The world size is known here: data_parallel_size gets the agreement check the other
+            # fields got at validation, before anything is written.
+            data_parallel_size = self.get_data_parallel_size(safe_get_world_size())
+            if dataset.data_parallel_size not in (1, data_parallel_size):
+                raise ValueError(
+                    f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
+                    "the model layout and the world size "
+                    f"(data_parallel_size={data_parallel_size}); the container writes this field "
+                    "at finalize(), leave it unset."
+                )
         # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
         # Keep this temporary args dependency in framework finalization, not validation.
         batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
@@ -561,8 +545,20 @@ class PretrainConfigContainer(ConfigContainerBase):
         super()._finalize()
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
-        for name, value in owned.items():
-            setattr(dataset, name, value)
+        if dataset is not None:
+            # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # from the validation config, the layout from the model config when there is one.
+            dataset.full_validation = self.validation.full_validation
+            dataset.multiple_validation_sets = self.validation.multiple_validation_sets
+            if transformer is not None:
+                dataset.data_parallel_size = data_parallel_size
+                dataset.context_parallel_size = transformer.context_parallel_size
+                dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                    bool(transformer.sequence_parallel)
+                )
+                dataset.hybrid_context_parallel = bool(
+                    getattr(transformer, "hybrid_context_parallel", False)
+                )
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)

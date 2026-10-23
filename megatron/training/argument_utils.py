@@ -779,7 +779,7 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
 
 
 # args attribute -> Megatron Core GPTDatasetConfig field, as the legacy entry-point factories read
-# them. The mirrors (layout, validation flags) are listed separately.
+# them. The fields the container writes (layout, validation flags) are listed separately.
 _DATASET_FIELD_SOURCES = {
     "random_seed": "seed",
     "sequence_length": "seq_length",
@@ -859,8 +859,9 @@ def _resolve_data_sources(args: Namespace):
     return blend, blend_per_split, sequences_per_dataset
 
 
-def _dataset_mirrors_from_args(args: Namespace) -> dict[str, Any]:
-    """The mirror values a standalone (container-less) dataset config takes from ``args``."""
+def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
+    """What a standalone (container-less) dataset config takes from ``args`` for the fields the
+    container writes otherwise (``CONTAINER_WRITTEN_FIELDS``: the layout, the validation flags)."""
     return {
         "data_parallel_size": args.data_parallel_size,
         "context_parallel_size": args.context_parallel_size,
@@ -885,9 +886,9 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     rejects itself (``pretrain_hybrid_flex.py``: varlen; the cache tool: mock, sft and fim).
 
     ``random_seed`` is the section's own setting, filled from ``--seed`` and saved with the section
-    (independent of ``cfg.rng.seed`` after construction, as in Megatron-Bridge). The mirrors
-    (layout, validation flags) are left unset for a container, which writes them at ``finalize()``;
-    ``standalone=True`` fills them from ``args`` for callers without a container
+    (independent of ``cfg.rng.seed`` after construction, as in Megatron-Bridge). The layout and
+    validation fields the container writes at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``) are left
+    unset for a container; ``standalone=True`` fills them from ``args`` for callers without one
     (``tools/prepare_cache.py``, the legacy ``core_gpt_dataset_config_from_args`` wrappers). The
     returned config is not prepared: ``prepare(tokenizer)`` runs Megatron Core's post-init.
     """
@@ -915,7 +916,7 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     kwargs["blend_per_split"] = blend_per_split
     kwargs["sequences_per_dataset"] = sequences_per_dataset
     if standalone:
-        kwargs.update(_dataset_mirrors_from_args(args))
+        kwargs.update(_container_written_fields_from_args(args))
     if family == "fim":
         kwargs.update(
             fim_rate=args.fim_rate,
@@ -940,7 +941,8 @@ def core_gpt_dataset_config_from_args(
 
     The call shape the GPT entry points had before ``cfg.data`` existed, kept for scripts that build
     the dataset config outside the container (the providers build from ``cfg.data``): the section of
-    ``gpt_data_config_from_args(args, standalone=True)`` (mirrors and seed from ``args``), the
+    ``gpt_data_config_from_args(args, standalone=True)`` (the layout and validation fields and the
+    seed from ``args``), the
     dataset class pinned to ``dataset_type`` when given (``tools/prepare_cache.py`` builds
     ``GPTDataset`` whatever the flags name), validated, then prepared with ``tokenizer`` or a
     tokenizer built from ``args``.

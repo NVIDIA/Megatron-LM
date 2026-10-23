@@ -4,7 +4,7 @@
 
 The reference is the frozen factory and provider logic of commit 438ef0025
 (``legacy_dataset_factories.py``), run on the same validated arguments as the new path: ``cfg.data``
-built by the one factory, the mirrors written by the container, the config prepared with the run's
+built by the one factory, the owned fields written by the container, the config prepared with the run's
 tokenizer and handed to the builder as is. pretrain_gpt.py's legacy factory is the oracle for all
 four entry points; where the other three legacy factories differed from it (fields they never
 forwarded, requests they silently downgraded), the difference is listed here as a documented change.
@@ -34,7 +34,6 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import GPTDatasetConfig, GPTFIMDatasetConfig
 from megatron.training.config import container as container_module
-from megatron.training.config.dataset_config import LAYOUT_MIRRORS
 from megatron.training.datasets import providers, sft_dataset, varlen_dataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig as RuntimeGPTFIMDatasetConfig
@@ -60,6 +59,10 @@ PARALLEL_OVERRIDES = dict(
     multiple_validation_sets=True,
 )
 VALIDATION_OVERRIDES = dict(full_validation=True, multiple_validation_sets=True)
+# The layout fields the container writes from the model config (pretrain_hybrid_flex.py has none).
+LAYOUT_FIELDS = (
+    "data_parallel_size", "context_parallel_size", "sequence_parallel_size", "hybrid_context_parallel",
+)  # fmt: skip
 
 
 @pytest.fixture(scope="module")
@@ -252,14 +255,14 @@ def _data_config(entry_point, args):
 def _prepare(monkeypatch, extra, overrides, entry_point="gpt"):
     """Validated args, the container as the entry point builds it (not yet finalized) and the
     run's tokenizer, registered as globals. pretrain_hybrid_flex.py builds its container without a
-    model config, so its layout mirrors have no owner there; the other scripts carry the layout the
+    model config, so its layout fields have no owner there; the other scripts carry the layout the
     same arguments give gpt_config_from_args."""
     args = _validated(extra, overrides)
     cfg = pretrain_cfg_container_from_args(args, data_cfg=_data_config(entry_point, args))
     cfg.model = None if entry_point == "hybrid_flex" else _layout_from_args(args)
     cfg.validation.full_validation = args.full_validation
     cfg.validation.multiple_validation_sets = args.multiple_validation_sets
-    monkeypatch.setattr(container_module, "_current_world_size", lambda: _world_size_for(args))
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: _world_size_for(args))
     tokenizer = build_tokenizer(args)
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     monkeypatch.setattr(global_vars, "_GLOBAL_TOKENIZER", tokenizer)
@@ -333,12 +336,12 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         names = [f.name for f in fields(expected)]
     compared = names
     if entry_point == "hybrid_flex":
-        # No model config: the layout mirrors keep Megatron Core's defaults, as the legacy factory
+        # No model config: the layout fields keep Megatron Core's defaults, as the legacy factory
         # left them; the standalone wrapper fills them from args like the other wrappers.
         flex_layout = legacy.legacy_hybrid_flex_dataset_config(args)
-        for name in LAYOUT_MIRRORS:
+        for name in LAYOUT_FIELDS:
             assert getattr(actual, name) == getattr(flex_layout, name), name
-        compared = [name for name in names if name not in LAYOUT_MIRRORS]
+        compared = [name for name in names if name not in LAYOUT_FIELDS]
     assert _signature(actual, compared) == _signature(expected, compared)
     if entry_point == "prepare_cache":
         return
@@ -388,7 +391,7 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     assert changed == LEGACY_OMISSIONS[entry_point]
     expected = legacy.legacy_gpt_dataset_config(args)
-    same = [n for n in names if entry_point != "hybrid_flex" or n not in LAYOUT_MIRRORS]
+    same = [n for n in names if entry_point != "hybrid_flex" or n not in LAYOUT_FIELDS]
     assert {n: getattr(actual, n) for n in same} == {n: getattr(expected, n) for n in same}
 
 

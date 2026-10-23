@@ -7,9 +7,9 @@ the dataset class.
 until ``prepare(tokenizer)`` runs it in full, once; the container is built from the arguments before
 the tokenizer exists (Megatron-Bridge defers it the same way). It declares no field of its own:
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Six fields are *mirrors* of values other container sections own (the
-parallel layout, the validation flags): the container writes them at ``finalize()`` and they are
-not serialized with the section.
+saved with the section. Six fields are owned by other container sections (the parallel layout,
+the validation flags): the container writes them at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``)
+and they are not serialized with the section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
@@ -28,10 +28,11 @@ from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig as Runtim
 DATALOADER_TYPES = ("single", "cyclic", "external")
 DATASET_FAMILIES = ("gpt", "fim", "varlen", "sft")
 
-# Core fields whose value another container section owns. The container writes them at finalize()
-# (see PretrainConfigContainer), they are left unset by the container-oriented factory, and they
-# are not serialized with the dataset section.
-MIRROR_FIELDS = (
+# Fields of the dataset config that other container sections own: the parallel layout (the model
+# config) and the validation flags (the validation config). PretrainConfigContainer writes them at
+# finalize(), the container-oriented factory leaves them unset and the section serializes without
+# them: they are recorded once, in their owning sections.
+CONTAINER_WRITTEN_FIELDS = (
     "data_parallel_size",
     "context_parallel_size",
     "sequence_parallel_size",
@@ -39,27 +40,7 @@ MIRROR_FIELDS = (
     "multiple_validation_sets",
     "full_validation",
 )
-# The mirrors derived from the model layout: the container writes them only with a model config.
-LAYOUT_MIRRORS = (
-    "data_parallel_size",
-    "context_parallel_size",
-    "sequence_parallel_size",
-    "hybrid_context_parallel",
-)
-# Megatron Core's own defaults for the mirrors. A layout mirror at its Core default (1, 0, False,
-# None for context_parallel_size) carries no explicit value: the container writes it when it can
-# derive it, and a run without a model config keeps it.
-_CORE_MIRROR_DEFAULTS = {
-    f.name: f.default for f in fields(MCoreGPTDatasetConfig) if f.name in MIRROR_FIELDS
-}
 _FIM_TOKEN_KEYS = ("prefix", "middle", "suffix", "pad", "eod")
-
-
-def mirror_is_unset(dataset: MCoreGPTDatasetConfig, name: str) -> bool:
-    """Whether mirror ``name`` carries no explicit value on ``dataset``: ``None``, or Megatron
-    Core's default for a layout mirror (what the field holds when nothing writes it)."""
-    value = getattr(dataset, name)
-    return value is None or value == _CORE_MIRROR_DEFAULTS[name]
 
 
 @dataclass(kw_only=True)
@@ -122,10 +103,9 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig):
 
     No field is declared here: ``random_seed`` is Core's required constructor argument (the
     factory fills it from ``--seed``; it is the dataset's own setting, saved with the section), and
-    the mirrors keep Core's fields and defaults, a layout mirror at its Core default carrying no
-    explicit value (``mirror_is_unset``). A prepared object is shared by reference with every
-    dataset built from it and is not edited afterwards: build a new object for a differently
-    configured run.
+    the fields other sections own keep Core's fields and defaults until the container writes them.
+    A prepared object is shared by reference with every dataset built from it and is not edited
+    afterwards: build a new object for a differently configured run.
     """
 
     def __post_init__(self) -> None:
@@ -207,16 +187,18 @@ class GPTDatasetConfig(MCoreGPTDatasetConfig):
             raise
 
     def to_cfg_dict(self) -> dict[str, Any]:
-        """Serialize the section: every constructor field except the tokenizer and the mirrors.
+        """Serialize the section: every constructor field except the tokenizer and the fields other
+        sections own.
 
         ``init=False`` fields (``split_matrix``, ``mock``, ``token_dtype_code``) are derived by
-        ``prepare()`` and never written; the mirrors are recorded once, in their owning sections.
+        ``prepare()`` and never written; the fields other sections own
+        (``CONTAINER_WRITTEN_FIELDS``) are recorded once, in their owning sections.
         """
         from megatron.training.config.container import ConfigContainerBase
 
         out: dict[str, Any] = {"_target_": f"{type(self).__module__}.{type(self).__qualname__}"}
         for f in fields(self):
-            if not f.init or f.name == "tokenizer" or f.name in MIRROR_FIELDS:
+            if not f.init or f.name == "tokenizer" or f.name in CONTAINER_WRITTEN_FIELDS:
                 continue
             out[f.name] = ConfigContainerBase._convert_value_to_dict(getattr(self, f.name))
         return out

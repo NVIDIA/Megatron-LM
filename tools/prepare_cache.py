@@ -126,7 +126,8 @@ def core_gpt_dataset_config_from_args(args: Any) -> MCoreGPTDatasetConfig:
     """Build the Megatron Core GPTDatasetConfig used for offline cache preparation.
 
     The shared ``argument_utils.core_gpt_dataset_config_from_args`` (a standalone section from the
-    legacy arguments, mirrors and seed from ``args``, a tokenizer built from ``args``) with the
+    legacy arguments, the layout and validation fields and the seed from ``args``, a tokenizer built
+    from ``args``) with the
     dataset class pinned to the plain ``GPTDataset`` this tool builds, after rejecting the modes it
     does not build (``--mock-data``, ``--sft``, ``--fim-data``); the section is validated there, so
     a missing data source is reported before the builder runs.
