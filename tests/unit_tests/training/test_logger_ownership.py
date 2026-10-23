@@ -68,9 +68,6 @@ def test_normalization_does_not_alias_or_mutate_args(monkeypatch, inference):
     args.modules_to_filter = ['module']
     args.log_interval = 7
     monkeypatch.setattr(
-        training, 'get_megatron_optimizer_config', lambda args: (OptimizerConfig(), None)
-    )
-    monkeypatch.setattr(
         training,
         'get_megatron_ddp_config',
         lambda args, *, use_torch_fsdp2: DistributedDataParallelConfig(),

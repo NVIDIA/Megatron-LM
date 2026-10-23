@@ -1386,13 +1386,7 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with (
-        patch(
-            "megatron.training.training.get_megatron_optimizer_config",
-            return_value=(mock_optimizer_config, {}),
-        ),
-        patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config),
-    ):
+    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
         yield
 
 
@@ -1404,23 +1398,9 @@ class TestPretrainContainerFromArgsStructure:
         assert isinstance(result, PretrainConfigContainer)
 
     @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_optimizer_config_comes_from_helper(self, mock_opt, mock_ddp):
-        """Test that optimizer config comes from get_megatron_optimizer_config."""
-        mock_optimizer = MagicMock(spec=OptimizerConfig)
-        mock_opt.return_value = (mock_optimizer, {})
-        mock_ddp.return_value = MagicMock(spec=DistributedDataParallelConfig)
-        args = _make_args()
-        result = pretrain_cfg_container_from_args(args)
-        mock_opt.assert_called_once_with(args)
-        assert result.optimizer is mock_optimizer
-
-    @patch("megatron.training.training.get_megatron_ddp_config")
-    @patch("megatron.training.training.get_megatron_optimizer_config")
-    def test_ddp_config_comes_from_helper(self, mock_opt, mock_ddp):
+    def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
-        mock_opt.return_value = (MagicMock(spec=OptimizerConfig), {})
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
@@ -1432,10 +1412,6 @@ class TestPretrainContainerFromArgsStructure:
         parser = ArgumentParser()
         add_megatron_arguments(parser)
         args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
-        monkeypatch.setattr(
-            "megatron.training.training.get_megatron_optimizer_config",
-            lambda args: (OptimizerConfig(), {}),
-        )
 
         cfg = pretrain_cfg_container_from_args(args)
 
