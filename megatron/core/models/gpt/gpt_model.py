@@ -870,11 +870,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             runtime_gather_output=runtime_gather_output,
             output_dtype=torch.float32 if emit_fp32 else None,
         )
-        if in_inference_mode:
-            logits = logits.float()
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        if in_inference_mode:
+            logits = logits.float()
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None
