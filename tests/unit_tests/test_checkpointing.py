@@ -19,6 +19,8 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.parallel_state import get_data_parallel_world_size
+from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule, WideResidualConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -442,6 +444,38 @@ def test_load_args_restores_gdp_num_householder_from_checkpoint(
         restored_args, _ = load_args_from_checkpoint(args)
 
     assert restored_args.gdp_num_householder == expected_num_householder
+
+
+def test_load_args_restores_quantile_balancing_from_checkpoint():
+    """QB mode and histogram shape are reconstructed before the router is built."""
+    checkpoint_args = SimpleNamespace(
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+        moe_router_quantile_balancing_estimation_scope="global_batch",
+        moe_router_qb_num_bins=257,
+    )
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_router_load_balancing_type="aux_loss",
+        moe_aux_loss_coeff=0.01,
+        moe_router_quantile_balancing_estimation_scope="micro_batch",
+        moe_router_qb_num_bins=64,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_router_load_balancing_type == "quantile_balancing"
+    assert restored_args.moe_aux_loss_coeff == 0.0
+    assert restored_args.moe_router_quantile_balancing_estimation_scope == "global_batch"
+    assert restored_args.moe_router_qb_num_bins == 257
 
 
 @pytest.mark.parametrize(
@@ -1034,14 +1068,14 @@ def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, run_config
 ):
     """Test override_opt_param_scheduler behavior during checkpoint load."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = False
     args.use_dist_ckpt = ckpt_format != "torch"
-    args.override_opt_param_scheduler = True
+    run_config.scheduler.override_opt_param_scheduler = True
     args.lr = 1.0
     args.min_lr = 0.1
     args.decoupled_lr = 0.5
@@ -1116,6 +1150,59 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
         assert loaded_iter_none == iteration
         assert loaded_flops_none == num_floating_point_operations_so_far
+
+
+@pytest.mark.parametrize("load_rerun_mode", [RerunMode.DISABLED, RerunMode.VALIDATE_RESULTS])
+def test_strict_load_idle_rerun_checkpoint(
+    init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args, load_rerun_mode
+):
+    """Load an idle rerun shard without treating it as a pending rerun."""
+    args = create_ckpt_load_args
+    # Startup normally fills these; the saved topology must match the real launch.
+    args.world_size = torch.distributed.get_world_size()
+    args.data_parallel_size = get_data_parallel_world_size()
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.dist_ckpt_strictness = "raise_all"
+    args.no_save_rng = True
+    args.no_load_rng = True
+    args.no_save_optim = True
+    args.no_load_optim = True
+    args.fp16 = False
+    args.bf16 = False
+    args.save_tokenizer_assets = False
+    args.finetune = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    saved_machine = RerunStateMachine(mode=RerunMode.VALIDATE_RESULTS)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_strict_idle_rerun", sync=True) as ckpt_dir:
+        args.save = ckpt_dir
+        args.load = ckpt_dir
+        set_args(args)
+        with mock.patch(
+            "megatron.training.checkpointing.get_rerun_state_machine", return_value=saved_machine
+        ):
+            save_checkpoint(123, [model], None, None, 456)
+
+        loaded_model = MockModel(config)
+        with torch.no_grad():
+            loaded_model.l.weight.zero_()
+        loaded_machine = RerunStateMachine(mode=load_rerun_mode)
+        with mock.patch(
+            "megatron.training.checkpointing.get_rerun_state_machine", return_value=loaded_machine
+        ):
+            iteration, flops = load_checkpoint(
+                [loaded_model], None, None, strict=True, restore_training_state=True
+            )
+
+        assert iteration == 123
+        assert flops == 456
+        torch.testing.assert_close(loaded_model.l.weight, model.l.weight, rtol=0, atol=0)
+        assert loaded_machine.state == RerunState.NOT_RUNNING_YET
+        assert loaded_machine.mode == load_rerun_mode
+        assert not loaded_machine.rerun_requested
 
 
 @pytest.mark.parametrize(

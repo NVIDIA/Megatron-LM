@@ -11,7 +11,6 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-from megatron.training.config_serialization import serialize_model_dataclass
 
 
 @runtime_checkable
@@ -98,7 +97,13 @@ class ModelConfig:
         - All dataclass fields, including nested dataclasses
         """
 
-        result = serialize_model_dataclass(self)
+        from megatron.training.config.utils import serialize_dataclass
+
+        result = serialize_dataclass(
+            self,
+            skip_fields=frozenset({"pre_wrap_hooks", "post_wrap_hooks"}),
+            encode_callables=True,
+        )
         result["_builder_"] = self.builder  # Serialize the builder path
         return result
 

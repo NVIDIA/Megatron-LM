@@ -3,7 +3,7 @@ import copy
 import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from dataclasses import is_dataclass, replace
+from dataclasses import replace
 from typing import Any, Type, TypeVar
 
 try:
@@ -16,8 +16,11 @@ except ImportError:
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
+from megatron.core.num_microbatches_calculator import (
+    get_current_global_batch_size,
+    update_num_microbatches,
+)
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.transformer import TransformerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
@@ -34,14 +37,16 @@ from megatron.training.config.training_config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import (
+    sanitize_dataclass_config,
+    serialize_dataclass,
+    serialize_value,
+)
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.config_serialization import serialize_model_dataclass
 from megatron.training.models import (
     BertModelConfig,
     LLaVAModelConfig,
     MimoModelConfig,
-    Serializable,
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
@@ -217,17 +222,7 @@ class ConfigContainerBase:
         Returns:
             Dictionary representation of this config
         """
-        result = {}
-        result["_target_"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-
-        for f in dataclass_fields(self):
-            if f.name.startswith("_"):
-                continue
-
-            value = getattr(self, f.name)
-            result[f.name] = self._convert_value_to_dict(value)
-
-        return result
+        return serialize_dataclass(self)
 
     @classmethod
     def _convert_value_to_dict(cls, value: Any) -> Any:
@@ -249,38 +244,7 @@ class ConfigContainerBase:
         Returns:
             The converted value
         """
-        if isinstance(value, ConfigContainerBase):
-            return value.to_dict()
-        elif isinstance(value, Serializable):
-            return value.as_dict()
-        elif hasattr(value, "to_cfg_dict"):
-            # Allow non-Container classes to implement own custom method
-            return value.to_cfg_dict()
-        elif isinstance(value, TransformerConfig):
-            # Callback model configs use the same runtime-field exclusions as builder configs.
-            return serialize_model_dataclass(value)
-        elif is_dataclass(value) and not isinstance(value, type):
-            # Handle regular dataclasses
-            result = {}
-
-            # Add _target_ field for instantiation
-            result["_target_"] = f"{value.__class__.__module__}.{value.__class__.__qualname__}"
-
-            # Convert each field, handling nested dataclasses properly
-            for field in dataclass_fields(value):
-                if field.name.startswith("_"):
-                    continue
-
-                field_value = getattr(value, field.name)
-                result[field.name] = cls._convert_value_to_dict(field_value)
-
-            return result
-        elif isinstance(value, (list, tuple)):
-            return [cls._convert_value_to_dict(item) for item in value]
-        elif isinstance(value, dict):
-            return {k: cls._convert_value_to_dict(v) for k, v in value.items()}
-        else:
-            return value
+        return serialize_value(value)
 
     def to_yaml(self, yaml_path: str) -> None:
         """
@@ -409,6 +373,43 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         return global_batch_size, eval_global_batch_size, eval_micro_batch_size
 
+    def _resolve_scheduler_step_fields(self):
+        """Calculate user-unspecified scheduler configuration arguments from configurable fields."""
+
+        # Without a training horizon there is nothing to resolve; building the optimizer param
+        # scheduler (get_optimizer_param_scheduler) is what requires one.
+        if self.train.train_iters is None and self.train.train_samples is None:
+            return
+        # Iteration-based training.
+        if self.train.train_iters:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+        # Sample-based training.
+        elif self.train.train_samples:
+            # We need to set training iters for later use. Technically
+            # we need to adjust the training samples too (due to last
+            # batch being incomplete) but we leave it as is for now.
+            update_train_iters(self.train)
+            if self.scheduler.lr_decay_samples is None:
+                self.scheduler.lr_decay_samples = self.train.train_samples
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
+            self.scheduler.wd_incr_steps = self.train.train_samples
+            self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
+
+
     def validate(self) -> None:
         """Validate each section and the cross-config GTP, batch-size, and RL policies."""
         self.rl.validate_ddp_config(self.ddp)
@@ -441,6 +442,12 @@ class PretrainConfigContainer(ConfigContainerBase):
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+        self.scheduler.validate_run(
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
+            skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
+        )
 
     def _finalize(self) -> None:
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
@@ -457,8 +464,37 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
         self.optimizer = optimizer
+        self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
+        self._resolve_scheduler_step_fields()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+
+def update_train_iters(train: TrainingConfig) -> None:
+    """Resolve the sample-based training horizon on the supplied training config."""
+    # Imported lazily: megatron.training.utils imports megatron.training.config.
+    from megatron.training.utils import print_rank_0
+
+    # For iteration-based training, we don't need to do anything
+    if train.train_iters:
+        return
+
+    if train.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
+        iterations = 0
+        consumed_samples = 0
+        while consumed_samples < train.train_samples:
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
+            iterations += 1
+        # Reset
+        update_num_microbatches(0, consistency_check=False)
+        train.train_iters = iterations
+    else:
+        # Constant batch size with sample-based training.
+        train.train_iters = train.train_samples // train.global_batch_size
+
+    print_rank_0(f'setting training iterations to {train.train_iters}')
 
 
 @dataclass(kw_only=True)
