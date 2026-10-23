@@ -63,6 +63,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_captu
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -4843,6 +4844,8 @@ def train(
     forward_backward_func = get_forward_backward_func(
         schedule_pg_collection=pg_collection
     )
+    if getattr(args, 'megatron_fsdp_record_prefetch_order', False):
+        forward_backward_func = with_mfsdp_iteration(forward_backward_func)
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,

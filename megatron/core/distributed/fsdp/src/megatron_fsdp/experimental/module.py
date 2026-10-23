@@ -20,7 +20,7 @@ from __future__ import annotations
 import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Literal, cast
+from typing import cast
 from weakref import ref
 
 import torch
@@ -32,7 +32,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionPhase, IterationOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import (
     FsdpParameter,
@@ -295,19 +295,31 @@ class FsdpModule:
 
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
+            # Independent roots can share a context even without VPP, e.g.
+            # separately sharded siblings whose parent is not sharded. Reset only
+            # at the first root so later roots continue the shared static cursor.
+            order = context.iteration_order
+            if order.mode == "static" and not is_recomputing:
+                first_forward_root, _ = order[0]
+                if first_forward_root() is self:
+                    order.reset_cursor()
 
-        self.unshard(prefetch="forward" if not is_recomputing else "none")
+        self.unshard("forward" if not is_recomputing else "recompute")
 
-    def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
+    def unshard(self, phase: ExecutionPhase | None = None) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
 
-        External schedulers invoking this directly (rather than through the
-        automatic ``pre_forward`` hook) must first synchronize the all-gather
-        stream on the root by calling
-        ``context.allgather_stream.wait_stream(context.current_stream())``
-        before this when ``self.is_root()``; the automatic forward path
-        performs that root sync in ``pre_forward()`` immediately before this.
+        The default demand-only call leaves the execution order unchanged.
+
+        An iteration scope synchronizes the all-gather stream before demands.
+        Outside a scope, external schedulers invoking this directly must call
+        ``context.allgather_stream.wait_stream(context.current_stream())`` on
+        roots first, as the automatic ``pre_forward`` hook does.
         """
+        # Combined hooks may run forward recomputation inside backward.
+        if phase == "forward" and _is_in_backward():
+            phase = "recompute"
+        order = self.context._advance_order(cast(nn.Module, self), phase)
         with self._nvtx_range("unshard"):
             self._unshard_parameter_groups()
             assert self._unshard_event is not None
@@ -315,36 +327,34 @@ class FsdpModule:
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
             self.context.current_stream().wait_event(self._unshard_event)
 
-            context = self.context
-            if prefetch == "forward":
-                self._prefetch_parameter_groups(
-                    context.forward_order, self._schedule_policy.forward_prefetch_size
+            if order is not None:
+                # The consumed occurrence defines the budget for static and replay.
+                _, current_phase = order[order.position - 1]
+                budget = (
+                    self._schedule_policy.forward_prefetch_size
+                    if current_phase == "forward"
+                    else self._schedule_policy.backward_prefetch_size
                 )
-            elif prefetch == "backward":
-                self._prefetch_parameter_groups(
-                    context.backward_order, self._schedule_policy.backward_prefetch_size
-                )
+                self._prefetch_parameter_groups(order, budget)
 
-    def _prefetch_parameter_groups(
-        self, order: ExecutionOrder[nn.Module], prefetch_size: int | None
-    ) -> None:
-        """Prefetch successors from ``order`` according to this module's budget."""
-        module = cast(nn.Module, self)
-        order.advance(module)
-        next_module = order.next_item()
-        if prefetch_size is None:
-            if next_module is not None:
-                cast(FsdpModule, next_module)._unshard_parameter_groups()
+    def _prefetch_parameter_groups(self, order: IterationOrder, prefetch_size: int | None) -> None:
+        """Prefetch successors of the consumed demand in a static or captured order."""
+        if prefetch_size == 0:
             return
-
-        prefetched_size = 0
-        offset = 1
-        while next_module is not None and prefetched_size < prefetch_size:
-            fsdp_module = cast(FsdpModule, next_module)
+        size = 0
+        _, phase = order[order.position - 1]
+        for index in range(order.position, len(order)):
+            module_ref, next_phase = order[index]
+            if order.mode == "static" and next_phase != phase:
+                break
+            module = module_ref()
+            if module is None:
+                raise RuntimeError("A module in the FSDP execution order was destroyed.")
+            fsdp_module = cast(FsdpModule, module)
             fsdp_module._unshard_parameter_groups()
-            prefetched_size += fsdp_module.num_parameter_elements
-            offset += 1
-            next_module = order.next_item(offset)
+            size += fsdp_module.num_parameter_elements
+            if prefetch_size is None or size >= prefetch_size:
+                break
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -400,29 +410,24 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        # Shared-layer MTP (mtp_use_repeated_layer=True) reuses the same FSDP block:
-        #   h1 = block(fuse(h0, shifted_embeddings_1))
-        #   h2 = block(fuse(h1, shifted_embeddings_2))
-        #   (loss1(h1) + loss2(h2)).backward()
-        # In ordinary autograd, backward enters depth 2 then depth 1, invoking this
-        # pre-hook twice on the same wrapper. Each shared parameter's post-accumulate
-        # hook fires once after both uses contribute, so our post_backward() has not
-        # reset BACKWARD when depth 1 enters.
-        # TODO: Separate post_backward (phase/weight release) from grads_ready (reduction).
-        # In shared MTP, post_backward would run twice (once per depth), resetting
-        # the phase after each invocation. Depth 1 could then enter from RESTING
-        # and gather its weights normally, without this guard. grads_ready would
-        # run once, after both depths' local gradient contributions have accumulated,
-        # and perform the reduction.
-        # This likely requires addressing static prefetch order for repeated invocations first:
-        # https://github.com/NVIDIA/Megatron-LM/issues/7764
+        # Keep the existing shared-layer return, but let capture/replay observe
+        # each occurrence without reopening the backward phase and NVTX range.
         if self.phase is FsdpModule.Phase.BACKWARD:
+            if self.context.iteration_order.active:
+                self.unshard("backward")
             return
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
+            # Backward has its own first root, in reverse construction order.
+            # Resetting at every root would restart the shared cursor mid-pass.
+            order = context.iteration_order
+            if order.mode == "static":
+                first_backward_root, _ = order[order.backward_start]
+                if first_backward_root() is self:
+                    order.reset_cursor(order.backward_start)
             context.register_post_backward_hook()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
@@ -433,7 +438,7 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self.unshard(prefetch="backward")
+        self.unshard("backward")
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""

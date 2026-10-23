@@ -12,6 +12,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
 )
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.common.mfsdp_iteration import with_mfsdp_iteration
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
@@ -35,6 +36,7 @@ def _release_tensor_storage(tensors):
             tensor.untyped_storage().resize_(0)
 
 
+@with_mfsdp_iteration
 def combined_1f1b_schedule_for_no_pipelining(
     forward_step_func,
     data_iterator,
