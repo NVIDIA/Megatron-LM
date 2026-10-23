@@ -218,31 +218,53 @@ def test_bias_dropout_add_fused_inference_replays_bit_exactly():
 
 
 class TestFusedCrossEntropy:
-    """``--cross-entropy-loss-fusion`` is rejected by ``--deterministic-mode``; this records
-    whether the compiled kernel itself replays bit-exactly (op catalog: non-deterministic)."""
+    """Native fused CE must replay under strict deterministic algorithms."""
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel()
+    @pytest.fixture(autouse=True)
+    def parallel_group(self, tp_size, det_algos, request):
+        """Exercise real TP groups and restore the caller's deterministic settings."""
+        if Utils.world_size % tp_size:
+            pytest.skip(f"TP={tp_size} requires a world size divisible by {tp_size}")
+        if not det_algos:
+            request.applymarker(
+                pytest.mark.xfail(
+                    strict=False,
+                    reason="default-mode compiler autotuning can change reduction order",
+                )
+            )
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        previous = torch.are_deterministic_algorithms_enabled()
+        previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(det_algos)
+        try:
+            yield
+        finally:
+            torch.use_deterministic_algorithms(previous, warn_only=previous_warn_only)
+            Utils.destroy_model_parallel()
 
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
+    @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
+    @pytest.mark.parametrize("det_algos", [False, True], ids=["default", "deterministic"])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
-    @pytest.mark.xfail(
-        strict=False,
-        reason="op-catalog lists the fused cross entropy as non-deterministic; recorded, not gated",
-    )
-    def test_fused_vocab_parallel_cross_entropy_replays(self, dtype):
-        """Both logits dtypes: fp32 logits skip the internal upcast, and the backward must
-        hand back a gradient in the logits dtype rather than a hardcoded one."""
+    def test_fused_vocab_parallel_cross_entropy_replays(self, dtype, tp_size, det_algos):
+        """Replay rank-distinct vocabulary shards under competing CUDA streams.
+
+        FP32 logits skip the internal upcast. Both dtypes must return gradients in
+        the logits dtype, with and without PyTorch's strict deterministic setting.
+        """
         seeded()
         tp_group = parallel_state.get_tensor_model_parallel_group()
-        logits = _act((TOKENS, 32768), dtype=dtype)
+        generator = torch.Generator(device="cuda").manual_seed(1234 + tp_group.rank())
+        logits = torch.randn(
+            (TOKENS, 32768), device="cuda", dtype=dtype, generator=generator, requires_grad=True
+        )
+        # The global generator is identical on all TP ranks; labels must agree even
+        # though each rank's vocabulary shard has different logits.
         target = torch.randint(0, 32768 * tp_group.size(), (TOKENS,), device="cuda")
         _, grads = assert_replays_bit_exact(
             lambda l, t: fused_vocab_parallel_cross_entropy(l, t, tp_group),
             (logits, target),
             replays=4,
+            contention=True,
             what="fused_vocab_parallel_cross_entropy",
         )
         assert grads["in[0]"].dtype == dtype
