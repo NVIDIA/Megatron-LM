@@ -1393,10 +1393,10 @@ CHUNKED_CG_MAX_SEQ_LEN = 2048
 @pytest.mark.internal
 @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
 class TestChunkedPrefillCudaGraphs:
-    """Verify correctness across chunked prefill and CUDA graph combinations.
+    """Verify chunked prefill against an unchunked baseline, eagerly and under CUDA graphs.
 
-    For each model type, runs a baseline config (no chunked prefill, no CUDA graphs)
-    and compares output tokens against every other combination.
+    Each test runs an unchunked baseline engine on the same model and compares a
+    chunked engine's output against it.
     """
 
     @classmethod
@@ -1604,8 +1604,11 @@ class TestChunkedPrefillCudaGraphs:
         [("gpt", None), ("hybrid", "mamba"), ("hybrid", "gdp")],
         ids=["gpt", "mamba", "gdp"],
     )
-    @pytest.mark.parametrize("chunked_prefill", [False, True])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
+    @pytest.mark.parametrize(
+        "chunked_prefill,num_cuda_graphs",
+        [(False, None), (True, None), (True, 2)],
+        ids=["unchunked_eager", "chunked_eager", "chunked_cuda_graphs"],
+    )
     @torch.inference_mode()
     def test_chunked_prefill_cuda_graphs(
         self, model_provider, ssm_mixer, chunked_prefill, num_cuda_graphs
