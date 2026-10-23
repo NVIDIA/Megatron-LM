@@ -101,11 +101,6 @@ def _validate_layer_config_sequence(
     supported_types = set(Symbols.LAYER_CONFIG_MAP.values())
     for index, layer_config in enumerate(layer_configs):
         if type(layer_config) not in supported_types:
-            if isinstance(layer_config, (PipelineSplit, MTPSplit)):
-                raise ValueError(
-                    f"{section_name} entry {index} is a sentinel instance. "
-                    "Use the bare PipelineSplit or MTPSplit class instead."
-                )
             raise ValueError(
                 f"{section_name} entry {index} has unsupported hybrid layer config type "
                 f"{type(layer_config).__name__}. Exact built-in layer config types are required."
