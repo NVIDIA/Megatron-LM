@@ -2940,7 +2940,7 @@ def setup_model_and_optimizer(
                 optimizer_type=optim_cfg.optimizer,
             )
             if mup_overrides:
-                config_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
+                optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
 
         optimizer = get_megatron_optimizer(
             optim_cfg,

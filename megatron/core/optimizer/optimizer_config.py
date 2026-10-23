@@ -462,6 +462,14 @@ class OptimizerConfig:
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
 
+        # finalize_optimizer_config() enables the layer-wise path for non-sgd/adam optimizers
+        # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
+        # value it will produce, not only the pre-finalize flag.
+        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
+            self.optimizer not in ('sgd', 'adam')
+            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
+        )
+
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
             if self.optimizer not in ('muon', 'dist_muon'):
@@ -470,7 +478,7 @@ class OptimizerConfig:
                     f"{self.optimizer!r}); other optimizers, including adaptive_muon, do not "
                     "implement layer sharding."
                 )
-            if self.optimizer == 'muon' and not self.use_layer_wise_distributed_optimizer:
+            if not will_be_layer_wise:
                 raise ValueError(
                     "muon_tp_mode='layer_sharded' requires the layer-wise distributed "
                     "optimizer path (use_layer_wise_distributed_optimizer=True)."
@@ -565,13 +573,6 @@ class OptimizerConfig:
                     "Use --optimizer muon --use-distributed-optimizer instead."
                 )
 
-        # finalize_optimizer_config() enables the layer-wise path for non-sgd/adam optimizers
-        # that use the distributed optimizer (or the deprecated dist_muon alias), so check the
-        # value it will produce, not only the pre-finalize flag.
-        will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
-            self.optimizer not in ('sgd', 'adam')
-            and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
-        )
         assert not (will_be_layer_wise and moe_single_grouped_weight), (
             "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
             "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
