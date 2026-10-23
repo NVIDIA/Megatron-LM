@@ -648,7 +648,7 @@ class FsdpParameterGroup:
         main_grad rests at the DP-outer-Partial accumulation placement, accumulating
         each backward through the standard zero_grad contract, and ``.grad`` binds to
         it. The last-microbatch DP-outer reduction is applied separately by
-        ``finalize_dp_outer_reduction``; the caller (``_reduce_gradient_groups``)
+        ``reduce_outer_gradients``; the caller (``_reduce_gradient_groups``)
         decides when and on which stream to run it, which is what lets the DP-outer
         reduction overlap the next group's DP-inner reduction.
         """
@@ -687,7 +687,7 @@ class FsdpParameterGroup:
 
         self._install_sharded_grads(self.main_grad)
 
-    def finalize_dp_outer_reduction(self) -> None:
+    def reduce_outer_gradients(self) -> None:
         """Finalize the deferred DP-outer reduction into the optimizer-layout view.
 
         All-reduce (HSDP) or reduce-scatter (HFSDP) the accumulator across DP-outer
