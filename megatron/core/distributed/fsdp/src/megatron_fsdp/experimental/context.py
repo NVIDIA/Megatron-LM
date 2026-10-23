@@ -36,7 +36,6 @@ class FsdpContext:
     # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
-    overlap_allgather_reduction: bool
     caller_managed_grad_sync: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
@@ -80,7 +79,6 @@ class FsdpContext:
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
-        self.overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
