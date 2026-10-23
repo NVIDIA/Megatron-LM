@@ -1111,6 +1111,19 @@ class _DispatchManager(ABC):
             if getattr(self, attr, None) is not None:
                 setattr(self, attr, None)
 
+    def disable_expert_rank_capacity(self) -> None:
+        """Clear the static expert-rank budget so the next attempt dispatches dropless.
+
+        Called by PagedStashRunner before it reruns a step that went over the expert-rank
+        budget or overflowed the paged stash, on backends that have an expert-rank budget
+        (``moe_expert_rank_capacity_factor``).
+        """
+        self.moe_expert_rank_capacity_factor = None
+
+    def restore_expert_rank_capacity(self) -> None:
+        """Restore the configured static expert-rank budget after a successful step."""
+        self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         """Set up metadata of routing_map and probs."""
@@ -1221,11 +1234,40 @@ class _HybridEPManager(_DispatchManager):
             )
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+        # Static budget set aside by disable_expert_rank_capacity() for a dropless rerun.
+        self._saved_num_permuted_tokens: int | None = None
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
         # When runtime token equalization is enabled, HybridEP metadata and hidden
         # states are padded to the group-wide max and trimmed again in combine.
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
+
+    def disable_expert_rank_capacity(self) -> None:
+        """Clear the static expert-rank budget so the next attempt dispatches dropless.
+
+        combine() keeps a static budget so CUDA graph replay, which skips setup_metadata(),
+        can reuse it. Clearing only the factor would therefore leave the failed attempt's
+        budget and expert counts in place for the first dispatch of the rerun: HybridEP would
+        drop over-budget tokens again without recording it, and the experts would read the
+        previous attempt's tokens_per_expert. Clear both so that dispatch sizes its output
+        with a host sync. Per-expert capacity (drop-and-pad) is static and stays.
+        """
+        if self.moe_expert_rank_capacity_factor is not None and not self.drop_and_pad:
+            self._saved_num_permuted_tokens = self.num_permuted_tokens
+            self.num_permuted_tokens = None
+            self.tokens_per_expert = None
+        self.moe_expert_rank_capacity_factor = None
+
+    def restore_expert_rank_capacity(self) -> None:
+        """Restore the configured static budget after a successful step.
+
+        Eager forwards recompute the budget in setup_metadata(); a replayed CUDA graph that
+        skips setup_metadata() reads the budget saved by disable_expert_rank_capacity().
+        """
+        self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
+        if self._saved_num_permuted_tokens is not None:
+            self.num_permuted_tokens = self._saved_num_permuted_tokens
+            self._saved_num_permuted_tokens = None
 
     def setup_metadata(
         self,
@@ -1252,11 +1294,12 @@ class _HybridEPManager(_DispatchManager):
 
         probs = probs.reshape(num_tokens, self.num_experts)
 
-        # Dropless HybridEP consumes the routing metadata directly, so padding rows must be
-        # excluded here or they are dispatched to experts. Capacity-based modes keep their
-        # fixed-route layout, where padded rows are already accounted for by the capacity.
-        dropless = self.capacity_factor is None and self.moe_expert_rank_capacity_factor is None
-        if padding_mask is not None and dropless:
+        # HybridEP consumes the routing metadata directly, so padding rows must be excluded
+        # here or they are dispatched to experts. This includes a static expert-rank budget:
+        # padding rows would otherwise count against it and could push a rank over it, which
+        # costs a dropless rerun of the step. Per-expert capacity keeps its fixed-route layout,
+        # where padded rows are already accounted for by the capacity.
+        if padding_mask is not None and self.capacity_factor is None:
             # The mask is batch-first [b, s] while tokens are flattened from sequence-first
             # [s, b, h] hidden states, so transpose before flattening to line up token rows.
             padding_rows = padding_mask.transpose(0, 1).reshape(-1)
@@ -2434,8 +2477,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             probs (torch.Tensor): Routing probabilities for each token-expert pair
             padding_mask (torch.Tensor, optional): Batch-first [b, s] bool mask of padding
                 tokens, as given to the router. Backends that consume routing metadata directly
-                (dropless HybridEP) drop those rows before dispatch; the other backends keep
-                their fixed-route layout.
+                (HybridEP without per-expert capacity, with or without an expert-rank budget)
+                drop those rows before dispatch; the other backends keep their fixed-route
+                layout.
 
         Returns:
             A tuple of reshaped hidden states and token probabilities.

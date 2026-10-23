@@ -1475,7 +1475,7 @@ class PagedStashRunner:
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun: go dropless, disable paged stashing, and reset grads/graph.
 
-        One path for both overflow kinds. Clearing the capacity factor sends HybridEP dropless
+        One path for both overflow kinds. Clearing the expert-rank budget sends HybridEP dropless
         and ncclEP into eager mode, neither of which can overflow a receive budget, and paged
         stashing is off, so the retry cannot fail the same way twice.
         """
@@ -1490,7 +1490,7 @@ class PagedStashRunner:
             if hasattr(mlp, 'token_dispatcher') and hasattr(
                 mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
             ):
-                mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
+                mlp.token_dispatcher._comm_manager.disable_expert_rank_capacity()
                 mlp.token_dispatcher.reset_over_budget()
                 mlp.token_dispatcher.invalidate_ep_bootstrap()
         # Record the peak the dropped step needed while it is still valid
@@ -1623,16 +1623,13 @@ class PagedStashRunner:
                         "Consider increasing moe_paged_stash_buffer_size_factor_cuda for "
                         "potentially better performance.",
                     )
-                # Restore moe_expert_rank_capacity_factor on every HybridEP MoE layer so the
-                # next step uses the static dispatch budget again (cleared by prepare_for_rerun
-                # on a failed retry).
+                # Restore the expert-rank budget on every MoE layer so the next step uses the
+                # static dispatch budget again (cleared by prepare_for_rerun on a failed retry).
                 for mlp in self.moe_layers:
                     if hasattr(mlp, 'token_dispatcher') and hasattr(
                         mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
                     ):
-                        mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = (
-                            mlp.token_dispatcher.config.moe_expert_rank_capacity_factor
-                        )
+                        mlp.token_dispatcher._comm_manager.restore_expert_rank_capacity()
                 # Only after an actual rerun: rebootstrap NCCL EP
                 if num_tries > 1:
                     for mlp in self.moe_layers:
