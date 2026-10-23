@@ -2086,9 +2086,9 @@ class _NCCLEPManager(_DispatchManager):
         # Note: this needs to stay out of the torch.compile region because TE's ep_bootstrap does
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_bootstrap()
-        if self.num_local_tokens > self._max_tokens_per_rank:
+        if hidden_states.shape[0] > self._max_tokens_per_rank:
             raise RuntimeError(
-                f"'ncclep' dispatch got {self.num_local_tokens} tokens on this rank, above the "
+                f"'ncclep' dispatch got {hidden_states.shape[0]} tokens on this rank, above the "
                 f"{self._max_tokens_per_rank} its NCCL EP buffers were sized for at bootstrap; "
                 "raise max_seqlen_per_dp_cp_rank or seq_length to the real per-rank maximum."
             )

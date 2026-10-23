@@ -384,6 +384,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fine_grained_offloading_max_inflight_offloads": None,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "seq_length": 1024,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
         "_name_": "none",
