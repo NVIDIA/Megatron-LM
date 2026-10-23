@@ -46,6 +46,8 @@ For NVIDIA GPU Cloud (NGC) container setup and all installation options, review 
 - **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 - **[Style Guide](style-guide.md)** - Python style overrides
 
+THD (packed sequences) support for [cross-layer tensor state](docs/user-guide/features/cross_layer_state.md) is still a work in progress and is not supported by this feature's main-branch implementation.
+
 # Latest News
 
 - **[2026/05]** **[DeepSeek-V4 initial support](https://github.com/NVIDIA/Megatron-LM/issues/4468)** - Megatron Core's `dev` branch includes the initial DeepSeek-V4 implementation; Megatron Bridge provides [conversion, inference, and pretraining recipes](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/models/deepseek_v4).
