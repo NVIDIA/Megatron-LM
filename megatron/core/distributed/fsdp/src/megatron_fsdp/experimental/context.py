@@ -31,6 +31,7 @@ class FsdpContext:
 
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
+    outer_reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because each parameter group tracks whether model_weight is stale
     # after syncing from main_weight.
@@ -72,8 +73,9 @@ class FsdpContext:
                 the current CUDA device.
             use_symmetric_memory: Whether modules constructed in this context allocate
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
-            unify_communication_stream: Whether all-gathers and reduce-scatters share one
-                communication stream to reduce peak transient memory. See
+            unify_communication_stream: Whether all-gathers and inner reduce-scatters share
+                one communication stream to reduce peak transient memory. Outer reductions
+                use a separate stream. See
                 https://github.com/NVIDIA/Megatron-LM/issues/6471.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
@@ -116,6 +118,7 @@ class FsdpContext:
             self.reduce_scatter_stream = self.allgather_stream
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
+        self.outer_reduce_scatter_stream = torch.cuda.Stream(device)
 
     def __enter__(self) -> "FsdpContext":
         """Activate this context for FSDP module construction."""
@@ -211,6 +214,7 @@ class FsdpContext:
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        self.current_stream().wait_stream(self.outer_reduce_scatter_stream)
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
