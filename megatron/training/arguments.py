@@ -2387,6 +2387,8 @@ def _add_network_size_args(parser):
         "hash_moe_vocab_size",
         "fp8_param",
         "fp4_param",
+        # defined by the explicit --seq-length argument below
+        "seq_length",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
