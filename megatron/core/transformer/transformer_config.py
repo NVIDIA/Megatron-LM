@@ -1627,6 +1627,16 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
+
+    mhc_keep_mappings_in_fp32: bool = False
+    """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_learned_output_contract: bool = True
+    """Contract residual streams to the ordinary hidden width using token-dependent gating;
+    otherwise average the streams."""
+
     use_fused_mhc: bool = False
     """Use fused kernels for mHC operations when supported.
 
@@ -3848,6 +3858,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+        if self.use_fused_mhc and (self.mhc_norm_eps_inside_sqrt or self.mhc_keep_mappings_in_fp32):
+            raise ValueError(
+                "use_fused_mhc does not support mhc_norm_eps_inside_sqrt or "
+                "mhc_keep_mappings_in_fp32; use the unfused mHC path."
+            )
 
         valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
         if self.mhc_fused_backend not in valid_mhc_fused_backends:

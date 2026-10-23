@@ -332,6 +332,19 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
+@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
+    with pytest.raises(ValueError, match="use_fused_mhc does not support"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            use_fused_mhc=True,
+            **{flag: True},
+        )
+
+
 @pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
 def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
     config = TransformerConfig(
@@ -362,6 +375,21 @@ def test_explicit_mhc_fused_backend_requires_fused_mhc():
             enable_mhc_connections=True,
             mhc_fused_backend="native",
         )
+
+
+def test_mhc_full_recompute_with_distributed_activations_is_configurable():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=True,
+    )
+    assert config.recompute_granularity == "full"
+    assert config.distribute_saved_activations
 
 
 def test_gdp_num_householder_defaults_to_three():
