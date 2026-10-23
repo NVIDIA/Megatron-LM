@@ -5,6 +5,7 @@
 import pickle
 from copy import deepcopy
 from dataclasses import fields
+from unittest import mock
 
 import torch
 
@@ -121,3 +122,50 @@ class TestCPUTensors:
                 assert file.exists()
                 file_size = file.stat().st_size
                 assert file_size < 10_000, file.name
+
+
+class TestDCPCoordinationGroup:
+    """DCP's plan / result exchange (gather_object, scatter_object_list) must not run on the NCCL
+    default group: NCCL gather / scatter set up persistent P2P connections from the coordinator to
+    every rank, which cost device memory linear in the world size for the rest of the run."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_sync_save_object_exchange_runs_on_gloo(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(1, 1)
+        sharded_state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.arange(8.0).cuda() + Utils.rank, (0, Utils.rank, Utils.world_size)
+            ),
+            'sd_keyB': ShardedTensor.from_rank_offsets(
+                'keyB', torch.ones(3, 5).cuda(), replica_id=Utils.rank
+            ),
+        }
+        groups = []
+        real_gather = torch.distributed.gather_object
+        real_scatter = torch.distributed.scatter_object_list
+
+        def gather_object(*args, **kwargs):
+            groups.append(kwargs.get('group'))
+            return real_gather(*args, **kwargs)
+
+        def scatter_object_list(*args, **kwargs):
+            groups.append(kwargs.get('group'))
+            return real_scatter(*args, **kwargs)
+
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'test_dcp_gloo') as ckpt_dir,
+            mock.patch.object(torch.distributed, 'gather_object', gather_object),
+            mock.patch.object(torch.distributed, 'scatter_object_list', scatter_object_list),
+        ):
+            save(sharded_state_dict, ckpt_dir, async_sharded_save=False)
+            # all ranks call gather_object (non-coordinators send); the exchange happened
+            assert groups
+            for group in groups:
+                assert group is not None
+                assert torch.distributed.get_backend(group) == 'gloo'
+                assert torch.distributed.get_world_size(group) == Utils.world_size
+            loaded = load(sharded_state_dict, ckpt_dir)
+            assert torch.equal(loaded['sd_keyA'].cpu(), torch.arange(8.0) + Utils.rank)
+            assert torch.equal(loaded['sd_keyB'].cpu(), torch.ones(3, 5))
