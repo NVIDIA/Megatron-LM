@@ -12,8 +12,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -60,6 +62,7 @@ class TestPartitionConfig:
 
     def test_from_mp_config_explicit_tp_group(self):
         mock_tp_group = MagicMock()
+        mock_tp_cp_group = MagicMock()
         mp = TransformerConfig(
             num_layers=1,
             hidden_size=64,
@@ -68,9 +71,12 @@ class TestPartitionConfig:
             sequence_parallel=True,
         )
         with patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=1):
-            cfg = PartitionConfig.from_mp_config(mp, max_seq_len=512, tp_group=mock_tp_group)
+            cfg = PartitionConfig.from_mp_config(
+                mp, max_seq_len=512, tp_group=mock_tp_group, tp_cp_group=mock_tp_cp_group
+            )
         assert cfg.seq_parallel is True
         assert cfg.tp_group is mock_tp_group
+        assert cfg.tp_cp_group is mock_tp_cp_group
 
     def test_from_mp_config_auto_fetch_cp_group(self):
         mock_group = MagicMock()
@@ -108,8 +114,8 @@ class TestPartitionConfig:
 
 
 @pytest.mark.experimental
-class TestPartitionAdapterShard:
-    """Tests for PartitionAdapter.shard()."""
+class TestPartitionAdapter:
+    """Tests for PartitionAdapter.partition()."""
 
     def _make_cfg(
         self,
@@ -137,20 +143,20 @@ class TestPartitionAdapterShard:
         return embeddings, labels, loss_mask
 
     def test_noop_when_both_disabled(self):
-        """With neither CP nor SP active, shard() is a pure passthrough.
+        """With neither CP nor SP active, partition() is a pure passthrough.
 
-        Production never constructs a PartitionAdapter unless CP or SP is enabled.
-        Embeddings are already sequence-first (S, B, H), so with no collectives the
-        inputs are returned untouched (no transpose, no sharding).
+        Embeddings are already sequence-first (S, B, H), so with no collectives the inputs are
+        returned untouched while packed metadata still follows the shared preparation path.
         """
         cfg = self._make_cfg(use_cp=False, seq_parallel=False)
         adapter = PartitionAdapter(cfg)
         embeddings, labels, loss_mask = self._make_tensors(B=2, S=8, H=16)
-        out = adapter.shard(embeddings, labels, loss_mask)
-        assert out[0] is embeddings
-        assert out[1] is labels
-        assert out[2] is loss_mask
-        assert out[3] is None
+        cp_batch = adapter.partition(embeddings, None, None, labels, loss_mask, None)
+        batch = cp_batch.get_batch()
+        assert batch["decoder_input"] is embeddings
+        assert batch["labels"] is labels
+        assert batch["loss_mask"] is loss_mask
+        assert cp_batch.get_packed_seq_params() is None
 
     def test_seq_not_divisible_raises(self):
         mock_cp_group = MagicMock()
@@ -163,7 +169,7 @@ class TestPartitionAdapterShard:
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
             pytest.raises(AssertionError, match="divisible"),
         ):
-            adapter.shard(embeddings, labels, loss_mask)
+            adapter.partition(embeddings, None, None, labels, loss_mask, None)
 
     def test_tp_comm_overlap_seq_len_assertion(self):
         mock_tp_group = MagicMock()
@@ -179,33 +185,45 @@ class TestPartitionAdapterShard:
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
             pytest.raises(AssertionError, match="TP Comm overlap"),
         ):
-            adapter.shard(embeddings, labels, loss_mask)
+            adapter.partition(embeddings, None, None, labels, loss_mask, None)
 
     def test_thd_format_skips_divisibility_check(self):
-        """PackedSeqParams with qkv_format='thd' bypasses the divisibility assertion."""
-        from megatron.core.packed_seq_params import PackedSeqParams
-
+        """Packed-sequence metadata bypasses the dense divisibility assertion."""
         mock_cp_group = MagicMock()
         cfg = self._make_cfg(use_cp=True, max_seq_len=7, cp_group=mock_cp_group)
         adapter = PartitionAdapter(cfg)
         embeddings = torch.rand(7, 2, 16)  # seq-first; len=7 not divisible by cp*2, THD skips check
         labels = torch.randint(0, 100, (2, 7))
         loss_mask = torch.ones(2, 7)
-        packed_seq_params = MagicMock(spec=PackedSeqParams)
-        packed_seq_params.qkv_format = 'thd'
-        packed_seq_params.cu_seqlens_q_padded = torch.tensor([0, 4, 7], dtype=torch.int32)
-
-        # THD path calls tex.thd_get_partitioned_indices — mock it to return first 4 indices
-        fake_index = torch.arange(4, dtype=torch.int32)
+        cu_seqlens = torch.tensor([[0, 4, 7]], dtype=torch.int32)
+        cp_batch = ContextParallelBatch.from_single_layout(
+            "zigzag",
+            {
+                "decoder_input": embeddings.transpose(0, 1)[:, :4],
+                "labels": labels[:, :4],
+                "loss_mask": loss_mask[:, :4],
+            },
+            MagicMock(spec=PackedSeqParams),
+        )
         with (
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
-            patch('megatron.core.models.mimo.partition.utils.get_pg_rank', return_value=0),
-            patch('megatron.core.models.mimo.partition.utils.tex') as mock_tex,
+            patch(
+                "megatron.core.models.mimo.partition.utils.get_batches_on_this_cp_rank",
+                return_value=cp_batch,
+            ),
         ):
-            mock_tex.thd_get_partitioned_indices.return_value = fake_index
             # Should NOT raise AssertionError about divisibility
-            out = adapter.shard(embeddings, labels, loss_mask, packed_seq_params)
-        assert out[0] is not None
+            result = adapter.partition(
+                embeddings,
+                None,
+                None,
+                labels,
+                loss_mask,
+                None,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=torch.tensor([4], dtype=torch.int32),
+            )
+        assert result.get_batch()["decoder_input"] is not None
 
     def test_none_embeddings_skips_shard_factor_check(self):
         """When embeddings is None, the divisibility check is skipped (non-first PP stage)."""
@@ -214,117 +232,116 @@ class TestPartitionAdapterShard:
         adapter = PartitionAdapter(cfg)
         labels = torch.randint(0, 100, (2, 7))
         loss_mask = torch.ones(2, 7)
-        cp_sharded = {'labels': labels[:, :4], 'loss_mask': loss_mask[:, :4]}
+        cp_batch = ContextParallelBatch.from_single_layout(
+            "zigzag", {"labels": labels[:, :4], "loss_mask": loss_mask[:, :4]}, None
+        )
         with (
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
             patch(
-                'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
-                return_value=cp_sharded,
+                "megatron.core.models.mimo.partition.utils.get_batches_on_this_cp_rank",
+                return_value=cp_batch,
             ),
         ):
-            out = adapter.shard(None, labels, loss_mask)
-        assert out[0] is None
-        assert out[1].shape == (2, 4)
-        assert out[2].shape == (2, 4)
+            result = adapter.partition(None, None, None, labels, loss_mask, None)
+        batch = result.get_batch()
+        assert batch.get("decoder_input") is None
+        assert batch["labels"].shape == (2, 4)
+        assert batch["loss_mask"].shape == (2, 4)
 
 
 @pytest.mark.experimental
-class TestPartitionAdapterApplyContextParallel:
-    """Tests for PartitionAdapter._apply_context_parallel()."""
+class TestPartitionAdapterContextParallelBatch:
+    """Tests for constructing MIMO's dual-layout CP batch."""
 
-    def _make_cfg(self, use_cp=True, cp_group=None):
-        return PartitionConfig(
-            use_cp=use_cp,
-            seq_parallel=False,
+    def test_partitions_all_language_inputs_together(self):
+        cp_group = MagicMock()
+        tp_group = MagicMock()
+        tp_cp_group = MagicMock()
+        cfg = PartitionConfig(
+            use_cp=True,
+            seq_parallel=True,
             tp_comm_overlap=False,
-            max_seq_len=128,
+            max_seq_len=8,
+            linear_cp_layout="contiguous",
+            attention_cp_layout="zigzag",
             cp_group=cp_group,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
         )
-
-    def test_returns_unchanged_when_cp_disabled(self):
-        cfg = self._make_cfg(use_cp=False)
         adapter = PartitionAdapter(cfg)
-        embeddings = torch.rand(2, 8, 16)
-        labels = torch.randint(0, 100, (2, 8))
-        loss_mask = torch.ones(2, 8)
-        out = adapter._apply_context_parallel(embeddings, labels, loss_mask, None)
-        assert out[0] is embeddings
-        assert out[1] is labels
-        assert out[2] is loss_mask
-        assert out[3] is None
+        embeddings, labels, loss_mask = TestPartitionAdapter()._make_tensors(S=8)
+        input_ids = torch.arange(8).view(1, 8).expand(2, -1)
+        position_ids = torch.stack((input_ids, input_ids + 10, input_ids + 20))
+        mtp_input_mask = input_ids != 3
+        cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32)
+        max_seqlen = torch.tensor([8], dtype=torch.int32)
 
-    def test_sbhd_path_calls_get_batch_on_this_cp_rank(self):
-        mock_cp_group = MagicMock()
-        cfg = self._make_cfg(use_cp=True, cp_group=mock_cp_group)
-        adapter = PartitionAdapter(cfg)
-        embeddings = torch.rand(2, 8, 16)
-        labels = torch.randint(0, 100, (2, 8))
-        loss_mask = torch.ones(2, 8)
-        sharded = {
-            'embeddings': embeddings[:, :4, :],
-            'labels': labels[:, :4],
-            'loss_mask': loss_mask[:, :4],
+        boundary_batch = {
+            "tokens": input_ids[:, :4],
+            "position_ids": position_ids.movedim(0, -1)[:, :4],
+            "labels": labels[:, :4],
+            "loss_mask": loss_mask[:, :4],
+            "mtp_input_mask": mtp_input_mask[:, :4],
+            "decoder_input": embeddings.transpose(0, 1)[:, :4],
         }
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
-            return_value=sharded,
-        ) as mock_fn:
-            out = adapter._apply_context_parallel(embeddings, labels, loss_mask, None)
-            mock_fn.assert_called_once()
-        # _apply_context_parallel keeps batch-first [B, S/cp, H]; shard() transposes later.
-        assert out[0].shape == (2, 4, 16)
-        assert out[1].shape == (2, 4)
+        zigzag_batch = {
+            "tokens": input_ids[:, 4:],
+            "position_ids": position_ids.movedim(0, -1)[:, 4:],
+            "labels": labels[:, 4:],
+            "loss_mask": loss_mask[:, 4:],
+            "mtp_input_mask": mtp_input_mask[:, 4:],
+            "decoder_input": embeddings.transpose(0, 1)[:, 4:],
+        }
+        local_packed = MagicMock(spec=PackedSeqParams)
+        cp_batch = ContextParallelBatch(
+            boundary_layout="contiguous",
+            batches_by_layout={"contiguous": boundary_batch, "zigzag": zigzag_batch},
+            packed_seq_params_by_layout={
+                "contiguous": local_packed,
+                "zigzag": MagicMock(spec=PackedSeqParams),
+            },
+            thd_plan=MagicMock(),
+        )
+        local_embeddings = embeddings[:2]
 
-    def test_all_none_inputs_produces_none_outputs(self):
-        mock_cp_group = MagicMock()
-        cfg = self._make_cfg(use_cp=True, cp_group=mock_cp_group)
-        adapter = PartitionAdapter(cfg)
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank', return_value={}
-        ):
-            out = adapter._apply_context_parallel(None, None, None, None)
-        assert all(v is None for v in out[:3])
-
-    def test_only_non_none_tensors_added_to_batch(self):
-        """None tensors must not appear in the batch dict passed to get_batch_on_this_cp_rank."""
-        mock_cp_group = MagicMock()
-        cfg = self._make_cfg(use_cp=True, cp_group=mock_cp_group)
-        adapter = PartitionAdapter(cfg)
-        embeddings = torch.rand(2, 8, 16)
-        sharded = {'embeddings': embeddings[:, :4, :]}
-        captured = {}
-
-        def mock_fn(batch, **kwargs):
-            captured.update(batch)
-            return sharded
-
-        with patch(
-            'megatron.core.models.mimo.partition.utils.get_batch_on_this_cp_rank',
-            side_effect=mock_fn,
-        ):
-            out = adapter._apply_context_parallel(embeddings, None, None, None)
-
-        assert 'embeddings' in captured
-        assert 'labels' not in captured
-        assert 'loss_mask' not in captured
-        assert out[0] is not None
-        assert out[1] is None
-
-    def test_thd_path_raises_when_te_unavailable(self):
-        """THD format must assert when Transformer Engine is not available."""
-        from megatron.core.packed_seq_params import PackedSeqParams
-
-        mock_cp_group = MagicMock()
-        cfg = self._make_cfg(use_cp=True, cp_group=mock_cp_group)
-        adapter = PartitionAdapter(cfg)
-        embeddings = torch.rand(2, 5, 16)
-        packed_seq_params = MagicMock(spec=PackedSeqParams)
-        packed_seq_params.qkv_format = 'thd'
         with (
-            patch('megatron.core.models.mimo.partition.utils._HAVE_TEX', False),
-            pytest.raises(AssertionError, match="Transformer Engine"),
+            patch(
+                "megatron.core.models.mimo.partition.utils.get_batches_on_this_cp_rank",
+                return_value=cp_batch,
+            ) as get_cp_batches,
+            patch(
+                "megatron.core.models.mimo.partition.utils."
+                "tensor_parallel.scatter_to_sequence_parallel_region",
+                return_value=local_embeddings,
+            ) as scatter,
         ):
-            adapter._apply_context_parallel(embeddings, None, None, packed_seq_params)
+            result = adapter.partition(
+                embeddings=embeddings,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+
+        (unsharded_batch,) = get_cp_batches.call_args.args
+        call_kwargs = get_cp_batches.call_args.kwargs
+        assert call_kwargs["boundary_layout"] == "contiguous"
+        assert call_kwargs["additional_layouts"] == {"zigzag"}
+        assert call_kwargs["tp_cp_group"] is tp_cp_group
+        assert unsharded_batch["decoder_input"].shape == (2, 8, 16)
+        assert unsharded_batch["position_ids"].shape == (2, 8, 3)
+        assert unsharded_batch["mtp_input_mask"] is mtp_input_mask
+        assert unsharded_batch["cu_seqlens"] is cu_seqlens
+        assert unsharded_batch["max_seqlen"] is max_seqlen
+        assert result is cp_batch
+        assert boundary_batch["decoder_input"] is local_embeddings
+        assert boundary_batch["position_ids"].shape == (3, 2, 4)
+        assert result.get_packed_seq_params() is local_packed
+        assert "decoder_input" not in zigzag_batch
+        scatter.assert_called_once()
 
 
 def _expected_cp_zigzag_shard(tensor: torch.Tensor, cp_size: int, cp_rank: int) -> torch.Tensor:
@@ -346,8 +363,8 @@ def _expected_cp_zigzag_shard(tensor: torch.Tensor, cp_size: int, cp_rank: int) 
     int(os.environ.get('WORLD_SIZE', '1')) != 8,
     reason="Real MIMO CP/SP sharding tests require an 8-GPU world",
 )
-class TestPartitionAdapterShardRealDistributed:
-    """Real 8-GPU tests for ``PartitionAdapter.shard()``.
+class TestPartitionAdapterRealDistributed:
+    """Real 8-GPU tests for ``PartitionAdapter.partition()``.
 
     These exercise the genuine collectives (CP zigzag chunking via
     ``get_batch_on_this_cp_rank`` and the SP scatter via
@@ -415,9 +432,13 @@ class TestPartitionAdapterShardRealDistributed:
         adapter = PartitionAdapter(cfg)
         embeddings, labels, loss_mask = self._make_inputs(B, S, H)
 
-        out_emb, out_labels, out_loss_mask, _ = adapter.shard(
-            embeddings.clone(), labels.clone(), loss_mask.clone()
+        cp_batch = adapter.partition(
+            embeddings.clone(), None, None, labels.clone(), loss_mask.clone(), None
         )
+        batch = cp_batch.get_batch()
+        out_emb = batch["decoder_input"]
+        out_labels = batch["labels"]
+        out_loss_mask = batch["loss_mask"]
 
         tp_rank = tp_group.rank()
         shard = S // tp_size
@@ -449,9 +470,13 @@ class TestPartitionAdapterShardRealDistributed:
         adapter = PartitionAdapter(cfg)
         embeddings, labels, loss_mask = self._make_inputs(B, S, H)
 
-        out_emb, out_labels, out_loss_mask, _ = adapter.shard(
-            embeddings.clone(), labels.clone(), loss_mask.clone()
+        cp_batch = adapter.partition(
+            embeddings.clone(), None, None, labels.clone(), loss_mask.clone(), None
         )
+        batch = cp_batch.get_batch()
+        out_emb = batch["decoder_input"]
+        out_labels = batch["labels"]
+        out_loss_mask = batch["loss_mask"]
 
         cp_rank = cp_group.rank()
         shard = S // cp_size
@@ -487,9 +512,13 @@ class TestPartitionAdapterShardRealDistributed:
         adapter = PartitionAdapter(cfg)
         embeddings, labels, loss_mask = self._make_inputs(B, S, H)
 
-        out_emb, out_labels, out_loss_mask, _ = adapter.shard(
-            embeddings.clone(), labels.clone(), loss_mask.clone()
+        cp_batch = adapter.partition(
+            embeddings.clone(), None, None, labels.clone(), loss_mask.clone(), None
         )
+        batch = cp_batch.get_batch()
+        out_emb = batch["decoder_input"]
+        out_labels = batch["labels"]
+        out_loss_mask = batch["loss_mask"]
 
         cp_rank = cp_group.rank()
         tp_rank = tp_group.rank()

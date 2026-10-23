@@ -125,6 +125,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.wgrad_store = object()
             self.scale_bias = scale_bias
 
         def need_backward_dw(self):
@@ -154,6 +155,8 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    # __new__ bypasses the compatibility check cached by TEGroupedMLP.__init__.
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=16,
         delay_wgrad_compute=False,
@@ -396,6 +399,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.wgrad_store = object()
             self.scale_bias = scale_bias
 
         def need_backward_dw(self):
@@ -425,6 +429,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=8,
         delay_wgrad_compute=False,
@@ -508,6 +513,7 @@ def _make_fake_te_namespace():
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.wgrad_store = object()
             self.scale_bias = scale_bias
 
         def need_backward_dw(self):
@@ -583,6 +589,7 @@ def test_make_fused_ops_uses_clamped_qgeglu(
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
@@ -623,6 +630,7 @@ def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch)
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -660,6 +668,7 @@ def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(monkeypatch):
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -697,6 +706,7 @@ def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch)
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
@@ -797,25 +807,22 @@ def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
     assert module._is_fused_impl_supported() is True
 
 
-@pytest.mark.parametrize("activation_func_clamp_value", [None, 10.0], ids=("unclamped", "clamped"))
-def test_is_fused_impl_supported_requires_cutedsl_for_swiglu(
-    monkeypatch, activation_func_clamp_value
-):
+def test_is_fused_impl_supported_ignores_offload_knobs(monkeypatch):
+    """expert_fc1/moe_act offload must not push a fusable GroupedMLP onto the unfused path;
+    the knobs are reconciled per instance in __init__ instead."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
     monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
     _install_fake_te_ops_modules(monkeypatch, fake_te)
 
     module = _make_fused_impl_support_module(
-        FakeGroupedLinear,
-        activation_func=F.silu,
-        gated_linear_unit=True,
-        activation_func_clamp_value=activation_func_clamp_value,
+        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
     )
+    module.offload_expert_fc1 = True
+    module.offload_moe_act = True
 
-    assert module._is_fused_impl_supported() is False
+    assert module._is_fused_impl_supported() is True
 
 
 def test_is_fused_impl_supported_requires_scaled_fc2_bias(monkeypatch):
@@ -962,6 +969,7 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
     module.config = SimpleNamespace(
         moe_mlp_glu_interleave_size=2,
         delay_wgrad_compute=False,
@@ -1325,6 +1333,83 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    def test_gpu_split_alignment_enables_fusion_without_env(self, monkeypatch):
+        """Explicit split alignment enables the real fused kernels without the legacy env var."""
+        import inspect
+
+        import transformer_engine.pytorch as te
+
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        if "split_alignment" not in inspect.signature(GroupedLinear).parameters:
+            pytest.skip("Installed TE op fuser GroupedLinear lacks split_alignment")
+        monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+
+        mxfp8_available, reason = te.is_mxfp8_available(return_reason=True)
+        if not mxfp8_available:
+            pytest.skip(reason)
+        fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        if not fused_cls.is_supported():
+            pytest.skip("Fused grouped MLP requires supported GPU and cuDNN frontend kernels")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+        )
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        with get_fp8_context(config, is_init=True):
+            layer = MoELayer(config, submodules)
+        experts = layer.experts.cuda()
+        tokens_per_expert = torch.full((self.num_experts,), 256, dtype=torch.long, device="cuda")
+        hidden = torch.randn(
+            (256 * self.num_experts, config.hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        probs = torch.rand(hidden.size(0), device="cuda", dtype=torch.float32, requires_grad=True)
+        with get_fp8_context(config):
+            output, _ = experts(hidden, tokens_per_expert, probs)
+        output.backward(torch.randn_like(output))
+
+        (sequential,) = experts._fused_ops
+        assert sequential[0].split_alignment == 256
+        assert sequential[2].split_alignment == 256
+        (fuser,) = sequential._module_groups
+        assert len(fuser._forward_ops) == 1
+        assert len(fuser._backward_ops) == 1
+        assert isinstance(fuser._forward_ops[0][0], fused_cls)
+        assert fuser._backward_ops[0][0] is fuser._forward_ops[0][0]
+        assert torch.isfinite(output).all()
+        for tensor in (hidden, probs, *experts.parameters()):
+            assert tensor.grad is not None
+            assert torch.isfinite(tensor.grad).all()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     @pytest.mark.parametrize("override_pattern", (None, "*experts*", "*linear_fc1", "*linear_fc2"))
     def test_gpu_precision_override_keeps_experts_unfused(self, override_pattern):
         """A per-module precision override must keep these experts off the op-fuser path.
@@ -1402,6 +1487,102 @@ class TestTEGroupedMLP:
             assert experts._with_fused_impl
         else:
             assert not experts._with_fused_impl
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "offload_modules",
+        (["expert_fc1", "moe_act"], ["fused_group_mlp"], ["moe_act"]),
+        ids=("unfused_knobs", "fused_knob", "partial_unfused_knob"),
+    )
+    @pytest.mark.parametrize("override_pattern", (None, "*experts*"), ids=("fused", "unfused"))
+    def test_gpu_offload_knobs_follow_the_experts_path(self, override_pattern, offload_modules):
+        """'fused_group_mlp' and 'expert_fc1' + 'moe_act' are equivalent spellings; each
+        GroupedMLP maps whichever is given onto its own path. A fused instance offloads the
+        block input (a partial 'expert_fc1'/'moe_act' selection is widened to that, with a
+        warning), an unfused instance offloads the fc1 and activation inputs. Listing the
+        unfused knobs must not force fusable experts onto the unfused path.
+        """
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        quant_recipe = None
+        if override_pattern is not None:
+            quant_recipe = RecipeConfig.from_config_dict(
+                {
+                    "configs": {
+                        "high_precision": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {},
+                        }
+                    },
+                    "matchers": {
+                        "experts_high_precision": {
+                            "type": "glob",
+                            "enabled": True,
+                            "pattern": override_pattern,
+                            "config": "high_precision",
+                        }
+                    },
+                }
+            )
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=quant_recipe,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        fused_instance = override_pattern is None
+        partial = offload_modules == ["moe_act"]
+        if fused_instance and partial:
+            with pytest.warns(UserWarning, match=r"partial 'expert_fc1' or 'moe_act' selection"):
+                layer = MoELayer(tf_config, submodules, name="mlp")
+        else:
+            import warnings as _warnings
+
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("error", UserWarning)
+                layer = MoELayer(tf_config, submodules, name="mlp")
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+
+        if fused_instance:
+            assert experts._with_fused_impl
+            assert experts._is_fused_impl_supported()
+            assert experts.offload_fused_group_mlp
+            assert not experts.offload_expert_fc1
+            assert not experts.offload_moe_act
+        else:
+            assert not experts._with_fused_impl
+            assert not experts.offload_fused_group_mlp
+            assert experts.offload_expert_fc1 == (not partial)
+            assert experts.offload_moe_act
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
@@ -1944,3 +2125,141 @@ class TestTEGroupedMLP:
 
         ratio = (peak(tight) / peak(loose).clamp_min(1e-6)).item()
         assert 16.0 < ratio < 256.0, ratio
+
+
+class _RecordingCheckpoint:
+    """Stand-in for tensor_parallel.CheckpointWithoutOutput that records its use.
+
+    checkpoint() runs the function eagerly so the forward still produces real
+    outputs, while construction and discard calls are counted so a test can assert
+    whether the moe_act checkpoint path was taken at all.
+    """
+
+    instances: list = []
+
+    def __init__(self, *args, **kwargs):
+        self.discard_calls = 0
+        type(self).instances.append(self)
+
+    def checkpoint(self, run_function, *args):
+        return run_function(*args)
+
+    def discard_output_and_register_recompute(self, hook_tensor):
+        self.discard_calls += 1
+
+
+class _DoublingGroupedLinear(torch.nn.Module):
+    """Minimal stand-in for TEGroupedLinear returning (output, bias)."""
+
+    def forward(self, hidden_states, tokens_per_expert):
+        return hidden_states * 2.0, None
+
+
+def _build_moe_act_recompute_module():
+    """TEGroupedMLP wired for the unfused moe_act path with recompute enabled.
+
+    Built via __new__ to skip TEGroupedMLP.__init__, which would require TE, CUDA and
+    an initialized distributed group. nn.Module.__init__ still has to run so that
+    submodules can be assigned and so that module.training is set to True, which the
+    grad-disabled test relies on.
+    """
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._with_fused_impl = False
+    module._use_grouped_tensor = False
+    module.offload_expert_fc1 = False
+    module.offload_moe_act = False
+    # The flag under test: moe_act selective recompute is configured on.
+    module.activation_recompute = True
+    module.activation_func = F.gelu
+    module.linear_fc1 = _DoublingGroupedLinear()
+    module.linear_fc2 = _DoublingGroupedLinear()
+    module.config = SimpleNamespace(
+        fp8=False,
+        fp4=False,
+        moe_router_padding_for_quantization=False,
+        moe_token_dispatcher_type=None,
+        moe_flex_dispatcher_backend=None,
+        moe_use_grouped_tensor=False,
+        moe_permute_fusion=False,
+        moe_apply_probs_on_input=False,
+        moe_mlp_glu_interleave_size=None,
+        moe_router_topk=1,
+        delay_offload_until_cuda_graph=False,
+        gated_linear_unit=False,
+        use_te_activation_func=False,
+        bias_activation_fusion=False,
+        use_fused_weighted_squared_relu=False,
+        # Every activation_func_* field read by bias_act_func is defined here, including
+        # ones only reached on branches this stub does not take, so that a future edit to
+        # a neighbouring branch fails on the assertion rather than on AttributeError.
+        activation_func=F.gelu,
+        activation_func_clamp_value=None,
+        activation_func_fp8_input_store=False,
+        activation_func_tanh_clamp_scale=None,
+        activation_func_tanh_clamp_scale_linear=None,
+        glu_linear_offset=0.0,
+    )
+    return module
+
+
+def _run_moe_act_forward(monkeypatch):
+    """Run TEGroupedMLP.forward with CheckpointWithoutOutput swapped for a spy."""
+    _RecordingCheckpoint.instances = []
+    monkeypatch.setattr(
+        experts_module.tensor_parallel, "CheckpointWithoutOutput", _RecordingCheckpoint
+    )
+    module = _build_moe_act_recompute_module()
+    hidden_states = torch.ones(4, 8, requires_grad=True)
+    tokens_per_expert = torch.tensor([2, 2])
+    permuted_probs = torch.ones(4)
+
+    output, _ = module.forward(hidden_states, tokens_per_expert, permuted_probs)
+    return output, _RecordingCheckpoint.instances, module
+
+
+def test_moe_act_recompute_is_set_up_when_grad_enabled(monkeypatch):
+    """With grad enabled, the moe_act checkpoint is created and its recompute registered."""
+    with torch.enable_grad():
+        output, instances, _ = _run_moe_act_forward(monkeypatch)
+
+    assert len(instances) == 1, "expected exactly one CheckpointWithoutOutput to be constructed"
+    assert instances[0].discard_calls == 1, (
+        "discard_output_and_register_recompute must be called so the discarded "
+        "activation has a recompute hook"
+    )
+    assert output.requires_grad
+
+
+def test_moe_act_recompute_is_skipped_when_grad_disabled(monkeypatch):
+    """Under torch.no_grad() the checkpoint must not be set up.
+
+    CheckpointWithoutOutput discards the activation and relies on a grad hook to
+    recompute it. With grad disabled the output does not require grad, so the hook is
+    never registered and the discard is left without its counterpart. Guarding on
+    self.training is not enough: when "moe" is also in recompute_modules,
+    CheckpointFunction invokes this same forward once under no_grad and again under
+    enable_grad during backward, and self.training is True in both cases.
+    """
+    with torch.no_grad():
+        output, instances, module = _run_moe_act_forward(monkeypatch)
+
+    assert instances == [], (
+        "CheckpointWithoutOutput must not be constructed under torch.no_grad(); "
+        "its recompute hook cannot be registered and the discard would be orphaned"
+    )
+    assert not output.requires_grad
+    # The module is still in train mode here, so a `self.training` guard would have
+    # taken the checkpoint path. Only torch.is_grad_enabled() separates the two passes.
+    assert module.training is True
+    assert module.activation_recompute is True
+
+
+def test_moe_act_recompute_paths_are_numerically_equivalent(monkeypatch):
+    """Skipping the checkpoint under no_grad must not change the forward result."""
+    with torch.enable_grad():
+        grad_output, _, _ = _run_moe_act_forward(monkeypatch)
+    with torch.no_grad():
+        nograd_output, _, _ = _run_moe_act_forward(monkeypatch)
+
+    torch.testing.assert_close(grad_output.detach(), nograd_output)

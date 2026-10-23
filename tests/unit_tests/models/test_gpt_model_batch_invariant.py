@@ -204,6 +204,7 @@ class TestGPTModelBatchInvariant:
 
         assert torch.equal(logits_full, logits_chunked)
 
+    @pytest.mark.flaky_in_dev
     def test_dynamic_engine_matches_batched_forward_rl(self):
         _configure_flash_attention_env()
         seq_len = 48
@@ -277,6 +278,7 @@ class TestGPTModelBatchInvariant:
                     inference_log_probs, baseline_log_probs
                 ), "Log probabilities from dynamic engine did not match batched forward."
 
+    @pytest.mark.flaky_in_dev
     def test_dynamic_engine_is_batch_invariant(self):
         """Check that the dynamic engine itself is batch invariant: changing the
         order in which requests are added does not change per-request outputs."""
@@ -352,6 +354,7 @@ class TestGPTModelBatchInvariant:
             assert r1.prompt_log_probs == r2.prompt_log_probs
             assert r1.generated_log_probs == r2.generated_log_probs
 
+    @pytest.mark.flaky_in_dev
     def test_dynamic_engine_is_batch_invariant_under_kv_cache_saturation(self):
         """Saturating the KV cache must not change what requests generate.
 

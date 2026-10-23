@@ -30,6 +30,45 @@ def add_multimodal_extra_args(parser):
         default="mlp",
         help="Projection from vision encoder features into the language-model hidden size.",
     )
+    # Inference from MIMO checkpoints builds the encoder named by --vision-model-type with these
+    # sizes in place of its registry defaults.
+    for name, help_text in (
+        ("num-layers", "Vision encoder layers."),
+        ("hidden-size", "Vision encoder hidden size."),
+        ("ffn-hidden-size", "Vision encoder MLP hidden size."),
+        ("num-attention-heads", "Vision encoder attention heads."),
+        ("num-query-groups", "Vision encoder key/value head groups."),
+        ("kv-channels", "Vision encoder attention head dim."),
+    ):
+        group.add_argument(f"--vision-{name}", type=int, default=None, help=help_text)
+    group.add_argument(
+        "--vision-projection-activation",
+        choices=["gelu", "fast_gelu"],
+        default="gelu",
+        help="Activation of the vision projection built for MIMO checkpoints.",
+    )
+    group.add_argument(
+        "--image-token-id",
+        type=int,
+        default=None,
+        help="Image placeholder token ID. For MIMO checkpoints, defaults to the image_token the "
+        "tokenizer's tokenizer_config.json declares, else the ID the checkpoint recorded.",
+    )
+    group.add_argument(
+        "--image-break-token-id",
+        type=int,
+        default=None,
+        help="Inference: token placed after each row of a dynamic-resolution image's tokens "
+        "except the last (Pixtral-style layout). For MIMO checkpoints, defaults to the "
+        "tokenizer's declared image_break_token.",
+    )
+    group.add_argument(
+        "--image-end-token-id",
+        type=int,
+        default=None,
+        help="Inference: token placed after the last row of a dynamic-resolution image's tokens. "
+        "For MIMO checkpoints, defaults to the tokenizer's declared image_end_token.",
+    )
     group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
     )

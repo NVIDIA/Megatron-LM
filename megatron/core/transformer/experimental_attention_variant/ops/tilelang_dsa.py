@@ -797,10 +797,11 @@ def fused_sparse_mla_absorbed(
         # while satisfying SparseMLA's 512 latent + 64 RoPE layout; keep the caller's scale.
         query = torch.nn.functional.pad(query, (0, 64))
         key = torch.nn.functional.pad(key, (0, 64))
-    if topk_indices.size(-1) % 64 != 0:
-        # Invalid slots leave the selected keys unchanged, including KPool tail tokens.
+    topk_width = topk_indices.size(-1)
+    padded_topk_width = (topk_width + 63) // 64 * 64
+    if padded_topk_width != topk_width:
         topk_indices = torch.nn.functional.pad(
-            topk_indices, (0, -topk_indices.size(-1) % 64), value=-1
+            topk_indices, (0, padded_topk_width - topk_width), value=-1
         )
 
     query_bshd = query.permute(1, 0, 2, 3).contiguous()

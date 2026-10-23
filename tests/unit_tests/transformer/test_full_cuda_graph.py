@@ -9,17 +9,31 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+    get_shared_capture_stream,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
-    initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
+    prime_cuda_rng_states_for_graph_capture,
 )
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.fixture(autouse=True)
+def reset_full_cuda_graph_state():
+    """The wrapper keeps its graph and static buffers on the class."""
+    yield
+    FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
+    FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
+    FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+    StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
@@ -91,14 +105,44 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
 
 
 @pytest.mark.skipif(
+    not is_torch_min_version("2.14.0a0"),
+    reason="Generator capture state is created lazily only on PyTorch >= 2.14",
+)
+def test_prime_cuda_rng_states_for_graph_capture():
+    """The first RNG use in a capture must not poll an event on a newly captured stream."""
+    side_stream = torch.cuda.Stream()
+    pending = torch.empty(1024, device="cuda")
+    # Recorded before capture, so the allocator still holds this use when the block is freed.
+    pending.record_stream(side_stream)
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(
+        cuda_graph, stream=torch.cuda.Stream(), capture_error_mode="thread_local"
+    ):
+        prime_cuda_rng_states_for_graph_capture()
+        # side_stream is not captured yet, so the allocator defers this free.
+        del pending
+        # side_stream joins the capture, as an NCCL stream does on a pipeline recv.
+        side_stream.wait_stream(torch.cuda.current_stream())
+        # Unprimed, this RNG use creates its capture state on the default stream; that allocation
+        # records and queries an event on side_stream and fails with cudaErrorCapturedEvent.
+        sample = torch.rand(8, device="cuda")
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+    cuda_graph.replay()
+    torch.cuda.synchronize()
+    assert bool(((sample >= 0) & (sample < 1)).all())
+
+
+@pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
     reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
 )
 def test_forward_backward_func_with_full_cuda_graph(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
-    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
 
     def forward_step_func(data_iterator, model):
         import os

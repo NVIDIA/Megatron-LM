@@ -197,7 +197,11 @@ def dynamic_res_preprocess(
             target_patch_height = max(grid_multiple, target_patch_height)
             target_patch_width = max(grid_multiple, target_patch_width)
 
-    assert target_patch_height * target_patch_width <= max_patches
+    if video_maintain_aspect_ratio is not True:
+        # When video_maintain_aspect_ratio=True, max_patches is an approx. target
+        # number of patches while the height and width respect the aspect ratio.
+        # Otherwise, limit to max_patches for square aspect ratios.
+        assert target_patch_height * target_patch_width <= max_patches
 
     resized_img = image.resize((target_patch_width * res_step, target_patch_height * res_step))
     return resized_img

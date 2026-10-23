@@ -6,6 +6,7 @@ from .global_vars import (
     get_adlr_autoresume,
     get_args,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
     get_tensorboard_writer,
     get_timers,

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import pretrain_gpt
 import pretrain_hybrid
 from megatron.core import mpu
 from megatron.core.context_parallel import get_batches_on_this_cp_rank
@@ -21,10 +22,18 @@ from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
 )
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.fixture(autouse=True)
+def destroy_test_environment():
+    yield
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
 
 
 def initialize_test_environment(
@@ -67,7 +76,7 @@ def initialize_test_environment(
     os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
-    set_global_variables(args, True)
+    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=True)
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
@@ -779,13 +788,19 @@ def test_get_batch_on_this_cp_rank_contiguous_keeps_attention_mask_zigzag(cp_siz
 def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with_contiguous_layout):
     tokens = torch.arange(1, 17).view(1, 16)
     loss_mask = torch.tensor([[1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]])
+    decoder_input = torch.stack((tokens, tokens + 20), dim=-1)
+    mtp_input_mask = tokens.remainder(2).to(dtype=torch.bool)
+    cu_seqlens = torch.tensor([[0, 3, 13]], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([[0, 4, 16]], dtype=torch.int32)
     batch = {
         "tokens": tokens,
         "labels": tokens + 100,
         "loss_mask": loss_mask,
         "position_ids": tokens - 1,
-        "cu_seqlens": torch.tensor([[0, 3, 13]], dtype=torch.int32),
-        "cu_seqlens_padded": torch.tensor([[0, 4, 16]], dtype=torch.int32),
+        "decoder_input": decoder_input,
+        "mtp_input_mask": mtp_input_mask,
+        "cu_seqlens": cu_seqlens,
+        "cu_seqlens_padded": cu_seqlens_padded,
         "max_seqlen": torch.tensor([12], dtype=torch.int32),
     }
     parallel_context = SimpleNamespace(
@@ -832,8 +847,16 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     expected_loss_mask = loss_mask.index_select(1, gathered_indices).masked_fill(
         padding.view(1, -1), 0
     )
+    expected_decoder_input = decoder_input.index_select(1, gathered_indices).masked_fill(
+        padding.view(1, -1, 1), 0
+    )
+    expected_mtp_input_mask = mtp_input_mask.index_select(1, gathered_indices).masked_fill(
+        padding.view(1, -1), 0
+    )
     torch.testing.assert_close(result["tokens"], expected_tokens)
     torch.testing.assert_close(result["loss_mask"], expected_loss_mask)
+    torch.testing.assert_close(result["decoder_input"], expected_decoder_input)
+    torch.testing.assert_close(result["mtp_input_mask"], expected_mtp_input_mask)
     torch.testing.assert_close(
         result["cu_seqlens_padded"], torch.tensor([[0, 8, 32]], dtype=torch.int32)
     )
@@ -847,9 +870,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     torch.testing.assert_close(
         zigzag_packed_seq_params.cu_seqlens_q_padded, result["cu_seqlens_padded"].squeeze(0)
     )
-    torch.testing.assert_close(
-        zigzag_packed_seq_params.cu_seqlens_q, batch["cu_seqlens"].squeeze(0)
-    )
+    torch.testing.assert_close(zigzag_packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
     assert zigzag_packed_seq_params.max_seqlen_q == 24
     assert zigzag_packed_seq_params.pad_between_seqs
     assert zigzag_packed_seq_params.total_tokens == 32
@@ -879,6 +900,27 @@ def test_metadata_only_cp_batch_skips_sharding():
     shard_batch.assert_not_called()
     assert cp_batch.get_batch()["tokens"] is None
     assert cp_batch.get_packed_seq_params("zigzag") is not None
+
+
+def test_size_one_cp_batch_without_group_skips_sharding():
+    tokens = torch.arange(8).view(1, 8)
+    batch = {
+        "tokens": tokens,
+        "cu_seqlens": torch.tensor([[0, 3, 8]], dtype=torch.int32),
+        "cu_seqlens_padded": None,
+        "max_seqlen": torch.tensor([5], dtype=torch.int32),
+    }
+
+    with patch("megatron.core.utils.get_batch_on_this_cp_rank") as shard_batch:
+        cp_batch = get_batches_on_this_cp_rank(
+            batch, boundary_layout="zigzag", is_hybrid_cp=False, cp_group=None, tokens_per_sample=8
+        )
+
+    shard_batch.assert_not_called()
+    assert cp_batch.get_batch()["tokens"] is tokens
+    packed_seq_params = cp_batch.get_packed_seq_params()
+    assert packed_seq_params is not None
+    torch.testing.assert_close(packed_seq_params.cu_seqlens_q, batch["cu_seqlens"].squeeze(0))
 
 
 def test_get_batch_builds_required_cp_layouts():
@@ -1510,5 +1552,50 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
 
     assert max_seqlen is not None
     assert max_seqlen.numel() == 1
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+@pytest.mark.parametrize("vp_size", [None, 2])
+def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_scheduler, vp_size):
+    """Check which ranks build a packed-sequence dataset.
+
+    Without the sequence-packing scheduler, middle PP stages read the packing metadata from their
+    own data iterator. The scheduler sends that metadata to them instead and rejects a data
+    iterator on any rank other than TP rank 0 of the first or last PP stage.
+    """
+    tp_size, pp_size = 2, 4
+    if tp_size * pp_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because tp_size * pp_size > torch.cuda.device_count() "
+            f"({tp_size * pp_size} > {torch.cuda.device_count()})"
+        )
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vp_size,
+    )
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+
+    args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
+    config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+    vp_stages = [None] if vp_size is None else range(vp_size)
+    with (
+        patch.object(script, "get_args", return_value=args),
+        patch.object(script, "core_transformer_config_from_args", return_value=config),
+    ):
+        for vp_stage in vp_stages:
+            built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
+
+            if sequence_packing_scheduler is None:
+                expected = tp_rank == 0
+            else:
+                on_first_stage = pp_rank == 0 and vp_stage == vp_stages[0]
+                on_last_stage = pp_rank == pp_size - 1 and vp_stage == vp_stages[-1]
+                expected = tp_rank == 0 and (on_first_stage or on_last_stage)
+            assert built == expected, f"{tp_rank=} {pp_rank=} {vp_stage=}"
 
     Utils.destroy_model_parallel()

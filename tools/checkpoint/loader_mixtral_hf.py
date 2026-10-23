@@ -3,10 +3,12 @@
 import json
 import os
 import sys
+import types
+
 import torch
 import transformers
+from packaging.version import Version
 from tqdm import tqdm
-import types
 
 from tools.checkpoint.utils import initialize_checkpoint_converter_fake_process_groups
 
@@ -34,7 +36,6 @@ def load_args_from_checkpoint(args):
     args.untie_embeddings_and_output_weights = True
     args.seq_length = 4096
     args.global_batch_size = 1024
-    args.iteration = 1 # '0', 'release' don't work
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
@@ -61,8 +62,9 @@ def load_args_from_checkpoint(args):
         args.num_query_groups = mixtral_config.num_key_value_heads
 
 def verify_transformers_version():
-    major, minor, patch = map(int, transformers.__version__.split('.'))
-    assert major >= 4 and minor >= 36
+    assert Version(transformers.__version__) >= Version("4.36.0"), (
+        f"Mixtral HF loader requires transformers>=4.36.0, found {transformers.__version__}"
+    )
 
 def set_preprocess_state(args, model, hf_model):
     '''Set embedding params.'''
@@ -100,20 +102,31 @@ def set_attn_state(args, layer, hf_layer):
 def set_mlp_state(args, layer, hf_layer):
     '''Set MLP params.'''
 
-    layer.mlp.router.weight.data.copy_(hf_layer.block_sparse_moe.gate.weight)
+    # Transformers 4 uses block_sparse_moe; Transformers 5 uses mlp.
+    hf_moe = hf_layer.block_sparse_moe if hasattr(hf_layer, "block_sparse_moe") else hf_layer.mlp
+    hf_experts = hf_moe.experts
+    fused_experts = hasattr(hf_experts, "gate_up_proj")
+    if fused_experts:
+        assert not getattr(hf_experts, "is_transposed", False), (
+            "Transposed HF expert weight layout is not supported."
+        )
+
+    layer.mlp.router.weight.data.copy_(hf_moe.gate.weight)
 
     mcore_experts = layer.mlp.experts.local_experts
-    hf_experts = hf_layer.block_sparse_moe.experts
     for expert_idx in range(args.num_experts):
-        mcore_experts[expert_idx].linear_fc1.weight.data.copy_(
-            torch.cat([
+        if fused_experts:
+            # gate_up_proj already concatenates w1 (gate) and w3 (up) along dim 0.
+            fc1_weight = hf_experts.gate_up_proj[expert_idx]
+            fc2_weight = hf_experts.down_proj[expert_idx]
+        else:
+            fc1_weight = torch.cat([
                 hf_experts[expert_idx].w1.weight,
                 hf_experts[expert_idx].w3.weight
             ], dim=0)
-        )
-        mcore_experts[expert_idx].linear_fc2.weight.data.copy_(
-            hf_experts[expert_idx].w2.weight
-        )
+            fc2_weight = hf_experts[expert_idx].w2.weight
+        mcore_experts[expert_idx].linear_fc1.weight.data.copy_(fc1_weight)
+        mcore_experts[expert_idx].linear_fc2.weight.data.copy_(fc2_weight)
 
 def set_layer_state(args, model, hf_model, layer_idx):
     '''Set transformer layer params.'''
@@ -130,9 +143,10 @@ def set_layer_state(args, model, hf_model, layer_idx):
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
-    from model_provider import model_provider
+    from transformers import MixtralConfig, MixtralForCausalLM
+
     from gpt_builders import gpt_builder
-    from transformers import MixtralForCausalLM, MixtralConfig
+    from model_provider import model_provider
 
     # Load Huggingface model.
 
@@ -151,7 +165,7 @@ def load_checkpoint_to_model(args):
 
 def _load_checkpoint(queue, args):
 
-    # Llama-2 requires HF transformers >=4.31.0.
+    # Mixtral requires HF transformers >=4.36.0.
     verify_transformers_version()
 
     # Search in directory above this.
@@ -163,11 +177,12 @@ def _load_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.training.arguments import parse_args, validate_args
-        from megatron.training.global_vars import set_args, set_global_variables
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.models.common.language_module.language_module import LanguageModule
+        from megatron.training.argument_utils import inference_cfg_container_from_args
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.global_vars import set_args, set_global_variables
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -222,7 +237,6 @@ def _load_checkpoint(queue, args):
     check_for_arg('max_position_embeddings')
     check_for_arg('position_embedding_type')
     check_for_arg('tokenizer_type')
-    check_for_arg('iteration')
     check_for_arg('disable_bias_linear')
     check_for_arg('params_dtype')
     check_for_arg('swiglu')
@@ -234,7 +248,8 @@ def _load_checkpoint(queue, args):
     # Suppress warning about torch.distributed not being initialized.
     LanguageModule.embedding_warning_printed = True 
 
-    set_global_variables(margs, build_tokenizer=False)
+    cfg = inference_cfg_container_from_args(margs, build_model_config=False)
+    set_global_variables(margs, cfg, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
@@ -256,7 +271,7 @@ def _load_checkpoint(queue, args):
     md.num_attention_heads = margs.num_attention_heads
     md.max_position_embeddings = margs.max_position_embeddings
     md.tokenizer_type = margs.tokenizer_type
-    md.iteration = margs.iteration
+    md.iteration = 1
     md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights

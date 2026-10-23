@@ -301,7 +301,11 @@ class MegatronOptimizer(ABC):
                 tp_group=getattr(self, 'tp_group', None),
                 expert_tp_group=getattr(self, 'expert_tp_group', None),
             )
-            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
+            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(
+                param,
+                gtp_group=getattr(self, 'gtp_group', None),
+                expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+            )
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
         return grads_for_norm
@@ -464,6 +468,8 @@ class MegatronOptimizer(ABC):
             use_decoupled_grad=self._uses_decoupled_grad(params),
             tp_group=getattr(self, 'tp_group', None),
             expert_tp_group=getattr(self, 'expert_tp_group', None),
+            gtp_group=getattr(self, 'gtp_group', None),
+            expert_gtp_group=getattr(self, 'expert_gtp_group', None),
         )
 
     @abstractmethod
@@ -1901,6 +1907,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 ),
                 tp_group=getattr(self.chained_optimizers[0], 'tp_group', None),
                 expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
+                gtp_group=getattr(self.chained_optimizers[0], 'gtp_group', None),
+                expert_gtp_group=getattr(self.chained_optimizers[0], 'expert_gtp_group', None),
             )
         else:
             num_zeros_in_grad = 0
