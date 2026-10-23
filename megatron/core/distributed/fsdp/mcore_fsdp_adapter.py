@@ -39,7 +39,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.common.ep_overlap_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
