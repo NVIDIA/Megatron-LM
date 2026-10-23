@@ -8,8 +8,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core.transformer.moe.megakernel.dist_moe import backend as dist_backend
 from megatron.core.transformer.moe.megakernel.dist_moe import runtime
 from megatron.core.transformer.moe.megakernel.dist_moe.backend import DistMoEMegakernel
+from megatron.core.transformer.moe.megakernel.dist_moe.pipeline import DistMoEPipelineSchedule
 from megatron.core.transformer.moe.megakernel.dist_moe.weights import bf16_view, prepare_weight
 from megatron.core.transformer.moe.megakernel.mok.weights import _swizzle_mxfp8_scale
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -25,6 +27,7 @@ def _config(**kwargs):
         moe_router_topk=2,
         bf16=True,
         params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
         gated_linear_unit=True,
         activation_func=torch.nn.functional.silu,
         add_bias_linear=False,
@@ -39,7 +42,7 @@ def _config(**kwargs):
     return TransformerConfig(**options)
 
 
-def _module():
+def _module(**config):
     experts = torch.nn.Module()
     for name, shape in (("linear_fc1", (2, 512, 256)), ("linear_fc2", (2, 256, 256))):
         linear = torch.nn.Module()
@@ -48,7 +51,7 @@ def _module():
             "weight", torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16))
         )
         experts.add_module(name, linear)
-    module = DistMoEMegakernel(_config(), object(), experts, None, 2)
+    module = DistMoEMegakernel(_config(**config), object(), experts, None, 2)
     return experts, module
 
 
@@ -60,6 +63,28 @@ def _module():
         {"fp8": "e4m3", "fp8_recipe": "mxfp8", "fp8_param": True},
         {"fp8": "e4m3", "fp8_recipe": "mxfp8", "fp8_param": False},
         {"cuda_graph_impl": "local", "cuda_graph_modules": []},
+        {"num_layers": 4, "pipeline_model_parallel_size": 2},
+        {
+            "num_layers": 4,
+            "pipeline_model_parallel_size": 2,
+            "cuda_graph_impl": "local",
+            "cuda_graph_modules": [],
+        },
+        {
+            "num_layers": 4,
+            "pipeline_model_parallel_size": 2,
+            "virtual_pipeline_model_parallel_size": 2,
+            "cuda_graph_impl": "local",
+            "cuda_graph_modules": [],
+            "fp8": "e4m3",
+            "fp8_recipe": "mxfp8",
+            "fp8_param": True,
+        },
+        {
+            "num_layers": 4,
+            "pipeline_model_parallel_size": 2,
+            "virtual_pipeline_model_parallel_size": 2,
+        },
         {
             "fp8": "e4m3",
             "fp8_recipe": "mxfp8",
@@ -136,6 +161,76 @@ def test_runtime_rejects_expert_parameters_tied_across_layers():
         )
 
 
+def test_pipeline_runtime_defers_allocation_and_sizes_each_chunk(monkeypatch):
+    import dist_moe
+
+    monkeypatch.setattr(runtime, "_POOLS", [])
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: SimpleNamespace(cuda_stream=7))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
+    contexts = []
+
+    def create_context(*, config, **kwargs):
+        context = SimpleNamespace(
+            config=config, memory_plan=SimpleNamespace(explain=lambda: "mock plan"), close=Mock()
+        )
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(dist_moe, "create_context", create_context)
+    group = Mock()
+    group.size.return_value = 4
+    chunks = []
+    for _ in range(2):
+        layers = []
+        for _ in range(2):
+            _, module = _module(
+                num_layers=8, pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
+            )
+            module.ep_group = group
+            for owner in module.owners:
+                owner.main_grad = torch.zeros_like(owner, dtype=torch.float32)
+            layers.append(module)
+        chunks.append(torch.nn.ModuleList(layers))
+    runtime.initialize_dist_moe_runtime(
+        chunks, ddp_config=SimpleNamespace(), max_num_local_input_tokens=256
+    )
+    assert not contexts and all(module.context is None for chunk in chunks for module in chunk)
+    with pytest.raises(RuntimeError, match="already initialized"):
+        runtime.initialize_dist_moe_runtime(
+            chunks, ddp_config=SimpleNamespace(), max_num_local_input_tokens=256
+        )
+    runtime.configure_dist_moe_activation_slots(chunks, 5)
+    assert len(contexts) == 1
+    assert contexts[0].config.num_activation_slots == 5
+    assert contexts[0].config.max_moe_layers_per_activation_slot == 2
+    runtime.configure_dist_moe_activation_slots(chunks, 5)
+    assert len(contexts) == 1
+    for chunk in chunks:
+        for module in chunk:
+            module._graph_bound = True
+    # Evaluation and a smaller schedule must not invalidate captured slot views.
+    for capacity in (1, 3, 5):
+        runtime.configure_dist_moe_activation_slots(chunks, capacity)
+        assert all(module.context is contexts[0] for chunk in chunks for module in chunk)
+    contexts[0].close.assert_not_called()
+    with pytest.raises(RuntimeError, match="delete_cuda_graphs"):
+        runtime.configure_dist_moe_activation_slots(chunks, 6)
+    for chunk in chunks:
+        for module in chunk:
+            module.cuda_graph_release()
+    chunks[0][0]._live = 1
+    with pytest.raises(RuntimeError, match="unfinished backward"):
+        runtime.configure_dist_moe_activation_slots(chunks, 6)
+    chunks[0][0]._live = 0
+    runtime.configure_dist_moe_activation_slots(chunks, {id(chunks[0][0]._runtime_pool): 6})
+    assert len(contexts) == 2
+    contexts[0].close.assert_called_once()
+    runtime.close_dist_moe_runtime(chunks)
+    contexts[1].close.assert_called_once()
+    assert not runtime._POOLS
+    assert all(module._runtime_pool is None for chunk in chunks for module in chunk)
+
+
 def _checkpoint_parent():
     experts, backend = _module()
     parent = torch.nn.Module()
@@ -206,6 +301,11 @@ def _functional_bridge(monkeypatch):
     return module, functional
 
 
+def _bridge_call(module, x, ids, scores, *owners, ticket=None):
+    call = runtime._DistMoECall(module._weight_binding, ticket) if module._live else None
+    return runtime._DistMoEAutograd.apply(module, call, x, ids, scores, *owners)
+
+
 @pytest.mark.parametrize("input_grad", [False, True])
 @pytest.mark.parametrize("pack_saved_tensors", [False, True])
 def test_autograd_bridge_accumulates_main_grad_and_completes_each_owner(
@@ -235,7 +335,7 @@ def test_autograd_bridge_accumulates_main_grad_and_completes_each_owner(
             if pack_saved_tensors
             else nullcontext()
         ):
-            output = runtime._DistMoEAutograd.apply(module, x, ids, scores, *module.owners)
+            output = _bridge_call(module, x, ids, scores, *module.owners)
         assert output.requires_grad  # Native owners alone must retain the backward edge.
         output.sum().backward(retain_graph=microbatch == 2)
         assert not module._live and counts == [microbatch + 1] * 2
@@ -260,7 +360,7 @@ def test_autograd_bridge_no_grad_does_not_retain_training_state(monkeypatch):
     module, functional = _functional_bridge(monkeypatch)
     module._live = False
     with torch.no_grad():
-        output = runtime._DistMoEAutograd.apply(
+        output = _bridge_call(
             module,
             torch.ones(2, 256),
             torch.zeros(2, 2, dtype=torch.int32),
@@ -272,11 +372,98 @@ def test_autograd_bridge_no_grad_does_not_retain_training_state(monkeypatch):
     functional.backward.assert_not_called()
 
 
+def test_multiple_live_calls_complete_independently_and_keep_prepared_weights(monkeypatch):
+    module, functional = _functional_bridge(monkeypatch)
+    inputs, outputs, tickets = [], [], []
+    hooks = [
+        owner.register_post_accumulate_grad_hook(lambda param: setattr(param, "grad", None))
+        for owner in module.owners
+    ]
+    prepare = Mock(side_effect=AssertionError("must not overwrite borrowed operands"))
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.megakernel.dist_moe.backend.prepare_weight", prepare
+    )
+    for index in range(3):
+        module._live = index + 1
+        module._prepare_weights(first_microbatch=True)
+        x = torch.full((2, 256), float(index), requires_grad=True)
+        ticket = SimpleNamespace(before_backward=Mock(), complete=Mock())
+        inputs.append(x)
+        tickets.append(ticket)
+        outputs.append(
+            _bridge_call(
+                module,
+                x,
+                torch.zeros(2, 2, dtype=torch.int32),
+                torch.ones(2, 2),
+                *module.owners,
+                ticket=ticket,
+            )
+        )
+    # Different activation slots permit FIFO or other non-LIFO completion.
+    for remaining, index in zip((2, 1, 0), (0, 2, 1)):
+        outputs[index].sum().backward()
+        assert module._live == remaining
+        assert functional.backward.call_args.args[0][0] is inputs[index]
+        tickets[index].before_backward.assert_called_once()
+        tickets[index].complete.assert_called_once()
+        torch.testing.assert_close(inputs[index].grad, torch.full_like(inputs[index], 2))
+    prepare.assert_not_called()
+    for index, owner in enumerate(module.owners):
+        torch.testing.assert_close(
+            owner.main_grad, torch.full_like(owner.main_grad, 0.25 + 3 * (index + 1))
+        )
+    for hook in hooks:
+        hook.remove()
+
+
+def test_live_weights_cannot_refresh_and_call_keeps_its_original_binding(monkeypatch):
+    module, functional = _functional_bridge(monkeypatch)
+    output = _bridge_call(
+        module,
+        torch.ones(2, 256, requires_grad=True),
+        torch.zeros(2, 2, dtype=torch.int32),
+        torch.ones(2, 2),
+        *module.owners,
+    )
+    with torch.no_grad():
+        module.owners[0].add_(1)
+    with pytest.raises(RuntimeError, match="live forwards"):
+        module._prepare_weights(first_microbatch=True)
+    # Even accidental replacement of module-wide bookkeeping cannot conceal a
+    # changed owner from the already-live call.
+    module._weight_binding = module._weight_signature()
+    with pytest.raises(RuntimeError, match="storage/version"):
+        output.sum().backward()
+    functional.backward.assert_not_called()
+
+
+def test_pipeline_order_checked_before_kernel_backward(monkeypatch):
+    module, functional = _functional_bridge(monkeypatch)
+    ticket = SimpleNamespace(
+        before_backward=Mock(side_effect=RuntimeError("wrong pipeline layer order")),
+        complete=Mock(),
+    )
+    output = _bridge_call(
+        module,
+        torch.ones(2, 256),
+        torch.zeros(2, 2, dtype=torch.int32),
+        torch.ones(2, 2),
+        *module.owners,
+        ticket=ticket,
+    )
+    with pytest.raises(RuntimeError, match="pipeline layer order"):
+        output.sum().backward()
+    functional.backward.assert_not_called()
+    ticket.complete.assert_not_called()
+    assert module._live
+
+
 @pytest.mark.parametrize("mutation", ["weight", "owner", "main_grad", "input"])
 def test_autograd_bridge_rejects_mutations_before_kernel_backward(monkeypatch, mutation):
     module, functional = _functional_bridge(monkeypatch)
     x = torch.ones(2, 256, requires_grad=True)
-    output = runtime._DistMoEAutograd.apply(
+    output = _bridge_call(
         module, x, torch.zeros(2, 2, dtype=torch.int32), torch.ones(2, 2), *module.owners
     )
     with torch.no_grad():
@@ -297,7 +484,7 @@ def test_autograd_bridge_rejects_mutations_before_kernel_backward(monkeypatch, m
 def test_autograd_bridge_rejects_higher_order_before_kernel_backward(monkeypatch):
     module, functional = _functional_bridge(monkeypatch)
     x = torch.ones(2, 256, requires_grad=True)
-    output = runtime._DistMoEAutograd.apply(
+    output = _bridge_call(
         module, x, torch.zeros(2, 2, dtype=torch.int32), torch.ones(2, 2), *module.owners
     )
     with pytest.raises(RuntimeError, match="first-order"):
@@ -366,14 +553,19 @@ def test_graph_runtime_pins_storage_and_checks_replay_ownership(monkeypatch):
     module.cuda_graph_capture_prepare()
     with pytest.raises(RuntimeError, match="delete_cuda_graphs"):
         module.load_state_dict({})
-    module.cuda_graph_prepare_replay(True, True)
+    call = module.cuda_graph_prepare_replay(True, True)
     with pytest.raises(RuntimeError, match="unfinished backward"):
         module.cuda_graph_release()
-    module.cuda_graph_finish_replay()
+    with pytest.raises(RuntimeError, match="drained pipeline schedule"):
+        with module.cuda_graph_capture_scope(None):
+            pytest.fail("capture entered a live graph replay")
+    module.cuda_graph_prepare_backward(call)
+    module.cuda_graph_finish_replay(call)
     with torch.no_grad():
         module.owners[0].add_(1)
-    module.cuda_graph_prepare_replay(True, True)
-    module.cuda_graph_finish_replay()
+    call = module.cuda_graph_prepare_replay(True, True)
+    module.cuda_graph_prepare_backward(call)
+    module.cuda_graph_finish_replay(call)
     runner = _CudaGraphRunner.__new__(_CudaGraphRunner)
     torch.nn.Module.__init__(runner)
     runner.megakernel_backends = (module,)
@@ -381,8 +573,9 @@ def test_graph_runtime_pins_storage_and_checks_replay_ownership(monkeypatch):
     with torch.no_grad(), pytest.raises(RuntimeError, match="no_grad"):
         runner.replay_graph_capture(False, (), {})
     assert not module._live
-    module.cuda_graph_prepare_replay(True, True)
-    module.cuda_graph_finish_replay()
+    call = module.cuda_graph_prepare_replay(True, True)
+    module.cuda_graph_prepare_backward(call)
+    module.cuda_graph_finish_replay(call)
     runner.cudagraph_created = True
     runner.fwd_graph = runner.bwd_graph = object()
     # Training capture clears its schedule; deletion must still find its runner.
@@ -397,18 +590,15 @@ def test_graph_runtime_pins_storage_and_checks_replay_ownership(monkeypatch):
 
 
 @pytest.mark.parametrize("mutation", ["weight", "main_grad"])
-def test_graph_backward_rejects_changed_storage_before_gpu_work(mutation):
+def test_graph_backward_rejects_changed_storage_before_gpu_work(monkeypatch, mutation):
     from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode, _GraphStatus
 
-    _, module = _module()
-    for owner in module.owners:
-        owner.main_grad = torch.zeros_like(owner, dtype=torch.float32)
-    module._gradient_binding = tuple(runtime.storage_signature(p.main_grad) for p in module.owners)
-    module._weight_binding = module._weight_signature()
-    module._live = True
+    module = _ready_graph_backend(monkeypatch)
+    call = module.cuda_graph_prepare_replay(True, True)
     grad_output, graph = Mock(), Mock()
     runner = SimpleNamespace(
         megakernel_backends=(module,),
+        megakernel_calls=(call,),
         bwd_graph=graph,
         status=_GraphStatus.BWD_READY,
         static_grad_outputs=(grad_output,),
@@ -423,6 +613,253 @@ def test_graph_backward_rejects_changed_storage_before_gpu_work(mutation):
     grad_output.copy_.assert_not_called()
     graph.replay.assert_not_called()
     assert module._live
+
+
+def _ready_graph_backend(monkeypatch, **config):
+    """Exercise ownership on CPU; the numeric suite tests actual graph execution."""
+    _, module = _module(**config)
+    for owner in module.owners:
+        owner.main_grad = torch.zeros_like(owner, dtype=torch.float32)
+    module._gradient_binding = tuple(runtime.storage_signature(p.main_grad) for p in module.owners)
+    module.context = SimpleNamespace(select_activation_slot=Mock())
+    monkeypatch.setattr(
+        dist_backend, "prepare_weight", lambda owner, **kwargs: (owner.detach(), None)
+    )
+    module.cuda_graph_capture_prepare()
+    return module
+
+
+def test_pipeline_graph_replay_owns_each_call_until_native_backward_returns(monkeypatch):
+    modules = [
+        _ready_graph_backend(monkeypatch, num_layers=4, pipeline_model_parallel_size=2)
+        for _ in range(2)
+    ]
+    for module in modules:
+        module._chunk_index = 0
+        module.context = modules[0].context
+        module._runtime_pool = modules[0].context
+    monkeypatch.setattr(runtime, "configure_dist_moe_activation_slots", Mock())
+    scope = DistMoEPipelineSchedule([torch.nn.ModuleList(modules)], [(0, 0), (1, 0)], 2)
+    calls = []
+    for microbatch in range(2):
+        with scope._step("forward", 0, microbatch):
+            calls.append(
+                tuple(
+                    module.cuda_graph_prepare_replay(microbatch == 0, True, module.cuda_graph_key())
+                    for module in modules
+                )
+            )
+    assert all(module._live == 2 for module in modules)
+    for microbatch in range(2):
+        with scope._step("backward", 0, microbatch):
+            first, last = calls[microbatch]
+            if microbatch == 0:
+                # Reject a future microbatch and the wrong layer before marking either started.
+                with pytest.raises(RuntimeError, match="reverse layer order"):
+                    modules[-1].cuda_graph_prepare_backward(calls[1][-1])
+                with pytest.raises(RuntimeError, match="reverse layer order"):
+                    modules[0].cuda_graph_prepare_backward(first)
+                with pytest.raises(RuntimeError, match="completion"):
+                    modules[-1].cuda_graph_finish_replay(last)
+                copied = runtime._DistMoECall(last.weight_binding, last.ticket)
+                with pytest.raises(RuntimeError, match="live forward"):
+                    modules[-1].cuda_graph_prepare_backward(copied)
+            # A whole-layer graph can contain multiple backends: validate all before launch.
+            for module, call in reversed(tuple(zip(modules, calls[microbatch]))):
+                module.cuda_graph_prepare_backward(call)
+                with pytest.raises(RuntimeError, match="live forward"):
+                    module.cuda_graph_prepare_backward(call)
+            for module, call in reversed(tuple(zip(modules, calls[microbatch]))):
+                module.cuda_graph_finish_replay(call)
+                with pytest.raises(RuntimeError, match="completion"):
+                    module.cuda_graph_finish_replay(call)
+            # Canonical owner hooks still execute inside this native backward interval.
+            assert (0, microbatch) in scope.leases
+            assert all(module._live == 1 - microbatch for module in modules)
+        assert (0, microbatch) not in scope.leases
+    scope.finish()
+    assert all(not module._graph_calls for module in modules)
+
+
+@pytest.mark.parametrize("mutation", ["slot", "depth", "schedule"])
+def test_graph_binding_mismatch_is_rejected_before_forward_launch(monkeypatch, mutation):
+    from megatron.core.transformer.cuda_graphs import _CudagraphReplayNode, _CudaGraphRunner
+
+    module = _ready_graph_backend(monkeypatch, num_layers=2, pipeline_model_parallel_size=2)
+    module._chunk_index = 0
+    module._runtime_pool = module.context
+    monkeypatch.setattr(runtime, "configure_dist_moe_activation_slots", Mock())
+    scope = DistMoEPipelineSchedule([torch.nn.ModuleList([module])], [(0, 0)], 0)
+    runner = _CudaGraphRunner.__new__(_CudaGraphRunner)
+    torch.nn.Module.__init__(runner)
+    runner.megakernel_backends = (module,)
+    runner.grad_enabled = True
+    runner.get_mismatch_errors = lambda *args: []
+    runner._gtp_fwd_params_to_ensure_ready = ()
+    runner.get_tensors = Mock()
+    launch = Mock()
+    monkeypatch.setattr(_CudagraphReplayNode, "apply", launch)
+    with scope._step("forward", 0, 0):
+        events, slot, depth = module.cuda_graph_key()
+        invalid_key = {
+            "slot": (events, slot + 1, depth),
+            "depth": (events, slot, depth + 1),
+            "schedule": (events + events, slot, depth),
+        }[mutation]
+        runner.megakernel_graph_keys = (invalid_key,)
+        with pytest.raises(RuntimeError, match="schedule/slot changed"):
+            runner.replay_graph_capture(True, (), {})
+        launch.assert_not_called()
+        runner.get_tensors.assert_not_called()
+        module.context.select_activation_slot.assert_not_called()
+        assert not module._live
+        # A rejected preflight leaves the valid invocation available.
+        call = module.cuda_graph_prepare_replay(True, True, module.cuda_graph_key())
+    with scope._step("backward", 0, 0):
+        module.cuda_graph_prepare_backward(call)
+        module.cuda_graph_finish_replay(call)
+    scope.finish()
+
+
+def test_capture_scope_keeps_outstanding_frames_and_warmup_independent(monkeypatch):
+    module, functional = _functional_bridge(monkeypatch)
+    hooks = [
+        owner.register_post_accumulate_grad_hook(lambda param: setattr(param, "grad", None))
+        for owner in module.owners
+    ]
+    module.config.pipeline_model_parallel_size = 2
+    module._live = 0
+    module._stream = 7
+    module.context = SimpleNamespace(
+        config=SimpleNamespace(max_num_local_input_tokens=2), select_activation_slot=Mock()
+    )
+    monkeypatch.setattr(
+        dist_backend, "prepare_weight", lambda owner, **kwargs: (owner.detach(), None)
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *args: SimpleNamespace(cuda_stream=7))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        dist_backend,
+        "routing_map_to_indices",
+        lambda probs, routing, topk: (probs[:, :topk], torch.zeros(2, topk, dtype=torch.long)),
+    )
+
+    def forward():
+        return module(
+            torch.ones(2, 256, requires_grad=True),
+            torch.ones(2, 8, requires_grad=True),
+            torch.ones(2, 8, dtype=torch.bool),
+        )
+
+    key0, key1 = ((), 0, 2), ((), 1, 2)
+    with module.cuda_graph_capture_scope(key0):
+        first = forward()
+    assert module._live == 1
+    with module.cuda_graph_capture_scope(key1):
+        # Native capture interposes a local warmup F+B while another runner is outstanding.
+        forward().sum().backward()
+        assert module._live == 1
+        second = forward()
+        assert module._live == 2
+    assert not module._capturing_graph and module._graph_capture_key is None
+    first.sum().backward()
+    assert module._live == 1
+    second.sum().backward()
+    assert module._live == 0
+    assert [call.args for call in module.context.select_activation_slot.call_args_list] == [
+        (0, 2),
+        (1, 2),
+        (1, 2),
+    ]
+    assert functional.backward.call_count == 3
+    with pytest.raises(ValueError, match="capture failure"):
+        with module.cuda_graph_capture_scope(key0):
+            raise ValueError("capture failure")
+    assert not module._capturing_graph and module._graph_capture_key is None
+    module._pipeline_schedule = object()
+    with pytest.raises(RuntimeError, match="drained pipeline schedule"):
+        with module.cuda_graph_capture_scope(key0):
+            pytest.fail("capture entered an active native schedule")
+    for hook in hooks:
+        hook.remove()
+
+
+def test_pipeline_recapture_discards_deleted_runners_and_recreates_pool(monkeypatch):
+    from megatron.core.transformer import cuda_graphs
+
+    manager = cuda_graphs.CudaGraphManager.__new__(cuda_graphs.CudaGraphManager)
+    torch.nn.Module.__init__(manager)
+    deleted = SimpleNamespace(mempool=None)
+    manager.cudagraph_runners = [deleted]
+    manager.custom_cudagraphs_lookup_table = {"old": deleted}
+    manager.need_backward = True
+    manager.func = object()
+    manager._num_warmup_steps = None
+    pool = object()
+    fresh = SimpleNamespace(mempool=pool, status=cuda_graphs._GraphStatus.FWD_READY)
+    constructor = Mock(return_value=fresh)
+    observer = Mock()
+    monkeypatch.setattr(cuda_graphs, "_CudaGraphRunner", constructor)
+    monkeypatch.setattr(cuda_graphs, "HAVE_GTP", False)
+    monkeypatch.setattr(cuda_graphs.CudaGraphManager, "global_mempool", None)
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", Mock(return_value=pool))
+    monkeypatch.setattr(cuda_graphs._CudagraphGlobalRecord, "cudagraph_created", False)
+    monkeypatch.setattr(
+        cuda_graphs._CudagraphGlobalRecord, "_enable_saved_tensors_observer", observer
+    )
+    model = object()
+    assert manager.get_cudagraph_runner(model, (), {}, False) is fresh
+    assert manager.cudagraph_runners == [fresh]
+    assert not manager.custom_cudagraphs_lookup_table
+    constructor.assert_called_once_with(model, pool, (), {}, manager.func, True)
+    observer.assert_called_once()
+    monkeypatch.setattr(cuda_graphs._CudagraphGlobalRecord, "cudagraph_created", True)
+    assert manager.get_cudagraph_runner(model, (), {}, False) is fresh
+    torch.cuda.graph_pool_handle.assert_called_once()
+
+
+def test_no_grad_eval_preserves_training_runners_and_runtime(monkeypatch):
+    from megatron.core.transformer import cuda_graphs
+
+    module = _ready_graph_backend(monkeypatch, num_layers=2, pipeline_model_parallel_size=2)
+    manager = cuda_graphs.CudaGraphManager.__new__(cuda_graphs.CudaGraphManager)
+    torch.nn.Module.__init__(manager)
+    manager.need_backward = True
+    manager.func = Mock(return_value="eager output")
+    manager.get_cudagraph_runner = Mock()
+    context = module.context
+    monkeypatch.setattr(cuda_graphs._CudagraphGlobalRecord, "cudagraph_created", True)
+    with torch.no_grad():
+        assert manager(module, ("input",), {}) == "eager output"
+    manager.func.assert_called_once_with("input")
+    manager.get_cudagraph_runner.assert_not_called()
+    assert module.context is context and module._graph_bound
+    assert not module._live and not module._graph_calls
+
+
+@pytest.mark.parametrize("has_megakernel", [False, True])
+def test_capture_restores_megakernel_execution_stream(monkeypatch, has_megakernel):
+    from megatron.core.transformer import cuda_graphs
+
+    record = cuda_graphs._CudagraphGlobalRecord
+    execution_stream, capture_stream = Mock(), Mock()
+    current_stream = Mock(side_effect=[execution_stream, capture_stream])
+    set_stream = Mock()
+    cleanup = Mock()
+    runner = SimpleNamespace(megakernel_backends=(object(),) if has_megakernel else ())
+    monkeypatch.setattr(record, "cudagraph_record", [(runner, "fwd")])
+    monkeypatch.setattr(record, "_create_cudagraphs", Mock(return_value="capture result"))
+    monkeypatch.setattr(record, "_disable_saved_tensors_observer", cleanup)
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    monkeypatch.setattr(torch.cuda, "set_stream", set_stream)
+    assert record.create_cudagraphs() == "capture result"
+    cleanup.assert_called_once()
+    if has_megakernel:
+        execution_stream.wait_stream.assert_called_once_with(capture_stream)
+        set_stream.assert_called_once_with(execution_stream)
+    else:
+        current_stream.assert_not_called()
+        set_stream.assert_not_called()
 
 
 def test_bf16_grouped_view_aliases_native_storage():

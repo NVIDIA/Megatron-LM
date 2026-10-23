@@ -25,6 +25,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
+from megatron.core.transformer.moe.megakernel.dist_moe.pipeline import DistMoEPipelineSchedule
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
@@ -1231,6 +1232,9 @@ def forward_backward_pipelining_with_interleaving(
     schedule_table = get_schedule_table(
         num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
     )
+    dist_moe_schedule = DistMoEPipelineSchedule(
+        model, schedule_table, num_warmup_microbatches, forward_only
+    )
 
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
     # For example, the micro-batch table for PP2 N3M5 with VP2 is
@@ -1392,7 +1396,8 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id, microbatch_id
         )
 
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens = dist_moe_schedule.forward_step(
+            forward_step,
             forward_step_func,
             data_iterator[model_chunk_id],
             model[model_chunk_id],
@@ -1465,7 +1470,15 @@ def forward_backward_pipelining_with_interleaving(
             virtual_microbatch_id, model_chunk_id
         )
 
-        input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+        input_tensor_grad = dist_moe_schedule.backward_step(
+            backward_step,
+            model_chunk_id,
+            microbatch_id_table[virtual_microbatch_id],
+            input_tensor,
+            output_tensor,
+            output_tensor_grad,
+            config,
+        )
 
         backward_step_helper_postprocess(virtual_microbatch_id)
 
@@ -2078,6 +2091,8 @@ def forward_backward_pipelining_with_interleaving(
         not recv_next_wait_handles
     ), 'recv_next_wait_handles should be cleared at the end of a step'
 
+    dist_moe_schedule.finish()
+
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -2308,6 +2323,12 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
+    dist_moe_schedule = DistMoEPipelineSchedule(
+        [model],
+        get_schedule_table(num_microbatches, 1, num_microbatches),
+        num_warmup_microbatches,
+        forward_only,
+    )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
@@ -2378,7 +2399,8 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens = dist_moe_schedule.forward_step(
+            forward_step,
             forward_step_func,
             forward_data_iterator,
             model,
@@ -2424,7 +2446,8 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor, num_tokens = forward_step(
+        output_tensor, num_tokens = dist_moe_schedule.forward_step(
+            forward_step,
             forward_step_func,
             forward_data_iterator,
             model,
@@ -2473,8 +2496,8 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
+            input_tensor_grad = dist_moe_schedule.backward_step(
+                backward_func, 0, i, input_tensor, output_tensor, output_tensor_grad, config
             )
 
             if last_iteration:
@@ -2510,8 +2533,14 @@ def forward_backward_pipelining_without_interleaving(
                 send_tensor_shapes, p2p_communicator.is_pp_last_stage
             )
 
-            input_tensor_grad = backward_func(
-                input_tensor, output_tensor, output_tensor_grad, config
+            input_tensor_grad = dist_moe_schedule.backward_step(
+                backward_func,
+                0,
+                num_microbatches_remaining + i,
+                input_tensor,
+                output_tensor,
+                output_tensor_grad,
+                config,
             )
 
             p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
@@ -2521,6 +2550,8 @@ def forward_backward_pipelining_without_interleaving(
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
+
+    dist_moe_schedule.finish()
 
     if config.finalize_model_grads_func is not None and not forward_only:
 

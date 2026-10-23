@@ -18,18 +18,28 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 )
 
 
+@dataclass(frozen=True)
+class _DistMoECall:
+    """Bindings and pipeline completion belonging to one live forward."""
+
+    weight_binding: tuple
+    ticket: object = None
+
+
 class _DistMoEAutograd(torch.autograd.Function):
     """Connect native MCore parameter edges to Dist's functional execution."""
 
     @staticmethod
-    def forward(ctx, module, x, ids, scores, *owners):
+    def forward(ctx, module, call, x, ids, scores, *owners):
         from dist_moe import functional
 
         output, state = functional.forward(
-            x, ids, scores, *module._prepared, module.context, save_for_backward=module._live
+            x, ids, scores, *module._prepared, module.context, save_for_backward=call is not None
         )
-        if module._live:
+        if call is not None:
             ctx.module = module
+            ctx.call = call
+            ctx.owners = owners
             ctx.state = state
             ctx.save_for_backward(x, ids, scores, *owners)
         return output
@@ -43,17 +53,21 @@ class _DistMoEAutograd(torch.autograd.Function):
         module = ctx.module
         if module is None:
             raise RuntimeError("dist_moe supports one backward per forward")
-        grad_w13, grad_w2 = module._check_backward_bindings()
+        if ctx.call.ticket is not None:
+            ctx.call.ticket.before_backward()
+        grad_w13, grad_w2 = module._check_backward_bindings(ctx.call.weight_binding)
         # Trigger input version checks, but complete the canonical parameters:
         # saved-tensor hooks may unpack aliases without native DDP metadata.
         _ = ctx.saved_tensors
         dx, dscores = functional.backward(
             ctx.state, grad_output.contiguous(), grad_w13=grad_w13, grad_w2=grad_w2
         )
-        owner_grads = tuple(finish_weight_gradient(owner) for owner in module.owners)
-        module._live = False
-        ctx.module = ctx.state = None
-        return None, dx, None, dscores, *owner_grads
+        owner_grads = tuple(finish_weight_gradient(owner) for owner in ctx.owners)
+        if ctx.call.ticket is not None:
+            ctx.call.ticket.complete()
+        module._live -= 1
+        ctx.module = ctx.state = ctx.call = ctx.owners = None
+        return None, None, dx, None, dscores, *owner_grads
 
 
 @dataclass(frozen=True)
@@ -103,7 +117,6 @@ def validate_config(config):
         "activation_func_clamp_value",
         "activation_func_tanh_clamp_scale",
         "moe_latent_size",
-        "virtual_pipeline_model_parallel_size",
         "recompute_granularity",
     ):
         if getattr(config, name, None) is not None:
@@ -112,7 +125,6 @@ def validate_config(config):
         "tensor_model_parallel_size",
         "expert_tensor_parallel_size",
         "context_parallel_size",
-        "pipeline_model_parallel_size",
         "gtp_weight_remat_size",
         "expert_gtp_weight_remat_size",
     ):
@@ -142,7 +154,86 @@ def storage_signature(tensor):
     return (tensor.data_ptr(), tensor.device, tensor.dtype, tuple(tensor.shape), tensor.stride())
 
 
-_CONTEXTS = []
+_POOLS = []
+
+
+@dataclass
+class _RuntimePool:
+    """Equal-shape layers share scratch; the scheduler sizes saved-state slots."""
+
+    modules: list
+    max_num_local_input_tokens: int
+    context: object = None
+
+    def configure(self, num_slots):
+        import dist_moe
+
+        if self.context is not None and self.context.config.num_activation_slots == num_slots:
+            return
+        if any(module._live for module in self.modules):
+            raise RuntimeError(
+                "cannot resize dist_moe activation slots with an unfinished backward"
+            )
+        if any(module._graph_bound for module in self.modules):
+            # Evaluation and smaller schedules can borrow the existing allocation.
+            # Captured slot views must keep their addresses until graphs are deleted.
+            if self.context is not None and self.context.config.num_activation_slots >= num_slots:
+                return
+            raise RuntimeError("delete_cuda_graphs before resizing dist_moe activation slots")
+        if self.context is not None:
+            torch.cuda.synchronize(self.modules[0].owners[0].device)
+            self.context.close()
+            self.context = None
+            for module in self.modules:
+                module.context = None
+        first = self.modules[0]
+        options = first.options
+        # One lease holds one chunk/microbatch, not every virtual stage together.
+        depth = max(
+            sum(module._chunk_index == chunk for module in self.modules)
+            for chunk in {module._chunk_index for module in self.modules}
+        )
+        config = dist_moe.Config(
+            max_num_local_input_tokens=self.max_num_local_input_tokens,
+            hidden_dim=first.hidden_size,
+            intermediate_dim=first.intermediate_size,
+            top_k=first.topk,
+            num_experts=first.config.num_moe_experts,
+            max_moe_layers_per_activation_slot=depth,
+            num_activation_slots=num_slots,
+            num_sms=options.num_sms,
+            device_scratch_capacity_factor=(
+                first.ep_group.size()
+                if options.device_scratch_capacity_factor is None
+                else options.device_scratch_capacity_factor
+            ),
+            activation_slot_bytes=options.activation_slot_bytes,
+            activation_slot_capacity_factor=(
+                options.activation_slot_capacity_factor
+                if options.activation_slot_capacity_factor is not None
+                else (1.0 if options.activation_slot_bytes is None else None)
+            ),
+            bf16_grouped_gemm_preset=options.bf16_grouped_gemm_preset,
+            block_scaled=(
+                dist_moe.BlockScaledConfig(pipeline=options.mxfp8_pipeline)
+                if first.use_mxfp8
+                else None
+            ),
+            wgrad_dtype=first.owners[0].main_grad.dtype,
+        )
+        self.context = dist_moe.create_context(
+            group=first.ep_group, config=config, device=first.owners[0].device
+        )
+        logging.getLogger(__name__).info(
+            "Dist-MoE runtime: layers=%d, primary=%s, config=%s; %s",
+            len(self.modules),
+            "MXFP8" if first.config.fp8_param else "BF16",
+            config,
+            self.context.memory_plan.explain(),
+        )
+        for module in self.modules:
+            module.context = self.context
+            module._stream = torch.cuda.current_stream(module.owners[0].device).cuda_stream
 
 
 def _backends(model_chunks):
@@ -165,9 +256,9 @@ def has_dist_moe_backend(model_chunks):
 def initialize_dist_moe_runtime(model_chunks, *, ddp_config, max_num_local_input_tokens: int):
     """Collectively initialize after DDP and checkpoint/optimizer materialization.
 
-    All EP ranks must enumerate the same layers and token bound. The supported
-    PP=1 schedule completes each microbatch backward before starting the next.
-    Equal-shape layers share one context and its stack of saved activations.
+    All EP ranks must enumerate the same layers and token bound. PP=1 creates
+    its single-slot contexts immediately. PP/VPP registers native bindings here;
+    its schedule later creates contexts with enough slots for live microbatches.
     """
     backends = _backends(model_chunks)
     if not backends:
@@ -175,16 +266,18 @@ def initialize_dist_moe_runtime(model_chunks, *, ddp_config, max_num_local_input
     owner_ids = [id(owner) for module in backends for owner in module.owners]
     if len(owner_ids) != len(set(owner_ids)):
         raise ValueError("dist_moe does not support tied expert parameters across layers")
-    import dist_moe
-
     if ddp_config is None or getattr(ddp_config, "use_megatron_fsdp", False):
         raise ValueError("dist_moe runtime requires native MCore DDP")
     if max_num_local_input_tokens <= 0:
         raise ValueError("dist_moe requires a positive physical token bound")
+    if any(module._runtime_pool is not None for module in backends):
+        raise RuntimeError("dist_moe runtime is already initialized; close it before rebinding")
+    chunks = [model_chunks] if isinstance(model_chunks, torch.nn.Module) else model_chunks
+    for chunk_index, chunk in enumerate(chunks):
+        for module in _backends(chunk):
+            module._chunk_index = chunk_index
     pools = {}
     for module in backends:
-        if module.context is not None:
-            raise RuntimeError("dist_moe runtime is already initialized; close it before rebinding")
         if module.config.fp8_param and not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             raise ValueError("dist_moe FP8 parameters require reuse_grad_buf_for_mxfp8_param_ag")
         grads = tuple(main_grad_buffer(param) for param in module.owners)
@@ -204,68 +297,50 @@ def initialize_dist_moe_runtime(model_chunks, *, ddp_config, max_num_local_input
         )
         pools.setdefault(key, []).append(module)
     for modules in pools.values():
-        first = modules[0]
-        options = first.options
-        config = dist_moe.Config(
-            max_num_local_input_tokens=max_num_local_input_tokens,
-            hidden_dim=first.hidden_size,
-            intermediate_dim=first.intermediate_size,
-            top_k=first.topk,
-            num_experts=first.config.num_moe_experts,
-            max_moe_layers_per_activation_slot=len(modules),
-            num_sms=options.num_sms,
-            device_scratch_capacity_factor=(
-                first.ep_group.size()
-                if options.device_scratch_capacity_factor is None
-                else options.device_scratch_capacity_factor
-            ),
-            activation_slot_bytes=options.activation_slot_bytes,
-            activation_slot_capacity_factor=(
-                options.activation_slot_capacity_factor
-                if options.activation_slot_capacity_factor is not None
-                else (1.0 if options.activation_slot_bytes is None else None)
-            ),
-            bf16_grouped_gemm_preset=options.bf16_grouped_gemm_preset,
-            block_scaled=(
-                dist_moe.BlockScaledConfig(pipeline=options.mxfp8_pipeline)
-                if first.use_mxfp8
-                else None
-            ),
-            wgrad_dtype=first.owners[0].main_grad.dtype,
-        )
-        context = dist_moe.create_context(
-            group=first.ep_group, config=config, device=first.owners[0].device
-        )
-        logging.getLogger(__name__).info(
-            "Dist-MoE runtime: layers=%d, primary=%s, config=%s; %s",
-            len(modules),
-            "MXFP8" if first.config.fp8_param else "BF16",
-            config,
-            context.memory_plan.explain(),
-        )
-        _CONTEXTS.append((context, modules))
+        pool = _RuntimePool(modules, max_num_local_input_tokens)
+        _POOLS.append(pool)
         for module in modules:
-            module.context = context
-            module._stream = torch.cuda.current_stream(module.owners[0].device).cuda_stream
+            module._runtime_pool = pool
+        if modules[0].config.pipeline_model_parallel_size == 1:
+            pool.configure(1)
+
+
+def configure_dist_moe_activation_slots(model_chunks, num_slots):
+    """Materialize/reconfigure drained contexts once the PP schedule is known."""
+    seen = set()
+    for module in _backends(model_chunks):
+        pool = module._runtime_pool
+        if pool is None:
+            raise RuntimeError("call initialize_dist_moe_runtime before the pipeline schedule")
+        if id(pool) not in seen:
+            capacity = num_slots[id(pool)] if isinstance(num_slots, dict) else num_slots
+            if capacity < 1:
+                raise ValueError("dist_moe requires at least one activation slot")
+            pool.configure(capacity)
+            seen.add(id(pool))
 
 
 def close_dist_moe_runtime(model_chunks=None):
     """Synchronize and release idle contexts before process-group teardown."""
     selected = None if model_chunks is None else set(_backends(model_chunks))
-    for context, modules in list(_CONTEXTS):
+    for pool in list(_POOLS):
+        context, modules = pool.context, pool.modules
         if selected is not None and not selected.intersection(modules):
             continue
         if any(module._live for module in modules):
             raise RuntimeError("cannot close dist_moe with an unfinished backward")
         if any(module._graph_bound for module in modules):
             raise RuntimeError("delete_cuda_graphs before closing the dist_moe runtime")
-        torch.cuda.synchronize(modules[0].owners[0].device)
-        context.close()
+        if context is not None:
+            torch.cuda.synchronize(modules[0].owners[0].device)
+            context.close()
         for module in modules:
             module.context = None
-            module._weight_cache = module._prepared = None
+            module._runtime_pool = None
+            module._pipeline_schedule = None
+            module._weight_cache = module._prepared = module._weight_binding = None
             module.is_first_microbatch = True
-        _CONTEXTS.remove((context, modules))
+        _POOLS.remove(pool)
 
 
 def dist_moe_runtime_lifecycle(function):
@@ -278,7 +353,7 @@ def dist_moe_runtime_lifecycle(function):
         finally:
             training_failed = sys.exc_info()[0] is not None
             try:
-                if any(module._graph_bound for _, modules in _CONTEXTS for module in modules):
+                if any(module._graph_bound for pool in _POOLS for module in pool.modules):
                     from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 
                     delete_cuda_graphs()

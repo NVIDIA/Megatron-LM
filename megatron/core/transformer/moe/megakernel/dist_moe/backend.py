@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import MethodType
 
 import torch
@@ -11,7 +12,13 @@ from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.parameter_bridge import main_grad_buffer
 from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 
-from .runtime import DistMoEBackendOptions, _DistMoEAutograd, storage_signature, validate_config
+from .runtime import (
+    DistMoEBackendOptions,
+    _DistMoEAutograd,
+    _DistMoECall,
+    storage_signature,
+    validate_config,
+)
 from .weights import prepare_weight
 
 
@@ -51,13 +58,18 @@ class DistMoEMegakernel(MegakernelBackend):
         if self.owners[0] is self.owners[1]:
             raise ValueError("dist_moe does not support tied expert weights")
         self.context = None
-        self._live = False
+        self._runtime_pool = None
+        self._pipeline_schedule = None
+        self._live = 0
         self._gradient_binding = None
         self._weight_cache = None
         self._weight_binding = None
         self._prepared = None
         self._graph_bound = False
         self._graph_binding = None
+        self._graph_calls = {}
+        self._capturing_graph = False
+        self._graph_capture_key = None
         self.is_first_microbatch = True
         routed_experts.register_load_state_dict_pre_hook(self._before_expert_load)
 
@@ -89,13 +101,22 @@ class DistMoEMegakernel(MegakernelBackend):
             for param in self.owners
         )
 
-    def _check_backward_bindings(self):
-        if self._weight_signature() != self._weight_binding:
+    def _check_backward_bindings(self, weight_binding=None):
+        if self._weight_signature() != (
+            self._weight_binding if weight_binding is None else weight_binding
+        ):
             raise RuntimeError("dist_moe parameter storage/version changed during backward")
         return self._grads()
 
     def _prepare_weights(self, first_microbatch=False):
         binding = self._weight_signature()
+        if self._live:
+            if binding != self._weight_binding:
+                raise RuntimeError("dist_moe parameter storage/version changed with live forwards")
+            # All in-flight calls borrow the same prepared operands. In particular,
+            # never overwrite cached FP8 scales while any backward still needs them.
+            self.is_first_microbatch = False
+            return
         if self._prepared is None or first_microbatch or binding != self._weight_binding:
             cached = (None, None) if self._weight_cache is None else self._weight_cache
             prepared = [
@@ -123,7 +144,7 @@ class DistMoEMegakernel(MegakernelBackend):
 
     def cuda_graph_capture_prepare(self):
         """Materialize stable operands before the local runner begins capture."""
-        if self.context is None or self._live:
+        if self.context is None or (self._live and not self._capturing_graph):
             raise RuntimeError("dist_moe capture requires an initialized, idle runtime")
         self._prepare_weights(first_microbatch=True)
         binding = self._graph_storage_binding()
@@ -132,24 +153,66 @@ class DistMoEMegakernel(MegakernelBackend):
         self._graph_binding = binding
         self._graph_bound = True
 
-    def cuda_graph_prepare_replay(self, is_first_microbatch, grad_enabled):
+    def cuda_graph_key(self):
+        """Include the whole schedule: graph-pool reuse also depends on its order."""
+        schedule = self._pipeline_schedule
+        if schedule is not None:
+            return schedule.graph_key(self)
+        if self.config.pipeline_model_parallel_size > 1:
+            raise RuntimeError("dist_moe PP/VPP requires the native pipeline schedule")
+        return None
+
+    @contextmanager
+    def cuda_graph_capture_scope(self, graph_key):
+        """Capture after the recording schedule drains, using its fixed slot."""
+        if self._pipeline_schedule is not None or self._capturing_graph or self._graph_calls:
+            raise RuntimeError("dist_moe graph capture requires a drained pipeline schedule")
+        self._capturing_graph = True
+        self._graph_capture_key = graph_key
+        try:
+            self.cuda_graph_capture_prepare()
+            yield
+        finally:
+            self._capturing_graph = False
+            self._graph_capture_key = None
+
+    def cuda_graph_prepare_replay(self, is_first_microbatch, grad_enabled, graph_key=None):
         """Refresh scales after native DDP gathering, outside the captured graph."""
-        if not self._graph_bound or self.context is None or self._live:
+        from .pipeline import begin_forward
+
+        if not self._graph_bound or self.context is None:
+            raise RuntimeError("dist_moe replay requires a captured runtime")
+        if self.cuda_graph_key() != graph_key:
+            raise RuntimeError("dist_moe graph schedule/slot changed; delete and recapture graphs")
+        if self._live and self._pipeline_schedule is None:
             raise RuntimeError("dist_moe replay requires an idle captured runtime")
         self._prepare_weights(first_microbatch=is_first_microbatch)
         if self._graph_storage_binding() != self._graph_binding:
             raise RuntimeError("dist_moe CUDA graph storage changed; delete and recapture graphs")
-        self._live = grad_enabled
+        if grad_enabled:
+            call = _DistMoECall(self._weight_binding, begin_forward(self))
+            self._graph_calls[id(call)] = (call, False)
+            self._live += 1
+            return call
+        return None
 
-    def cuda_graph_prepare_backward(self):
+    def cuda_graph_prepare_backward(self, call):
         """Reject stale graph operands before the GPU can read or write them."""
-        if not self._live:
+        if not self._live or self._graph_calls.get(id(call)) != (call, False):
             raise RuntimeError("dist_moe backward replay requires a live forward")
-        self._check_backward_bindings()
+        self._check_backward_bindings(call.weight_binding)
+        if call.ticket is not None:
+            call.ticket.before_backward()
+        self._graph_calls[id(call)] = (call, True)
 
-    def cuda_graph_finish_replay(self):
+    def cuda_graph_finish_replay(self, call):
         """Release this frame; the local runner completes native DDP owner edges."""
-        self._live = False
+        if self._graph_calls.get(id(call)) != (call, True):
+            raise RuntimeError("dist_moe graph completion is missing, repeated, or out of order")
+        if call.ticket is not None:
+            call.ticket.complete()
+        del self._graph_calls[id(call)]
+        self._live -= 1
 
     def cuda_graph_release(self):
         """Release borrowed graph storage before runtime or model teardown."""
@@ -163,9 +226,19 @@ class DistMoEMegakernel(MegakernelBackend):
 
     def forward(self, hidden_states, probs, routing_map):
         """Execute with borrowed payloads and direct optimizer-visible accumulation."""
+        from .pipeline import begin_forward
+
         if self.context is None:
+            if self._runtime_pool is not None:
+                raise RuntimeError("dist_moe PP/VPP requires the native pipeline schedule")
             raise RuntimeError("call initialize_dist_moe_runtime after wrapping the model in DDP")
-        if self._live:
+        if self._capturing_graph:
+            if self._graph_capture_key is not None:
+                self.context.select_activation_slot(*self._graph_capture_key[1:])
+            ticket = None
+        else:
+            ticket = begin_forward(self)
+        if self._live and ticket is None and not self._capturing_graph:
             raise RuntimeError("dist_moe requires each microbatch backward before its next forward")
         capturing = torch.cuda.is_current_stream_capturing()
         if torch.cuda.current_stream(hidden_states.device).cuda_stream != self._stream and not (
@@ -184,8 +257,11 @@ class DistMoEMegakernel(MegakernelBackend):
         elif not self._graph_bound or self._graph_storage_binding() != self._graph_binding:
             raise RuntimeError("dist_moe capture requires stable, prepared graph operands")
         self._grads()
-        self._live = torch.is_grad_enabled()
-        output = _DistMoEAutograd.apply(self, x, ids, scores, *self.owners)
+        call = None
+        if torch.is_grad_enabled():
+            call = _DistMoECall(self._weight_binding, ticket)
+            self._live += 1
+        output = _DistMoEAutograd.apply(self, call, x, ids, scores, *self.owners)
         return output.view(shape)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -218,7 +294,7 @@ class DistMoEMegakernel(MegakernelBackend):
         self._invalidate_weights()
 
     def _apply(self, *args, **kwargs):
-        if self.context is not None:
+        if self._runtime_pool is not None or self.context is not None:
             raise RuntimeError("close dist_moe runtime before moving parameter storage")
         # TE wrapper swap_tensors can discard DDP metadata on a second alias visit.
         snapshots = {

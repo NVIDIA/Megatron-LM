@@ -942,28 +942,71 @@ TE versions that gate single grouped parameters with an environment variable
 also require `NVTE_GROUPED_LINEAR_SINGLE_PARAM=1`; the backend checks the actual
 parameter layout rather than relying only on the requested configuration.
 
-The initial integration supports TP/ETP/CP/PP/GTP=1, sequential microbatch
-forward/backward, ordinary SwiGLU, native MCore DDP, and device-resident
-activations. Local whole-layer CUDA graphs (`cuda_graph_impl: local` with
-`cuda_graph_modules: []`) reuse MCore's graph runner and native DDP hooks.
+The integration supports TP/ETP/CP/GTP=1, ordinary SwiGLU, native MCore DDP, and
+device-resident activations. PP and VPP use the native pipeline schedule:
+each live chunk/microbatch owns an activation slot, while equal-shape layers
+share communication scratch. Saved states and parameter-hook completion belong
+to each forward; weights and prepared scales cannot change until all of their
+live backwards finish. The combined MoE forward/backward overlap path
+(`overlap_moe_expert_parallel_comm`) remains unsupported. Forward-only evaluation
+does not retain training slots, and a drained runtime can resize its slots when
+the number of microbatches changes.
+
+Local whole-layer CUDA graphs (`cuda_graph_impl: local` with
+`cuda_graph_modules: []`) support PP=1, PP, and VPP through MCore's graph runners
+and native DDP hooks. Each pipeline runner captures a fixed activation slot;
+each replay owns a new forward/backward ticket. Keep the captured microbatch
+schedule unchanged, or delete and recapture the graphs before changing it.
 MXFP8 CUDA graphs require `fp8_param: true`; MXFP8 compute with BF16 primary
 parameters is supported only in eager mode. BF16 compute also supports local graphs.
 Prepared scales refresh in place after parameter gathering and before replay;
 the graphs retain their runtime storage until `delete_cuda_graphs()` is called.
-Training graphs require forward/backward pairs; `no_grad` replay is rejected
-before launch. Evaluation through a captured training runner is unsupported.
-Other graph modes, outer activation recomputation, delayed WGRAD, Flex dispatch,
-and FSDP are rejected. Routed precision
-must be uniform; `first_last_layers_bf16` overrides are rejected. Expert parallelism
+Training graphs require forward/backward pairs; direct `no_grad` replay is
+rejected before launch. Forward-only evaluation uses eager execution and retains
+the captured runtime's storage, so training can resume with the same graphs.
+Other graph modes, outer activation recomputation,
+delayed WGRAD, Flex dispatch, and FSDP are rejected. Routed precision must be
+uniform; `first_last_layers_bf16` overrides are rejected. Expert parallelism
 comes from the layer's explicit EP process group.
 
-The training entrypoint initializes contexts after DDP, optimizer, and checkpoint
-setup and closes them on exit. Library users call
+The training entrypoint registers the runtime after DDP, optimizer, and checkpoint
+setup and closes it on exit. PP=1 creates contexts immediately; PP/VPP defers
+allocation until the native schedule determines the maximum live slot count.
+Library users call
 `initialize_dist_moe_runtime(model_chunks, ddp_config=..., max_num_local_input_tokens=...)`
 after equivalent setup and `close_dist_moe_runtime(model_chunks)` after the last
 backward and before destroying process groups. Library users must delete local
 graphs before closing the runtime or loading model weights. These functions are exported by
 `megatron.core.transformer.moe.megakernel.dist_moe`.
+
+The numerical pipeline unit tests require installed Dist-MoE and Transformer
+Engine on Blackwell GPUs, with a world size divisible by eight (PP2 x EP4).
+They compare eager execution with native all-to-all across multiple microbatches
+and optimizer steps, with shared experts and both shared-expert and combined
+1F1B overlap disabled. The numerical unit comparisons explicitly use Adam
+epsilon `1e-4` to limit amplification of BF16/MXFP8 differences in updates to
+near-zero LayerNorm biases; forward/backward and updated-parameter comparison
+tolerances are unchanged. This does not establish equivalent optimizer
+trajectories with the default epsilon `1e-8`.
+
+For an eight-rank BF16 smoke test, run the following on each of two four-GPU
+nodes, setting `NODE_RANK` to 0 or 1 and `MASTER_ADDR` to the address of node 0:
+
+```bash
+NVTE_GROUPED_LINEAR_SINGLE_PARAM=1 torchrun \
+  --nnodes=2 --nproc-per-node=4 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port=29500 \
+  -m pytest -q \
+  'tests/unit_tests/transformer/moe/test_dist_moe_pipeline_numeric.py::test_dist_moe_pipeline_numeric[pp2-bf16]'
+```
+
+Select the full test file to exercise its BF16/MXFP8 and PP/VPP cases. Sixteen
+ranks additionally exercise nontrivial expert-data-parallel communication.
+The companion `test_dist_moe_pipeline_graph_numeric.py` compares local graph
+replay against the same Dist-MoE eager trajectory with default Adam epsilon
+`1e-8`, checking outputs, gradients, and updated parameters bit for bit. It also
+checks actual forward/backward replay counts, changing microbatch routes, and
+stable runtime storage across training, eager evaluation, and resumed training.
 
 Backend options are `num_sms`, `device_scratch_capacity_factor`,
 `activation_slot_bytes` or `activation_slot_capacity_factor`,
