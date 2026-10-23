@@ -161,8 +161,6 @@ class ShortcutMoEBlock(MegatronModule):
         self.is_first_layer = getattr(compute_layer, "is_first_layer", False)
         self.is_last_layer = getattr(moe_layer, "is_last_layer", False)
         self.tp_group = moe_layer.mlp.tp_group
-        self.compute_layer = compute_layer
-        self.moe_layer = moe_layer
         self.recompute_shortcut_pre_mlp_layernorm = (
             self.config.recompute_granularity == "selective"
             and "shortcut_pre_mlp_layernorm" in (self.config.recompute_modules or [])
@@ -221,6 +219,14 @@ class ShortcutMoEBlock(MegatronModule):
             eps=self.config.layernorm_epsilon,
             has_residual=False,
         )
+        # Routing runs before the compute layer; preserve that order for FSDP prefetch
+        # when callers explicitly select norms as additional FSDP units.
+        self.compute_layer = compute_layer
+        self.moe_layer = moe_layer
+        # This norm feeds shared experts after routed experts have already executed.
+        pre_mlp_layernorm = moe_layer.pre_mlp_layernorm
+        del moe_layer.pre_mlp_layernorm
+        moe_layer.pre_mlp_layernorm = pre_mlp_layernorm
         self.shortcut_post_norm = (
             build_module(
                 shortcut_norm_spec,

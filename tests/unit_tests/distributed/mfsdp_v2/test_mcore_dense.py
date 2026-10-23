@@ -24,7 +24,7 @@ from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimize
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
@@ -240,6 +240,35 @@ class TestMcoreDense:
         )
 
         assert fully_shard_context_calls == [True]
+
+    def test_rejects_residual_stream_recompute(self, distributed_setup):
+        """Reject stack-managed replay before mutating parameters or creating FSDP units."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            gradient_accumulation_fusion=False,
+            wide_residual=WideResidualConfig(num_streams=3),
+            recompute_granularity="selective",
+            recompute_modules=["residual_stream"],
+            residual_stream_recompute_num_layers=1,
+        )
+        layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
+        parameters = list(layer.parameters())
+        with pytest.raises(ValueError, match="does not support residual_stream recomputation"):
+            FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                ),
+                module=layer,
+                pg_collection=self.process_group_collection,
+            )
+        assert not isinstance(layer, FsdpModule)
+        assert all(actual is original for actual, original in zip(layer.parameters(), parameters))
+        assert all(not isinstance(parameter, DTensor) for parameter in layer.parameters())
 
     def test_rejects_shared_context_without_caller_managed_grad_sync(self, distributed_setup):
         """The adapter rejects an incompatible shared context before sharding the model."""
