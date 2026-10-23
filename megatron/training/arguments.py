@@ -2668,6 +2668,15 @@ def _add_regularization_args(parser):
 
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
+    group.add_argument(
+        '--rmsnorm-weight-decay-mult',
+        type=float,
+        default=None,
+        help='Multiplier on scheduled global weight decay for RMSNorm gamma '
+        'only (e.g. 0.5 for half decay, 1.0 for full decay, 0.0 for none). '
+        'Unset preserves the existing policy. Overrides '
+        '--apply-wd-to-qk-layernorm for RMSNorm gamma only.',
+    )
     group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
                        help='Apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,

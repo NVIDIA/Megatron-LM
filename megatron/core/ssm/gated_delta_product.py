@@ -462,6 +462,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+            self.norm.weight.is_rmsnorm_weight = True
             self.norm.tp_group = self.pg_collection.tp
             setattr(self.norm.weight, 'tensor_model_parallel', True)
 
