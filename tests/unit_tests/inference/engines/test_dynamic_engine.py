@@ -100,6 +100,32 @@ except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
 
+@pytest.mark.asyncio
+async def test_join_coordinator_process_reaps_and_escalates():
+    """A cooperative coordinator is only joined; a wedged one is terminated, then killed."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    # Class default: this rank spawned no coordinator -> no-op.
+    await engine.join_coordinator_process()
+
+    cooperative = mock.Mock()
+    cooperative.is_alive.return_value = False
+    cooperative.exitcode = 0
+    engine.inference_coordinator_process = cooperative
+    await engine.join_coordinator_process(timeout=0.01)
+    cooperative.join.assert_called_once_with(0.01)
+    cooperative.terminate.assert_not_called()
+    assert engine.inference_coordinator_process is None
+
+    wedged = mock.Mock()
+    wedged.is_alive.return_value = True
+    engine.inference_coordinator_process = wedged
+    await engine.join_coordinator_process(timeout=0.01)
+    wedged.terminate.assert_called_once_with()
+    wedged.kill.assert_called_once_with()
+    assert wedged.join.call_args_list == [mock.call(0.01), mock.call(5.0), mock.call()]
+    assert engine.inference_coordinator_process is None
+
+
 class _ImageOnlyCapabilityWrapper:
     supports_text = True
     supports_image = True
