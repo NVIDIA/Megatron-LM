@@ -415,6 +415,18 @@ def require_shared_prefix_flash_attn() -> None:
         )
 
 
+def _dense_core_attention_types() -> tuple:
+    """Core attention classes that compute plain softmax dot-product attention."""
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+
+    if not HAVE_TE:
+        return (DotProductAttention,)
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+    return (DotProductAttention, TEDotProductAttention)
+
+
 def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size: int) -> None:
     """Reject a ``SelfAttention`` that the forest attention cannot run on this TP/CP topology.
 
@@ -431,6 +443,14 @@ def validate_shared_prefix_attention(attention, config, *, tp_size: int, cp_size
         raise NotImplementedError(
             "shared-prefix fused attention supports only SelfAttention, got "
             f"{type(attention).__name__}"
+        )
+    # The forest replaces core attention outright, so only dense dot-product core attention can
+    # be replaced exactly. Attention variants can keep SelfAttention's forward and plug in a
+    # different core attention (DSA over GQA does), which the forest would silently bypass.
+    if not isinstance(getattr(attention, "core_attention", None), _dense_core_attention_types()):
+        raise NotImplementedError(
+            "shared-prefix fused attention requires dot-product core attention, got "
+            f"{type(getattr(attention, 'core_attention', None)).__name__}"
         )
     if attention.checkpoint_core_attention:
         raise NotImplementedError(

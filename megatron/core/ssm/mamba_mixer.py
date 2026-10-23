@@ -172,6 +172,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             parallel.
     """
 
+    # Per-call shared-prefix request. forward_mamba_layer_shared_prefix sets it on the instance
+    # around one MambaLayer call and deletes it afterwards, restoring this default. Dispatching
+    # here rather than in MambaLayer.forward keeps this module's own hooks on the shared-prefix
+    # path, such as Megatron FSDP's fine-grained gather of the parameters the mixer owns.
+    _shared_prefix_call = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -533,6 +539,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
     ):
         """Run the input projection/SSM phase followed by the output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        shared_prefix_call = self._shared_prefix_call
+        if shared_prefix_call is not None:
+            if inference_context is not None or packed_seq_params is not None:
+                raise NotImplementedError(
+                    "shared-prefix Mamba only supports static, unpacked training forwards"
+                )
+            # Imported here: mamba_shared_prefix imports this module.
+            from megatron.core.ssm.mamba_shared_prefix import forward_mamba_mixer_shared_prefix
+
+            return forward_mamba_mixer_shared_prefix(self, hidden_states, shared_prefix_call)
         in_inference_mode = InferenceMode.is_active()
 
         _, batch, _ = hidden_states.shape
@@ -1032,14 +1048,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         tensor_masked_update(ssm_state, batch_indices, cache_states)
         if self.config.batch_invariant_mode:
             self._get_batch_invariant_decoder().seed(
-                x,
-                z.squeeze(0),
-                dt,
-                B,
-                C,
-                cu_seqlens,
-                batch_indices,
-                max_requests=ssm_state.shape[0],
+                x, dt, B, C, cu_seqlens, batch_indices, max_requests=ssm_state.shape[0]
             )
 
         if extract_intermediates:

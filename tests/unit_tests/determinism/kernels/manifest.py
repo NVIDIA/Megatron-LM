@@ -174,8 +174,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
-        "test_runtime_cp_attention.py. The shared-prefix branch (a forest attached by a caller "
-        "selects shared_prefix_attention instead of core attention) is replayed through a real "
+        "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
+        "dispatch (FA2 prefill/decode) is replayed there with a config-driven softmax_scale. "
+        "The shared-prefix branch (a forest attached by a caller selects "
+        "shared_prefix_attention instead of core attention) is replayed through a real "
         "SelfAttention at CP1/CP2 in test_shared_prefix_attention.py.",
     ),
     KernelEntry(
@@ -471,7 +473,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="ssm_mamba2_batch_invariant_decode",
-        sources=("megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",),
+        sources=(
+            "megatron/core/ssm/ops/mamba2/batch_invariant_decode.py",
+            "megatron/core/ssm/ops/mamba2/batch_invariant_decode_rows.py",
+        ),
         tests=("tests/unit_tests/ssm/ops/mamba2/test_batch_invariant_decode.py",),
         kind="triton",
         training_path=False,
@@ -525,7 +530,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
-        "test_ssm_kernels.py.",
+        "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "
+        "Householder update, replayed with M=1 by test_chunk_gated_delta_product_varlen_replays.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
@@ -597,7 +603,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vmm_symm_allocator",
-        sources=("megatron/core/allocator/vmm_symm_allocator.py",),
+        sources=(
+            "megatron/core/allocator/vmm_symm_allocator.py",
+            "megatron/core/allocator/csrc/vmm_symm_allocator.cpp",
+        ),
         kind="cuda-ext",
         exempt_reason="Pluggable allocator (CUDA VMM driver calls); allocation only, no "
         "compute kernel.",
@@ -699,13 +708,78 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_ssm_conv1d.py",
             K + "test_ssm_kernels.py",
             "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_module_call.py",
         ),
         kind="dispatch",
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
         "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
-        "kernels replayed piecewise in test_ssm_kernels.py.",
+        "kernels replayed piecewise in test_ssm_kernels.py. The shared-prefix branch (a "
+        "MambaSharedPrefixCall attached by forward_mamba_layer_shared_prefix) hands the mixer half "
+        "to mamba_shared_prefix; its ragged and packed scans are replayed through a real "
+        "MambaMixer in test_shared_prefix_mamba_kernels.py, and "
+        "test_shared_prefix_mamba_module_call.py checks that the branch runs through the layer "
+        "and mixer module calls.",
+    ),
+    # Shared-prefix Mamba: the ragged state-fork forest, the chunk-aligned packed recurrence
+    # and the NRL_SP_MAMBA_IMPL dispatch that selects them.
+    KernelEntry(
+        name="ssm_mamba_ragged_forest",
+        sources=("megatron/core/ssm/mamba_ragged.py", "megatron/core/ssm/mamba_ragged_scan.py"),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
+        kind="triton",
+        notes="_RaggedGather forward/backward (one owner per input element, fixed-order FP32 "
+        "sibling sum, no atomics), channel-last causal_conv1d_fn with seq_idx, and the forest "
+        "state-passing kernels around the private mamba_ssm SSD kernels, whose ddt/dD/ddA "
+        "atomics need MAMBA_DETERMINISTIC=1 (negative control without it). Replayed kernel by "
+        "kernel (star and forest, D per head and per head-dim, save_intermediates on/off "
+        "bitwise equal) and through a real MambaMixer's parameters. "
+        "test_shared_prefix_mamba_backends.py checks int32 and int64 offsets bitwise, the "
+        "gather backward against index_add_ and compile reuse across lengths; "
+        "test_shared_prefix_mamba_numerics.py compares the layer with dense rows and checks "
+        "eval == train forward bitwise.",
+    ),
+    KernelEntry(
+        name="ssm_mamba_sequence_packing",
+        sources=("megatron/core/ssm/mamba_sequence_packing.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+        ),
+        kind="dispatch",
+        notes="Pads every sequence to a scan-chunk boundary and calls causal_conv1d_fn and "
+        "mamba_chunk_scan_combined with seq_idx; scan_mamba_packed_recurrence is replayed "
+        "through a real MambaMixer's parameters in test_shared_prefix_mamba_kernels.py, and "
+        "the packed_recurrence backend is compared with dense rows in "
+        "test_shared_prefix_mamba_numerics.py.",
+    ),
+    KernelEntry(
+        name="ssm_mamba_shared_prefix_dispatch",
+        sources=("megatron/core/ssm/mamba_shared_prefix.py",),
+        tests=(
+            K + "test_shared_prefix_mamba_kernels.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_backends.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_numerics.py",
+            "tests/unit_tests/shared_prefix/ssm/test_shared_prefix_mamba_module_call.py",
+        ),
+        kind="dispatch",
+        notes="forward_mamba_layer_shared_prefix routes every Mamba layer through "
+        "NRL_SP_MAMBA_IMPL: the default ragged forest (mamba_ragged), the packed recurrence "
+        "(mamba_sequence_packing), the opt-in state_fork/replay_prefix helpers, which call "
+        "causal_conv1d_fn and mamba_chunk_scan_combined directly, or the packed_fused "
+        "diagnostic oracle. The ragged and packed scans are replayed in "
+        "test_shared_prefix_mamba_kernels.py. test_shared_prefix_mamba_backends.py covers the "
+        "selector and dispatch; test_shared_prefix_mamba_numerics.py compares the four "
+        "differentiable backends (not packed_fused) with dense rows and checks eval == train "
+        "bitwise; test_shared_prefix_mamba_module_call.py checks that the layer runs through "
+        "MambaLayer.__call__ and MambaMixer.__call__. The state_fork/replay_prefix helpers have "
+        "no bit-exact backward replay.",
     ),
     KernelEntry(
         name="ssm_gated_delta_product",
@@ -739,8 +813,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
         "quantization (fused_mla_kv_rope_mxfp8, use_fused_mla_kv_rope_quant), both replayed in "
-        "test_te_wrappers.py. The TE FusedMLAQUpProj GEMM path and mxfp8_quantize_only are not "
-        "replayed.",
+        "test_te_wrappers.py. The TE attention replay there also covers the config-derived "
+        "softmax_scale MultiLatentAttention hands to its core attention. The TE FusedMLAQUpProj "
+        "GEMM path and mxfp8_quantize_only are not replayed.",
     ),
     KernelEntry(
         name="dsa_indexer_weights_projection",
@@ -855,6 +930,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
         "TensorParallelMuon duplicated mode. The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
+    ),
+    KernelEntry(
+        name="mfsdp_muon_dispatch",
+        sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/muon.py",),
+        tests=("tests/unit_tests/distributed/mfsdp_v2/test_muon.py",),
+        kind="dispatch",
+        notes="FsdpMuon calls Emerging Optimizers Muon on matrices gathered to their owners. "
+        "test_muon_matches_reference checks weights, momentum, and forward outputs bitwise "
+        "against unsharded Muon across multiple steps, including an optimizer-state reload. "
+        "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(
