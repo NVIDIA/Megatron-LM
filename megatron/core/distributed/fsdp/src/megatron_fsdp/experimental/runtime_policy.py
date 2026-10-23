@@ -25,7 +25,8 @@ class RuntimePolicy:
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
         overlap_allgather_reduction: Use separate all-gather and reduction streams.
-            Disable to reduce peak transient memory.
+            Disable to reduce peak transient memory. See
+            https://github.com/NVIDIA/Megatron-LM/issues/6471.
         overlap_outer_communication: Run the last-microbatch DP-outer reduction on
             a separate stream, independently of overlap_allgather_reduction.
         caller_managed_grad_sync: Leave gradient synchronization to the caller

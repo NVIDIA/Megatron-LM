@@ -394,7 +394,7 @@ def _ddp_wrap(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
-                    ),
+                    )
                 )
             )
             if is_mfsdp_v2
