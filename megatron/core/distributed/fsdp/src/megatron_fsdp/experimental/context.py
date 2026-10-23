@@ -38,7 +38,6 @@ class FsdpContext:
     # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
-    overlap_allgather_reduction: bool
     caller_managed_grad_sync: bool
     """Leave gradient synchronization to the caller instead of an autograd callback.
 
@@ -100,7 +99,6 @@ class FsdpContext:
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
-        self.overlap_allgather_reduction = overlap_allgather_reduction
         self.caller_managed_grad_sync = caller_managed_grad_sync
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
