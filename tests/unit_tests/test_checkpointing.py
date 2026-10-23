@@ -39,7 +39,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     set_checkpoint_version,
 )
-from megatron.training.config import ProfilingConfig
+from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig, ProfilingConfig
 from megatron.training.global_vars import set_args
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -1334,6 +1334,22 @@ class TestBuildShardedStateDictMetadata:
     """
 
     DUMMY_GROUP = object()
+
+    @pytest.mark.parametrize('ckpt_format', ['torch_dist', 'fsdp_dtensor'])
+    def test_inference_container_keeps_shared_metadata(self, monkeypatch, run_config, ckpt_format):
+        cfg = InferenceConfigContainer(
+            model=None, checkpoint=run_config.checkpoint, inference=InferenceSetupConfig()
+        )
+        monkeypatch.setattr('megatron.training.checkpointing.get_run_config', lambda: cfg)
+        args = SimpleNamespace(ckpt_format=ckpt_format)
+
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+
+        assert metadata == {
+            'singleton_local_shards': False,
+            'chained_optim_avoid_prefix': True,
+            'dp_cp_group': self.DUMMY_GROUP,
+        }
 
     def test_distributed_optimizer_sets_dp_reshardable_default(self, run_config):
         args = _make_metadata_args(run_config, use_distributed_optimizer=True)
