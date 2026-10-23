@@ -11,6 +11,7 @@ from megatron.core.inference.utils import (
     get_language_model,
     lm_head_can_emit,
 )
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 
 
@@ -115,3 +116,23 @@ class TestInferenceUtils:
         head = _lm_head(head_cls, params_dtype)
         assert lm_head_can_emit(head, torch.float32) is expected
         assert lm_head_can_emit(head, params_dtype) is True
+
+    def test_lm_head_can_emit_fp32_follows_batch_invariant_mode(self, monkeypatch):
+        """Enabling batch-invariant mode after a model's first inference step must switch the
+        head back to training's bf16 logits, so the model-level property is read live."""
+        self._head_capabilities(monkeypatch, general_gemm=True)
+        mode = {"enabled": False}
+        monkeypatch.setattr(
+            "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+            "is_batch_invariant_mode_enabled",
+            lambda: mode["enabled"],
+        )
+        model = object.__new__(LanguageModule)
+        torch.nn.Module.__init__(model)
+        model.output_layer = _lm_head(ColumnParallelLinear, torch.bfloat16)
+
+        assert model.lm_head_can_emit_fp32 is True
+        mode["enabled"] = True
+        assert model.lm_head_can_emit_fp32 is False
+        mode["enabled"] = False
+        assert model.lm_head_can_emit_fp32 is True
