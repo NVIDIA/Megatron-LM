@@ -1,9 +1,86 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
+import torch
 
+from megatron.core.activations import squared_relu
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+
+
+def _make_glu_interleave_config(**overrides):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        gated_linear_unit=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize("kind", ["routed", "shared"])
+def test_glu_interleave_rejects_fp32_model_parameters(kind):
+    interleave_kwargs = (
+        {"moe_mlp_glu_interleave_size": 32}
+        if kind == "routed"
+        else {
+            "use_grouped_gemm_for_shared_expert": True,
+            "moe_shared_expert_intermediate_size": 256,
+            "moe_shared_expert_glu_interleave_size": 32,
+        }
+    )
+    with pytest.raises(
+        ValueError, match="GLU interleave is not supported with FP32 model parameters"
+    ):
+        _make_glu_interleave_config(params_dtype=torch.float32, **interleave_kwargs)
+
+
+@pytest.mark.parametrize("params_dtype", [torch.bfloat16, torch.float16])
+def test_glu_interleave_accepts_low_precision_model_parameters(params_dtype):
+    config = _make_glu_interleave_config(
+        params_dtype=params_dtype,
+        moe_mlp_glu_interleave_size=32,
+        use_grouped_gemm_for_shared_expert=True,
+        moe_shared_expert_intermediate_size=256,
+        moe_shared_expert_glu_interleave_size=32,
+    )
+
+    assert config.params_dtype == params_dtype
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({}, id="interleave-disabled"),
+        pytest.param(
+            {"gated_linear_unit": False, "moe_mlp_glu_interleave_size": 32}, id="non-glu-routed"
+        ),
+        pytest.param(
+            {
+                "gated_linear_unit": False,
+                "use_grouped_gemm_for_shared_expert": True,
+                "moe_shared_expert_intermediate_size": 256,
+                "moe_shared_expert_glu_interleave_size": 32,
+            },
+            id="non-glu-shared",
+        ),
+        pytest.param(
+            {
+                "moe_shared_expert_intermediate_size": 256,
+                "moe_shared_expert_glu_interleave_size": 32,
+            },
+            id="shared-without-grouped-gemm",
+        ),
+    ],
+)
+def test_inactive_glu_interleave_accepts_fp32_model_parameters(overrides):
+    config = _make_glu_interleave_config(params_dtype=torch.float32, **overrides)
+
+    assert config.params_dtype == torch.float32
 
 
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
@@ -50,6 +127,33 @@ def test_mhc_fused_backend_defaults_to_auto():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
     assert config.mhc_fused_backend == "auto"
+
+
+def _make_dsa_kpool_config(**overrides) -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="dsa",
+        add_bias_linear=False,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("kpool", [0, -1])
+def test_dsa_kpool_requires_positive_pool_size(kpool):
+    with pytest.raises(ValueError, match="dsa_indexer_kpool must be positive"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=kpool)
+
+
+def test_dsa_kpool_requires_divisible_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be divisible"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4, dsa_indexer_topk=6)
+
+
+def test_dsa_kpool_requires_topk():
+    with pytest.raises(ValueError, match="dsa_indexer_topk must be set"):
+        _make_dsa_kpool_config(dsa_indexer_kpool=4)
 
 
 @pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
@@ -124,6 +228,197 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
     assert config.dynamic_value == {"items": []}
 
 
+def _make_softcap_config(attn_logit_softcapping) -> TransformerConfig:
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        attn_logit_softcapping=attn_logit_softcapping,
+    )
+
+
+@pytest.mark.parametrize("softcap", [None, 50.0])
+def test_attn_logit_softcapping_accepts_none_and_positive_values(softcap):
+    """None disables softcapping; any positive finite cap is a real cap."""
+    assert _make_softcap_config(softcap).attn_logit_softcapping == softcap
+
+
+@pytest.mark.parametrize("softcap", [0.0, -50.0, float("inf")])
+def test_attn_logit_softcapping_rejects_invalid_values(softcap):
+    """Values the attention backends disagree about must not reach a kernel.
+
+    0.0 disables softcapping in TransformerEngine but collapses every logit to zero
+    in the local path, a negative cap is applied as its absolute value locally while
+    FlashAttention ignores it, and a non-finite cap yields NaN logits.
+    """
+    with pytest.raises(ValueError, match="attn_logit_softcapping must be"):
+        _make_softcap_config(softcap)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error", "message"),
+    [
+        pytest.param(
+            {"moe_shortcut_connection": True},
+            AssertionError,
+            "requires MoE to be enabled",
+            id="requires-moe",
+        ),
+        pytest.param(
+            {"num_moe_experts": 2, "moe_shortcut_parallel": True},
+            AssertionError,
+            "requires moe_shortcut_connection",
+            id="parallel-requires-shortcut",
+        ),
+        pytest.param(
+            {
+                "num_moe_experts": 2,
+                "moe_shortcut_connection": True,
+                "recompute_granularity": "full",
+            },
+            ValueError,
+            "not supported with full activation recomputation",
+            id="full-recompute",
+        ),
+        pytest.param(
+            {
+                "num_moe_experts": 2,
+                "moe_shortcut_connection": True,
+                "moe_shared_expert_overlap": True,
+            },
+            ValueError,
+            "mutually exclusive",
+            id="shared-expert-overlap",
+        ),
+        pytest.param(
+            {"num_moe_experts": 2, "moe_shortcut_connection": True, "cuda_graph_impl": "local"},
+            AssertionError,
+            "supports CUDA graphs only",
+            id="cuda-graphs-layer-scope",
+        ),
+    ],
+)
+def test_shortcut_rejects_incompatible_configurations(overrides, error, message):
+    with pytest.raises(error, match=message):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            **overrides,
+        )
+
+
+def test_shortcut_accepts_local_block_cuda_graphs():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        cuda_graph_impl="local",
+        inference_cuda_graph_scope="block",
+    )
+    assert config.cuda_graph_impl == "local"
+    assert config.inference_cuda_graph_scope.name == "block"
+
+
+def _make_shortcut_memory_config(**overrides):
+    kwargs = dict(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        moe_shortcut_post_norm=True,
+        recompute_modules=[],
+        offload_modules=[],
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("recompute_pre_norm", "offload_post_norm"),
+    [
+        pytest.param(True, False, id="pre-recompute"),
+        pytest.param(False, True, id="post-offload"),
+        pytest.param(True, True, id="combined"),
+    ],
+)
+def test_shortcut_memory_controls_accept_independent_and_combined_selection(
+    recompute_pre_norm, offload_post_norm
+):
+    config = _make_shortcut_memory_config(
+        recompute_granularity="selective" if recompute_pre_norm else None,
+        recompute_modules=["shortcut_pre_mlp_layernorm"] if recompute_pre_norm else [],
+        fine_grained_activation_offloading=offload_post_norm,
+        offload_modules=["shortcut_post_norm"] if offload_post_norm else [],
+    )
+
+    assert ("shortcut_pre_mlp_layernorm" in config.recompute_modules) is recompute_pre_norm
+    assert ("shortcut_post_norm" in config.offload_modules) is offload_post_norm
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param(
+            {
+                "recompute_granularity": "selective",
+                "recompute_modules": ["shortcut_pre_mlp_layernorm"],
+            },
+            id="pre-recompute",
+        ),
+        pytest.param(
+            {"fine_grained_activation_offloading": True, "offload_modules": ["shortcut_post_norm"]},
+            id="post-offload",
+        ),
+    ],
+)
+def test_shortcut_memory_controls_require_shortcut_connection(overrides):
+    with pytest.raises(ValueError, match="require moe_shortcut_connection"):
+        _make_shortcut_memory_config(moe_shortcut_connection=False, **overrides)
+
+
+@pytest.mark.parametrize("recompute_granularity", [None, "full"])
+def test_shortcut_pre_norm_recompute_requires_selective_granularity(recompute_granularity):
+    with pytest.raises(ValueError, match="requires recompute_granularity='selective'"):
+        _make_shortcut_memory_config(
+            recompute_granularity=recompute_granularity,
+            recompute_modules=["shortcut_pre_mlp_layernorm"],
+        )
+
+
+def test_shortcut_pre_norm_recompute_rejects_fp8_delayed_scaling():
+    with pytest.raises(ValueError, match="Delayed scaling does not support"):
+        _make_shortcut_memory_config(
+            recompute_granularity="selective",
+            recompute_modules=["shortcut_pre_mlp_layernorm"],
+            fp8="e4m3",
+            fp8_recipe="delayed",
+        )
+
+
+def test_shortcut_pre_norm_recompute_applies_fp8_te_version_requirement(monkeypatch):
+    from megatron.core.transformer import transformer_config as transformer_config_module
+
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: False)
+    monkeypatch.setattr(transformer_config_module, "get_te_version", lambda: "2.5.0")
+    with pytest.raises(ValueError, match="transformer-engine>=2.6.0dev0"):
+        _make_shortcut_memory_config(
+            recompute_granularity="selective",
+            recompute_modules=["shortcut_pre_mlp_layernorm"],
+            fp8="e4m3",
+            fp8_recipe="tensorwise",
+        )
+
+
 @pytest.mark.parametrize("num_householder", [0, -1])
 def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
     with pytest.raises(ValueError, match="gdp_num_householder must be positive"):
@@ -133,6 +428,24 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
             num_attention_heads=4,
             gdp_num_householder=num_householder,
         )
+
+
+def test_squared_relu_tanh_clamp_allows_te_op_fuser():
+    """Whether the fused path can clamp depends on the installed TE; TEGroupedMLP decides."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
+        activation_func=squared_relu,
+        use_fused_weighted_squared_relu=True,
+        activation_func_tanh_clamp_scale=16.0,
+        use_transformer_engine_op_fuser=True,
+    )
+
+    assert config.activation_func_tanh_clamp_scale == 16.0
+    assert config.use_transformer_engine_op_fuser is True
 
 
 def _make_mxfp8_wire_config(**overrides) -> TransformerConfig:
@@ -215,7 +528,7 @@ def test_sequence_packing_dense_config_passes():
 
 
 @requires_te_2_9
-def test_sequence_packing_moe_requires_alltoall_dispatcher():
+def test_sequence_packing_moe_rejects_allgather_dispatcher():
     # The general allgather-vs-variable_seq_lengths check fires first, since
     # sequence packing derives variable_seq_lengths=True.
     with pytest.raises(ValueError, match="alltoall"):
@@ -225,6 +538,28 @@ def test_sequence_packing_moe_requires_alltoall_dispatcher():
 @requires_te_2_9
 def test_sequence_packing_moe_alltoall_dispatcher_passes():
     config = _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="alltoall")
+    assert config.variable_seq_lengths is True
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_requires_uneven_input_padding():
+    with pytest.raises(ValueError, match="HybridEP requires"):
+        _make_packing_config(
+            num_moe_experts=2,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+
     assert config.variable_seq_lengths is True
 
 
@@ -267,3 +602,21 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+
+def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
+    """fused_group_mlp and expert_fc1 + moe_act are equivalent spellings, so combining them is
+    rejected as redundant."""
+    common = dict(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=2,
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        fine_grained_activation_offloading=True,
+    )
+    TransformerConfig(offload_modules=["fused_group_mlp"], **common)
+    TransformerConfig(offload_modules=["expert_fc1", "moe_act"], **common)
+    with pytest.raises(ValueError, match="cannot be combined with expert_fc1 or moe_act"):
+        TransformerConfig(offload_modules=["fused_group_mlp", "moe_act"], **common)

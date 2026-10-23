@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -31,7 +31,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -54,6 +54,37 @@ except ImportError:
     HAVE_FLA = False
 
 logger = logging.getLogger(__name__)
+
+
+class _TorchL2Norm(torch.autograd.Function):
+    """Match FLA's saved-output gradient without its timing-based autotuning."""
+
+    @staticmethod
+    def forward(ctx, x, eps):
+        """Normalize in FP32 and save the rounded output used by FLA's backward."""
+        x_float = x.float()
+        rstd = 1.0 / torch.sqrt((x_float * x_float).sum(dim=-1, keepdim=True) + eps)
+        y = (x_float * rstd).to(x.dtype)
+        ctx.save_for_backward(y, rstd)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        """Apply the saved-output gradient formula in FP32."""
+        y, rstd = ctx.saved_tensors
+        y_float, dy_float = y.float(), dy.float()
+        dx = dy_float * rstd - (dy_float * y_float).sum(dim=-1, keepdim=True) * y_float * rstd
+        return dx.to(y.dtype), None
+
+
+def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize the last dimension with FLA-compatible epsilon and dtype semantics.
+
+    Both passes compute in FP32. Backward uses the normalized output rounded to
+    the input dtype, matching FLA rather than differentiating an unrounded norm.
+    This path avoids timing-selected reduction layouts in deterministic training.
+    """
+    return _TorchL2Norm.apply(x, eps)
 
 
 @dataclass
@@ -91,7 +122,7 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
-class _GDNBase(MegatronModule):
+class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     """Common base class for the Gated Delta Net (GDN) family of layers.
 
     Hosts everything the GDN variants share: the fused input projection, causal
@@ -289,8 +320,24 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
-
         self.reset_parameters()
+
+    def supports_two_stage_attention(self) -> bool:
+        """Output-norm recomputation requires the original atomic forward path."""
+        return not self.recompute_norm_out
+
+    def forward_post_core_attn(
+        self, norm_out: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply a GDN variant's output projection to its normalized recurrence output."""
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
+        return out, out_bias
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
@@ -344,9 +391,18 @@ class _GDNBase(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # pylint: disable=missing-function-docstring
-        raise NotImplementedError
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run a GDN variant's recurrence followed by its output projection."""
+        norm_out = self.forward_pre_attn_and_core_attn(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
+        return self.forward_post_core_attn(norm_out)
 
     def _gated_norm_and_a2a(
         self,
@@ -419,7 +475,8 @@ class _GDNBase(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            normalize = torch_l2norm if self.config.deterministic_mode else l2norm
+            query_key = normalize(query_key.contiguous())
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
@@ -532,6 +589,12 @@ class _GDNBase(MegatronModule):
                     tp_group=tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
                 )
+            elif name == "core_attention":
+                # The TE backend adds a parameter-free TEGatedDeltaNetAttention wrapper around
+                # GatedDeltaNetAttention solely as a kernel adapter. Its TE runtime/extra state is
+                # not part of the learned GDN state and has no FLA counterpart, so omit it to
+                # keep checkpoints portable between the TransformerEngine and FLA backends.
+                continue
             else:
                 module_sharded_sd = sharded_state_dict_default(
                     module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=tp_group

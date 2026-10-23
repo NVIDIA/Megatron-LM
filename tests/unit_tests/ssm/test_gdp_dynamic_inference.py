@@ -64,6 +64,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.ssm import ssm_inference
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.ops.gdp.chunk import chunk_gated_delta_product_varlen
 from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
@@ -217,19 +218,25 @@ class _FakeSSM(SSMDynamicInferenceMixin):
 
 
 @pytest.mark.parametrize(
-    ("batch_invariant_mode", "num_requests", "tokens_per_request", "padded_token_count"),
-    [
-        (False, 40, 1, 40),
-        (True, 40, 1, 40),
-        (True, 40, 1, 64),
-        (False, 20, 3, 60),
-        (True, 20, 3, 64),
-    ],
+    ("batch_invariant_mode", "global_batch_invariant_mode"),
+    [(False, False), (False, True), (True, False), (True, True)],
 )
-def test_decode_ssm_preserves_batch_invariant_token_padding(
-    batch_invariant_mode, num_requests, tokens_per_request, padded_token_count
+@pytest.mark.parametrize(
+    ("num_requests", "tokens_per_request", "padded_token_count"),
+    [(40, 1, 40), (40, 1, 64), (20, 3, 60), (20, 3, 64)],
+)
+def test_decode_ssm_preserves_token_padding(
+    monkeypatch,
+    batch_invariant_mode,
+    global_batch_invariant_mode,
+    num_requests,
+    tokens_per_request,
+    padded_token_count,
 ):
-    """Only batch-invariant token-only rows bypass SSM decode."""
+    """Token-only padding requires at least one of the independent switches."""
+    monkeypatch.setattr(
+        ssm_inference, "is_batch_invariant_mode_enabled", lambda: global_batch_invariant_mode
+    )
     metadata_token_count = num_requests * tokens_per_request
     projected = torch.arange(padded_token_count * 4, dtype=torch.float32).reshape(
         padded_token_count, 1, 4
@@ -250,6 +257,13 @@ def test_decode_ssm_preserves_batch_invariant_token_padding(
         padding_slice=slice(metadata_token_count, padded_token_count),
     )
 
+    if padded_token_count > metadata_token_count and not (
+        batch_invariant_mode or global_batch_invariant_mode
+    ):
+        with pytest.raises(AssertionError, match="Token-only SSM padding requires"):
+            mixer.ssm_dynamic_inference(torch.empty(0), context)
+        return
+
     output, bias = mixer.ssm_dynamic_inference(torch.empty(0), context)
 
     decode_input, received_indices = mixer.decode_inputs[0]
@@ -262,6 +276,92 @@ def test_decode_ssm_preserves_batch_invariant_token_padding(
     assert torch.equal(output[:metadata_token_count], projected[:metadata_token_count, :, :2])
     assert torch.count_nonzero(output[metadata_token_count:]) == 0
     assert bias is None
+
+
+class _NonContiguousDecodeSSM(_FakeSSM):
+    """Returns a non-contiguous `[N, S, d]`, as the GDP decode kernel does."""
+
+    def ssm_decode(self, zxBCdt, *args, **kwargs):
+        y = super().ssm_decode(zxBCdt, *args, **kwargs)
+        return y.transpose(0, 1).contiguous().transpose(0, 1)
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [0, 1, 3])
+def test_decode_ssm_flattens_non_contiguous_output(num_speculative_tokens):
+    """A non-contiguous decode output is flattened request-major, then token."""
+    num_requests = 5
+    seq_len = 1 + num_speculative_tokens
+    token_count = num_requests * seq_len
+    projected = torch.arange(token_count * 4, dtype=torch.float32).reshape(token_count, 1, 4)
+    mixer = _NonContiguousDecodeSSM(projected)
+
+    context = types.SimpleNamespace(
+        batch_invariant_mode=False,
+        mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
+        num_speculative_tokens=num_speculative_tokens,
+        padded_batch_dimensions=InferenceBatchDimensions(
+            token_count=token_count, prefill_req_count=0, decode_req_count=num_requests
+        ),
+        mamba_metadata=types.SimpleNamespace(
+            batch_indices_decode=torch.arange(num_requests, dtype=torch.int32)
+        ),
+        padding_slice=slice(token_count, token_count),
+    )
+
+    output, _ = mixer.ssm_dynamic_inference(torch.empty(0), context)
+
+    assert output.shape == (token_count, 1, 2)
+    assert torch.equal(output, projected[..., :2])
+
+
+def test_decode_ssm_zeroes_padding_rows_on_cuda_graph_replay():
+    """With quantization scales on, padding rows are zeroed by the replay-time token count.
+
+    The graph is captured with every row real, as dummy requests fill the graph during
+    capture, so the captured `padding_slice` is empty.
+    """
+    num_requests = 8
+    original = torch.arange(1, num_requests * 4 + 1, dtype=torch.float32, device="cuda").reshape(
+        num_requests, 1, 4
+    )
+    projected = original.clone()
+    mixer = _FakeSSM(projected)
+    # Turns on the zeroing; the fake runs no quantized kernel.
+    mixer.config = types.SimpleNamespace(fp8="hybrid", fp4=False)
+
+    counts = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    counts.gpu_view = types.SimpleNamespace(
+        real_token_count=torch.tensor([num_requests], dtype=torch.int32, device="cuda")
+    )
+    context = types.SimpleNamespace(
+        batch_invariant_mode=False,
+        mamba_states_cache=lambda _layer, intermediate=False: (torch.empty(0), torch.empty(0)),
+        num_speculative_tokens=0,
+        padded_batch_dimensions=InferenceBatchDimensions(
+            token_count=num_requests, prefill_req_count=0, decode_req_count=num_requests
+        ),
+        mamba_metadata=types.SimpleNamespace(
+            batch_indices_decode=torch.arange(num_requests, dtype=torch.int32, device="cuda")
+        ),
+        padding_slice=slice(num_requests, num_requests),
+        zero_padding_tokens=counts.zero_padding_tokens,
+    )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mixer.ssm_dynamic_inference(torch.empty(0), context)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, _ = mixer.ssm_dynamic_inference(torch.empty(0), context)
+
+    for real_token_count in (5, num_requests, 0):
+        projected.copy_(original)
+        counts.gpu_view.real_token_count.fill_(real_token_count)
+        graph.replay()
+        assert torch.equal(output[:real_token_count], original[:real_token_count, :, :2])
+        assert torch.all(output[real_token_count:] == 0)
 
 
 class TestGDPDynamicInference:
@@ -465,6 +565,350 @@ class TestGDPDynamicInference:
 
 
 # ======================================================================
+# Speculative decoding.
+#
+# A speculative decode step runs `1 + num_speculative_tokens` tokens per request
+# in a single call, and verification may accept only a prefix of them. The
+# recurrent state therefore has to be recoverable at every draft token, which
+# the decode kernels provide by snapshotting into the context's intermediate
+# conv/SSM buffers -- the contract `MambaMixer` already implements and
+# `TextGenerationController`'s rollback reads back.
+#
+# The reference for snapshot `i` is a decode step over just the first `i + 1`
+# tokens: the same kernels doing the same arithmetic in the same order, with
+# the state landing in the cache rather than in the snapshot buffer. So the two
+# agree bitwise even in bf16, and no tolerance can hide a drifting snapshot.
+# ======================================================================
+
+
+class TestGDPSpeculativeDecode:
+    """Multi-token decode steps and their per-draft-token state snapshots."""
+
+    pytestmark = requires_gdp_model + [requires_cuda]
+
+    _SLOTS = 6
+    _BATCH = 3
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model = _build_model(tp=1)
+        self.mixer = next(
+            layer.mixer
+            for layer in model.decoder.layers
+            if getattr(layer, "mixer", None) is not None
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _caches(self, seed=0):
+        """Non-zero conv/SSM caches, so a dropped carry-in shows up."""
+        torch.manual_seed(seed)
+        conv_shape, ssm_shape = self.mixer.mamba_state_shapes_per_request()
+        dtype = self.mixer.config.params_dtype
+        conv = torch.randn(self._SLOTS, *conv_shape, device="cuda", dtype=dtype)
+        ssm = torch.randn(self._SLOTS, *ssm_shape, device="cuda", dtype=dtype)
+        return conv, ssm
+
+    def _snapshot_buffers(self, seq_len, fill=None):
+        """Per-slot, per-draft-token snapshot buffers, shaped as the context's."""
+        conv_shape, ssm_shape = self.mixer.mamba_state_shapes_per_request()
+        dtype = self.mixer.config.params_dtype
+        make = torch.empty if fill is None else (lambda *a, **kw: torch.full(*a, fill, **kw))
+        return (
+            make((self._SLOTS, seq_len, *conv_shape), device="cuda", dtype=dtype),
+            make((self._SLOTS, seq_len, *ssm_shape), device="cuda", dtype=dtype),
+        )
+
+    def _projected(self, seq_len, seed=0):
+        """A decode step's `in_proj` output: `[batch, seq_len, proj_dim]`."""
+        torch.manual_seed(seed + 1)
+        return torch.randn(
+            self._BATCH,
+            seq_len,
+            self.mixer.in_proj.weight.shape[0],
+            device="cuda",
+            dtype=self.mixer.config.params_dtype,
+        )
+
+    # ------------------------------------------------------------------
+    # Tests
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 4])
+    def test_snapshots_match_truncated_decode_steps(self, num_speculative_tokens):
+        """Snapshot `i` is the state a step that stopped at draft token `i` leaves."""
+        seq_len = 1 + num_speculative_tokens
+        # Slots deliberately out of order: a snapshot written at the batch
+        # position rather than the cache slot fails here.
+        indices = torch.tensor([4, 0, 3], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+        int_conv, int_ssm = self._snapshot_buffers(seq_len)
+
+        self.mixer.ssm_decode(
+            projected,
+            conv_cache.clone(),
+            ssm_cache.clone(),
+            batch_indices=indices,
+            intermediate_conv_state=int_conv,
+            intermediate_ssm_state=int_ssm,
+        )
+
+        slots = indices.long()
+        for accepted in range(seq_len):
+            ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
+            self.mixer.ssm_decode(
+                projected[:, : accepted + 1].contiguous(), ref_conv, ref_ssm, batch_indices=indices
+            )
+            assert torch.equal(int_conv[slots, accepted], ref_conv[slots]), (
+                f"conv snapshot for draft token {accepted} does not match a decode step "
+                "that stopped there"
+            )
+            assert torch.equal(int_ssm[slots, accepted], ref_ssm[slots]), (
+                f"SSM snapshot for draft token {accepted} does not match a decode step "
+                "that stopped there"
+            )
+
+    @torch.inference_mode()
+    def test_snapshots_do_not_change_the_step(self):
+        """The snapshots are a pure side effect: same output, same final caches.
+
+        The engine captures one decode graph and replays it for every step, so
+        the speculative and non-speculative paths must not diverge beyond the
+        extra stores.
+        """
+        seq_len = 3
+        indices = torch.tensor([2, 5, 0], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+
+        projected_before = projected.clone()
+
+        plain_conv, plain_ssm = conv_cache.clone(), ssm_cache.clone()
+        plain_out = self.mixer.ssm_decode(projected, plain_conv, plain_ssm, batch_indices=indices)
+
+        # A decode step without snapshot buffers must not write through them.
+        # Both kernels take the buffers as optional pointers, and substituting a
+        # dummy for a missing one is what broke Mamba2's `selective_state_update`
+        # in 6e5a8c1: the `is not None` heuristic stayed on and the dump
+        # scribbled over the input with all-zero strides.
+        assert torch.equal(projected, projected_before)
+
+        snap_conv, snap_ssm = conv_cache.clone(), ssm_cache.clone()
+        int_conv, int_ssm = self._snapshot_buffers(seq_len)
+        snap_out = self.mixer.ssm_decode(
+            projected,
+            snap_conv,
+            snap_ssm,
+            batch_indices=indices,
+            intermediate_conv_state=int_conv,
+            intermediate_ssm_state=int_ssm,
+        )
+
+        assert torch.equal(plain_out, snap_out)
+        assert torch.equal(plain_conv, snap_conv)
+        assert torch.equal(plain_ssm, snap_ssm)
+        # The last snapshot is where a fully-accepted draft leaves the caches.
+        slots = indices.long()
+        assert torch.equal(int_conv[slots, -1], snap_conv[slots])
+        assert torch.equal(int_ssm[slots, -1], snap_ssm[slots])
+
+    @torch.inference_mode()
+    def test_padding_requests_write_no_snapshot(self):
+        """A `-1` row zeroes its output and touches neither cache nor snapshot.
+
+        Decode batches are padded up to the captured graph's shape, so padding
+        rows run the kernels over whatever the input buffers hold. Nothing they
+        compute may land where a real request can read it.
+        """
+        seq_len = 3
+        indices = torch.tensor([1, -1, 4], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+        before_conv, before_ssm = conv_cache.clone(), ssm_cache.clone()
+        int_conv, int_ssm = self._snapshot_buffers(seq_len, fill=float("nan"))
+        sentinel_conv, sentinel_ssm = int_conv.clone(), int_ssm.clone()
+
+        out = self.mixer.ssm_decode(
+            projected,
+            conv_cache,
+            ssm_cache,
+            batch_indices=indices,
+            intermediate_conv_state=int_conv,
+            intermediate_ssm_state=int_ssm,
+        )
+
+        # `ssm_decode` ends in the gated output norm, so a padding row's zeros
+        # only have to survive the recurrence, not the norm's bias-free scaling.
+        assert torch.count_nonzero(out[1]) == 0
+
+        untouched = [0, 2, 3, 5]
+        torch.testing.assert_close(
+            int_conv[untouched], sentinel_conv[untouched], atol=0, rtol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            int_ssm[untouched], sentinel_ssm[untouched], atol=0, rtol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            conv_cache[untouched], before_conv[untouched], atol=0, rtol=0, equal_nan=True
+        )
+        torch.testing.assert_close(
+            ssm_cache[untouched], before_ssm[untouched], atol=0, rtol=0, equal_nan=True
+        )
+
+    @torch.inference_mode()
+    def test_cuda_graph_capture_and_replay(self):
+        """Capture and replay a speculative decode step, snapshots included.
+
+        Every decode step in the engine is a graph replay, so the snapshot
+        stores have to be capturable: no host synchronization, no
+        data-dependent shapes, and fixed buffer addresses. A replay must
+        reproduce the eager step exactly -- the kernels are the same, and only
+        the launch mechanism differs.
+        """
+        seq_len = 3
+        indices = torch.tensor([3, 0, 5], device="cuda", dtype=torch.int32)
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+
+        eager_conv, eager_ssm = conv_cache.clone(), ssm_cache.clone()
+        # Zero-filled, not `empty`: slots no request names are written by
+        # neither run, so the comparison below only means something if both
+        # sides start from the same value there. It then doubles as a check
+        # that a replay leaves unnamed slots alone.
+        eager_int_conv, eager_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+        eager_out = self.mixer.ssm_decode(
+            projected,
+            eager_conv,
+            eager_ssm,
+            batch_indices=indices,
+            intermediate_conv_state=eager_int_conv,
+            intermediate_ssm_state=eager_int_ssm,
+        )
+
+        # Static buffers: capture records these addresses, so replay must find
+        # its inputs here and will write its outputs here.
+        static_projected = projected.clone()
+        graph_conv, graph_ssm = conv_cache.clone(), ssm_cache.clone()
+        graph_int_conv, graph_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+
+        def step():
+            return self.mixer.ssm_decode(
+                static_projected,
+                graph_conv,
+                graph_ssm,
+                batch_indices=indices,
+                intermediate_conv_state=graph_int_conv,
+                intermediate_ssm_state=graph_int_ssm,
+            )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                graph_conv.copy_(conv_cache)
+                graph_ssm.copy_(ssm_cache)
+                step()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        with torch.cuda.graph(graph):
+            graph_out = step()
+
+        # Reset the caches so the replay -- not the capture-time launch -- is
+        # what produces the values compared below.
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        graph_int_conv.zero_()
+        graph_int_ssm.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(graph_out, eager_out)
+        assert torch.equal(graph_conv, eager_conv)
+        assert torch.equal(graph_ssm, eager_ssm)
+        assert torch.equal(graph_int_conv, eager_int_conv)
+        assert torch.equal(graph_int_ssm, eager_int_ssm)
+
+    @torch.inference_mode()
+    def test_cuda_graph_replay_tolerates_a_smaller_batch(self):
+        """A graph captured at the padded batch shape replays for fewer requests.
+
+        The engine rounds the decode batch up to a captured shape and marks the
+        leftover rows `-1`. Those rows must not perturb the real ones, snapshots
+        included.
+        """
+        seq_len = 2
+        projected = self._projected(seq_len)
+        conv_cache, ssm_cache = self._caches()
+
+        real = 2
+        padded_indices = torch.tensor([2, 5, -1], device="cuda", dtype=torch.int32)
+
+        # Reference: the same real rows, run eagerly without the padding row.
+        ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
+        ref_int_conv, ref_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+        ref_out = self.mixer.ssm_decode(
+            projected[:real].contiguous(),
+            ref_conv,
+            ref_ssm,
+            batch_indices=padded_indices[:real],
+            intermediate_conv_state=ref_int_conv,
+            intermediate_ssm_state=ref_int_ssm,
+        )
+
+        static_projected = projected.clone()
+        graph_conv, graph_ssm = conv_cache.clone(), ssm_cache.clone()
+        graph_int_conv, graph_int_ssm = self._snapshot_buffers(seq_len, fill=0.0)
+
+        def step():
+            return self.mixer.ssm_decode(
+                static_projected,
+                graph_conv,
+                graph_ssm,
+                batch_indices=padded_indices,
+                intermediate_conv_state=graph_int_conv,
+                intermediate_ssm_state=graph_int_ssm,
+            )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                graph_conv.copy_(conv_cache)
+                graph_ssm.copy_(ssm_cache)
+                step()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        with torch.cuda.graph(graph):
+            graph_out = step()
+
+        graph_conv.copy_(conv_cache)
+        graph_ssm.copy_(ssm_cache)
+        graph_int_conv.zero_()
+        graph_int_ssm.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(graph_out[:real], ref_out)
+        assert torch.equal(graph_conv, ref_conv)
+        assert torch.equal(graph_ssm, ref_ssm)
+        assert torch.equal(graph_int_conv, ref_int_conv)
+        assert torch.equal(graph_int_ssm, ref_int_ssm)
+
+
+# ======================================================================
 # End-to-end engine tests.
 #
 # The tests above exercise a single forward pass. These drive the full
@@ -640,9 +1084,8 @@ class TestGDPDynamicInferenceEngine:
         # Bound the loop so a scheduling regression fails loudly instead of hanging.
         for _ in range(1000):
             result = engine.step_modern()
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = merged
+            for request in result["finished_requests"]:
+                finished[request.request_id] = request
             if not engine.has_unfinished_requests():
                 break
         assert not engine.has_unfinished_requests(), "engine did not drain within step budget"
@@ -708,8 +1151,7 @@ class TestGDPDynamicInferenceEngine:
 
         engine.controller.tokenize_prompt = mock_tokenize_prompt
 
-        finished_records = engine.generate(prompts, requests[0].sampling_params)
-        finished = [record.merge() for record in finished_records]
+        finished = engine.generate(prompts, requests[0].sampling_params)
 
         assert len(finished) == len(prompts)
         # generate() returns finished requests in request-id order.
@@ -875,13 +1317,122 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
         torch.testing.assert_close(out_padded[:real], out_real, atol=0, rtol=0, equal_nan=True)
         torch.testing.assert_close(state_padded, state_real, atol=0, rtol=0, equal_nan=True)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("headwise_beta", [True, False])
+    def test_nonfinite_padding_rows_store_positive_zero(self, dtype, headwise_beta):
+        """Padding rows store +0.0 even when their stale inputs are NaN or inf."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE, dtype=dtype)
+        if not headwise_beta:
+            beta = torch.rand_like(v).sigmoid()
+        indices = torch.tensor([7, -1, 3, 10, -1, 5], device="cuda", dtype=torch.int32)
+        q[1] = float("nan")
+        v[4] = float("inf")
+        state_before = state.clone()
+
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            state=state,
+            g=g,
+            beta=beta,
+            state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        real = indices >= 0
+        assert torch.count_nonzero(out[~real].view(torch.uint8)) == 0
+        state_real = state_before.clone()
+        out_real, _ = fused_recurrent_gated_delta_rule_update(
+            q[real],
+            k[real],
+            v[real],
+            state=state_real,
+            g=g[real],
+            beta=beta[real],
+            state_indices=indices[real],
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert torch.equal(out[real].view(torch.uint8), out_real.view(torch.uint8))
+        assert torch.equal(state.view(torch.uint8), state_real.view(torch.uint8))
+
+    def test_padding_follows_slots_across_graph_replays(self):
+        """The padding select reads the slots at replay time, not at capture time."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
+        q[1] = float("nan")
+        v[4] = float("inf")
+        initial_state = state.clone()
+        indices = torch.tensor([7, -1, 3, 10, -1, 5], device="cuda", dtype=torch.int32)
+
+        def step():
+            out, _ = fused_recurrent_gated_delta_rule_update(
+                q,
+                k,
+                v,
+                state=state,
+                g=g,
+                beta=beta,
+                state_indices=indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return out
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            step()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                graph_out = step()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        for slots in ([7, -1, 3, 10, -1, 5], [-1] * 6, [0, 1, 2, 3, 4, 6], [-1, 8, -1, 2, 9, -1]):
+            indices.copy_(torch.tensor(slots, device="cuda", dtype=torch.int32))
+            state.copy_(initial_state)
+            graph.replay()
+            replayed_out, replayed_state = graph_out.clone(), state.clone()
+            state.copy_(initial_state)
+            eager_out = step()
+
+            padded = indices < 0
+            assert torch.count_nonzero(replayed_out[padded].view(torch.uint8)) == 0
+            assert torch.equal(replayed_out.view(torch.uint8), eager_out.view(torch.uint8))
+            assert torch.equal(replayed_state.view(torch.uint8), state.view(torch.uint8))
+
+    def test_slot_indices_reject_varlen(self):
+        q, k, v, g, beta, state = _random_inputs(B=1, T=2, H=1, HV=1, K=16, V=8, num_slots=2)
+        state_before = state.clone()
+        with pytest.raises(AssertionError, match="cu_seqlens"):
+            fused_recurrent_gated_delta_rule_update(
+                q,
+                k,
+                v,
+                state=state,
+                g=g,
+                beta=beta,
+                state_indices=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                cu_seqlens=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+            )
+        # The rejection happens before the launch, so the shared cache is untouched.
+        torch.cuda.synchronize()
+        assert torch.equal(state.view(torch.uint8), state_before.view(torch.uint8))
+
     @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
-    def test_matches_upstream_fla(self):
-        """Fork parity with the pip FLA kernel the training path still uses."""
+    @pytest.mark.parametrize("gate_in_kernel", [False, True])
+    def test_matches_upstream_fla(self, gate_in_kernel):
+        """Fork parity with the pip FLA kernel; the in-kernel gate is GDN's decode form."""
         from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
         q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
         indices = torch.tensor([7, 0, 3, 10, 1, 5], device="cuda", dtype=torch.int32)
+        gate_kwargs = {}
+        if gate_in_kernel:
+            HV = self.SHAPE["HV"]
+            gate_kwargs = dict(
+                A_log=torch.randn(HV, device="cuda"),
+                dt_bias=torch.randn(HV, device="cuda"),
+                use_beta_sigmoid_in_kernel=True,
+            )
 
         state_fork = state.clone()
         out_fork, _ = fused_recurrent_gated_delta_rule_update(
@@ -893,6 +1444,7 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
             beta=beta,
             state_indices=indices,
             use_qk_l2norm_in_kernel=True,
+            **gate_kwargs,
         )
 
         # Upstream needs the initial states gathered in, and returns the final
@@ -906,6 +1458,8 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
             initial_state=state[indices.long()],
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=gate_in_kernel,
+            **gate_kwargs,
         )
         state_fla = state.clone()
         state_fla[indices.long()] = final_state.to(state.dtype)

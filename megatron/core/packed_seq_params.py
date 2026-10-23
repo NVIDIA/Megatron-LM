@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -20,11 +21,9 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
-    # When doing runtime (hybrid/dynamic) context parallelism, these are set
-    # per microbatch by get_batch_on_this_cp_rank. local_cp_size == 1 means CP is off
-    # for this sub-sample and cp_group MUST be None (consumers fall back to
-    # their build-time group); cp_group is only bound when local_cp_size > 1.
-    # TEDotProductAttention asserts both directions of this contract.
+    # Runtime dynamic context parallelism, set per microbatch by the packing scheduler.
+    # When local_cp_size is set, cp_group is the matching runtime group,
+    # including a singleton group when CP is disabled for this microbatch.
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
@@ -72,3 +71,19 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def resolve_cp_group(
+    static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+) -> Optional[dist.ProcessGroup]:
+    """Resolve and validate the context-parallel group for this microbatch."""
+    if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        assert (
+            packed_seq_params.cp_group is not None
+        ), "packed_seq_params.cp_group must be set when local_cp_size is provided"
+        assert packed_seq_params.cp_group.size() == packed_seq_params.local_cp_size, (
+            "packed_seq_params.cp_group size must match local_cp_size: "
+            f"{packed_seq_params.cp_group.size()} != {packed_seq_params.local_cp_size}"
+        )
+        return packed_seq_params.cp_group
+    return static_cp_group

@@ -58,6 +58,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata],
         padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if isinstance(self.inner_layer, TransformerLayer):
             output = self.inner_layer(
@@ -68,6 +69,7 @@ class HyperConnectionHybridLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
+                input_ids=input_ids,
             )
         else:
             # Mamba-like layers only consume the common HybridStack arguments.
@@ -96,6 +98,8 @@ class HyperConnectionHybridLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor] = None,
+        mhc_recompute_manager=None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw branch output for split Hybrid TransformerLayer instances.
 
@@ -126,6 +130,7 @@ class HyperConnectionHybridLayer(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
+                    mhc_recompute_manager=mhc_recompute_manager,
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -138,7 +143,13 @@ class HyperConnectionHybridLayer(MegatronModule):
             inference_context=inference_context,
             padding_mask=padding_mask,
             packed_seq_params=packed_seq_params,
+            input_ids=input_ids,
+            mhc_recompute_manager=mhc_recompute_manager,
         )
+        if layer.recompute_pre_mlp_layernorm or (
+            mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
+        ):
+            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output_with_bias[0])
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]
@@ -157,6 +168,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         padding_mask: Optional[Tensor] = None,
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
         mhc_recompute_manager=None,
+        input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
         aggregated, h_res, h_post, residual = self.hyper_connection(
@@ -170,6 +182,8 @@ class HyperConnectionHybridLayer(MegatronModule):
             sequence_len_offset,
             packed_seq_params,
             padding_mask,
+            input_ids,
+            mhc_recompute_manager,
         )
 
         if fast_path_result is None:
@@ -182,6 +196,7 @@ class HyperConnectionHybridLayer(MegatronModule):
                 packed_seq_params,
                 packed_sequence_cp_metadata,
                 padding_mask,
+                input_ids,
             )
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
                 aggregated = aggregated.to(layer_output.dtype)

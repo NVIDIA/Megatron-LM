@@ -301,7 +301,11 @@ class MegatronOptimizer(ABC):
                 tp_group=getattr(self, 'tp_group', None),
                 expert_tp_group=getattr(self, 'expert_tp_group', None),
             )
-            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
+            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(
+                param,
+                gtp_group=getattr(self, 'gtp_group', None),
+                expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+            )
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
         return grads_for_norm
@@ -464,6 +468,8 @@ class MegatronOptimizer(ABC):
             use_decoupled_grad=self._uses_decoupled_grad(params),
             tp_group=getattr(self, 'tp_group', None),
             expert_tp_group=getattr(self, 'expert_tp_group', None),
+            gtp_group=getattr(self, 'gtp_group', None),
+            expert_gtp_group=getattr(self, 'expert_gtp_group', None),
         )
 
     @abstractmethod
@@ -1901,6 +1907,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 ),
                 tp_group=getattr(self.chained_optimizers[0], 'tp_group', None),
                 expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
+                gtp_group=getattr(self.chained_optimizers[0], 'gtp_group', None),
+                expert_gtp_group=getattr(self.chained_optimizers[0], 'expert_gtp_group', None),
             )
         else:
             num_zeros_in_grad = 0
@@ -2105,16 +2113,22 @@ class ChainedOptimizer(MegatronOptimizer):
         so we need to align the step across param groups before saving and after loading.
         """
 
+        # Go through the ``param_groups`` property rather than ``.optimizer``: a
+        # chained member can itself be a ChainedOptimizer. LayerWiseDistributedOptimizer
+        # subclasses one and holds more than one inner optimizer whenever the model
+        # mixes optimizers, muon plus AdamW for instance, and ``.optimizer`` asserts on
+        # those. The property aggregates the same param_group dicts, so the writes below
+        # still land on the real groups.
         steps = []
         for optimizer in self.chained_optimizers:
-            for param_group in optimizer.optimizer.param_groups:
+            for param_group in optimizer.param_groups:
                 if len(param_group['params']) > 0 and 'step' in param_group:
                     steps.append(param_group['step'])
         steps = list(set(steps))
         assert len(steps) <= 1, f"steps: {steps}"
         step = steps[0] if len(steps) == 1 else None
         for optimizer in self.chained_optimizers:
-            for param_group in optimizer.optimizer.param_groups:
+            for param_group in optimizer.param_groups:
                 if len(param_group['params']) > 0 and 'step' in param_group:
                     param_group['step'] = step
 

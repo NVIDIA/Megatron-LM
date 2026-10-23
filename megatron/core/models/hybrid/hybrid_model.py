@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
@@ -37,6 +38,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
+    get_pg_rank,
     is_using_quantization_scales,
     log_single_rank,
 )
@@ -54,6 +56,50 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
     if tp_group is None:
         return {}
     return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+
+
+def _get_hash_moe_layer_threshold(main_pattern: str | None, n_hash_layers: int) -> int:
+    """Convert a leading hash-MoE count to a global hybrid layer-number threshold."""
+    if n_hash_layers <= 0:
+        return 0
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    global_layer_pattern = (main_pattern or '').replace(Symbols.PIPE, '')
+    moe_layer_numbers = [
+        layer_number
+        for layer_number, layer_type in enumerate(global_layer_pattern, start=1)
+        if layer_type == Symbols.MOE
+    ]
+    if n_hash_layers > len(moe_layer_numbers):
+        raise ValueError(
+            f"moe_num_hash_layers={n_hash_layers} exceeds the {len(moe_layer_numbers)} "
+            "MoE layers in the main hybrid layer pattern."
+        )
+    return moe_layer_numbers[n_hash_layers - 1]
+
+
+def _validate_hash_moe_pipeline_placement(
+    layer_type_list: list[str], layer_offset: int, hash_moe_layer_threshold: int, pre_process: bool
+) -> None:
+    """Reject local hash-MoE layers on a stage that does not own the token IDs."""
+    if hash_moe_layer_threshold <= 0 or pre_process:
+        return
+
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    local_hash_layer_numbers = [
+        layer_offset + local_layer_number
+        for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
+        if layer_type == Symbols.MOE
+        and layer_offset + local_layer_number <= hash_moe_layer_threshold
+    ]
+    if local_hash_layer_numbers:
+        raise ValueError(
+            "Currently, all hash MoE layers must be in the same pipeline/virtual-pipeline "
+            "stage as the embedding because only that stage owns input_ids. This "
+            f"non-embedding stage contains hash MoE layer(s) {local_hash_layer_numbers}."
+        )
 
 
 class HybridModel(LanguageModule, GraphableMegatronModule):
@@ -199,6 +245,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Parse unified pattern to extract main and MTP components.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            get_layer_type_list_from_layer_config_list,
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
@@ -206,10 +253,48 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+        hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
+            parsed.main_pattern, self.config.moe_num_hash_layers
+        )
+
+        if self.mtp_num_depths > 0:
+            if self.config.mtp_num_layers is None:
+                self.config.mtp_num_layers = self.mtp_num_depths
+            elif self.config.mtp_num_layers != self.mtp_num_depths:
+                raise ValueError(
+                    f"hybrid_layer_pattern defines {self.mtp_num_depths} MTP depths, "
+                    f"but mtp_num_layers is {self.config.mtp_num_layers}"
+                )
+        if (
+            self.config.mtp_num_layers
+            and self.mtp_num_depths == 0
+            and self.config.mtp_hybrid_override_pattern is None
+        ):
+            raise ValueError(
+                "HybridModel has mtp_num_layers set but no MTP template. "
+                "Use hybrid_layer_pattern with '/' separators (e.g., 'M*M*/MM/MM')."
+            )
+
+        # Validate the full architecture, including MTP heads on other pipeline stages.
         if self.mtp_pattern is not None and self.config.overlap_moe_expert_parallel_comm:
             raise ValueError(
                 "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
                 "overlap scheduler does not expand the nested HybridStack."
+            )
+        if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
+            raise ValueError(
+                "freeze_base_model_for_mtp requires the HybridModel architecture "
+                "to define at least one MTP head"
+            )
+        if self.mtp_num_depths > 0 and self.position_embedding_type not in ('rope', 'none'):
+            raise ValueError(
+                "Multi-Token Prediction (MTP) is not supported with "
+                f"{self.position_embedding_type} position embedding type. "
+                "The supported position embedding types are rope and none."
+            )
+        if self.config.mtp_hsm and self.mtp_num_depths < 2:
+            raise ValueError(
+                "mtp_hsm=True requires at least two MTP heads in the HybridModel architecture."
             )
 
         # Determine if MTP is needed (based on pattern parsing)
@@ -230,6 +315,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
         )
 
+        if self.config.enable_mhc_connections and self.mtp_process and not self.post_process:
+            raise ValueError(
+                "mHC Hybrid MTP must run on the final post_process pipeline chunk. "
+                "Standalone MTP stages do not preserve the multi-stream decoder contract."
+            )
+
         # Validate TP communication overlap after determining whether this rank builds MTP,
         # before constructing the decoder or MTP modules.
         layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
@@ -244,6 +335,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
             **logging_pg_kwargs,
+        )
+        _validate_hash_moe_pipeline_placement(
+            get_layer_type_list_from_layer_config_list(layer_config_list),
+            layer_offset,
+            hash_moe_layer_threshold,
+            self.pre_process,
         )
 
         # megatron core pipelining currently depends on model type
@@ -301,17 +398,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
+            hash_moe_layer_threshold=hash_moe_layer_threshold or None,
             name="decoder",
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
         if self.mtp_process:
-            hybrid_submodules = hybrid_stack_spec.submodules
-            mtp_block_spec = hybrid_submodules.mtp_block_spec
+            decoder_submodules = hybrid_stack_spec.submodules
+            mtp_block_spec = decoder_submodules.mtp_block_spec
             assert mtp_block_spec is not None, (
                 "MTP pattern specified but mtp_block_spec is None in hybrid_stack_spec.submodules. "
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
+            if decoder_submodules.mtp_stack_submodules is not None:
+                # Wide decoder specs provide separate ordinary-width layer recipes for MTP.
+                mtp_stack_submodules = decoder_submodules.mtp_stack_submodules
+            else:
+                # Ordinary decoder specs can reuse their own layer recipes for MTP.
+                mtp_stack_submodules = decoder_submodules
 
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
@@ -320,7 +424,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 vp_stage=self.vp_stage,
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
-                hybrid_submodules=hybrid_submodules,
+                hybrid_submodules=mtp_stack_submodules,
+                hash_moe_layer_threshold=hash_moe_layer_threshold or None,
                 name="mtp",
             )
             self._setup_mtp_cuda_graphs()
@@ -482,21 +587,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
+        use_precomputed_mtp_embeddings = decoder_input is not None
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-
-            # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
-            if (
-                in_inference_mode
-                and inference_context is not None
-                and inference_context.is_dynamic_batching()
-                and is_using_quantization_scales(self.config)
-            ):
-                decoder_input[inference_context.padding_slice] = 0.0
 
             if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
                 # The embedding skips SP scatter for models whose outer wrapper scatters instead
@@ -504,10 +601,64 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
                     decoder_input, group=self.pg_collection.tp
                 )
+
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations. Under sequence
+            # parallelism, decoder_input holds this rank's shard of the tokens.
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
+            ):
+                inference_context.zero_padding_tokens(
+                    decoder_input,
+                    sequence_parallel_rank=(
+                        get_pg_rank(self.pg_collection.tp) if self.config.sequence_parallel else 0
+                    ),
+                )
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
+
+        # Hash routing consumes batch-major token IDs. Under sequence parallelism,
+        # shard them with decoder activations so each TP rank hashes its local tokens.
+        hash_input_ids = None
+        if self.config.moe_num_hash_layers > 0:
+            hash_input_ids = input_ids
+        if (
+            self.config.sequence_parallel
+            and decoder_input is not None
+            and hash_input_ids is not None
+            and hash_input_ids.shape[1] != decoder_input.shape[0]
+        ):
+            hash_input_ids = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    hash_input_ids.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
+        # TODO: Apply the same later-stage SP mask alignment in GPTModel.
+        # Later pipeline stages receive activations through set_input_tensor.
+        decoder_reference = decoder_input
+        if padding_mask is not None and self.config.sequence_parallel and decoder_reference is None:
+            decoder_reference = self.decoder.input_tensor
+        if (
+            padding_mask is not None
+            and self.config.sequence_parallel
+            and decoder_reference is not None
+            and padding_mask.shape[1] != decoder_reference.shape[0]
+        ):
+            padding_mask = (
+                tensor_parallel.scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
@@ -565,6 +716,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask=padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                input_ids=hash_input_ids,
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
@@ -596,14 +748,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,
                 mtp_input_mask=mtp_input_mask,
                 packed_seq_params=packed_seq_params,
                 cp_batch=cp_batch,
+                padding_mask=padding_mask,
             )
-            assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None
+            if mtp_inputs.decoder_input is None:
+                assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None, (
+                    "MTP requires both input_ids and position_ids when precomputed "
+                    "decoder_input embeddings are not provided."
+                )
             mtp_hidden_states = self.mtp(
                 input_ids=mtp_inputs.input_ids,
                 position_ids=mtp_inputs.position_ids,
@@ -614,7 +772,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=mtp_inputs.packed_seq_params,
                 embedding=self.embedding,
+                decoder_input=mtp_inputs.decoder_input,
                 mtp_input_mask=mtp_inputs.mtp_input_mask,
+                padding_mask=mtp_inputs.padding_mask,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
             )
@@ -648,7 +808,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     loss_mask=mtp_inputs.loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
@@ -692,6 +851,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
         logits = self._scale_logits(logits)
+        gather_output = (
+            self.output_layer.gather_output
+            if runtime_gather_output is None
+            else runtime_gather_output
+        )
+        observe_tensor(
+            self.output_layer,
+            "output_logits",
+            "output_logits",
+            logits,
+            tp_shard_dim=None if gather_output else -1,
+            sequence_dim=0,
+            batch_dim=1,
+        )
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

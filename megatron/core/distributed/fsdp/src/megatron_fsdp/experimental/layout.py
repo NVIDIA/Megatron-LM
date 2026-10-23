@@ -14,171 +14,64 @@
 
 """Global tensor layout metadata for DBuffer."""
 
+import bisect
 import dataclasses
+import itertools
 import math
 from collections.abc import Iterable
 from typing import TypeAlias
 
 import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from .placement import Flat
+from .range import Range
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 
 
 @dataclasses.dataclass(frozen=True)
 class GlobalLayout:
-    """Global tensor layout in element coordinates."""
+    """Global tensor layout in element coordinates.
+
+    Use :mod:`.layout_builder` to construct layouts for specific placements.
+
+    Attributes:
+        tensor_shapes: Logical tensor shapes in tensor-id order.
+        tensor_to_offset: Global element offset of each logical tensor's first element.
+        size: Total number of global elements, including any padding or gaps.
+        rank_to_offset: Global element offset of each rank segment's first element
+            (``dp_size`` entries). Segment ``k`` spans ``rank_to_offset[k]`` up to the
+            next entry, or ``size`` for the last segment; see ``rank_size``. On a 1-D
+            mesh ``k`` is the rank; on a multi-axis mesh ``get_rank_range`` maps the ranks
+            of the Shard axes to ``k``. Segment sizes are equal (``size // dp_size``) for
+            ``RowAtomic`` / ``BlockAtomic``; generally uneven for ``TensorAtomic``.
+    """
 
     tensor_shapes: tuple[torch.Size, ...]
     tensor_to_offset: tuple[int, ...]
     size: int
+    rank_to_offset: tuple[int, ...]
 
-    @classmethod
-    def build(cls, shapes: Iterable[Shape], dp_size: int) -> "GlobalLayout":
-        """Compute global tensor element offsets and padded size.
-
-        This is a DBuffer-specific reimplementation of
-        ``param_and_grad_buffer.build_data_parallel_buffer_index``. It keeps only
-        the global offset construction and final padding so each rank-local shard
-        size is a multiple of ``chunk_size``; DBuffer derives rank-local slices
-        later through DTensor placements.
-
-        The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
-        even though the latter two are not implemented.
-
-        ``chunk_size`` is the least common multiple of each tensor's row size
-        (``shape[1:].numel()``). For example, with shapes P0=(2, 6), P1=(4, 4),
-        P2=(4, 4), P3=(1, 2), P4=(1, 6), ``chunk_size = LCM(6, 4, 4, 2, 6) = 12``
-        and a 5-rank DP layout has equal-size rank shards:
-
-        ```
-        rank 0 [ 0, 12): | P0 row 0              | P0 row 1               |
-        rank 1 [12, 24): | P1 row 0      | P1 row 1      | P1 row 2       |
-        rank 2 [24, 36): | P1 row 3      | P3    | gap   | P2 row 0       |
-        rank 3 [36, 48): | P2 row 1      | P2 row 2      | P2 row 3       |
-        rank 4 [48, 60): | P4                    | pad                    |
-        ```
-
-        The diagram uses four character columns per element; segment widths are
-        proportional. Every chunk boundary is aligned to each tensor's row size,
-        so each DP shard owns full rows even when fragments fill regular-tensor
-        padding gaps.
-
-        Args:
-            shapes: Logical tensor shapes in tensor-id order.
-            dp_size: Data-parallel shard count for this global layout.
-
-        Returns:
-            Global layout with row-aligned tensor offsets and a total size padded
-            to a multiple of ``chunk_size * dp_size``, so every rank-local shard
-            length is a multiple of ``chunk_size``.
-        """
-        if dp_size <= 0:
-            raise ValueError(f"DP size must be positive, got {dp_size}.")
-
-        tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
-        chunk_size = 1
-        for shape in tensor_shapes:
-            row_size = non_leading_numel(shape)
-            if row_size <= 0:
-                raise ValueError(
-                    f"Cannot compute a layout for zero-sized non-leading dims: {shape}."
-                )
-            chunk_size = math.lcm(chunk_size, row_size)
-
-        # chunk_size is the packing granularity. Since every tensor row size divides it,
-        # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
-        UNASSIGNED_OFFSET = -1
-        tensor_to_offset: list[int] = [UNASSIGNED_OFFSET] * len(tensor_shapes)
-        fragment_items = []
-        regular_items = []
-        for tensor_id, shape in enumerate(tensor_shapes):
-            if shape.numel() < chunk_size:
-                fragment_items.append((tensor_id, shape))
-            else:
-                regular_items.append((tensor_id, shape))
-
-        # Regular tensors anchor the layout. Fragments are held back to fill padding
-        # gaps left by regular tensors whose sizes are not exact multiples of chunk_size.
-        fragment_items.sort(key=lambda id_shape: id_shape[1].numel(), reverse=True)
-
-        next_offset = 0
-        while regular_items:
-            tensor_id, shape = regular_items.pop(0)
-            tensor_numel = shape.numel()
-            tensor_to_offset[tensor_id] = next_offset
-
-            if tensor_numel % chunk_size == 0:
-                next_offset += tensor_numel
-                continue
-
-            gap_offset = next_offset + tensor_numel
-            next_offset += _pad_to_multiple(tensor_numel, chunk_size)
-            fragment_gap_end = next_offset
-            remainder = tensor_numel % chunk_size
-
-            # Try to pair this non-divisible regular tensor with a conjugate regular
-            # tensor whose remainder fits in the same chunk_size interval. The
-            # conjugate starts in the gap and then continues with full chunk_size
-            # intervals after this one.
-            conjugate_item = None
-            for candidate_item in regular_items[:]:
-                _, candidate_shape = candidate_item
-                candidate_numel = candidate_shape.numel()
-                candidate_remainder = candidate_numel % chunk_size
-                if candidate_remainder == 0:
-                    continue
-                if remainder + candidate_remainder <= chunk_size:
-                    conjugate_item = candidate_item
-                    regular_items.remove(candidate_item)
-                    break
-
-            if conjugate_item is not None:
-                conjugate_id, conjugate_shape = conjugate_item
-                conjugate_numel = conjugate_shape.numel()
-                conjugate_remainder = conjugate_numel % chunk_size
-                conjugate_offset = next_offset - conjugate_remainder
-                tensor_to_offset[conjugate_id] = conjugate_offset
-                fragment_gap_end = conjugate_offset
-                next_offset += (conjugate_numel // chunk_size) * chunk_size
-
-            # Fill any remaining gap with fragments, keeping each fragment aligned to
-            # its own row size so dim-0 rows remain contiguous within DP shards.
-            for fragment in fragment_items[:]:
-                frag_id, frag_shape = fragment
-                frag_numel = frag_shape.numel()
-                aligned_gap_offset = _pad_to_multiple(gap_offset, non_leading_numel(frag_shape))
-                if aligned_gap_offset + frag_numel > fragment_gap_end:
-                    continue
-                tensor_to_offset[frag_id] = aligned_gap_offset
-                gap_offset = aligned_gap_offset + frag_numel
-                fragment_items.remove(fragment)
-
-        # Fragments that did not fit into regular-tensor gaps are appended at the tail.
-        for frag_id, frag_shape in fragment_items:
-            next_offset = _pad_to_multiple(next_offset, non_leading_numel(frag_shape))
-            tensor_to_offset[frag_id] = next_offset
-            next_offset += frag_shape.numel()
-
-        return cls(
-            tensor_shapes=tensor_shapes,
-            tensor_to_offset=tuple(tensor_to_offset),
-            size=_pad_to_multiple(next_offset, chunk_size * dp_size),
+    def __init__(
+        self,
+        tensor_shapes: Iterable[Shape],
+        tensor_to_offset: Iterable[int],
+        size: int,
+        rank_to_offset: Iterable[int],
+    ) -> None:
+        """Normalize iterable inputs to immutable tuples and validate the layout."""
+        object.__setattr__(
+            self, "tensor_shapes", tuple(torch.Size(shape) for shape in tensor_shapes)
         )
+        object.__setattr__(self, "tensor_to_offset", tuple(tensor_to_offset))
+        object.__setattr__(self, "size", size)
+        object.__setattr__(self, "rank_to_offset", tuple(rank_to_offset))
+        self.__post_init__()
 
     def __post_init__(self) -> None:
-        """Validate tensor offsets are row-aligned, in bounds, and non-overlapping."""
-
-        @dataclasses.dataclass(frozen=True)
-        class TensorRange:
-            """Contiguous global element range occupied by one logical tensor."""
-
-            start: int
-            end: int
-            tensor_id: int
+        """Validate offsets are in bounds and tensor ranges do not overlap."""
 
         if self.size < 0:
             raise AssertionError(f"Global layout size {self.size} is negative.")
@@ -187,58 +80,140 @@ class GlobalLayout:
                 "Global layout has mismatched tensor shapes and offsets: "
                 f"{len(self.tensor_shapes)} shapes and {len(self.tensor_to_offset)} offsets."
             )
+        offsets = self.rank_to_offset
+        if not offsets:
+            raise AssertionError("rank_to_offset needs at least one entry.")
+        if offsets[0] != 0 or offsets[-1] > self.size:
+            raise AssertionError(f"rank_to_offset must lie within [0, {self.size}], got {offsets}.")
+        if any(a > b for a, b in zip(offsets, offsets[1:])):
+            raise AssertionError(f"rank_to_offset must be non-decreasing, got {offsets}.")
 
-        tensor_ranges: list[TensorRange] = []
+        tensor_ranges = [
+            self.get_tensor_range(tensor_id) for tensor_id in range(len(self.tensor_shapes))
+        ]
+        for tensor_id, tensor_range in enumerate(tensor_ranges):
+            if tensor_range.start < 0:
+                raise AssertionError(f"Tensor {tensor_id} offset {tensor_range.start} is negative.")
+            if tensor_range.end > self.size:
+                raise AssertionError(
+                    f"Tensor {tensor_id} range [{tensor_range.start}, {tensor_range.end}) exceeds "
+                    f"layout size {self.size}."
+                )
+
+        ordered_ranges = sorted(enumerate(tensor_ranges), key=lambda item: item[1].start)
+        for (previous_id, previous_range), (current_id, current_range) in itertools.pairwise(
+            ordered_ranges
+        ):
+            if current_range.start < previous_range.end:
+                raise AssertionError(
+                    "Global layout tensors overlap: "
+                    f"tensor {previous_id} "
+                    f"[{previous_range.start}, {previous_range.end}) and "
+                    f"tensor {current_id} "
+                    f"[{current_range.start}, {current_range.end})."
+                )
+
+    def validate_for_row_atomic(self, *, block_size: int = 1) -> None:
+        """Check equal-size shards and row/block alignment from the actual offsets."""
+        if block_size <= 0:
+            raise ValueError(f"Block size must be positive, got {block_size}.")
+        if not self.has_equal_shard_sizes:
+            raise ValueError(
+                "Unequal rank segment sizes are incompatible with RowAtomic/BlockAtomic."
+            )
+        chunk_size = 1
         for tensor_id, (shape, start) in enumerate(
             zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
         ):
-            if start < 0:
-                raise AssertionError(f"Tensor {tensor_id} offset {start} is negative.")
-
             row_size = non_leading_numel(shape)
-            if row_size <= 0:
-                raise AssertionError(f"Tensor {tensor_id} has invalid row size {row_size}.")
-            if start % row_size != 0:
-                raise AssertionError(
-                    f"Tensor {tensor_id} offset {start} is not aligned to row size {row_size}."
-                )
-
-            end = start + shape.numel()
-            if end > self.size:
-                raise AssertionError(
-                    f"Tensor {tensor_id} range [{start}, {end}) exceeds "
-                    f"layout size {self.size}."
-                )
-            tensor_ranges.append(TensorRange(start, end, tensor_id))
-
-        previous_range: TensorRange | None = None
-        for current_range in sorted(tensor_ranges, key=lambda tensor_range: tensor_range.start):
-            if previous_range is not None and current_range.start < previous_range.end:
-                raise AssertionError(
-                    "Global layout tensors overlap: "
-                    f"tensor {previous_range.tensor_id} "
-                    f"[{previous_range.start}, {previous_range.end}) and "
-                    f"tensor {current_range.tensor_id} "
-                    f"[{current_range.start}, {current_range.end})."
-                )
-            previous_range = current_range
-
-    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
-        """Return this rank's local element offset and length for ``placements``."""
-        offset = 0
-        numel = self.size
-        for axis, placement in reversed(tuple(enumerate(placements))):
-            if not isinstance(placement, Flat):
-                continue
-            axis_size = mesh.size(axis)
-            if numel % axis_size != 0:
+            if row_size <= 0 or shape[0] % block_size != 0:
                 raise ValueError(
-                    f"Local range size {numel} is not divisible by Flat axis size {axis_size}."
+                    f"Tensor {tensor_id} shape {shape} is incompatible with block size "
+                    f"{block_size}."
                 )
-            shard_size = numel // axis_size
-            offset += mesh.get_local_rank(axis) * shard_size
-            numel = shard_size
-        return offset, numel
+            alignment = block_size * row_size
+            if start % alignment != 0:
+                raise ValueError(
+                    f"Tensor {tensor_id} offset {start} is incompatible with alignment {alignment}."
+                )
+            chunk_size = math.lcm(chunk_size, alignment)
+        if any(offset % chunk_size for offset in self.rank_to_offset):
+            raise ValueError(
+                f"Rank offsets {self.rank_to_offset} are incompatible with alignment {chunk_size}."
+            )
+
+    def validate_for_tensor_atomic(self) -> None:
+        """Check every nonempty tensor is contained in a single rank segment."""
+        for tensor_id, (shape, start) in enumerate(
+            zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
+        ):
+            if shape.numel() == 0:
+                continue
+            end = start + shape.numel()
+            # (The last rank whose offset <= start) == (the first rank whose offset > start) - 1
+            rank = bisect.bisect_right(self.rank_to_offset, start) - 1
+            if end > self.rank_to_offset[rank] + self.rank_size(rank):
+                raise ValueError(
+                    f"Tensor {tensor_id} [{start}, {end}) crosses a rank segment boundary "
+                    "and is incompatible with TensorAtomic."
+                )
+
+    @property
+    def dp_size(self) -> int:
+        """Number of segments (data-parallel shards) this layout was planned for."""
+        return len(self.rank_to_offset)
+
+    def rank_size(self, rank: int) -> int:
+        """Number of elements in segment ``rank``."""
+        end = self.rank_to_offset[rank + 1] if rank + 1 < self.dp_size else self.size
+        return end - self.rank_to_offset[rank]
+
+    @property
+    def has_equal_shard_sizes(self) -> bool:
+        """Whether every rank's segment has the same numel."""
+        return len({self.rank_size(rank) for rank in range(self.dp_size)}) == 1
+
+    def get_rank_range(self, mesh: DeviceMesh, placements: Iterable[Placement], rank: int) -> Range:
+        """Return the global buffer element range for a global process rank.
+
+        Args:
+            mesh: The device mesh defining the distribution.
+            placements: Per-mesh-axis placements.
+            rank: Global process rank belonging to ``mesh``.
+        """
+        coordinates = (mesh.mesh == rank).nonzero(as_tuple=False)
+        if coordinates.size(0) == 0:
+            raise ValueError(f"Global rank {rank} is not in the device mesh.")
+        coordinate = coordinates[0].tolist()
+        placements = tuple(placements)
+        # Innermost Shard axis is the most significant digit of the shard index.
+        shard_index = 0
+        num_shards = 1
+        shard_axes: list[int] = []
+        for axis in reversed(range(len(placements))):
+            if not isinstance(placements[axis], Shard):
+                continue
+            shard_axes.append(axis)
+            shard_index = shard_index * mesh.size(axis) + coordinate[axis]
+            num_shards *= mesh.size(axis)
+        if self.dp_size % num_shards != 0:
+            raise ValueError(
+                f"Layout was built for {self.dp_size} shards, which cannot be split evenly "
+                f"over {num_shards} shard ranks on mesh axes {sorted(shard_axes)}."
+            )
+        segments_per_rank = self.dp_size // num_shards
+        first = shard_index * segments_per_rank
+        last = first + segments_per_rank - 1
+        start = self.rank_to_offset[first]
+        return Range(start, self.rank_to_offset[last] + self.rank_size(last) - start)
+
+    def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> Range:
+        """Return this rank's element range in the global buffer for ``placements``."""
+        return self.get_rank_range(mesh, placements, mesh.get_rank())
+
+    def get_tensor_range(self, tensor_index: int) -> Range:
+        """Return the full tensor's element range in the global buffer."""
+        return Range(self.tensor_to_offset[tensor_index], self.tensor_shapes[tensor_index].numel())
 
 
 def non_leading_numel(shape: torch.Size) -> int:
@@ -246,7 +221,3 @@ def non_leading_numel(shape: torch.Size) -> int:
     if len(shape) == 0:
         raise ValueError(f"DBuffer layout does not support 0D tensor shapes: {shape}.")
     return shape[1:].numel()
-
-
-def _pad_to_multiple(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
