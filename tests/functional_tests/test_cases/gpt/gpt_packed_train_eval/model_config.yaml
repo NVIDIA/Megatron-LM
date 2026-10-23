@@ -43,4 +43,6 @@ MODEL_ARGS:
   --distributed-backend: nccl
   --ckpt-format: torch_dist
   --bf16: true
+# run_test.py checks its own invariants; there are no golden values to compare.
+METRICS: []
 TEST_TYPE: regular
