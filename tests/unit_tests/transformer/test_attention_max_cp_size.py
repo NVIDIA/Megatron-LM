@@ -205,6 +205,8 @@ def check_attention_constructor(monkeypatch):
         self.kv_projection_size = config.num_query_groups * config.kv_channels
 
     monkeypatch.setattr(attention.Attention, "__init__", initialize_metadata)
+    monkeypatch.setattr(attention, "get_pg_size", lambda group: group.size())
+    monkeypatch.setattr(multi_latent_attention, "get_pg_size", lambda group: group.size())
     monkeypatch.setattr(
         multi_latent_attention.MultiLatentAttention, "__init__", initialize_metadata
     )
