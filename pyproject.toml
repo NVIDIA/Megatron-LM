@@ -6,6 +6,24 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
+# Ship megatron.rl's shared-prefix packing modules (torch and the standard
+# library only), the lazy package __init__, and generation_api, which backs the
+# lazy megatron.rl.Request exports and needs pydantic (not a declared dependency).
+# The RL runtime (rl_utils, agent, inference, server) needs undeclared
+# dependencies and stays out of built wheels. An editable install maps the whole
+# megatron/rl directory, so megatron.training imports the RL runtime only for RL
+# runs.
+py-modules = [
+    "megatron.rl.generation_api",
+    "megatron.rl.shared_prefix_alignment",
+    "megatron.rl.shared_prefix_cost",
+    "megatron.rl.shared_prefix_dense_bins",
+    "megatron.rl.shared_prefix_execution",
+    "megatron.rl.shared_prefix_metadata",
+    "megatron.rl.shared_prefix_packing",
+    "megatron.rl.shared_prefix_tensors",
+    "megatron.rl.tree_layout",
+]
 
 [tool.setuptools.packages.find]
 include = [
@@ -14,6 +32,9 @@ include = [
     "megatron.training",
     "megatron.training.*",
 ]
+
+[tool.setuptools.package-data]
+"megatron.core.allocator" = ["csrc/*.cpp"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
@@ -104,7 +125,7 @@ dev = [
     "av",
     "Pillow",
     "flashinfer-python>=0.5.0,<0.7.0",
-    "nvidia-cudnn-frontend[cutedsl]==1.29.0",
+    "nvidia-cudnn-frontend[cutedsl]==1.29.1",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0

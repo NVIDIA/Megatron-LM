@@ -285,6 +285,7 @@ jobs:
               docker/patches/deepep.patch
               megatron/core/__init__.py
               megatron/core/package_info.py
+              megatron/rl/__init__.py
               pyproject.toml
               uv.lock
             )
@@ -300,6 +301,7 @@ jobs:
               docker/patches/deepep-nvshmem.patch
               megatron/core/__init__.py
               megatron/core/package_info.py
+              megatron/rl/__init__.py
               pyproject.toml
               uv.lock
             )

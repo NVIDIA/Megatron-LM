@@ -5,18 +5,18 @@ repos:
   rev: 'refs/tags/26.3.0:refs/tags/26.3.0'
   hooks:
   - id: black
-    files: ^megatron/core/.*|^tests/unit_tests/.*
+    files: ^megatron/core/.*|^megatron/rl/(shared_prefix_\w+|tree_layout)\.py$|^tests/unit_tests/.*
     args: ["--skip-magic-trailing-comma", "--skip-string-normalization"]
 - repo: https://github.com/pycqa/pylint
   rev: v3.2.6
   hooks:
   - id: pylint
-    files: ^megatron/core/.*
+    files: ^megatron/core/.*|^megatron/rl/(shared_prefix_\w+|tree_layout)\.py$
 - repo: https://github.com/pycqa/isort
   rev: 5.13.2
   hooks:
   - id: isort
-    files: ^megatron/core/.*
+    files: ^megatron/core/.*|^megatron/rl/(shared_prefix_\w+|tree_layout)\.py$
 - repo: local
   hooks:
   - id: check-dco
