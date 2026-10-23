@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer, vocab_size_with_padding
 from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.utils import print_rank_0
 
 
 def calculate_padded_vocab_size(
@@ -61,8 +62,6 @@ def _calculate_padded_vocab_size_cached(
 
 
 def build_tokenizer_and_pad_vocab_size(config: TokenizerConfig, make_vocab_size_divisible_by: int | None = None, tensor_model_parallel_size: int = 1):
-    from megatron.training.utils import print_rank_0
-
     tokenizer = build_tokenizer(config)
     
     if config.pad_vocab_size:
