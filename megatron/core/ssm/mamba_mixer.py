@@ -991,10 +991,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         # the caller. When enabled, the chunk scan returns its raw states so
         # our Triton kernels do a fused gather+conditional-scatter directly,
         # skipping the dense intermediate tensor and the padded-slot writes.
+        # Batch-invariant mode also caches these complete-chunk FP32 states.
+        # Restoring one does not require the partial-tail decode replay buffers:
+        # the suffix prefill seeds those buffers at the same aligned boundary.
         extract_intermediates = (
-            not self.config.batch_invariant_mode
-            and intermediate_chunk_indices is not None
-            and intermediate_ssm_out is not None
+            intermediate_chunk_indices is not None and intermediate_ssm_out is not None
         )
         ssm_varlen_result = mamba_chunk_scan_combined_varlen(
             x=x,

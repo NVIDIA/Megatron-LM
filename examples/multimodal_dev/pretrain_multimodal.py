@@ -33,12 +33,9 @@ from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step, seqlen_alignment_factor
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
-from megatron.training.argument_utils import (
-    pretrain_cfg_container_from_args,
-    resolve_tokenizer_vocab_size,
-)
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import set_run_config
 from megatron.training.training import validate_vision_flops_metadata
 from megatron.training.utils import start_memory_history_recording
 
@@ -188,8 +185,6 @@ if __name__ == "__main__":
             )
     full_config = pretrain_cfg_container_from_args(args)
     set_run_config(full_config)
-    initialize_runtime_services(args, training=True)
-    resolve_tokenizer_vocab_size(full_config, args.padded_vocab_size)
     # training.py enables allocator history only on the config-container MODEL
     # flow; this entry uses model_provider, so it enables recording itself, and
     # must stay ahead of pretrain(), which constructs the model.

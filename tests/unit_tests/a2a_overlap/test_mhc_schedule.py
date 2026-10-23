@@ -120,6 +120,8 @@ class _RecordingChunk:
         self.tensor_release = None
         # Read by run() only on the post_process path, which this chunk does not take.
         self.recompute_full = False
+        # Match TransformerModelChunkSchedulePlan's model state read by run().
+        self._model_chunk_state = SimpleNamespace(model=None)
 
     def record_current_stream(self):
         self.calls.append("chunk.record_current_stream")

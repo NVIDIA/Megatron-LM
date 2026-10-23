@@ -38,7 +38,7 @@ from examples.mimo_bagel.runtime_state import (
 from examples.mimo_bagel.utils.data_helpers import bagel_packed_batch_to_mimo_batch
 from examples.mimo_bagel.utils.model_helpers import get_pg_collection
 from megatron.core.enums import ModelType
-from megatron.training import get_args, pretrain
+from megatron.training import get_args, get_train_state, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 
@@ -348,7 +348,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection):
 
                 import numpy as _np
 
-                _global_step = getattr(args, 'curr_iteration', 0) or 0
+                _global_step = get_train_state().iteration
                 _data_seed = (
                     getattr(args, 'seed', 1234)
                     + 7919 * _global_step
@@ -580,7 +580,7 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
             mse_mean = mse_sum_global / max(mse_den_global, 1.0)
             print(
                 '[BAGEL_LOSS_ALIGNMENT_AUDIT] '
-                f'iteration={getattr(args, "iteration", 0) + 1} '
+                f'iteration={get_train_state().iteration + 1} '
                 f'ce_sum={ce_sum_global:.9g} ce_tokens={ce_den_global:.9g} '
                 f'ce_weight_sum={ce_weight_sum_global:.9g} ce_mean={ce_mean:.9g} '
                 f'mse_sum={mse_sum_global:.9g} mse_tokens={mse_den_global:.9g} '

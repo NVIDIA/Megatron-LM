@@ -85,8 +85,11 @@ def test_dense_route_indices_dtype(
             moe_flex_dispatcher_backend=backend,
             moe_hybridep_routing_map_mode=routing_map_mode,
             num_moe_experts=num_experts,
+            moe_virtual_expert_load_balance=False,
         ),
         expt_tp_group=SimpleNamespace(size=lambda: 1),
+        is_hash_layer=False,
+        routing_type="aux_loss",
     )
 
     assert TopKRouter._dense_route_indices_dtype(router) == expected_dtype

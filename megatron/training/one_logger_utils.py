@@ -42,6 +42,7 @@ def on_train_start(
         log_throughput (bool): log throughput or not
         num_floating_point_operations_so_far (int): flops so far
     """
+    cfg = get_run_config()
     args = get_args()
     one_logger = get_one_logger()
 
@@ -64,7 +65,7 @@ def on_train_start(
             one_logger.store_set('save_checkpoint_sync_time_total', 0.0)
 
             # Derive train_samples from iters for iteration-based training
-            train_samples_target = train_samples or train_iters * args.global_batch_size
+            train_samples_target = train_samples or train_iters * cfg.train.global_batch_size
 
             train_tokens_target = seq_length * train_samples_target
             e2e_metrics = {
@@ -328,8 +329,8 @@ def on_pretrain_start():
                     'train_iterations_warmup': 5,
                     'data_parallel_size': args.data_parallel_size,
                     'context_parallel_size': args.context_parallel_size,
-                    'global_batch_size': args.global_batch_size,
-                    'micro_batch_size': args.micro_batch_size,
+                    'global_batch_size': cfg.train.global_batch_size,
+                    'micro_batch_size': cfg.train.micro_batch_size,
                     'pipeline_model_parallel_size': args.pipeline_model_parallel_size,
                     'tensor_model_parallel_size': args.tensor_model_parallel_size,
                     'expert_model_parallel_size': args.expert_model_parallel_size,
@@ -360,7 +361,7 @@ def track_config_flags(train_iters, skip_train, do_train, do_valid, do_test, dat
     one_logger = get_one_logger()
     if one_logger:
         with one_logger.get_context_manager():
-            # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
+            # Track if training is enabled. Can only be done once train_state.do_train is assigned after dataloader is built.
             train_enabled = train_iters and (not skip_train) and do_train and train_iters > 0
             one_logger.log_metrics(
                 {

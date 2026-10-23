@@ -44,7 +44,6 @@ def load_args_from_checkpoint(args):
     args.untie_embeddings_and_output_weights = True
     args.seq_length = 4096
     args.global_batch_size = 1024
-    args.iteration = 1  # '0', 'release' don't work
     args.add_position_embedding = False
     args.use_rotary_position_embeddings = True
     args.swiglu = True
@@ -247,7 +246,6 @@ def _load_checkpoint(queue, args):
     check_for_arg('max_position_embeddings')
     check_for_arg('position_embedding_type')
     check_for_arg('tokenizer_type')
-    check_for_arg('iteration')
     check_for_arg('disable_bias_linear')
     check_for_arg('params_dtype')
     check_for_arg('swiglu')
@@ -282,7 +280,7 @@ def _load_checkpoint(queue, args):
     md.num_attention_heads = margs.num_attention_heads
     md.max_position_embeddings = margs.max_position_embeddings
     md.tokenizer_type = margs.tokenizer_type
-    md.iteration = margs.iteration
+    md.iteration = 1
     md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights

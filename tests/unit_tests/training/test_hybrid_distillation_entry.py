@@ -45,7 +45,9 @@ def test_hybrid_cached_logits_loss_uses_reader_and_keeps_reporting(monkeypatch):
     assert all(actual is wanted for actual, wanted in zip(result, expected))
 
 
-def test_multimodal_dev_entry_initializes_runtime_before_pretrain(monkeypatch):
+def test_multimodal_dev_entry_leaves_runtime_setup_to_pretrain(monkeypatch):
+    # Since main #8272, initialize_megatron (called by pretrain) owns runtime services and
+    # tokenizer vocabulary resolution; the entry only registers the validated run config.
     args = SimpleNamespace(pipeline_model_parallel_size=1, padded_vocab_size=None)
     config = SimpleNamespace(profiling=None)
     events = []
@@ -55,25 +57,21 @@ def test_multimodal_dev_entry_initializes_runtime_before_pretrain(monkeypatch):
     monkeypatch.setattr(
         global_vars, "set_run_config", lambda value: events.append(("config", value))
     )
-
-    def initialize(value, training):
-        assert value is args and training
-        args.padded_vocab_size = 128
-        events.append(("runtime", value))
-
-    monkeypatch.setattr(global_vars, "initialize_runtime_services", initialize)
+    services = Mock(side_effect=AssertionError("entrypoint initialized services before pretrain"))
+    monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
+    vocab = Mock(side_effect=AssertionError("entrypoint resolved vocabulary before pretrain"))
+    monkeypatch.setattr(argument_utils, "resolve_tokenizer_vocab_size", vocab)
     monkeypatch.setattr(
-        argument_utils,
-        "resolve_tokenizer_vocab_size",
-        lambda value, size: events.append(("vocab", value, size)),
+        utils, "start_memory_history_recording", lambda value: events.append(("memory", value))
     )
-    monkeypatch.setattr(utils, "start_memory_history_recording", lambda value: None)
 
     def pretrain(value, *rest, **kwargs):
         assert value is config
-        assert events == [("config", config), ("runtime", args), ("vocab", config, 128)]
+        assert events == [("config", config), ("memory", None)]
         events.append(("pretrain", value))
 
     monkeypatch.setattr(training, "pretrain", pretrain)
     runpy.run_module("examples.multimodal_dev.pretrain_multimodal", run_name="__main__")
     assert events[-1] == ("pretrain", config)
+    services.assert_not_called()
+    vocab.assert_not_called()

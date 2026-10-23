@@ -984,6 +984,7 @@ class TransformerConfig(ModelParallelConfig):
     """When set, GLU activations in the shared expert MLP will use a block
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
+    Requires BF16 or FP16 model parameters when GLU is enabled.
     """
     moe_shortcut_connection: bool = False
     """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
@@ -1221,6 +1222,9 @@ class TransformerConfig(ModelParallelConfig):
     backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via
     TransformerEngine's transformer_engine.pytorch.ep API."""
 
+    moe_virtual_expert_load_balance: bool = False
+    """Balance MoE routes by materializing virtual experts over HybridEP."""
+
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
@@ -1383,7 +1387,7 @@ class TransformerConfig(ModelParallelConfig):
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
-    advanced fused kernels."""
+    advanced fused kernels. Requires BF16 or FP16 model parameters when GLU is enabled."""
 
     ##################
     # Context Parallel
@@ -2141,9 +2145,20 @@ class TransformerConfig(ModelParallelConfig):
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
-            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+            if (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            ) and not (
+                self.cuda_graph_impl == "local"
+                and not self.enable_cuda_graph
+                and not self.external_cuda_graph
+                and normalize_inference_cuda_graph_scope(
+                    self.inference_cuda_graph_scope, self.cuda_graph_impl
+                )
+                == InferenceCudaGraphScope.block
+            ):
                 raise NotImplementedError(
-                    "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
+                    "wide_residual supports CUDA graphs only with cuda_graph_impl='local' "
+                    "and inference_cuda_graph_scope='block'."
                 )
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
@@ -3161,6 +3176,90 @@ class TransformerConfig(ModelParallelConfig):
                 self.num_moe_experts is not None and self.num_moe_experts > 0
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
+        if self.moe_virtual_expert_load_balance:
+            MAX_VIRTUAL_EXPERT_EP_SIZE = 64
+
+            def require(condition: bool, message: str) -> None:
+                if not condition:
+                    raise ValueError(f"Virtual-expert load balancing requires {message}.")
+
+            required_values = {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_routing_map_mode": "indices",
+                "bf16": True,
+                "params_dtype": torch.bfloat16,
+                "fp4": None,
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "moe_expert_rank_capacity_factor": None,
+                "moe_paged_stash": False,
+                "moe_use_grouped_tensor": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "moe_router_enable_expert_bias": False,
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_hybridep_pad_uneven_dispatch_inputs": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            for name, value in required_values.items():
+                require(getattr(self, name) == value, f"{name}={value!r}")
+            require(
+                2 <= self.expert_model_parallel_size <= MAX_VIRTUAL_EXPERT_EP_SIZE,
+                f"2<=expert_model_parallel_size<={MAX_VIRTUAL_EXPERT_EP_SIZE}",
+            )
+            require(
+                self.num_moe_experts is not None and self.num_moe_experts <= 8192,
+                "1<=num_moe_experts<=8192",
+            )
+            require(
+                self.num_moe_experts % self.expert_model_parallel_size == 0,
+                "num_moe_experts divisible by expert_model_parallel_size",
+            )
+            require(
+                1 <= self.moe_router_topk <= min(32, self.num_moe_experts),
+                "1<=moe_router_topk<=min(32, num_moe_experts)",
+            )
+            routing = self.moe_router_load_balancing_type
+            require(
+                "sinkhorn" not in ((routing,) if isinstance(routing, str) else routing),
+                "no sinkhorn routing",
+            )
+            require(
+                (self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu))
+                or (
+                    not self.gated_linear_unit
+                    and self.activation_func == squared_relu
+                    and self.use_fused_weighted_squared_relu
+                ),
+                "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation",
+            )
+            require(
+                (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                "moe_latent_size (or hidden_size) divisible by 128",
+            )
+            require(self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128")
+            mxfp8 = self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            require(
+                not self.fp8 or mxfp8,
+                "fp8=None for BF16, or fp8='e4m3' with fp8_recipe='mxfp8' " "and fp8_param=True",
+            )
+            require(
+                not self.moe_router_padding_for_quantization or mxfp8,
+                "moe_router_padding_for_quantization=False unless using native MXFP8",
+            )
+            require(
+                self.moe_flex_dispatcher_num_sms is None or self.moe_flex_dispatcher_num_sms > 0,
+                "moe_flex_dispatcher_num_sms>0",
+            )
+
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
@@ -4012,6 +4111,29 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
+        has_glu_interleave = self.moe_mlp_glu_interleave_size is not None or (
+            self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        )
+        if self.gated_linear_unit and has_glu_interleave and self.params_dtype == torch.float32:
+            raise ValueError(
+                "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
+            )
+        if self.gated_linear_unit and self.moe_mlp_glu_interleave_size is not None:
+            assert self.expert_gtp_weight_remat_size == 1, (
+                "Routed expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable routed expert GLU interleave or expert GTP weight sharding."
+            )
+        if (
+            self.gated_linear_unit
+            and self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        ):
+            assert self.gtp_weight_remat_size == 1, (
+                "Shared expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable shared expert GLU interleave or GTP weight sharding."
+            )
+
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
                 raise ValueError(
@@ -4822,8 +4944,16 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         assert not (
-            self.moe_shortcut_connection and self.cuda_graph_impl != "none"
-        ), "CUDA graphs are not supported with moe_shortcut_connection."
+            self.moe_shortcut_connection
+            and self.cuda_graph_impl != "none"
+            and not (
+                self.cuda_graph_impl == "local"
+                and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            )
+        ), (
+            "moe_shortcut_connection supports CUDA graphs only with "
+            "cuda_graph_impl='local' and inference_cuda_graph_scope='block'."
+        )
 
         if self.cuda_graph_impl != "none":
 
@@ -4871,7 +5001,17 @@ class TransformerConfig(ModelParallelConfig):
                             'mlp cuda graph is only supported for dense layers, '
                             'but not found in the model.'
                         )
-                    if (
+                    if self.moe_virtual_expert_load_balance:
+                        # The virtual-expert planner keeps its routing metadata private to one
+                        # forward, which only the whole-layer moe scope preserves.
+                        assert not {
+                            CudaGraphModule.moe_router,
+                            CudaGraphModule.moe_preprocess,
+                        } & set(self.cuda_graph_modules), (
+                            'virtual-expert load balancing supports the moe CUDA graph scope only; '
+                            'moe_router and moe_preprocess are not supported.'
+                        )
+                    elif (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
@@ -5580,16 +5720,25 @@ class MLATransformerConfig(TransformerConfig):
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
 
-    use_fused_mla_q_uproj: bool = False
-    """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).
-    Requires apply_rope_fusion=True, q_lora_rank set, TP=1, SBHD, MXFP8 DPA, and zero
-    attention dropout."""
-
     mla_proj_use_quantization: bool = True
     """Whether absorbed-MLA projections use the enclosing FP8/FP4 context.
     When disabled, they use the configured unquantized dtype (e.g. BF16). Core-attention
     precision is unchanged.
     """
+
+    use_fused_mla_q_uproj: bool = False
+    """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).
+    Requires apply_rope_fusion=True, q_lora_rank set, TP=1, SBHD, MXFP8 DPA, and zero
+    attention dropout."""
+
+    use_fused_mla_kv_rope_quant: bool = False
+    """Split the key/value up-projection output, apply RoPE to the key and quantize key and value
+    for MXFP8 attention in one Transformer Engine kernel (SM100 only), and quantize the RoPE'd
+    query before attention, instead of writing BF16 key and value that attention then
+    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA, zero attention
+    dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
+    above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
+    NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
 
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
@@ -5688,6 +5837,19 @@ class MLATransformerConfig(TransformerConfig):
                 "fp8_dot_product_attention=True so TE interprets the pre-quantized Q/K/V "
                 "scale layout correctly, plus attention_dropout=0.0 because MXFP8 attention "
                 "backward does not support dropout."
+            )
+
+        if self.use_fused_mla_kv_rope_quant and (
+            self.fp8 is None
+            or self.fp8_recipe != Fp8Recipe.mxfp8
+            or not self.fp8_dot_product_attention
+            or self.attention_dropout != 0.0
+        ):
+            raise ValueError(
+                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' and "
+                "fp8_dot_product_attention=True, because it feeds MXFP8 Q/K/V to attention, "
+                "plus attention_dropout=0.0 because MXFP8 attention backward does not support "
+                "dropout."
             )
 
         if self.attention_output_gate and self.mla_down_proj_fusion:

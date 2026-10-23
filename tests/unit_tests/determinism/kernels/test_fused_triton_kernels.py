@@ -9,8 +9,9 @@
 * ``fused_moe_residual_add``: elementwise with unique stores -- forward and backward replay and
   agree bit for bit with the two unfused adds it replaces.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
-  ``triton.autotune``; forward and backward replay in sbhd and thd layouts, at a head count the
-  autotuned ``BLOCK_H`` divides and at one it does not, plus a check that the result does not
+  ``triton.autotune``; forward and backward replay in sbhd and thd layouts (the query kernels in
+  both RoPE output layouts), at a head count the autotuned ``BLOCK_H`` divides and at one it does
+  not, plus a check that the result does not
   depend on ``BLOCK_H`` at all -- a replay cannot see that, because Triton caches the config the
   first call chose.
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
@@ -125,6 +126,61 @@ def test_csa_teacher_lse_replays():
         what="CSA teacher LSE",
     )
     assert torch.isfinite(outputs["out"]).all()
+
+
+def test_dsa_weights_projection_replays():
+    """Replay the DSA weights projection GEMM dispatch under stream contention."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        _dsa_weights_proj_forward_gemm,
+    )
+
+    seeded()
+    x = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+
+    outputs, _ = assert_replays_bit_exact(
+        lambda hidden, proj_weight: _dsa_weights_proj_forward_gemm(hidden, proj_weight, None)[0],
+        (x, weight),
+        backward=False,
+        contention=True,
+        what="DSA weights projection",
+    )
+    assert outputs["out"].dtype == torch.float32
+
+
+def test_dsa_kpool_chunked_selection_replays(monkeypatch):
+    """Replay the fixed-memory KPool score and top-k path across query chunks."""
+    from megatron.core.transformer.experimental_attention_variant import dsa
+
+    seeded()
+    monkeypatch.setattr(dsa, "_KPOOL_SCORE_CHUNK_BYTES", 128)
+    q = torch.randn(9, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(16, 1, 8, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(9, 1, 2, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(k)
+    ape = torch.randn(4, 8, device="cuda")
+
+    def run(query, key, head_weights, gate_score, positional_bias):
+        _, topk = dsa.fused_qk_topk_kpool(
+            query,
+            key,
+            head_weights,
+            index_topk=8,
+            pool_size=4,
+            gate_score=gate_score,
+            ape=positional_bias,
+            rotate_activation_enabled=False,
+            return_index_scores=False,
+        )
+        return topk
+
+    assert_replays_bit_exact(
+        run,
+        (q, k, weights, gate, ape),
+        backward=False,
+        contention=True,
+        what="DSA KPool chunked selection",
+    )
 
 
 def _topk_routing_map(num_tokens, num_experts, topk):
@@ -270,7 +326,8 @@ def _pinned_block_h(block_h):
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("variant", ["out_of_place", "inplace"])
 @pytest.mark.parametrize("heads", [32, 12])
-def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
+@pytest.mark.parametrize("remove_interleaving", [False, True])
+def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads, remove_interleaving):
     seeded()
     nope_dim, emb_dim = 128, 64
     dtype = torch.bfloat16
@@ -288,9 +345,23 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
     fn = fused_mla_rope_out_of_place if variant == "out_of_place" else fused_mla_rope_inplace
 
     def run(t):
-        return fn(t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens)
+        return fn(
+            t,
+            cos,
+            sin,
+            nope_dim,
+            emb_dim,
+            cu_seqlens_q=cu_seqlens,
+            remove_interleaving=remove_interleaving,
+        )
 
-    assert_replays_bit_exact(run, (t,), replays=3, what=f"fused_mla_rope_{variant}[{layout}]")
+    outputs, _ = assert_replays_bit_exact(
+        run,
+        (t,),
+        replays=3,
+        what=f"fused_mla_rope_{variant}[{layout}, remove_interleaving={remove_interleaving}]",
+    )
+    assert torch.isfinite(outputs["out"]).all()
 
 
 # Every kernel here is launched over ``cdiv(head_num, BLOCK_H)`` head programs. 12 heads at the

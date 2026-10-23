@@ -1201,7 +1201,49 @@ def _register_rebuild_hook(hook_tensor: torch.Tensor, rebuild: Callable[[], None
     hook_tensor.register_hook(_rebuild_on_grad)
 
 
-class MHCCheckpointManager:
+class CheckpointWithoutOutputManager:
+    """
+    Coordinates activation recomputation across multiple CheckpointWithoutOutput instances
+    within a TransformerBlock, enabling unified recomputation during backward pass.
+    This is particularly useful for scenarios where multiple checkpoint operations have
+    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
+
+    Usage:
+        manager = CheckpointWithoutOutputManager()
+        ckpt_function = CheckpointWithoutOutput(ckpt_manager=manager)
+        ckpt_function.checkpoint(run_function, *args)
+        # other checkpointed operations
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
+    """
+
+    def __init__(self):
+        self.checkpoints = []
+        # Set by TransformerBlock before each layer forward.
+        # When True, the layer should keep block-boundary output uncheckpointed.
+        self.is_last_layer_in_recompute_block = False
+
+    def add_checkpoint(self, ckpt):
+        """Add a checkpoint to the manager."""
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        if ckpt.outputs is None:
+            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        regions = [ckpt._release_outputs() for ckpt in self.checkpoints]
+        regions = [region for region in regions if region is not None]
+
+        def rebuild_in_forward_order():
+            # A later region may read the outputs of an earlier one, which are rebuilt first.
+            for region in regions:
+                region.rebuild()
+
+        _register_rebuild_hook(hook_tensor, rebuild_in_forward_order)
+
+
+class MHCCheckpointManager(CheckpointWithoutOutputManager):
     """Manage mHC checkpoints that are recomputed together across transformer layers.
 
     This manager enables unified recomputation for checkpoint operations with sequential
@@ -1210,9 +1252,9 @@ class MHCCheckpointManager:
     Specific to manifold hyper-connections, and named for it: it owns an
     ``MHCRecomputeArena``, validates slot addresses before every replay, and its
     phase argument is ``MHCRecomputePhase``. Every construction site in the tree
-    is an mHC one. Should a second consumer ever want the group-replay machinery
-    without the arena, the general part is worth lifting into a base class at
-    that point rather than being asserted by the name now.
+    is an mHC one. It subclasses ``CheckpointWithoutOutputManager`` so callers typed
+    against the shared manager contract, such as the recompute-plan adapters, accept
+    it; it overrides every base-class method.
 
     Examples:
         ckpt_manager = MHCCheckpointManager()
@@ -1330,48 +1372,6 @@ class MHCCheckpointManager:
         # Guards live in recompute_until; duplicating them here lets the two
         # error paths drift apart.
         self.recompute_until(MHCRecomputePhase.BEFORE_ATTN_BWD)
-
-
-class CheckpointWithoutOutputManager:
-    """
-    Coordinates activation recomputation across multiple CheckpointWithoutOutput instances
-    within a TransformerBlock, enabling unified recomputation during backward pass.
-    This is particularly useful for scenarios where multiple checkpoint operations have
-    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
-
-    Usage:
-        manager = CheckpointWithoutOutputManager()
-        ckpt_function = CheckpointWithoutOutput(ckpt_manager=manager)
-        ckpt_function.checkpoint(run_function, *args)
-        # other checkpointed operations
-        manager.discard_all_outputs_and_register_unified_recompute(final_output)
-    """
-
-    def __init__(self):
-        self.checkpoints = []
-        # Set by TransformerBlock before each layer forward.
-        # When True, the layer should keep block-boundary output uncheckpointed.
-        self.is_last_layer_in_recompute_block = False
-
-    def add_checkpoint(self, ckpt):
-        """Add a checkpoint to the manager."""
-        if not isinstance(ckpt, CheckpointWithoutOutput):
-            raise TypeError("Expected CheckpointWithoutOutput object")
-        if ckpt.outputs is None:
-            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
-        self.checkpoints.append(ckpt)
-
-    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
-        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
-        regions = [ckpt._release_outputs() for ckpt in self.checkpoints]
-        regions = [region for region in regions if region is not None]
-
-        def rebuild_in_forward_order():
-            # A later region may read the outputs of an earlier one, which are rebuilt first.
-            for region in regions:
-                region.rebuild()
-
-        _register_rebuild_hook(hook_tensor, rebuild_in_forward_order)
 
 
 class CheckpointWithoutOutput:
