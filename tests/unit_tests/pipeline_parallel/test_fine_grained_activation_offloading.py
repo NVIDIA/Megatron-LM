@@ -21,6 +21,8 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     OffloadTensorPool,
     PipelineOffloadManager,
 )
+from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
@@ -193,6 +195,101 @@ def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandle
     handler.offload_groups = list(groups)
     handler._max_group_size = len(groups)
     return handler
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading.")
+@pytest.mark.parametrize("fraction", [0.0, 0.5, 1.0])
+def test_offload_resident_groups_preserve_forward_chunks(monkeypatch, fraction):
+    """Keep chunk ownership through fixed-length native training when groups stay on GPU."""
+    Utils.initialize_model_parallel()
+    off_interface.reset_instance()
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        snapshots = []
+        transfers = []
+        original_offload = ChunkOffloadHandler.offload
+
+        def record_transfer(handler, *args, **kwargs):
+            transfers.append(handler.is_warmup)
+            return original_offload(handler, *args, **kwargs)
+
+        monkeypatch.setattr(ChunkOffloadHandler, "offload", record_transfer)
+        for enabled in (False, True):
+            config = TransformerConfig(
+                num_layers=4,
+                hidden_size=128,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                attention_backend=AttnBackend.unfused,
+                attention_dropout=0.0,
+                hidden_dropout=0.0,
+                bf16=True,
+                fine_grained_activation_offloading=enabled,
+                offload_modules=["core_attn", "attn_proj"] if enabled else [],
+                activation_offload_fraction=fraction,
+                min_offloaded_tensor_size=1024,
+            )
+            torch.manual_seed(31)
+            model_parallel_cuda_manual_seed(31)
+            model = (
+                GPTModel(
+                    config=config,
+                    transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                    vocab_size=256,
+                    max_sequence_length=128,
+                )
+                .bfloat16()
+                .cuda()
+            )
+            optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+
+            def forward_step(batches, model):
+                tokens, positions, mask = next(batches)
+                output = model(tokens, positions, mask)
+
+                def loss_func(logits):
+                    loss = logits.float().square().mean()
+                    return loss, {"loss": loss.detach().clone()}
+
+                return output, loss_func
+
+            results = []
+            for _ in range(3):
+                optimizer.zero_grad(set_to_none=True)
+                inputs = _make_gpt_inputs(
+                    seq_length=128, micro_batch_size=1, device=torch.device("cuda")
+                )
+                inputs[2].copy_(torch.triu(torch.ones_like(inputs[2]), diagonal=1))
+                losses = get_forward_backward_func()(
+                    forward_step_func=forward_step,
+                    data_iterator=iter([inputs] * 2),
+                    model=model,
+                    num_microbatches=2,
+                    seq_length=128,
+                    micro_batch_size=1,
+                    forward_only=False,
+                    pg_collection=groups,
+                )
+                results.append(
+                    (
+                        [item["loss"].cpu() for item in losses],
+                        {
+                            name: p.grad.cpu().clone()
+                            for name, p in model.named_parameters()
+                            if p.grad is not None
+                        },
+                    )
+                )
+                optimizer.step()
+            snapshots.append(results)
+            del optimizer, model
+        torch.testing.assert_close(snapshots[1], snapshots[0], rtol=0, atol=0)
+        assert any(transfers), "Training warmup must exercise actual transfers."
+        assert (False in transfers) == (fraction > 0)
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
 
 
 def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
@@ -1296,3 +1393,83 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
 
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload ordering.")
+def test_inline_reload_is_ordered_after_the_groups_offload():
+    """The inline ``tensor_pop`` reload must wait on its group's D2H and then hand the group back
+    from the reload LIFO, so the next prefetch advances to the group backward runs next.
+
+    Two forward-ordered groups are what make the second half visible. Backward reaches ``g2``
+    first and pops it inline; the next ``bulk_reload`` then has to target ``g1``. With a single
+    group nothing ever asks the prefetch to advance, so dropping the LIFO bookkeeping leaves the
+    values correct and the test green while warmup keeps re-targeting drained groups.
+    """
+    off_interface.reset_instance()
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        handler = ChunkOffloadHandler(
+            min_offloaded_tensor_size=0, cpu_tensor_pool=manager.cpu_tensor_pool
+        )
+        name = "core_attn"
+        numel = 4 * 1024 * 1024
+        tensors = [torch.randn(numel, device="cuda") for _ in range(2)]
+
+        # Warm the pinned pool before stalling. First-touch allocation of a staging buffer costs
+        # more wall time than the stall below, so leaving it inside the commit would let both
+        # D2H copies land before the pop and silently disarm the ordering check.
+        warmed = [
+            manager.cpu_tensor_pool.allocate(torch.Size([numel]), dtype=tensors[0].dtype)
+            for _ in range(2)
+        ]
+        for buffer in warmed:
+            manager.cpu_tensor_pool.free(buffer)
+
+        # Stall d2h_stream ahead of both commits, so neither group's D2H has provably run when
+        # the pop below fires.
+        with torch.cuda.stream(handler.d2h_stream):
+            torch.cuda._sleep(1_000_000_000)
+
+        tags = []
+        for tensor in tensors:
+            handler.on_group_start_forward(name)
+            tag = handler.tensor_push(tensor)
+            assert not isinstance(tag, torch.Tensor), "tensor was not managed by the handler"
+            handler.on_group_commit_forward(name, [])
+            tags.append(tag)
+
+        first_group, second_group = handler.offload_groups
+        first_tag, second_tag = tags
+        assert isinstance(first_group._tensors[first_tag], tuple), "group 1 was not offloaded"
+        assert isinstance(second_group._tensors[second_tag], tuple), "group 2 was not offloaded"
+        assert handler._groups_to_reload == [
+            first_group,
+            second_group,
+        ], "both groups should be queued for reload in forward order"
+        assert not second_group._offload_event.query(), "the d2h_stream stall did not take effect"
+
+        # Backward reaches the second group first and finds no prefetch: the inline path.
+        reloaded = handler.tensor_pop(second_tag)
+        torch.cuda.current_stream().synchronize()
+        assert second_group._offload_event.query(), (
+            "the inline reload finished before this group's D2H did: the H2D read the pinned "
+            "buffer before the D2H filled it"
+        )
+        assert torch.equal(reloaded, tensors[1]), "the inline reload returned the wrong values"
+
+        # The inline pop must also release the group, or every later prefetch re-targets a
+        # drained one and the groups still to be backwarded are never reloaded.
+        assert handler._groups_to_reload == [
+            first_group
+        ], "the inline-consumed group was left on the reload LIFO"
+        handler.bulk_reload()
+        assert not isinstance(
+            first_group._tensors[first_tag], tuple
+        ), "the next prefetch did not advance to the group backward runs next"
+        torch.cuda.synchronize()
+        assert torch.equal(
+            handler.tensor_pop(first_tag), tensors[0]
+        ), "the prefetched reload returned the wrong values"
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
