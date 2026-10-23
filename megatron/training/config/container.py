@@ -433,6 +433,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         super()._finalize()
         self.optimizer.finalize_optimizer_config()
+        if self.optimizer.use_layer_wise_distributed_optimizer:
+            self.ddp.use_distributed_optimizer = False
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if self.rl.perform_rl_step:
