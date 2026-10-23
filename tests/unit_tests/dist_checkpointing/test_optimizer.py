@@ -226,6 +226,36 @@ class PPAgnosticModel(torch.nn.Module):
         return sharded_state_dict
 
 
+class PaddingGapModel(torch.nn.Module):
+    """Two small params whose 64-element alignment gap exceeds a DP shard.
+
+    With two buckets, `proj` fills the first (so every DP rank owns a param) and the small
+    params share the second: [24 | pad: 40 | 24 | trailing pad: 40] = 128 elements. With
+    4 DP ranks (32-element shards) rank 1 holds only the padding between the params and
+    rank 3 only trailing padding; with 8 DP ranks (16-element shards) ranks 2-3 and 6-7 do.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.a_log = torch.nn.Parameter(torch.randn(24))
+        self.dt_bias = torch.nn.Parameter(torch.randn(24))
+        self.proj = torch.nn.Linear(32, 32, bias=False)
+        self.config = TransformerConfig(
+            hidden_size=8, num_attention_heads=1, num_layers=1, bf16=True
+        )
+
+    def sharded_state_dict(self):
+        replica_id = (
+            parallel_state.get_pipeline_model_parallel_rank(),
+            parallel_state.get_tensor_model_parallel_rank(),
+            parallel_state.get_data_parallel_rank(with_context_parallel=True),
+        )
+        return {
+            key: ShardedTensor.from_rank_offsets(key, value, replica_id=replica_id)
+            for key, value in self.state_dict(keep_vars=True).items()
+        }
+
+
 class MultiBucketModel(torch.nn.Module):
     """Model with enough separate params for the grad buffer to split into several buckets.
 
@@ -420,6 +450,13 @@ def initialize_multi_bucket_model(pre_process=True, post_process=True, seed=0, *
     model_parallel_cuda_manual_seed(seed)
 
     return MultiBucketModel()
+
+
+def initialize_padding_gap_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+
+    return PaddingGapModel()
 
 
 def initialize_small_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
@@ -1413,6 +1450,62 @@ class TestDistributedOptimizer:
                     f"no bucket-end padding to strip ({paddings}); this test cannot "
                     f"distinguish adjusted from unadjusted indices"
                 )
+
+            optim_sd = optimizer_A.sharded_state_dict(
+                model_A[0].sharded_state_dict(), metadata=metadata
+            )
+            save(optim_sd, ckpt_dir)
+            dp_zero_optim_A = get_param_state_dp_zero(optimizer_A)
+
+            # A different seed, so an unloaded optimizer B is guaranteed to differ from A.
+            model_B, optimizer_B = setup_model_and_optimizer(seed=3, **setup_kwargs)
+            dp_zero_optim_B = get_param_state_dp_zero(optimizer_B)
+            assert not self.check_equal_dp_zero_state(
+                dp_zero_optim_A, dp_zero_optim_B, same_dp_group=True
+            )
+
+            load_sharded_state_dict = optimizer_B.sharded_state_dict(
+                model_B[0].sharded_state_dict(), metadata=metadata, is_loading=True
+            )
+            state_dict, _, unexpected_keys = load(
+                load_sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL
+            )
+            assert not unexpected_keys
+            optimizer_B.load_state_dict(state_dict)
+
+            dp_zero_optim_B = get_param_state_dp_zero(optimizer_B)
+            assert self.check_equal_dp_zero_state(
+                dp_zero_optim_A, dp_zero_optim_B, same_dp_group=True, raise_if_different=True
+            )
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    def test_dp_reshardable_padding_only_shards_save_load(self, tmp_path_dist_ckpt):
+        """Round-trip dp_reshardable state when some DP shards hold only padding.
+
+        Params start on 64-element boundaries, so a DP shard smaller than the gap after a
+        small param can hold no param elements. A shard of only trailing padding contributes
+        nothing; a shard of padding inside the payload must still be written so the
+        checkpoint tensor stays fully covered.
+        """
+        Utils.initialize_model_parallel(1, 1)
+        if Utils.world_size not in (4, 8):
+            pytest.skip("the padding layout below needs 4 or 8 DP ranks")
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+        setup_kwargs = dict(
+            tp=1,
+            pp=1,
+            bf16=True,
+            dist_opt=True,
+            initialize_fn=initialize_padding_gap_model,
+            ddp_num_buckets=2,
+        )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_dp_reshardable_padding_only_shards_save_load', sync=True
+        ) as ckpt_dir:
+            model_A, optimizer_A = setup_model_and_optimizer(seed=2, **setup_kwargs)
 
             optim_sd = optimizer_A.sharded_state_dict(
                 model_A[0].sharded_state_dict(), metadata=metadata
