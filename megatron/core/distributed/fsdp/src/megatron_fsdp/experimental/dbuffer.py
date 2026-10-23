@@ -174,6 +174,11 @@ class DBuffer:
             self.local_buffer
         )
 
+    @property
+    def holds_full_tensors(self) -> bool:
+        """Whether this rank's local buffer covers the whole global layout."""
+        return self.local_buffer.numel() == self.layout.size
+
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
         # The allocator may hand back a different address than release_storage() freed.
