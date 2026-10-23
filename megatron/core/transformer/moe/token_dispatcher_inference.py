@@ -334,6 +334,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _symm_agv_routing: Optional[dict] = None
     _symm_agv_probs: Optional[dict] = None
     _symm_rsv: Optional[dict] = None
+    # moe_ep_invariant_combine: the RSV combine finishes the EP-invariant combine tree.
+    _ep_invariant_combine: bool = False
 
     @classmethod
     def _get_rsv_tensor(cls) -> Optional[torch.Tensor]:
@@ -382,6 +384,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._symm_agv_routing = None
         cls._symm_agv_probs = None
         cls._symm_rsv = None
+        cls._ep_invariant_combine = False
         cls._symm_metadata = None
         cls._real_token_count_tensor = None
 
@@ -392,6 +395,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         topk: int,
         hidden_size: int,
         ep_group: torch.distributed.ProcessGroup,
+        ep_invariant_combine: bool = False,
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
@@ -405,8 +409,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             topk: MoE router top-k value.
             hidden_size: Model hidden dimension.
             ep_group: Expert parallel process group.
+            ep_invariant_combine: ``moe_ep_invariant_combine``: token_combine sums the
+                rank partials as the top of the EP-invariant combine tree.
         """
         ep_size = get_pg_size(ep_group)
+        cls._ep_invariant_combine = ep_invariant_combine
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
         global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()
@@ -663,7 +670,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        # moe_ep_invariant_combine: the rank partials are subtrees of the EP-invariant
+        # combine tree, so they are summed as its top levels, pairwise in rank order
+        # (ordered kernel, whatever the configured collective).
+        ep_invariant = self.__class__._ep_invariant_combine
+        use_ordered = ep_invariant or (
+            batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        )
         # Under batch-invariant mode the "multimem" option keeps the native
         # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
         # bitwise-equal to an fp64 reference), deterministic and
@@ -679,6 +692,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rank_token_offset=self._rank_token_offset(),
             ep_max_tokens=self._ep_max_tokens(),
             per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            pairwise_tree=ep_invariant,
         )
         return output.to(torch.bfloat16)
 
