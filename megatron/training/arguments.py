@@ -2296,11 +2296,6 @@ def _add_inference_args(parser):
                        help='Dtype for the Mamba inference SSM states tensor')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
-    group.add_argument('--inference-disable-ep-consensus', action=argparse.BooleanOptionalAction,
-                       required=False, default=False,
-                       help='Skip the EP-group consensus all-reduce in the inference engine control loop and step on local state only. '
-                            'Pause/unpause take effect as soon as the signal is delivered to a rank. '
-                            'Only safe when EP coordination is not required (e.g. ep_world_size == 1).')
     group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',
                        help='Partition the world into independent inference models, each with '
                             'its own parallelism, e.g. "tp=2,role=prefill+tp=1,dp=2,role=decode". '
@@ -2343,6 +2338,8 @@ def _add_network_size_args(parser):
         "csa_compress_ratios",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
+        "moe_router_quantile_balancing_estimation_scope",
+        "moe_router_qb_num_bins",
         "cp_comm_type",
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
@@ -2781,7 +2778,7 @@ def _add_training_args(parser):
         ProfilingConfig, exclude=["use_nsys_profiler", "run_workload_inspector_server"]
     )
     prof_group = prof_factory.build_group(parser, "profiling")
-    prof_group.add_argument('--profile', action='store_true', 
+    prof_group.add_argument('--profile', action='store_true',
                        help='Enable nsys profiling. When using this option, nsys '
                        'options should be specified in commandline.')
 
@@ -3433,9 +3430,14 @@ def _add_moe_args(parser):
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'quantile_balancing', 'none'],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" (QB) uses dual coordinate descent on a per-expert bias to handle load balance internally; "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" selects either the exact micro-batch estimator or Kimi K3 global-batch histogram estimator via --moe-router-quantile-balancing-estimation-scope; "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-router-quantile-balancing-estimation-scope', type=str,
+                       choices=['micro_batch', 'global_batch'], default='micro_batch',
+                       help='Population used to estimate quantile-balancing biases. "micro_batch" preserves the existing exact estimator; "global_batch" uses Kimi K3 histogram accumulation.')
+    group.add_argument('--moe-router-qb-num-bins', type=int, default=1000,
+                       help='Number of uniform histogram bins per expert for global-batch quantile balancing.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 

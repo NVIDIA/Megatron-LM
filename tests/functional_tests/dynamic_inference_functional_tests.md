@@ -113,7 +113,6 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Feature | CLI / config | Notes |
 |---|---|---|
 | Data-parallel coordinator (ZMQ) | uses `gpt_dynamic_inference_with_coordinator.py`; `--inference-use-synchronous-zmq-collectives` | Cross-rank routing |
-| Disable EP consensus | `--inference-disable-ep-consensus` | Skip all-reduce for single-EP |
 | Tensor / pipeline / expert parallel | `--{tensor,pipeline,expert}-model-parallel-size` | Standard parallel knobs |
 
 ### I. Model-family-specific

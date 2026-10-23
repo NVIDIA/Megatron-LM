@@ -251,9 +251,6 @@ class InferenceSetupConfig:
     """Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for
     MoEs."""
 
-    inference_disable_ep_consensus: bool = False
-    """Skip the EP-group consensus all-reduce in the inference engine control loop and step on local
-    state only. Only safe when EP coordination is not required (e.g. ep_world_size == 1)."""
 
     inference_shards: str | None = None
     """Partition the world using comma-separated ``key=value`` fields per shard, with
@@ -467,7 +464,6 @@ class InferenceSetupConfig:
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
-            disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
