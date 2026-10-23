@@ -6,6 +6,9 @@ import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
@@ -674,6 +677,33 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 # enclosing plan.
                 layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)
 
+        output_layer = getattr(model, "output_layer", None)
+        embedding = getattr(model, "embedding", None)
+        if (
+            self.post_process is not None
+            and model.share_embeddings_and_output_weights
+            and output_layer is not None
+            and not list(output_layer.parameters(recurse=False))
+            and embedding is not None
+        ):
+            group = get_containing_parameter_group(embedding.word_embeddings.weight)
+            owner = group._owning_module() if group is not None else None
+            if owner is not None:
+                # A previous microbatch's backward may have released the tied
+                # weight. These callables run inside the node's stream context,
+                # after its event wait, before either direction consumes it.
+                def unshard_before(func):
+                    def wrapped(*args, **kwargs):
+                        if owner.is_root():
+                            context = owner.context
+                            context.allgather_stream.wait_stream(context.current_stream())
+                        owner.unshard()
+                        return func(*args, **kwargs)
+
+                    return wrapped
+
+                self.post_process.forward_func = unshard_before(self.post_process.forward_func)
+                self.post_process.backward_func = unshard_before(self.post_process.backward_func)
         # Split into segments; pre_process and post_process keep their graphs.
         self._build_recompute_segments(model.config)
 
