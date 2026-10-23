@@ -40,6 +40,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
@@ -598,7 +599,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer, MoE transformer, and Mamba layers are used.
+                unspecified, transformer, MoE transformer, Mamba layers, and shortcut
+                MoE blocks are used. An explicit list replaces these defaults.
+                Directly invoked shortcut helper layers remain owned by their enclosing
+                FSDP unit.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -629,7 +633,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         self.ddp_config = ddp_config
 
         if fsdp_unit_modules is None:
-            fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            fsdp_unit_modules = [
+                TransformerLayer,
+                MoETransformerLayer,
+                MambaLayer,
+                ShortcutMoEBlock,
+            ]
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -722,7 +731,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             grad_scale=expert_grad_scale,
                             **common_fully_shard_kwargs,
                         )
+            # ShortcutMoEBlock calls compute_layer.forward_pre_attn_and_core_attn(),
+            # moe_layer._pre_mlp_layernorm_and_residual(), and mlp.route()/dispatch()
+            # directly. Their __call__ hooks never run, so these modules must not own
+            # FSDP shards. Their enclosing FSDP unit gathers their weights.
+            # Experts keep their expert-DP units above; other explicitly selected children
+            # (e.g. a norm called through __call__) can still be separate units.
+            shortcut_inner_modules = {
+                child
+                for block in module.modules()
+                if isinstance(block, ShortcutMoEBlock)
+                for child in (block.compute_layer, block.moe_layer, block.moe_layer.mlp)
+            }
             for submodule in reversed(list(module.modules())):
+                if submodule in shortcut_inner_modules:
+                    continue
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
                     # wrapped twice when its type also appears in fsdp_unit_modules.
@@ -793,6 +816,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
+
+        if "residual_stream" in (config.recompute_modules or []):
+            # Stack-managed replay can run before the owning layer gathers its weights.
+            raise ValueError(
+                "MFSDP v2 does not support residual_stream recomputation (#7777). "
+                "Remove it from recompute_modules and clear residual_stream_recompute_num_layers."
+            )
 
         if config.mtp_detach_heads:
             # Detached MTP heads are tagged into a separate gradient-norm group, which
