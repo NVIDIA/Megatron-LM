@@ -64,6 +64,7 @@ from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .mtp_context_mixin import MTPContextMixin
 from .routing_metadata import RoutingMetadata
+from .zero_padding_rows_kernel import zero_padding_rows
 
 # These callbacks are currently consumed only by the Dynamo frontend.
 KVEventListener = Callable[[str, dict[str, Any]], None]
@@ -1819,6 +1820,28 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
+
+    def zero_padding_tokens(self, tensor: Tensor, sequence_parallel_rank: int = 0) -> None:
+        """Zero, in place, the rows of a token-major activation that belong to padding tokens.
+
+        Rows at or past this step's real token count are padding. Their values still reach
+        the amax of FP8/FP4 GEMMs, so callers zero them before quantized layers. The count is
+        read on device from ``gpu_view.real_token_count`` rather than taken from
+        ``padding_slice``: a Python slice is frozen when a CUDA graph is captured, and capture
+        fills the graph with dummy tokens, so slice-based zeroing would be empty on every
+        replay.
+
+        Args:
+            tensor: Activation whose first dimension is the padded token dimension.
+            sequence_parallel_rank: If ``tensor`` is this rank's sequence-parallel shard, the
+                rank's index in the tensor-parallel group, so that local row ``i`` is treated
+                as token ``i + sequence_parallel_rank * tensor.shape[0]``.
+        """
+        zero_padding_rows(
+            tensor,
+            self.gpu_view.real_token_count,
+            first_token_idx=sequence_parallel_rank * tensor.shape[0],
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
@@ -4989,23 +5012,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         return no_top_k, no_top_p
 
     def _processed_log_probs(
-        self,
-        logits: Tensor,
-        n_active: int,
-        active_query_lengths: Optional[Tensor],
-        sampling: Optional[Sampling],
-        row_to_request: Optional[Tensor] = None,
+        self, logits: Tensor, sampling: Optional[Sampling], row_to_request: Optional[Tensor] = None
     ) -> Tensor:
         """Calculate raw or sampling-processed per-row log probabilities.
 
         Args:
             logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
-            n_active (int): Number of active requests represented by the rows.
-            active_query_lengths (Optional[Tensor]): CPU token counts used to
-                map prefill rows to active requests, or `None` for decode.
             sampling (Optional[Sampling]): Backend providing processed logprobs.
             row_to_request (Optional[Tensor]): Explicit CPU mapping from each
-                logit row to an active request.
+                logit row to an active request, or `None` if row `i` belongs to
+                active request `i`.
 
         Returns:
             Tensor: Per-row log probabilities over the vocabulary.
@@ -5014,10 +5030,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return F.log_softmax(logits, dim=-1)
 
         assert sampling is not None, "processed_logprobs requires a sampling backend"
-
-        # Map each logits row to its active request.
-        if row_to_request is None and active_query_lengths is not None:
-            row_to_request = torch.arange(n_active).repeat_interleave(active_query_lengths)
         return sampling.log_probs_kernel(logits, self, token_to_request_index=row_to_request)
 
     def calculate_log_probs_tensors(
@@ -5051,9 +5063,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
             active_logits = logits_squeezed[: len(new_tokens)].float()
-            log_probs = self._processed_log_probs(
-                active_logits, n_active, None, sampling, row_to_request
-            )
+            log_probs = self._processed_log_probs(active_logits, sampling, row_to_request)
             selected_log_probs = log_probs[seq_idx, new_tokens]
             if self.config.logprobs_mode != "raw_logprobs" and not all(
                 self.active_sampling_filter_flags(n_active)
@@ -5075,8 +5085,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return selected_log_probs, log_probs
 
         logits_squeezed = logits_squeezed.float()
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        active_query_lengths_cpu = self.request_query_lengths[active_slice]
         active_query_lengths_gpu = self.gpu_view.request_query_lengths[:n_active]
 
         # Shift away each request's first prompt token, then insert its sampled token.
@@ -5084,23 +5092,37 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         new_token_idx = active_query_lengths_gpu.cumsum(0) - 1
         active_token_ids[new_token_idx] = new_tokens
 
-        log_probs = self._processed_log_probs(
-            logits_squeezed, n_active, active_query_lengths_cpu, sampling
-        )
+        # Prompt rows score tokens the engine did not sample, so they always use the
+        # raw distribution. Sampling settings apply only to engine-sampled rows. Top-N
+        # log-probs are read from `log_probs`, so prompt top-N stays raw as well.
+        log_probs = F.log_softmax(logits_squeezed, dim=-1)
+        num_sampled = 0
+        if self.config.logprobs_mode != "raw_logprobs":
+            # A partial chunk's final row scores its next prompt token. The chunked
+            # prefill request is always the last active request.
+            num_sampled = n_active
+            chunked_idx = self.get_index_of_chunked_prefill_request(safe=True)
+            if chunked_idx != -1:
+                assert (
+                    chunked_idx == self.total_request_count - 1
+                ), "chunked prefill request must be the last active request"
+                num_sampled -= 1
+            if num_sampled > 0:
+                sampled_idx = new_token_idx[:num_sampled]
+                sampled_logits = logits_squeezed[sampled_idx]
+                log_probs[sampled_idx] = self._processed_log_probs(
+                    sampled_logits, sampling, torch.arange(num_sampled)
+                )
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
         selected_log_probs = log_probs[seq_idx, active_token_ids]
-        if self.config.logprobs_mode != "raw_logprobs" and not all(
-            self.active_sampling_filter_flags(n_active)
-        ):
-            # Only each request's final row is engine-sampled; prompt rows may keep -inf.
-            temperature = self.gpu_view.temperature[:n_active]
-            scaled = logits_squeezed[new_token_idx] / temperature.clamp(
-                min=MIN_SAMPLING_TEMPERATURE
-            ).unsqueeze(1)
-            gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+        if num_sampled > 0 and not all(self.active_sampling_filter_flags(n_active)):
+            # Sampled tokens outside the filtered support fall back to the tempered logprob.
+            temperature = self.gpu_view.temperature[:num_sampled]
+            scaled = sampled_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(1)
+            gathered = scaled.gather(1, new_tokens[:num_sampled].view(-1, 1).long()).squeeze(1)
             tempered = gathered - scaled.logsumexp(dim=1)
-            sampled = selected_log_probs[new_token_idx]
-            selected_log_probs[new_token_idx] = torch.where(
+            sampled = selected_log_probs[sampled_idx]
+            selected_log_probs[sampled_idx] = torch.where(
                 torch.isfinite(sampled), sampled, tempered
             )
         return selected_log_probs, log_probs

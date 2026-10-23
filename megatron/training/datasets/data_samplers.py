@@ -14,6 +14,7 @@ from megatron.core.datasets.utils import Split
 
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+from megatron.training.global_vars import get_run_config
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -27,6 +28,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             return None
     except TypeError:
         pass
+    cfg = get_run_config()
     args = get_args()
 
     if hasattr(dataset, 'split'):
@@ -43,10 +45,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
-    micro_batch_size = getattr(args, 'eval_micro_batch_size', args.micro_batch_size) if is_eval else args.micro_batch_size
-    global_batch_size = getattr(args, 'eval_global_batch_size', args.global_batch_size) if is_eval else args.global_batch_size
+    micro_batch_size = cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size
+    global_batch_size = cfg.validation.eval_global_batch_size if is_eval else cfg.train.global_batch_size
 
-    if split == Split.valid and args.full_validation:
+    if split == Split.valid and cfg.validation.full_validation:
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
             data_parallel_rank=mpu.get_data_parallel_rank(),
@@ -98,8 +100,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                     pass
 
         close_nvidia_fds()
-        if args.exit_signal_handler:
-            DistributedSignalHandler(args.exit_signal).__enter__()
+        if cfg.train.exit_signal_handler:
+            DistributedSignalHandler(cfg.train.exit_signal).__enter__()
 
     maybe_worker_init_fn = (
         worker_init_fn if args.num_workers > 0 else None
