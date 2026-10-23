@@ -642,7 +642,7 @@ class FsdpParameterGroup:
             raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
         return has_any_grad
 
-    def reduce_dp_inner_gradients(self, partial_grad: DBuffer) -> None:
+    def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
         """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
 
         main_grad rests at the DP-outer-Partial accumulation placement, accumulating
@@ -693,7 +693,7 @@ class FsdpParameterGroup:
         All-reduce (HSDP) or reduce-scatter (HFSDP) the accumulator across DP-outer
         into ``pre_optimizer_main_grad`` (the persistent buffer's optimizer-layout
         view), then bind each sharded ``.grad`` to it. Runs after
-        ``reduce_dp_inner_gradients`` on the last microbatch; the caller can run it on
+        ``reduce_inner_gradients`` on the last microbatch; the caller can run it on
         its own stream to overlap the DP-inner reductions (see
         ``FsdpModule._reduce_gradient_groups``). main_grad and its view are
         persistent, so running on a separate stream needs no cross-stream free.

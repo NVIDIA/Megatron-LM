@@ -503,7 +503,7 @@ class FsdpModule:
 
                 inner_reduction_stream.wait_stream(current_stream)
                 with torch.cuda.stream(inner_reduction_stream):
-                    group.reduce_dp_inner_gradients(partial_grad)
+                    group.reduce_inner_gradients(partial_grad)
 
                 if not context.is_last_microbatch:
                     continue
