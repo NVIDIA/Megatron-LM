@@ -146,7 +146,32 @@ param_group_identifier_keys = (
     'lr_mult',
     'is_expert_parallel',
     'is_decoupled_lr',
+    # DSA: indexer groups must not collide with non-indexer groups on load.
+    'is_dsa_indexer',
 )
+
+
+def get_param_group_identifier_value(param_group: Dict, key: str):
+    """Return a parameter-group identifier value with backward-compatible defaults."""
+    if key in param_group:
+        return param_group[key]
+    pre_key = f"pre_{key}"
+    if pre_key in param_group:
+        return param_group[pre_key]
+    if key == 'is_dsa_indexer':
+        # Pre-DSA checkpoints lack the key; False keeps them matching non-indexer groups.
+        return False
+    # Upstream treats missing and explicit None as equivalent when matching groups.
+    return None
+
+
+def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
+    """Return the tuple used to match optimizer parameter groups across checkpoints."""
+    return tuple(
+        get_param_group_identifier_value(param_group, key) for key in param_group_identifier_keys
+    )
+
+
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -212,6 +237,7 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
+        self._last_dsa_split_grad_norms = None
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -223,6 +249,20 @@ class MegatronOptimizer(ABC):
                 for param in param_group['params']:
                     params.append(param)
         return params
+
+    def get_dsa_split_parameters(self) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+        """Get optimizer-owned parameters split into DSA indexer and non-indexer buckets."""
+        indexer_params = []
+        non_indexer_params = []
+        if hasattr(self.optimizer, 'param_groups'):
+            for param_group in self.optimizer.param_groups:
+                target_params = (
+                    indexer_params
+                    if param_group.get('is_dsa_indexer', False)
+                    else non_indexer_params
+                )
+                target_params.extend(param_group['params'])
+        return indexer_params, non_indexer_params
 
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage optimizer-owned model params before an explicit DDP param sync."""
@@ -272,6 +312,7 @@ class MegatronOptimizer(ABC):
           - should not be a replica due to tensor model parallelism.
           - should not be a replica due to (expert) generalized tensor parallelism.
         """
+
         grads_for_norm = []
         for param in params:
             if param_filter is not None and not param_filter(param):
@@ -351,6 +392,25 @@ class MegatronOptimizer(ABC):
             )
             cache[grad_norm_group] = bool(flag.item() > 0)
         return cache[grad_norm_group]
+
+    @torch.no_grad()
+    def get_dsa_split_grad_norms(self) -> Tuple[float, float]:
+        """Compute pre-clip grad norms for DSA indexer and non-indexer buckets."""
+        indexer_params, non_indexer_params = self.get_dsa_split_parameters()
+        indexer_grads = self._filter_grads_for_norm(indexer_params)
+        non_indexer_grads = self._filter_grads_for_norm(non_indexer_params)
+        grad_stats_parallel_group = self.get_grad_stats_parallel_group()
+        indexer_grad_norm = get_grad_norm_fp32(
+            indexer_grads, grad_stats_parallel_group=grad_stats_parallel_group
+        )
+        non_indexer_grad_norm = get_grad_norm_fp32(
+            non_indexer_grads, grad_stats_parallel_group=grad_stats_parallel_group
+        )
+        return indexer_grad_norm, non_indexer_grad_norm
+
+    def get_last_dsa_split_grad_norms(self) -> Optional[Tuple[float, float]]:
+        """Return the last pre-clip DSA split grad norms, if separate clipping computed them."""
+        return self._last_dsa_split_grad_norms
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -458,6 +518,42 @@ class MegatronOptimizer(ABC):
                     use_decoupled_grad=self._uses_decoupled_grad(grouped_params),
                 )
         return grad_norm
+
+    def _maybe_store_dsa_split_grad_norms(self) -> None:
+        """Store pre-clip split grad norms for consistent logging when DSA groups exist."""
+        if not hasattr(self.optimizer, 'param_groups'):
+            return
+        if any(
+            param_group.get('is_dsa_indexer', False) for param_group in self.optimizer.param_groups
+        ):
+            self._last_dsa_split_grad_norms = self.get_dsa_split_grad_norms()
+
+    def clip_grad_norm_separate_dsa_indexer(self, clip_grad: float) -> float:
+        """Clip non-indexer and DSA indexer gradients with independent norms."""
+        indexer_params, non_indexer_params = self.get_dsa_split_parameters()
+        indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms()
+        self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
+
+        indexer_clip_grad = self.config.dsa_indexer_clip_grad
+
+        # Per group: _uses_decoupled_grad reads param_list[0], so the answer belongs to the
+        # parameters rather than to the config alone.
+        if non_indexer_params and clip_grad > 0.0:
+            clip_grad_by_total_norm_fp32(
+                non_indexer_params,
+                clip_grad,
+                non_indexer_grad_norm,
+                self._uses_decoupled_grad(non_indexer_params),
+            )
+        if indexer_params and indexer_clip_grad > 0.0:
+            clip_grad_by_total_norm_fp32(
+                indexer_params,
+                indexer_clip_grad,
+                indexer_grad_norm,
+                self._uses_decoupled_grad(indexer_params),
+            )
+
+        return math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
@@ -864,7 +960,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = 0.0
-        if self.config.clip_grad > 0.0:
+        self._last_dsa_split_grad_norms = None
+        if self.config.dsa_indexer_clip_grad is not None:
+            if self.config.clip_grad > 0.0 or self.config.dsa_indexer_clip_grad > 0.0:
+                grad_norm = self.clip_grad_norm_separate_dsa_indexer(self.config.clip_grad)
+        elif self.config.clip_grad > 0.0:
+            self._maybe_store_dsa_split_grad_norms()
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
@@ -1271,7 +1372,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        if step:
+        if step is not None:
             state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
@@ -1403,7 +1504,12 @@ class FP32Optimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = None
-        if self.config.clip_grad > 0.0:
+        self._last_dsa_split_grad_norms = None
+        if self.config.dsa_indexer_clip_grad is not None:
+            if self.config.clip_grad > 0.0 or self.config.dsa_indexer_clip_grad > 0.0:
+                grad_norm = self.clip_grad_norm_separate_dsa_indexer(self.config.clip_grad)
+        elif self.config.clip_grad > 0.0:
+            self._maybe_store_dsa_split_grad_norms()
             grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
@@ -1460,7 +1566,7 @@ class FP32Optimizer(MegatronOptimizer):
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        if step:
+        if step is not None:
             state_dict['state']['common_step'] = step
         return state_dict
 
@@ -1533,6 +1639,7 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
+        self._last_dsa_split_grad_norms = None
 
     @property
     def optimizer(self):
@@ -1559,6 +1666,17 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             params.extend(optimizer.get_parameters())
         return params
+
+    @override
+    def get_dsa_split_parameters(self) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
+        """Get optimizer-owned parameters split into DSA indexer and non-indexer buckets."""
+        indexer_params = []
+        non_indexer_params = []
+        for optimizer in self.chained_optimizers:
+            child_indexer_params, child_non_indexer_params = optimizer.get_dsa_split_parameters()
+            indexer_params.extend(child_indexer_params)
+            non_indexer_params.extend(child_non_indexer_params)
+        return indexer_params, non_indexer_params
 
     @property
     def state(self) -> ProxyDict:
@@ -1890,6 +2008,37 @@ class ChainedOptimizer(MegatronOptimizer):
             grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
         return grad_norm
 
+    @override
+    @torch.no_grad()
+    def get_dsa_split_grad_norms(self) -> Tuple[float, float]:
+        if len(self.chained_optimizers) == 1:
+            return self.chained_optimizers[0].get_dsa_split_grad_norms()
+        if self.grads_states_parallel_group_is_shared():
+            indexer_grads = []
+            non_indexer_grads = []
+            for optimizer in self.chained_optimizers:
+                child_indexer_params, child_non_indexer_params = (
+                    optimizer.get_dsa_split_parameters()
+                )
+                indexer_grads += optimizer._filter_grads_for_norm(child_indexer_params)
+                non_indexer_grads += optimizer._filter_grads_for_norm(child_non_indexer_params)
+            indexer_grad_norm = get_grad_norm_fp32(
+                indexer_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+            non_indexer_grad_norm = get_grad_norm_fp32(
+                non_indexer_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+        else:
+            indexer_norm_sq = 0.0
+            non_indexer_norm_sq = 0.0
+            for optimizer in self.chained_optimizers:
+                child_indexer_norm, child_non_indexer_norm = optimizer.get_dsa_split_grad_norms()
+                indexer_norm_sq += child_indexer_norm**2
+                non_indexer_norm_sq += child_non_indexer_norm**2
+            indexer_grad_norm = math.sqrt(indexer_norm_sq)
+            non_indexer_grad_norm = math.sqrt(non_indexer_norm_sq)
+        return indexer_grad_norm, non_indexer_grad_norm
+
     @torch.no_grad()
     def count_zeros(self):
         if self.grads_states_parallel_group_is_shared():
@@ -1980,7 +2129,15 @@ class ChainedOptimizer(MegatronOptimizer):
         if found_inf_flag:
             return False, None, None
 
-        grad_norm = self.get_grad_norm()
+        self._last_dsa_split_grad_norms = None
+        if self.config.dsa_indexer_clip_grad is not None:
+            indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms()
+            self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
+            grad_norm = math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
+        else:
+            if any(param_group.get('is_dsa_indexer', False) for param_group in self.param_groups):
+                self._last_dsa_split_grad_norms = self.get_dsa_split_grad_norms()
+            grad_norm = self.get_grad_norm()
         should_skip_update = False
 
         should_clip = any(
@@ -2008,7 +2165,24 @@ class ChainedOptimizer(MegatronOptimizer):
                 optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                 or use_fsdp_decoupled_grad
             )
-
+            if optimizer.config.dsa_indexer_clip_grad is not None:
+                indexer_clip_grad = optimizer.config.dsa_indexer_clip_grad
+                indexer_params, non_indexer_params = optimizer.get_dsa_split_parameters()
+                if non_indexer_params and optimizer.config.clip_grad > 0.0:
+                    clip_grad_by_total_norm_fp32(
+                        non_indexer_params,
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=non_indexer_grad_norm,
+                        use_decoupled_grad=use_decoupled_grad,
+                    )
+                if indexer_params and indexer_clip_grad > 0.0:
+                    clip_grad_by_total_norm_fp32(
+                        indexer_params,
+                        max_norm=indexer_clip_grad,
+                        total_norm=indexer_grad_norm,
+                        use_decoupled_grad=use_decoupled_grad,
+                    )
+                continue
             main_params = []
             params_by_grad_norm_group = {}
             for p in parameters:
