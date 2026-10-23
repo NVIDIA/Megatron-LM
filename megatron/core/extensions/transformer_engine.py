@@ -69,6 +69,9 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
+# Token alignment required by TE's grouped-tensor and fused grouped-MLP kernels.
+TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT = 256
+
 try:
     import transformer_engine as te
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
@@ -3480,6 +3483,11 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     f"activation_func={self.config.activation_func}, "
                     f"gated_linear_unit={self.config.gated_linear_unit}."
                 )
+            self._grouped_linear_kwargs = {}
+            if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
+                self._grouped_linear_kwargs["split_alignment"] = (
+                    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
+                )
 
         def _reset_fused_impl(self) -> None:
             """Discard both cached execution views."""
@@ -3556,6 +3564,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 bias=False,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+                **self._grouped_linear_kwargs,
             )
             op.weight0 = weight
             op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
@@ -3576,6 +3585,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 bias=False,
                 rng_state_tracker_function=rng_state_tracker_function,
                 accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+                **self._grouped_linear_kwargs,
             )
             op.weight0 = weight
             # FC2 has no SwiGLU — MXFP8 quantization done on-the-fly in fuser_forward.
@@ -3628,6 +3638,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             hidden_size = hidden_states.size(-1)
             hidden_states_2d = hidden_states.view(-1, hidden_size)
             total_tokens = hidden_states_2d.size(0)
+            if total_tokens % TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT != 0:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires the flattened token count to be "
+                    f"divisible by {TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT} for grouped MLP "
+                    f"fusion, but got {total_tokens}. "
+                    "Inputs must already be aligned; this module does not pad them."
+                )
 
             tokens_per_expert = torch.full(
                 (1,), total_tokens, dtype=torch.long, device=hidden_states.device
@@ -4091,18 +4108,33 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
     )
 
     try:
+        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+            mark_qb_bin_bounds_validated,
+        )
+    except ImportError:
+        mark_qb_bin_bounds_validated = None
+
+    try:
         _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
+        fused_topk_with_score_function_supports_qb = {
+            "qb_histogram",
+            "qb_bin_bounds",
+            "qb_histogram_mode",
+        }.issubset(_fused_topk_sig.parameters)
         fused_topk_with_score_function_supports_topk_indices = (
             "topk_indices" in _fused_topk_sig.parameters
         )
         del _fused_topk_sig
     except (TypeError, ValueError):
+        fused_topk_with_score_function_supports_qb = False
         fused_topk_with_score_function_supports_topk_indices = False
 
 else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+    fused_topk_with_score_function_supports_qb = False
+    mark_qb_bin_bounds_validated = None
     fused_topk_with_score_function_supports_topk_indices = False
 
 

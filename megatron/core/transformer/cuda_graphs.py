@@ -72,9 +72,9 @@ except ImportError:
 if HAVE_GTP:
     from megatron.core.tensor_parallel.gtp_api import (
         GTP_CONFIG,
-        GTPChain,
         get_rs_stream,
         initialize_graph_wgrad_rings,
+        is_graphed_chain,
         preserve_gtp_prefetch_state,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
@@ -84,7 +84,7 @@ else:
     # Placeholders so static analysis does not flag these GTP-only symbols as
     # possibly-used-before-assignment; every use site is guarded by HAVE_GTP /
     # gtp_remat at runtime.
-    GTPChain = None
+    is_graphed_chain = None
     GTP_CONFIG = None
     get_rs_stream = None
     initialize_graph_wgrad_rings = None
@@ -589,6 +589,7 @@ class _CudagraphGlobalRecord:
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
     _saved_tensors_observer = None
+    _te_capture_started = False
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -635,6 +636,13 @@ class _CudagraphGlobalRecord:
         try:
             return cls._create_cudagraphs()
         finally:
+            # A failed capture must not leave DDP hooks disabled for subsequent backwards.
+            if is_graph_capturing():
+                _set_warmup_end()
+                _set_capture_end()
+                if cls._te_capture_started:
+                    te_set_capture_end()
+                    cls._te_capture_started = False
             cls._disable_saved_tensors_observer()
 
     @classmethod
@@ -690,9 +698,20 @@ class _CudagraphGlobalRecord:
             GTP_CONFIG.check_param_states = False
             initialize_graph_wgrad_rings()
 
+        # Recording/warmup can keep AccumulateGrad nodes alive on the default stream.
+        # Match full-iteration capture: let autograd redirect those stale references to
+        # the capturing stream rather than introduce an illegal default-stream dependency.
+        # Intentionally leave this process-global setting enabled, as full-iteration capture
+        # does. The API has no getter for restoring its previous value; resetting it to False
+        # could disable an override enabled by another caller. It only affects capture-time
+        # stream handling, not ordinary eager backward.
+        if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
+            torch.autograd.graph.set_override_stale_capture_stream(True)
+
         _set_capture_start()
         if has_te_modules:
             te_set_capture_start()
+            cls._te_capture_started = True
 
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
 
@@ -764,6 +783,7 @@ class _CudagraphGlobalRecord:
         _set_capture_end()
         if has_te_modules:
             te_set_capture_end()
+            cls._te_capture_started = False
 
         torch.cuda.set_stream(torch.cuda.default_stream())
 
@@ -1107,19 +1127,10 @@ class _CudaGraphRunner(torch.nn.Module):
         if not self.finalized_during_bwd_capture:
             return
 
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        dense_group = pg_collection.gtp_remat
-        expert_group = pg_collection.expt_gtp_remat
-        params_by_group = defaultdict(list)
+        params_by_stream = defaultdict(list)
         for param in self.finalized_during_bwd_capture:
-            is_expert = not getattr(param, 'allreduce', True)
-            params_by_group[expert_group if is_expert else dense_group].append(param)
-        self._gtp_finalize_hook_plan = [
-            (get_rs_stream(GTPChain.GRAPHED.value, group), params)
-            for group, params in params_by_group.items()
-        ]
+            params_by_stream[get_rs_stream(param.chain_id, param.group)].append(param)
+        self._gtp_finalize_hook_plan = list(params_by_stream.items())
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -1386,9 +1397,9 @@ class _CudaGraphRunner(torch.nn.Module):
                         # by both capture ownership and chain keeps UNGRAPHED work on its eager
                         # lifecycle instead of turning it into a cross-graph handoff.
                         warmup_params, warmup_ag_streams, warmup_rs_streams = (
-                            warmup_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                            warmup_comms.get_comms_for_chains(is_graphed_chain)
                         )
-                        wait_async_comms(GTPChain.GRAPHED.value, params=warmup_params)
+                        wait_async_comms(graphed_only=True, params=warmup_params)
                         self._wait_side_streams(warmup_ag_streams)
                         self._wait_side_streams(warmup_rs_streams)
             _set_warmup_end()
@@ -1432,12 +1443,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.gtp_remat:
                         # Forward only issues AG prefetches. Drain the operations directly.
-                        captured_params, captured_ag_streams, _ = capture_comms.get_comms_for_chain(
-                            GTPChain.GRAPHED.value
+                        captured_params, captured_ag_streams, _ = (
+                            capture_comms.get_comms_for_chains(is_graphed_chain)
                         )
-                        wait_async_comms(
-                            GTPChain.GRAPHED.value, skip_rs=True, params=captured_params
-                        )
+                        wait_async_comms(graphed_only=True, skip_rs=True, params=captured_params)
                         self._wait_side_streams(captured_ag_streams)
 
                 if self.gtp_remat:
@@ -1591,10 +1600,10 @@ class _CudaGraphRunner(torch.nn.Module):
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
                 captured_params, captured_ag_streams, captured_rs_streams = (
-                    capture_comms.get_comms_for_chain(GTPChain.GRAPHED.value)
+                    capture_comms.get_comms_for_chains(is_graphed_chain)
                 )
                 # Phase 1: drain AG
-                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=captured_params)
+                wait_async_comms(graphed_only=True, skip_rs=True, params=captured_params)
                 self._wait_side_streams(captured_ag_streams)
 
                 # Release the next runner after AG drain but before RS drain.
@@ -1602,7 +1611,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 # Phase 2: in-graph RS drain + finalize.
                 wait_async_comms(
-                    GTPChain.GRAPHED.value, finalize_after_drain=True, params=captured_params
+                    graphed_only=True, finalize_after_drain=True, params=captured_params
                 )
                 self._wait_side_streams(captured_rs_streams)
 
