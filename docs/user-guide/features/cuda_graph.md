@@ -204,6 +204,13 @@ fixed-schedule, static-shape contract:
   cu_seqlens and masks may change while the realized group remains fixed.
 - Pipeline parallel send/recv use the static CP-local token capacity instead of the per-step
   variable-shape handshake.
+- With the interleaved schedule (VPP), every (model chunk, microbatch) pair owns its own static
+  slot, in chunk-major order (chunk `c`, microbatch `b` -> slot `c * num_microbatches + b`), and the
+  dynamic-CP certificate covers all of those slots. The packing scheduler aligns the microbatch
+  count to `microbatch_group_size_per_vp_stage`, so that aligned count must also stay constant.
+  Without `--no-overlap-p2p-communication` the interleaved schedule uses separate non-blocking
+  P2P sends and receives instead of the batched P2P path that the non-interleaved schedule
+  captures.
 - Validation/eval runs eager: a dedicated fixed-shape validation graph is not implemented yet.
 
 ---
