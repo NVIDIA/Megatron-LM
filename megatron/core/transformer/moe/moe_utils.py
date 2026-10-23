@@ -767,6 +767,11 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
 
     Returns:
         torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
+
+    Raises:
+        RuntimeError: If an expert is routed more than ``num_tokens - num_to_pad`` tokens, so
+            there are not enough zeros left in its row to reach the next multiple of
+            pad_multiple.
     """
     # Work on a copy because fused router autograd saves the returned routing
     # map for backward. Padding a transposed view in place would increment the
@@ -776,6 +781,15 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     # Calculate how many tokens need to be padded for each expert
     num_ones = routing_map.sum(dim=1)
     num_to_pad = (-num_ones) % pad_multiple
+
+    # Each expert can only be padded with the zeros left in its row. Without this check an
+    # expert that needs more padding than that is silently returned with an unaligned count.
+    # _assert_async keeps the check off the host so it does not add a device synchronization.
+    torch._assert_async(
+        torch.all(num_ones + num_to_pad <= routing_map.shape[1]),
+        "pad_routing_map: not enough tokens to pad every expert's token count to a multiple "
+        f"of {pad_multiple}",
+    )
 
     # Find the positions of zeros in each row and their ranks
     is_zero = routing_map == 0
