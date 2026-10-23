@@ -3143,9 +3143,9 @@ def _add_distributed_args(parser):
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
     group.add_argument('--megatron-fsdp-record-prefetch-order', action='store_true',
-                       help='Record module call order once per training or validation schedule '
-                       'and replay it for parameter prefetch. Requires Megatron-FSDP v2, '
-                       'eager execution, and a repeatable module call pattern.')
+                       help='Record one complete training iteration and replay its module call '
+                       'order for parameter prefetch. Requires Megatron-FSDP v2, eager '
+                       'execution, and a repeatable module call pattern.')
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',
