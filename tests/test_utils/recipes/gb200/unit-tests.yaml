@@ -76,6 +76,8 @@ spec:
 # GB200 selection is marker-driven. find_test_cases.py excludes dedicated
 # buckets from the catch-all bucket, so each marked test runs only once.
 # Keep M2N in a separate process: NCCL caches the test fixture's transport settings.
+# Keep inference in a separate process: the MFSDP v2 fixtures select the NCCL
+# symmetric-memory backend process-wide, and the NVLS dispatcher needs the CUDA backend.
 products:
   - test_case: [tests/unit_tests/**/*.py]
     products:
@@ -85,6 +87,13 @@ products:
         n_repeat: [1]
         time_limit: [1800]
   - test_case: [tests/unit_tests/resharding/test_nccl_m2n_copy_service.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/**/*.py]
     products:
       - environment: [dev]
         tag: [latest]
