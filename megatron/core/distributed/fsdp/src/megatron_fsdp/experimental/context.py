@@ -92,6 +92,16 @@ class FsdpContext:
         self._module_names = WeakKeyDictionary()
         self.parameter_to_owner = parameter_to_owner
         self._is_finalized = False
+        # The two overlap options independently split streams from the inner
+        # reduction stream. With (overlap_allgather_reduction,
+        # overlap_outer_communication), the assignments are:
+        #   (False, False): all-gather and both reductions share one stream.
+        #   (True, False):  all-gather is separate; both reductions share a stream.
+        #   (False, True):  all-gather and inner reduction share; outer is separate.
+        #   (True, True):   all-gather, inner reduction, and outer reduction each
+        #                  have a separate stream.
+        # Outer all-gather separation is not implemented yet; the outer option
+        # currently affects only reduction.
         self.inner_reduction_stream = torch.cuda.Stream(device)
         self.allgather_stream = (
             torch.cuda.Stream(device)
