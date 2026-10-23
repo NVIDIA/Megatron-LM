@@ -458,8 +458,8 @@ class FsdpParameterGroup:
         never waits for a later prefetch when its weights are already available.
         """
         phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
-        phases = tuple(p for p in phases if p not in self._unshard_events)
-        if not phases:
+        missing_phases = tuple(p for p in phases if p not in self._unshard_events)
+        if not missing_phases:
             return
 
         if self._model_weight_is_stale:
@@ -473,21 +473,21 @@ class FsdpParameterGroup:
             # Reinstall so parameters see the latest optimizer update; MXFP8 padded
             # scales are copies.
             self._install_unsharded_parameters(self.model_weight)
-            phases = (Phase.FORWARD, Phase.BACKWARD)
+            missing_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(unsharded_model_weight, DBuffer):
             self._materialize_unsharded_model_weight()
             self._install_unsharded_parameters(unsharded_model_weight)
-            phases = (Phase.FORWARD, Phase.BACKWARD)
+            missing_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
-            rowwise = Phase.FORWARD in phases
-            columnwise = Phase.BACKWARD in phases
+            rowwise = Phase.FORWARD in missing_phases
+            columnwise = Phase.BACKWARD in missing_phases
             self._materialize_unsharded_model_weight(rowwise=rowwise, columnwise=columnwise)
             self._install_unsharded_parameters(
                 unsharded_model_weight, rowwise=rowwise, columnwise=columnwise
             )
         self._switch_to_unsharded_parameters()
         event = torch.cuda.current_stream().record_event()
-        for ready_phase in phases:
+        for ready_phase in missing_phases:
             self._unshard_events[ready_phase] = event
 
     def wait_for_unshard(self, phase: Phase | None) -> None:
