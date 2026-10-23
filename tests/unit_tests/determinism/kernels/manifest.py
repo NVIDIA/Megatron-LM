@@ -151,7 +151,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            "tests/unit_tests/models/test_gpt_model_batch_invariant.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
@@ -732,7 +736,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/multi_latent_attention.py",
             "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py",
         ),
-        tests=(K + "test_fused_triton_kernels.py", K + "test_te_wrappers.py"),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            K + "test_te_wrappers.py",
+            "tests/unit_tests/models/test_gpt_model_batch_invariant.py",
+        ),
         kind="dispatch",
         notes="Calls the Triton MLA YaRN RoPE kernels (fused_apply_mla_rope_for_q / _kv, replayed in "
         "test_fused_triton_kernels.py), TE fused RoPE and TE's fused MLA key/value RoPE + MXFP8 "
