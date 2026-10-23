@@ -19,15 +19,26 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_pg_size, log_single_rank
-from megatron.training.global_vars import get_args, get_run_config, get_tokenizer
+from megatron.training.global_vars import (
+    get_args,
+    get_run_config,
+    get_tokenizer,
+    get_train_state,
+)
 from megatron.training.utils import print_rank_0
 
 from ..inference.inference_interface import (
     InferenceRequest,
     InferenceResponse,
     LLMChatMessage,
-    ReturnsRaw,
     ReturnsTokens,
+)
+from ..rollout_bank import (
+    FinishedRequestLedgerWriter,
+    LedgerPayloadStager,
+    gather_view,
+    request_record_backup_path,
+    resolve_bank_dir,
 )
 from ..server.api import InferenceServer
 
@@ -76,7 +87,7 @@ def resolve_generation_lag(
     return generation_lag
 
 
-class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
+class MegatronLocal(InferenceServer, ReturnsTokens):
     """Interface to use MCoreEngine directly as an inference engine."""
 
     host: str
@@ -86,6 +97,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _generation_lag: float = PrivateAttr(None)
     _openai_client: AsyncOpenAI = PrivateAttr(None)
+    _request_record_backup_dir: str | None = PrivateAttr(None)
 
     @property
     def generation_lag(self) -> float:
@@ -113,25 +125,20 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             extra_body={
                 "skip_prompt_log_probs": True,
                 "add_BOS": (not cfg.rl.rl_skip_bos_token and tokenizer.bos is not None),
-                # TODO: These are non-standard fields that add significant memory overheads to the
-                # chat completions payload. return_raw_text also wastes a lot of CPU cycles
-                # detokenizing prompt tokens, especially expensive for long prompts in agentic RL.
-                # Set to False if not needed in MRL.
-                "return_tokenized_data": True,
-                "return_raw_text": True,
+                "return_raw_text": False,
             },
         )
 
         choice = response.choices[0]
 
+        # The API response only carries the text; token IDs and logprobs are staged in the engine.
         return InferenceResponse(
             # TODO: Handle tool calls and reasoning in LLMChatMessage
             response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
-            raw_text=choice.message.raw_text,
-            token_ids=choice.message.prompt_token_ids + choice.message.generation_token_ids,
-            logprobs=choice.message.generation_log_probs,
+            token_ids=None,
+            logprobs=None,
             finish_reason=choice.finish_reason,
-            prompt_length=len(choice.message.prompt_token_ids),
+            prompt_length=None,
             completion_id=response.id,
         )
 
@@ -156,7 +163,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
-        inference_engine.local_metadata_ledger_enabled = True
         if inference_engine.context.config.disaggregation_shards is not None:
             print_rank_0(
                 "WARNING: disaggregated RL generation-lag autotuning and HTTP concurrency "
@@ -173,6 +179,16 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 dp_size=get_pg_size(inference_engine.pg_collection.dp),
                 max_requests=inference_engine.context.max_requests,
             )
+        bank_dir = writer = None
+        if cfg.rl.rl_durable_rollout_bank:
+            # Need to copy the staged payloads into the durable bank.
+            bank_dir = resolve_bank_dir(cfg.rl.rl_rollout_bank_dir, args.save)
+            writer = FinishedRequestLedgerWriter(
+                request_record_backup_path(
+                    bank_dir, dist.get_rank(), get_train_state().iteration
+                )
+            )
+        inference_engine.payload_stager = LedgerPayloadStager(writer)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -203,6 +219,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server._client = client
         launched_server._inference_engine = inference_engine
         launched_server._generation_lag = generation_lag
+        launched_server._request_record_backup_dir = bank_dir
 
         concurrency_limit = (
             get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
@@ -238,6 +255,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.stop_engines()
         await self._inference_engine.wait_until(EngineState.STOPPED)
 
+        writer = self._inference_engine.payload_stager.writer
+        if writer is not None:
+            writer.close()
+
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()
             self._client.stop()
@@ -261,18 +282,40 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.suspend_engines()
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
-    def merge_global_request_ledgers(self) -> dict[str, FinishedRequestRecord]:
-        """Union every engine's local-metadata ledger and clear them."""
-        engine = self._inference_engine
-        local, engine.local_metadata_ledger = engine.local_metadata_ledger, {}
-        shards = [None] * dist.get_world_size()
-        dist.all_gather_object(shards, local)
+    def merge_global_request_ledgers(
+        self, rotate_to: int | None = None
+    ) -> dict[str, FinishedRequestRecord]:
+        """Drain every engine's staged records into rank 0 (a gather over the world).
+
+        Routing indices and prompt log probs stay on the owning rank (its durable backup holds
+        them); the gathered record carries the token ids, generated log probs and stamps.
+
+        Args:
+            rotate_to: New window for the writer to point to after the drain,
+                so that the drained records can be flushed to a durable backup.
+
+        Returns:
+            The union of every engine's records on rank 0; an empty dict elsewhere.
+        """
+        stager = self._inference_engine.payload_stager
+        drained = stager.drain()
+        if rotate_to is not None and stager.writer is not None:
+            stager.writer.rotate(
+                request_record_backup_path(
+                    self._request_record_backup_dir, dist.get_rank(), rotate_to
+                )
+            )
+        local = {uid: gather_view(record) for uid, record in drained.items()}
+        shards = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(local, shards, dst=0)
+        if shards is None:
+            return {}
         merged: dict[str, FinishedRequestRecord] = {}
         for shard in shards:
             merged.update(shard)
-        assert len(merged) == sum(len(shard) for shard in shards), (
-            "finished-request ledger: duplicate uids across engine ledgers"
-        )
+        assert len(merged) == sum(
+            len(shard) for shard in shards
+        ), "finished-request ledger: duplicate uids across engine ledgers"
         return merged
 
     async def resume(self):

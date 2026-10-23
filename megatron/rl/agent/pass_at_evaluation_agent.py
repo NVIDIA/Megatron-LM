@@ -62,12 +62,9 @@ class PassAtEvaluationAgent(EvaluationAgent, ABC):
         evaluations = [self._evaluation(prompt, golden, request) for _ in range(self.max_k)]
         responses = await asyncio.gather(*evaluations)
 
-        rewards = [
-            result.reward for result in sum([response.results for response in responses], [])
-        ]
-        response_texts = [
-            result.response for result in sum([response.results for response in responses], [])
-        ]
+        results = sum([response.results for response in responses], [])
+        rewards = [result.reward for result in results]
+        response_texts = [result.response for result in results]
 
         # Count number of passing solutions (reward == 1.0)
         pass_count = sum(1 for reward in rewards if reward == 1.0)
@@ -96,5 +93,7 @@ class PassAtEvaluationAgent(EvaluationAgent, ABC):
             reward=rewards,
             greedy_response=greedy_response.response,
             greedy_reward=greedy_response.reward,
+            completion_ids=[cid for result in results for cid in result.completion_ids]
+            + greedy_response.completion_ids,
         )
         return PassAtEvaluationResponse(results=[result], env_id=self.env_id)
