@@ -546,10 +546,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
 
-        if self.num_attention_layers == 0:
+        # A hybrid model can hold no attention layer on a pipeline stage (e.g. the stage
+        # `M-` of the pattern `M*-|M-`), or on any stage. Such a stage stores no KV, but it
+        # keeps the same block tables as the other stages: every stage admits requests and
+        # assigns blocks alike. Size its blocks as if it held one attention layer, so the
+        # block count and the pipeline MIN below are computed as on any other stage; its KV
+        # buffer has no layers, so the blocks reserve no memory.
+        if self.num_attention_layers == 0 and not self.is_hybrid_model:
             raise NotImplementedError(
                 f"Using `DynamicInferenceContext` with no attention is not supported."
             )
+        kv_block_layer_count = max(self.num_attention_layers, 1)
 
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
@@ -559,7 +566,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
             self.block_size_bytes = (
                 kv_dtype_size_bytes
-                * self.num_attention_layers
+                * kv_block_layer_count
                 * self.block_size_tokens
                 * self.kv_reduced_dim
             )
@@ -567,7 +574,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.block_size_bytes = (
                 kv_dtype_size_bytes
                 * 2  # key, value
-                * self.num_attention_layers
+                * kv_block_layer_count
                 * self.block_size_tokens
                 * self.num_attention_heads_per_partition
                 * self.hidden_size_per_attention_head
