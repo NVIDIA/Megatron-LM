@@ -1109,6 +1109,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        scoring_precision="bf16",
     ):
         seen["q_shape"] = q_bshd.shape
         seen["k_shape"] = k_bsd.shape
@@ -1256,6 +1257,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         packed_max_seqlen_q=None,
         packed_max_seqlen_k=None,
         packed_cp_size=1,
+        scoring_precision="bf16",
     ):
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
@@ -3094,3 +3096,52 @@ def test_cudnn_split_real_kernel_packed_cp_varlen_matches_reference():
     ref_output, ref_loss = _reference_absorbed_output_and_sparse_loss(case, topk_indices)
     _assert_similarity(fused_output, ref_output, eps=5e-3)
     torch.testing.assert_close(fused_loss, ref_loss, rtol=5e-2, atol=5e-3)
+
+
+def test_global_row_bf16_rounds_fp32_carriers():
+    """Global-row BF16 scoring rounds FP32 carriers to BF16, matching the dense path.
+
+    Regression for dsa_indexer_rope_fp32 producing FP32 q/k while scoring stays BF16: the
+    global-row (varlen/chunked) path must round to BF16 like the dense _indexer_forward path,
+    and must rebuild a cached FP32 ``k_bdk`` from the rounded key. Pure-torch, no cuDNN.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for DSA indexer scoring tests")
+    from megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels import (
+        _compute_indexer_scores_chunk_with_global_rows,
+    )
+
+    # One head / one dim; q=k=1.001 rounds to 1.0 in BF16, so the score is 1.0 (FP32 ~1.002).
+    q = torch.full((1, 1, 1, 1), 1.001, dtype=torch.float32, device="cuda")
+    k = torch.full((1, 1, 1, 1), 1.001, dtype=torch.float32, device="cuda")
+    w = torch.ones((1, 1, 1), dtype=torch.float32, device="cuda")
+    seq_lens = torch.ones(1, dtype=torch.int64, device="cuda")
+    expected = torch.ones((1, 1, 1), dtype=torch.float32, device="cuda")
+
+    # (a) no precomputed cache
+    scores = _compute_indexer_scores_chunk_with_global_rows(
+        q,
+        k,
+        w,
+        row_start=0,
+        indexer_ratio=1,
+        sm_scale=1.0,
+        seq_lens=seq_lens,
+        scoring_precision="bf16",
+    )
+    torch.testing.assert_close(scores, expected)
+
+    # (b) a stale FP32 k_bdk cache built from the original (unrounded) key must be rebuilt
+    k_bdk_fp32 = k[:, :, 0, :].to(torch.float32).transpose(1, 2).contiguous()
+    scores_cached = _compute_indexer_scores_chunk_with_global_rows(
+        q,
+        k,
+        w,
+        row_start=0,
+        indexer_ratio=1,
+        sm_scale=1.0,
+        seq_lens=seq_lens,
+        k_bdk=k_bdk_fp32,
+        scoring_precision="bf16",
+    )
+    torch.testing.assert_close(scores_cached, expected)
