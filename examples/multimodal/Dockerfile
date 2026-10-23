@@ -1,6 +1,7 @@
 # Base image: NVIDIA PyTorch container with CUDA, cuDNN, NCCL, Python, and uv pre-installed
 FROM nvcr.io/nvidia/pytorch:25.12-py3
 ARG UV_VERSION=0.13.5
+ENV PATH="/root/.local/bin:$PATH"
 
 # Install JRE for pycocoevalcap
 RUN apt-get update && \
