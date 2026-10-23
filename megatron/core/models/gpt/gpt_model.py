@@ -31,13 +31,20 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType, ModelType
+from megatron.core.transformer.forward_sharing import (
+    forward_sharing_lifetime,
+    is_forward_sharing_enabled,
+)
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
-    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -668,96 +675,108 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             output_processor_context (Any, optional): User-defined context object forwarded to
                 `output_processor`.
         """
-        if self.config.fine_grained_activation_offloading:
-            self.preprocess_for_fine_grained_offloading()
 
-        if self.config.moe_paged_stash:
-            self.preprocess_for_paged_stash()
+        sharing_lifetime = nullcontext()
+        if is_forward_sharing_enabled(self.config):
+            sharing_lifetime = forward_sharing_lifetime(
+                packed_seq_params, attention_mask, self.config
+            )
+        with sharing_lifetime:
+            if self.config.fine_grained_activation_offloading:
+                self.preprocess_for_fine_grained_offloading()
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+            if self.config.moe_paged_stash:
+                self.preprocess_for_paged_stash()
 
-        preproc_output = self._preprocess(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            decoder_input=decoder_input,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-        )
+            inference_context = deprecate_inference_params(inference_context, inference_params)
+            # MTP sequence-roll preparation operates on the unsharded batch layout. Keep
+            # the raw routing mask while _preprocess separately scatters the decoder's
+            # copy when sequence parallelism is enabled.
+            mtp_padding_mask = padding_mask
 
-        # Under sequence parallelism the pre-process scatters the padding mask along the sequence
-        # for the decoder (whose hidden states are scattered). The post-process keeps the caller's
-        # full-length mask: the MTP rolls it alongside input_ids / position_ids, and its MoE
-        # layers re-align it to their hidden states themselves.
-        (
-            decoder_input,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            decoder_padding_mask,
-        ) = preproc_output[:6]
-
-        rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
-
-        # Pass input_ids to decoder for hash-based MoE routing
-        decoder_extra_block_kwargs = dict(extra_block_kwargs or {})
-        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
-            decoder_extra_block_kwargs['input_ids'] = input_ids
-
-        # Run decoder.
-        backbone_context = (
-            torch.no_grad()
-            if self.config.freeze_base_model_for_mtp and self.training
-            else nullcontext()
-        )
-        with backbone_context:
-            decoder_output = self.decoder(
-                hidden_states=decoder_input,
-                attention_mask=attention_mask,
+            preproc_output = self._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
                 inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
+
+            # Under sequence parallelism the pre-process scatters the padding mask along the
+            # sequence for the decoder (whose hidden states are scattered). The post-process keeps
+            # the caller's full-length mask: the MTP rolls it alongside input_ids / position_ids,
+            # and its MoE layers re-align it to their hidden states themselves.
+            (
+                decoder_input,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+                decoder_padding_mask,
+            ) = preproc_output[:6]
+
+            rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
+
+            # Pass input_ids to decoder for hash-based MoE routing
+            decoder_extra_block_kwargs = dict(extra_block_kwargs or {})
+            if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+                decoder_extra_block_kwargs['input_ids'] = input_ids
+
+            # Run decoder.
+            backbone_context = (
+                torch.no_grad()
+                if self.config.freeze_base_model_for_mtp and self.training
+                else nullcontext()
+            )
+            with backbone_context:
+                decoder_output = self.decoder(
+                    hidden_states=decoder_input,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    rotary_pos_cos_sin=rotary_pos_cos_sin,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    padding_mask=decoder_padding_mask,
+                    **decoder_extra_block_kwargs,
+                )
+
+            if isinstance(decoder_output, tuple):
+                # With mHC + MTP, preserve the pre-contraction streams for MTP on
+                # the final decoder stage, including pipeline-parallel models.
+                hidden_states, mhc_multistream = decoder_output
+            else:
+                hidden_states = decoder_output
+                mhc_multistream = None
+
+            return self._postprocess(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
-                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                mtp_in_postprocess=self.mtp_process,
+                loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                mtp_padding_mask=mtp_padding_mask,
+                inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                padding_mask=decoder_padding_mask,
-                **decoder_extra_block_kwargs,
+                runtime_gather_output=runtime_gather_output,
+                extra_block_kwargs=extra_block_kwargs,
+                inference_context=inference_context,
+                mhc_multistream=mhc_multistream,
+                output_processor=output_processor,
+                output_processor_context=output_processor_context,
             )
-
-        if isinstance(decoder_output, tuple):
-            # With mHC + MTP, preserve the pre-contraction streams for MTP on
-            # the final decoder stage, including pipeline-parallel models.
-            hidden_states, mhc_multistream = decoder_output
-        else:
-            hidden_states = decoder_output
-            mhc_multistream = None
-
-        return self._postprocess(
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            labels=labels,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            mtp_in_postprocess=self.mtp_process,
-            loss_mask=loss_mask,
-            mtp_input_mask=mtp_input_mask,
-            decoder_input=decoder_input,
-            attention_mask=attention_mask,
-            padding_mask=padding_mask,
-            inference_params=inference_params,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            runtime_gather_output=runtime_gather_output,
-            extra_block_kwargs=extra_block_kwargs,
-            inference_context=inference_context,
-            mhc_multistream=mhc_multistream,
-            output_processor=output_processor,
-            output_processor_context=output_processor_context,
-        )
 
     def _postprocess(
         self,
@@ -774,6 +793,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         decoder_input=None,
         attention_mask=None,
         padding_mask=None,
+        mtp_padding_mask=None,
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
@@ -783,6 +803,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         mhc_multistream=None,
         output_processor=None,
         output_processor_context=None,
+        sequence_roll_context=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -803,50 +824,54 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
         mtp_cp_group = None
-        sequence_roll_context = None
         if (
             self.config.mtp_num_layers
             and (mtp_in_postprocess or self.post_process)
             and not (in_inference_mode or is_spec_decode)
         ):
             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
-            # Build layout-specific metadata once, then fetch every locally owned
-            # MTP field's compact successor rows in one grouped operation. The extra
-            # row covers RL's initial label derivation before the per-layer rolls.
-            sequence_roll_tokens = input_ids if input_ids is not None else labels
-            sequence_roll_context = prepare_mtp_sequence_roll_context(
-                tensor=sequence_roll_tokens,
-                cp_group=mtp_cp_group,
-                packed_seq_params=packed_seq_params,
-            )
-            if sequence_roll_context is not None:
-                roll_position_ids = mtp_in_postprocess and getattr(
-                    self.embedding, "add_position_embedding", True
+            if sequence_roll_context is None:
+                # Build layout-specific metadata once, then prepare every locally owned
+                # MTP field for absolute sequence-roll access in one grouped operation.
+                sequence_roll_context = prepare_mtp_sequence_roll_context(
+                    tensor=input_ids if input_ids is not None else labels,
+                    cp_group=mtp_cp_group,
+                    packed_seq_params=packed_seq_params,
                 )
-                roll_padding_mask = padding_mask if mtp_in_postprocess else None
+                # Absolute rows cover none of a conditioning mask or the contiguous
+                # attention CP layout; their consumers keep the cumulative-roll path.
                 if (
-                    roll_padding_mask is not None
-                    and self.config.sequence_parallel
-                    and roll_padding_mask.shape != sequence_roll_tokens.shape
+                    sequence_roll_context is not None
+                    and mtp_input_mask is None
+                    and getattr(self.config, "attention_cp_layout", None) != "contiguous"
                 ):
-                    roll_padding_mask = tensor_parallel.gather_from_sequence_parallel_region(
-                        roll_padding_mask.transpose(0, 1).contiguous(),
-                        tensor_parallel_output_grad=False,
-                        group=self.pg_collection.tp,
-                    ).transpose(0, 1)
-                sequence_roll_context = sequence_roll_context.prefetch_halos(
-                    width=self.config.mtp_num_layers + 1,
-                    input_ids=(
+                    roll_position_ids = mtp_in_postprocess and getattr(
+                        self.embedding, "add_position_embedding", True
+                    )
+                    fields = []
+                    input_source = (
                         input_ids
                         if mtp_in_postprocess or (self.post_process and labels is None)
                         else None
-                    ),
-                    position_ids=position_ids if roll_position_ids else None,
-                    labels=labels if self.post_process else None,
-                    loss_mask=loss_mask if self.post_process else None,
-                    padding_mask=roll_padding_mask,
-                    mtp_input_mask=mtp_input_mask if mtp_in_postprocess else None,
-                )
+                    )
+                    if input_source is not None:
+                        fields.append(MTPSequenceRollField("input_ids", input_source, -1, 0, 0))
+                    if roll_position_ids and position_ids is not None:
+                        fields.append(MTPSequenceRollField("position_ids", position_ids, -1, 0, 0))
+                    if self.post_process and labels is not None:
+                        fields.append(MTPSequenceRollField("labels", labels, -1, 0, 0))
+                    if self.post_process and loss_mask is not None:
+                        fields.append(MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0))
+                    if mtp_in_postprocess and mtp_padding_mask is not None:
+                        fields.append(
+                            MTPSequenceRollField("padding_mask", mtp_padding_mask, -1, 0, True)
+                        )
+                    max_offset = self.config.mtp_num_layers + int(
+                        self.post_process and labels is None
+                    )
+                    sequence_roll_context = sequence_roll_context.prepare_fields(
+                        fields, max_offset=max_offset
+                    )
 
         # logits and loss
         output_weight = None
@@ -868,6 +893,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 sequence_roll_context=sequence_roll_context,
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
+                sequence_roll_padding_mask=mtp_padding_mask,
                 embedding=self.embedding,
                 mtp_input_mask=mtp_input_mask,
                 **(extra_block_kwargs or {}),

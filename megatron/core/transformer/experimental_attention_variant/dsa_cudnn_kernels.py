@@ -5,17 +5,26 @@
 from __future__ import annotations
 
 import functools
+import gc
+import inspect
 import logging
+import math
+import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
 from torch import Tensor
 
+from megatron.core.quantization import indexer_quantization
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_deepgemm_scorer,
+    dsa_deepselect_topk,
     dsa_indexer_loss,
     dsa_layout,
     dsa_masking,
+    dsa_topk_zero_ties,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
     FUSED_INDEXER_MAX_SAFE_ROWS,
@@ -26,6 +35,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan i
     IndexerScoringPlan,
     report_unfused_scoring_once,
     resolve_indexer_scoring_plan,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_topk_zero_ties import (
+    ZERO_TIE_SENTINEL,
+    select_lowest_index_zero_ties,
 )
 from megatron.core.utils import (
     filter_kwargs_for_callable,
@@ -50,9 +63,19 @@ class CudnnDsaInterface(Protocol):
     """
 
     def indexer_top_k_wrapper(
-        self, scores: Tensor, seq_lens: Tensor, top_k: int, next_n: int, return_val: bool
+        self,
+        scores: Tensor,
+        seq_lens: Tensor,
+        top_k: int,
+        next_n: int,
+        return_val: bool,
+        tie_break: int = 0,
     ) -> dict:
-        """Select the top-``top_k`` key indices (and optional scores) per query row."""
+        """Select the top-``top_k`` key indices (and optional scores) per query row.
+
+        ``tie_break`` (cuDNN frontend >= 1.31 only) picks among equal radix keys at the
+        cutoff: 0 arbitrary, 1 lowest source column, 2 highest source column.
+        """
 
     def indexer_forward_wrapper(
         self,
@@ -81,6 +104,7 @@ class CudnnDsaInterface(Protocol):
         loss_coeff: float,
         grad_loss: Tensor,
         block_I: int,
+        topk_indices_global: bool = False,
     ) -> dict:
         """Backprop the sparse (top-k) indexer KL loss to the indexer q/k/weights."""
 
@@ -123,6 +147,8 @@ class CudnnDsaInterface(Protocol):
         indices: Tensor,
         softmax_scale: float,
         topk_length: Tensor,
+        deterministic: bool = False,
+        workspace: Optional[Tensor] = None,
     ) -> dict:
         """Backprop FlashMLA sparse attention to query and compressed KV (``"dq"``/``"dkv"``)."""
 
@@ -139,21 +165,154 @@ class CudnnDsaInterface(Protocol):
     ) -> dict:
         """Recompute the head-summed sparse attention target over the top-k keys."""
 
+    def sparse_indexer_score_recompute_wrapper(
+        self,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        topk_indices: Tensor,
+        qhead_per_kv_head: Optional[int] = None,
+        topk_length: Optional[Tensor] = None,
+        topk_indices_global: bool = False,
+    ) -> dict:
+        """FP32 softmax over the selected keys of ``sum_h relu(q_h . k) * w_h`` (``"predict"``).
+
+        Without ``topk_length`` slots with a negative index are masked; the top-k must be a
+        multiple of 128.
+        """
+
 
 _cudnn_dsa: Optional[CudnnDsaInterface] = None
+# Every cudnn-frontend DSA entry point MCore calls; _ensure_dsa_namespace resolves them all.
+_CUDNN_DSA_ENTRY_POINTS = (
+    "indexer_forward_wrapper",
+    "indexer_top_k_wrapper",
+    "indexer_backward_wrapper",
+    "sparse_attention_backward_wrapper",
+    "SparseAttentionBackward",
+    "sparse_attn_score_recompute_wrapper",
+    "dense_attn_score_recompute_wrapper",
+    "dense_indexer_backward_wrapper",
+    "sparse_indexer_score_recompute_wrapper",
+)
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
-_TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
+# cuDNN radix top-k allocates an int32 scratch of ``rows x 2 x num_cols`` per launch. 8 GiB is
+# 1024 rows per launch at 1M keys (4.3 waves of CTAs on GB300 instead of 256 rows), which
+# measured 20.85 -> 14.24 ms per 1M CP64 rank-0 call; at 128K it fits all 4096 rows in one launch.
+# The scratch is transient but needs this much spare memory, eagerly and inside a CUDA graph
+# pool, for every call whose FP32 scores exceed 1 GiB (rows x cols > 2**28): it is
+# min(8 GiB, twice the score buffer the caller already holds), so e.g. a 32K CP1 call (4 GiB of
+# scores) also takes 8 GiB where it took 2 GiB. Headroom was checked for GLM-5.2 1M CP64 and
+# 128K CP32 only; the toolkit's GLM-5.3-flash recipes (4K, CP1) stay far below 1 GiB of scores.
+_TOPK_WRAPPER_MAX_SCRATCH_BYTES = 8 * 1024 * 1024 * 1024
 _TOPK_WRAPPER_SCRATCH_INT32_FACTOR = 2
-_TOPK_WRAPPER_ROW_ALIGNMENT = 512
+# The frontend indexes that scratch with int32: one launch may hold at most 2**31 elements, so
+# the highest scratch index is 2**31 - 1 (FE 1.21.1 has no internal split). The limit is on
+# elements, not rows, so short rows still get large launches. At 1M keys the 8 GiB budget hits
+# exactly 2**31 elements (1024 rows). That deliberately takes FE >= 1.31's own split branch
+# (it splits only above 2**31 - 1 elements, into ``(2**31 - 1) // (2 * cols) + 1`` = 1024 rows,
+# i.e. the same single 2**31-element buffer); both FE 1.21.1 and FE 1.31 were validated exact
+# there (jobs 4629521, 4629523). 2**31 - 1 would cost a 17th launch per 1M rank-0 call.
+_TOPK_WRAPPER_MAX_SCRATCH_INT32_ELEMENTS = 2**31
+# The compiled kernel assumes a 32-byte aligned score base pointer; chunk starts keep it.
+_TOPK_WRAPPER_INPUT_ALIGNMENT_BYTES = 32
+_DETERMINISTIC_TOPK_REPAIR_MAX_BYTES = 512 * 1024 * 1024
 _INDEXER_SCORE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _INDEXER_SCORE_CHUNK_ROW_ALIGNMENT = 512
 _DENSE_ATTN_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _FLASH_MLA_REQUIRED_VALUE_DIM = 512
 _CUDA_GRID_Y_MAX = 65535
 _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS = 32768
+_DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES = 256 * 1024 * 1024
+_DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS = frozenset((16, 32, 64, 96, 128))
+_DETERMINISTIC_SPARSE_BWD_WORKSPACES: dict[tuple[torch.device, int], Tensor] = {}
+# First cuDNN frontend release whose dense DSA kernels default to a zero (top-left)
+# q_causal_offset instead of the legacy bottom-right alignment.
+_TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION = (1, 29)
+# First cuDNN frontend release whose varlen radix top-k never reads past a row's length.
+_TOPK_OOB_LANE_GUARD_FE_VERSION = (1, 29)
+# First cuDNN frontend release whose radix top-k takes ``tie_break`` (1: the lowest source
+# columns among copies of the cutoff key). FE 1.21.1 has no such parameter.
+_TOPK_TIE_BREAK_FE_VERSION = (1, 31)
+_TOPK_LOWEST_INDEX_TIE_BREAK = 1
+_NAMED_PARAMETER_CACHE: dict[int, tuple[object, frozenset]] = {}
+_CLEAN_LOGITS_UNAVAILABLE_LOGGED = False
+_MXFP8_SCORER_HEAD_COUNTS = frozenset((32, 64))
+_MXFP8_SCORER_HEAD_DIM = 128
+_MXFP8_SCORER_MIN_SM_MAJOR = 10
+_MXFP8_SCORER_WRAPPER_PARAMETERS = (
+    "precision",
+    "q_scale",
+    "k_scale",
+    "cu_seqlens_q_scale_padded",
+    "cu_seqlens_k_scale_padded",
+    "sf_vec_size",
+)
+_MXFP8_SF_VEC_SIZE = 32
+# cuDNN's sparse indexer score recompute tiles the top-k by 128 keys.
+_SPARSE_INDEXER_RECOMPUTE_TOPK_ALIGNMENT = 128
+# Row granularity of DeepGEMM scorer chunks (see _deepgemm_row_chunks).
+_DEEPGEMM_CHUNK_ROW_ALIGNMENT = 128
+# Transformer Engine's MXFP8 cast launches one grid row (y block) per 64 rows of 128 elements,
+# and CUDA caps a grid's y dimension at 65535, so one cast takes at most 65535 * 64 such rows:
+# 65535 query rows with 64 indexer heads, 131070 with 32 (on GB300 a 65536-row x 64-head Q
+# raised "CUDA Error: invalid argument" in quantize_mxfp8.cuh). That is TE's generic cast
+# kernel, the one the GB300 container's TE 2.16.0.dev0 (01aef4fc) runs by default. Its
+# specialized rowwise cast-only kernel takes 4 rows per y block (at most 262140 rows of 128,
+# 8191 query rows with 32 heads, below one 1M-token K): that TE runs it only with
+# ENABLE_CAST_ONLY=1 and without a grid-fit check, so a run that sets it fails at such sizes
+# (newer TE checks the grid and keeps the generic kernel). Nothing in these paths sets it. The
+# cuDNN MXFP8 scorer, the DeepGEMM path's fallback, casts the whole Q of a call, so it takes at
+# most 131070 query rows with 32 heads (65535 with 64); the GLM-5.2 recipes have up to 16384.
+_TE_MXFP8_CAST_MAX_ROWS = 65535 * 64
+
+
+@dataclass(frozen=True)
+class IndexerScorerOptions:
+    """Opt-in behaviour of the dense cuDNN indexer scorer, resolved from the config.
+
+    Attributes:
+        skip_masked_score_fill: Let the general packed THD scorer pass
+            ``clean_logits=False`` so cuDNN skips the ``-inf`` prefill of the dense score
+            buffer, when the installed frontend supports it. Columns at or past each row's
+            causal limit are then unspecified; every reader is clamped to that limit.
+        precision: Compute precision of the selection scorer, ``"bf16"`` or ``"mxfp8"``.
+            With ``"mxfp8"`` the general packed THD scorer quantizes the indexer Q and K to
+            E4M3 with E8M0 1x32 scales and runs the cuDNN MXFP8 dense scorer, which then
+            decides only the top-k selection: the selected scores returned for the indexer
+            loss are recomputed in FP32 from the BF16 Q/K/weights over the selected keys
+            (:func:`_selected_scores_for_indexer_loss`). Weights stay BF16, and the indexer
+            loss and backward keep using the BF16 Q/K. ``"bf16"`` returns the scorer's own
+            FP32 values. Every other scorer path rejects ``"mxfp8"``.
+        topk_backend: Kernel of the non-deterministic top-k over the scores, ``'cudnn'`` or
+            ``'deepselect'`` (``dsa_indexer_topk_backend``). DeepSelect runs only where
+            :func:`dsa_deepselect_topk.fallback_reason` allows it; other calls use cuDNN.
+        scorer_backend: Kernel of the MXFP8 selection scorer, ``'cudnn'`` or ``'deepgemm'``
+            (``dsa_indexer_scorer_backend``; ``'deepgemm'`` needs ``precision='mxfp8'``).
+            ``'deepgemm'`` scores the general packed THD path with DeepGEMM's BF16 logits
+            where :func:`_deepgemm_scorer_fallback_reason` allows it, else with the cuDNN
+            MXFP8 scorer. It changes only which kernel selects: the selected scores returned
+            for the indexer loss follow ``precision`` (recomputed from the BF16 Q/K/weights
+            for ``'mxfp8'``, :func:`_selected_scores_for_indexer_loss`) whichever ran.
+    """
+
+    skip_masked_score_fill: bool = False
+    precision: str = "bf16"
+    topk_backend: str = "cudnn"
+    scorer_backend: str = "cudnn"
+
+
+def _scorer_options_from_config(config: Optional["TransformerConfig"]) -> IndexerScorerOptions:
+    """Read the indexer scorer options from ``config`` (defaults when absent)."""
+    return IndexerScorerOptions(
+        skip_masked_score_fill=bool(getattr(config, "dsa_indexer_skip_masked_score_fill", False)),
+        precision=str(getattr(config, "dsa_indexer_precision", "bf16")),
+        topk_backend=getattr(config, "dsa_indexer_topk_backend", "cudnn") or "cudnn",
+        scorer_backend=getattr(config, "dsa_indexer_scorer_backend", "cudnn") or "cudnn",
+    )
 
 
 def _indexer_forward_wrapper_with_warning(
@@ -171,6 +330,27 @@ def _indexer_forward_wrapper_with_warning(
     if total_q > FUSED_INDEXER_MAX_SAFE_ROWS:
         warn_fused_indexer_row_limit_once(total_q, logger=logging.getLogger(__name__))
     return _cudnn_dsa.indexer_forward_wrapper(index_q, index_k, weights, **kwargs)
+
+
+def _indexer_forward_bshd_bottom_right(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, *, ratio: int
+) -> Tensor:
+    """Dense BSHD indexer scores with the bottom-right causal alignment on any frontend."""
+    return _indexer_forward_wrapper_with_warning(
+        q_bshd,
+        k_bshd,
+        w_bsh,
+        ratio=ratio,
+        sm_scale=_INDEXER_SOFTMAX_SCALE,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.indexer_forward_wrapper,
+            batch=q_bshd.size(0),
+            seqlen_q=q_bshd.size(1),
+            seqlen_k=k_bshd.size(1),
+            ratio=ratio,
+            device=q_bshd.device,
+        ),
+    )["scores"]
 
 
 def _assert_supported_indexer_scoring(use_relu: bool) -> None:
@@ -364,6 +544,7 @@ def run_fused_dsa_attention(
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
         tp_group=getattr(pg_collection, "tp", None),
+        scorer_options=_scorer_options_from_config(config),
         **packed_thd_kwargs,
     )
 
@@ -488,6 +669,33 @@ def _bytes_to_chunk_rows(n_rows: int, bytes_per_row: int, max_bytes: int, alignm
     return min(n_rows, chunk_rows)
 
 
+def _topk_wrapper_row_alignment(num_cols: int, element_size: int) -> int:
+    """Smallest row multiple that keeps every top-k chunk start 32-byte aligned.
+
+    Rows whose byte width is already a multiple of 32 need no alignment (1); otherwise chunk
+    starts are multiples of ``32 / gcd(32, row_bytes)`` rows (at most 8 for FP32 scores).
+    """
+    row_bytes = max(1, num_cols) * element_size
+    return _TOPK_WRAPPER_INPUT_ALIGNMENT_BYTES // math.gcd(
+        _TOPK_WRAPPER_INPUT_ALIGNMENT_BYTES, row_bytes
+    )
+
+
+def _topk_wrapper_chunk_rows(n_rows: int, num_cols: int, element_size: int) -> int:
+    """Rows per cuDNN top-k launch under the scratch budget and the frontend's int32 limit."""
+    scratch_elements_per_row = max(1, num_cols) * _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
+    int32_bytes = torch.iinfo(torch.int32).bits // 8
+    max_scratch_bytes = min(
+        _TOPK_WRAPPER_MAX_SCRATCH_BYTES, _TOPK_WRAPPER_MAX_SCRATCH_INT32_ELEMENTS * int32_bytes
+    )
+    return _bytes_to_chunk_rows(
+        n_rows,
+        scratch_elements_per_row * int32_bytes,
+        max_scratch_bytes,
+        _topk_wrapper_row_alignment(num_cols, element_size),
+    )
+
+
 def _causal_seq_lens(q_positions: Tensor, ratio: int, sk: int) -> Tensor:
     """Per-query causal key length under the indexer ``ratio``, clamped to ``sk``."""
     return ((q_positions + 1) // ratio).clamp(max=sk)
@@ -568,44 +776,397 @@ def _remove_indexer_topk_tie_break(
     return torch.where(topk_indices >= 0, topk_scores - bias, topk_scores)
 
 
-def _indexer_top_k_wrapper_chunked(
-    scores_flat: Tensor, seq_lens: Tensor, topk_k: int, return_topk_scores: bool
-) -> dict:
-    """Run cuDNN top-k in row chunks to bound wrapper scratch allocation."""
+def _selectable_topk_scores(scores: Tensor) -> Tensor:
+    """Scores the deterministic top-k may select: every value except NaN and ``-inf``.
+
+    ``-inf`` is the mask value of the indexer scores (causal prefill, varlen starts), so it is
+    never a member. ``+inf`` is the largest score, not a masked one, and must be selected like
+    any other: the radix kernel ranks it above every finite score. NaN is dropped and a slot
+    the raw kernel spent on a NaN is not refilled, so the members never include a NaN, but the
+    member count does depend on where the kernel ranks NaN: radix keys put a positive NaN above
+    ``+inf`` (it takes a top-K slot, and the row returns one member fewer per such NaN) and a
+    sign-bit NaN below ``-inf`` (it takes no slot, and the row returns K). Both deterministic
+    paths apply the same rule to the same raw result, so they agree either way.
+    """
+    return scores > float("-inf")
+
+
+def _check_deterministic_topk_geometry(
+    scores_flat: Tensor, seq_lens: Tensor, topk_indices: Tensor, topk_k: int
+) -> None:
     n_rows, sk = scores_flat.shape
-    scratch_bytes_per_row = max(1, sk) * torch.iinfo(torch.int32).bits // 8
-    scratch_bytes_per_row *= _TOPK_WRAPPER_SCRATCH_INT32_FACTOR
-    chunk_rows = _bytes_to_chunk_rows(
-        n_rows, scratch_bytes_per_row, _TOPK_WRAPPER_MAX_SCRATCH_BYTES, _TOPK_WRAPPER_ROW_ALIGNMENT
+    if sk <= 0 or topk_k <= 0 or topk_k > sk:
+        raise RuntimeError(
+            f"invalid deterministic top-k geometry: rows={n_rows}, sk={sk}, topk={topk_k}"
+        )
+    if seq_lens.ndim != 1 or seq_lens.numel() != n_rows:
+        raise RuntimeError(f"deterministic top-k sequence lengths must have shape ({n_rows},)")
+    if topk_indices.numel() != n_rows * topk_k:
+        raise RuntimeError(
+            "deterministic top-k indices have an unexpected number of elements: "
+            f"expected={n_rows * topk_k}, actual={topk_indices.numel()}"
+        )
+
+
+def _canonicalize_deterministic_topk_membership(
+    scores_flat: Tensor,
+    seq_lens: Tensor,
+    topk_indices: Tensor,
+    *,
+    topk_k: int,
+    return_topk_scores: bool,
+) -> dict:
+    """Resolve cutoff-score ties by ascending key index without dynamic shapes.
+
+    The cuDNN CuTe radix kernel may return different members when more candidates
+    share the final cutoff score than there are remaining top-k slots. Its raw
+    result still determines the exact cutoff value. Reconstruct the selected set
+    as every selectable score (:func:`_selectable_topk_scores`: not NaN, not ``-inf``)
+    strictly above that cutoff plus the lowest-index cutoff ties, as many as the raw
+    result holds selectable members. Prefix ranks and ``searchsorted`` compact that set
+    into a fixed ``[R,K]`` result, so deterministic mode remains compatible with CUDA
+    Graph capture.
+
+    This is the canonical rule. It reads every in-row score, so it is used only when the
+    installed frontend cannot break ties itself (see
+    :func:`_canonicalize_lowest_index_tie_break_topk`).
+    """
+    n_rows, sk = scores_flat.shape
+    _check_deterministic_topk_geometry(scores_flat, seq_lens, topk_indices, topk_k)
+
+    raw_indices = topk_indices.reshape(n_rows, topk_k)
+    row_limits = seq_lens.to(dtype=torch.int64).clamp(min=0, max=sk).view(n_rows, 1)
+    safe_raw_indices = raw_indices.clamp(min=0, max=sk - 1).to(dtype=torch.int64)
+    raw_scores = torch.gather(scores_flat, dim=1, index=safe_raw_indices)
+    raw_valid = (
+        (raw_indices >= 0)
+        & (raw_indices < sk)
+        & (raw_indices.to(dtype=torch.int64) < row_limits)
+        & _selectable_topk_scores(raw_scores)
+    )
+    # A row without selectable raw members gets an +inf cutoff and a zero quota below.
+    cutoff = torch.where(raw_valid, raw_scores, torch.full_like(raw_scores, float("inf"))).amin(
+        dim=1
     )
 
-    if chunk_rows >= n_rows:
-        return _cudnn_dsa.indexer_top_k_wrapper(
-            scores_flat, seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
-        )
+    columns = torch.arange(sk, device=scores_flat.device, dtype=torch.int64).view(1, sk)
+    candidate_valid = (columns < row_limits) & _selectable_topk_scores(scores_flat)
+    desired_count = raw_valid.sum(dim=1, dtype=torch.int32)
+    strictly_above = candidate_valid & (scores_flat > cutoff.unsqueeze(1))
+    cutoff_ties = candidate_valid & (scores_flat == cutoff.unsqueeze(1))
+    tie_quota = (desired_count - strictly_above.sum(dim=1, dtype=torch.int32)).clamp(min=0)
+    tie_rank = torch.cumsum(cutoff_ties, dim=1, dtype=torch.int32)
+    selected = strictly_above | (cutoff_ties & (tie_rank <= tie_quota.unsqueeze(1)))
 
-    indices_chunks = []
-    values_chunks = [] if return_topk_scores else None
+    selected_prefix = torch.cumsum(selected, dim=1, dtype=torch.int32)
+    targets = (
+        torch.arange(1, topk_k + 1, device=scores_flat.device, dtype=torch.int32)
+        .view(1, topk_k)
+        .expand(n_rows, topk_k)
+        .contiguous()
+    )
+    canonical_indices = torch.searchsorted(
+        selected_prefix.contiguous(), targets, right=False, out_int32=True
+    )
+    canonical_valid = targets <= desired_count.unsqueeze(1)
+    safe_canonical_indices = canonical_indices.clamp(max=sk - 1).to(dtype=torch.int64)
+    canonical_indices = torch.where(
+        canonical_valid, canonical_indices, torch.full_like(canonical_indices, -1)
+    )
+
+    canonical_scores = None
+    if return_topk_scores:
+        canonical_scores = torch.gather(scores_flat, dim=1, index=safe_canonical_indices)
+        canonical_scores = torch.where(
+            canonical_valid,
+            canonical_scores,
+            torch.full_like(canonical_scores, torch.finfo(scores_flat.dtype).min),
+        )
+    return {"indices": canonical_indices, "values": canonical_scores}
+
+
+def _canonicalize_lowest_index_tie_break_topk(
+    scores_flat: Tensor,
+    seq_lens: Tensor,
+    topk_indices: Tensor,
+    *,
+    topk_k: int,
+    return_topk_scores: bool,
+) -> dict:
+    """Canonical deterministic top-k from a cuDNN ``tie_break=1`` result in O(rows * K).
+
+    Returns exactly what :func:`_canonicalize_deterministic_topk_membership` returns for the
+    same raw result: every selectable in-row score (not NaN, not ``-inf``; ``+inf`` is
+    selected) strictly above the cutoff plus the lowest-index cutoff ties, in ascending index
+    order, padded with ``-1`` indices and ``finfo.min`` values.
+
+    That rule depends on the raw result only through its selectable in-row members, whose
+    count and minimum (the cutoff) do not depend on how the kernel broke ties. With
+    ``tie_break=1`` the radix kernel keeps every key above the cutoff key plus the lowest-index
+    copies of the cutoff key, so the raw selectable members already are the canonical set
+    (``+inf`` has a single radix key, so an ``+inf`` cutoff needs nothing more), except in one
+    case:
+    radix keys order ``+0.0`` above ``-0.0`` while the rule compares values. When the cutoff
+    value is zero, the raw result holds every positive score plus ``q`` zeros chosen by sign;
+    those rows replace their zeros with the ``q`` lowest-index in-row zeros of either sign
+    (:func:`select_lowest_index_zero_ties`, which reads only those rows). Rows no longer
+    than ``topk_k`` keep every in-row score and need no repair.
+
+    Sorting the selected indices gives the canonical order. Shapes are fixed and no step
+    synchronizes with the host, so the result stays CUDA Graph capturable.
+    """
+    n_rows, sk = scores_flat.shape
+    _check_deterministic_topk_geometry(scores_flat, seq_lens, topk_indices, topk_k)
+
+    raw_indices = topk_indices.reshape(n_rows, topk_k).to(dtype=torch.int32)
+    row_limits = seq_lens.to(dtype=torch.int64).clamp(min=0, max=sk)
+    safe_raw_indices = raw_indices.clamp(min=0, max=sk - 1).to(dtype=torch.int64)
+    raw_scores = torch.gather(scores_flat, dim=1, index=safe_raw_indices)
+    raw_valid = (
+        (raw_indices >= 0)
+        & (raw_indices < sk)
+        & (raw_indices.to(dtype=torch.int64) < row_limits.view(n_rows, 1))
+        & _selectable_topk_scores(raw_scores)
+    )
+    cutoff = torch.where(raw_valid, raw_scores, torch.full_like(raw_scores, float("inf"))).amin(
+        dim=1
+    )
+    raw_zero = raw_valid & (raw_scores == 0)
+    zero_cutoff = (cutoff == 0) & (row_limits > topk_k)
+    zero_quotas = torch.where(
+        zero_cutoff,
+        raw_zero.sum(dim=1, dtype=torch.int32),
+        torch.zeros((n_rows,), dtype=torch.int32, device=scores_flat.device),
+    )
+    zero_ties = select_lowest_index_zero_ties(
+        scores_flat, row_limits.to(dtype=torch.int32), zero_quotas, topk_k
+    )
+
+    kept = raw_valid & ~(raw_zero & zero_cutoff.view(n_rows, 1))
+    candidates = torch.cat(
+        (
+            torch.where(kept, raw_indices, torch.full_like(raw_indices, ZERO_TIE_SENTINEL)),
+            zero_ties,
+        ),
+        dim=1,
+    )
+    # Valid indices are distinct, so stability only orders the sentinel padding.
+    ordered = torch.sort(candidates, dim=1, stable=True)
+    canonical_indices = ordered.values[:, :topk_k]
+    canonical_valid = canonical_indices != ZERO_TIE_SENTINEL
+    canonical_indices = torch.where(
+        canonical_valid, canonical_indices, torch.full_like(canonical_indices, -1)
+    )
+
+    canonical_scores = None
+    if return_topk_scores:
+        # Zero-tie values come from the score buffer, so their sign bit is preserved.
+        safe_zero_ties = zero_ties.clamp(max=sk - 1).to(dtype=torch.int64)
+        candidate_scores = torch.cat(
+            (raw_scores, torch.gather(scores_flat, dim=1, index=safe_zero_ties)), dim=1
+        )
+        canonical_scores = torch.gather(candidate_scores, dim=1, index=ordered.indices[:, :topk_k])
+        canonical_scores = torch.where(
+            canonical_valid,
+            canonical_scores,
+            torch.full_like(canonical_scores, torch.finfo(scores_flat.dtype).min),
+        )
+    return {"indices": canonical_indices, "values": canonical_scores}
+
+
+def _supports_lowest_index_topk_tie_break() -> bool:
+    """Whether cuDNN top-k can keep the lowest-index copies of the cutoff key itself.
+
+    Requires an ``indexer_top_k_wrapper`` that names ``tie_break`` (``**kwargs`` does not
+    count) on cuDNN frontend >= 1.31, the first release whose ``tie_break=1`` semantics were
+    verified. Otherwise deterministic top-k falls back to the full-row canonicalization.
+    """
+    if _cudnn_dsa is None:
+        return False
+    wrapper = getattr(_cudnn_dsa, "indexer_top_k_wrapper", None)
+    return (
+        wrapper is not None
+        and _accepts_named_parameter(wrapper, "tie_break")
+        and _cudnn_frontend_at_least(_TOPK_TIE_BREAK_FE_VERSION)
+    )
+
+
+def _indexer_top_k_wrapper_chunked(
+    scores_flat: Tensor,
+    seq_lens: Tensor,
+    topk_k: int,
+    return_topk_scores: bool,
+    deterministic: bool = False,
+    topk_backend: str = "cudnn",
+) -> dict:
+    """Run cuDNN top-k in row chunks to bound wrapper scratch allocation.
+
+    Deterministic mode returns the canonical membership and order of
+    :func:`_canonicalize_deterministic_topk_membership`. With a frontend that supports
+    ``tie_break`` it is derived from a ``tie_break=1`` launch at the same chunking as the
+    non-deterministic path; otherwise the full-row canonicalization runs in small chunks.
+
+    Every cuDNN top-k call in this module goes through here. The CSA paths
+    (``csa_utils/fused_sparse_attention.py``) call the frontend directly with their own sizing
+    and deterministic selection (the dense fallback row-chunks under its own 1 GiB score
+    budget when only top-k is needed), so neither this scratch budget nor the ``tie_break``
+    path applies to them.
+
+    With ``topk_backend='deepselect'`` an eligible non-deterministic call
+    (:func:`dsa_deepselect_topk.fallback_reason`) runs one DeepSelect launch over all rows
+    instead, with the same output contract and no scratch; any other call runs cuDNN. Which
+    one ran is logged once per reason and score dtype.
+
+    Scores may be FP32 or BF16; the selected values come back in the scores' dtype from either
+    backend. The cuDNN radix top-k is compiled for a compact row-major ``[rows, cols]``
+    tensor, so callers hand it contiguous scores, and its scratch is sized by the FP32 budget
+    below, which over-estimates BF16 (one int32 buffer instead of two).
+    """
+    n_rows, sk = scores_flat.shape
+    deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
+    if topk_backend == "deepselect":
+        reason = dsa_deepselect_topk.fallback_reason(scores_flat, seq_lens, topk_k, deterministic)
+        dsa_deepselect_topk.log_topk_backend_once(topk_backend, reason, scores_flat.dtype)
+        if reason is None:
+            return dsa_deepselect_topk.deepselect_topk(
+                scores_flat, seq_lens, topk_k, return_topk_scores
+            )
+    elif topk_backend != "cudnn":
+        raise ValueError(
+            f"DSA indexer top-k backend must be one of {dsa_deepselect_topk.TOPK_BACKENDS}, "
+            f"got {topk_backend!r}."
+        )
+    chunk_rows = _topk_wrapper_chunk_rows(n_rows, sk, scores_flat.element_size())
+    use_frontend_tie_break = deterministic and _supports_lowest_index_topk_tie_break()
+    if deterministic and not use_frontend_tie_break:
+        # Bound the masks, prefix ranks, and K-wide gather buffers used by the
+        # fixed-shape cutoff repair. The estimate is deliberately conservative.
+        repair_bytes_per_row = max(1, 16 * sk + 40 * topk_k)
+        chunk_rows = min(
+            chunk_rows,
+            _bytes_to_chunk_rows(
+                n_rows,
+                repair_bytes_per_row,
+                _DETERMINISTIC_TOPK_REPAIR_MAX_BYTES,
+                _topk_wrapper_row_alignment(sk, scores_flat.element_size()),
+            ),
+        )
+    if deterministic:
+        _log_deterministic_topk_path_once(use_frontend_tie_break, scores_flat.is_cuda)
+
+    def run_chunk(chunk_scores: Tensor, chunk_seq_lens: Tensor) -> dict:
+        if use_frontend_tie_break:
+            result = _cudnn_dsa.indexer_top_k_wrapper(
+                chunk_scores,
+                chunk_seq_lens,
+                top_k=topk_k,
+                next_n=1,
+                return_val=False,
+                tie_break=_TOPK_LOWEST_INDEX_TIE_BREAK,
+            )
+            return _canonicalize_lowest_index_tie_break_topk(
+                chunk_scores,
+                chunk_seq_lens,
+                result["indices"],
+                topk_k=topk_k,
+                return_topk_scores=return_topk_scores,
+            )
+        result = _cudnn_dsa.indexer_top_k_wrapper(
+            chunk_scores, chunk_seq_lens, top_k=topk_k, next_n=1, return_val=return_topk_scores
+        )
+        if deterministic:
+            return _canonicalize_deterministic_topk_membership(
+                chunk_scores,
+                chunk_seq_lens,
+                result["indices"],
+                topk_k=topk_k,
+                return_topk_scores=return_topk_scores,
+            )
+        return result
+
+    if chunk_rows >= n_rows:
+        return run_chunk(scores_flat, seq_lens)
+
+    # Each chunk's result is copied into outputs allocated before the first launch and dropped
+    # before the next one. The frontend allocates a launch's outputs before its scratch, so a
+    # chunk result still alive at the next launch (as in the former collect-then-torch.cat) is
+    # carved out of the scratch block just freed, and every later launch needs a second
+    # scratch-sized segment: two 8 GiB blocks in a CUDA graph's private pool at 1M (16.02 GiB
+    # reserved against an 8.25 GiB allocated peak, job 4629523), likewise cached eagerly.
+    indices = torch.empty((n_rows, topk_k), dtype=torch.int32, device=scores_flat.device)
+    values = (
+        torch.empty((n_rows, topk_k), dtype=scores_flat.dtype, device=scores_flat.device)
+        if return_topk_scores
+        else None
+    )
     for row_start in range(0, n_rows, chunk_rows):
         row_end = min(row_start + chunk_rows, n_rows)
-        tk_result = _cudnn_dsa.indexer_top_k_wrapper(
-            scores_flat[row_start:row_end].contiguous(),
-            seq_lens[row_start:row_end].contiguous(),
-            top_k=topk_k,
-            next_n=1,
-            return_val=return_topk_scores,
+        tk_result = run_chunk(
+            scores_flat[row_start:row_end].contiguous(), seq_lens[row_start:row_end].contiguous()
         )
-        indices_chunks.append(tk_result["indices"])
+        _copy_topk_chunk(indices[row_start:row_end], tk_result["indices"], "indices")
         if return_topk_scores:
-            values = tk_result["values"]
-            if values is None:
+            if tk_result["values"] is None:
                 raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
-            values_chunks.append(values)
+            _copy_topk_chunk(values[row_start:row_end], tk_result["values"], "values")
+        del tk_result
 
-    return {
-        "indices": torch.cat(indices_chunks, dim=0),
-        "values": torch.cat(values_chunks, dim=0) if return_topk_scores else None,
-    }
+    return {"indices": indices, "values": values}
+
+
+def _copy_topk_chunk(destination: Tensor, chunk: Tensor, name: str) -> None:
+    """Copy one top-k chunk result into its output rows without a silent dtype or shape cast."""
+    if chunk.dtype != destination.dtype or chunk.numel() != destination.numel():
+        raise RuntimeError(
+            f"cuDNN top-k chunk {name} have dtype {chunk.dtype} and {chunk.numel()} elements; "
+            f"expected {destination.dtype} and {destination.numel()} ({tuple(destination.shape)})."
+        )
+    destination.copy_(chunk.reshape(destination.shape))
+
+
+_DETERMINISTIC_TOPK_PATHS_LOGGED: set = set()
+
+
+def _log_deterministic_topk_path_once(use_frontend_tie_break: bool, on_cuda: bool) -> None:
+    """Log once per selection which deterministic top-k path runs and why.
+
+    The fallback full-row canonicalization costs about 2.2 s per 1M CP64 rank-0 call
+    against about 19 ms for ``tie_break=1``, and the zero-tie repair's PyTorch fallback
+    (CUDA without Triton) scans whole rows, so both are reported as warnings.
+    """
+    wrapper = None if _cudnn_dsa is None else getattr(_cudnn_dsa, "indexer_top_k_wrapper", None)
+    names_tie_break = wrapper is not None and _accepts_named_parameter(wrapper, "tie_break")
+    zero_tie_backend = (
+        "triton" if on_cuda and dsa_topk_zero_ties.HAVE_TRITON else ("torch" if on_cuda else "cpu")
+    )
+    key = (use_frontend_tie_break, names_tie_break, zero_tie_backend)
+    if key in _DETERMINISTIC_TOPK_PATHS_LOGGED:
+        return
+    _DETERMINISTIC_TOPK_PATHS_LOGGED.add(key)
+    frontend = _cudnn_frontend_version()
+    logger = logging.getLogger(__name__)
+    if not use_frontend_tie_break:
+        logger.warning(
+            "Deterministic DSA top-k uses the full-row canonicalization (slow: it reads every "
+            "in-row score in small row chunks): cuDNN frontend %s, indexer_top_k_wrapper "
+            "names tie_break=%s; tie_break=1 needs a wrapper naming it and frontend >= %s.",
+            frontend,
+            names_tie_break,
+            _TOPK_TIE_BREAK_FE_VERSION,
+        )
+    elif zero_tie_backend == "torch":
+        logger.warning(
+            "Deterministic DSA top-k uses cuDNN tie_break=1 (frontend %s), but Triton is not "
+            "installed: the signed-zero cutoff repair runs its PyTorch fallback over whole rows.",
+            frontend,
+        )
+    else:
+        logger.info(
+            "Deterministic DSA top-k uses cuDNN tie_break=1 (frontend %s) with the %s "
+            "signed-zero cutoff repair.",
+            frontend,
+            zero_tie_backend,
+        )
 
 
 def _indexer_score_chunk_rows(b: int, sq: int, sk: int) -> int:
@@ -686,6 +1247,8 @@ def _indexer_topk_from_score_chunks(
     indexer_ratio: int = _INDEXER_RATIO,
     score_seq_lens: Optional[Tensor] = None,
     bottom_right_key_start: Optional[int] = None,
+    deterministic: bool = False,
+    topk_backend: str = "cudnn",
 ) -> Tuple[Tensor, Optional[Tensor]]:
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
@@ -720,13 +1283,13 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
-            scores_chunk = _indexer_forward_wrapper_with_warning(
-                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )["scores"]
+            scores_chunk = _indexer_forward_bshd_bottom_right(
+                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio
+            )
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
-            scores_chunk = _indexer_forward_wrapper_with_warning(
-                q_chunk, k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )["scores"]
+            scores_chunk = _indexer_forward_bshd_bottom_right(
+                q_chunk, k_bshd, w_chunk, ratio=indexer_ratio
+            )
         else:
             if global_rows_k_bdk is None:
                 global_rows_k_bdk = (
@@ -759,6 +1322,8 @@ def _indexer_topk_from_score_chunks(
             chunk_seq_lens,
             topk_k=chunk_topk_k,
             return_topk_scores=return_topk_scores,
+            deterministic=deterministic,
+            topk_backend=topk_backend,
         )
         topk_indices = tk_result["indices"].view(b, row_end - row_start, chunk_topk_k)
         topk_values = None
@@ -900,6 +1465,8 @@ def _indexer_topk_packed_thd(
     cp_rank: int,
     local_packed_cp_query_start: int,
     local_packed_cp_query_len: Optional[int],
+    deterministic: bool = False,
+    scorer_options: Optional[IndexerScorerOptions] = None,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Run cuDNN's general THD indexer for packed sequences at any CP size.
 
@@ -907,7 +1474,26 @@ def _indexer_topk_packed_thd(
     cuDNN in one call. CP>1 retains the front/back segmented representation required by
     zigzag context parallelism. Top-k selection and sequence-local to global index
     restoration are shared by both representations.
+
+    With ``scorer_options.skip_masked_score_fill`` and a frontend that supports it, the
+    scorer is asked not to prefill the dense score buffer with ``-inf``. Every reader
+    below is then clamped to the kernel's per-row column limit derived from the same
+    segment layout that the kernel consumes.
+
+    The selected scores returned for the indexer loss (``return_topk_scores``) follow the
+    scorer's compute precision on every path, the every-column one included
+    (:func:`_selected_scores_for_indexer_loss`): the BF16 scorer's own values, or, for
+    ``scorer_options.precision == 'mxfp8'``, the selected keys' scores recomputed in FP32
+    from the BF16 inputs.
+
+    With ``scorer_options.scorer_backend == 'deepgemm'`` an eligible call
+    (:func:`_deepgemm_scorer_fallback_reason`) is scored by DeepGEMM instead
+    (:func:`_indexer_topk_packed_thd_deepgemm`), any other one by the cuDNN MXFP8 scorer
+    below. The backend decides only which kernel selects; the loss-score rule above does not
+    depend on it.
     """
+    if scorer_options is None:
+        scorer_options = IndexerScorerOptions()
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
     if not _packed_thd_kernel_applicable(
@@ -925,7 +1511,93 @@ def _indexer_topk_packed_thd(
         local_packed_cp_query_len=local_packed_cp_query_len,
     ):
         raise RuntimeError("general packed THD scorer received incompatible layout metadata")
+    max_score_k = _packed_thd_score_width(
+        cp_size=cp_size, cp_rank=cp_rank, packed_max_seqlen_k=packed_max_seqlen_k
+    )
+    common = dict(
+        q_bshd=q_bshd,
+        k_bshd=k_bshd,
+        w_bsh=w_bsh,
+        topk_k=topk_k,
+        return_topk_scores=return_topk_scores,
+        starts=starts,
+        ends=ends,
+        packed_cu_seqlens_q=packed_cu_seqlens_q,
+        cp_size=cp_size,
+        max_score_k=max_score_k,
+        scorer_options=scorer_options,
+    )
+    use_deepgemm = False
+    if scorer_options.scorer_backend == "deepgemm":
+        reason = _deepgemm_scorer_fallback_reason(
+            q_bshd, k_bshd, w_bsh, deterministic=deterministic
+        )
+        dsa_deepgemm_scorer.log_scorer_backend_once(reason)
+        use_deepgemm = reason is None
+    if use_deepgemm:
+        topk_indices, selection_scores = _indexer_topk_packed_thd_deepgemm(**common)
+    else:
+        topk_indices, selection_scores = _indexer_topk_packed_thd_cudnn(
+            **common,
+            packed_cu_seqlens_k=packed_cu_seqlens_k,
+            packed_max_seqlen_q=packed_max_seqlen_q,
+            packed_max_seqlen_k=packed_max_seqlen_k,
+            cp_rank=cp_rank,
+            deterministic=deterministic,
+        )
+    topk_indices, topk_scores = _selected_scores_for_indexer_loss(
+        topk_indices,
+        selection_scores,
+        return_topk_scores=return_topk_scores,
+        q_bshd=q_bshd,
+        k_bshd=k_bshd,
+        w_bsh=w_bsh,
+        starts=starts,
+        ends=ends,
+        topk_k=topk_k,
+        precision=scorer_options.precision,
+    )
+    return _pad_topk_result(topk_indices, topk_scores, topk_k)
 
+
+def _packed_thd_score_width(*, cp_size: int, cp_rank: int, packed_max_seqlen_k: int) -> int:
+    """Host bound on every row's key range of the general packed THD scorer.
+
+    At CP1 the longest sequence. At CP>1 the longest segment prefix: the front segment of
+    rank ``r`` sees ``(r + 1) * half`` keys of its sequence, the back one ``L - r * half``.
+    """
+    if cp_size == 1:
+        return packed_max_seqlen_k
+    max_k_half = packed_max_seqlen_k // (2 * cp_size)
+    return max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
+
+
+def _indexer_topk_packed_thd_cudnn(
+    *,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    w_bsh: Tensor,
+    topk_k: int,
+    return_topk_scores: bool,
+    starts: Tensor,
+    ends: Tensor,
+    packed_cu_seqlens_q: Tensor,
+    packed_cu_seqlens_k: Tensor,
+    packed_max_seqlen_q: int,
+    packed_max_seqlen_k: int,
+    cp_size: int,
+    cp_rank: int,
+    max_score_k: int,
+    deterministic: bool,
+    scorer_options: IndexerScorerOptions,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """cuDNN dense scorer + top-k of :func:`_indexer_topk_packed_thd`.
+
+    Returns global top-k indices ``(1, sq, min(topk_k, max_score_k))`` and, when asked, the
+    scorer's own values in the same slots (both unpadded).
+    """
+    _b, sq, _idx_nh, _idx_hd = q_bshd.shape
+    sk = k_bshd.size(1)
     device = q_bshd.device
     score_q_causal_offsets: Optional[Tensor] = None
     if cp_size == 1:
@@ -935,7 +1607,6 @@ def _indexer_topk_packed_thd(
         score_cu_q = packed_cu_seqlens_q
         score_cu_k = packed_cu_seqlens_k
         max_score_q = packed_max_seqlen_q
-        max_score_k = packed_max_seqlen_k
     else:
         segment_divisor = 2 * cp_size
         layout = dsa_layout.build_packed_cp_indexer_layout(
@@ -955,9 +1626,17 @@ def _indexer_topk_packed_thd(
             (layout.segment_k_lengths - layout.segment_q_lengths).to(dtype=torch.int32).contiguous()
         )
         max_score_q = packed_max_seqlen_q // segment_divisor
-        max_k_half = packed_max_seqlen_k // segment_divisor
-        max_score_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
 
+    skip_fill = scorer_options.skip_masked_score_fill and _supports_indexer_clean_logits()
+    if scorer_options.skip_masked_score_fill and not skip_fill:
+        _log_clean_logits_unavailable_once()
+    precision_kwargs = {}
+    if scorer_options.precision == "mxfp8":
+        # Only the scorer consumes the quantized tensors; the loss and indexer backward
+        # keep the caller's BF16 Q/K.
+        score_q, score_k, precision_kwargs = _quantize_packed_thd_scorer_inputs_mxfp8(
+            score_q, score_k, score_w, score_cu_q, score_cu_k
+        )
     scores = _indexer_forward_wrapper_with_warning(
         score_q,
         score_k,
@@ -973,23 +1652,59 @@ def _indexer_topk_packed_thd(
             if score_q_causal_offsets is not None
             else {}
         ),
+        **({"clean_logits": False} if skip_fill else {}),
+        **precision_kwargs,
+        **_deepselect_score_out_kwargs(
+            n_rows=score_q.size(0),
+            width=max_score_k,
+            topk_k=min(topk_k, max_score_k),
+            device=device,
+            deterministic=deterministic,
+            topk_backend=scorer_options.topk_backend,
+        ),
     )["scores"]
+
+    # Without the prefill only [0, column_limit) of each row is defined. Rows outside
+    # every segment are never written, so their limit is zero.
+    column_limits = (
+        _packed_thd_score_column_limits(
+            score_cu_q, score_cu_k, score_q_causal_offsets, num_rows=sq, ratio=_INDEXER_RATIO
+        )
+        if skip_fill
+        else None
+    )
 
     score_topk = min(topk_k, max_score_k)
     if score_topk == max_score_k:
         # Ranking is unnecessary when K covers every score column. This also
         # avoids cuDNN FE's vectorized-output restriction for large odd K.
-        topk_indices = torch.arange(score_topk, dtype=torch.int32, device=device).view(
-            1, 1, score_topk
-        ) + starts.view(1, sq, 1).to(dtype=torch.int32)
+        columns = torch.arange(score_topk, dtype=torch.int32, device=device).view(1, 1, score_topk)
+        topk_indices = columns + starts.view(1, sq, 1).to(dtype=torch.int32)
+        if column_limits is not None:
+            # The caller masks by bounds and finiteness; drop undefined columns first.
+            topk_indices = torch.where(
+                columns < column_limits.view(1, sq, 1),
+                topk_indices,
+                torch.full_like(topk_indices, -1),
+            )
         topk_scores = scores.view(1, sq, score_topk) if return_topk_scores else None
-        return _pad_topk_result(topk_indices, topk_scores, topk_k)
+        return topk_indices, topk_scores
 
-    local_seq_lens = (ends - starts).clamp(max=max_score_k).to(torch.int32).contiguous()
+    local_seq_lens = ends - starts
+    if column_limits is not None:
+        local_seq_lens = torch.minimum(
+            local_seq_lens, column_limits.to(local_seq_lens.dtype)
+        ).clamp(min=0)
+    local_seq_lens = local_seq_lens.clamp(max=max_score_k).to(torch.int32).contiguous()
     use_tie_break = _use_dense_indexer_topk_tie_break(scores, score_topk)
     scores_for_topk = _add_indexer_topk_tie_break(scores, inplace=True) if use_tie_break else scores
     tk_result = _indexer_top_k_wrapper_chunked(
-        scores_for_topk, local_seq_lens, topk_k=score_topk, return_topk_scores=return_topk_scores
+        scores_for_topk,
+        local_seq_lens,
+        topk_k=score_topk,
+        return_topk_scores=return_topk_scores,
+        deterministic=deterministic,
+        topk_backend=scorer_options.topk_backend,
     )
     topk_indices = tk_result["indices"].view(1, sq, score_topk)
     topk_scores = None
@@ -1005,7 +1720,590 @@ def _indexer_topk_packed_thd(
     topk_indices = torch.where(
         valid, topk_indices + starts.view(1, sq, 1).to(dtype=topk_indices.dtype), topk_indices
     )
-    return _pad_topk_result(topk_indices, topk_scores, topk_k)
+    return topk_indices, topk_scores
+
+
+def _recomputes_indexer_loss_scores(precision: str) -> bool:
+    """Whether the selected scores for the indexer loss are recomputed from the BF16 inputs.
+
+    True exactly when the selection scorer computes in MXFP8 (``dsa_indexer_precision=
+    'mxfp8'``), whichever kernel scores and whatever dtype its scores come in: MXFP8 then
+    decides only which keys are selected. A scorer that computes in BF16 keeps its own
+    values, which already are the BF16 path's: the dense BF16 scorer's FP32 scores today,
+    and a future BF16-compute scorer that writes BF16 scores would keep its values as well.
+    """
+    return precision == "mxfp8"
+
+
+def _selected_scores_for_indexer_loss(
+    topk_indices: Tensor,
+    selection_scores: Optional[Tensor],
+    *,
+    return_topk_scores: bool,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    w_bsh: Tensor,
+    starts: Tensor,
+    ends: Tensor,
+    topk_k: int,
+    precision: str,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """The selected scores the indexer loss consumes for one packed THD selection.
+
+    ``topk_indices`` ``(1, sq, n)`` holds global key ids (``-1`` unselected) and
+    ``selection_scores`` the selection scorer's values in the same slots. The loss is on
+    exactly when the caller asked for scores (``return_topk_scores``), whatever the kernel
+    returned: a call without them (a frozen indexer or a selection-only call) keeps its
+    indices, returns no scores and never recomputes, and a loss-on call without values
+    raises. A BF16-compute scorer's values are returned unchanged
+    (:func:`_recomputes_indexer_loss_scores`). For an MXFP8-compute scorer they only mark the
+    selections the caller would drop: a slot whose value is not finite (a ``-inf`` prefill
+    column, a NaN score), outside its row's ``[starts, ends)`` or past the keys becomes
+    ``-1``, so such a slot or row still ends with no key, and the remaining keys are scored
+    again by :func:`_recompute_selected_indexer_log_probs`. Given the selection, the KL
+    predict and its gradient are then the BF16 path's.
+    """
+    if not return_topk_scores:
+        return topk_indices, None
+    if selection_scores is None:
+        raise RuntimeError(
+            "the DSA indexer selection scorer returned no selected scores for a call with the "
+            "indexer loss on (return_topk_scores=True)."
+        )
+    if not _recomputes_indexer_loss_scores(precision):
+        return topk_indices, selection_scores
+    sq, sk = q_bshd.size(1), k_bshd.size(1)
+    valid = (
+        (topk_indices >= 0)
+        & (topk_indices >= starts.view(1, sq, 1))
+        & (topk_indices < ends.view(1, sq, 1))
+        & (topk_indices < sk)
+        & torch.isfinite(selection_scores)
+    )
+    topk_indices = torch.where(valid, topk_indices, torch.full_like(topk_indices, -1))
+    return topk_indices, _recompute_selected_indexer_log_probs(
+        q_bshd, k_bshd, w_bsh, topk_indices, topk_k=topk_k
+    )
+
+
+def _recompute_selected_indexer_log_probs(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, topk_indices: Tensor, *, topk_k: int
+) -> Tensor:
+    """FP32 indexer log-probabilities over each row's selected keys (``-inf`` at ``-1``).
+
+    cuDNN's sparse indexer score recompute evaluates ``softmax_S(sum_h relu(q_h . k_j) w_h)``
+    in FP32 from the BF16 ``q_bshd`` ``(1, sq, H, D)``, ``k_bshd`` ``(1, sk, 1, D)`` and
+    ``w_bsh`` over the selected set ``S`` (``topk_indices`` ``(1, sq, n)``, global packed
+    key ids, ``-1`` unselected; masked by the kernel, so the valid slots need not be a
+    prefix). The same math as the dense BF16 scorer, on the selected keys only. The result is
+    ``log(max(p, FLT_MIN))``: the selected logits minus the row's log-sum-exp over ``S``.
+    Every consumer of the selected scores takes a per-row softmax over a subset of ``S``
+    (``masked_log_softmax``), which is shift invariant, so this equals passing the logits
+    themselves; only slots with ``p < FLT_MIN`` read -87.3 instead of their exact
+    log-probability. Those are the logits more than 87.3 below the row's log-sum-exp over
+    ``S``, which exceeds the row's maximum by up to ``ln |S|``: every logit more than 87.3
+    below the maximum, and at ``|S| = 2048`` possibly one only about 79.7 below it. The backward
+    clamps ``p`` to ``FLT_MIN`` as well, so the gradient is unchanged; the reported KL value
+    is not: where the attention target puts mass on such a slot, its term is capped near
+    87.3 nats while the BF16 path's keeps growing with the gap, so the KL reads lower than
+    the BF16 path's. The indices are padded with ``-1`` to ``topk_k`` rounded up to 128 (the
+    kernel's tile), one shape per configured top-k, so a narrow call never compiles a new
+    kernel variant.
+    """
+    recompute = getattr(_cudnn_dsa, "sparse_indexer_score_recompute_wrapper", None)
+    if recompute is None:
+        raise RuntimeError(
+            f"cuDNN frontend {_cudnn_frontend_version()} lacks "
+            "sparse_indexer_score_recompute_wrapper, needed for the indexer loss of "
+            "dsa_indexer_precision='mxfp8' (it recomputes the selected scores in FP32 from "
+            "the BF16 indexer inputs)."
+        )
+    n_selected = topk_indices.size(-1)
+    padded_topk = round_up_to_nearest_multiple(
+        max(topk_k, n_selected), _SPARSE_INDEXER_RECOMPUTE_TOPK_ALIGNMENT
+    )
+    indices = torch.nn.functional.pad(
+        topk_indices.to(torch.int32), (0, padded_topk - n_selected), value=-1
+    ).contiguous()
+    predict = recompute(
+        q_bshd.contiguous(),
+        k_bshd.squeeze(2).contiguous(),
+        w_bsh.contiguous(),
+        indices,
+        qhead_per_kv_head=q_bshd.size(2),
+        topk_indices_global=False,
+    )["predict"][..., :n_selected]
+    log_probs = torch.log(predict.float().clamp_min(_CLIP_PROB_MIN))
+    return torch.where(topk_indices >= 0, log_probs, torch.full_like(log_probs, float("-inf")))
+
+
+def _packed_thd_row_lengths(
+    starts: Tensor,
+    ends: Tensor,
+    packed_cu_seqlens_q: Tensor,
+    *,
+    cp_size: int,
+    num_rows: int,
+    width: int,
+) -> Tensor:
+    """Per-row key count ``[starts, starts + length)`` the DeepGEMM scorer covers (int32).
+
+    Rows inside a packed segment get ``min(ends - starts, width)``: their causal key range,
+    which equals the cuDNN scorer's per-row column limit (front segment of CP rank ``r``:
+    offset ``r * half``; back segment: ``L - r * half - half``; both give the query's
+    position in its sequence plus one). Rows past the covered rows (``cu_q[-1]`` at CP1,
+    ``2 * sum(len // (2 * cp))`` at CP>1) belong to no segment and get 0, as on the
+    skip-fill cuDNN path; their ``ks = ke = starts`` (``cu_q[-1]``) can only widen the key
+    span of the one DeepGEMM query block that straddles the covered boundary. Device ops
+    only; ``width`` is a host bound.
+    """
+    cu_q = packed_cu_seqlens_q.to(device=starts.device, dtype=torch.int64)
+    if cp_size == 1:
+        covered = cu_q[-1]
+    else:
+        covered = 2 * torch.div(cu_q[1:] - cu_q[:-1], 2 * cp_size, rounding_mode="floor").sum()
+    rows = torch.arange(num_rows, dtype=torch.int64, device=starts.device)
+    lengths = (ends.to(torch.int64) - starts.to(torch.int64)).clamp(min=0, max=width)
+    return torch.where(rows < covered, lengths, torch.zeros_like(lengths)).to(torch.int32)
+
+
+def _deepgemm_scorer_fallback_reason(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, *, deterministic: bool
+) -> Optional[str]:
+    """Why this call cannot use the DeepGEMM scorer (``None`` if it can); host facts only.
+
+    Adds the runtime deterministic flag, the cuDNN frontend and the JIT state to
+    :func:`dsa_deepgemm_scorer.static_fallback_reason`. The frontend must have the radix
+    top-k out-of-bounds lane guard (>= 1.29), as for the skip-fill scorer: DeepGEMM leaves
+    the logits past each row's length unwritten, and a call DeepSelect does not take is read
+    by cuDNN's top-k. The rule holds for every call, so a run with dynamic CP never switches
+    scorers between batches. A cold specialization is warmed up here on the first eager call;
+    inside CUDA graph capture it raises instead, before any deep_gemm call. A device other
+    than the first one this process ran DeepGEMM on falls back (one DeepGEMM device per
+    process, :mod:`dsa_deepgemm_scorer`).
+    """
+    num_heads, head_dim = q_bshd.size(2), q_bshd.size(3)
+    reason = dsa_deepgemm_scorer.static_fallback_reason(
+        device=q_bshd.device,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        q_dtype=q_bshd.dtype,
+        k_dtype=k_bshd.dtype,
+        w_dtype=w_bsh.dtype,
+        deterministic=bool(deterministic or torch.are_deterministic_algorithms_enabled()),
+    )
+    if reason is None and not _cudnn_frontend_at_least(_TOPK_OOB_LANE_GUARD_FE_VERSION):
+        reason = (
+            f"cuDNN frontend {_cudnn_frontend_version()} is older than 1.29: its top-k lacks "
+            "the out-of-bounds lane guard that reading DeepGEMM's logits needs"
+        )
+    if reason is None:
+        reason = dsa_deepgemm_scorer.jit_problem(q_bshd.device, num_heads, head_dim)
+    return reason
+
+
+def _deepgemm_quantized_q(q_rows: Tensor) -> Tuple[Tensor, Tensor]:
+    """TE MXFP8 Q ``[rows, H, 128]`` with packed UE8M0 scales ``[rows, H]`` of one call's rows.
+
+    Quantized per DeepGEMM call (row chunk): one TE MXFP8 cast takes at most
+    :data:`_TE_MXFP8_CAST_MAX_ROWS` // H query rows, which every chunk of
+    :func:`_deepgemm_row_chunks` respects.
+    """
+    return indexer_quantization.quantize_indexer_mxfp8_packed_ue8m0(q_rows.contiguous())
+
+
+def _deepgemm_quantized_k(k_bshd: Tensor) -> Tuple[Tensor, Tensor]:
+    """TE MXFP8 K ``[sk, 128]`` with packed UE8M0 scales ``[sk]``, shared by every row chunk.
+
+    One cast, so at most :data:`_TE_MXFP8_CAST_MAX_ROWS` (4194240) keys; the 1M-token recipes
+    gather 1048576.
+    """
+    return indexer_quantization.quantize_indexer_mxfp8_packed_ue8m0(k_bshd[0, :, 0].contiguous())
+
+
+def _deepgemm_packed_thd_logits(
+    q_bshd: Tensor, k_bshd: Tensor, w_bsh: Tensor, ks: Tensor, ke: Tensor, width: int
+) -> Tensor:
+    """DeepGEMM BF16 logits ``[sq, width]`` of the packed THD rows over the original K.
+
+    One DeepGEMM call, so at most :func:`dsa_deepgemm_scorer.max_rows_per_call` rows.
+    """
+    q_fp8, q_scale = _deepgemm_quantized_q(q_bshd[0])
+    k_fp8, k_scale = _deepgemm_quantized_k(k_bshd)
+    return dsa_deepgemm_scorer.mqa_logits(
+        q_fp8, q_scale, k_fp8, k_scale, w_bsh[0].contiguous(), ks, ke, max_seqlen_k=width
+    )
+
+
+def _deepgemm_row_chunks(n_rows: int, num_heads: int) -> list[tuple[int, int]]:
+    """Row ranges of at most one DeepGEMM call and one TE MXFP8 cast of Q each.
+
+    DeepGEMM takes at most :func:`dsa_deepgemm_scorer.max_rows_per_call` rows per call
+    (116208 with 32 heads, 58104 with 64) and TE's cast at most
+    :data:`_TE_MXFP8_CAST_MAX_ROWS` // ``num_heads`` (131070, 65535); the smaller one bounds
+    a chunk. One range when the rows fit, else ranges starting at multiples of
+    :data:`_DEEPGEMM_CHUNK_ROW_ALIGNMENT`, which keeps every row slice of Q, its scales, the
+    weights and ``ks``/``ke`` 16-byte aligned for DeepGEMM's TMA descriptors.
+    """
+    limit = min(
+        dsa_deepgemm_scorer.max_rows_per_call(num_heads), _TE_MXFP8_CAST_MAX_ROWS // num_heads
+    )
+    if n_rows <= limit:
+        return [(0, n_rows)]
+    step = limit // _DEEPGEMM_CHUNK_ROW_ALIGNMENT * _DEEPGEMM_CHUNK_ROW_ALIGNMENT
+    return [(start, min(start + step, n_rows)) for start in range(0, n_rows, step)]
+
+
+def _deepgemm_logits_topk(
+    logits: Tensor, lengths: Tensor, topk_k: int, topk_backend: str
+) -> Tuple[Tensor, Tensor]:
+    """Local top-k indices (int32) and BF16 values of DeepGEMM logits ``[rows, width]``.
+
+    The backend is chosen once, on the tensor it will read. DeepSelect reads the logits in
+    place when :func:`dsa_deepselect_topk.fallback_reason` allows it. Otherwise cuDNN's BF16
+    radix top-k reads the compact full-row view (it is compiled for compact rows), and its
+    out-of-bounds lane guard (frontend >= 1.29, required by
+    :func:`_deepgemm_scorer_fallback_reason`) keeps it inside each row's length, so the
+    unwritten columns are never read. The values are always returned.
+    """
+    backend, scores = "cudnn", dsa_deepgemm_scorer.full_row_view(logits)
+    if topk_backend == "deepselect":
+        reason = dsa_deepselect_topk.fallback_reason(logits, lengths, topk_k, False)
+        if reason is None:
+            backend, scores = "deepselect", logits
+        else:
+            dsa_deepselect_topk.log_topk_backend_once(topk_backend, reason, logits.dtype)
+    result = _indexer_top_k_wrapper_chunked(
+        scores,
+        lengths,
+        topk_k=topk_k,
+        return_topk_scores=True,
+        deterministic=False,
+        topk_backend=backend,
+    )
+    if result["values"] is None:
+        raise RuntimeError("the DSA top-k did not return the selected values.")
+    return result["indices"], result["values"]
+
+
+def _indexer_topk_packed_thd_deepgemm(
+    *,
+    q_bshd: Tensor,
+    k_bshd: Tensor,
+    w_bsh: Tensor,
+    topk_k: int,
+    return_topk_scores: bool,
+    starts: Tensor,
+    ends: Tensor,
+    packed_cu_seqlens_q: Tensor,
+    cp_size: int,
+    max_score_k: int,
+    scorer_options: IndexerScorerOptions,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """DeepGEMM MXFP8 scorer + BF16 top-k of :func:`_indexer_topk_packed_thd`.
+
+    Row ``r`` is scored over keys ``[ks, ke)`` = ``[starts, starts + length)`` of the
+    original K (:func:`_packed_thd_row_lengths`), so a selected column ``t`` restores to the
+    global key ``ks + t``, exactly what the cuDNN path returns (``topk_indices + starts``).
+    No duplicated-prefix K pool is built. The top-k always asks for the selected values, so
+    an indices-only call (a checkpoint's first call) and a call that keeps the scores (its
+    replay) run the identical top-k invocation on bitwise-identical logits; the values only
+    mark non-finite selections for the caller. Each call's top-k backend is chosen once
+    (:func:`_deepgemm_logits_topk`). Calls of more rows than one DeepGEMM call or one TE
+    MXFP8 cast of Q takes (:func:`_deepgemm_row_chunks`, never reached by the GLM-5.2
+    recipes' 4096 or 16384 rows per rank) are quantized, scored and selected in row chunks;
+    rows are independent in all three, so only the outputs are copied together. K is
+    quantized once for all chunks.
+
+    Returns global top-k indices ``(1, sq, min(topk_k, max_score_k))`` and, when
+    ``return_topk_scores``, the selected BF16 logits in the same slots (both unpadded).
+    """
+    sq = q_bshd.size(1)
+    sk = k_bshd.size(1)
+    device = q_bshd.device
+    width = max_score_k
+    lengths = _packed_thd_row_lengths(
+        starts, ends, packed_cu_seqlens_q, cp_size=cp_size, num_rows=sq, width=width
+    )
+    ks = starts.clamp(min=0, max=sk).to(torch.int32).contiguous()
+    ke = (ks + lengths).contiguous()
+    score_topk = min(topk_k, width)
+    every_key = score_topk == width
+    if every_key:
+        # Every in-row key is selected: no ranking. The logits are needed only to mark
+        # non-finite selections when the scores are kept.
+        columns = torch.arange(width, dtype=torch.int32, device=device).view(1, width)
+        every_key_indices = torch.where(
+            columns < lengths.view(sq, 1), columns + ks.view(sq, 1), torch.full_like(columns, -1)
+        ).view(1, sq, width)
+        if not return_topk_scores:
+            return every_key_indices, None
+
+    chunks = _deepgemm_row_chunks(sq, q_bshd.size(2))
+    k_fp8, k_scale = _deepgemm_quantized_k(k_bshd)
+    w = w_bsh[0].contiguous()
+    local_indices: Optional[Tensor] = None
+    values: Optional[Tensor] = None
+    if len(chunks) > 1:
+        values = torch.empty((sq, score_topk), dtype=torch.bfloat16, device=device)
+        if not every_key:
+            local_indices = torch.empty((sq, score_topk), dtype=torch.int32, device=device)
+    for row_start, row_end in chunks:
+        rows = slice(row_start, row_end)
+        q_fp8, q_scale = _deepgemm_quantized_q(q_bshd[0, rows])
+        logits = dsa_deepgemm_scorer.mqa_logits(
+            q_fp8, q_scale, k_fp8, k_scale, w[rows], ks[rows], ke[rows], max_seqlen_k=width
+        )
+        del q_fp8, q_scale
+        if every_key:
+            chunk_indices, chunk_values = None, logits
+        else:
+            chunk_indices, chunk_values = _deepgemm_logits_topk(
+                logits, lengths[rows], score_topk, scorer_options.topk_backend
+            )
+        del logits
+        if len(chunks) == 1:
+            local_indices, values = chunk_indices, chunk_values
+        else:
+            values[rows].copy_(chunk_values)
+            if chunk_indices is not None:
+                local_indices[rows].copy_(chunk_indices)
+        del chunk_indices, chunk_values
+
+    if every_key:
+        return every_key_indices, values.unsqueeze(0)
+    local_indices = local_indices.view(1, sq, score_topk)
+    topk_indices = torch.where(
+        local_indices >= 0, local_indices + ks.view(1, sq, 1), torch.full_like(local_indices, -1)
+    )
+    if not return_topk_scores:
+        return topk_indices, None
+    return topk_indices, values.view(1, sq, score_topk)
+
+
+# cuDNN's SM100 scorer binds a caller ``out`` directly only when its row width is a multiple of
+# 4 FP32 elements (its TMA store alignment); otherwise it stages through a padded buffer and
+# copies back, and rejects that copy with ``clean_logits=False``. Only frontend 1.31 was
+# checked to bind a row-padded ``out`` without a copy.
+_CUDNN_SCORE_OUT_WIDTH_ALIGNMENT = 4
+_SCORE_OUT_FE_VERSION = (1, 31)
+
+
+def _deepselect_score_out_kwargs(
+    *,
+    n_rows: int,
+    width: int,
+    topk_k: int,
+    device: torch.device,
+    deterministic: bool,
+    topk_backend: str,
+) -> dict:
+    """``out=`` for the dense THD scorer when DeepSelect will read a padded-stride buffer.
+
+    DeepSelect needs a score row stride that is a multiple of 1024 bytes. The scorer
+    allocates ``[rows, width]`` (``width`` rounded to 4 elements), which already satisfies
+    that for every GLM-5.2 rank width: 1M CP64 widths are multiples of 8192 elements, 128K ones
+    multiples of 2048 at the recipe's realized CP32 (and of 1024 at CP64).
+    For other widths that DeepSelect would take, the scorer writes into a view of a buffer
+    whose rows are padded to the stride instead: frontend >= 1.31 binds such an ``out``
+    directly (its own row padding uses the same strided view), so nothing is copied. Calls
+    that will not use DeepSelect, and older frontends, keep the default buffer (and the
+    top-k then falls back to cuDNN for an unaligned width).
+    """
+    if topk_backend != "deepselect" or topk_k >= width:
+        return {}
+    deterministic = bool(deterministic or torch.are_deterministic_algorithms_enabled())
+    if (
+        dsa_deepselect_topk.static_fallback_reason(
+            n_rows=n_rows,
+            width=width,
+            topk_k=topk_k,
+            dtype=torch.float32,
+            device=device,
+            deterministic=deterministic,
+        )
+        is not None
+    ):
+        return {}
+    row_stride = dsa_deepselect_topk.score_row_stride(width, torch.float32)
+    if (
+        row_stride == width
+        or width % _CUDNN_SCORE_OUT_WIDTH_ALIGNMENT
+        or not _cudnn_frontend_at_least(_SCORE_OUT_FE_VERSION)
+        or not _accepts_named_parameter(_cudnn_dsa.indexer_forward_wrapper, "out")
+    ):
+        return {}
+    buffer = torch.empty((n_rows, row_stride), dtype=torch.float32, device=device)
+    return {"out": buffer[:, :width]}
+
+
+def _mxfp8_scorer_device_problem(device: torch.device) -> Optional[str]:
+    """Why ``device`` cannot run the cuDNN MXFP8 dense indexer scorer, or None."""
+    if device.type != "cuda":
+        return f"the MXFP8 scorer needs CUDA tensors, got device {device}"
+    capability = torch.cuda.get_device_capability(device)
+    if capability[0] < _MXFP8_SCORER_MIN_SM_MAJOR:
+        return f"SM{_MXFP8_SCORER_MIN_SM_MAJOR}0+ is required, got SM{capability[0]}{capability[1]}"
+    return None
+
+
+def _check_mxfp8_scorer_supported(q_thd: Tensor, k_thd: Tensor, w_th: Tensor) -> None:
+    """Raise unless this process can run the cuDNN MXFP8 dense indexer scorer."""
+    problems = []
+    if q_thd.ndim != 3 or q_thd.size(1) not in _MXFP8_SCORER_HEAD_COUNTS:
+        problems.append(f"indexer heads must be 32 or 64, got q shape {tuple(q_thd.shape)}")
+    if q_thd.size(-1) != _MXFP8_SCORER_HEAD_DIM or k_thd.size(-1) != _MXFP8_SCORER_HEAD_DIM:
+        problems.append(f"indexer head_dim must be {_MXFP8_SCORER_HEAD_DIM}")
+    if q_thd.dtype != torch.bfloat16 or k_thd.dtype != torch.bfloat16:
+        problems.append(f"indexer q/k must be BF16, got {q_thd.dtype}/{k_thd.dtype}")
+    if w_th.dtype != torch.bfloat16:
+        problems.append(
+            f"indexer weights must be BF16 (dsa_indexer_weights_proj_output_dtype='bf16'), "
+            f"got {w_th.dtype}"
+        )
+    device_problem = _mxfp8_scorer_device_problem(q_thd.device)
+    if device_problem is not None:
+        problems.append(device_problem)
+    missing = [
+        name
+        for name in _MXFP8_SCORER_WRAPPER_PARAMETERS
+        if not _accepts_named_parameter(_cudnn_dsa.indexer_forward_wrapper, name)
+    ]
+    if missing:
+        problems.append(
+            "the installed cuDNN frontend indexer_forward_wrapper lacks "
+            f"{', '.join(missing)} (cuDNN frontend >= 1.29 provides the MXFP8 dense scorer)"
+        )
+    if not indexer_quantization.HAVE_TE_MXFP8:
+        problems.append("Transformer Engine MXFP8 quantization is unavailable")
+    if not indexer_quantization.HAVE_TRITON:
+        problems.append("Triton (MXFP8 scale packing) is unavailable")
+    if problems:
+        raise RuntimeError(
+            "dsa_indexer_precision='mxfp8' cannot run the cuDNN dense indexer scorer: "
+            + "; ".join(problems)
+        )
+
+
+def _quantize_packed_thd_scorer_inputs_mxfp8(
+    q_thd: Tensor, k_thd: Tensor, w_th: Tensor, cu_seqlens_q: Tensor, cu_seqlens_k: Tensor
+) -> Tuple[Tensor, Tensor, dict]:
+    """Quantize the packed THD scorer Q ``(T_q, H, D)`` and K ``(T_k, 1, D)`` to MXFP8.
+
+    Returns the E4M3 Q/K and the ``indexer_forward_wrapper`` kwargs carrying the packed
+    E8M0 1x32 scales and their per-segment padded prefixes.
+
+    CUDA graph safety: no tensor is read on the host. The padded scale prefixes are
+    computed on the device, and the scale storage is sized from tensor shapes alone:
+    ``indexer_mxfp8_thd_scale_capacity`` bounds the padded scale rows of any boundaries
+    with these token and segment counts, which covers every dynamic-CP layout that maps
+    onto the same static shapes. All storage is dispatch-local, so a capture pool can
+    reuse it and replay never depends on an earlier call's pointers.
+    """
+    _check_mxfp8_scorer_supported(q_thd, k_thd, w_th)
+    total_q, num_heads, head_dim = q_thd.shape
+    total_k = k_thd.size(0)
+    num_segments = cu_seqlens_q.numel() - 1
+    device = q_thd.device
+    cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int32).contiguous()
+    cu_seqlens_k = cu_seqlens_k.to(dtype=torch.int32).contiguous()
+    q_scale_cu = indexer_quantization.make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_q, num_heads)
+    k_scale_cu = indexer_quantization.make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_k, 1)
+    q_scale = torch.empty(
+        _packed_thd_mxfp8_scale_shape(total_q, num_segments, num_heads, head_dim),
+        dtype=torch.float8_e8m0fnu,
+        device=device,
+    )
+    k_scale = torch.empty(
+        _packed_thd_mxfp8_scale_shape(total_k, num_segments, 1, head_dim),
+        dtype=torch.float8_e8m0fnu,
+        device=device,
+    )
+    q_fp8, q_scale = indexer_quantization.quantize_indexer_mxfp8(
+        q_thd.contiguous(),
+        cu_seqlens=cu_seqlens_q,
+        cu_seqlens_scale_padded=q_scale_cu,
+        out_scale=q_scale,
+        sf_vec_size=_MXFP8_SF_VEC_SIZE,
+    )
+    k_fp8, k_scale = indexer_quantization.quantize_indexer_mxfp8(
+        k_thd.reshape(total_k, head_dim).contiguous(),
+        cu_seqlens=cu_seqlens_k,
+        cu_seqlens_scale_padded=k_scale_cu,
+        out_scale=k_scale,
+        sf_vec_size=_MXFP8_SF_VEC_SIZE,
+    )
+    return (
+        q_fp8,
+        k_fp8.view(total_k, 1, head_dim),
+        {
+            "precision": "mxfp8",
+            "q_scale": q_scale,
+            "k_scale": k_scale,
+            "cu_seqlens_q_scale_padded": q_scale_cu,
+            "cu_seqlens_k_scale_padded": k_scale_cu,
+            "sf_vec_size": _MXFP8_SF_VEC_SIZE,
+        },
+    )
+
+
+def _packed_thd_mxfp8_scale_shape(
+    total_tokens: int, num_segments: int, num_heads: int, head_dim: int
+) -> Tuple[int, int, int]:
+    """Static packed E8M0 scale shape covering any segment boundaries of this geometry."""
+    capacity = indexer_quantization.indexer_mxfp8_thd_scale_capacity(
+        max(1, total_tokens), max(1, num_segments), num_heads
+    )
+    return indexer_quantization.indexer_mxfp8_thd_scale_shape(
+        capacity, num_heads, head_dim, _MXFP8_SF_VEC_SIZE
+    )
+
+
+def _log_clean_logits_unavailable_once() -> None:
+    global _CLEAN_LOGITS_UNAVAILABLE_LOGGED
+    if _CLEAN_LOGITS_UNAVAILABLE_LOGGED:
+        return
+    _CLEAN_LOGITS_UNAVAILABLE_LOGGED = True
+    logging.getLogger(__name__).info(
+        "dsa_indexer_skip_masked_score_fill is set, but the installed cuDNN frontend "
+        "(%s) lacks indexer_forward_wrapper(clean_logits=...) or the top-k out-of-bounds "
+        "lane guard of frontend >= 1.29; keeping the -inf prefill of the indexer scores.",
+        _cudnn_frontend_version(),
+    )
+
+
+def _packed_thd_score_column_limits(
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    q_causal_offsets: Optional[Tensor],
+    *,
+    num_rows: int,
+    ratio: int,
+) -> Tensor:
+    """Per-row column count the THD indexer kernel writes, without host synchronization.
+
+    Row ``r`` of segment ``s`` (``cu_q[s] <= r < cu_q[s + 1]``) is written on columns
+    ``[0, min((offset_s + r - cu_q[s] + 1) // ratio, len_k[s]))``. ``offset_s`` is the
+    explicit q causal offset, or zero, which is the default of every frontend that can
+    skip the prefill. Rows at or after ``cu_q[-1]`` belong to no segment and get zero.
+    """
+    device = cu_seqlens_q.device
+    cu_q = cu_seqlens_q.to(dtype=torch.int64)
+    cu_k = cu_seqlens_k.to(dtype=torch.int64)
+    num_segments = cu_q.numel() - 1
+    rows = torch.arange(num_rows, dtype=torch.int64, device=device)
+    segment = torch.searchsorted(cu_q[1:].contiguous(), rows, right=True).clamp(
+        max=num_segments - 1
+    )
+    local_row = rows - cu_q.index_select(0, segment)
+    if q_causal_offsets is None:
+        offsets = torch.zeros_like(local_row)
+    else:
+        offsets = q_causal_offsets.to(dtype=torch.int64).index_select(0, segment)
+    key_lengths = (cu_k[1:] - cu_k[:-1]).index_select(0, segment)
+    limits = torch.div(offsets + local_row + 1, ratio, rounding_mode="floor")
+    limits = torch.minimum(limits.clamp(min=0), key_lengths)
+    return torch.where(rows < cu_q[-1], limits, torch.zeros_like(limits))
 
 
 def _indexer_topk_single_packed_cp_segments(
@@ -1018,6 +2316,8 @@ def _indexer_topk_single_packed_cp_segments(
     local_packed_cp_rank: int,
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
+    deterministic: bool = False,
+    topk_backend: str = "cudnn",
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Fast cuDNN top-k for one packed THD sequence split into CP front/back slices."""
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
@@ -1086,6 +2386,8 @@ def _indexer_topk_single_packed_cp_segments(
             segment_topk,
             return_topk_scores,
             bottom_right_key_start=key_start + rel_start,
+            deterministic=deterministic,
+            topk_backend=topk_backend,
         )
         topk_indices, topk_scores = _pad_topk_result(topk_indices, topk_scores, topk_k)
         indices_chunks.append(topk_indices)
@@ -1160,7 +2462,21 @@ def _dsa_fwd_flash_mla(
 
 
 def _ensure_dsa_namespace() -> None:
-    """Lazily import the cudnn-frontend DSA namespace."""
+    """Import the cudnn-frontend DSA namespace and every entry point MCore calls.
+
+    ``cudnn.DSA`` imports the kernel modules behind an entry point on its first attribute
+    access. Under CUTLASS DSL 4.6 each ``@cute.kernel`` decoration in those modules leaves
+    a frame that references itself (``CuTeDSL.kernel`` keeps ``inspect.currentframe()`` in
+    a local), and that frame's ``f_back`` chain runs through the import into the frame that
+    touched the entry point. A first access from inside a training step therefore pins
+    every tensor on the Python stack at that moment (the activations and gradients of the
+    first recompute/backward on the rank) until the cyclic collector runs, which
+    ``--manual-gc`` defers to the GC interval or to the collection before full-iteration
+    CUDA graph capture: 1.3-3.6 GB per rank through the eager warmup steps of the 16K
+    GLM-5.2 proxy. Resolve all entry points in this one-time call and collect the import's
+    reference cycles before returning, so later calls import nothing and no caller frame
+    is kept alive.
+    """
     global _cudnn_dsa
     if _cudnn_dsa is not None:
         return
@@ -1171,6 +2487,14 @@ def _ensure_dsa_namespace() -> None:
             "cudnn-frontend DSA namespace not available. Install with "
             "`pip install nvidia-cudnn-frontend[cutedsl]`."
         ) from e
+    for name in _CUDNN_DSA_ENTRY_POINTS:
+        try:
+            getattr(_ns, name)
+        except AttributeError:
+            # Not provided by this frontend; its call sites probe for it.
+            pass
+    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+        gc.collect()
     _cudnn_dsa = _ns
 
 
@@ -1181,6 +2505,165 @@ def _supports_indexer_q_causal_offsets() -> bool:
     return bool(
         filter_kwargs_for_callable(_cudnn_dsa.indexer_forward_wrapper, {"q_causal_offsets": None})
     )
+
+
+def _accepts_named_parameter(fn, name: str) -> bool:
+    """Whether ``fn`` declares ``name`` explicitly (``**kwargs`` does not count).
+
+    A wrapper that only forwards ``**kwargs`` might drop or reject a capability flag, so
+    capability probes for optional behaviour require the parameter to be named.
+    """
+    cached = _NAMED_PARAMETER_CACHE.get(id(fn))
+    if cached is None or cached[0] is not fn:
+        try:
+            parameters = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            names = frozenset()
+        else:
+            names = frozenset(
+                parameter.name
+                for parameter in parameters.values()
+                if parameter.kind
+                not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+            )
+        cached = (fn, names)
+        _NAMED_PARAMETER_CACHE[id(fn)] = cached
+    return name in cached[1]
+
+
+def _supports_indexer_clean_logits() -> bool:
+    """Whether the dense indexer scorer may leave columns past each row's causal limit unset.
+
+    Requires an ``indexer_forward_wrapper`` that names a ``clean_logits`` parameter and
+    the radix top-k out-of-bounds-lane guard of cuDNN frontend >= 1.29
+    (NVIDIA/cudnn-frontend#410). Older top-k kernels can re-read register-only lanes past
+    a degenerate row from memory, which the ``-inf`` prefill hides today.
+    """
+    if _cudnn_dsa is None:
+        return False
+    return _accepts_named_parameter(
+        _cudnn_dsa.indexer_forward_wrapper, "clean_logits"
+    ) and _cudnn_frontend_at_least(_TOPK_OOB_LANE_GUARD_FE_VERSION)
+
+
+@functools.lru_cache(maxsize=1)
+def _cudnn_frontend_version() -> Optional[Tuple[int, int]]:
+    """Return the installed cuDNN frontend ``(major, minor)``, or None if unknown."""
+    try:
+        import cudnn
+    except ImportError:
+        return None
+    match = re.match(r"(\d+)\.(\d+)", str(getattr(cudnn, "__version__", "")))
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _cudnn_frontend_at_least(version: Tuple[int, int]) -> bool:
+    """Whether the installed cuDNN frontend is known to be at least ``version``."""
+    installed = _cudnn_frontend_version()
+    return installed is not None and installed >= version
+
+
+def _bottom_right_q_offset_kwargs(
+    wrapper, *, batch: int, seqlen_q: int, seqlen_k: int, ratio: int, device: torch.device
+) -> dict:
+    """Pin the bottom-right causal alignment of a cuDNN BSHD dense DSA call.
+
+    Without ``q_causal_offsets`` the dense indexer forward, dense attention score
+    recompute and dense indexer backward kernels of cuDNN frontend <= 1.28 (including the
+    1.21.1 q-offset overlay) align the causal mask bottom-right, i.e. local query row ``i``
+    sees keys ``[0, (seqlen_k * ratio - seqlen_q + i + 1) // ratio)``. Frontend 1.29
+    (NVIDIA/cudnn-frontend#370) changed that default to a zero offset (top-left). Every
+    MCore BSHD call site was written against the bottom-right contract -- the score-chunk
+    path crops the key prefix precisely so that bottom-right masking reproduces each row's
+    absolute length -- so pass the legacy offset explicitly whenever the default differs.
+
+    Returns no kwargs when the offset is zero (both conventions agree) or when the
+    installed frontend still has the legacy default, which keeps those calls, and their
+    kernel compile keys, exactly as before.
+    """
+    offset = seqlen_k * ratio - seqlen_q
+    if offset == 0 or not _cudnn_frontend_at_least(_TOP_LEFT_DEFAULT_Q_OFFSET_FE_VERSION):
+        return {}
+    if not filter_kwargs_for_callable(wrapper, {"q_causal_offsets": None}):
+        raise RuntimeError(
+            f"cuDNN frontend {_cudnn_frontend_version()} aligns causal masks top-left by "
+            f"default, but {getattr(wrapper, '__name__', wrapper)!r} does not accept "
+            "q_causal_offsets to restore the bottom-right alignment MCore requires."
+        )
+    return {"q_causal_offsets": torch.full((batch,), offset, dtype=torch.int32, device=device)}
+
+
+def _supports_deterministic_sparse_attention_backward(query: Tensor) -> bool:
+    """Return whether the installed cuDNN DSA backend can run deterministic backward."""
+    if not query.is_cuda or query.size(2) not in _DETERMINISTIC_SPARSE_BWD_HEAD_COUNTS:
+        return False
+    major, _minor = torch.cuda.get_device_capability(query.device)
+    if major != 10:
+        return False
+
+    _ensure_dsa_namespace()
+    wrapper = getattr(_cudnn_dsa, "sparse_attention_backward_wrapper", None)
+    backward_api = getattr(_cudnn_dsa, "SparseAttentionBackward", None)
+    if wrapper is None or backward_api is None:
+        return False
+    try:
+        parameters = inspect.signature(wrapper).parameters
+    except (TypeError, ValueError):
+        return False
+    return "deterministic" in parameters and "workspace" in parameters
+
+
+def _get_deterministic_sparse_attention_workspace(
+    q_flat: Tensor,
+    kv_flat: Tensor,
+    out_flat: Tensor,
+    lse: Tensor,
+    attn_sink: Tensor,
+    global_idxs: Tensor,
+    topk_length: Tensor,
+    softmax_scale: float,
+) -> Tensor:
+    """Return retained per-shape scratch shared by serial DSA backward calls.
+
+    The default MCore execution path serializes DSA backward calls within one
+    process. Keep one buffer per device and shape rather than one per CUDA
+    stream: full-iteration graph capture uses a capture stream after eager
+    warmup, and retaining both stream-local buffers can duplicate many GiB of
+    scratch. A caller that intentionally overlaps independent DSA backward
+    calls must pass an explicit ``deterministic_workspace`` to
+    ``_run_sparse_attention_backward`` for each concurrent lane.
+    """
+    backward_api = _cudnn_dsa.SparseAttentionBackward(
+        sample_q=q_flat,
+        sample_kv=kv_flat,
+        sample_out=out_flat,
+        # Only the descriptor is consumed while sizing scratch; output has the same contract.
+        sample_dout=out_flat,
+        sample_lse=lse,
+        sample_attn_sink=attn_sink,
+        sample_topk_idxs=global_idxs,
+        sample_topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        deterministic=True,
+    )
+    if not backward_api.check_support():
+        raise RuntimeError("cuDNN rejected deterministic DSA sparse-attention backward")
+    required_bytes = backward_api.scratch_workspace_bytes()
+    device = q_flat.device
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    # Retain every captured pointer for the process lifetime. Replacing one grow-only
+    # buffer would let a later, larger shape free storage embedded in an older graph.
+    # The pointer is intentionally shared across serial eager and graph streams so a
+    # pre-capture warmup does not leave a second workspace resident on the device.
+    cache_key = (device, int(required_bytes))
+    workspace = _DETERMINISTIC_SPARSE_BWD_WORKSPACES.get(cache_key)
+    if workspace is None:
+        workspace = torch.empty(required_bytes, dtype=torch.uint8, device=device)
+        _DETERMINISTIC_SPARSE_BWD_WORKSPACES[cache_key] = workspace
+    return workspace
 
 
 def _local_to_global_flat(local_idxs: Tensor, batch_size: int) -> Tensor:
@@ -1421,6 +2904,8 @@ def _indexer_topk_bshd(
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    deterministic: bool = False,
+    scorer_options: Optional[IndexerScorerOptions] = None,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -1441,8 +2926,12 @@ def _indexer_topk_bshd(
     ``use_local_indexer_varlen`` identifies a packed causal identity-key layout. The
     selected packed executor scores compact local query rows directly, then restores
     sequence-local top-k indices to the global packed key coordinate space.
+
+    ``scorer_options`` carries the config-level scorer opt-ins: the skipped prefill applies
+    to the general packed THD executor only, the top-k backend to every executor.
     """
     _ensure_dsa_namespace()
+    topk_backend = (scorer_options or IndexerScorerOptions()).topk_backend
 
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bsd.shape[1]
@@ -1499,6 +2988,18 @@ def _indexer_topk_bshd(
         packed_metadata_available=packed_metadata_available,
     )
     if (
+        scorer_options is not None
+        and scorer_options.precision == "mxfp8"
+        and scoring_plan.plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS
+        and packed_metadata_available
+    ):
+        # Only the general THD scorer runs in MXFP8. A one-sequence pack is an ordinary
+        # general-THD layout, so score it there instead of rejecting the request.
+        scoring_plan = IndexerScoringDecision(
+            IndexerScoringPlan.PACKED_THD_GENERAL,
+            "single-sequence pack scored by the general packed THD scorer for MXFP8",
+        )
+    if (
         scoring_plan.plan is IndexerScoringPlan.PACKED_THD_GENERAL
         and packed_cp_size > 1
         and not _supports_indexer_q_causal_offsets()
@@ -1511,6 +3012,10 @@ def _indexer_topk_bshd(
     report_unfused_scoring_once(scoring_plan, "indexer scoring")
     if plan is IndexerScoringPlan.DECLINE:
         raise RuntimeError(f"invalid DSA scoring dispatch: {scoring_plan.reason}")
+    if scorer_options is not None:
+        _check_scorer_precision_supported(
+            scorer_options, plan=plan, reason=scoring_plan.reason, return_scores=return_scores
+        )
 
     # PLAIN_CAUSAL means the bounds, if any, are the trivial whole-sequence causal ones
     # that ``_causal_seq_lens`` rebuilds exactly, so the single-kernel scorer applies.
@@ -1519,14 +3024,18 @@ def _indexer_topk_bshd(
         seq_lens = _causal_seq_lens(q_idx, _INDEXER_RATIO, sk).to(torch.int32).repeat(b)
         if not return_scores:
             topk_indices, topk_scores = _indexer_topk_from_score_chunks(
-                q_bshd, k_bshd, w_bsh, seq_lens, topk_k, return_topk_scores
+                q_bshd,
+                k_bshd,
+                w_bsh,
+                seq_lens,
+                topk_k,
+                return_topk_scores,
+                deterministic=deterministic,
+                topk_backend=topk_backend,
             )
         else:
-            scores = _indexer_forward_wrapper_with_warning(
-                q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO, sm_scale=_INDEXER_SOFTMAX_SCALE
-            )[
-                "scores"
-            ]  # (b, sq, sk) fp32, -inf on masked positions
+            # (b, sq, sk) fp32, -inf on masked positions
+            scores = _indexer_forward_bshd_bottom_right(q_bshd, k_bshd, w_bsh, ratio=_INDEXER_RATIO)
     else:
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
         if not return_scores and plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS:
@@ -1540,6 +3049,8 @@ def _indexer_topk_bshd(
                 local_packed_cp_rank,
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
+                deterministic=deterministic,
+                topk_backend=topk_backend,
             )
         elif not return_scores and plan is IndexerScoringPlan.PACKED_THD_GENERAL:
             topk_indices, topk_scores = _indexer_topk_packed_thd(
@@ -1558,6 +3069,8 @@ def _indexer_topk_bshd(
                 local_packed_cp_rank,
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
+                deterministic=deterministic,
+                scorer_options=scorer_options,
             )
         elif not return_scores:
             topk_indices, topk_scores = _indexer_topk_from_score_chunks(
@@ -1572,6 +3085,8 @@ def _indexer_topk_bshd(
                 key_positions_i64=key_positions_i64,
                 indexer_ratio=_INDEXER_RATIO,
                 score_seq_lens=ends,
+                deterministic=deterministic,
+                topk_backend=topk_backend,
             )
         else:
             # This branch runs only when ``starts`` is set; normalize_varlen_bounds then
@@ -1601,7 +3116,12 @@ def _indexer_topk_bshd(
         )
 
         tk_result = _indexer_top_k_wrapper_chunked(
-            scores_for_topk, seq_lens, topk_k=topk_k, return_topk_scores=return_topk_scores
+            scores_for_topk,
+            seq_lens,
+            topk_k=topk_k,
+            return_topk_scores=return_topk_scores,
+            deterministic=deterministic,
+            topk_backend=topk_backend,
         )
         del scores_for_topk, scores_flat
         if not return_scores:
@@ -1674,6 +3194,39 @@ def _indexer_topk_bshd(
     return topk_indices.int().contiguous(), topk_length, None
 
 
+def _check_scorer_precision_supported(
+    scorer_options: IndexerScorerOptions,
+    *,
+    plan: IndexerScoringPlan,
+    reason: str,
+    return_scores: bool,
+) -> None:
+    """Reject a requested scorer precision that this call's scoring path cannot honour."""
+    precision = scorer_options.precision
+    if scorer_options.scorer_backend not in dsa_deepgemm_scorer.SCORER_BACKENDS:
+        raise ValueError(
+            f"dsa_indexer_scorer_backend must be one of {dsa_deepgemm_scorer.SCORER_BACKENDS}, "
+            f"got {scorer_options.scorer_backend!r}"
+        )
+    if scorer_options.scorer_backend == "deepgemm" and precision != "mxfp8":
+        raise ValueError(
+            "dsa_indexer_scorer_backend='deepgemm' is the MXFP8 selection scorer; set "
+            f"dsa_indexer_precision='mxfp8', got {precision!r}"
+        )
+    if precision == "bf16":
+        return
+    if precision != "mxfp8":
+        raise ValueError(f"dsa_indexer_precision must be 'bf16' or 'mxfp8', got {precision!r}")
+    if plan is IndexerScoringPlan.PACKED_THD_GENERAL and not return_scores:
+        return
+    path = "the dense indexer loss (full scores)" if return_scores else f"the {plan.value} plan"
+    raise RuntimeError(
+        "dsa_indexer_precision='mxfp8' is implemented only by the general packed THD cuDNN "
+        f"scorer with the sparse indexer loss, but this call takes {path} ({reason}). "
+        "Use dsa_indexer_precision='bf16' for this layout."
+    )
+
+
 def _sbhd_to_bshd_indexer_inputs(
     q_indexer: Tensor, k_indexer: Tensor, weights: Tensor
 ) -> Tuple[Tensor, Tensor, Tensor]:
@@ -1703,6 +3256,8 @@ def run_fused_qk_topk(
     varlen_is_plain_causal: bool = False,
     packed_thd_causal_identity_layout: Optional[bool] = None,
     packed_thd_single_sequence: Optional[bool] = None,
+    deterministic: bool = False,
+    config: Optional["TransformerConfig"] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
     use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
@@ -1750,6 +3305,8 @@ def run_fused_qk_topk(
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
         varlen_is_plain_causal=varlen_is_plain_causal,
+        deterministic=deterministic,
+        scorer_options=_scorer_options_from_config(config),
     )
     return topk_indices, topk_length
 
@@ -1781,6 +3338,7 @@ def run_fused_qk_topk_with_loss(
     varlen_is_plain_causal: bool = False,
     packed_thd_causal_identity_layout: Optional[bool] = None,
     packed_thd_single_sequence: Optional[bool] = None,
+    deterministic: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
     use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
@@ -1852,6 +3410,189 @@ def run_fused_qk_topk_with_loss(
         cp_size,
         tp_group,
         varlen_is_plain_causal,
+        bool(
+            deterministic
+            or getattr(config, "deterministic_mode", False)
+            or torch.are_deterministic_algorithms_enabled()
+        ),
+        _scorer_options_from_config(config),
+    )
+
+
+def _sparse_indexer_loss_layout_supported(
+    q: Tensor, query: Optional[Tensor], key: Optional[Tensor], config
+) -> bool:
+    """Whether ``run_sparse_indexer_loss_from_topk`` can consume this attention layout."""
+    if query is None or key is None or query.ndim != 4 or key.ndim != 4 or key.size(2) != 1:
+        return False
+    if query.size(0) != q.size(0) or query.size(1) != q.size(1) or key.size(1) != q.size(1):
+        return False
+    if query.size(3) != key.size(3):
+        return False
+    latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
+    return (
+        latent_v_channels > 0
+        and _supports_flash_mla_value_layout(key.size(-1), latent_v_channels)
+        and _flash_mla_supports_head_count(query)
+    )
+
+
+def run_fused_qk_topk_with_scores(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    index_topk: int,
+    starts: Tensor,
+    ends: Tensor,
+    block_size: int,
+    use_relu: bool = True,
+    use_local_indexer_varlen: bool = False,
+    single_packed_thd_sequence: bool = False,
+    local_packed_cp_rank: int = 0,
+    local_packed_cp_query_start: int = 0,
+    local_packed_cp_query_len: Optional[int] = None,
+    packed_seq_params: Optional["PackedSeqParams"] = None,
+    cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
+    deterministic: bool = False,
+    query: Optional[Tensor] = None,
+    key: Optional[Tensor] = None,
+    config: Optional["TransformerConfig"] = None,
+) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+    """Run the cuDNN fused indexer and return index-sorted top-k plus aligned scores.
+
+    The indices and lengths have the same index-sorted prefix layout as
+    ``run_fused_qk_topk``. The fp32 scores are the selected indexer logits in the same
+    slots, which ``run_sparse_indexer_loss_from_topk`` consumes in a checkpoint replay.
+    Declines when that replay could not consume the attention ``query``/``key`` layout,
+    so no scores are kept for nothing. The kept scores are exactly what the non-reusing
+    path feeds the loss: with ``dsa_indexer_precision='mxfp8'`` the fp32 payload is the
+    selected keys' scores recomputed in FP32 from the BF16 indexer inputs, as
+    log-probabilities over the selection floored at ``log(FLT_MIN)``
+    (:func:`_recompute_selected_indexer_log_probs`); every consumer applies a per-row
+    softmax, which is shift invariant.
+    """
+    if not _sparse_indexer_loss_layout_supported(q, query, key, config):
+        return None
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
+    _assert_supported_indexer_scoring(use_relu)
+    del block_size
+    if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
+        return None
+    if q.size(0) != weights.size(0) or q.size(1) != k.size(1) or q.size(1) != weights.size(1):
+        return None
+    if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
+        return None
+    if starts is None or ends is None:
+        return None
+
+    packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
+        _get_packed_thd_metadata(use_local_indexer_varlen, packed_seq_params)
+    )
+    q_bshd, k_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q, k, weights)
+    topk_indices, topk_length, topk_scores = _indexer_topk_bshd(
+        q_bshd,
+        k_bsd,
+        w_bsh,
+        index_topk,
+        varlen_starts=starts,
+        varlen_ends=ends,
+        key_positions=None,
+        return_scores=False,
+        return_topk_scores=True,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        local_packed_cp_rank=local_packed_cp_rank,
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
+        packed_cu_seqlens_q=packed_cu_seqlens_q,
+        packed_cu_seqlens_k=packed_cu_seqlens_k,
+        packed_max_seqlen_q=packed_max_seqlen_q,
+        packed_max_seqlen_k=packed_max_seqlen_k,
+        packed_cp_size=cp_size,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        deterministic=deterministic,
+        scorer_options=_scorer_options_from_config(config),
+    )
+    if topk_scores is None:
+        return None
+    topk_indices, topk_scores = _sort_valid_topk_indices_and_scores_by_index(
+        topk_indices, topk_scores, topk_length, k_bsd.size(1)
+    )
+    return topk_indices.int().contiguous(), topk_length, topk_scores.contiguous()
+
+
+def run_sparse_indexer_loss_from_topk(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    topk_indices: Tensor,
+    topk_length: Tensor,
+    topk_scores: Tensor,
+    query: Tensor,
+    key: Tensor,
+    softmax_scale: float,
+    loss_coeff: float,
+    pg_collection: "ProcessGroupCollection",
+    query_valid_rows: Optional[Tensor] = None,
+    calculate_per_token_loss: bool = False,
+    config: Optional["TransformerConfig"] = None,
+    deterministic: bool = False,
+) -> Optional[Tensor]:
+    """Run the cuDNN sparse indexer loss for top-k selected by an earlier call.
+
+    ``topk_indices``/``topk_length``/``topk_scores`` must come from
+    ``run_fused_qk_topk_with_scores`` on the same layer inputs. The scores enter the loss
+    only through a per-row softmax over the valid slots, so the log-probability payload of
+    ``dsa_indexer_precision='mxfp8'`` is consumed exactly like logits.
+    """
+    tp_group = getattr(pg_collection, "tp", None)
+    if loss_coeff <= 0:
+        return None
+    if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
+        return None
+    if q.size(0) != weights.size(0) or q.size(1) != k.size(1) or q.size(1) != weights.size(1):
+        return None
+    if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
+        return None
+    if not _sparse_indexer_loss_layout_supported(q, query, key, config):
+        return None
+    batch, rows = q.size(1), q.size(0)
+    if topk_indices.ndim != 3 or tuple(topk_indices.shape[:2]) != (batch, rows):
+        return None
+    if topk_scores.shape != topk_indices.shape or topk_scores.dtype != torch.float32:
+        return None
+    if tuple(topk_length.shape) != (batch, rows):
+        return None
+
+    latent_v_channels = int(config.kv_lora_rank)
+    return SparseIndexerLossFromTopKFunc.apply(
+        q.contiguous(),
+        k.contiguous(),
+        weights.contiguous(),
+        query.contiguous(),
+        key.squeeze(2).contiguous(),
+        topk_indices,
+        topk_length,
+        topk_scores,
+        softmax_scale,
+        loss_coeff,
+        calculate_per_token_loss,
+        latent_v_channels,
+        query_valid_rows,
+        tp_group,
+        bool(
+            deterministic
+            or getattr(config, "deterministic_mode", False)
+            or torch.are_deterministic_algorithms_enabled()
+        ),
     )
 
 
@@ -1905,6 +3646,193 @@ def _pad_sparse_backward_topk(
     return attn_score.contiguous(), index_score.contiguous(), topk_indices.contiguous()
 
 
+def _deterministic_indexer_dk_chunk_rows(
+    q_idx_bshd: Tensor, k_idx_bsd: Tensor, topk_indices: Tensor, compute_grad_w: bool = False
+) -> int:
+    """Choose a bounded flattened-query-row chunk for deterministic sparse gradients."""
+    batch, sq, indexer_heads, indexer_dim = q_idx_bshd.shape
+    topk = topk_indices.size(2)
+    total_keys = k_idx_bsd.size(0) * k_idx_bsd.size(1)
+    fp32_bytes = torch.finfo(torch.float32).bits // 8
+    # Per selected slot the implementation holds up to four fp32 D-vectors
+    # (selected K, contribution, sorted contribution, prefix), two fp32 H-vectors
+    # (dot products and their coefficients), plus integer sort metadata.  Three
+    # full-K tensors cover the running output and the left/right prefix gathers.
+    bytes_per_selected_key = (
+        4 * indexer_dim * fp32_bytes
+        + 2 * indexer_heads * torch.finfo(torch.float32).bits // 8
+        + 4 * torch.iinfo(torch.int64).bits // 8
+    )
+    grad_w_reduction_bytes = indexer_heads * fp32_bytes if compute_grad_w else 0
+    bytes_per_query = (
+        indexer_heads * indexer_dim + indexer_heads
+    ) * fp32_bytes + grad_w_reduction_bytes
+    bytes_per_flat_row = max(1, topk) * bytes_per_selected_key + bytes_per_query
+    fixed_key_bytes = total_keys * (
+        3 * indexer_dim * fp32_bytes + 3 * torch.iinfo(torch.int64).bits // 8
+    )
+    grad_w_output_bytes = (
+        batch * sq * indexer_heads * q_idx_bshd.element_size() if compute_grad_w else 0
+    )
+    row_budget = max(
+        1, _DETERMINISTIC_INDEXER_DK_CHUNK_MAX_BYTES - fixed_key_bytes - grad_w_output_bytes
+    )
+    return _bytes_to_chunk_rows(batch * sq, bytes_per_flat_row, row_budget, 1)
+
+
+def _requires_native_deterministic_indexer_grad_w(q_idx_bshd: Tensor) -> bool:
+    """Whether cuDNN's sparse indexer dW needs a deterministic replacement."""
+    if not q_idx_bshd.is_cuda:
+        return False
+    device_index = q_idx_bshd.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _device_sm(device_index) == (9, 0)
+
+
+def _deterministic_sparse_indexer_grads_wk(
+    q_idx_bshd: Tensor,
+    w_bsh: Tensor,
+    k_idx_bsd: Tensor,
+    attn_score: Tensor,
+    index_score: Tensor,
+    topk_indices: Tensor,
+    *,
+    loss_coeff: float,
+    grad_loss: Tensor,
+    compute_grad_w: bool,
+) -> Tuple[Optional[Tensor], Tensor]:
+    """Recompute sparse-indexer dK, and optionally dW, without floating-point atomics.
+
+    cuDNN's sparse backward atomically accumulates every selected query contribution into
+    ``d_index_k``.  The arrival order changes between launches.  This deterministic-mode
+    replacement keeps the sparse score-gradient work bounded by query-row chunks.
+    Contributions are stable-sorted by flattened key id, prefix-summed in their original
+    row-major order, and gathered at fixed left/right boundaries for every key before a
+    dense fixed-order add to dK.  No scatter, atomic, or data-dependent output shape is used.
+
+    ``topk_indices`` follows the cuDNN contract and therefore indexes flattened ``(B, S_k)``
+    keys.  Negative/padded entries are mapped to one private sentinel row and contribute
+    exact zeros.  SM90 also merges per-thread dW partials with shared-memory atomics, so its
+    deterministic path computes dW from the same dot products and score gradients.  SM100
+    uses fixed-order, unique dW stores and keeps cuDNN's result.
+    """
+    batch, sq, indexer_heads, indexer_dim = q_idx_bshd.shape
+    if k_idx_bsd.shape[0] != batch or w_bsh.shape[:2] != (batch, sq):
+        raise ValueError("sparse indexer backward expects matching B and S_q dimensions")
+    if w_bsh.size(2) != indexer_heads or k_idx_bsd.size(2) != indexer_dim:
+        raise ValueError("sparse indexer backward expects matching indexer head dimensions")
+    if attn_score.shape != index_score.shape or attn_score.shape != topk_indices.shape:
+        raise ValueError("sparse indexer backward scores and top-k indices must have one shape")
+
+    total_keys = k_idx_bsd.size(0) * k_idx_bsd.size(1)
+    if total_keys == 0 or batch * sq == 0:
+        grad_w = torch.zeros_like(w_bsh) if compute_grad_w else None
+        return grad_w, torch.zeros_like(k_idx_bsd)
+
+    topk = topk_indices.size(2)
+    if topk == 0:
+        grad_w = torch.zeros_like(w_bsh) if compute_grad_w else None
+        return grad_w, torch.zeros_like(k_idx_bsd)
+    q_flat = q_idx_bshd.reshape(batch * sq, indexer_heads, indexer_dim)
+    w_flat = w_bsh.reshape(batch * sq, indexer_heads)
+    k_flat = k_idx_bsd.reshape(total_keys, indexer_dim)
+    attn_flat = attn_score.reshape(batch * sq, topk)
+    index_flat = index_score.reshape(batch * sq, topk)
+    topk_flat = topk_indices.reshape(batch * sq, topk)
+
+    # The cuDNN KL backward normalizes by B*S_q.  The caller already folds the
+    # per-token-loss and valid-row corrections into loss_coeff/grad_loss.
+    grad_scale = grad_loss.to(dtype=torch.float32) * (loss_coeff / (batch * sq))
+    grad_scale = grad_scale * _INDEXER_SOFTMAX_SCALE
+    grad_k_flat = torch.zeros(
+        (total_keys, indexer_dim), device=k_idx_bsd.device, dtype=torch.float32
+    )
+    grad_w_flat = torch.empty_like(w_flat) if compute_grad_w else None
+    sentinel = total_keys
+    key_ids = torch.arange(total_keys, device=topk_indices.device, dtype=torch.int64)
+    chunk_rows = _deterministic_indexer_dk_chunk_rows(
+        q_idx_bshd, k_idx_bsd, topk_indices, compute_grad_w
+    )
+
+    for row_start in range(0, batch * sq, chunk_rows):
+        row_end = min(row_start + chunk_rows, batch * sq)
+        q_chunk = q_flat[row_start:row_end].float()
+        w_chunk = w_flat[row_start:row_end].float()
+        indices_chunk = topk_flat[row_start:row_end]
+        valid = (indices_chunk >= 0) & (indices_chunk < total_keys)
+        safe_indices = torch.where(valid, indices_chunk, sentinel).long()
+
+        # Sentinel slots gather an arbitrary real key and are then zeroed by ``valid``.
+        selected_k = k_flat.index_select(0, safe_indices.clamp_max(total_keys - 1).reshape(-1))
+        selected_k = selected_k.reshape(row_end - row_start, topk, indexer_dim).float()
+        dot = torch.bmm(q_chunk, selected_k.transpose(1, 2))
+        score_grad = (index_flat[row_start:row_end] - attn_flat[row_start:row_end]).float()
+        score_grad = (score_grad * grad_scale).masked_fill(~valid, 0.0)
+        head_coeff = (dot > 0).to(dtype=torch.float32)
+        if grad_w_flat is not None:
+            dot.relu_()
+            dot.mul_(score_grad.unsqueeze(1))
+            grad_w_flat[row_start:row_end].copy_(dot.sum(dim=-1))
+        head_coeff.mul_(w_chunk.unsqueeze(-1))
+        head_coeff.mul_(score_grad.unsqueeze(1))
+        contributions = torch.bmm(head_coeff.transpose(1, 2), q_chunk)
+
+        # Stable sorting fixes the within-key summation order.  Prefix boundaries are
+        # gathered for every key, which keeps all output shapes independent of index data
+        # and makes the operation CUDA-Graph capturable.
+        sorted_keys, order = torch.sort(safe_indices.reshape(-1), stable=True)
+        sorted_contributions = contributions.reshape(-1, indexer_dim).index_select(0, order)
+        prefix = torch.nn.functional.pad(torch.cumsum(sorted_contributions, dim=0), (0, 0, 1, 0))
+        left = torch.searchsorted(sorted_keys, key_ids, right=False)
+        right = torch.searchsorted(sorted_keys, key_ids, right=True)
+        chunk_grad_k = prefix.index_select(0, right)
+        chunk_grad_k.sub_(prefix.index_select(0, left))
+        grad_k_flat.add_(chunk_grad_k)
+
+    grad_k = grad_k_flat.reshape_as(k_idx_bsd).to(dtype=k_idx_bsd.dtype)
+    grad_w = grad_w_flat.reshape_as(w_bsh) if grad_w_flat is not None else None
+    return grad_w, grad_k
+
+
+def _call_sparse_indexer_backward(
+    q_idx_bshd: Tensor,
+    w_bsh: Tensor,
+    k_idx_bsd: Tensor,
+    attn_score: Tensor,
+    index_score: Tensor,
+    topk_indices: Tensor,
+    *,
+    loss_coeff: float,
+    grad_loss: Tensor,
+    block_i: int,
+) -> dict:
+    """Call either generation of the cuDNN wrapper with global flattened KV ids.
+
+    Historical wrappers accepted only global ids and therefore exposed no selector.
+    Newer wrappers default to local ids and expose ``topk_indices_global``.  MCore's
+    sparse-loss path has always materialized global ``B * S_k + local`` ids, so set
+    the selector whenever the installed wrapper supports it while preserving the
+    historical call signature.
+    """
+    wrapper = _cudnn_dsa.indexer_backward_wrapper
+    kwargs = {
+        "sm_scale": _INDEXER_SOFTMAX_SCALE,
+        "loss_coeff": loss_coeff,
+        "grad_loss": grad_loss,
+        "block_I": block_i,
+    }
+    try:
+        parameters = inspect.signature(wrapper).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "topk_indices_global" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    ):
+        kwargs["topk_indices_global"] = True
+    return wrapper(q_idx_bshd, w_bsh, k_idx_bsd, attn_score, index_score, topk_indices, **kwargs)
+
+
 def _run_sparse_indexer_backward(
     q_idx_bshd: Tensor,
     w_bsh: Tensor,
@@ -1916,45 +3844,66 @@ def _run_sparse_indexer_backward(
     loss_coeff: float,
     grad_loss: Tensor,
     block_i: int,
+    deterministic: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Run cuDNN sparse indexer backward within CUDA's grid-Y limit."""
-    sq = q_idx_bshd.size(1)
-    if sq <= _CUDA_GRID_Y_MAX:
-        result = _cudnn_dsa.indexer_backward_wrapper(
+    """Run cuDNN sparse indexer backward with deterministic atomic-free replacements."""
+    deterministic_grad_w = None
+    deterministic_grad_k = None
+    if deterministic:
+        # cuDNN Frontend overwrites its score operands, so consume them before the wrapper.
+        deterministic_grad_w, deterministic_grad_k = _deterministic_sparse_indexer_grads_wk(
             q_idx_bshd,
             w_bsh,
             k_idx_bsd,
             attn_score,
             index_score,
             topk_indices,
-            sm_scale=_INDEXER_SOFTMAX_SCALE,
             loss_coeff=loss_coeff,
             grad_loss=grad_loss,
-            block_I=block_i,
+            compute_grad_w=_requires_native_deterministic_indexer_grad_w(q_idx_bshd),
         )
-        return result["d_index_q"], result["d_weights"], result["d_index_k"]
+
+    sq = q_idx_bshd.size(1)
+    if sq <= _CUDA_GRID_Y_MAX:
+        result = _call_sparse_indexer_backward(
+            q_idx_bshd,
+            w_bsh,
+            k_idx_bsd,
+            attn_score,
+            index_score,
+            topk_indices,
+            loss_coeff=loss_coeff,
+            grad_loss=grad_loss,
+            block_i=block_i,
+        )
+        grad_w = deterministic_grad_w if deterministic_grad_w is not None else result["d_weights"]
+        grad_k = deterministic_grad_k if deterministic_grad_k is not None else result["d_index_k"]
+        return result["d_index_q"], grad_w, grad_k
 
     grad_q = torch.empty_like(q_idx_bshd)
-    grad_w = torch.empty_like(w_bsh)
+    grad_w = torch.empty_like(w_bsh) if deterministic_grad_w is None else deterministic_grad_w
     grad_k = torch.zeros_like(k_idx_bsd, dtype=torch.float32)
     for row_start in range(0, sq, _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS):
         row_end = min(row_start + _SPARSE_INDEXER_BACKWARD_CHUNK_ROWS, sq)
         chunk_rows = row_end - row_start
-        result = _cudnn_dsa.indexer_backward_wrapper(
+        result = _call_sparse_indexer_backward(
             q_idx_bshd[:, row_start:row_end].contiguous(),
             w_bsh[:, row_start:row_end].contiguous(),
             k_idx_bsd,
             attn_score[:, row_start:row_end].contiguous(),
             index_score[:, row_start:row_end].contiguous(),
             topk_indices[:, row_start:row_end].contiguous(),
-            sm_scale=_INDEXER_SOFTMAX_SCALE,
             loss_coeff=loss_coeff * chunk_rows / sq,
             grad_loss=grad_loss,
-            block_I=block_i,
+            block_i=block_i,
         )
         grad_q[:, row_start:row_end].copy_(result["d_index_q"])
-        grad_w[:, row_start:row_end].copy_(result["d_weights"])
-        grad_k.add_(result["d_index_k"].float())
+        if deterministic_grad_w is None:
+            grad_w[:, row_start:row_end].copy_(result["d_weights"])
+        if not deterministic:
+            grad_k.add_(result["d_index_k"].float())
+    if deterministic:
+        return grad_q, grad_w, deterministic_grad_k
     return grad_q, grad_w, grad_k.to(dtype=k_idx_bsd.dtype)
 
 
@@ -2106,6 +4055,14 @@ def _compute_dense_attn_score(
         softmax_scale,
         qhead_per_kv_head=qhead_per_kv_head,
         ratio=_INDEXER_RATIO,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.dense_attn_score_recompute_wrapper,
+            batch=q_attn_bshd.size(0),
+            seqlen_q=q_attn_bshd.size(1),
+            seqlen_k=k_attn_bshd.size(1),
+            ratio=_INDEXER_RATIO,
+            device=q_attn_bshd.device,
+        ),
     )
     return result["out"], result["denom"]
 
@@ -2173,6 +4130,7 @@ def _compute_sparse_indexer_loss_and_grads(
     query_valid_rows: Optional[Tensor],
     calculate_per_token_loss: bool,
     tp_group,
+    deterministic: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute sparse indexer KL loss and precomputed indexer gradients."""
     sq, b, num_heads, _d = query.shape
@@ -2191,9 +4149,10 @@ def _compute_sparse_indexer_loss_and_grads(
         q_idx_bshd, w_bsh
     )
 
-    if get_pg_size(tp_group) > 1:
-        # TP ranks own the same query rows but different attention heads. Canonicalize
-        # selected-key slots before the positional target all-reduce.
+    if deterministic or get_pg_size(tp_group) > 1:
+        # cuDNN top-k does not guarantee an order within the selected set. Canonicalize
+        # selected-key slots for deterministic reductions and before the positional
+        # target all-reduce across TP ranks.
         topk_indices_cmp, indexer_score_payload = _sort_valid_topk_indices_and_scores_by_index(
             topk_indices_cmp, indexer_score_payload, topk_length_cmp, skv
         )
@@ -2256,6 +4215,7 @@ def _compute_sparse_indexer_loss_and_grads(
         loss_coeff=indexer_loss_coeff,
         grad_loss=unit_grad_loss,
         block_i=block_i,
+        deterministic=deterministic,
     )
 
     grad_q_bshd, grad_w_bsh = _slice_indexer_backward_head_grads(
@@ -2269,6 +4229,54 @@ def _compute_sparse_indexer_loss_and_grads(
         precomputed_grad_q_indexer,
         precomputed_grad_k_indexer,
         precomputed_grad_weights,
+    )
+
+
+def _sparse_indexer_loss_and_grads_for_selected_topk(
+    *,
+    q_idx_bshd: Tensor,
+    k_idx_bsd: Tensor,
+    w_bsh: Tensor,
+    topk_indices_cmp: Tensor,
+    topk_length_cmp: Tensor,
+    topk_scores: Tensor,
+    topk_indices_attn: Tensor,
+    topk_length_attn: Tensor,
+    query: Tensor,
+    kv_full: Tensor,
+    softmax_scale: float,
+    d_v: int,
+    loss_coeff: float,
+    query_valid_rows: Optional[Tensor],
+    calculate_per_token_loss: bool,
+    tp_group,
+    deterministic: bool,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Sparse indexer loss and precomputed gradients for an already selected top-k set.
+
+    FlashMLA returns only the output and LSE, so the attention target needs one
+    sparse-attention forward over the attention-ordered indices for its LSE. The loss
+    then reads the indexer scores aligned with ``topk_indices_cmp``.
+    """
+    _out_flat, lse, *_ = _run_sparse_attention_forward(
+        query, kv_full, topk_indices_attn, softmax_scale, d_v, topk_length=topk_length_attn
+    )
+    return _compute_sparse_indexer_loss_and_grads(
+        q_idx_bshd=q_idx_bshd,
+        k_idx_bsd=k_idx_bsd,
+        w_bsh=w_bsh,
+        topk_indices_cmp=topk_indices_cmp,
+        topk_length_cmp=topk_length_cmp,
+        indexer_score_payload=topk_scores,
+        query=query,
+        kv_full=kv_full,
+        lse=lse,
+        softmax_scale=softmax_scale,
+        loss_coeff=loss_coeff,
+        query_valid_rows=query_valid_rows,
+        calculate_per_token_loss=calculate_per_token_loss,
+        tp_group=tp_group,
+        deterministic=deterministic,
     )
 
 
@@ -2333,6 +4341,14 @@ def _compute_dense_indexer_loss_and_grads(
         grad_loss=unit_grad_loss,
         ratio=_INDEXER_RATIO,
         block_I=128,
+        **_bottom_right_q_offset_kwargs(
+            _cudnn_dsa.dense_indexer_backward_wrapper,
+            batch=q_idx_bshd_for_bwd.size(0),
+            seqlen_q=q_idx_bshd_for_bwd.size(1),
+            seqlen_k=k_idx_bsd.size(1),
+            ratio=_INDEXER_RATIO,
+            device=q_idx_bshd_for_bwd.device,
+        ),
     )
     # BSHD -> SBHD (match input layout).
     grad_q_bshd, grad_w_bsh = _slice_indexer_backward_head_grads(
@@ -2415,6 +4431,8 @@ def _run_sparse_attention_backward(
     skv: int,
     grad_output: Tensor,
     all_topk_rows_nonempty: bool = False,
+    deterministic: bool = False,
+    deterministic_workspace: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Run sparse attention backward with fixed-shape handling for empty top-k rows."""
     d_v = out_flat.shape[-1]
@@ -2426,7 +4444,7 @@ def _run_sparse_attention_backward(
     bwd_lse = lse
     bwd_attn_sink = attn_sink
     padded_num_heads = num_heads
-    if q_flat.is_cuda:
+    if q_flat.is_cuda and not deterministic:
         padded_num_heads = _get_head_padding(num_heads)
     if padded_num_heads != num_heads:
         bwd_q_flat = q_flat.new_zeros((q_flat.size(0), padded_num_heads, q_flat.size(2)))
@@ -2461,6 +4479,20 @@ def _run_sparse_attention_backward(
             bwd_dO_flat = bwd_dO_flat.masked_fill(empty_rows[:, None, None], 0)
             bwd_lse = bwd_lse.masked_fill(empty_rows[:, None], float("inf"))
 
+    if deterministic and deterministic_workspace is None:
+        deterministic_workspace = _get_deterministic_sparse_attention_workspace(
+            bwd_q_flat,
+            kv_flat,
+            bwd_out_flat,
+            bwd_lse,
+            bwd_attn_sink,
+            global_idxs,
+            topk_length,
+            softmax_scale,
+        )
+    backward_kwargs = {"softmax_scale": softmax_scale, "topk_length": topk_length}
+    if deterministic:
+        backward_kwargs.update(deterministic=True, workspace=deterministic_workspace)
     attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
         bwd_q_flat,
         kv_flat,
@@ -2469,8 +4501,7 @@ def _run_sparse_attention_backward(
         bwd_lse,
         bwd_attn_sink,
         global_idxs,
-        softmax_scale=softmax_scale,
-        topk_length=topk_length,
+        **backward_kwargs,
     )
     grad_query_flat = attn_bwd["dq"]
     if padded_num_heads != num_heads:
@@ -2533,6 +4564,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        scorer_options: Optional[IndexerScorerOptions] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -2570,6 +4602,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            scorer_options=scorer_options,
         )
 
         prepared_topk_length = (
@@ -2748,13 +4781,15 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         #   use_local_indexer_varlen, single_packed_thd_sequence,
         #   local_packed_cp_rank, local_packed_cp_query_start,
         #   local_packed_cp_query_len, packed_cu_seqlens_q, packed_cu_seqlens_k,
-        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group.
+        #   packed_max_seqlen_q, packed_max_seqlen_k, packed_cp_size, tp_group,
+        #   scorer_options.
         return (
             grad_query,
             grad_kv_full,
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -2810,6 +4845,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         packed_cp_size: int,
         tp_group,
         varlen_is_plain_causal: bool = False,
+        deterministic: bool = False,
+        scorer_options: Optional[IndexerScorerOptions] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -2841,6 +4878,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
             varlen_is_plain_causal=varlen_is_plain_causal,
+            deterministic=deterministic,
+            scorer_options=scorer_options,
         )
 
         if indexer_score_payload is None:
@@ -2848,34 +4887,35 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         topk_indices_attn, topk_length_attn = _prepare_attention_topk_indices(
             topk_indices_cmp, kv_full.size(0)
         )
-        _out_flat, lse, *_ = _run_sparse_attention_forward(
-            query, kv_full, topk_indices_attn, softmax_scale, d_v, topk_length=topk_length_attn
-        )
         (
             indexer_loss,
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
-        ) = _compute_sparse_indexer_loss_and_grads(
+        ) = _sparse_indexer_loss_and_grads_for_selected_topk(
             q_idx_bshd=q_idx_bshd,
             k_idx_bsd=k_idx_bsd,
             w_bsh=w_bsh,
             topk_indices_cmp=topk_indices_cmp,
             topk_length_cmp=topk_length_cmp,
-            indexer_score_payload=indexer_score_payload,
+            topk_scores=indexer_score_payload,
+            topk_indices_attn=topk_indices_attn,
+            topk_length_attn=topk_length_attn,
             query=query,
             kv_full=kv_full,
-            lse=lse,
             softmax_scale=softmax_scale,
+            d_v=d_v,
             loss_coeff=loss_coeff,
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
             tp_group=tp_group,
+            deterministic=deterministic,
         )
 
         ctx.save_for_backward(
             precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights
         )
+        ctx.num_inputs = len(ctx.needs_input_grad)
         ctx.mark_non_differentiable(topk_indices_attn, topk_length_attn)
         return topk_indices_attn, topk_length_attn, indexer_loss
 
@@ -2902,8 +4942,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         #   local_packed_cp_query_start, local_packed_cp_query_len,
         #   packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q,
         #   packed_max_seqlen_k, packed_cp_size, tp_group,
-        #   varlen_is_plain_causal.
-        return (
+        #   varlen_is_plain_causal, deterministic, scorer_options.
+        gradients = (
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
@@ -2929,7 +4969,97 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             None,
             None,
             None,  # varlen_is_plain_causal
+            None,  # deterministic
+            None,  # scorer_options
         )
+        return gradients[: ctx.num_inputs]
+
+
+class SparseIndexerLossFromTopKFunc(torch.autograd.Function):
+    """Sparse indexer-loss autograd for a top-k set selected by an earlier call.
+
+    ``FusedQKTopKWithSparseLossFunc`` without the dense indexer scoring and top-k: the
+    index-sorted indices and their aligned scores come from the checkpoint's first call.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        query: Tensor,
+        kv_full: Tensor,
+        topk_indices: Tensor,
+        topk_length: Tensor,
+        topk_scores: Tensor,
+        softmax_scale: float,
+        loss_coeff: float,
+        calculate_per_token_loss: bool,
+        d_v: int,
+        query_valid_rows: Optional[Tensor],
+        tp_group,
+        deterministic: bool = False,
+    ) -> Tensor:
+        """Compute the sparse indexer loss from stored top-k indices and scores."""
+        _ensure_dsa_namespace()
+
+        sq, b, _num_heads, _d = query.shape
+        query_valid_rows = dsa_masking.normalize_query_valid_rows(
+            query_valid_rows, b=b, sq=sq, device=query.device
+        )
+        q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
+        (
+            indexer_loss,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        ) = _sparse_indexer_loss_and_grads_for_selected_topk(
+            q_idx_bshd=q_idx_bshd,
+            k_idx_bsd=k_idx_bsd,
+            w_bsh=w_bsh,
+            topk_indices_cmp=topk_indices,
+            topk_length_cmp=topk_length,
+            topk_scores=topk_scores,
+            topk_indices_attn=topk_indices,
+            topk_length_attn=topk_length,
+            query=query,
+            kv_full=kv_full,
+            softmax_scale=softmax_scale,
+            d_v=d_v,
+            loss_coeff=loss_coeff,
+            query_valid_rows=query_valid_rows,
+            calculate_per_token_loss=calculate_per_token_loss,
+            tp_group=tp_group,
+            deterministic=deterministic,
+        )
+
+        ctx.save_for_backward(
+            precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights
+        )
+        ctx.num_inputs = len(ctx.needs_input_grad)
+        return indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        """Scale saved indexer-loss gradients for autograd."""
+        precomputed_grad_q_indexer, precomputed_grad_k_indexer, precomputed_grad_weights = (
+            ctx.saved_tensors
+        )
+        if grad_loss is not None:
+            grad_q_indexer = precomputed_grad_q_indexer * grad_loss
+            grad_k_indexer = precomputed_grad_k_indexer * grad_loss
+            grad_weights = precomputed_grad_weights * grad_loss
+        else:
+            grad_q_indexer = None
+            grad_k_indexer = None
+            grad_weights = None
+
+        # Grads: q_indexer, k_indexer, weights, then None for query, kv_full,
+        #   topk_indices, topk_length, topk_scores, softmax_scale, loss_coeff,
+        #   calculate_per_token_loss, d_v, query_valid_rows, tp_group, deterministic.
+        gradients = (grad_q_indexer, grad_k_indexer, grad_weights) + (None,) * 12
+        return gradients[: ctx.num_inputs]
 
 
 class FusedSparseAttentionFunc(torch.autograd.Function):
@@ -2945,6 +5075,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         d_v: int,
         topk_length: Optional[Tensor],
         all_topk_rows_nonempty: bool,
+        deterministic: bool,
     ) -> Tensor:
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
@@ -2968,6 +5099,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         ctx.d = d
         ctx.skv = skv
         ctx.all_topk_rows_nonempty = all_topk_rows_nonempty
+        ctx.deterministic = deterministic
 
         return out_flat.reshape(sq, b, num_heads, d_v)
 
@@ -2994,9 +5126,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             skv=skv,
             grad_output=grad_output,
             all_topk_rows_nonempty=ctx.all_topk_rows_nonempty,
+            deterministic=ctx.deterministic,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None, None
+        return grad_query, grad_kv_full, None, None, None, None, None, None
 
 
 def run_fused_absorbed_sparse_attention(
@@ -3007,6 +5140,7 @@ def run_fused_absorbed_sparse_attention(
     v_channels: int,
     topk_length: Optional[Tensor] = None,
     all_topk_rows_nonempty: bool = False,
+    deterministic: bool = False,
 ) -> Optional[Tensor]:
     """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
@@ -3022,10 +5156,19 @@ def run_fused_absorbed_sparse_attention(
         return None
     if not _flash_mla_supports_head_count(query):
         return None
+    if deterministic and not _supports_deterministic_sparse_attention_backward(query):
+        return None
 
     kv_full = key.squeeze(2).contiguous()
     return FusedSparseAttentionFunc.apply(
-        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length, all_topk_rows_nonempty
+        query,
+        kv_full,
+        topk_indices,
+        softmax_scale,
+        v_channels,
+        topk_length,
+        all_topk_rows_nonempty,
+        deterministic,
     )
 
 
@@ -3056,6 +5199,7 @@ def fused_indexer_sparse_attn(
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
     tp_group=None,
+    scorer_options: Optional[IndexerScorerOptions] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused DSv3.2 indexer, sparse attention, and optional indexer loss.
 
@@ -3105,6 +5249,7 @@ def fused_indexer_sparse_attn(
         packed_max_seqlen_k,
         packed_cp_size,
         tp_group,
+        scorer_options,
     )
 
 
@@ -3114,4 +5259,6 @@ __all__ = [
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",
+    "run_fused_qk_topk_with_scores",
+    "run_sparse_indexer_loss_from_topk",
 ]

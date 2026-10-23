@@ -12,6 +12,10 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
+from megatron.core.transformer.forward_sharing import (
+    is_forward_sharing_enabled,
+    preserve_forward_sharing_for_checkpoint,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -184,6 +188,10 @@ def checkpointed_forward(
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
 
+        if is_forward_sharing_enabled(self.config):
+            custom_forward = preserve_forward_sharing_for_checkpoint(
+                custom_forward, packed_seq_params, self.config, attention_mask_arg=1
+            )
         return custom_forward
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):

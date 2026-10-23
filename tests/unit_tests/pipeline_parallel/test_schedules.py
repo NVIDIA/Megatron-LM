@@ -197,6 +197,8 @@ def test_dynamic_context_parallel_non_source_tp_receives_batch_metadata(monkeypa
         torch.tensor([0, 8], dtype=torch.int32),
         torch.tensor([0, 8], dtype=torch.int32),
         torch.tensor([8], dtype=torch.int32),
+        # Zigzag packed-CP MTP certificate; -1 means unknown.
+        torch.tensor([-1], dtype=torch.int32),
         torch.tensor([2], dtype=torch.int32),
     ]
 
@@ -220,6 +222,7 @@ def test_dynamic_context_parallel_non_source_tp_receives_batch_metadata(monkeypa
     assert params.cu_seqlens_q.tolist() == [0, 8]
     assert params.max_seqlen_q == 8
     assert params.local_cp_size == 2 and params.cp_group is cp_group
+    assert params.zigzag_cp_min_chunk_size is None
 
 
 @pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])

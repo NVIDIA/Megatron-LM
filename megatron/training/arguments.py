@@ -462,6 +462,21 @@ def _normalize_dynamic_context_parallel_args(args):
         args.hybrid_context_parallel = False
 
 
+def dataloader_prefetch_factor_type(x):
+    """Parse --dataloader-prefetch-factor: a positive integer or 'auto'."""
+    if x is None or x == 'auto':
+        return x
+    try:
+        value = int(x)
+    except (TypeError, ValueError):
+        value = 0
+    if isinstance(x, (bool, float)) or value <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--dataloader-prefetch-factor must be a positive integer or 'auto', got {x!r}"
+        )
+    return value
+
+
 def validate_args(args, defaults={}):
     _normalize_dynamic_context_parallel_args(args)
     # Preserve dev's padded hash-table checkpoint shape when its legacy flag is used.
@@ -1366,6 +1381,13 @@ def validate_args(args, defaults={}):
 
     # data
     assert args.num_dataset_builder_threads > 0
+    # torch's DataLoader rejects prefetch_factor without worker processes; 'auto'
+    # resolves to a no-op there (see data_samplers.get_dataloader_prefetch_factor).
+    if isinstance(args.dataloader_prefetch_factor, int) and args.num_workers == 0:
+        raise ValueError(
+            f"--dataloader-prefetch-factor {args.dataloader_prefetch_factor} requires "
+            "--num-workers > 0: the DataLoader only prefetches in worker processes."
+        )
 
     # Consumed tokens.
     args.consumed_train_samples = 0
@@ -1951,6 +1973,47 @@ def validate_args(args, defaults={}):
         assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
             f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
             f'must be >= single sequence max length ({args.seq_length})'
+        )
+
+    # A training prefetch window larger than PyTorch's default (2 per worker) keeps the
+    # pin-memory thread pinning samples while the step runs. Its CUDA host-allocator calls
+    # are illegal from another thread during a capture in torch's default
+    # capture_error_mode='global' (full-iteration graphs use 'thread_local'). The window
+    # is widened by --dataloader-prefetch-factor 'auto' or an integer above 2, or, with
+    # the flag unset, by the one-step default of sequence-packing schedulers once a step
+    # pulls more than two items per worker (see
+    # data_samplers.build_pretraining_data_loader). Placed after the scheduler
+    # auto-select logic above so that it sees the resolved scheduler.
+    prefetch_factor = args.dataloader_prefetch_factor
+    widened_window = None
+    if prefetch_factor is None:
+        if args.sequence_packing_scheduler is not None and args.num_workers > 0:
+            # The packing default of build_pretraining_data_loader, which equals
+            # PyTorch's window unless one step needs more than two items per worker.
+            items_per_step = args.global_batch_size // (
+                args.micro_batch_size * args.data_parallel_size
+            )
+            default_window = max(2, -(-items_per_step // args.num_workers))
+            if default_window > 2:
+                widened_window = (
+                    f"the one-step DataLoader prefetch window ({default_window} per worker) "
+                    f"that --sequence-packing-scheduler {args.sequence_packing_scheduler} "
+                    "uses by default"
+                )
+    elif prefetch_factor == 'auto' or prefetch_factor > 2:
+        widened_window = f"--dataloader-prefetch-factor {prefetch_factor}"
+    if (
+        widened_window is not None
+        and args.num_workers > 0
+        and (args.optimizer_cuda_graph or args.cuda_graph_impl in ('local', 'transformer_engine'))
+    ):
+        warn_rank_0(
+            f"{widened_window} keeps the DataLoader pin-memory thread issuing CUDA calls "
+            "during the training step, which can invalidate CUDA graph captures that use "
+            "capture_error_mode='global' (--optimizer-cuda-graph, --cuda-graph-impl local "
+            "backward graphs, --cuda-graph-impl transformer_engine). If capture fails with "
+            "'operation not permitted when stream is capturing', pass "
+            "--dataloader-prefetch-factor 2 (PyTorch's default window)."
         )
 
     # Data blend checks
@@ -4716,6 +4779,24 @@ def _add_data_args(parser):
         help='Probability of producing a short sequence.',
     )
     group.add_argument('--num-workers', type=int, default=2, help="Dataloader number of workers.")
+    group.add_argument(
+        '--dataloader-prefetch-factor',
+        type=dataloader_prefetch_factor_type,
+        default=None,
+        help="Batches each training dataloader worker loads in advance (torch DataLoader "
+        "prefetch_factor); validation and test loaders always keep the PyTorch default. "
+        "Unset uses the default: with a --sequence-packing-scheduler the training loader "
+        "keeps one step in flight, max(2, ceil(items per step / num_workers)); other "
+        "training loaders keep the PyTorch default (2). An explicit value overrides that "
+        "default: an integer sets the window directly (2 restores the PyTorch default), and "
+        "'auto' keeps one whole step in flight, ceil(num_microbatches / num_workers) + 1, "
+        "for any training loader. Requires --num-workers > 0 ('auto' is a no-op without "
+        "workers). A one-step window costs about one step of samples in pinned host memory "
+        "per training loader; with virtual pipeline parallelism every virtual stage that "
+        "builds a loader gets its own window. The pin-memory thread then issues CUDA calls "
+        "during the step, so CUDA graph captures must use capture_error_mode "
+        "'thread_local' or 'relaxed' (full-iteration graphs do).",
+    )
     group.add_argument(
         '--reset-position-ids',
         action='store_true',

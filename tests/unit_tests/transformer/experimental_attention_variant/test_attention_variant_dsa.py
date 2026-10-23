@@ -18,8 +18,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import _validate_dsa_mtp_index_share_pipeline_split
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graph_config import is_packed_dsa_cp_cuda_graph_experimental
 from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
@@ -35,7 +37,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
     _compute_indexer_teacher_probabilities,
+    _DSAIndexSharingPayload,
     _normalize_indexer_teacher_target,
+    _permute_rows,
+    _PermuteRows,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     bwd_fused_indexer_loss_naive,
@@ -53,8 +58,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layout import 
     build_packed_allgather_cp_query_positions_and_key_reorder,
     build_packed_allgather_cp_query_positions_and_key_reorder_from_host,
     build_zigzag_allgather_cp_key_reorder,
+    build_zigzag_cp_local_positions,
     extract_query_positions_from_position_ids,
     get_cp_positions_from_layout,
+    invert_permutation,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     build_causal_mask_from_positions,
@@ -67,6 +74,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     masked_softmax,
     scatter_topk_into_index_mask,
 )
+from megatron.core.transformer.forward_sharing import get_forward_sharing_state
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -125,6 +133,23 @@ class TestDSAIndexShareHelpers:
         with pytest.raises(RuntimeError, match="pipeline split is invalid"):
             _validate_dsa_index_share_pipeline_split(config, [1, 2, 3, 4])
 
+    @pytest.mark.parametrize("shared_components", [["latent_kv"], ["sparse_attention_index"]])
+    def test_repeated_mtp_index_share_rejects_cross_segment_source(self, shared_components):
+        config = SimpleNamespace(
+            experimental_attention_variant="dsa",
+            mtp_repeated_layer_shared_components=shared_components,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=3,
+        )
+
+        _validate_dsa_mtp_index_share_pipeline_split(
+            config, local_decoder_layer_ids=[2], mtp_layer_number=4
+        )
+        with pytest.raises(RuntimeError, match="repeated-MTP IndexShare pipeline split"):
+            _validate_dsa_mtp_index_share_pipeline_split(
+                config, local_decoder_layer_ids=[], mtp_layer_number=4
+            )
+
     def test_skip_layer_does_not_build_indexer(self, monkeypatch):
         def fail_build_module(*_args, **_kwargs):
             raise AssertionError("skip layers must not build indexer modules")
@@ -137,6 +162,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
 
@@ -154,11 +180,12 @@ class TestDSAIndexShareHelpers:
         assert attention.indexer is None
         assert attention.source_layer == 1
 
-    def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
+    def test_index_share_state_uses_attention_mask_without_packed_seq_params(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -172,19 +199,20 @@ class TestDSAIndexShareHelpers:
         )
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(None, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(None, attention_mask)
+        index_payload = attention._get_dsa_index_sharing_payload(None, attention_mask)
 
-        assert topk_holder is getattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._HOLDER_ATTR)
-        assert not hasattr(config, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(None, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(config, "_forward_sharing_state")
 
-    def test_index_share_holder_uses_packed_seq_params_when_available(self):
+    def test_index_share_state_uses_packed_seq_params_when_available(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -199,15 +227,13 @@ class TestDSAIndexShareHelpers:
         packed_seq_params = PackedSeqParams(qkv_format="thd")
         attention_mask = torch.empty(1)
 
-        topk_holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-        length_holder = attention._get_index_share_topk_length_holder(
-            packed_seq_params, attention_mask
-        )
+        index_payload = attention._get_dsa_index_sharing_payload(packed_seq_params, attention_mask)
 
-        assert topk_holder is getattr(packed_seq_params, DSAttention._HOLDER_ATTR)
-        assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
-        assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
+        forward_state = get_forward_sharing_state(packed_seq_params, attention_mask, config)
+        dsa_payload = forward_state.get(_DSAIndexSharingPayload)
+        assert dsa_payload is not None
+        assert index_payload is dsa_payload
+        assert not hasattr(attention_mask, "_forward_sharing_state")
 
 
 def _build_packed_causal_mask_for_test(
@@ -330,6 +356,14 @@ class _FakeCPGroup:
         return self._rank
 
 
+_CPU_AND_CUDA = [
+    "cpu",
+    pytest.param(
+        "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    ),
+]
+
+
 @pytest.mark.parametrize(
     ("configured_cp_size", "effective_cp_size", "cp_rank"),
     [(1, 2, 0), (1, 2, 1), (2, 1, 0), (2, 2, 0), (2, 2, 1), (1, 1, 0)],
@@ -428,6 +462,7 @@ def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
         _get_kv_up_weights=lambda: (k_up_weight, None),
         recompute_up_proj=recompute_up_proj,
         cache_mla_latents=False,
+        core_attention=SimpleNamespace(mtp_latent_kv_share=False),
     )
     reference = copy.copy(attention)
     reference.config = make_config(effective_cp_size, False)
@@ -944,6 +979,67 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     assert seen["full_kwargs"]["packed_thd_causal_identity_layout"] is True
 
 
+def test_dsa_deterministic_mode_splits_combined_fusion_and_marks_sparse_backward(monkeypatch):
+    class Config:
+        attention_backend = "auto"
+        dsa_kernel_backend = "cudnn"
+        deterministic_mode = True
+
+    q = torch.zeros((1, 1, 1, 1))
+    topk_indices = torch.zeros((1, 1, 1), dtype=torch.int32)
+    expected_sparse = torch.ones_like(q)
+    seen = {}
+
+    def fail_combined(**_kwargs):
+        raise AssertionError("deterministic DSA must decline the combined autograd function")
+
+    def sparse_attention(*_args, deterministic=False, **_kwargs):
+        seen["deterministic"] = deterministic
+        return expected_sparse
+
+    monkeypatch.setattr(
+        dsa_kernels,
+        "_load_backend",
+        lambda _config: SimpleNamespace(
+            run_fused_dsa_attention=fail_combined,
+            run_fused_absorbed_sparse_attention=sparse_attention,
+        ),
+    )
+
+    assert (
+        dsa_kernels.run_fused_dsa_attention(
+            config=Config,
+            query=q,
+            key=q,
+            value=None,
+            up_v_weight=None,
+            q_indexer=q,
+            k_indexer=q[..., 0],
+            indexer_weights=q[..., 0],
+            indexer_topk=1,
+            softmax_scale=1.0,
+            loss_coeff=0.01,
+            sparse_loss=True,
+            calculate_per_token_loss=False,
+            absorbed_mla=True,
+            cp_size=1,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=None,
+            varlen_starts=None,
+            varlen_ends=None,
+            key_positions=None,
+            query_valid_rows=None,
+            use_relu=True,
+        )
+        is None
+    )
+    assert (
+        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, topk_indices, 1.0, 1)
+        is expected_sparse
+    )
+    assert seen["deterministic"] is True
+
+
 def test_dsa_kernel_dependency_validation(monkeypatch):
     from megatron.core import utils as core_utils
 
@@ -1005,6 +1101,30 @@ class TestDSACPPositionHelpers:
         gathered_key_pos = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int64)
         restored = gathered_key_pos.index_select(0, key_reorder_idx)
         assert restored.tolist() == list(range(8))
+
+    @pytest.mark.parametrize("device", _CPU_AND_CUDA)
+    @pytest.mark.parametrize(("sq", "cp_size"), [(4, 2), (6, 3), (8, 4), (16, 8)])
+    def test_nonpacked_allgather_cp_key_reorder_returns_its_inverse(self, sq, cp_size, device):
+        """The zigzag reorder's inverse is the gathered key positions it sorts."""
+        device = torch.device(device)
+        key_reorder_idx = build_zigzag_allgather_cp_key_reorder(
+            sq=sq, cp_size=cp_size, device=device
+        )
+        reorder_with_inverse, inverse = build_zigzag_allgather_cp_key_reorder(
+            sq=sq, cp_size=cp_size, device=device, return_inverse_key_reorder=True
+        )
+
+        # Requesting the inverse leaves the reorder untouched.
+        assert torch.equal(reorder_with_inverse, key_reorder_idx)
+        assert inverse.dtype == torch.int64 and inverse.device == key_reorder_idx.device
+        assert torch.equal(inverse.cpu(), invert_permutation(key_reorder_idx.cpu()))
+        expected_inverse = torch.cat(
+            [
+                build_zigzag_cp_local_positions(sq * cp_size, cp_size, rank, device)
+                for rank in range(cp_size)
+            ]
+        )
+        assert torch.equal(inverse, expected_inverse)
 
     def test_nonpacked_allgather_cp_rejects_uneven_rank_lengths(self, monkeypatch):
         """Non-packed allgather CP requires uniform per-rank sequence lengths."""
@@ -1630,6 +1750,103 @@ class TestDSACPPositionHelpers:
         expected[b_idx, q_idx, k_idx] = 0.0
 
         assert torch.equal(got, expected)
+
+
+def _float_bits(tensor: torch.Tensor) -> torch.Tensor:
+    """Raw bit pattern of a 2- or 4-byte floating-point tensor."""
+    return tensor.detach().view(torch.int32 if tensor.element_size() == 4 else torch.int16)
+
+
+def _float_bits_ignoring_zero_sign(tensor: torch.Tensor) -> torch.Tensor:
+    """Raw bit pattern with ``-0.0`` folded into ``+0.0``."""
+    tensor = tensor.detach()
+    return _float_bits(tensor.masked_fill(tensor == 0, 0.0))
+
+
+class TestDSAPermuteRows:
+    """The CP reorder's inverse-gather backward against autograd's ``index_select`` backward."""
+
+    @pytest.mark.parametrize("device", _CPU_AND_CUDA)
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    @pytest.mark.parametrize("row_shape", [(), (7,), (2, 1, 5)], ids=["1d", "2d", "4d"])
+    @pytest.mark.parametrize("num_rows", [1, 33, 4099])
+    def test_matches_index_select_autograd(self, device, dtype, row_shape, num_rows):
+        generator = torch.Generator().manual_seed(num_rows * 10 + len(row_shape))
+        perm = torch.randperm(num_rows, generator=generator)
+        inv_perm = invert_permutation(perm).to(device)
+        perm = perm.to(device)
+        x = torch.randn(num_rows, *row_shape, generator=generator).to(device=device, dtype=dtype)
+        grad = torch.randn(num_rows, *row_shape, generator=generator).to(device=device, dtype=dtype)
+        grad.view(-1)[::5] = 0.0
+        grad.view(-1)[1::7] = -0.0
+
+        x_ref = x.clone().requires_grad_(True)
+        x_new = x.clone().requires_grad_(True)
+        y_ref = x_ref.index_select(0, perm)
+        y_new = _permute_rows(x_new, perm, inv_perm)
+        assert type(y_ref.grad_fn).__name__ == "IndexSelectBackward0"
+        assert type(y_new.grad_fn).__name__ == "_PermuteRowsBackward"
+        assert torch.equal(_float_bits(y_new), _float_bits(y_ref))
+
+        y_ref.backward(grad)
+        y_new.backward(grad)
+        # Bit-exact up to the sign of zero: index_add_ onto the zero fill turns -0.0 into +0.0.
+        assert torch.equal(
+            _float_bits_ignoring_zero_sign(x_new.grad), _float_bits_ignoring_zero_sign(x_ref.grad)
+        )
+        # The new gradient is exactly the inverse gather of the upstream one, -0.0 included.
+        assert torch.equal(_float_bits(x_new.grad), _float_bits(grad.index_select(0, inv_perm)))
+
+    def test_accumulates_like_index_select_with_non_contiguous_grads(self):
+        """Two reorders of one tensor plus a direct use, with a transposed upstream gradient."""
+        generator = torch.Generator().manual_seed(7)
+        num_rows = 64
+        perms = [torch.randperm(num_rows, generator=generator) for _ in range(2)]
+        inv_perms = [invert_permutation(perm) for perm in perms]
+        x = torch.randn(num_rows, 3, 5, generator=generator)
+        weight = torch.randn(5, 3, num_rows, generator=generator)
+
+        def _loss(leaf, permute):
+            first = permute(leaf, perms[0], inv_perms[0])
+            second = permute(leaf, perms[1], inv_perms[1])
+            return (first.permute(2, 1, 0) * weight).sum() + (second * second).sum() + leaf.sum()
+
+        x_ref = x.clone().requires_grad_(True)
+        x_new = x.clone().requires_grad_(True)
+        _loss(x_ref, lambda leaf, perm, _inv_perm: leaf.index_select(0, perm)).backward()
+        _loss(x_new, _permute_rows).backward()
+
+        assert torch.equal(_float_bits(x_new.grad), _float_bits(x_ref.grad))
+
+    def test_gradcheck(self):
+        generator = torch.Generator().manual_seed(3)
+        perm = torch.randperm(6, generator=generator)
+        inv_perm = invert_permutation(perm)
+        x = torch.randn(6, 3, dtype=torch.float64, generator=generator, requires_grad=True)
+
+        def _fn(leaf):
+            return _PermuteRows.apply(leaf, perm, inv_perm)
+
+        assert torch.autograd.gradcheck(_fn, (x,))
+        assert torch.autograd.gradgradcheck(_fn, (x,))
+
+    def test_falls_back_to_index_select(self):
+        """No inverse, no grad mode or no grad-requiring input keep the plain index_select."""
+        generator = torch.Generator().manual_seed(5)
+        perm = torch.randperm(8, generator=generator)
+        inv_perm = invert_permutation(perm)
+        x = torch.randn(8, 2, generator=generator, requires_grad=True)
+        expected = x.detach().index_select(0, perm)
+
+        without_inverse = _permute_rows(x, perm, None)
+        assert type(without_inverse.grad_fn).__name__ == "IndexSelectBackward0"
+        with torch.no_grad():
+            without_grad_mode = _permute_rows(x, perm, inv_perm)
+        assert without_grad_mode.grad_fn is None
+        without_grad_input = _permute_rows(x.detach(), perm, inv_perm)
+        assert without_grad_input.grad_fn is None
+        for result in (without_inverse, without_grad_mode, without_grad_input):
+            assert torch.equal(result.detach(), expected)
 
 
 class TestDSAAbsorbedParityCPU:
@@ -3087,6 +3304,180 @@ class TestDSAIndexer:
                 assert torch.all(topk_indices[b, i] <= max(self.index_topk, i))
 
 
+_DSA_MODULE = "megatron.core.transformer.experimental_attention_variant.dsa"
+
+
+def _packed_cp_seq_params(
+    cu_seqlens: list[int], host_layout: bool, device: str = "cpu"
+) -> PackedSeqParams:
+    """Packed THD metadata, optionally with the host cu_seqlens the host layout path reads."""
+    cu_seqlens_tensor = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    max_seqlen = max(end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:]))
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_tensor,
+        cu_seqlens_kv=cu_seqlens_tensor,
+        cu_seqlens_q_padded=cu_seqlens_tensor.clone(),
+        cu_seqlens_kv_padded=cu_seqlens_tensor.clone(),
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
+    if host_layout:
+        packed_seq_params.thd_cp_host_cu_seqlens_q = list(cu_seqlens)
+        packed_seq_params.thd_cp_host_cu_seqlens_kv = list(cu_seqlens)
+    return packed_seq_params
+
+
+def _count_cp_reorder_builds(monkeypatch, layout: str) -> list:
+    """Record each CP key-reorder build and whether it asked for the inverse.
+
+    ``layout`` names the builder DSAttention uses: ``host`` and ``device`` for packed THD
+    with and without host cu_seqlens, ``nonpacked`` for the zigzag reorder.
+    """
+    if layout == "host":
+        builder = build_packed_allgather_cp_query_positions_and_key_reorder_from_host
+        target = f"{_DSA_MODULE}._cp_reorder_from_host"
+    elif layout == "device":
+        builder = build_packed_allgather_cp_query_positions_and_key_reorder
+        target = (
+            f"{_DSA_MODULE}.dsa_layout." "build_packed_allgather_cp_query_positions_and_key_reorder"
+        )
+    else:
+        assert layout == "nonpacked"
+        builder = build_zigzag_allgather_cp_key_reorder
+        target = f"{_DSA_MODULE}.dsa_layout.build_zigzag_allgather_cp_key_reorder"
+    builds = []
+
+    def _counted_builder(*args, **kwargs):
+        builds.append(kwargs.get("return_inverse_key_reorder", False))
+        return builder(*args, **kwargs)
+
+    monkeypatch.setattr(target, _counted_builder)
+    return builds
+
+
+def _single_packed_cp_reorder_entry(packed_seq_params: PackedSeqParams) -> tuple:
+    """Return the one memoized (positions, reorder, inverse) triple of a microbatch."""
+    layout_cache = getattr(packed_seq_params, DSAttention._LAYOUT_HOLDER_ATTR)
+    entries = [value for key, value in layout_cache.items() if key[0] == "positions_and_reorder"]
+    assert len(entries) == 1
+    assert len(entries[0]) == 3
+    return entries[0]
+
+
+def _run_cp_reorder_forward(
+    attention,
+    monkeypatch,
+    *,
+    packed_seq_params,
+    local_rows,
+    indexer_rows,
+    groups,
+    with_loss,
+    device="cpu",
+    seed=4321,
+    real_gather=False,
+):
+    """Run one DSA forward with a fake fused kernel, recording the CP-gathered tensors.
+
+    Every random tensor is drawn from one freshly seeded generator in call order, so
+    repeated calls see identical values. The CP/TP gathers are faked, with the rows
+    they attribute to peer ranks drawn from that generator too, unless ``real_gather``
+    routes them through the real all-gather, whose backward is a reduce-scatter. The
+    fake kernel makes the output depend on every key/value row and the indexer loss on
+    every indexer-key row, so each row gets its own gradient.
+    """
+    config = attention.config
+    generator = torch.Generator().manual_seed(seed)
+
+    def _randn(*shape):
+        return torch.randn(*shape, generator=generator).to(device)
+
+    batch_size = 1
+    num_heads = config.num_attention_heads
+    head_dim = config.hidden_size // num_heads
+    leaves = {
+        "key": _randn(local_rows, batch_size, num_heads, head_dim).requires_grad_(),
+        "value": _randn(local_rows, batch_size, num_heads, head_dim).requires_grad_(),
+        "k_indexer": _randn(indexer_rows, batch_size, 4).requires_grad_(),
+    }
+    gathered_cp = []
+    consumed = {}
+
+    def _recording_gather(tensor, group):
+        assert any(group is known_group for known_group in groups.values())
+        if real_gather:
+            gathered = gather_from_sequence_parallel_region(tensor, group=group)
+        else:
+            pieces = [_randn(*tensor.shape) for _ in range(group.size() - 1)]
+            pieces.insert(group.rank(), tensor)
+            gathered = torch.cat(pieces, dim=0)
+        if group is groups["cp"]:
+            if gathered.requires_grad:
+                gathered.retain_grad()
+            gathered_cp.append(gathered)
+        return gathered
+
+    def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
+        return (
+            _randn(indexer_rows, batch_size, 2, 4),
+            leaves["k_indexer"],
+            torch.ones(indexer_rows, batch_size, 2, device=device),
+        )
+
+    def _fake_run_fused_attention(**kwargs):
+        consumed.update(key=kwargs["key"], value=kwargs["value"], k_indexer=kwargs["k_indexer"])
+        mixed = sum((kwargs[name] * _randn(*kwargs[name].shape)).sum() for name in ("key", "value"))
+        output = torch.zeros(kwargs["query"].size(0), batch_size, config.hidden_size, device=device)
+        indexer_loss = None
+        if with_loss:
+            k_indexer = kwargs["k_indexer"]
+            indexer_loss = (k_indexer * _randn(*k_indexer.shape)).sum()
+        return output + mixed, indexer_loss
+
+    monkeypatch.setattr(attention.indexer, "forward_before_topk", _fake_forward_before_topk)
+    monkeypatch.setattr(f"{_DSA_MODULE}.gather_from_sequence_parallel_region", _recording_gather)
+    monkeypatch.setattr(
+        f"{_DSA_MODULE}.dsa_kernels.run_fused_dsa_attention", _fake_run_fused_attention
+    )
+    was_training = attention.training
+    attention.train()
+    try:
+        output = attention(
+            query=_randn(local_rows, batch_size, num_heads, head_dim),
+            key=leaves["key"],
+            value=leaves["value"],
+            x=_randn(local_rows, batch_size, config.hidden_size),
+            qr=_randn(local_rows, batch_size, config.q_lora_rank),
+            attention_mask=None,
+            attn_mask_type=AttnMaskType.causal,
+            packed_seq_params=packed_seq_params,
+        )
+    finally:
+        attention.train(was_training)
+    return output, _randn(*output.shape), leaves, gathered_cp, consumed
+
+
+def _assert_cp_reorder_grads_match(names, new_run, ref_run):
+    """The new and the ``index_select`` reorder runs agree, gradients up to the zero sign."""
+    output, _, leaves, gathered, consumed = new_run
+    ref_output, _, ref_leaves, ref_gathered, ref_consumed = ref_run
+    assert torch.equal(output, ref_output)
+    assert len(gathered) == len(ref_gathered) >= len(names)
+    for name, new_gathered, old_gathered in zip(names, gathered, ref_gathered):
+        assert torch.equal(consumed[name], ref_consumed[name])
+        assert torch.count_nonzero(new_gathered.grad) == new_gathered.grad.numel()
+        assert torch.equal(
+            _float_bits_ignoring_zero_sign(new_gathered.grad),
+            _float_bits_ignoring_zero_sign(old_gathered.grad),
+        )
+        assert torch.count_nonzero(leaves[name].grad) == leaves[name].grad.numel()
+        assert torch.equal(
+            _float_bits_ignoring_zero_sign(leaves[name].grad),
+            _float_bits_ignoring_zero_sign(ref_leaves[name].grad),
+        )
+
+
 class TestDSAttention:
     """Test DSAttention module basic functionality with TP=1."""
 
@@ -3712,6 +4103,201 @@ class TestDSAttention:
         assert seen["k_indexer_len"] == global_seq_len
         assert seen["key_len"] == global_seq_len
 
+    @pytest.mark.parametrize("device", _CPU_AND_CUDA)
+    @pytest.mark.parametrize("host_layout", [True, False], ids=["host-layout", "device-layout"])
+    @pytest.mark.parametrize(
+        "cu_seqlens", [[0, 16], [0, 8, 16]], ids=["one-sequence", "two-sequences"]
+    )
+    def test_packed_cp_reorder_backward_gathers_with_memoized_inverse(
+        self, monkeypatch, host_layout, cu_seqlens, device
+    ):
+        """KV, value and indexer-K reorders share the memoized inverse and match index_select."""
+        cp_group = _FakeCPGroup(2, 1)
+        local_rows = cu_seqlens[-1] // cp_group.size()
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 1.0)
+        monkeypatch.setattr(self.config, "dsa_indexer_use_sparse_loss", False)
+        monkeypatch.setattr(self.config, "sequence_parallel", False)
+        monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "cp", cp_group)
+        monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}.DSAIndexerLossLoggingHelper.save_loss_to_tracker",
+            lambda **_kwargs: None,
+        )
+        builds = _count_cp_reorder_builds(monkeypatch, "host" if host_layout else "device")
+        names = ("key", "value", "k_indexer")
+
+        def _forward(packed_seq_params):
+            return _run_cp_reorder_forward(
+                self.sparse_attention,
+                monkeypatch,
+                packed_seq_params=packed_seq_params,
+                local_rows=local_rows,
+                indexer_rows=local_rows,
+                groups={"cp": cp_group},
+                with_loss=True,
+                device=device,
+            )
+
+        packed_seq_params = _packed_cp_seq_params(cu_seqlens, host_layout, device)
+        new_run = _forward(packed_seq_params)
+        output, output_grad, _, gathered, consumed = new_run
+        assert builds == [True]
+        _, kv_reorder_idx, kv_reorder_inv_idx = _single_packed_cp_reorder_entry(packed_seq_params)
+        assert kv_reorder_idx.device.type == device
+        assert not torch.equal(kv_reorder_idx.cpu(), torch.arange(kv_reorder_idx.numel()))
+        assert torch.equal(kv_reorder_inv_idx, torch.argsort(kv_reorder_idx))
+        for name in names:
+            grad_fn = consumed[name].grad_fn
+            assert type(grad_fn).__name__ == "_PermuteRowsBackward"
+            assert grad_fn.saved_tensors[0].data_ptr() == kv_reorder_inv_idx.data_ptr()
+            assert torch.equal(consumed[name], gathered[names.index(name)][kv_reorder_idx])
+
+        # The next DSA layer of the same microbatch reuses the memo, inverse included.
+        next_layer_consumed = _forward(packed_seq_params)[4]
+        assert builds == [True]
+        for name in names:
+            saved_inverse = next_layer_consumed[name].grad_fn.saved_tensors[0]
+            assert saved_inverse.data_ptr() == kv_reorder_inv_idx.data_ptr()
+
+        output.backward(output_grad)
+
+        # Reference: the previous reorder, whose backward is autograd's zero fill + index_add_.
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}._permute_rows", lambda x, perm, _inv_perm: x.index_select(0, perm)
+        )
+        ref_run = _forward(_packed_cp_seq_params(cu_seqlens, host_layout, device))
+        ref_output, ref_output_grad, _, _, ref_consumed = ref_run
+        for name in names:
+            assert type(ref_consumed[name].grad_fn).__name__ == "IndexSelectBackward0"
+        ref_output.backward(ref_output_grad)
+
+        _assert_cp_reorder_grads_match(names, new_run, ref_run)
+
+    @pytest.mark.parametrize("device", _CPU_AND_CUDA)
+    @pytest.mark.parametrize(("cp_size", "cp_rank"), [(2, 1), (4, 2)], ids=["cp2", "cp4"])
+    def test_nonpacked_cp_reorder_backward_gathers_with_zigzag_inverse(
+        self, monkeypatch, cp_size, cp_rank, device
+    ):
+        """The non-packed zigzag reorder gives KV, value and indexer K one shared inverse."""
+        cp_group = _FakeCPGroup(cp_size, cp_rank)
+        local_rows = 8
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 1.0)
+        monkeypatch.setattr(self.config, "dsa_indexer_use_sparse_loss", False)
+        monkeypatch.setattr(self.config, "sequence_parallel", False)
+        monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "cp", cp_group)
+        monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}.DSAIndexerLossLoggingHelper.save_loss_to_tracker",
+            lambda **_kwargs: None,
+        )
+        # The fake CP group cannot run the length all-gather; every rank has local_rows here.
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}._validate_nonpacked_cp_uniform_length", lambda **_kwargs: None
+        )
+        builds = _count_cp_reorder_builds(monkeypatch, "nonpacked")
+        names = ("key", "value", "k_indexer")
+
+        def _forward():
+            return _run_cp_reorder_forward(
+                self.sparse_attention,
+                monkeypatch,
+                packed_seq_params=None,
+                local_rows=local_rows,
+                indexer_rows=local_rows,
+                groups={"cp": cp_group},
+                with_loss=True,
+                device=device,
+            )
+
+        new_run = _forward()
+        output, output_grad, _, gathered, consumed = new_run
+        # Without PackedSeqParams nothing is memoized: one build per forward, with inverse.
+        assert builds == [True]
+        kv_reorder_idx = build_zigzag_allgather_cp_key_reorder(
+            sq=local_rows, cp_size=cp_size, device=torch.device(device)
+        )
+        saved_inverses = []
+        for name in names:
+            grad_fn = consumed[name].grad_fn
+            assert type(grad_fn).__name__ == "_PermuteRowsBackward"
+            saved_inverses.append(grad_fn.saved_tensors[0])
+            assert torch.equal(consumed[name], gathered[names.index(name)][kv_reorder_idx])
+        assert len({inverse.data_ptr() for inverse in saved_inverses}) == 1
+        assert torch.equal(saved_inverses[0], torch.argsort(kv_reorder_idx))
+        output.backward(output_grad)
+
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}._permute_rows", lambda x, perm, _inv_perm: x.index_select(0, perm)
+        )
+        ref_run = _forward()
+        ref_output, ref_output_grad, _, _, ref_consumed = ref_run
+        for name in names:
+            assert type(ref_consumed[name].grad_fn).__name__ == "IndexSelectBackward0"
+        ref_output.backward(ref_output_grad)
+
+        _assert_cp_reorder_grads_match(names, new_run, ref_run)
+
+    @pytest.mark.parametrize("host_layout", [True, False], ids=["host-layout", "device-layout"])
+    def test_sequence_parallel_cp_reorder_memoizes_inverse_at_gather(
+        self, monkeypatch, host_layout
+    ):
+        """The memo site inside the CP gather (TP sequence parallel) also carries the inverse."""
+        tp_group = _FakeCPGroup(2, 1)
+        cp_group = _FakeCPGroup(2, 1)
+        local_rows = 4
+        cp_local_rows = local_rows * tp_group.size()
+        cu_seqlens = [0, cp_local_rows * cp_group.size()]
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "sequence_parallel", True)
+        monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "tp", tp_group)
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "cp", cp_group)
+        builds = _count_cp_reorder_builds(monkeypatch, "host" if host_layout else "device")
+        names = ("key", "value")
+
+        def _forward(packed_seq_params):
+            return _run_cp_reorder_forward(
+                self.sparse_attention,
+                monkeypatch,
+                packed_seq_params=packed_seq_params,
+                local_rows=local_rows,
+                indexer_rows=cp_local_rows,
+                groups={"cp": cp_group, "tp": tp_group},
+                with_loss=False,
+            )
+
+        packed_seq_params = _packed_cp_seq_params(cu_seqlens, host_layout)
+        new_run = _forward(packed_seq_params)
+        output, output_grad, _, gathered, consumed = new_run
+        assert builds == [True]
+        _, kv_reorder_idx, kv_reorder_inv_idx = _single_packed_cp_reorder_entry(packed_seq_params)
+        assert torch.equal(kv_reorder_inv_idx, torch.argsort(kv_reorder_idx))
+        for name in names:
+            grad_fn = consumed[name].grad_fn
+            assert type(grad_fn).__name__ == "_PermuteRowsBackward"
+            assert grad_fn.saved_tensors[0].data_ptr() == kv_reorder_inv_idx.data_ptr()
+        # Without the indexer loss the indexer key is reordered under no_grad: plain gather.
+        assert consumed["k_indexer"].grad_fn is None
+        assert torch.equal(consumed["k_indexer"], gathered[2].index_select(0, kv_reorder_idx))
+        output.backward(output_grad)
+
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}._permute_rows", lambda x, perm, _inv_perm: x.index_select(0, perm)
+        )
+        ref_run = _forward(_packed_cp_seq_params(cu_seqlens, host_layout))
+        ref_output, ref_output_grad = ref_run[:2]
+        ref_output.backward(ref_output_grad)
+
+        _assert_cp_reorder_grads_match(names, new_run, ref_run)
+
     @pytest.mark.parametrize("packed_thd", [False, True], ids=["nonpacked", "packed"])
     def test_tp_sequence_parallel_uses_global_causal_rows(self, monkeypatch, packed_thd):
         """A sequence-local TP rank should use global rows for causal and packed bounds."""
@@ -3955,6 +4541,139 @@ class TestDSAttention:
         # Check that topk_indices are valid
         _assert_topk_indices_in_bounds_or_invalid(topk_indices, seq_len)
         assert topk_indices.shape[2] == min(self.config.dsa_indexer_topk, seq_len)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for NCCL CP gathers")
+@pytest.mark.parametrize(
+    ("tp_size", "layout", "cu_seqlens"),
+    [
+        pytest.param(1, "host", [0, 16], id="cp2-host-layout-one-sequence"),
+        pytest.param(1, "host", [0, 8, 16], id="cp2-host-layout-two-sequences"),
+        pytest.param(1, "device", [0, 8, 16], id="cp2-device-layout-two-sequences"),
+        pytest.param(1, "nonpacked", [0, 16], id="cp2-nonpacked"),
+        pytest.param(2, "host", [0, 32], id="tp2-sp-cp2-host-layout"),
+        pytest.param(2, "device", [0, 16, 32], id="tp2-sp-cp2-device-layout"),
+    ],
+)
+def test_cp_reorder_backward_matches_index_select_through_real_gathers(
+    monkeypatch, tp_size, layout, cu_seqlens
+):
+    """With real NCCL gathers (CP=2), the inverse-gather backward matches index_select's.
+
+    The CP all-gather's backward is a reduce-scatter, so each local leaf's gradient sums
+    every CP rank's reorder backward. ``tp_size=2`` adds a real TP sequence-parallel
+    gather, which moves the reorder build into the CP gather (the second memo site).
+    The fake fused kernel keeps everything else deterministic, so the A/B against the
+    old ``index_select`` backward is bit-exact up to the sign of zero.
+    """
+    cp_size = 2
+    if Utils.world_size % (tp_size * cp_size) != 0:
+        pytest.skip(f"TP{tp_size} x CP{cp_size} needs a multiple of {tp_size * cp_size} ranks")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        sequence_parallel = tp_size > 1
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=sequence_parallel,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+            # Sequence-local TP query shards cannot form the indexer loss target.
+            dsa_indexer_loss_coeff=0.0 if sequence_parallel else 1.0,
+            dsa_indexer_use_sparse_loss=False,
+        )
+        from megatron.core.extensions.transformer_engine import TELinear, TENorm
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        indexer_submodules = DSAIndexerSubmodules(
+            linear_wq_b=ModuleSpec(module=TELinear),
+            linear_wk=ModuleSpec(module=TELinear),
+            k_norm=ModuleSpec(module=TENorm),
+            linear_weights_proj=ModuleSpec(module=TELinear),
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        attention = DSAttention(
+            config=config,
+            submodules=DSAttentionSubmodules(
+                indexer=ModuleSpec(module=DSAIndexer, submodules=indexer_submodules)
+            ),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            cp_comm_type="allgather",
+            pg_collection=pg_collection,
+        ).cuda()
+        monkeypatch.setattr(config, "attention_backend", "auto")
+        monkeypatch.setattr(config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}.DSAIndexerLossLoggingHelper.save_loss_to_tracker",
+            lambda **_kwargs: None,
+        )
+        builds = _count_cp_reorder_builds(monkeypatch, layout)
+        groups = {"cp": pg_collection.cp}
+        if sequence_parallel:
+            groups["tp"] = pg_collection.tp
+        # Without the indexer loss the indexer key is reordered under no_grad.
+        names = ("key", "value") if sequence_parallel else ("key", "value", "k_indexer")
+        cp_local_rows = cu_seqlens[-1] // cp_size
+
+        def _forward():
+            packed_seq_params = (
+                None
+                if layout == "nonpacked"
+                else _packed_cp_seq_params(cu_seqlens, layout == "host", "cuda")
+            )
+            return _run_cp_reorder_forward(
+                attention,
+                monkeypatch,
+                packed_seq_params=packed_seq_params,
+                local_rows=cp_local_rows // tp_size,
+                indexer_rows=cp_local_rows,
+                groups=groups,
+                with_loss=not sequence_parallel,
+                device="cuda",
+                # CP peers must hold different rows, or a misordered gradient could pass.
+                seed=4321 + torch.distributed.get_rank(),
+                real_gather=True,
+            )
+
+        # Both runs, collectives included, finish before any assertion, so a failure on
+        # one rank cannot leave the others waiting in a collective.
+        new_run = _forward()
+        new_run[0].backward(new_run[1])
+        new_grad_fns = [type(new_run[4][name].grad_fn).__name__ for name in names]
+        new_builds = list(builds)
+        monkeypatch.setattr(
+            f"{_DSA_MODULE}._permute_rows", lambda x, perm, _inv_perm: x.index_select(0, perm)
+        )
+        ref_run = _forward()
+        ref_run[0].backward(ref_run[1])
+        ref_grad_fns = [type(ref_run[4][name].grad_fn).__name__ for name in names]
+
+        assert new_builds == [True]
+        assert new_grad_fns == ["_PermuteRowsBackward"] * len(names)
+        assert ref_grad_fns == ["IndexSelectBackward0"] * len(names)
+        _assert_cp_reorder_grads_match(names, new_run, ref_run)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 # ======================================================================================

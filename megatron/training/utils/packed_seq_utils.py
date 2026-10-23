@@ -23,10 +23,15 @@ def prepare_packed_seq_params(
             Dynamic packed graphs otherwise use the configured fixed capacity.
 
     Returns:
-        The supplied metadata with its CP group and per-microbatch routes prepared.
+        The supplied metadata with its CP group and per-microbatch routes prepared,
+        plus DSA's packed-CP layout tables for DSA models.
     """
     packed_seq_params = finalize_packed_seq_params(packed_seq_params)
-    if packed_seq_params is None or not getattr(config, "dsa_cp_balance_indexer", False):
+    if packed_seq_params is None:
+        return None
+    if getattr(config, "experimental_attention_variant", None) == "dsa":
+        _prebuild_dsa_packed_cp_layout(packed_seq_params, capacity)
+    if not getattr(config, "dsa_cp_balance_indexer", False):
         return packed_seq_params
 
     from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
@@ -46,3 +51,26 @@ def prepare_packed_seq_params(
         graph_dynamic_packs=dynamic_packs,
     )
     return packed_seq_params
+
+
+def _prebuild_dsa_packed_cp_layout(
+    packed_seq_params: PackedSeqParams, capacity: int | None
+) -> None:
+    """Build DSA's packed-CP query positions, key reorder and its inverse before the forward.
+
+    The tables are built from the host boundaries finalize_packed_seq_params just
+    recorded, for the realized CP group, at the CP-local row count those boundaries
+    describe. With raw boundaries (``capacity`` differs from their endpoint) the
+    physical row count is unknown here, so any earlier layout is detached and DSA keeps
+    building the tables lazily in eager mode.
+    """
+    from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+        attach_prebuilt_packed_cp_layout,
+        prebuild_packed_cp_layout,
+    )
+
+    host_cu_seqlens_q = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+    if capacity is not None and (host_cu_seqlens_q is None or host_cu_seqlens_q[-1] != capacity):
+        attach_prebuilt_packed_cp_layout(packed_seq_params, None)
+        return
+    prebuild_packed_cp_layout(packed_seq_params)

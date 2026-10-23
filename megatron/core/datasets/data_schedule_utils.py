@@ -264,6 +264,7 @@ def _pack_sequences(
     original_lengths: torch.Tensor,
     local_cp_size: Optional[torch.Tensor],
     dev: torch.device,
+    zigzag_cp_min_chunk_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
@@ -294,6 +295,10 @@ def _pack_sequences(
 
     if local_cp_size is not None:
         new_sample["local_cp_size"] = local_cp_size
+    if zigzag_cp_min_chunk_size is not None:
+        new_sample["zigzag_cp_min_chunk_size"] = torch.tensor(
+            zigzag_cp_min_chunk_size, dtype=torch.int32, device=dev
+        )
 
     return new_sample
 
@@ -494,7 +499,12 @@ def create_data_iterator(
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
         if tp_group.rank() == 0:
-            metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
+            metadata_keys = [
+                "max_seqlen",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "zigzag_cp_min_chunk_size",
+            ]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
             new_data_iterator = []
@@ -642,6 +652,7 @@ def build_packed_microbatches(
     dcp_rank: int,
     dev: torch.device,
     is_dynamic_cp: bool = False,
+    global_id_seqlens: Optional[List[Tuple[int, int]]] = None,
 ) -> List[Dict[str, torch.Tensor]]:
     """Build packed samples for each microbatch.
 
@@ -652,6 +663,10 @@ def build_packed_microbatches(
         dcp_rank: This rank's index within the DP×CP group.
         dev: Target device.
         is_dynamic_cp: Whether dynamic context parallel is enabled.
+        global_id_seqlens: Optional host mapping from global sample ID to its
+            physical padded length. When present, it emits the minimum zigzag
+            half-chunk size without a model-forward D2H copy; zero means the
+            physical lengths do not admit one-hop certification.
     """
     num_micro_batches = len(sample_id_groups)
     seg_starts: List[int] = [0]
@@ -667,20 +682,16 @@ def build_packed_microbatches(
     ]
 
     local_cp_sizes_gpu = None
+    effective_cp_sizes_cpu: List[int] = []
+    for i in range(num_micro_batches):
+        sample_ids_this_group = sample_id_groups[i][dcp_rank]
+        effective_cp_sizes_cpu.append(
+            len([1 for sample_ids in sample_id_groups[i] if sample_ids_this_group[0] in sample_ids])
+        )
     if is_dynamic_cp:
-        local_cp_sizes_cpu: List[int] = []
-        for i in range(num_micro_batches):
-            sample_ids_this_group = sample_id_groups[i][dcp_rank]
-            local_cp_sizes_cpu.append(
-                len(
-                    [
-                        1
-                        for sample_ids in sample_id_groups[i]
-                        if sample_ids_this_group[0] in sample_ids
-                    ]
-                )
-            )
-        local_cp_sizes_gpu = torch.tensor(local_cp_sizes_cpu, dtype=torch.int32, device=dev)
+        local_cp_sizes_gpu = torch.tensor(effective_cp_sizes_cpu, dtype=torch.int32, device=dev)
+
+    padded_length_by_id = dict(global_id_seqlens) if global_id_seqlens is not None else None
 
     for i in range(num_micro_batches):
         samples = grouped_samples[i]
@@ -697,7 +708,24 @@ def build_packed_microbatches(
         lens_padded = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         lens_original = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         local_cp_size = local_cp_sizes_gpu[i] if is_dynamic_cp else None
-        new_sample = _pack_sequences(samples, lens_padded, lens_original, local_cp_size, dev)
+        zigzag_cp_min_chunk_size = None
+        if padded_length_by_id is not None:
+            divisor = 2 * effective_cp_sizes_cpu[i]
+            padded_lengths_host = [
+                padded_length_by_id[sample_id] for sample_id in sample_id_groups[i][dcp_rank]
+            ]
+            if any(length % divisor != 0 for length in padded_lengths_host):
+                zigzag_cp_min_chunk_size = 0
+            else:
+                zigzag_cp_min_chunk_size = min(length // divisor for length in padded_lengths_host)
+        new_sample = _pack_sequences(
+            samples,
+            lens_padded,
+            lens_original,
+            local_cp_size,
+            dev,
+            zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
+        )
         new_samples.append(new_sample)
 
     return new_samples
@@ -838,7 +866,29 @@ def next_hdp_group_packing_aware(
         sample_ids_per_gpu[rank].append(sample_id)
 
     leftovers: List[Tuple[int, int]] = []
-    for sample_id, seq_len in sample_seqlens[1:]:
+    # Exact early exit. A sample is placed either by adding it to a group it still fits in
+    # or by forming a new group on free ranks. Samples are sorted longest first, so once no
+    # rank is free and the shortest sample fits no group, no later sample can be placed and
+    # the rest become leftovers in order, as the full scan would make them. The state only
+    # changes on a placement, so the check only reruns after one. Non-positive lengths keep
+    # the full scan so that cp_min_fn still rejects them.
+    shortest_seq_len = sample_seqlens[-1][1]
+    placed = True
+    for index in range(1, len(sample_seqlens)):
+        if (
+            placed
+            and shortest_seq_len > 0
+            and None not in gpu_group_id
+            and all(
+                packing_sequence_len[group_id] + shortest_seq_len / size > max_seq_len_per_rank
+                for group_id, size in group_size.items()
+            )
+        ):
+            leftovers.extend((sample_id, seq_len) for sample_id, seq_len in sample_seqlens[index:])
+            break
+        placed = False
+
+        sample_id, seq_len = sample_seqlens[index]
         min_needed = cp_min_fn(seq_len)
         best = None
 
@@ -881,6 +931,7 @@ def next_hdp_group_packing_aware(
             leftovers.append((sample_id, seq_len))
             continue
 
+        placed = True
         _, selected_cp_size, action, group_id, chosen_members = best
         per_gpu_cost = workload(seq_len, selected_cp_size)
         if action == "add":

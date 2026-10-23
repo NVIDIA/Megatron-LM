@@ -105,7 +105,10 @@ C = "tests/unit_tests/determinism/correctness/"
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="mtp_packed_cp1_roll",
-        sources=("megatron/core/transformer/multi_token_prediction.py",),
+        sources=(
+            "megatron/core/transformer/multi_token_prediction.py",
+            "megatron/core/transformer/mtp_sequence_roll.py",
+        ),
         tests=(K + "test_dev_sync_kernels.py",),
         kind="torch-op",
         notes="CP1 packed roll forward/backward with repeated static metadata boundaries "
@@ -968,6 +971,34 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="Experimental DeepSeek sparse attention kernels (indexer / sparse MLA backward accumulate with "
         "atomics). Bit-exact replay is tracked as a follow-up; parity tests live in "
         "tests/unit_tests/transformer/experimental_attention_variant/.",
+    ),
+    KernelEntry(
+        name="dsa_topk_zero_ties",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_topk_zero_ties.py",),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_topk_zero_ties.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/"
+            "test_dsa_cudnn_topk_deterministic_gpu.py",
+        ),
+        kind="triton",
+        notes="Lowest-index exact-zero tie selection of the deterministic DSA top-k: integer "
+        "compares and per-row index writes only. The tests compare it exactly with a reference "
+        "(Triton interpreter on CPU, CUDA on GPU) and repeat the deterministic top-k bitwise, "
+        "eager and under CUDA graph replay.",
+    ),
+    KernelEntry(
+        name="dsa_deepselect_topk",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_deepselect_topk.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/"
+            "test_dsa_deepselect_topk_gpu.py",
+        ),
+        kind="triton",
+        notes="Optional DeepSelect top-k backend (external DeepSelect build) and its NaN-row "
+        "repair kernel; deterministic mode never selects it. The GPU tests repeat the "
+        "selection bitwise, check batch independence and replay it under a CUDA graph.",
     ),
 )
 

@@ -1,7 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from functools import partial
-from typing import Callable, Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -37,6 +38,8 @@ from ..utils import (
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _get_main_grad_attr(param: torch.nn.Parameter):
@@ -174,11 +177,18 @@ def _allreduce_word_embedding_grads(
     config: TransformerConfig,
     embd_group: Optional[torch.distributed.ProcessGroup] = None,
     pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """All-reduce word-embedding gradients across the first and last PP stages.
 
     This ensures that the ``word_embeddings`` parameters stay in sync when they
     are shared between the input and output layers.
+
+    When the embedding's grad bucket is reduce-scattered by the distributed optimizer and
+    ``force_all_reduce`` is False, only this rank's distributed-optimizer shard of
+    ``main_grad`` (the only part the optimizer reads) is all-reduced across stages; the rest
+    keeps what the data-parallel reduce-scatter left there. Callers that need the whole
+    gradient synced, after a data-parallel all-reduce, must pass ``force_all_reduce=True``.
 
     Args:
         model: A list containing the pipeline chunks
@@ -193,6 +203,9 @@ def _allreduce_word_embedding_grads(
         pp_group: The pipeline
             parallel process group used to identify first/last stages. If
             ``None``, it will be looked up.
+        force_all_reduce: Whether the data-parallel grad sync was forced to all-reduce
+            (e.g. to save full wgrads). The whole gradient is then all-reduced across
+            stages instead of only this rank's distributed-optimizer shard.
     """
     if embd_group is None:
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
@@ -206,6 +219,7 @@ def _allreduce_word_embedding_grads(
         pp_group,
         partial(_get_shared_word_embedding_weight, config=config),
         config=config,
+        shard_for_distributed_optimizer=not force_all_reduce,
     )
 
 
@@ -238,6 +252,206 @@ def _copy_embedding_grad_back(orig_grad, full_grad):
     orig_grad._local_tensor.copy_(full_grad[local_slice])
 
 
+# Fields of the per-rank layout of the shared embedding gradient that the embedding group
+# compares before all-reducing only part of it. ``eligible`` is 1 for a reduce-scattered
+# distributed-optimizer bucket, 0 for any other gradient and -1 for an invalid bucket layout.
+# ``reduced_start``/``reduced_end`` is the part of the gradient this rank holds reduced across
+# data-parallel ranks, which is the whole gradient when ``eligible`` is 0.
+_EMBEDDING_GRAD_SHARD_LAYOUT_FIELDS = (
+    'eligible',
+    'bucket_numel',
+    'param_start',
+    'param_end',
+    'dist_opt_rank',
+    'dist_opt_size',
+    'reduced_start',
+    'reduced_end',
+)
+
+
+def _get_distributed_optimizer_shard_range(
+    param_start: int, param_end: int, bucket_numel: int, shard_rank: int, num_shards: int
+) -> Tuple[int, int]:
+    """Return the part of a param that lies in this rank's distributed-optimizer shard.
+
+    The distributed optimizer splits each (padded) grad bucket into ``num_shards`` equal
+    contiguous shards and reduce-scatters the bucket, so after the data-parallel grad sync
+    only shard ``shard_rank`` holds reduced gradients, and it is the only part the optimizer
+    reads (see ``DistributedOptimizer._build_model_gbuf_range``).
+
+    Args:
+        param_start (int): Start of the param's element range inside its bucket.
+        param_end (int): End (exclusive) of the param's element range inside its bucket.
+        bucket_numel (int): Number of elements in the padded bucket.
+        shard_rank (int): This rank's index in the group the bucket is reduce-scattered over.
+        num_shards (int): Size of that group.
+
+    Returns:
+        ``(start, end)`` in the param's flattened element coordinates. ``start == end``
+        when the param does not intersect this rank's shard.
+    """
+    if num_shards <= 0 or bucket_numel % num_shards != 0:
+        raise ValueError(
+            f"Bucket of {bucket_numel} elements cannot be split into {num_shards} equal shards"
+        )
+    if not 0 <= shard_rank < num_shards:
+        raise ValueError(f"Shard rank {shard_rank} is out of range for {num_shards} shards")
+    if not 0 <= param_start <= param_end <= bucket_numel:
+        raise ValueError(
+            f"Param range [{param_start}, {param_end}) is outside the bucket of "
+            f"{bucket_numel} elements"
+        )
+    shard_numel = bucket_numel // num_shards
+    shard_start = shard_rank * shard_numel
+    start = max(param_start, shard_start)
+    end = min(param_end, shard_start + shard_numel)
+    if end <= start:
+        return 0, 0
+    return start - param_start, end - param_start
+
+
+def _get_local_embedding_grad_shard_layout(
+    model_chunk: torch.nn.Module, weight: torch.nn.Parameter, grad: torch.Tensor
+) -> Tuple[Tuple[int, ...], Optional[str]]:
+    """Describe this rank's distributed-optimizer shard of the shared embedding gradient.
+
+    Returns:
+        A tuple ordered like ``_EMBEDDING_GRAD_SHARD_LAYOUT_FIELDS`` and, when ``eligible`` is
+        -1, why the bucket layout is invalid (else ``None``). The layout is never rejected by
+        raising here, so that every rank of the embedding group still reaches the all-gather
+        of the layouts and they all raise together.
+    """
+    not_eligible = (0, 0, 0, 0, 0, 0, 0, grad.numel()), None
+    if HAVE_DTENSOR and isinstance(grad, DTensor):
+        return not_eligible
+    param_to_bucket_group = getattr(model_chunk, 'param_to_bucket_group', None)
+    if param_to_bucket_group is None or weight not in param_to_bucket_group:
+        return not_eligible
+    bucket_group = param_to_bucket_group[weight]
+    # Read the flag from the weight's own bucket group, not the model chunk: the LayerWise
+    # (Muon) optimizer forces the chunk-level flag on while its own buffers are all-reduced.
+    if not bucket_group.ddp_config.use_distributed_optimizer:
+        return not_eligible
+    # Spare ranks under non-uniform TP skip the data-parallel reduce-scatter.
+    ntp_config = getattr(bucket_group, 'ntp_config', None)
+    if ntp_config is not None and ntp_config.tp_spares > 0:
+        return not_eligible
+    bucket = bucket_group.param_to_bucket[weight]
+    param_start, param_end = bucket.param_to_index[weight]
+    if grad.numel() != param_end - param_start or not grad.is_contiguous():
+        return not_eligible
+    bucket_numel = bucket.grad_data.numel()
+    dist_opt_rank = bucket_group.intra_distributed_optimizer_instance_rank
+    dist_opt_size = bucket_group.intra_distributed_optimizer_instance_size
+    layout = (bucket_numel, param_start, param_end, dist_opt_rank, dist_opt_size)
+    try:
+        reduced_start, reduced_end = _get_distributed_optimizer_shard_range(
+            param_start, param_end, bucket_numel, dist_opt_rank, dist_opt_size
+        )
+    except ValueError as error:
+        return (-1, *layout, 0, 0), str(error)
+    return (1, *layout, reduced_start, reduced_end), None
+
+
+def _select_embedding_grad_shard_range(
+    layouts: List[Tuple[int, ...]],
+    grad_numel: int,
+    group_ranks: List[int],
+    local_error: Optional[str] = None,
+) -> Optional[Tuple[int, int]]:
+    """Pick the slice of the shared embedding gradient that the embedding group all-reduces.
+
+    Each rank's optimizer reads exactly the part of the gradient that the rank holds reduced
+    across data-parallel ranks. If that part is the same on every rank of the group, the
+    ranks all-reduce it alone. If it differs, some rank reads elements that a partner never
+    reduced, which the full all-reduce got wrong too, so this raises. The result depends only
+    on ``layouts``, which every rank of the group has, so all of them pick the same slice or
+    all of them raise.
+
+    Args:
+        layouts (List[Tuple[int, ...]]): Every group rank's layout, ordered like
+            ``_EMBEDDING_GRAD_SHARD_LAYOUT_FIELDS``.
+        grad_numel (int): Number of elements of the gradient.
+        group_ranks (List[int]): Global ranks of the group, for the error message.
+        local_error (str, optional): Why this rank's bucket layout is invalid, if it is.
+
+    Returns:
+        ``None`` to all-reduce the whole gradient, else ``(start, end)`` into its flattened
+        view, which is empty when no rank holds any of the gradient reduced.
+    """
+    reduced_ranges = {tuple(layout[-2:]) for layout in layouts}
+    if len(reduced_ranges) == 1 and all(layout[0] >= 0 for layout in layouts):
+        reduced_range = reduced_ranges.pop()
+        return None if reduced_range == (0, grad_numel) else reduced_range
+
+    details = '; '.join(
+        f"rank {rank}: "
+        + ', '.join(
+            f"{name}={value}" for name, value in zip(_EMBEDDING_GRAD_SHARD_LAYOUT_FIELDS, layout)
+        )
+        for rank, layout in zip(group_ranks, layouts)
+    )
+    message = (
+        "The shared embedding gradient has different distributed-optimizer layouts across "
+        f"the embedding group ({details}), so its ranks hold different parts of it reduced "
+        "across data-parallel ranks. Every stage holding the shared embedding must keep it "
+        "in a distributed-optimizer bucket of its own (the `shared_embedding` param "
+        "attribute) with the same numel and data-parallel size."
+    )
+    if local_error is not None:
+        message += f" This rank's bucket layout is invalid: {local_error}"
+    raise RuntimeError(message)
+
+
+def _get_embedding_grad_shard_range(
+    model_chunk: torch.nn.Module,
+    weight: torch.nn.Parameter,
+    grad: torch.Tensor,
+    embd_group: torch.distributed.ProcessGroup,
+) -> Optional[Tuple[int, int]]:
+    """Return the slice of the shared embedding gradient to all-reduce across stages.
+
+    After the data-parallel reduce-scatter only this rank's distributed-optimizer shard of
+    the gradient is reduced and read by the optimizer, so the cross-stage all-reduce only
+    needs that shard. Every rank of ``embd_group`` must all-reduce the same slice, so the
+    layouts are compared across the group once (it needs a host sync, so never inside CUDA
+    graph capture; see ``_select_embedding_grad_shard_range``) and the result is cached on
+    ``model_chunk``.
+
+    Returns:
+        ``None`` to all-reduce the whole gradient, else ``(start, end)`` into its flattened
+        view (possibly empty).
+    """
+    cache = getattr(model_chunk, '_embedding_grad_shard_ranges', None)
+    if cache is None:
+        cache = {}
+        model_chunk._embedding_grad_shard_ranges = cache
+    if weight in cache:
+        return cache[weight]
+
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        # Every embedding-group rank captures the same step without a cached layout, so all
+        # of them fall back to the full all-reduce here.
+        logger.warning(
+            "Shared embedding grad layout was not checked before CUDA graph capture; "
+            "all-reducing the whole embedding gradient across pipeline stages."
+        )
+        return None
+
+    local_layout, local_error = _get_local_embedding_grad_shard_layout(model_chunk, weight, grad)
+    local_tensor = torch.tensor(local_layout, dtype=torch.int64, device=grad.device)
+    gathered = [torch.empty_like(local_tensor) for _ in range(get_pg_size(embd_group))]
+    torch.distributed.all_gather(gathered, local_tensor, group=embd_group)
+    shard_range = _select_embedding_grad_shard_range(
+        [tuple(tensor.tolist()) for tensor in gathered],
+        grad.numel(),
+        torch.distributed.get_process_group_ranks(embd_group),
+        local_error,
+    )
+    cache[weight] = shard_range
+    return shard_range
+
+
 def _allreduce_embedding_grad(
     model: List[torch.nn.Module],
     embd_group: torch.distributed.ProcessGroup,
@@ -245,6 +459,7 @@ def _allreduce_embedding_grad(
     weight_getter: Callable[[torch.nn.Module], Optional[torch.nn.Parameter]],
     skip_if_none: bool = True,
     config: TransformerConfig = None,
+    shard_for_distributed_optimizer: bool = False,
 ):
     """Unified helper to all-reduce embedding parameters across pipeline stages.
 
@@ -258,6 +473,10 @@ def _allreduce_embedding_grad(
             (or ``None`` if not applicable).
         skip_if_none (bool, optional): If True, quietly returns when the parameter or its
             gradient is ``None``. Defaults to True.
+        shard_for_distributed_optimizer (bool, optional): If True and the parameter's grad
+            bucket was reduce-scattered by the distributed optimizer, all-reduce only this
+            rank's shard of the gradient; the rest keeps what the reduce-scatter left there.
+            Defaults to False.
     """
 
     if (
@@ -277,6 +496,7 @@ def _allreduce_embedding_grad(
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        model_chunk = model_module
         ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
 
@@ -295,7 +515,23 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        torch.distributed.all_reduce(grad, group=embd_group)
+
+        shard_range = None
+        if (
+            shard_for_distributed_optimizer
+            and getattr(ddp_config, 'use_distributed_optimizer', False)
+            and not ddp_config.use_megatron_fsdp
+            and not getattr(model_chunk, 'force_all_reduce', False)
+        ):
+            shard_range = _get_embedding_grad_shard_range(
+                model_chunk, weight, orig_grad, embd_group
+            )
+        if shard_range is None:
+            torch.distributed.all_reduce(grad, group=embd_group)
+        elif shard_range[1] > shard_range[0]:
+            torch.distributed.all_reduce(
+                grad.view(-1)[shard_range[0] : shard_range[1]], group=embd_group
+            )
         if ddp_config.use_megatron_fsdp:
             _copy_embedding_grad_back(orig_grad, grad)
         else:
@@ -770,7 +1006,9 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
+    _allreduce_word_embedding_grads(
+        model, config, embd_group, pp_group, force_all_reduce=force_all_reduce
+    )
     _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
 
     if config.timers is not None:
