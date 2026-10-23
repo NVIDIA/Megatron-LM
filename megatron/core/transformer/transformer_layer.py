@@ -2512,3 +2512,14 @@ class MoETransformerLayer(TransformerLayer):
                 packed_seq_params=packed_seq_params,
                 input_ids=input_ids,
             )
+
+
+def __getattr__(name):
+    """Resolve the legacy mHC layer import to its canonical implementation."""
+    if name == "HyperConnectionTransformerLayer":
+        from megatron.core.transformer.hyper_connection_transformer_layer import (
+            HyperConnectionTransformerLayer,
+        )
+
+        return HyperConnectionTransformerLayer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

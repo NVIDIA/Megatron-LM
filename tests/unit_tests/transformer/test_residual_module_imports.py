@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Canonical residual modules and package exports import in either order."""
+"""Canonical residual modules and the legacy mHC export preserve class identity."""
 
 import os
 import subprocess
@@ -44,6 +44,19 @@ for symbol, new_name in (
     ("TransformerLayerSubmodules", "transformer_layer"),
 ):
     assert getattr(package, symbol) is getattr(importlib.import_module(prefix + new_name), symbol)
+
+from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
+
+legacy = importlib.import_module(prefix + "transformer_layer")
+canonical = importlib.import_module(prefix + "hyper_connection_transformer_layer")
+assert HyperConnectionTransformerLayer is canonical.HyperConnectionTransformerLayer
+assert legacy.HyperConnectionTransformerLayer is canonical.HyperConnectionTransformerLayer
+assert not hasattr(legacy, "_missing_residual_symbol")
+
+class DownstreamHyperConnectionLayer(HyperConnectionTransformerLayer):
+    pass
+
+assert DownstreamHyperConnectionLayer.__bases__ == (canonical.HyperConnectionTransformerLayer,)
 """
 
 
