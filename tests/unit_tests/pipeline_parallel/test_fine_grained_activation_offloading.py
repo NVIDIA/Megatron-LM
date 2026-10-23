@@ -5,6 +5,7 @@ import logging
 import math
 import os
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -808,15 +809,40 @@ def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> 
 
 
 def _expected_unique_offload_bytes(manager, offload_modules):
-    # These GPT tests run one microbatch without pipeline parallelism. Copying
-    # multiple views' full storage increases PCIe traffic, but the source GPU
+    # For these PP=1 tests, the manager's summary window ends at the first
+    # backward chunk, including when the schedule runs multiple microbatches.
+    # Multiple copies of one storage increase PCIe traffic, but that GPU
     # allocation can only be freed once. Compare memory savings to unique bytes.
-    (chunk,) = manager._cached_chunks_forward
+    chunk = manager._cached_chunks_backward[0]
     return sum(
         group.total_offload_bytes - group.duplicate_storage_bytes
         for group in chunk.offload_groups
         if group.offload and group._name in offload_modules
     )
+
+
+@pytest.mark.parametrize("num_chunks", [1, 2])
+def test_expected_unique_offload_bytes_uses_first_backward_chunk(num_chunks):
+    def group(name, offload, total_bytes, duplicate_bytes=0):
+        return SimpleNamespace(
+            _name=name,
+            offload=offload,
+            total_offload_bytes=total_bytes,
+            duplicate_storage_bytes=duplicate_bytes,
+        )
+
+    first_chunk = SimpleNamespace(
+        offload_groups=[
+            group("core_attn", True, 100, 20),
+            group("core_attn", False, 900),
+            group("attn_proj", True, 700),
+        ]
+    )
+    second_chunk = SimpleNamespace(offload_groups=[group("core_attn", True, 500)])
+    chunks = [first_chunk, second_chunk][:num_chunks]
+    manager = SimpleNamespace(_cached_chunks_forward=chunks, _cached_chunks_backward=chunks)
+
+    assert _expected_unique_offload_bytes(manager, ["core_attn"]) == 80
 
 
 def _run_one_iter_and_capture(
