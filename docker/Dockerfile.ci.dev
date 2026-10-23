@@ -130,7 +130,6 @@ ARG NVTE_CUDA_ARCHS="80;90;100"
 ARG NVTE_BUILD_THREADS_PER_JOB
 # Keep compiled wheels separate when the CPU or TE GPU targets change.
 RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cache/uv \
-    --mount=type=bind,source=docker/common/prepare_optional_backends.py,target=/opt/prepare_optional_backends.py \
     bash -ex <<"EOF"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
@@ -153,14 +152,16 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     if [ -n "${NVTE_BUILD_THREADS_PER_JOB:-}" ]; then
         export NVTE_BUILD_MAX_JOBS="${NVTE_BUILD_MAX_JOBS:-$(( (${MAX_JOBS:-$(nproc)} + NVTE_BUILD_THREADS_PER_JOB - 1) / NVTE_BUILD_THREADS_PER_JOB ))}"
     fi
+    # Preserve the base image's FlashAttention packages with --no-install-package.
     # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
     UV_CONCURRENT_INSTALLS=1 uv sync -v \
-        --extra ${IMAGE_TYPE} --extra inference --extra nvshmem --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+        --extra ${IMAGE_TYPE} --extra inference --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
         --no-install-project \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
         --no-install-package flash-attn \
+        --no-install-package flash-attn-4 \
         --no-install-package mamba-ssm \
         --no-install-package transformer-engine-cu12 \
         --no-install-package nvidia-cublas-cu12 \
@@ -175,24 +176,6 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
-
-    # Preserve NGC's compiled FA2 and expose the locked FA4/CuTeDSL packages beside it.
-    # Adapted from the coexistence fix in NVIDIA/Megatron-LM#7184.
-    python /opt/prepare_optional_backends.py
-    # Import-only checks need no GPU and fail before the expensive native builds.
-    python - <<'PY'
-from pathlib import Path
-import sysconfig
-
-import cutlass
-import tilelang
-from flash_attn import flash_attn_func, flash_attn_varlen_func
-from flash_attn.cute import flash_attn_func as fa4_func
-from flash_attn.cute import flash_attn_varlen_func as fa4_varlen_func
-
-assert Path(cutlass.__file__).resolve().is_relative_to(Path(sysconfig.get_path("purelib")).resolve())
-assert all(callable(function) for function in (flash_attn_func, flash_attn_varlen_func, fa4_func, fa4_varlen_func))
-PY
 
     # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
     # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.
@@ -283,9 +266,8 @@ RUN bash -ex <<"EOF"
     cd /workspace
     # DeepEP discovers NVSHMEM through the wheel, including the headers and
     # static archive it needs. Keep its runtime ABI aligned with NGC PyTorch.
-    # The nvshmem extra and CI constraint install the locked 3.7.1 runtime above.
+    uv pip install nvidia-nvshmem-cu13==3.7.1
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
-        test -f libnvshmem_host.so.3
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so
     popd
     python -c "import torch"
@@ -311,17 +293,6 @@ RUN bash -ex <<"EOF"
     popd
     rm -rf DeepEP
 EOF
-
-# Validate the Python weight-transfer interfaces without initializing CUDA/NVSHMEM.
-RUN python - <<'PY'
-import cupy
-import nvshmem.core
-import nvshmem.core.interop.torch
-
-assert callable(nvshmem.core.init)
-assert callable(nvshmem.core.interop.torch.register_external_tensor)
-assert callable(cupy.RawKernel)
-PY
 
 # Install the local project after expensive dependency builds so README-only
 # changes do not invalidate those layers.

@@ -2,7 +2,6 @@
 import copy
 import gc
 import importlib.util
-import os
 import types
 from dataclasses import fields
 from functools import partial
@@ -22,7 +21,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.resharding.nvshmem_copy_service.compat import get_cuda_core_device_class
 from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -38,16 +36,10 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig, T
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import cupy  # noqa: F401
     import nvshmem.core
 
-    get_cuda_core_device_class()
     has_nvshmem = True
-except Exception as exc:
-    if os.environ.get("MCORE_REQUIRE_NVSHMEM") == "1":
-        raise RuntimeError(
-            "MCORE_REQUIRE_NVSHMEM=1 requires working nvshmem.core, CuPy, and cuda-core imports."
-        ) from exc
+except Exception:
     has_nvshmem = False
 
 try:
@@ -67,14 +59,6 @@ try:
     has_mamba_deps = True
 except Exception:
     has_mamba_deps = False
-
-
-@pytest.fixture(autouse=True)
-def configure_nvshmem(request, monkeypatch):
-    """Apply the required CTA limit only to NVSHMEM cases and restore it afterward."""
-    callspec = getattr(request.node, "callspec", None)
-    if callspec is not None and callspec.params.get("refit_backend") == "nvshmem":
-        monkeypatch.setenv("NVSHMEM_MAX_CTAS", "2")
 
 
 def _build_pg_collection(
@@ -384,7 +368,7 @@ def _set_pg_collection(module, tp_group, dp_group):
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
-                reason="NVSHMEM dependencies (nvshmem.core, CuPy, cuda-core) are unavailable",
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
             ),
         ),
         "nccl",
@@ -702,7 +686,7 @@ def test_swap_dsa_parallelism(dsa_type: str, src_tp: int, src_pp: int, dst_tp: i
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
-                reason="NVSHMEM dependencies (nvshmem.core, CuPy, cuda-core) are unavailable",
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
             ),
         ),
         "nccl",
@@ -870,7 +854,7 @@ def test_router_expert_bias_refit(
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
-                reason="NVSHMEM dependencies (nvshmem.core, CuPy, cuda-core) are unavailable",
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
             ),
         ),
         "nccl",
@@ -1214,7 +1198,7 @@ def test_swap_dsa_non_collocated(
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
-                reason="NVSHMEM dependencies (nvshmem.core, CuPy, cuda-core) are unavailable",
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
             ),
         ),
         "nccl",

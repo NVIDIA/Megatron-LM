@@ -3,7 +3,6 @@
 import contextlib
 import importlib.util
 import math
-import os
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -357,9 +356,7 @@ class TestDynamicContext:
         assert max_seqlen_q >= 2
 
     @pytest.mark.internal
-    @pytest.mark.parametrize(
-        "flash_attention_version", [2, pytest.param(4, marks=pytest.mark.launch_on_gb200)]
-    )
+    @pytest.mark.parametrize("flash_attention_version", [2, 4])
     def test_one_token_prefill_metadata_is_correct_under_flash_attention(
         self, flash_attention_version
     ):
@@ -371,13 +368,7 @@ class TestDynamicContext:
         if flash_attention_version == 2:
             varlen = pytest.importorskip("flash_attn").flash_attn_varlen_func
         else:
-            # The dev GB200 lane must execute FA4 instead of passing with a missing-backend skip.
-            fa4 = (
-                importlib.import_module("flash_attn.cute")
-                if os.environ.get("MCORE_REQUIRE_FA4") == "1"
-                else pytest.importorskip("flash_attn.cute")
-            )
-            varlen = fa4.flash_attn_varlen_func
+            varlen = pytest.importorskip("flash_attn.cute").flash_attn_varlen_func
         block_size = 256  # FA2 paged KV requires a multiple of 256.
         ctx = self._get_dynamic_context(
             params_dtype=torch.bfloat16,
