@@ -908,17 +908,29 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing",
+        "balancing,score,expert_bias,hash_routing,sigmoid_input_scaling_factor",
         [
-            ("aux_loss", "softmax", False, False),
-            ("seq_aux_loss", "sigmoid", True, False),
-            ("sinkhorn", "softmax", False, False),
-            ("none", "sigmoid", False, True),
-            ("none", "softmax", False, True),
+            ("aux_loss", "softmax", False, False, 1.0),
+            ("seq_aux_loss", "sigmoid", True, False, 1.0),
+            ("sinkhorn", "softmax", False, False, 1.0),
+            ("none", "sigmoid", False, True, 1.0),
+            ("none", "softmax", False, True, 1.0),
+            ("seq_aux_loss", "sigmoid", True, False, 0.612),
+            ("none", "sigmoid", False, True, 1.5),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
+        ids=[
+            "aux_loss",
+            "seq_aux_loss+sigmoid+bias",
+            "sinkhorn",
+            "hash+sigmoid",
+            "hash+softmax",
+            "seq_aux_loss+scaled_sigmoid+bias",
+            "hash+scaled_sigmoid",
+        ],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
+    def test_topk_router_replays(
+        self, balancing, score, expert_bias, hash_routing, sigmoid_input_scaling_factor
+    ):
         self._init()
         seeded()
         config = _moe_config(
@@ -926,6 +938,7 @@ class TestMoEModules:
             moe_router_topk=8 if balancing != "sinkhorn" else 1,
             moe_router_load_balancing_type=balancing,
             moe_router_score_function=score,
+            moe_router_sigmoid_input_scaling_factor=sigmoid_input_scaling_factor,
             moe_router_enable_expert_bias=expert_bias,
             moe_router_pre_softmax=balancing == "sinkhorn",
             moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
@@ -955,7 +968,7 @@ class TestMoEModules:
             replays=3,
             grad_output=grad_output,
             contention=hash_routing,
-            what=f"TopKRouter[{balancing}, hash={hash_routing}]",
+            what=f"TopKRouter[{balancing}, hash={hash_routing}, scaled_sigmoid={sigmoid_input_scaling_factor}]",
         )
 
     def test_topk_router_per_token_loss_replays_and_captures(self):
@@ -1356,6 +1369,23 @@ class TestMoEModules:
             ("allgather", 1, {}),
             ("alltoall", 1, {}),
             pytest.param(
+                "allgather",
+                1,
+                {"moe_latent_size": 512, "moe_latent_sigmoid_input_scale": 1.7},
+                id="allgather-latent-sigmoid-scale",
+            ),
+            pytest.param(
+                "alltoall",
+                1,
+                {
+                    "moe_latent_size": 512,
+                    "moe_latent_sigmoid_input_scale": 1.7,
+                    "activation_func_tanh_clamp_scale": 5.0,
+                    "activation_func_tanh_clamp_scale_linear": 3.0,
+                },
+                id="alltoall-latent-situ-sigmoid-scale",
+            ),
+            pytest.param(
                 "alltoall",
                 1,
                 {
@@ -1390,6 +1420,8 @@ class TestMoEModules:
         ],
     )
     def test_moe_layer_replays(self, dispatcher, ep, extra):
+        if extra.get("moe_latent_size") is not None and not HAVE_TE:
+            pytest.skip("Latent MoE projections require Transformer Engine")
         if Utils.world_size % ep != 0 or (ep > 1 and Utils.world_size < ep):
             pytest.skip(f"needs a world size divisible by EP={ep}")
         self._init(ep=ep)

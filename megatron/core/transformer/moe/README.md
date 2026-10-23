@@ -658,6 +658,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-qb-num-bins | Uniform histogram bins per expert for global-batch quantile balancing | 1000 |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |
+| --moe-router-sigmoid-input-scaling-factor | Positive, finite multiplier for sigmoid input logits | 1.0 |
 | --moe-router-pre-softmax | Softmax before top-k | False |
 | --moe-router-num-groups | Groups for group-limited routing | None |
 | --moe-router-group-topk | Selected groups in group-limited routing | None |
@@ -666,6 +667,87 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-fusion | Enable router fusion | False |
 | --moe-router-dtype | Router precision: fp32, fp64 | None |
 | --moe-router-padding-for-fp8 | Pad for FP8 alignment | False |
+
+With `--moe-router-score-function sigmoid --moe-router-sigmoid-input-scaling-factor a`,
+the router computes `sigmoid(a * logits)`, where `a` is a fixed positive, finite
+multiplier. The default `1.0` preserves existing behavior, including logit dtype.
+Non-identity scaling promotes FP16/BF16 logits to FP32 before multiplication.
+The scaled logits are shared by training, auxiliary losses, z-loss, diagnostics,
+and inference. Expert selection bias is added after sigmoid and remains unscaled.
+This is independent of `--moe-router-topk-scaling-factor`, which multiplies selected
+output probabilities. The option adds no parameters or checkpoint tensors and is
+restored by `--use-checkpoint-args`. Non-identity scaling requires sigmoid MoE
+routing without Sinkhorn balancing.
+
+#### Calibrating the sigmoid input multiplier
+
+Do not infer this multiplier from the expert count. Calibrate it for the actual
+router initialization and representative activations at random initialization.
+For an RMS-normalized expert mixture, one possible signal-propagation criterion
+is the local sensitivity of the normalized selected gate direction:
+
+1. Capture router inputs from a randomly initialized model using representative
+   contexts. Keep the inputs and router weights fixed while sweeping a positive
+   multiplier `a` over a broad logarithmic grid.
+2. For each input `x`, compute the router logits (including any gate bias), select
+   the actual top-k sigmoid scores `s = sigmoid(a * logits)[topk]`, and form
+   `b = s / ||s||_2`. Include any group/hash selection used by the model.
+3. Estimate `mean(||db/dx||_F^2)` with autograd, treating the selected indices as
+   fixed within each derivative. Maximize this objective and refine near its
+   peak. Normalizing by the L2 norm models mixture direction when expert outputs
+   are independent and the mixture is RMS-normalized.
+4. Validate the selected multiplier on held-out contexts and independent router
+   initializations. Inspect sigmoid scores and saturation as well as the objective.
+
+This criterion measures local, smooth gate-direction sensitivity. It ignores
+hard top-k boundary changes, expert and residual Jacobians, and correlations
+between expert outputs; it does not establish full-network criticality. Other
+architectures or propagation objectives can require different calibration.
+
+Distinguish an initialization gain from a logit multiplier. If the existing
+router weights have `std(W) = c_init / sqrt(hidden_size)` and calibration targets
+`c_target`, pass `a = c_target / c_init` (assuming zero gate bias). For example,
+one calibration with 512 experts, top-k 10 and hidden size 1792 found
+`c_target ~= 0.5506` starting from `c_init = 0.9`, giving `a ~= 0.6118`:
+
+```bash
+--moe-router-score-function sigmoid --moe-router-sigmoid-input-scaling-factor 0.6118
+```
+
+These values are model-specific results, not defaults or a universal muP rule.
+With nonzero gate bias, calibrate the logit multiplier directly because it scales
+both the gate's weight contribution and bias.
+
+### Expert Sigmoid Input Scaling
+
+The independent `--moe-latent-sigmoid-input-scale KAPPA` option defaults to `1.0`.
+It changes only routed latent experts' sigmoid argument:
+
+```text
+SwiGLU(gate, linear) = gate * sigmoid(kappa * gate) * linear
+SiTU(gate, linear) = s * tanh(gate / s) * sigmoid(kappa * gate) * linear
+```
+
+This expert activation scale is independent of the router logit scale above.
+The gate's multiplicative factor and the linear branch retain their original inputs;
+SiTU tanh arguments and any linear-branch tanh clamp stay unchanged. Dense/shared
+experts and routing are unaffected.
+For example, `--moe-latent-size 3584 --moe-latent-sigmoid-input-scale 1.41421356237`
+adjusts only the expert activation sigmoid sensitivity. The scale must
+be finite; non-unit values require latent MoE with gated SiLU. Reuse the same scale
+when loading a checkpoint to reproduce its computation.
+
+The fused custom backward includes the `kappa` chain-rule factor and uses the same
+sigmoid scale for the router-probability gradient in weighted fusions. TE native
+activations fall back to the standard activation path for non-unit scales. The TE op fuser cannot express this
+option; disable `--use-transformer-engine-op-fuser` and use `--bias-activation-fusion`
+for the custom fused activation instead.
+Inference-optimized MoE kernels reject non-unit scales; use standard grouped or
+sequential experts instead. CPU reference comparisons verify the activation math;
+GPU compiler replay, distributed training, and quality ablations remain separate
+validation. Calibrate this expert activation scale separately from the router scale; the router
+calibration criterion above does not determine the expert activation scale. Record
+activation saturation and routed-branch RMS alongside loss.
 
 ### Loss and Regularization
 | Argument | Description | Default |

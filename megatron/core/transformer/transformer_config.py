@@ -983,6 +983,19 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
     """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
 
+    moe_router_sigmoid_input_scaling_factor: float = 1.0
+    """Fixed positive, finite multiplier for sigmoid router logits before scoring and
+    z-loss. Calibrate on representative random-init activations; see the MoE README.
+    The value is not derived from the expert count or hidden size. Separate from
+    ``moe_router_topk_scaling_factor``, which scales selected output probabilities.
+    Non-identity values require sigmoid MoE routing without Sinkhorn balancing.
+    Defaults to 1.0 (unchanged behavior) and adds no checkpoint tensors."""
+
+    moe_latent_sigmoid_input_scale: float = 1.0
+    """Scale only the sigmoid argument of routed latent experts' SwiGLU or SiTU gates.
+    Leaves linear factors and tanh inputs unchanged; independent of router logit scaling.
+    A non-unit value requires latent MoE with gated SiLU. Must be finite. Defaults to 1.0."""
+
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
@@ -2428,6 +2441,25 @@ class TransformerConfig(ModelParallelConfig):
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
                 )
 
+        if not math.isfinite(self.moe_latent_sigmoid_input_scale):
+            raise ValueError("moe_latent_sigmoid_input_scale must be finite.")
+        if self.moe_latent_sigmoid_input_scale != 1.0:
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "Non-unit moe_latent_sigmoid_input_scale is not supported by the TE op fuser; "
+                    "disable use_transformer_engine_op_fuser and use bias_activation_fusion."
+                )
+            if self.moe_latent_size is None or self.moe_latent_size <= 0:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires a positive moe_latent_size."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError("moe_latent_sigmoid_input_scale requires num_moe_experts.")
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError(
+                    "moe_latent_sigmoid_input_scale requires gated SiLU (SwiGLU/SiTU)."
+                )
+
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
 
@@ -3590,6 +3622,22 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.expert_tensor_parallel_size == 1
             ), "Bias in Moe is only supported when ETP==1"
+
+        if (
+            not math.isfinite(self.moe_router_sigmoid_input_scaling_factor)
+            or self.moe_router_sigmoid_input_scaling_factor <= 0
+        ):
+            raise ValueError("moe_router_sigmoid_input_scaling_factor must be positive and finite.")
+        if self.moe_router_sigmoid_input_scaling_factor != 1.0:
+            if not self.num_moe_experts or self.moe_router_score_function != "sigmoid":
+                raise ValueError(
+                    "moe_router_sigmoid_input_scaling_factor requires a MoE model with sigmoid "
+                    "scoring."
+                )
+            if self.moe_router_load_balancing_type == "sinkhorn":
+                raise ValueError(
+                    "moe_router_sigmoid_input_scaling_factor does not support Sinkhorn."
+                )
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function not in (
             "sigmoid",

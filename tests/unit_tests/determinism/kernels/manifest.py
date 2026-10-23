@@ -359,7 +359,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing.",
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Explicit sigmoid input gains replay with sequence auxiliary loss, expert bias and hash routing.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
@@ -377,7 +378,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/experts.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "Non-unit expert sigmoid scales replay in complete latent MoE layers.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
