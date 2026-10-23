@@ -563,8 +563,7 @@ def _assert_same_datasets(expected, built):
 def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
     """The provider body is megatron.training.datasets.providers.build_gpt_datasets; each script's
     train_valid_test_datasets_provider keeps the legacy shape and passes its rank predicate (the
-    shared GPT / hybrid rule applied to the script's own arguments, or hybrid-flex's own, which
-    accepts the packed-sequence flag)."""
+    shared GPT / hybrid rule, or hybrid-flex's own, which accepts the packed-sequence flag)."""
     for name in ("gpt", "hybrid", "hybrid_flex"):
         module = _entry_point(name)
         calls = []
@@ -578,41 +577,17 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
         ((positional, keywords),) = calls
         assert positional == ((8, 8, 8), 1)
         assert keywords == {"built_on_rank": module.is_dataset_built_on_rank}
+        shared = module.is_dataset_built_on_rank is providers.is_dataset_built_on_rank
+        assert shared is (name != "hybrid_flex")
         parameters = inspect.signature(module.is_dataset_built_on_rank).parameters
         assert {"vp_stage", "is_packed_sequence"} <= set(parameters)
-        if name == "hybrid_flex":
-            continue  # its own rule: the first and last stages, the packed flag ignored
-        # The GPT and hybrid predicates are the shared rule applied to the script's own arguments:
-        # get_args / core_transformer_config_from_args resolved in the script, which is what
-        # tests/unit_tests/data/test_get_batch.py patches on 8 GPUs.
-        rule_calls = []
-        monkeypatch.setattr(
-            module, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler="dp_balanced")
-        )
-        monkeypatch.setattr(
-            module,
-            "core_transformer_config_from_args",
-            lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=3),
-        )
-        monkeypatch.setattr(
-            module, "dataset_built_on_rank", lambda *a, **k: rule_calls.append((a, k)) or True
-        )
-        assert module.is_dataset_built_on_rank(vp_stage=1, is_packed_sequence=True) is True
-        assert rule_calls == [
-            (
-                (1, True),
-                {
-                    "sequence_packing_scheduler": "dp_balanced",
-                    "pipeline_model_parallel_layout": "layout",
-                    "mtp_num_layers": 3,
-                },
-            )
-        ]
 
 
 def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
-    """providers.is_dataset_built_on_rank, the default predicate of build_gpt_datasets, applies the
-    rule to the registered arguments and the transformer config built from them."""
+    """providers.is_dataset_built_on_rank, the predicate pretrain_gpt and pretrain_hybrid pass and the
+    default of build_gpt_datasets, applies the rule to the registered arguments and the transformer
+    config built from them, read at call time from global_vars and arguments (where tests patch
+    them; tests/unit_tests/data/test_get_batch.py does the same on eight GPUs)."""
     rule_calls = []
     monkeypatch.setattr(
         global_vars, "_GLOBAL_ARGS", SimpleNamespace(sequence_packing_scheduler=None)

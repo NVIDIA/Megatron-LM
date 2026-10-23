@@ -8,8 +8,8 @@ and hands the dataset config to ``BlendedMegatronDatasetBuilder`` as is. Each sc
 ``train_valid_test_datasets_provider`` of the legacy shape that calls it with its rank predicate:
 ``dataset_built_on_rank`` below is the GPT and hybrid rule (a packed dataset is built on every
 pipeline stage, the others on the first and last stages and on the multi-token-prediction ranks),
-which ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` apply to their own arguments and
-``is_dataset_built_on_rank`` to the registered ones; hybrid-flex passes its own.
+applied to the registered arguments by ``is_dataset_built_on_rank``, the predicate ``pretrain_gpt.py``
+and ``pretrain_hybrid.py`` pass; hybrid-flex passes its own.
 """
 
 from functools import partial
@@ -54,9 +54,10 @@ def dataset_built_on_rank(
 def is_dataset_built_on_rank(
     vp_stage: Optional[int] = None, is_packed_sequence: bool = False
 ) -> bool:
-    """``dataset_built_on_rank`` applied to the registered arguments: the default predicate of
-    ``build_gpt_datasets``. ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` define the same function
-    over their own ``get_args`` / ``core_transformer_config_from_args`` names."""
+    """``dataset_built_on_rank`` applied to the registered arguments: the predicate ``pretrain_gpt.py``
+    and ``pretrain_hybrid.py`` pass, and the default of ``build_gpt_datasets``. The arguments and the
+    transformer config are read at call time from ``megatron.training.global_vars`` and
+    ``megatron.training.arguments``, which is where tests patch them."""
     from megatron.training.arguments import core_transformer_config_from_args
     from megatron.training.global_vars import get_args
 
