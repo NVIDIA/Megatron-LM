@@ -493,7 +493,7 @@ class FsdpModule:
                 if context.outer_reduction_stream is not inner_reduction_stream:
                     context.outer_reduction_stream.wait_stream(inner_reduction_stream)
                 with torch.cuda.stream(context.outer_reduction_stream):
-                    group.finalize_dp_outer_reduction()
+                    group.reduce_outer_gradients()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
