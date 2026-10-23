@@ -2057,7 +2057,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     # The global ckpt tensors must be fully covered.
                     # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    if not bucket_state:
+                        # Trailing padding is excluded from the checkpoint. Interior padding
+                        # still needs a shard so that the checkpoint tensor is fully covered.
+                        if data_parallel_rank * gbuf_local_numel >= gbuf_world_numel_unpadded:
+                            continue
+                        template = self._get_main_param_and_optimizer_states(
+                            next(iter(self.model_param_group_index_map))
+                        )
+                        bucket_state.append(
+                            {
+                                **{
+                                    k: torch.empty(gbuf_local_numel, dtype=v.dtype, device=v.device)
+                                    for k, v in template.items()
+                                    if isinstance(v, torch.Tensor)
+                                },
+                                'gbuf_local_start': 0,
+                                'gbuf_local_end': gbuf_local_numel,
+                                'padding': True,
+                            }
+                        )
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}
@@ -2250,6 +2269,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                    if not gbuf_range_map["param_map"]:
+                        # Padding-only shards have no parameter state to restore.
+                        continue
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
                     bucket_state = [
                         bucket_state_elem
