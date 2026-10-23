@@ -10,6 +10,7 @@ state dict uses the checkpoint's MIMO key names, so it loads with the standard c
 
 from dataclasses import replace
 
+from megatron.training.global_vars import get_run_config
 import torch
 
 from megatron.core.dist_checkpointing.dict_utils import nested_values
@@ -148,6 +149,7 @@ def model_provider(
 ) -> LLaVAModel:
     """Build a LLaVAModel that loads the MIMO checkpoint described by the arguments."""
     args = get_args()
+    cfg = get_run_config()
     print_rank_0('building a LLaVA model for a MIMO checkpoint ...')
 
     language_model_config = hybrid_config_from_args(args, config)
@@ -193,7 +195,7 @@ def model_provider(
         conv_merging=args.conv_merging,
         dynamic_resolution=args.dynamic_resolution,
         max_num_tiles=args.max_num_tiles,
-        tokenizer_type=args.tokenizer_prompt_format,
+        tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
         pg_collection=pg_collection,
         vp_stage=vp_stage,
     )
