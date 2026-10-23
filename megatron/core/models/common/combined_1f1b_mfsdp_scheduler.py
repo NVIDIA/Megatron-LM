@@ -31,6 +31,12 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     return hook
 
 
+def _module_post_forward_hook(module: FsdpModule, _args, _output) -> None:
+    """Reshard after evaluation, which bypasses the combined schedule's release hooks."""
+    if not module.training:
+        module.reshard()
+
+
 def _module_post_backward_hook(module: FsdpModule) -> None:
     module.reshard()
     module._reduce_gradient_groups()
@@ -62,6 +68,7 @@ def register_combined_1f1b_hooks(module: FsdpModule) -> None:
 
     for submodule in module.modules():
         if isinstance(submodule, FsdpModule):
+            submodule.register_forward_hook(_module_post_forward_hook)
             submodule.register_post_backward_hook(_module_post_backward_hook)
 
 

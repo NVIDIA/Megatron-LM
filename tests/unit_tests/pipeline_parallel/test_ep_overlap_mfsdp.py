@@ -2,17 +2,29 @@
 
 """MFSDP v2 integration with the expert-parallel overlap schedule."""
 
+import copy
 from collections import Counter
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+    fully_shard_optimizer,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     FsdpParameterGroup,
 )
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -26,8 +38,11 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.distributed.mfsdp_v2.conftest import distributed_setup as distributed_setup
 from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
+
+pytestmark = pytest.mark.mfsdp
 
 
 def test_ep_overlap_mtp(distributed_setup, monkeypatch):
@@ -130,3 +145,49 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch):
         assert all(unit._trainable_parameter_countdown.is_complete for unit in units)
     finally:
         destroy_model_parallel()
+
+
+def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
+    """Evaluation releases every unit's full weights and preserves subsequent updates."""
+    setup = distributed_setup
+    torch.manual_seed(0)
+    reference = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16)).to(setup.device)
+    model = copy.deepcopy(reference)
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
+    units = (model[1], model)
+    with fully_shard_context(device=setup.device, caller_managed_grad_sync=True):
+        for unit in units:
+            fully_shard(unit, mesh=mesh, placements=placements, register_hooks=False)
+    register_combined_1f1b_hooks(model)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    fully_shard_optimizer(optimizer)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+
+    torch.manual_seed(123 + setup.rank)
+    for training in (True, False, True, False, True, False):
+        model.train(training)
+        reference.train(training)
+        inputs = torch.randn(4, 16, device=setup.device)
+        with torch.set_grad_enabled(training):
+            if training:
+                optimizer.zero_grad()
+                reference_optimizer.zero_grad()
+            expected = reference(inputs)
+            actual = model(inputs)
+            torch.testing.assert_close(actual, expected)
+            if training:
+                # Training releases weights at schedule boundaries; evaluation
+                # bypasses that schedule and must release them through its hooks.
+                for unit in units:
+                    unit.reshard()
+                actual.square().mean().backward()
+                expected.square().mean().backward()
+                model.context.finish_grad_sync()
+                for parameter in reference.parameters():
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+                optimizer.step()
+                reference_optimizer.step()
+        for unit in units:
+            assert not unit._unshard_events
+            assert unit._trainable_parameter_countdown.is_complete
