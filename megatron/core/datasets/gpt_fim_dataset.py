@@ -38,11 +38,11 @@ class GPTFIMDatasetConfig(GPTDatasetConfig):
     """Do not apply FIM to fragments that start with this prefix"""
 
     def validate(self) -> None:
-        """The GPT checks, then the FIM ones: both rates and the five extra tokens are required
-        (what ``validate_args`` checks for ``--fim-data`` on the command line)."""
+        """The GPT checks, then the FIM ones: both rates and the five extra tokens must be given
+        (a rate of 0.0 is a value; ``validate_args`` checks the same for ``--fim-data``)."""
         super().validate()
-        assert self.fim_rate, "fim_rate should be specified."
-        assert self.fim_spm_rate, "fim_spm_rate should be specified."
+        assert self.fim_rate is not None, "fim_rate should be specified."
+        assert self.fim_spm_rate is not None, "fim_spm_rate should be specified."
         assert self.fim_extra_tokens is not None and all(
             self.fim_extra_tokens.get(key) is not None for key in _FIM_TOKEN_KEYS
         ), (

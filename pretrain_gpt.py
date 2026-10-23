@@ -60,7 +60,7 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
+from megatron.training.datasets.providers import build_gpt_datasets, dataset_built_on_rank
 from megatron.training.global_vars import set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
@@ -417,11 +417,25 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+    """Whether the dataset should be built on the current rank: the shared GPT rule
+    (``megatron.training.datasets.providers.dataset_built_on_rank``) with this script's arguments."""
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+    return dataset_built_on_rank(
+        vp_stage,
+        is_packed_sequence,
+        sequence_packing_scheduler=args.sequence_packing_scheduler,
+        pipeline_model_parallel_layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+    )
+
+
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train, validation and test datasets from the run config's ``cfg.data``.
 
     The provider body is ``megatron.training.datasets.providers.build_gpt_datasets``, shared with
-    ``pretrain_hybrid.py`` and ``pretrain_hybrid_flex.py``; this script uses the shared rank
+    ``pretrain_hybrid.py`` and ``pretrain_hybrid_flex.py``, called with this script's rank
     predicate.
     """
     return build_gpt_datasets(

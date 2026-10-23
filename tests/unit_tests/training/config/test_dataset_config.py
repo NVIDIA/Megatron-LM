@@ -151,8 +151,11 @@ def test_fim_config_is_megatron_cores(tokenizer):
     assert data.dataset_type is GPTFIMDataset
     data.bind_tokenizer(tokenizer)
     assert data.dataset_build()[0] is GPTFIMDataset
+    DataConfig(dataset=_fim(fim_rate=0.0, fim_spm_rate=0.0)).bind_tokenizer(
+        tokenizer
+    )  # 0.0 is a rate
     for bad, message in (
-        (dict(fim_rate=0), "fim_rate"),
+        (dict(fim_rate=None), "fim_rate"),
         (dict(fim_spm_rate=None), "fim_spm_rate"),
         (dict(fim_extra_tokens={"prefix": "<p>"}), "FIM extra tokens"),
         (dict(fim_extra_tokens=None), "FIM extra tokens"),

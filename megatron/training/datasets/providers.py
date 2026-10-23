@@ -6,9 +6,10 @@
 (the dataset config bound to the run's tokenizer, the loader settings and the dataset class)
 and hands the dataset config to ``BlendedMegatronDatasetBuilder`` as is. Each script keeps a
 ``train_valid_test_datasets_provider`` of the legacy shape that calls it with its rank predicate:
-``is_dataset_built_on_rank`` below is the GPT and hybrid rule (a packed dataset is built on every
+``dataset_built_on_rank`` below is the GPT and hybrid rule (a packed dataset is built on every
 pipeline stage, the others on the first and last stages and on the multi-token-prediction ranks),
-hybrid-flex passes its own.
+which ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` apply to their own arguments and
+``is_dataset_built_on_rank`` to the registered ones; hybrid-flex passes its own.
 """
 
 from functools import partial
@@ -19,29 +20,54 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 
 
+def dataset_built_on_rank(
+    vp_stage: Optional[int],
+    is_packed_sequence: bool,
+    *,
+    sequence_packing_scheduler: Optional[str],
+    pipeline_model_parallel_layout: Any,
+    mtp_num_layers: Optional[int],
+) -> bool:
+    """Whether the dataset should be built on the current rank (the GPT and hybrid rule).
+
+    Only tensor-parallel rank 0 builds. With a sequence-packing scheduler only the first and last
+    pipeline stages do (the scheduler sends the packing metadata to the middle stages itself); a
+    packed dataset is built on every stage; the others on the first and last stages and on the
+    multi-token-prediction ranks.
+    """
+    from megatron.training.utils import is_first_or_last_pipeline_stage
+
+    if mpu.get_tensor_model_parallel_rank() != 0:
+        return False
+    if sequence_packing_scheduler is not None:
+        return is_first_or_last_pipeline_stage(vp_stage)
+    if is_packed_sequence:
+        return True
+    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
+        layout=pipeline_model_parallel_layout,
+        mtp_num_layers=mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
+    )
+
+
 def is_dataset_built_on_rank(
     vp_stage: Optional[int] = None, is_packed_sequence: bool = False
 ) -> bool:
-    """Whether the dataset should be built on the current rank (the GPT and hybrid rule)."""
+    """``dataset_built_on_rank`` applied to the registered arguments: the default predicate of
+    ``build_gpt_datasets``. ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` define the same function
+    over their own ``get_args`` / ``core_transformer_config_from_args`` names."""
     from megatron.training.arguments import core_transformer_config_from_args
     from megatron.training.global_vars import get_args
-    from megatron.training.utils import is_first_or_last_pipeline_stage
 
     args = get_args()
     config = core_transformer_config_from_args(args)
-    if mpu.get_tensor_model_parallel_rank() != 0:
-        return False
-    elif args.sequence_packing_scheduler is not None:
-        # The scheduler sends packing metadata to middle PP stages itself and requires that
-        # only the first and last stages hold a data iterator.
-        return is_first_or_last_pipeline_stage(vp_stage)
-    elif is_packed_sequence:
-        return True
-    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
-        layout=config.pipeline_model_parallel_layout,
+    return dataset_built_on_rank(
+        vp_stage,
+        is_packed_sequence,
+        sequence_packing_scheduler=args.sequence_packing_scheduler,
+        pipeline_model_parallel_layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
-        ignore_virtual=False,
-        vp_stage=vp_stage,
     )
 
 

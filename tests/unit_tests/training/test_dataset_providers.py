@@ -25,7 +25,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.core.datasets.utils import Split, compile_helpers
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.training import argument_utils, global_vars, training
+from megatron.training import argument_utils, arguments, global_vars, training
 from megatron.training.argument_utils import (
     gpt_data_config_from_args,
     pretrain_cfg_container_from_args,
@@ -563,7 +563,8 @@ def _assert_same_datasets(expected, built):
 def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
     """The provider body is megatron.training.datasets.providers.build_gpt_datasets; each script's
     train_valid_test_datasets_provider keeps the legacy shape and passes its rank predicate (the
-    shared GPT / hybrid rule, or hybrid-flex's own, which accepts the packed-sequence flag)."""
+    shared GPT / hybrid rule applied to the script's own arguments, or hybrid-flex's own, which
+    accepts the packed-sequence flag)."""
     for name in ("gpt", "hybrid", "hybrid_flex"):
         module = _entry_point(name)
         calls = []
@@ -577,10 +578,81 @@ def test_scripts_delegate_to_the_shared_provider_body(monkeypatch):
         ((positional, keywords),) = calls
         assert positional == ((8, 8, 8), 1)
         assert keywords == {"built_on_rank": module.is_dataset_built_on_rank}
-        shared = module.is_dataset_built_on_rank is providers.is_dataset_built_on_rank
-        assert shared is (name != "hybrid_flex")
         parameters = inspect.signature(module.is_dataset_built_on_rank).parameters
         assert {"vp_stage", "is_packed_sequence"} <= set(parameters)
+        if name == "hybrid_flex":
+            continue  # its own rule: the first and last stages, the packed flag ignored
+        # The GPT and hybrid predicates are the shared rule applied to the script's own arguments:
+        # get_args / core_transformer_config_from_args resolved in the script, which is what
+        # tests/unit_tests/data/test_get_batch.py patches on 8 GPUs.
+        rule_calls = []
+        monkeypatch.setattr(
+            module, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler="dp_balanced")
+        )
+        monkeypatch.setattr(
+            module,
+            "core_transformer_config_from_args",
+            lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=3),
+        )
+        monkeypatch.setattr(
+            module, "dataset_built_on_rank", lambda *a, **k: rule_calls.append((a, k)) or True
+        )
+        assert module.is_dataset_built_on_rank(vp_stage=1, is_packed_sequence=True) is True
+        assert rule_calls == [
+            (
+                (1, True),
+                {
+                    "sequence_packing_scheduler": "dp_balanced",
+                    "pipeline_model_parallel_layout": "layout",
+                    "mtp_num_layers": 3,
+                },
+            )
+        ]
+
+
+def test_shared_rank_predicate_reads_the_registered_arguments(monkeypatch):
+    """providers.is_dataset_built_on_rank, the default predicate of build_gpt_datasets, applies the
+    rule to the registered arguments and the transformer config built from them."""
+    rule_calls = []
+    monkeypatch.setattr(
+        global_vars, "_GLOBAL_ARGS", SimpleNamespace(sequence_packing_scheduler=None)
+    )
+    monkeypatch.setattr(
+        arguments,
+        "core_transformer_config_from_args",
+        lambda args: SimpleNamespace(pipeline_model_parallel_layout="layout", mtp_num_layers=None),
+    )
+    monkeypatch.setattr(
+        providers, "dataset_built_on_rank", lambda *a, **k: rule_calls.append((a, k)) or False
+    )
+    assert providers.is_dataset_built_on_rank(vp_stage=2) is False
+    assert rule_calls == [
+        (
+            (2, False),
+            {
+                "sequence_packing_scheduler": None,
+                "pipeline_model_parallel_layout": "layout",
+                "mtp_num_layers": None,
+            },
+        )
+    ]
+
+
+def test_rank_rule_gates_on_tensor_parallel_rank():
+    """With one pipeline stage every branch of the rule reduces to "tensor-parallel rank 0
+    builds"; the stage logic runs on 8 GPUs in tests/unit_tests/data/test_get_batch.py."""
+    from megatron.core import mpu
+
+    Utils.initialize_model_parallel(2, 1)
+    try:
+        expected = mpu.get_tensor_model_parallel_rank() == 0
+        layout = dict(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+        rule = providers.dataset_built_on_rank
+        assert rule(None, False, sequence_packing_scheduler=None, **layout) is expected
+        assert rule(None, True, sequence_packing_scheduler=None, **layout) is expected
+        assert rule(None, False, sequence_packing_scheduler="dp_balanced", **layout) is expected
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_legacy_wrapper_is_the_shared_helper(monkeypatch, corpus):

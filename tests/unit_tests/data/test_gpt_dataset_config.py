@@ -118,8 +118,9 @@ def test_fim_config_validates_its_own_fields(tokenizer):
     assert isinstance(cfg, GPTDatasetConfig)
     cfg.validate()
     assert cfg.token_dtype_code == 8
+    fim(fim_rate=0.0, fim_spm_rate=0.0).validate()  # 0.0 is a rate, not a missing value
     for bad, message in (
-        (dict(fim_rate=0), "fim_rate"),
+        (dict(fim_rate=None), "fim_rate"),
         (dict(fim_spm_rate=None), "fim_spm_rate"),
         (dict(fim_extra_tokens={"prefix": "<p>"}), "FIM extra tokens"),
         (dict(fim_extra_tokens=None), "FIM extra tokens"),
