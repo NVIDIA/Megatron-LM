@@ -268,7 +268,7 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+    logprobs_dir, decode_threads, msc_prefetch_depth, kd_loss_alpha, ignore_errors, ignore_hash
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -280,10 +280,10 @@ def _build_cached_logits_loss_func(
     return LossFuncCallable(
         logprobs_dir=logprobs_dir,
         decode_threads=decode_threads,
-        prefetch_factor=prefetch_factor,
         msc_prefetch_depth=msc_prefetch_depth,
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
+        ignore_hash=ignore_hash,
     )
 
 
@@ -310,10 +310,10 @@ def loss_func(
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
             decode_threads=args.logits_load_decode_threads,
-            prefetch_factor=args.logits_load_prefetch_factor,
             msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
@@ -379,6 +379,26 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             get_batch(data_iterator, vp_stage)
         )
+
+        # Offline logits KD: record this microbatch's global (un-CP-sharded)
+        # document boundaries so the saver can persist them alongside the
+        # logits _forward_hook is about to capture -- required for
+        # document-aware CP reassembly of packed (--sft) sequences. get_batch
+        # carries them in packed_seq_params (cu_seqlens_q_padded, falling back
+        # to cu_seqlens_q); the sequence-packing scheduler path records None.
+        from megatron.training.distillation.logits_saver import get_logits_saver
+
+        saver = get_logits_saver()
+        if saver is not None:
+            cu_seqlens_for_saver = None
+            if args.sequence_packing_scheduler is None and packed_seq_params is not None:
+                cu_seqlens_for_saver = (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else packed_seq_params.cu_seqlens_q
+                )
+            saver.set_current_cu_seqlens(cu_seqlens_for_saver)
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -416,6 +436,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
+    elif getattr(args, 'sequence_packing_scheduler', None) is not None:
+        # The scheduler sends packing metadata to middle PP stages itself and requires that
+        # only the first and last stages hold a data iterator.
+        return is_first_or_last_pipeline_stage(vp_stage)
     elif is_packed_sequence or (
         getattr(args, 'use_varlen_dataset', False)
         and getattr(args, 'varlen_sbhd_validation', False)

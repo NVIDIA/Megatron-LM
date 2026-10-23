@@ -1473,6 +1473,8 @@ class InferenceTopKRouter(TopKRouter):
         # Preserve the compiled inference router's established single-batch layout.
         logits = logits.squeeze(1)  # [num_tokens, num_experts]
 
+        # Micro-batch QB selects on (logits - qb_beta). Global-batch QB passes its
+        # fixed additive bias through the normal score-function route.
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
