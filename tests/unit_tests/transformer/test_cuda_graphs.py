@@ -28,7 +28,10 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.schedules import set_current_microbatch
+from megatron.core.pipeline_parallel.schedules import (
+    deallocate_output_tensor,
+    set_current_microbatch,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -482,11 +485,41 @@ class TestCudaGraphConfigAndArguments:
 
 
 class TestCudaGraphReplay:
+    def test_pipeline_deallocation_preserves_captured_output_surface(self):
+        class FakeGraph:
+            calls = 0
+
+            def replay(self):
+                self.calls += 1
+
+        runner = object.__new__(_CudaGraphRunner)
+        runner.fwd_graph = FakeGraph()
+        runner.status = cuda_graphs_module._GraphStatus.FWD_READY
+        runner.fp8_enabled = runner.fp4_enabled = runner.use_stream = False
+        runner.is_last_layer = runner.deallocate_pipeline_outputs = True
+        runner.fwd_graph_input_surface = (torch.zeros(2, 4),)
+        surface = torch.ones(2, 4)
+        runner.fwd_graph_output_surface = (surface,)
+        shape, pointer = surface.shape, surface.data_ptr()
+        for _ in range(2):
+            output = _CudagraphReplayNode.apply(runner, False, torch.ones(2, 4, requires_grad=True))
+            output = runner._make_pipeline_output_viewless(output)[0]
+            assert output.shape == shape and output._base is None
+            deallocate_output_tensor(output, True)
+            # Pipeline pseudo-deallocation may change the user's wrapper, never
+            # the retained TensorImpl used as the next replay's output surface.
+            assert surface.shape == shape
+            assert surface.data_ptr() == pointer
+        assert runner.fwd_graph.calls == 2
+
     def test_gtp_forward_ensures_captured_params_ready_before_replay(self, monkeypatch):
         calls = []
         first = object()
         second = object()
         runner = object.__new__(_CudaGraphRunner)
+        runner.megakernel_backends = ()
+        runner.megakernel_graph_keys = ()
+        runner.megakernel_calls = ()
         runner._gtp_fwd_params_to_ensure_ready = (first, second)
         runner.grad_enabled = False
         runner.fwd_graph_outputs = (object(),)
