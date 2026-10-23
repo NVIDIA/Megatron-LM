@@ -640,11 +640,18 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    kda_disable_fp8: bool = False
+    """Force KDA projections to BF16 even under FP8 training,
+    (KDA projections are BF16 in the checkpoint)."""
+
     kda_safe_gate: bool = False
     """Whether the KDA kernel should use bounded gate values."""
 
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
+
+    kda_two_stage_gates: bool = False
+    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
@@ -2575,6 +2582,8 @@ class TransformerConfig(ModelParallelConfig):
                     "flag would only add per-microbatch prebuild work."
                 )
         if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if self.experimental_attention_variant == "kda":
+                self.validate_kda()
             if not self.is_hybrid_model:
                 assert (
                     self.linear_attention_freq is not None
@@ -3604,6 +3613,11 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
+            from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+            is_kda_variant = isinstance(self, KDALayerConfig) or (
+                self.experimental_attention_variant == "kda"
+            )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -3645,6 +3659,7 @@ class TransformerConfig(ModelParallelConfig):
             if (
                 "gdn_norm_out" in self.recompute_modules
                 and not self.is_hybrid_model
+                and not is_kda_variant
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
@@ -3655,6 +3670,7 @@ class TransformerConfig(ModelParallelConfig):
             if (
                 "gdn" in self.recompute_modules
                 and not self.is_hybrid_model
+                and not is_kda_variant
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
@@ -5929,6 +5945,57 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
                     f"Available schedulers: {supported_schedulers}"
+                )
+
+    def validate_kda(self) -> None:
+        """Validate KDA-specific dimensions, including configs copied with from_config."""
+        if self.gdn_conv_pad_alignment is not None and self.gdn_conv_pad_alignment <= 0:
+            raise ValueError(
+                "gdn_conv_pad_alignment must be positive when set for KDA, got "
+                f"{self.gdn_conv_pad_alignment}."
+            )
+        if self.kda_safe_gate and (
+            self.kda_lower_bound is None or not (-5 <= self.kda_lower_bound < 0)
+        ):
+            raise ValueError(
+                "kda_lower_bound must be in the safe range [-5, 0) when kda_safe_gate=True, "
+                f"got {self.kda_lower_bound}."
+            )
+        required_positive = (
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        )
+        for name in required_positive:
+            value = getattr(self, name)
+            if value is None or value <= 0:
+                raise ValueError(f"{name} must be positive for KDA, got {value}.")
+        if self.linear_num_key_heads != self.linear_num_value_heads:
+            raise ValueError("KDA requires equal key and value head counts.")
+        if self.linear_key_head_dim != self.linear_value_head_dim:
+            raise ValueError("KDA requires equal key and value head dimensions.")
+        if (
+            self.context_parallel_size > 1
+            and self.linear_cp_mode == "chunkwise"
+            and self.deterministic_mode
+        ):
+            raise ValueError(
+                "KDA chunkwise context parallelism is incompatible with deterministic_mode "
+                "because the fallback convolution cannot exchange history across ranks."
+            )
+        if self.linear_num_key_heads % self.tensor_model_parallel_size != 0:
+            raise ValueError(
+                "KDA key/value head count must be divisible by tensor parallel size; "
+                f"got heads={self.linear_num_key_heads}, tp={self.tensor_model_parallel_size}."
+            )
+        if self.linear_cp_mode == "headwise":
+            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+            if self.linear_num_key_heads % tp_cp_size != 0:
+                raise ValueError(
+                    "KDA headwise context parallelism requires head count divisible by TP*CP; "
+                    f"got heads={self.linear_num_key_heads}, tp_cp={tp_cp_size}."
                 )
 
 

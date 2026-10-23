@@ -37,6 +37,7 @@ def _make_layer(layer_cls, process_groups, precision, recompute, observations):
         fp4="e2m1" if precision.startswith("fp4") else None,
         linear_cp_mode="headwise",
         sequence_parallel=False,
+        distribute_saved_activations=False,
     )
     layer.pg_collection = process_groups
     layer.sp_size = 1
