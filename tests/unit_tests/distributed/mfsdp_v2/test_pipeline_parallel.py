@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from megatron.core.distributed.fsdp.mcore_adapter import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
 )
