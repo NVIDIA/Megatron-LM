@@ -9,6 +9,7 @@ import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import save_checkpoint
@@ -29,10 +30,11 @@ from tests.unit_tests.test_checkpointing import (
 class MockFullConfig:
     """Minimal stand-in for ``PretrainConfigContainer`` exposing ``to_yaml``."""
 
-    def __init__(self, data):
+    def __init__(self, data, use_distributed_optimizer=False):
         from megatron.training.config import LoggerConfig, RNGConfig
 
         self._data = data
+        self.optimizer = OptimizerConfig(use_distributed_optimizer=use_distributed_optimizer)
         self.logger = LoggerConfig()
         self.rng = RNGConfig()
 
@@ -71,7 +73,9 @@ def test_save_checkpoint_writes_run_config(init_model_parallel, create_args, tmp
 
         with mock.patch(
             "megatron.training.checkpointing.get_run_config",
-            return_value=MockFullConfig(run_config_data),
+            return_value=MockFullConfig(
+                run_config_data, use_distributed_optimizer=args.use_distributed_optimizer
+            ),
         ):
             save_checkpoint(
                 iteration,
@@ -123,7 +127,9 @@ def test_save_checkpoint_writes_run_config_release(
 
         with mock.patch(
             "megatron.training.checkpointing.get_run_config",
-            return_value=MockFullConfig(run_config_data),
+            return_value=MockFullConfig(
+                run_config_data, use_distributed_optimizer=args.use_distributed_optimizer
+            ),
         ):
             save_checkpoint(
                 iteration,
@@ -187,7 +193,9 @@ def test_save_checkpoint_writes_run_config_other_formats(
 
         with mock.patch(
             "megatron.training.checkpointing.get_run_config",
-            return_value=MockFullConfig(run_config_data),
+            return_value=MockFullConfig(
+                run_config_data, use_distributed_optimizer=args.use_distributed_optimizer
+            ),
         ):
             save_checkpoint(
                 iteration,

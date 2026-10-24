@@ -557,10 +557,13 @@ if __name__ == "__main__":
     from megatron.core.optimizer.optimizer_config import ParamKey, ParamWithNamePredicate
     from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 
-    _orig_get_opt_cfg = _mtt.get_megatron_optimizer_config
+    _orig_get_opt_cfg_overrides = _mtt.get_standard_config_overrides
 
-    def _patched_get_opt_cfg(args):
-        config, config_overrides = _orig_get_opt_cfg(args)
+    def _patched_get_opt_cfg_overrides(config):
+        config_overrides = _orig_get_opt_cfg_overrides(config)
+        args = _mtt.get_args()
+        cfg = _mtt.get_run_config()
+
         lr_mult = getattr(args, 'lr_mult_router', 1.0)
         if lr_mult != 1.0:
             router_key = ParamKey(
@@ -570,13 +573,13 @@ if __name__ == "__main__":
                 )
             )
             router_override = ParamGroupOverride(
-                max_lr=args.lr * lr_mult,
-                min_lr=args.min_lr * lr_mult,
+                max_lr=cfg.optimizer.lr * lr_mult,
+                min_lr=cfg.optimizer.min_lr * lr_mult,
             )
             config_overrides = {**(config_overrides or {}), router_key: router_override}
-        return config, config_overrides
+        return config_overrides
 
-    _mtt.get_megatron_optimizer_config = _patched_get_opt_cfg
+    _mtt.get_standard_config_overrides = _patched_get_opt_cfg_overrides
 
     # `pretrain()` no longer accepts extra_args_provider / args_defaults; parse
     # args up-front instead (see pretrain_mamba.py for the same pattern).

@@ -2,23 +2,35 @@
 import pytest
 import torch
 
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
+
+
+def _validate_run(**kwargs):
+    """Build an OptimizerConfig and run its (run-level) validation."""
+    OptimizerConfig(**kwargs).validate_run(
+        ddp_config=DistributedDataParallelConfig(),
+        use_torch_fsdp2=False,
+        moe_single_grouped_weight=False,
+        virtual_pipeline_model_parallel_size=None,
+        ckpt_format=None,
+    )
 
 
 def test_layer_sharded_muon_tp_mode_requirements():
     """muon_tp_mode='layer_sharded' needs muon, the layer-wise path and no split-QKV."""
     ok = dict(optimizer='muon', use_layer_wise_distributed_optimizer=True, muon_split_qkv=False)
-    OptimizerConfig(muon_tp_mode='layer_sharded', **ok)
+    _validate_run(muon_tp_mode='layer_sharded', **ok)
     # dist_muon is the deprecated alias for muon + the layer-wise path.
-    OptimizerConfig(muon_tp_mode='layer_sharded', optimizer='dist_muon', muon_split_qkv=False)
+    _validate_run(muon_tp_mode='layer_sharded', optimizer='dist_muon', muon_split_qkv=False)
     with pytest.raises(ValueError, match="requires optimizer='muon'"):
-        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'optimizer': 'adaptive_muon'})
+        _validate_run(muon_tp_mode='layer_sharded', **{**ok, 'optimizer': 'adaptive_muon'})
     with pytest.raises(ValueError, match="layer-wise"):
-        OptimizerConfig(
+        _validate_run(
             muon_tp_mode='layer_sharded', **{**ok, 'use_layer_wise_distributed_optimizer': False}
         )
     with pytest.raises(ValueError, match="split-QKV"):
-        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True})
+        _validate_run(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True})
 
 
 def test_paramkey_matches():

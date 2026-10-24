@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
@@ -773,7 +774,7 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
-    from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
+    from megatron.training.training import get_megatron_ddp_config
 
     if model_cfg is None:
         msg = """
@@ -793,7 +794,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
 
-    optim_cfg, _ = get_megatron_optimizer_config(args)
+    optim_cfg = _default_config_from_args(OptimizerConfig, args)
     ddp_config = get_megatron_ddp_config(args, use_torch_fsdp2=getattr(args, "use_torch_fsdp2", False))
 
     cfg = PretrainConfigContainer(
@@ -837,8 +838,8 @@ def inference_cfg_container_from_args(
     """Build an InferenceConfigContainer from the argparse arguments.
 
     This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
-    inference needs (no optimizer, scheduler, training, validation, DDP, rerun, or straggler
-    configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
+    inference needs (an optimizer settings section, but no scheduler, training, validation, DDP,
+    rerun, or straggler configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
 
     Args:
         args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
