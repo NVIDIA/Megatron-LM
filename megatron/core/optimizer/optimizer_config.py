@@ -302,16 +302,13 @@ class OptimizerConfig:
     """Additional scale factor for the muon update."""
 
     muon_ns_batch_size: int = 1
-    """Max number of same-shape matrices fused into one batched Newton-Schulz under
-    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
-    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
-    the per-matrix loop is kernel-launch bound; batching trades transient memory for
-    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
-    value is an upper bound per same-shape bucket, so a value above the matrix count
-    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
-    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
-    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
-    emerging-optimizers >= 0.3.0."""
+    """Maximum same-shape matrices per Newton-Schulz call in Muon. Duplicated mode
+    batches only unsharded expert matrices, leaving dense, QKV-split, and TP/GTP-sharded
+    weights on their existing paths. Layer-sharded mode batches complete matrices on
+    each NS home or single-rank domain. The default of one retains the per-matrix path.
+    Larger batches trade transient memory for fewer launches and can introduce
+    kernel-level rounding differences (baddbmm versus addmm). Values above one require
+    emerging-optimizers >= 0.3.0. Duplicated batching does not support muon_use_syrk."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
@@ -463,6 +460,18 @@ class OptimizerConfig:
             assert not math.isfinite(
                 self.grad_norm_skip_threshold
             ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
+        if self.muon_ns_batch_size < 1:
+            raise ValueError("muon_ns_batch_size must be at least 1.")
+        if self.muon_ns_batch_size > 1:
+            if self.optimizer not in ("muon", "dist_muon"):
+                raise ValueError("muon_ns_batch_size > 1 requires optimizer='muon'.")
+            if self.muon_tp_mode not in ("duplicated", "layer_sharded"):
+                raise ValueError(
+                    "muon_ns_batch_size > 1 requires duplicated or layer_sharded Muon."
+                )
+            if self.muon_tp_mode == "duplicated" and self.muon_use_syrk:
+                raise ValueError("Batched duplicated Muon does not support muon_use_syrk.")
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

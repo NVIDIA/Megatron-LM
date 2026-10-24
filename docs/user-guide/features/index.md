@@ -18,6 +18,7 @@ cuda_graph
 fine_grained_activation_offloading
 low_precision_training
 moe
+batched_muon
 megatron_fsdp
 dist_optimizer
 checkpoint-merge
