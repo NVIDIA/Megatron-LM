@@ -318,7 +318,10 @@ def test_gpt_forward_keeps_full_token_padding_mask_for_mtp():
 
     model = types.SimpleNamespace(
         config=types.SimpleNamespace(
-            fine_grained_activation_offloading=False, moe_paged_stash=False, moe_n_hash_layers=0
+            fine_grained_activation_offloading=False,
+            moe_paged_stash=False,
+            moe_n_hash_layers=0,
+            freeze_base_model_for_mtp=False,
         ),
         mtp_process=True,
         _preprocess=lambda **kwargs: (hidden, None, None, None, None, sp_mask),
