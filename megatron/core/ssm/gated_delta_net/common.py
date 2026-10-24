@@ -53,6 +53,14 @@ except ImportError:
 
     HAVE_FLA = False
 
+# FLA's l2norm passes its Triton kernels a row-count bucket, NB = cdiv(rows, 65536), as a
+# constexpr. Traced by torch.compile inside _prepare_input_for_gated_delta_rule, every bucket
+# becomes a guard, so variable-length inputs multiply the compiled variants until Dynamo's
+# recompile limit is spent; later calls then run eagerly, and a grad-enabled forward no longer
+# matches a no-grad forward of the same input bit for bit. Calling the same kernels outside
+# the graph keeps the number of variants independent of the sequence length.
+_l2norm_outside_graph = torch.compiler.disable(l2norm) if l2norm is not None else None
+
 logger = logging.getLogger(__name__)
 
 
@@ -475,7 +483,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            normalize = torch_l2norm if self.config.deterministic_mode else l2norm
+            normalize = torch_l2norm if self.config.deterministic_mode else _l2norm_outside_graph
             query_key = normalize(query_key.contiguous())
 
         # Split query and key
