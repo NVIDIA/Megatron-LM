@@ -104,7 +104,13 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
         only_left = []
         only_right = []
         mismatch_debug_data = [prefix, type(x1), type(x2)]
-        if isinstance(x1, torch.Tensor) and isinstance(x2, torch.Tensor):
+        tensors = isinstance(x1, torch.Tensor) and isinstance(x2, torch.Tensor)
+        if tensors and x1.shape != x2.shape:
+            # Elementwise comparison would broadcast e.g. [1, n] against [m, n]
+            # and wrongly report the tensors as equal.
+            _is_mismatch = True
+            mismatch_debug_data.extend([x1.shape, x2.shape])
+        elif tensors:
             try:
                 if x1.device != x2.device:
                     _is_mismatch = not torch.all(x1.cpu() == x2.cpu())
