@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 from contextlib import nullcontext
@@ -150,8 +150,10 @@ def init() -> None:
     trigger NCCL errors. To avoid this, the pool is explicitly deregistered
     on entry and re-registered on exit for each context use.
     """
-    # Enables NCCL NVLS algorithm
-    os.environ["NCCL_NVLS_ENABLE"] = "1"
+    # Enable NCCL NVLS by default without overriding an explicit application or
+    # recipe choice.  Disabling NVLS is useful for isolating registration paths
+    # and for platforms where the NVLS algorithm is not operational.
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
     # Disables the use of the tensor register allocator hook
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "0"
     _build_nccl_allocator()
