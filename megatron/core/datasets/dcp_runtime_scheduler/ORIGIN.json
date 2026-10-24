@@ -33,5 +33,22 @@
     "attention/gb200.json": "7f4ccc3da6665f4eed70e00847fb0f3b874eb44ced8639f3e806854658939a66",
     "attention/gb300.json": "75f8377ad93976a36c08841c5c05bbea195b730a085c5bc0afe08668f2f10197",
     "qwen35.json": "c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc"
+  },
+  "dynamic_usp": {
+    "repository": "https://github.com/mazhuoru/DynamicUSP",
+    "commit": "1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
+    "scope": "Generic solve_gbs Stage 1 allocation and microbatch-count search",
+    "adaptations": [
+      "remove head and communication-specific constraints; caller supplies legal group sizes",
+      "use the existing injected cost model and physical-capacity predicate",
+      "retain the original aligned power-of-two allocation policy",
+      "omit profile-specific Stage 2, prediction assets, CLI and pipeline simulation"
+    ],
+    "source_python_sha256": {
+      "gbs/allocator.py": "7f9e3da37e6d613a46d504f2677a6e9c8a920af9b393f729ab6222647fbc2a8a",
+      "gbs/bounds.py": "8ec1410c93b9760b394c5ccaef03a0713ba61e602a55848e1a829a89136ff3ee",
+      "gbs/placement.py": "c3d33039a108e72caa67abc632c89f78d706e1b1b83e0da2ca8e2b150f06ed1b",
+      "gbs/search.py": "f3235b85347b2e111b219722969c5bef562f253c5ce9e67410d56f5eeec2aa9e"
+    }
   }
 }

@@ -43,3 +43,25 @@ CPU JIT backend, make Numba available in the training environment and add
 predictors. Caller-provided `module:factory` model, solver and historical powers
 baseline hooks remain supported. `--dynamic-cp-runtime-force-powers` bypasses
 the arbitrary search using the configured validated powers-only baseline.
+
+An optional generic hot-switch solver is selected independently of the model:
+
+```bash
+--dynamic-cp-runtime-solver dynamic_usp \
+--dynamic-cp-runtime-solver-options '{"candidate_count":4,"outlier_threshold":1.0}'
+```
+
+It ports DynamicUSP `solve_gbs` Stage 1: long-sample group allocation, short
+prepacking/LPT, empty-group repair, rank rotation, tier affinity, heavy-middle
+ordering and bounded microbatch-count search. Allowed power-of-two widths are
+taken from the existing geometry. Samples and physical sequence-count/padding
+limits are validated by the same rank-row contract as the default planner.
+The injected model supplies scheduling work and complete-step candidate scores;
+no heads, attention implementation or communication backend is selected by this
+solver. The configured incumbent is retained if no candidate is predicted faster.
+
+The original USP cost profiles, optional profile-specific fixed-topology Stage 2,
+PP/VPP simulation, CLI and calibration assets are not imported. Existing
+PP1/VPP1 restrictions, the CPU worker, async lookahead and sync control are
+unchanged. No external `hot_switch_solver` installation is needed. Upstream
+revision and license are recorded in `DYNAMIC_USP_NOTICE.txt`.

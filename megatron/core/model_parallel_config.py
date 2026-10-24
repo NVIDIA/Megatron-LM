@@ -176,12 +176,13 @@ class ModelParallelConfig:
     """JSON object, or JSON file path, passed as keywords to the cost-model factory."""
 
     dynamic_cp_runtime_solver: Optional[str] = None
-    """Optional CPU planner factory ('module:factory'), called with geometry, model and
-    solver-options keyword arguments. None uses the in-tree lightweight planner.
+    """'dynamic_usp' selects the generic hot-switch solver. A CPU planner factory
+    ('module:factory') receives geometry, model and solver-options keyword arguments.
+    None uses the in-tree lightweight planner. This does not select communication.
     """
 
     dynamic_cp_runtime_solver_options: Optional[str] = None
-    """JSON object/file passed to the planner factory, or to LightweightOptions by default."""
+    """JSON object/file passed to the selected solver, or to LightweightOptions by default."""
 
     dynamic_cp_runtime_baseline: Optional[str] = None
     """Optional baseline factory ('module:factory'), called with the geometry dictionary.

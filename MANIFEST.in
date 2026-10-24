@@ -3,5 +3,6 @@ include megatron/core/README.md
 include megatron/core/package_info.py
 recursive-include megatron/core/datasets/dcp_runtime_scheduler *.json
 include megatron/core/datasets/dcp_runtime_scheduler/README.md
+include megatron/core/datasets/dcp_runtime_scheduler/DYNAMIC_USP_NOTICE.txt
 global-exclude LICENSE
 recursive-include requirements *

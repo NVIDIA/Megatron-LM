@@ -64,6 +64,10 @@ def _initialize_planner(spec):
         module, factory = spec['model'].split(':', 1)
         model = getattr(importlib.import_module(module), factory)(**spec['model_options'])
     options = spec.get('solver_options', {})
+    if spec.get('solver') == 'dynamic_usp':
+        return _runtime_module('runtime.dynamic_usp').DynamicUSPRuntimePlanner(
+            geometry, model, **options
+        )
     if spec.get('solver'):
         module, factory = spec['solver'].split(':', 1)
         return getattr(importlib.import_module(module), factory)(geometry, model, **options)
@@ -111,7 +115,11 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
             if is_dataclass(getattr(planner, 'options', None))
             else spec.get('solver_options', {})
         ),
-        solver_entry=(spec.get('solver') or f'{type(planner).__module__}:LightweightRuntimePlanner')
+        solver_entry=(
+            spec['solver']
+            if spec.get('solver') and ':' in spec['solver']
+            else f'{type(planner).__module__}:{type(planner).__name__}'
+        )
         + '.plan_padded',
         solve_start=started,
         solve_end={'monotonic_ns': time.monotonic_ns(), 'wall_ns': time.time_ns()},
