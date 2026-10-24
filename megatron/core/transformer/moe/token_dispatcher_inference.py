@@ -196,6 +196,29 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
+        # Rank inside pg_collection.tp, for the SP offset of the padding mask (as in the
+        # NVLS dispatcher).
+        self.sp_rank = get_pg_rank(pg_collection.tp)
+
+    _real_token_count_tensor: Optional[torch.Tensor] = None
+
+    @classmethod
+    def set_real_token_count_tensor(cls, tensor: torch.Tensor) -> None:
+        """Bind the context's GPU real-token-count tensor (see the NVLS dispatcher).
+
+        Called by DynamicInferenceContext after allocate_buffers. On the CUDA-graph path
+        the rows from this count on are graph padding, and their routing is masked.
+        """
+        cls._real_token_count_tensor = tensor
+
+    @classmethod
+    def modify_real_token_count_for_mtp(cls, mtp_token_count: int) -> None:
+        """Point the padding mask at an MTP forward's row count (see the NVLS dispatcher)."""
+        assert cls._real_token_count_tensor is not None, (
+            "real-token-count tensor not wired; DynamicInferenceContext must "
+            "call set_real_token_count_tensor first"
+        )
+        cls._real_token_count_tensor.fill_(mtp_token_count)
 
     @classmethod
     def allocate_buffers(cls) -> None:
@@ -203,8 +226,10 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
 
         Called once at model init from the dynamic context. Must run outside any
         CUDA graph capture so update_metadata can write to a stable address during
-        replay without triggering allocations inside the graph.
+        replay without triggering allocations inside the graph. Clears the padding
+        mask's token-count binding, which the context sets again afterwards.
         """
+        cls._real_token_count_tensor = None
         device = torch.cuda.current_device()
         InferenceAllGatherDispatcherBase._valid_tokens_tensor = torch.zeros(
             1, dtype=torch.int32, device=device
@@ -265,7 +290,13 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             self.update_metadata(hidden_states.shape[0])
 
         if not self.__class__._use_allgather_v:
-            # CG path: equal token counts, standard gather.
+            # CG path: equal token counts, standard gather. Every rank is padded to the
+            # graph's token count; mask the padding rows' routing (-1) so they skip the
+            # expert GEMMs, as the NVLS dispatcher does.
+            if self.__class__._real_token_count_tensor is not None:
+                mask_routing_padding(
+                    self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+                )
             with torch.no_grad():
                 self.routing_map = gather_from_sequence_parallel_region(
                     self.routing_map, group=self.tp_ep_group

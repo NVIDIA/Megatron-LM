@@ -996,14 +996,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
 
-        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
-        # so it can mask out CUDA-graph padding tokens during routing. The
-        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
-        # dispatcher requires equal token counts across ranks already.
-        if self._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
-
         # Print info.
         pool_size = self.kv_block_allocator.pool_size
         usable_blocks = pool_size - 1
@@ -1638,6 +1630,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # only one is active per step, so sharing storage is safe.
         self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
         self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+
+        # Bind the GPU real-token-count tensor onto the EP dispatcher class so it can
+        # mask out CUDA-graph padding tokens during routing. Like the bindings above it
+        # is redone on every allocation: a RECOMPUTE resume replaces gpu_view, and the
+        # CUDA graphs recaptured afterwards must read the new tensor.
+        if self._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
+        elif self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Deferred Mamba GPU operations.  Populated by add_request() /
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().

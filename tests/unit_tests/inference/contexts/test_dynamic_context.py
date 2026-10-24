@@ -698,6 +698,37 @@ class TestDynamicContext:
         )
 
     @pytest.mark.internal
+    def test_recompute_resume_rebinds_dispatcher_real_token_count(self):
+        """A RECOMPUTE suspend/resume replaces gpu_view; the EP dispatcher's padding mask must
+        follow it, or CUDA graphs recaptured after the resume read a tensor nobody updates."""
+        from megatron.core.inference.config import KVCacheManagementMode
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.05,
+            block_size_tokens=256,
+            max_tokens=None,
+            max_requests=16,
+        )
+        # The nccl EP dispatcher needs EP > 1; only its flag matters for the binding.
+        dynamic_context._nccl_ep_dispatcher = True
+        dynamic_context.kv_cache_management_mode = KVCacheManagementMode.RECOMPUTE
+        old_tensor = dynamic_context.gpu_view.real_token_count
+        try:
+            dynamic_context.deallocate_inference_state_buffers()
+            dynamic_context.reinitialize_inference_state_buffers()
+            new_tensor = dynamic_context.gpu_view.real_token_count
+            assert new_tensor.data_ptr() != old_tensor.data_ptr()
+            assert NCCLAllGatherDispatcher._real_token_count_tensor is new_tensor
+        finally:
+            NCCLAllGatherDispatcher.set_real_token_count_tensor(None)
+
+    @pytest.mark.internal
     @rounder_override(4)
     def test_real_token_count_for_padding_zeroing(self):
         """The count read by `zero_padding_tokens` is 0 on graph capture, else the active count."""

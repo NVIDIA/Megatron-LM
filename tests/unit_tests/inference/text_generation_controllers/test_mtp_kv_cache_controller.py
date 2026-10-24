@@ -117,6 +117,7 @@ def _make_context(
         request_to_kv_block_ids=request_to_kv_block_ids,
         gpu_view=gpu_view,
         _nvls_dispatcher=None,
+        _nccl_ep_dispatcher=None,
         inference_cuda_graph_scope=InferenceCudaGraphScope.none,
         mtp_decoder_hidden_states=None,
         setup_prefill_calls=[],
@@ -1528,6 +1529,32 @@ class TestExpertParallelForwardParity:
         # First the commit pass's packed token total (2 accepted + 4 prompt), then the draft
         # loop's request count.
         assert counts == [6, 2]
+
+    def test_nccl_routing_mask_is_repointed_like_nvls(self):
+        """The nccl CUDA-graph path masks padding with the same real-token-count tensor, so
+        the MTP forwards repoint it exactly as for NVLS; the NVLS dispatcher is not touched."""
+        controller, model, context, _ = _build_step(
+            num_decode_requests=1, prefill=((5, 0, 200),), accepted=(2,), num_mtp_depths=2
+        )
+        context._nccl_ep_dispatcher = object()
+
+        with (
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
+                "NCCLAllGatherDispatcher"
+            ) as nccl,
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
+                "NVLSAllGatherVDispatcher"
+            ) as nvls,
+        ):
+            controller._compute_serial_mtp_and_sample(
+                base_position=torch.tensor([10, 5], device=DEVICE)
+            )
+
+        counts = [call.args[0] for call in nccl.modify_real_token_count_for_mtp.call_args_list]
+        assert counts == [6, 2]
+        nvls.modify_real_token_count_for_mtp.assert_not_called()
 
 
 class TestMtpKvCacheCombinations:
