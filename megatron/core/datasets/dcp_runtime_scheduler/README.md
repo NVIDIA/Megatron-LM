@@ -44,7 +44,9 @@ predictors. Caller-provided `module:factory` model, solver and historical powers
 baseline hooks remain supported. `--dynamic-cp-runtime-force-powers` bypasses
 the arbitrary search using the configured validated powers-only baseline.
 
-An optional generic hot-switch solver is selected independently of the model:
+With `dynamic_cp_runtime_model` configured, an optional generic hot-switch solver
+is selected independently of the model. Solver/options flags alone do not enable
+the runtime path:
 
 ```bash
 --dynamic-cp-runtime-solver dynamic_usp \

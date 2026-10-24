@@ -4798,7 +4798,8 @@ def train_step(
                     pg_collection=pg_collection,
                     prefetch_next=(
                         iteration is not None
-                        and iteration + 1 < args.train_iters
+                        and cfg.train.train_iters is not None
+                        and iteration + 1 < cfg.train.train_iters
                         and args.dataloader_type != 'external'
                         and (args.num_workers > 0 or args.use_varlen_dataset)
                     ),
