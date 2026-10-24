@@ -445,6 +445,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         hybrid_context_parallel=args.hybrid_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
+        varlen_pretokenized_dataset=args.varlen_pretokenized_dataset,
         varlen_sbhd_validation=args.varlen_sbhd_validation,
     )
 

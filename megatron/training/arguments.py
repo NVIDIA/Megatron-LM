@@ -1532,11 +1532,37 @@ def validate_args(args, defaults={}):
     # because they are mutually-exclusive top-level dataset selectors that both
     # drive the packed-sequence (THD) path. These stay in validate_args: the
     # selectors are CLI-level args, not core config fields.
+    if args.varlen_pretokenized_dataset:
+        assert (
+            args.use_varlen_dataset
+        ), "--varlen-pretokenized-dataset requires --use-varlen-dataset."
     if args.use_varlen_dataset:
         assert not args.sft, (
             "--use-varlen-dataset and --sft are mutually exclusive; both "
             "select the packed-sequence dataset family. Pick one."
         )
+        if args.varlen_pretokenized_dataset:
+            assert not args.mock_data, (
+                "--varlen-pretokenized-dataset reads real IndexedDataset files and "
+                "cannot be combined with --mock-data."
+            )
+            assert (
+                args.data_path is not None
+                or args.data_args_path is not None
+                or any(
+                    path is not None
+                    for path in (
+                        args.train_data_path,
+                        args.valid_data_path,
+                        args.test_data_path,
+                    )
+                )
+                or args.per_split_data_args_path is not None
+            ), (
+                "--varlen-pretokenized-dataset requires a data path; pass the tokens "
+                "IndexedDataset prefix via --data-path (the mask sidecar is read from "
+                "<prefix>.mask)."
+            )
         if args.varlen_sbhd_validation:
             assert args.sequence_packing_scheduler is None, (
                 "--varlen-sbhd-validation does not use a sequence packing "
@@ -3727,6 +3753,16 @@ def _add_varlen_dataset_args(parser):
                        'scheduler when none is given: dp_balanced. '
                        'Combine with --mock-data for a synthetic lognormal sequence-length '
                        'distribution; see --varlen-mock-dataset-config-json.')
+    group.add_argument(
+        '--varlen-pretokenized-dataset',
+        action="store_true",
+        help='Read pre-tokenized tokens and an assistant-only loss mask from '
+        'IndexedDataset .bin/.idx files instead of tokenizing --data-path at '
+        'load time. --data-path is the tokens prefix and the mask sidecar must '
+        'be at <prefix>.mask.bin/.idx; build both with '
+        'tools/preprocess_varlen_sft.py. Requires --use-varlen-dataset and is '
+        'incompatible with --mock-data.',
+    )
     group.add_argument('--varlen-sbhd-validation', action="store_true",
                        help='Reference SBHD mode for THD numerical verification. When set, '
                        'VarlenDataset emits SBHD-style samples right-padded to '

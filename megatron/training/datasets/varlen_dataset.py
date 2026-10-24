@@ -56,6 +56,7 @@ import numpy as np
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import LowLevelDataset
 from megatron.core.datasets.utils import Split
 from megatron.training.datasets.sft_dataset import (
@@ -308,6 +309,56 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         return self._converter(self.dataset[idx])
 
 
+class VarlenPretokenizedLowLevelDataset:
+    """Low-level reader for pre-tokenized SFT samples and assistant loss masks.
+
+    ``dataset_path`` is the tokens IndexedDataset prefix. The mask sidecar must
+    live at ``<dataset_path>.mask``. Both streams must contain one sequence per
+    sample with identical lengths, and every mask value must be 0 or 1.
+
+    ``__getitem__`` returns ``(tokens, loss_mask)``. Tokens are returned
+    verbatim, so the preprocessing step must add the EOD token and write an
+    assistant mask aligned with the token positions.
+    """
+
+    MASK_SUFFIX = ".mask"
+
+    def __init__(self, dataset_path: str) -> None:
+        self._tokens = IndexedDataset(dataset_path)
+        mask_path = dataset_path + self.MASK_SUFFIX
+        if not IndexedDataset.exists(mask_path):
+            raise ValueError(
+                f"Missing assistant loss mask sidecar at {mask_path}.bin/.idx; "
+                "build it with tools/preprocess_varlen_sft.py."
+            )
+        self._loss_mask = IndexedDataset(mask_path)
+
+        if len(self._tokens) != len(self._loss_mask):
+            raise ValueError(
+                "Tokens and assistant loss mask contain a different number of "
+                f"samples ({len(self._tokens)} vs {len(self._loss_mask)})."
+            )
+        if not np.array_equal(self._tokens.sequence_lengths, self._loss_mask.sequence_lengths):
+            raise ValueError(
+                "Tokens and assistant loss mask sequence lengths do not match; "
+                "both streams must be written from the same conversations."
+            )
+
+    def __len__(self) -> int:
+        return len(self._tokens)
+
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        tokens = self._tokens[idx]
+        loss_mask = self._loss_mask[idx]
+        if len(tokens) != len(loss_mask):
+            raise ValueError(
+                f"Sample {idx} has {len(tokens)} tokens but {len(loss_mask)} mask values."
+            )
+        if not np.all((loss_mask == 0) | (loss_mask == 1)):
+            raise ValueError(f"Sample {idx} assistant loss mask must contain only 0/1 values.")
+        return tokens, loss_mask.astype(np.uint8, copy=False)
+
+
 class VarlenDataset(SFTDataset):
     """Variable-length single-sample SFT dataset for the packed-sequence path.
 
@@ -347,6 +398,8 @@ class VarlenDataset(SFTDataset):
     def build_low_level_dataset(
         dataset_path: str, config: GPTDatasetConfig
     ) -> LowLevelDataset:
+        if config.varlen_pretokenized_dataset:
+            return VarlenPretokenizedLowLevelDataset(dataset_path)
         return VarlenLowLevelDataset(dataset_path)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -362,7 +415,8 @@ class VarlenDataset(SFTDataset):
             "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
         )
 
-        # 1. Pull a single item from the low-level dataset. For SFT schemas
+        # 1. Pull a single item from the low-level dataset. Pre-tokenized
+        #    samples are (tokens, assistant_mask) tuples. For SFT schemas
         #    (alpaca / sharegpt / openai-messages) this is a messages list;
         #    for the pretrain-text schema it is a raw string.
         item = self.dataset[int(self.indices[idx % len(self.indices)])]
@@ -370,15 +424,31 @@ class VarlenDataset(SFTDataset):
         assert not self.config.reset_position_ids
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
 
-        # 2. Tokenize. SFT schemas go through tokenize_conversation (chat
-        #    template + role-aware target masking); pretrain-text bypasses
-        #    chat templating and uses the plain ``tokenize`` interface,
-        #    treating every token as a target (no prompt masking).
-        if isinstance(item, str):
+        pretokenized = isinstance(item, tuple)
+        mask_list: Optional[List[int]] = None
+        if pretokenized:
+            token_array, mask_array = item
+            tokens_list = token_array.tolist()
+            mask_list = mask_array.astype(np.uint8).tolist()
+            if len(tokens_list) != len(mask_list):
+                raise ValueError(
+                    f"Pre-tokenized sample has {len(tokens_list)} tokens but "
+                    f"{len(mask_list)} assistant mask values."
+                )
+            if len(tokens_list) < 2:
+                raise ValueError(
+                    "Pre-tokenized samples need at least two tokens to form a "
+                    "next-token prediction pair."
+                )
+            targets_list = list(tokens_list)
+        elif isinstance(item, str):
+            # Pretrain-text bypasses chat templating and treats every token as
+            # a target (no prompt masking).
             ids = list(tokenizer.tokenize(item))
             tokens_list = ids
             targets_list = list(ids)
         else:
+            # SFT schemas use the chat template and role-aware target masking.
             tokens, targets = tokenizer.tokenize_conversation(
                 item, return_target=True, add_generation_prompt=False
             )
@@ -395,17 +465,22 @@ class VarlenDataset(SFTDataset):
             targets_list = [eod, eod]
 
         # 3. Right-truncate to ``sequence_length + 1`` (we drop the last token
-        #    after the input/label shift below). Keep an EOD at the end so a
+        #    after the input/label shift below). Pretokenized samples are kept
+        #    verbatim; for the tokenized paths keep an EOD at the end so a
         #    truncated assistant turn still has a valid stop token.
         if len(tokens_list) > max_len + 1:
             tokens_list = tokens_list[: max_len + 1]
             targets_list = targets_list[: max_len + 1]
-            if tokens_list[-1] != eod:
+            if pretokenized:
+                assert mask_list is not None
+                mask_list = mask_list[: max_len + 1]
+            elif tokens_list[-1] != eod:
                 tokens_list[-1] = eod
                 targets_list[-1] = eod
 
-        # 4. Ensure EOD is the last token (unconditional for short samples).
-        if tokens_list[-1] != eod:
+        # 4. Ensure EOD is the last token for tokenized paths. The
+        #    preprocessing script is responsible for pretokenized EOD tokens.
+        if not pretokenized and tokens_list[-1] != eod:
             tokens_list.append(eod)
             targets_list.append(eod)
 
@@ -422,9 +497,16 @@ class VarlenDataset(SFTDataset):
             assert len(tokens_list) == max_len + 1
             input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
             labels = torch.tensor(targets_list[1:], dtype=torch.int64)
-            loss_mask = torch.ones(max_len, dtype=torch.float32)
-            loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
-            loss_mask[labels == IGNORE_INDEX] = 0.0
+            if pretokenized:
+                assert mask_list is not None
+                loss_mask = torch.zeros(max_len, dtype=torch.float32)
+                loss_mask[:valid_len] = torch.tensor(
+                    mask_list[1 : valid_len + 1], dtype=torch.float32
+                )
+            else:
+                loss_mask = torch.ones(max_len, dtype=torch.float32)
+                loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
+                loss_mask[labels == IGNORE_INDEX] = 0.0
             return {
                 'tokens': input_ids,
                 'labels': labels,
@@ -447,13 +529,19 @@ class VarlenDataset(SFTDataset):
             targets_list.extend([pad] * pad_len)
         padded_seq_len = len(tokens_list) - 1
 
-        # 6. Apply the next-token shift.
+        # 6. Apply the next-token shift. The pretokenized mask is shifted the
+        #    same way, so its positions always describe the target token.
         input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
         labels = torch.tensor(targets_list[1:], dtype=torch.int64)
         position_ids = torch.arange(padded_seq_len, dtype=torch.int64)
-        loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
-        loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
-        loss_mask[labels == IGNORE_INDEX] = 0.0
+        if pretokenized:
+            assert mask_list is not None
+            loss_mask = torch.zeros(padded_seq_len, dtype=torch.float32)
+            loss_mask[:valid_len] = torch.tensor(mask_list[1 : valid_len + 1], dtype=torch.float32)
+        else:
+            loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
+            loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
+            loss_mask[labels == IGNORE_INDEX] = 0.0
 
         return {
             'tokens': input_ids,
