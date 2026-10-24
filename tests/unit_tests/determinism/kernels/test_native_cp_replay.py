@@ -182,7 +182,9 @@ def test_native_attention_runtime_cp_replays(native_parent, monkeypatch):
             dynamic_context_parallel=True,
             max_seqlen_per_dp_cp_rank=1024,
         )
-        core = TEDotProductAttention(config, 1, AttnMaskType.causal, pg_collection=pg).cuda()
+        core = TEDotProductAttention(
+            config, 1, AttnMaskType.causal, attention_type="self", pg_collection=pg
+        ).cuda()
         original_group, original_ranks = core.cp_group, core.cp_global_ranks
         lengths = (960, 1920)  # Both divisible by 2*CP3 and 2*CP5.
         cu = torch.tensor([0, lengths[0], sum(lengths)], device="cuda", dtype=torch.int32)
