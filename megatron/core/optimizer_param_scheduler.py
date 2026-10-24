@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -383,12 +384,6 @@ class OptimizerParamScheduler:
             self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
         )
 
-        if 'num_iters' in state_dict:
-            num_steps = state_dict['num_iters']
-        else:
-            num_steps = state_dict['num_steps']
-        self.step(increment=num_steps)
-
         if 'start_wd' in state_dict:
             self.start_wd = self._check_and_set(
                 self.start_wd, state_dict['start_wd'], "start weight decay"
@@ -402,3 +397,11 @@ class OptimizerParamScheduler:
             self.wd_incr_style = self._check_and_set(
                 self.wd_incr_style, state_dict['wd_incr_style'], "weight decay incr style"
             )
+
+        if 'num_iters' in state_dict:
+            num_steps = state_dict['num_iters']
+        else:
+            num_steps = state_dict['num_steps']
+        # Write the loaded schedule into the param groups only after every value above has
+        # been restored, so lr and weight_decay both follow the checkpoint from the first step.
+        self.step(increment=num_steps)
