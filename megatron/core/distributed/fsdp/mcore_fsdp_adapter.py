@@ -721,23 +721,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         with construction_context:
             # Pre-order: collect only the modules to shard.
             units_to_shard = [module]
-            shortcut_modules = []
-            for submodule in module.modules():
-                if isinstance(submodule, ShortcutMoEBlock):
-                    shortcut_modules.extend(submodule.modules())
+
+            def collect_units(submodule, inside_shortcut=False):
                 if expert_dp_mesh is not None and isinstance(submodule, MoELayer):
                     if submodule.experts not in units_to_shard:
                         units_to_shard.append(submodule.experts)
-                # These containers run through helpers inside a shortcut block.
-                if submodule in shortcut_modules and isinstance(
-                    submodule, (TransformerLayer, MambaLayer, MoELayer)
-                ):
-                    continue
+                # Shortcut blocks call these containers through helpers.
                 if (
                     isinstance(submodule, tuple(fsdp_unit_modules))
+                    and not (
+                        inside_shortcut
+                        and isinstance(submodule, (TransformerLayer, MambaLayer, MoELayer))
+                    )
                     and submodule not in units_to_shard
                 ):
                     units_to_shard.append(submodule)
+
+                inside_shortcut = inside_shortcut or isinstance(submodule, ShortcutMoEBlock)
+                for child in submodule.children():
+                    collect_units(child, inside_shortcut)
+
+            collect_units(module)
 
             # Post-order: children claim their parameters before their parents.
             def shard_selected_units(submodule, parent=None):
