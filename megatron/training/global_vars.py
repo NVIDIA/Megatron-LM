@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron global variables."""
 
@@ -199,6 +199,7 @@ def initialize_runtime_services(
     if build_tokenizer:
         _build_tokenizer(args)
     resolve_tokenizer_vocab_size(cfg, getattr(args, "padded_vocab_size", None))
+    _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -322,6 +323,27 @@ def rebuild_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
     return _build_tokenizer(args)
+
+
+def _bind_dataset_tokenizer(cfg) -> None:
+    """Bind the run's tokenizer to ``cfg.data.dataset`` (Megatron Core's ``validate()`` runs then).
+
+    Only GPT entry points carry a dataset there, and nothing happens without a tokenizer
+    (``build_tokenizer=False``: the provider then reports the unbound config). The container must
+    be finalized first, as ``initialize_megatron`` and ``set_global_variables`` do (the fields other
+    sections own are written then). ``DataConfig.bind_tokenizer`` decides the rest: a config bound
+    earlier to this tokenizer is left as is, one bound to another tokenizer is an error.
+    """
+    data = getattr(cfg, "data", None)
+    if getattr(data, "dataset", None) is None or _GLOBAL_TOKENIZER is None:
+        return
+    if not getattr(cfg, "_finalized", False):
+        raise RuntimeError(
+            "cfg.data.dataset cannot bind the tokenizer before the container is finalized: call "
+            "cfg.finalize() before initialize_runtime_services(), as initialize_megatron() and "
+            "set_global_variables() do."
+        )
+    data.bind_tokenizer(_GLOBAL_TOKENIZER)
 
 
 def _set_tensorboard_writer(args):

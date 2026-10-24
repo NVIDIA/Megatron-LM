@@ -22,6 +22,7 @@ from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
 )
+from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -1583,9 +1584,11 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
     args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
     config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
     vp_stages = [None] if vp_size is None else range(vp_size)
+    # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
+    # the arguments and the transformer config at call time from these two modules.
     with (
-        patch.object(script, "get_args", return_value=args),
-        patch.object(script, "core_transformer_config_from_args", return_value=config),
+        patch.object(global_vars, "get_args", return_value=args),
+        patch.object(arguments, "core_transformer_config_from_args", return_value=config),
     ):
         for vp_stage in vp_stages:
             built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
