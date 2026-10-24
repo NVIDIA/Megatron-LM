@@ -103,6 +103,13 @@ K = "tests/unit_tests/determinism/kernels/"
 C = "tests/unit_tests/determinism/correctness/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
+    KernelEntry(
+        name="csa_output_rope_reconstruction",
+        sources=("megatron/core/ops/attention/csa/output_rope.py",),
+        tests=(K + "test_csa_output_rope.py",),
+        kind="triton",
+        notes="Alias-safe output/gradient reconstruction, SBHD B>1 and THD/CP positions.",
+    ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
         name="fused_bias_swiglu",
