@@ -410,10 +410,13 @@ class MegatronLiteRuntime(RuntimeBase):
         )
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+        from megatron.lite.primitive.ckpt.dcp import sync_params_before_read
+
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
+        sync_params_before_read(model_chunks)
 
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)

@@ -113,6 +113,13 @@ register_model(
     impls={"lite": "megatron.lite.model.deepseek_v4.lite.protocol"},
 )
 
+register_model(
+    "minimax_m3",
+    package="megatron.lite.model.minimax_m3",
+    hf_model_types=["minimax_m3_vl", "minimax_m3_vl_text", "minimax_m3"],
+    impls={"lite": "megatron.lite.model.minimax_m3.lite.protocol"},
+)
+
 
 # ---------------------------------------------------------------------------
 # Lookup functions

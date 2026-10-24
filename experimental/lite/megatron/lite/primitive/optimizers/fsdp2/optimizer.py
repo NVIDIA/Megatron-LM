@@ -365,6 +365,7 @@ def build_fsdp2_training_optimizer(
     use_fp32_shards: bool | None = None,
     use_fp32_master: bool | None = None,
     adamw_foreach: bool | str = _DEFAULT_ADAMW_FOREACH,
+    cast_forward_inputs: bool = True,
 ) -> FSDP2Optimizer:
     """Wrap model chunks with FSDP2 and build the matching AdamW adapter."""
 
@@ -417,6 +418,7 @@ def build_fsdp2_training_optimizer(
         backward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=backward_prefetch_depth),
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
+        cast_forward_inputs=cast_forward_inputs,
     )
     if effective_use_fp32_shards:
         model_param_dtypes = _collect_model_param_dtypes(model_chunks)
