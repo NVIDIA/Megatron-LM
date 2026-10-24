@@ -127,6 +127,14 @@ class TransformerConfig(ModelParallelConfig):
     the number of local sequence rows per tensor-parallel rank. ``None`` disables chunking.
     """
 
+    mtp_loss_skip_masked_tokens: bool = False
+    """Skip MTP vocabulary projection and cross entropy for tokens masked out of the loss.
+
+    This compacts the hidden states before the LM head and scatters the selected losses back to
+    the original token layout. It can be combined with ``mtp_loss_chunk_size`` to bound both the
+    number of projected tokens and the peak vocabulary-sized activation.
+    """
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.

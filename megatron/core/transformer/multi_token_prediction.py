@@ -1158,7 +1158,8 @@ def process_mtp_loss(
         one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
         """
         chunk_size = config.mtp_loss_chunk_size
-        if chunk_size is None:
+        skip_masked_tokens = config.mtp_loss_skip_masked_tokens
+        if chunk_size is None and not skip_masked_tokens:
             mtp_logits, _ = output_layer(
                 head_hidden, weight=output_weight, runtime_gather_output=False
             )
@@ -1216,12 +1217,30 @@ def process_mtp_loss(
         def _checkpoint_contexts():
             return nullcontext(), _recompute_context()
 
+        @contextmanager
+        def _disable_output_sequence_parallel():
+            sequence_parallel = getattr(output_layer, "sequence_parallel", False)
+            if sequence_parallel:
+                output_layer.sequence_parallel = False
+            try:
+                yield
+            finally:
+                if sequence_parallel:
+                    output_layer.sequence_parallel = True
+
         def _project_and_compute_loss(
-            chunk_hidden: Tensor, chunk_labels: Tensor, chunk_number: int
+            chunk_hidden: Tensor,
+            chunk_labels: Tensor,
+            chunk_number: int,
+            disable_sequence_parallel: bool = False,
         ) -> tuple[Tensor, Tensor]:
-            chunk_logits, _ = output_layer(
-                chunk_hidden, weight=output_weight, runtime_gather_output=False
+            output_context = (
+                _disable_output_sequence_parallel() if disable_sequence_parallel else nullcontext()
             )
+            with output_context:
+                chunk_logits, _ = output_layer(
+                    chunk_hidden, weight=output_weight, runtime_gather_output=False
+                )
             if scale_logits_fn is not None:
                 chunk_logits = scale_logits_fn(chunk_logits)
             if is_observing_tensor("mtp_logits") and not recomputing:
@@ -1249,6 +1268,79 @@ def process_mtp_loss(
                 else:
                     chunk_preds = torch.empty(0, dtype=torch.long, device=chunk_logits.device)
             return chunk_loss, chunk_preds
+
+        if skip_masked_tokens:
+            if config.sequence_parallel:
+                head_hidden = tensor_parallel.gather_from_sequence_parallel_region(
+                    head_hidden, tensor_parallel_output_grad=False, group=tp_group
+                )
+            flat_hidden = head_hidden.transpose(0, 1).reshape(-1, head_hidden.size(-1))
+            flat_labels = head_labels.reshape(-1)
+            flat_loss_mask = layer_loss_mask.reshape(-1)
+            selected = flat_loss_mask.bool()
+            selected_indices = selected.nonzero(as_tuple=False).squeeze(-1)
+            selected_hidden = flat_hidden[selected]
+            selected_labels = flat_labels[selected]
+            selected_loss_mask = flat_loss_mask[selected]
+
+            if selected_hidden.size(0) == 0:
+                projection_weight = (
+                    output_weight if output_weight is not None else output_layer.weight
+                )
+                anchor = head_hidden.reshape(-1)[:1].sum() * 0
+                anchor = anchor + projection_weight.reshape(-1)[:1].sum() * 0
+                head_loss = torch.zeros_like(layer_loss_mask, dtype=torch.float32) + anchor
+                return (
+                    head_loss,
+                    (correct if is_training else None),
+                    (total if is_training else None),
+                )
+
+            compact_chunk_size = chunk_size or selected_hidden.size(0)
+            compact_loss_chunks = []
+            for chunk_number, start in enumerate(
+                range(0, selected_hidden.size(0), compact_chunk_size)
+            ):
+                end = min(start + compact_chunk_size, selected_hidden.size(0))
+
+                def compute_compact_chunk(hidden, labels, current_chunk_number=chunk_number):
+                    return _project_and_compute_loss(
+                        hidden.unsqueeze(1),
+                        labels.unsqueeze(0),
+                        current_chunk_number,
+                        disable_sequence_parallel=True,
+                    )
+
+                if torch.is_grad_enabled():
+                    chunk_loss, chunk_preds = checkpoint(
+                        compute_compact_chunk,
+                        selected_hidden[start:end],
+                        selected_labels[start:end],
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                        context_fn=_checkpoint_contexts,
+                    )
+                else:
+                    chunk_loss, chunk_preds = compute_compact_chunk(
+                        selected_hidden[start:end], selected_labels[start:end]
+                    )
+                compact_loss_chunks.append(chunk_loss.reshape(-1) * selected_loss_mask[start:end])
+                if is_training:
+                    with torch.no_grad():
+                        correct += (
+                            (chunk_preds.reshape(-1) == selected_labels[start:end]).sum().float()
+                        )
+                        total += end - start
+
+            compact_loss = torch.cat(compact_loss_chunks)
+            head_loss = torch.zeros_like(flat_loss_mask, dtype=compact_loss.dtype).scatter(
+                0, selected_indices, compact_loss
+            )
+            return (
+                head_loss.reshape_as(layer_loss_mask),
+                (correct if is_training else None),
+                (total if is_training else None),
+            )
 
         for chunk_number, start in enumerate(range(0, local_sequence_length, chunk_size)):
             end = min(start + chunk_size, local_sequence_length)
