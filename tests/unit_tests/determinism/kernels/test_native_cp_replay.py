@@ -137,11 +137,11 @@ def test_native_zigzag_token_halos_replay(native_parent, sizes, transport_kind):
 
 def test_native_attention_runtime_cp_replays(native_parent, monkeypatch):
     """Real TE fused attention and Q/K/V backward survive CP1/3/5 topology switches."""
+    Utils.initialize_model_parallel()
     monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
     monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
     monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-    Utils.initialize_model_parallel()
     try:
         pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         pg.dp_cp = native_parent
