@@ -1017,9 +1017,7 @@ class TestMoEModules:
     )
     @pytest.mark.parametrize("num_tokens", [2, 512])
     def test_inference_topk_router_replays(self, num_experts, topk, scaling_factor, num_tokens):
-        """Inference router replay through small top-k fusion and parallel selection."""
-        from megatron.core.inference.moe.sigmoid_topk import is_topk_scores_supported
-
+        """Inference router replay through the fused sigmoid top-k kernel."""
         self._init()
         seeded()
         config = _moe_config(
@@ -1030,6 +1028,7 @@ class TestMoEModules:
             moe_router_score_function="sigmoid",
             moe_router_enable_expert_bias=True,
             moe_router_topk_scaling_factor=scaling_factor,
+            inference_moe_triton_router=True,
         )
         router = InferenceTopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
@@ -1039,9 +1038,7 @@ class TestMoEModules:
             router.expert_bias.uniform_(-0.05, 0.05)
         hidden = torch.randn(num_tokens, 1, 1024, device="cuda", dtype=torch.bfloat16)
         with torch.inference_mode():
-            assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None) == (
-                topk < 8 or is_topk_scores_supported(num_experts, topk)
-            )
+            assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None)
 
         def route(h):
             with InferenceMode.active(), torch.inference_mode():
