@@ -2,6 +2,8 @@
 
 """Replay native logical CP reductions and MTP halos without subgroup communicators."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -13,7 +15,11 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.multi_token_prediction import bind_native_mtp_cp_group, roll_tensor
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionLayer,
+    bind_native_mtp_cp_group,
+    roll_tensor,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, bytes_equal
 from tests.unit_tests.test_utilities import Utils, _restore_torch_settings, _snapshot_torch_settings
@@ -42,6 +48,54 @@ def test_cudnn_fixture_restoration_respects_frozen_settings(monkeypatch, changed
     names = ("deterministic", "benchmark", "allow_tf32")
     assert tuple(getattr(state, name) for name in names) == snapshot["cudnn"]
     assert writes == (list(names) if changed else [])
+
+
+@pytest.mark.parametrize("replicated", [False, True])
+def test_mtp_precomputed_sp_mask_replays(replicated):
+    """Precomputed SP masks are not sharded twice; full masks are sharded exactly once."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        tp = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]).tp
+        full_mask = (torch.arange(16, device="cuda") % 3 == 0).repeat(2, 1)
+        local_mask = full_mask.chunk(tp.size(), -1)[tp.rank()].contiguous()
+
+        def transformer(hidden_states, decoder_input, padding_mask, **kwargs):
+            assert bytes_equal(padding_mask, local_mask)
+            return (hidden_states + decoder_input).masked_fill(padding_mask.T.unsqueeze(-1), 0)
+
+        layer = SimpleNamespace(
+            config=SimpleNamespace(sequence_parallel=True, recompute_granularity=None),
+            tp_group=tp,
+            training=True,
+            mtp_layer_pattern=None,
+            _get_precomputed_embeddings=lambda **kwargs: (
+                kwargs["decoder_input"],
+                kwargs["hidden_states"],
+            ),
+            _proj_and_transformer_layer=transformer,
+        )
+        inputs = {
+            "hidden_states": torch.randn(8, 2, 16, device="cuda", requires_grad=True),
+            "decoder_input": torch.randn(8, 2, 16, device="cuda", requires_grad=True),
+            "padding_mask": full_mask if replicated else local_mask,
+        }
+        outputs, gradients = assert_replays_bit_exact(
+            lambda **kwargs: MultiTokenPredictionLayer.forward(
+                layer, None, None, attention_mask=None, **kwargs
+            )[0],
+            inputs,
+            contention=True,
+            what="precomputed MTP SP mask dispatch",
+        )
+        expected = (inputs["hidden_states"] + inputs["decoder_input"]).masked_fill(
+            local_mask.T.unsqueeze(-1), 0
+        )
+        assert bytes_equal(outputs["out"], expected)
+        expected_grad = torch.ones_like(expected).masked_fill(local_mask.T.unsqueeze(-1), 0)
+        assert set(gradients) == {"in.hidden_states", "in.decoder_input"}
+        assert all(bytes_equal(gradient, expected_grad) for gradient in gradients.values())
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.fixture

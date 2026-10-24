@@ -113,7 +113,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch-op",
         notes="CP1 packed roll forward/backward with repeated static metadata boundaries "
         "and physical padding not represented by logical documents; native CP3/CP5 boundary "
-        "exchange and differentiable contiguous rolls use one parent arena.",
+        "exchange and differentiable contiguous rolls use one parent arena. Precomputed MTP "
+        "mask dispatch replays both full and already sequence-sharded metadata.",
     ),
     KernelEntry(
         name="dev_csa_packed_compaction_and_routing",
