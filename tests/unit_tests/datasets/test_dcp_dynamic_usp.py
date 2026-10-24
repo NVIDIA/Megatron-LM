@@ -56,7 +56,7 @@ def test_equal_weights_preserve_input_order_not_sorted_sample_ids():
     assert _layout(rows) == [[(0, 1, [9]), (1, 1, [2]), (2, 1, [7]), (3, 1, [1])]]
 
 
-@pytest.mark.parametrize('world', [1, 3, 8, 12, 32])
+@pytest.mark.parametrize("world", [1, 3, 8, 12, 32])
 def test_runtime_is_independent_of_attention_or_communication_attributes(world):
     geometry = _geometry(world)
     model = QuadraticCostModel(geometry)
@@ -71,7 +71,7 @@ def test_runtime_is_independent_of_attention_or_communication_attributes(world):
     plan = planner.plan_padded(padded, logical_lengths=logical)
     validate_rows(plan.rows, padded, geometry, 1)
     assert all(group[1] & (group[1] - 1) == 0 for row in plan.groups for group in row)
-    assert planner.last_statistics['cost_length_source'] == 'after_lm_logical'
+    assert planner.last_statistics["cost_length_source"] == "after_lm_logical"
 
 
 def test_physical_padding_and_group_sequence_caps_are_enforced():
@@ -100,15 +100,15 @@ def test_invalid_inputs_and_incumbents_fail_before_execution():
     for invalid in ({0: 17}, [(0, 16), (0, 16)], {0: 0}, {-1: 16}):
         with pytest.raises(ValueError):
             planner.plan_padded(invalid)
-    with pytest.raises(RuntimeScheduleError, match='lost or duplicated'):
+    with pytest.raises(RuntimeScheduleError, match="lost or duplicated"):
         planner.plan_padded({0: 16, 1: 16}, incumbent_rows=[[[0]] * 8])
-    with pytest.raises(RuntimeScheduleError, match='exceeds every allowed'):
+    with pytest.raises(RuntimeScheduleError, match="exceeds every allowed"):
         planner.plan_padded({0: 8208})
 
 
 @pytest.mark.parametrize(
-    'options',
-    [dict(candidate_count=0), dict(outlier_threshold=float('nan')), dict(column_offset=1)],
+    "options",
+    [dict(candidate_count=0), dict(outlier_threshold=float("nan")), dict(column_offset=1)],
 )
 def test_invalid_options_are_not_silently_ignored(options):
     with pytest.raises(ValueError):
@@ -125,9 +125,9 @@ def test_builtin_worker_reuses_one_cpu_process_and_independent_model_interface()
     config = SimpleNamespace(
         max_seqlen_per_dp_cp_rank=1024,
         min_dynamic_context_parallel_size=1,
-        dynamic_cp_runtime_model='calibrated_attention',
+        dynamic_cp_runtime_model="calibrated_attention",
         dynamic_cp_runtime_model_options='{"allow_provisional":true}',
-        dynamic_cp_runtime_solver='dynamic_usp',
+        dynamic_cp_runtime_solver="dynamic_usp",
         dynamic_cp_runtime_solver_options='{"candidate_count":2}',
     )
     worker = prefetch._CpuPlanner(prefetch.runtime_spec(config, 8))
@@ -136,11 +136,11 @@ def test_builtin_worker_reuses_one_cpu_process_and_independent_model_interface()
         second = worker.solve([2300, 1400], [2304, 1408], [[[0, 1]] * 8])
     finally:
         worker.close()
-    assert first['rows'] == second['rows']
-    assert first['worker_pid'] == second['worker_pid']
+    assert first["rows"] == second["rows"]
+    assert first["worker_pid"] == second["worker_pid"]
     for result in (first, second):
-        assert not result['worker_cuda_initialized']
-        assert not result['worker_distributed_initialized']
-        assert not result['external_scheduler_imported']
-        assert 'DynamicUSPRuntimePlanner.plan_padded' in result['solver_entry']
-        assert result['planner_options']['candidate_count'] == 2
+        assert not result["worker_cuda_initialized"]
+        assert not result["worker_distributed_initialized"]
+        assert not result["external_scheduler_imported"]
+        assert "DynamicUSPRuntimePlanner.plan_padded" in result["solver_entry"]
+        assert result["planner_options"]["candidate_count"] == 2

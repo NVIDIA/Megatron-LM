@@ -48,10 +48,10 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
         values = (lengths[sample_id],)
         size = next((s for s in self.scheduler.sizes if self.costs.fits(values, s)), None)
         if size is None:
-            raise InfeasibleLayout(f'sample {sample_id} exceeds every allowed group capacity')
+            raise InfeasibleLayout(f"sample {sample_id} exceeds every allowed group capacity")
         value = self.costs.pack(values, size, 0)
         if value is None:
-            raise RuntimeScheduleError(f'cost model rejected scheduling sample {sample_id}')
+            raise RuntimeScheduleError(f"cost model rejected scheduling sample {sample_id}")
         forward, backward, program = value
         if self.timeline.program is None:
             duration = self.timeline.layer_count * (
@@ -61,13 +61,13 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
             )
         else:
             duration = sum(
-                program[payload] if kind == 'cp' else payload
+                program[payload] if kind == "cp" else payload
                 for phase in self.timeline.program
                 for kind, payload in phase
             )
         work = size * duration
         if not math.isfinite(work) or work <= 0:
-            raise ValueError('cost model must produce finite positive scheduling work')
+            raise ValueError("cost model must produce finite positive scheduling work")
         return work
 
     def plan(self, lengths, *, incumbent_rounds=None) -> RuntimePlan:
@@ -77,7 +77,7 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
         if not lengths or any(
             type(i) is not int or i < 0 or type(n) is not int or n <= 0 for i, n in lengths.items()
         ):
-            raise ValueError('lengths must map nonnegative integer IDs to positive lengths')
+            raise ValueError("lengths must map nonnegative integer IDs to positive lengths")
         self.model.clear()
         self.costs = self._new_costs()
         self.scheduler.last_candidates = []
@@ -91,7 +91,7 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
             )
             value = self.timeline.evaluate(self._costed(rounds, lengths))
             if not math.isfinite(value) or value < 0:
-                raise ValueError('cost model must produce a finite nonnegative step time')
+                raise ValueError("cost model must produce a finite nonnegative step time")
             return value
 
         best = None if incumbent_rounds is None else (score(incumbent_rounds), incumbent_rounds)
@@ -113,14 +113,14 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
         except InfeasibleLayout as error:
             rejection = str(error)
             if best is None:
-                raise RuntimeScheduleError(f'hot-switch search: {error}') from error
+                raise RuntimeScheduleError(f"hot-switch search: {error}") from error
 
         rows = encode_rows(best[1], self.geometry.world_size)
         groups = validate_rows(rows, lengths, self.geometry, min(self.geometry.allowed_cp_sizes))
         elapsed = time.perf_counter() - begin
         self.last_statistics = dict(
-            algorithm='DynamicUSP solve_gbs Stage 1 + injected complete-step cost',
-            source_commit='1ff97a4ae0beb5e088fadb9e112265bdd194b24d',
+            algorithm="DynamicUSP solve_gbs Stage 1 + injected complete-step cost",
+            source_commit="1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
             group_sizes=self.scheduler.sizes,
             candidates=self.scheduler.last_candidates,
             selected_incumbent=selected_incumbent,

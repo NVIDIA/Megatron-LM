@@ -82,6 +82,8 @@ def deterministic_mode():
         "NCCL_NVLS_ENABLE": "0",
         "NVTE_FUSED_ATTN": "0",
         "NCCL_ALGO": "^NVLS",
+        # Preserve expert token order before NCCL EP creates its process-wide group.
+        "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
         "NVTE_FWD_LAYERNORM_SM_MARGIN": "8",
         "NVTE_BWD_LAYERNORM_SM_MARGIN": "8",
     }
@@ -249,13 +251,13 @@ def get_valid_flex_dispatcher_backends():
     its TransformerEngine NCCL EP build is present, so each overlap test exercises ncclep alongside
     the existing reference backend.
     """
-    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+    from tests.unit_tests.test_utilities import is_nccl_ep_available
 
     backends = []
     primary = get_valid_flex_dispatcher_backend()
     if primary is not None:
         backends.append(primary)
-    if HAVE_TE_EP and "ncclep" not in backends:
+    if is_nccl_ep_available() and "ncclep" not in backends:
         backends.append("ncclep")
     return backends
 
@@ -275,18 +277,13 @@ def get_valid_dispatcher_configs():
 def apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend):
     """Wire the dispatcher type + flex backend into a config kwargs dict.
 
-    For ncclep, also set moe_expert_rank_capacity_factor: ncclep sizes a per-rank receive buffer
-    from it and overflow hard-traps, so it must be set (2.0 gives ample headroom at test sizes).
+    ncclep is left in eager mode (no moe_expert_rank_capacity_factor): the static path needs the
+    fused grouped GEMM, which these overlap tests do not enable. Tests that do (zero-copy) set the
+    capacity factor themselves.
     """
     extra_kwargs["moe_token_dispatcher_type"] = dispatcher_type
     if dispatcher_type == "flex":
         extra_kwargs["moe_flex_dispatcher_backend"] = flex_backend
-        if flex_backend == "ncclep":
-            # ncclep sizes a per-rank receive buffer from this and overflow hard-traps (the
-            # em_scan_kernel "padded slots > max_recv_tokens_per_rank" device check). These overlap
-            # tests use small token counts (high routing-imbalance variance), so use a generous
-            # factor to guarantee no overflow; the staging buffer is tiny at this model size.
-            extra_kwargs["moe_expert_rank_capacity_factor"] = 8.0
     return extra_kwargs
 
 

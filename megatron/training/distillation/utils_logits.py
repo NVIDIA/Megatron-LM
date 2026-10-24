@@ -33,7 +33,8 @@ except ImportError:
     HAVE_ZSTANDARD = False
 
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
-from megatron.training import get_args
+from megatron.training import get_args, get_train_state
+from megatron.training.global_vars import get_run_config
 from megatron.training.utils import get_blend_and_blend_per_split
 
 logger = logging.getLogger(__name__)
@@ -149,12 +150,8 @@ def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True)
 
 
 def get_current_iteration() -> int:
-    """Return the current training iteration from ``get_args()``."""
-    args = get_args()
-    iteration = getattr(args, 'curr_iteration', None)
-    if iteration is None:
-        iteration = getattr(args, 'iteration')
-    return iteration
+    """Return the current iteration from the global TrainState."""
+    return get_train_state().iteration
 
 
 def _blend_identifiers(args: Any) -> Dict[str, Any]:
@@ -187,16 +184,17 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     stream itself: ``seed``, ``sequence_length``, ``train_samples`` (with a
     fall-back to ``train_iters * global_batch_size``), and the data ``blend``.
     """
+    cfg = get_run_config()
     args = get_args()
-    train_samples = getattr(args, 'train_samples', None)
+    train_samples = cfg.train.train_samples
     if train_samples is None:
-        train_iters = getattr(args, 'train_iters', None)
-        global_batch_size = getattr(args, 'global_batch_size', None)
+        train_iters = cfg.train.train_iters
+        global_batch_size = cfg.train.global_batch_size
         if train_iters is not None and global_batch_size is not None:
             train_samples = int(train_iters) * int(global_batch_size)
 
     identifiers = OrderedDict()
-    identifiers["seed"] = getattr(args, 'seed', None)
+    identifiers["seed"] = cfg.rng.seed
     identifiers["sequence_length"] = getattr(args, 'seq_length', None)
     identifiers["train_samples"] = train_samples
     identifiers["blend"] = _blend_identifiers(args)

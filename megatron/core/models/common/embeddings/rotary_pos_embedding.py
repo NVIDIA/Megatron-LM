@@ -142,6 +142,10 @@ class RotaryEmbedding(nn.Module):
     def get_cos_sin(self, max_seq_len: int, offset: int = 0) -> (Tensor, Tensor):
         """Cosine and sine values for RoPE are precomputed for all positions up to the maximum
         sequence length"""
+        if self.inv_freq.device.type == 'cpu':
+            # Match get_emb(): CPU initialization defers this persistent tensor's
+            # device transfer until its first inference forward.
+            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
         freqs = self.get_freqs_non_repeated(max_seq_len, offset)
         cos = torch.cos(freqs)
         sin = torch.sin(freqs)

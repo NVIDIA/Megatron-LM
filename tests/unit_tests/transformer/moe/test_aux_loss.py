@@ -310,6 +310,8 @@ class TestRouterAuxLoss:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
@@ -418,6 +420,8 @@ class TestRouterAuxLoss:
         torch.testing.assert_close(aux_loss, seq_aux_loss)
         torch.testing.assert_close(grad1, grad2)
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("with_padding", [False, True])
@@ -651,10 +655,16 @@ class TestRouterAuxLoss:
     def test_aux_loss_fusion_equivalence(self, aux_type):
         # Compare fused vs unfused aux loss path to ensure numerical equivalence
         router_ref = self.new_router(
-            moe_router_load_balancing_type=aux_type, moe_aux_loss_coeff=1.0, moe_router_dtype="fp32"
+            moe_router_load_balancing_type=aux_type,
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            moe_router_fusion=False,
         ).cuda()
         router_fused = self.new_router(
-            moe_router_load_balancing_type=aux_type, moe_aux_loss_coeff=1.0, moe_router_dtype="fp32"
+            moe_router_load_balancing_type=aux_type,
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            moe_router_fusion=True,
         ).cuda()
 
         with torch.no_grad():
@@ -671,7 +681,6 @@ class TestRouterAuxLoss:
         loss_name = loss_name_map[aux_type]
 
         # Unfused
-        router_ref.config.moe_router_fusion = False
         clear_aux_losses_tracker()
         router_ref.weight.grad = None
         scores_ref, routing_ref = router_ref(hidden_states)
@@ -683,7 +692,6 @@ class TestRouterAuxLoss:
         reduce_from_tensor_model_parallel_region(aux_loss_ref, router_ref.tp_cp_group)
 
         # Fused
-        router_fused.config.moe_router_fusion = True
         clear_aux_losses_tracker()
         router_fused.weight.grad = None
         scores_fused, routing_fused = router_fused(hidden_states)
@@ -699,6 +707,8 @@ class TestRouterAuxLoss:
         torch.testing.assert_close(aux_loss_ref, aux_loss_fused)
         torch.testing.assert_close(grad_ref, grad_fused)
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
@@ -781,6 +791,8 @@ class TestRouterAuxLoss:
         assert router.ga_steps == 0
         assert torch.all(router.global_tokens_per_expert == 0)
 
+    # Shared reinitialization race: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
@@ -837,6 +849,8 @@ class TestRouterAuxLoss:
         assert router.get_aux_loss_coeff("global_aux_loss") == 2.0
         assert router.get_aux_loss_coeff("non_existent_type") == 0.0
 
+    # Intermittent Gloo timeout: https://github.com/NVIDIA/Megatron-LM/issues/7745
+    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(

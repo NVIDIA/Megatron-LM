@@ -33,21 +33,21 @@ class HotSwitchOptions:
 
     def __post_init__(self):
         if type(self.candidate_count) is not int or self.candidate_count < 1:
-            raise ValueError('candidate_count must be a positive integer')
+            raise ValueError("candidate_count must be a positive integer")
         if (
             isinstance(self.outlier_threshold, bool)
             or not math.isfinite(self.outlier_threshold)
             or self.outlier_threshold <= 0
         ):
-            raise ValueError('outlier_threshold must be finite and positive')
+            raise ValueError("outlier_threshold must be finite and positive")
         for name in (
-            'pack_shorts_into_long_groups',
-            'column_offset',
-            'tier_affinity',
-            'heavy_middle',
+            "pack_shorts_into_long_groups",
+            "column_offset",
+            "tier_affinity",
+            "heavy_middle",
         ):
             if type(getattr(self, name)) is not bool:
-                raise ValueError(f'{name} must be a boolean')
+                raise ValueError(f"{name} must be a boolean")
 
 
 @dataclass
@@ -80,9 +80,9 @@ class HotSwitchScheduler:
     ) -> None:
         sizes = tuple(sorted(set(group_sizes)))
         if world_size < 1 or tokens_per_rank < 1 or not sizes:
-            raise ValueError('positive world/capacity and nonempty group_sizes required')
+            raise ValueError("positive world/capacity and nonempty group_sizes required")
         if any(type(s) is not int or s < 1 or s & (s - 1) or world_size % s for s in sizes):
-            raise ValueError('group_sizes must be power-of-two divisors of world_size')
+            raise ValueError("group_sizes must be power-of-two divisors of world_size")
         self.world_size = world_size
         self.sizes = sizes
         self.tokens_per_rank = tokens_per_rank
@@ -94,7 +94,7 @@ class HotSwitchScheduler:
         for sample_id in tokens:
             size = next((s for s in self.sizes if fits([sample_id], s)), None)
             if size is None:
-                raise InfeasibleLayout(f'sample {sample_id} exceeds every allowed group capacity')
+                raise InfeasibleLayout(f"sample {sample_id} exceeds every allowed group capacity")
             required[sample_id] = size
         return required
 
@@ -107,13 +107,13 @@ class HotSwitchScheduler:
     ) -> list[list[Group]]:
         """Allocate one candidate count, preserving upstream sample and rank ties."""
         if type(count) is not int or count < 1:
-            raise ValueError('microbatch count must be a positive integer')
+            raise ValueError("microbatch count must be a positive integer")
         if tokens.keys() != weights.keys() or not tokens:
-            raise ValueError('tokens and weights must have the same nonempty sample IDs')
+            raise ValueError("tokens and weights must have the same nonempty sample IDs")
         if any(type(t) is not int or t <= 0 for t in tokens.values()) or any(
             isinstance(w, bool) or not math.isfinite(w) or w <= 0 for w in weights.values()
         ):
-            raise ValueError('tokens and scheduling weights must be finite and positive')
+            raise ValueError("tokens and scheduling weights must be finite and positive")
         needed = self._requirements(tokens, fits)
         world, minimum = self.world_size, self.sizes[0]
         capacity = world * self.tokens_per_rank
@@ -231,7 +231,7 @@ class HotSwitchScheduler:
             else:
                 eligible = [g for g in long_groups if can_take(g, sample_id)]
                 if not eligible:
-                    raise InfeasibleLayout('group_capacity')
+                    raise InfeasibleLayout("group_capacity")
                 group = min(eligible, key=lambda g: (g.load, creation[id(g)]))
                 add(group, sample_id)
 
@@ -257,7 +257,7 @@ class HotSwitchScheduler:
                 add(empty, sample_id)
                 break
             if not empty.sample_ids:
-                raise InfeasibleLayout('coverage')
+                raise InfeasibleLayout("coverage")
 
         rows = []
         for column in range(count):
@@ -311,10 +311,10 @@ class HotSwitchScheduler:
                 continue
             value = float(objective(layout))
             if not math.isfinite(value) or value < 0:
-                raise ValueError('layout objective must be finite and nonnegative')
+                raise ValueError("layout objective must be finite and nonnegative")
             self.last_candidates.append(dict(microbatches=count, predicted_ms=value))
             if best is None or value < best[0]:
                 best = value, layout
         if best is None:
-            raise InfeasibleLayout('no candidate count produced a complete feasible layout')
+            raise InfeasibleLayout("no candidate count produced a complete feasible layout")
         return best

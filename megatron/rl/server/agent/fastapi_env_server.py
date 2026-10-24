@@ -15,7 +15,6 @@ from uvicorn.config import LOGGING_CONFIG
 LOGGING_CONFIG['root'] = {"handlers": ["default"], "level": "INFO"}
 
 from ... import inference
-from ...agent.registry import get_agent_class
 from ...agent.api import (
     Agent,
     ContrastiveRollout,
@@ -30,6 +29,7 @@ from ...agent.api import (
     RolloutRequest,
     TokenRollout,
 )
+from ...agent.registry import get_agent_class
 from ...server.api import (
     EnvironmentServer,
     InferenceServer,
@@ -118,10 +118,7 @@ class FastAPIEnvServer(EnvironmentServer):
         rollouts = [ContrastiveRollout.model_validate(r) for r in response.json()]
         return rollouts
 
-    async def prepare_group_rollout(
-        self,
-        request: GroupedRolloutRequest,
-    ) -> GroupRolloutParams:
+    async def prepare_group_rollout(self, request: GroupedRolloutRequest) -> GroupRolloutParams:
         raise NotImplementedError(
             "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."
         )
@@ -141,7 +138,6 @@ class FastAPIEnvServer(EnvironmentServer):
         assert (
             request.submission_granularity != "R"
         ), "FastAPIEnvServer does not support rollout submission granularity"
-        assert not request.streaming, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient() as client:

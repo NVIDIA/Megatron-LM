@@ -168,7 +168,11 @@ def test_torch_chunk_gated_delta_rule_preserves_public_signature():
         "cu_seqlens",
         "cp_context",
         "scale",
+        "kwargs",
     )
+    assert signature.parameters["kwargs"].kind is inspect.Parameter.VAR_KEYWORD
+    assert signature.parameters["cp_context"].default is None
+    assert signature.parameters["scale"].default is None
 
 
 def test_gdn_headwise_cp_head_divisibility_includes_cp_size():
@@ -459,6 +463,7 @@ class TestGatedDeltaNet:
 
         det_config = copy.deepcopy(self.transformer_config)
         det_config.deterministic_mode = True
+        det_config.gdn_kernel_backend = "torch"
 
         gdn_submodules = get_experimental_attention_variant_module_spec(
             config=det_config
@@ -852,6 +857,7 @@ def test_qk_l2_norm_deterministic_mode(dtype, deterministic_mode, use_qk_l2norm)
     """Check normalization dispatch, additive epsilon, and gradients on CPU."""
     gdn = SimpleNamespace(
         config=SimpleNamespace(deterministic_mode=deterministic_mode),
+        cp_size=1,
         use_qk_l2norm=use_qk_l2norm,
         qk_dim_local_tp=2,
         v_dim_local_tp=2,
@@ -892,5 +898,16 @@ def test_qk_l2_norm_deterministic_mode(dtype, deterministic_mode, use_qk_l2norm)
     torch.testing.assert_close(actual, expected, rtol=rtol, atol=1e-6)
 
     actual.float().sum().backward()
-    expected.float().sum().backward()
-    torch.testing.assert_close(qkv.grad, reference.grad.to(dtype), rtol=rtol, atol=1e-6)
+    if use_qk_l2norm and deterministic_mode:
+        # FLA's backward uses the saved, dtype-rounded output, not the derivative
+        # of an unrounded norm. Keep a high-precision oracle for that same contract.
+        values = reference[..., :4].reshape(1, 3, 2, 2)
+        rstd = torch.rsqrt(values.square().sum(-1, keepdim=True) + 1e-6)
+        saved_output = (values * rstd).to(dtype).double()
+        normalized_grad = rstd * (1 - saved_output * saved_output.sum(-1, keepdim=True))
+        expected_grad = torch.zeros_like(reference)
+        expected_grad[..., :4] = normalized_grad.reshape(1, 3, 4)
+    else:
+        expected.float().sum().backward()
+        expected_grad = reference.grad
+    torch.testing.assert_close(qkv.grad, expected_grad.to(dtype), rtol=rtol, atol=1e-6)

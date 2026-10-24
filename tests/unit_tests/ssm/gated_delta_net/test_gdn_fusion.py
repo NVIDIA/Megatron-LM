@@ -116,6 +116,7 @@ class TestFusedPreGatedDeltaRule:
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
             deterministic_mode=deterministic_mode,
+            gdn_kernel_backend="torch" if deterministic_mode else "fla",
             gdn_pre_gated_delta_rule_fusion=gdn_pre_gated_delta_rule_fusion,
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(

@@ -17,18 +17,22 @@ jobs:
       REPO: ${{ github.repository }}
       AUTHOR: ${{ github.event.pull_request.user.login }}
     steps:
-      - name: Check PR author permission
+      - name: Check repository permission
         id: permission
         run: |
-          permission=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission)
+          set -euo pipefail
+
+          permission=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq '.permission')
           case "$permission" in
             admin|maintain|write)
-              echo "has-write-permission=true" >> "$GITHUB_OUTPUT"
+              has_write_permission=true
               ;;
             *)
-              echo "has-write-permission=false" >> "$GITHUB_OUTPUT"
+              has_write_permission=false
               ;;
           esac
+
+          echo "has-write-permission=$has_write_permission" >> "$GITHUB_OUTPUT"
 
   analyze_complexity:
     name: Analyze PR Complexity

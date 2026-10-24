@@ -12,7 +12,7 @@ import io
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
@@ -29,14 +29,17 @@ from .mapping import (
     apply_factory_merges,
 )
 from .state_dict_utils import load_preprocess, save_preprocess
-from .strategies.async_utils import AsyncRequest
 from .strategies.common import COMMON_STATE_FNAME, load_common
 from .strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
     _get_filesystem_reader,
 )
-from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
+from .utils import (
+    extract_sharded_base,
+    force_all_tensors_to_non_fp8,
+    prepare_quantized_tensors_for_streaming_load,
+)
 from .validation import (
     StrictHandling,
     determine_global_metadata,
@@ -46,6 +49,12 @@ from .validation import (
     verify_checkpoint,
     verify_integrity_manifest,
 )
+
+if TYPE_CHECKING:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+else:
+    AsyncRequest = Any
+
 
 logger = logging.getLogger(__name__)
 
@@ -133,21 +142,24 @@ def load(
     #   2. When using delayed scaling, this loading process writes an extra value into the global
     #      amax_history buffer of Transformer Engine, which is undesirable.
     #
-    # When the sharded strategy supports per-tensor streaming dequantize
-    # (``stream_ckpt_dequant``), both concerns are handled inside the
-    # LoadPlanner on a per-tensor basis, which avoids peaking GPU memory
-    # with N simultaneous high-precision scratch tensors before the load
-    # begins. Covers FP8/MXFP8/blockwise-FP8/NVFP4 via the common
-    # ``QuantizedTensor`` base class.
-    if not getattr(sharded_strategy, "stream_ckpt_dequant", False):
+    # Dequantizing everything up front allocates a high-precision copy of every quantized param
+    # at once. When the strategy streams the dequantization (`stream_ckpt_dequant`, a load path
+    # for inference), quantized tensors stay in the state dict and the load planner quantizes
+    # each destination in place from a per-tensor high-precision scratch (see
+    # `MCoreLoadPlanner.resolve_tensor`). Case 1 above is then unsupported by construction,
+    # delayed scaling (case 2: its scale is only known once `load_state_dict` restores the fp8
+    # metadata) is rejected, and the few tensors that cannot be quantized in place (see
+    # `prepare_quantized_tensors_for_streaming_load`) are still dequantized up front.
+    if getattr(sharded_strategy, "stream_ckpt_dequant", False):
+        prepare_quantized_tensors_for_streaming_load(sharded_state_dict)
+    else:
         force_all_tensors_to_non_fp8(sharded_state_dict)
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
     )
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
-    # torch_dist checkpoint (current format) or in a legacy common.pt. Loading it up front
-    # is also required to determine `async_strategy` for the sharded load below.
+    # torch_dist checkpoint (current format) or in a legacy common.pt.
     common_state_dict = load_common_state_dict(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
@@ -179,13 +191,7 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    ckpt_args = common_state_dict.get("args")
-    async_strategy = (
-        getattr(ckpt_args, "async_strategy", "mcore")
-        if getattr(ckpt_args, "async_save", False)
-        else "mcore"
-    )
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -233,7 +239,7 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     loaded = pyt_state_dict[unique_key]
     if isinstance(loaded, io.BytesIO):
         loaded.seek(0)
-        loaded = torch.load(loaded, weights_only=False)
+        loaded = torch.load(loaded, weights_only=True)
     return loaded[0]
 
 
@@ -356,7 +362,6 @@ def save(
         Callable[[CommonStateDict], StateDict]
     ] = None,
     content_metadata: Optional[dict] = None,
-    async_strategy: Optional[str] = "nvrx",
     verify_integrity: bool = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
@@ -464,7 +469,7 @@ def save(
             integrity_finalize_fn()
         return None
 
-    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
+    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
     async_request.finalize_fns.append(metadata_finalize_fn)
     if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)

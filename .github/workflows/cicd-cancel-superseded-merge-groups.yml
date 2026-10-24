@@ -1,0 +1,35 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+name: Cancel Superseded Merge-Group Runs
+
+on:
+  workflow_run:
+    workflows: ["CICD Megatron-LM"]
+    types: [requested]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel-superseded-runs:
+    if: >-
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.event.workflow_run.event == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      # workflow_run is privileged, so execute only code from the trusted default branch.
+      - name: Checkout trusted repository code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Cancel superseded merge-group runs for this PR
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TRIGGER_CREATED_AT: ${{ github.event.workflow_run.created_at }}
+          TRIGGER_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
+          TRIGGER_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+        run: python3 .github/scripts/cancel_superseded_merge_group_runs.py

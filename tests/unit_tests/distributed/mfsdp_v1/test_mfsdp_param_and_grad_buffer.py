@@ -170,8 +170,8 @@ def test_grouped_expert_weights_split_when_chunk_size_factors_differ():
     ]
 
 
-def test_per_expert_2d_weights_merge_via_lcm():
-    """Per-expert 2D weights merge into a single bucket via LCM chunk size factor."""
+def test_per_expert_2d_weights_avoid_lcm_padding():
+    """Incompatible row sizes stay separate, preserving main's bounded-padding fix."""
     hidden_size = 12
     moe_ffn_hidden_size = 8
     shapes = {
@@ -182,13 +182,11 @@ def test_per_expert_2d_weights_merge_via_lcm():
 
     assert _get_bucket_signatures(module) == [
         {
-            "chunk_size_factor": math.lcm(
-                torch.Size(shapes["linear_fc1"])[1:].numel(),
-                torch.Size(shapes["linear_fc2"])[1:].numel(),
-            ),
-            "params": [
-                ("layer.experts.linear_fc1", shapes["linear_fc1"]),
-                ("layer.experts.linear_fc2", shapes["linear_fc2"]),
-            ],
-        }
+            "chunk_size_factor": torch.Size(shapes["linear_fc1"])[1:].numel(),
+            "params": [("layer.experts.linear_fc1", shapes["linear_fc1"])],
+        },
+        {
+            "chunk_size_factor": torch.Size(shapes["linear_fc2"])[1:].numel(),
+            "params": [("layer.experts.linear_fc2", shapes["linear_fc2"])],
+        },
     ]

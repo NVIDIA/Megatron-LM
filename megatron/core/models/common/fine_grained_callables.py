@@ -36,7 +36,9 @@ def build_mtp_layer_callables(layer):
 
     forward_funcs, backward_dw = build_layer_callables(layer.mtp_model_layer)
     is_moe, _ = get_layer_moe_metadata(layer.mtp_model_layer)
-    pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
+    pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _, mhc_post = (
+        forward_funcs
+    )
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_pre_dispatch_forward(node, hidden_states):
@@ -63,21 +65,32 @@ def build_mtp_layer_callables(layer):
                         inp=hidden_states, requires_grad=True, keep_graph=True
                     )
 
-            offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
+            model = node.chunk_state.model
+            offset = get_mtp_layer_offset(
+                layer.config, model.vp_stage, pp_rank=model.pg_collection.pp.rank()
+            )
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-            hidden_states = node.chunk_state.mtp_hidden_states[offset]
+            multistream = getattr(node.chunk_state, "mhc_multistream", None)
+            if getattr(layer.config, "enable_hyper_connections", False) and multistream is not None:
+                hidden_states = torch.chunk(multistream, 1 + offset, dim=0)[offset]
+            else:
+                hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
-        input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
-            input_ids=node.chunk_state.input_ids,
-            position_ids=node.chunk_state.position_ids,
-            embedding=node.chunk_state.model.embedding,
-            hidden_states=hidden_states,
-            packed_seq_params=node.chunk_state.packed_seq_params,
-            padding_mask=node.chunk_state.padding_mask,
+        input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states = (
+            layer._get_embeddings(
+                input_ids=node.chunk_state.input_ids,
+                position_ids=node.chunk_state.position_ids,
+                embedding=node.chunk_state.model.embedding,
+                hidden_states=hidden_states,
+                packed_seq_params=node.chunk_state.packed_seq_params,
+                padding_mask=node.chunk_state.padding_mask,
+                mtp_input_mask=getattr(node.chunk_state, 'mtp_input_mask', None),
+            )
         )
         node.chunk_state.input_ids = input_ids
         node.chunk_state.position_ids = position_ids
         node.chunk_state.padding_mask = padding_mask
+        node.chunk_state.mtp_input_mask = mtp_input_mask
 
         # MTP Layer Preprocess
         # norm, linear projection and transformer
@@ -99,11 +112,17 @@ def build_mtp_layer_callables(layer):
             return pre_dispatch_forward(node, hidden_states)
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
+        multistream = (
+            hidden_states if getattr(layer.config, "enable_hyper_connections", False) else None
+        )
         hidden_states = layer._postprocess(hidden_states)
         node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
             hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
             node.chunk_state.mtp_hidden_states = None
+            node.chunk_state.mhc_multistream = None
+        elif multistream is not None:
+            hidden_states = multistream
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):
@@ -132,12 +151,18 @@ def build_mtp_layer_callables(layer):
         mlp_func,
         combine_func,
         mtp_post_process_func,
+        mhc_post,
     ]
-    pre_dispatch_bwd = backward_dw["pre_dispatch_computation"]
+    pre_dispatch_bwd = backward_dw["attn"]
+    projections = (
+        [layer.e_proj, layer.h_proj]
+        if getattr(layer.config, "enable_hyper_connections", False)
+        else [layer.eh_proj]
+    )
     if isinstance(pre_dispatch_bwd, list):
-        pre_dispatch_bwd.append(layer.eh_proj)
+        pre_dispatch_bwd.extend(projections)
     else:
-        backward_dw["pre_dispatch_computation"] = [pre_dispatch_bwd, layer.eh_proj]
+        backward_dw["attn"] = [pre_dispatch_bwd, *projections]
 
     return forward_funcs, backward_dw
 

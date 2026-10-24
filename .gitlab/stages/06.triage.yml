@@ -25,12 +25,12 @@ triage:linear_reconcile:
       artifacts: true
   script:
     - >-
-      nemo-ci-linear status
-      --config "${NEMO_CI_TRIAGE_CONFIG}"
+      cerno-linear status
+      --config "${CERNO_CONFIG}"
       --build-module-regex '^megatron-lm$'
       --output linear_status_report.json
     - >-
-      nemo-ci-linear reconcile
+      cerno-linear reconcile
       --failure-buckets failure_buckets.json
       --linear-report linear_status_report.json
       --pipeline-summaries pipeline_summaries.json
@@ -49,11 +49,17 @@ triage:linear_write:
       artifacts: true
   allow_failure: true
   script:
-    - >-
-      nemo-ci-linear write
-      --config "${NEMO_CI_TRIAGE_CONFIG}"
-      --plan linear_action_plan.json
-      --output linear_action_plan_post.json
+    # The shared GitHub email lookup reads the existing GH_TOKEN CI variable.
+    - |
+      ONCALL_ASSIGNEE="$(
+        python tests/test_utils/python_scripts/resolve_oncall_assignee.py \
+          --schedule-file .github/oncall_schedule.json
+      )"
+      cerno-linear write \
+        --config "${CERNO_CONFIG}" \
+        --plan linear_action_plan.json \
+        --output linear_action_plan_post.json \
+        --assignee "${ONCALL_ASSIGNEE}"
   artifacts:
     when: always
     paths:
@@ -79,7 +85,7 @@ triage:slack_linear_followup:
   allow_failure: true
   script:
     - >-
-      nemo-ci-notify
+      cerno-notify
       --pipeline-summary slack_notification.json
       --linear-plan linear_action_plan_post.json
       --slack-bot-token "${MCORE_SLACK_BOT_TOKEN:-${ALERTMANAGER_TOKEN}}"
@@ -89,8 +95,8 @@ triage:slack_linear_followup:
       if [[ -z "${THREAD_TIMESTAMP}" ]]; then
         echo "No Slack thread timestamp; skipping detailed triage follow-ups."
       else
-        nemo-ci-notify \
-          --config "${NEMO_CI_TRIAGE_CONFIG}" \
+        cerno-notify \
+          --config "${CERNO_CONFIG}" \
           --module megatron_lm \
           --only-followup \
           --thread-ts "${THREAD_TIMESTAMP}" \

@@ -2,16 +2,19 @@
 
 """Utilities for transformer layers."""
 
+import functools
 import gc
 import logging
+import os
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import (
     get_pg_rank,
     get_tensor_model_parallel_group_if_none,
@@ -23,6 +26,60 @@ if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
 
 logger = logging.getLogger(__name__)
+
+
+def set_attention_backend(config: 'TransformerConfig') -> None:
+    """Configure Transformer Engine attention backends from a transformer config."""
+    attention_backend = config.attention_backend
+    if isinstance(attention_backend, str):
+        try:
+            attention_backend = AttnBackend[attention_backend]
+        except KeyError as exc:
+            choices = ", ".join(backend.name for backend in AttnBackend)
+            raise ValueError(
+                f"Unknown attention backend {attention_backend!r}; expected one of: {choices}"
+            ) from exc
+
+    if config.batch_invariant_mode:
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            assert_te_supports_batch_invariant_attention,
+        )
+
+        assert_te_supports_batch_invariant_attention()
+
+    def check_and_set_env_variable(
+        env_variable_name: str, expected_value: int, attn_type: AttnBackend
+    ) -> None:
+        current_value = os.getenv(env_variable_name)
+        assert current_value is None or current_value == str(expected_value), (
+            f'{env_variable_name} is set to {current_value}, but attention_backend='
+            f'{attn_type.name!r} and flash_attention_version='
+            f'{config.flash_attention_version!r} require {expected_value}. Transformer Engine '
+            'attention backend and FlashAttention version controls are process-wide; all models '
+            'constructed in one process must use compatible settings. Unset the NVTE attention '
+            'environment variables before model construction to let the configs set them.'
+        )
+        os.environ[env_variable_name] = str(expected_value)
+
+    backend_flags = {
+        AttnBackend.local: (0, 0, 0),
+        AttnBackend.flash: (1, 0, 0),
+        AttnBackend.fused: (0, 1, 0),
+        AttnBackend.unfused: (0, 0, 1),
+        AttnBackend.auto: (1, 1, 1),
+    }
+    flash, fused, unfused = backend_flags[attention_backend]
+    check_and_set_env_variable('NVTE_FLASH_ATTN', flash, attention_backend)
+    check_and_set_env_variable('NVTE_FUSED_ATTN', fused, attention_backend)
+    check_and_set_env_variable('NVTE_UNFUSED_ATTN', unfused, attention_backend)
+
+    if config.flash_attention_version is not None:
+        for version in (2, 3, 4):
+            check_and_set_env_variable(
+                f'NVTE_FLASH_ATTN_V{version}',
+                int(version == config.flash_attention_version),
+                attention_backend,
+            )
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
@@ -301,6 +358,41 @@ def sharded_state_dict_default(
 _sequence_parallel_attr_cache = None
 
 
+def set_model_config_attribute(model: Any, attribute: str, value: Any) -> None:
+    """Set a config attribute on a model and all distinct child-module configs.
+
+    Some models give individual layers separate config objects. Runtime model-wide
+    toggles must update those configs just as they did when every layer shared the
+    model's root config.
+
+    Args:
+        model: Model whose configs should be updated.
+        attribute: Config attribute to set.
+        value: Value to assign. The same value object is assigned to every config.
+    """
+    root_config = model.config
+    setattr(root_config, attribute, value)
+    updated_config_ids = {id(root_config)}
+
+    module_root = model
+    visited_wrapper_ids = set()
+    while not isinstance(module_root, torch.nn.Module) or not hasattr(module_root, "_modules"):
+        visited_wrapper_ids.add(id(module_root))
+        module_root = getattr(module_root, "module", None)
+        if module_root is None or id(module_root) in visited_wrapper_ids:
+            return
+
+    for module in module_root.modules():
+        config = getattr(module, "config", None)
+        if (
+            config is not None
+            and id(config) not in updated_config_ids
+            and hasattr(config, attribute)
+        ):
+            setattr(config, attribute, value)
+            updated_config_ids.add(id(config))
+
+
 def _init_sequence_parallel_cache(model, exclude_modules):
     """
     Initialize the cache of modules with sequence parallel attributes.
@@ -365,7 +457,7 @@ def set_model_to_sequence_parallel(model, set_to=False, exclude_modules=None):
     if _sequence_parallel_attr_cache is None or model_id not in _sequence_parallel_attr_cache:
         _init_sequence_parallel_cache(model, exclude_modules)
 
-    model.config.sequence_parallel = set_to
+    set_model_config_attribute(model, "sequence_parallel", set_to)
 
     # Set all cached attributes to desired value
     for attr, modules in _sequence_parallel_attr_cache[model_id].items():
@@ -449,7 +541,7 @@ def toggle_cuda_graphs(model, set_to="none"):
         init_cuda_graph_cache(model)
 
     assert set_to in ["none", "local"], f"Invalid CUDA graph implementation: {set_to}"
-    model.config.cuda_graph_impl = set_to
+    set_model_config_attribute(model, "cuda_graph_impl", set_to)
 
     # Collect all modules that have any of the CUDA graph attributes
     for attribute, modules in cuda_graph_attr_cache[model_id].items():
@@ -510,3 +602,46 @@ def is_layer_window_attention(
         f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, "
         f"{window_attn_skip_freq}"
     )
+
+
+def precision_aware_checkpoint(
+    function: Callable[..., Any],
+    config: 'TransformerConfig',
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    /,
+    *args: Any,
+    distribute_saved_activations: bool = False,
+    **kwargs: Any,
+) -> Any:
+    """Activation-checkpoint ``function`` with the implementation its precision requires.
+
+    FP8 and FP4 recompute must go through Transformer Engine's checkpoint, because FP4 is
+    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``). Other
+    precisions use ``tensor_parallel.checkpoint``.
+
+    Args:
+        function: Callable to checkpoint.
+        config: Transformer config whose ``fp8`` and ``fp4`` fields select the implementation.
+        tp_group: Tensor-parallel group for Transformer Engine's checkpoint.
+        *args: Positional arguments for ``function``.
+        distribute_saved_activations: Passed through to the checkpoint implementation.
+        **kwargs: Keyword arguments for ``function``.
+
+    Returns:
+        The output of ``function``.
+    """
+    if config.fp8 or config.fp4:
+        # Imported lazily to avoid a circular import.
+        from megatron.core.extensions.transformer_engine import te_checkpoint
+
+        return te_checkpoint(
+            function,
+            distribute_saved_activations,
+            tensor_parallel.random.get_cuda_rng_tracker,
+            tp_group,
+            *args,
+            **kwargs,
+        )
+    if kwargs:
+        function = functools.partial(function, **kwargs)
+    return tensor_parallel.checkpoint(function, distribute_saved_activations, *args)

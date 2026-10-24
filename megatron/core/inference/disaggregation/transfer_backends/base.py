@@ -19,6 +19,37 @@ from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout
 KVTransportBackend = Any
 
 
+class TransferStartError(RuntimeError):
+    """Transfer submission failed after storage may have become transport-owned.
+
+    ``resources`` keeps transport descriptors and staging buffers alive while
+    their storage cannot be safely reused. ``cleanup_handles`` contains any
+    submitted operations that can later prove the storage safe.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        storage_safe: bool,
+        resources: Any = None,
+        cleanup_handles: Optional[list[Any]] = None,
+    ):
+        super().__init__(message)
+        self._storage_safe = storage_safe
+        self.resources = resources
+        self.cleanup_handles = list(cleanup_handles or [])
+
+    @property
+    def storage_safe(self) -> bool:
+        """Whether submission failed before use or every submitted operation stopped."""
+
+        return self._storage_safe or (
+            bool(self.cleanup_handles)
+            and all(handle.storage_safe for handle in self.cleanup_handles)
+        )
+
+
 def construct_kv_transfer_backend_class(name: str) -> KVTransportBackend:
     """Return the backend class registered under ``name``."""
 
@@ -109,20 +140,28 @@ def compute_buffer_geometry(
     )
 
     shape = list(memory_buffer.shape)
-    candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
-    if not candidates:
-        raise RuntimeError(
-            f"{backend_name}: no axis in memory_buffer shape {shape} matches "
-            f"expected_num_blocks={expected_num_blocks}. Layout is unrecognized; "
-            "bug in caller or new Megatron tensor shape."
-        )
-    if len(candidates) > 1:
-        raise RuntimeError(
-            f"{backend_name}: ambiguous blocks axis in shape {shape} "
-            f"(expected_num_blocks={expected_num_blocks} matches multiple axes "
-            f"{candidates}). Caller must pass a more distinctive value."
-        )
-    blocks_axis = candidates[0]
+    if ssm_layout is not None:
+        blocks_axis = 1
+        if len(shape) <= blocks_axis or shape[blocks_axis] != expected_num_blocks:
+            raise RuntimeError(
+                f"{backend_name}: SSM state shape {shape} does not have "
+                f"expected_num_blocks={expected_num_blocks} on slot axis 1"
+            )
+    else:
+        candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
+        if not candidates:
+            raise RuntimeError(
+                f"{backend_name}: no axis in memory_buffer shape {shape} matches "
+                f"expected_num_blocks={expected_num_blocks}. Layout is unrecognized; "
+                "bug in caller or new Megatron tensor shape."
+            )
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"{backend_name}: ambiguous blocks axis in shape {shape} "
+                f"(expected_num_blocks={expected_num_blocks} matches multiple axes "
+                f"{candidates}). Caller must pass a more distinctive value."
+            )
+        blocks_axis = candidates[0]
 
     elements_per_slice = 1
     for dim in shape[blocks_axis + 1 :]:

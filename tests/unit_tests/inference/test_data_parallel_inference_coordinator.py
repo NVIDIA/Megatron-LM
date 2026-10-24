@@ -8,7 +8,7 @@ import os
 import time
 import unittest.mock
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import msgpack
 import numpy as np
@@ -19,12 +19,20 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.data_parallel_inference_coordinator.handlers import handle_engine_reply
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    HANDLERS,
+    handle_engine_reply,
+)
+from megatron.core.inference.disaggregation.handoff_ownership import (
+    HandoffClaimStatus,
+    HandoffOwnership,
+)
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
     RequestEntry,
+    _engine_reply_frames,
 )
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
@@ -33,6 +41,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.core.inference.routing import select_engine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_asyncio_loop
@@ -50,6 +59,267 @@ NUM_TOKENS = 2
 DEFAULT_PORT = 46581
 
 
+def test_unclaimed_offer_expiry_fences_claims_but_not_live_readers(monkeypatch):
+    clock = unittest.mock.Mock(return_value=10.0)
+    monkeypatch.setattr(
+        "megatron.core.inference.disaggregation.handoff_ownership.time.monotonic", clock
+    )
+    ownership = HandoffOwnership(offer_timeout=5)
+    ownership.offer(1, b"prefill", require_claim=True)
+    ownership.offer(2, b"prefill", require_claim=True)
+    ownership.offer(3, b"unfenced-source")
+    assert ownership.claim(2, "decode") is HandoffClaimStatus.ACCEPTED
+    clock.return_value = 15.0
+    assert ownership.claim(1, "late") is HandoffClaimStatus.EXPIRED
+    assert ownership.expired_unclaimed() == [(1, b"prefill")]
+    assert ownership.expired_unclaimed() == [(1, b"prefill")]  # failed send must retry
+    ownership.release(1)
+    assert ownership.claim(1, "late") is HandoffClaimStatus.EXPIRED
+    assert ownership.claim(2, "other") is HandoffClaimStatus.REJECTED
+    assert ownership.claim(99, "unknown") is HandoffClaimStatus.REJECTED
+    assert not ownership.expired_unclaimed()
+    assert ownership.confirm_terminated("decode") == [(2, b"prefill")]
+    assert ownership.source_engine(3) == b"unfenced-source"
+    ownership.confirm_terminated("late")
+    assert ownership.claim(1, "late") is HandoffClaimStatus.REJECTED
+    ownership.offer(1, b"prefill", require_claim=True)
+    assert ownership.source_engine(1) is None
+    ownership._max_expired_offers = 1
+    ownership.offer(4, b"prefill", require_claim=True)
+    clock.return_value = 20.0
+    ownership.release(4)
+    assert ownership.claim(4, "new") is HandoffClaimStatus.EXPIRED
+    assert ownership.claim(1, "new") is HandoffClaimStatus.REJECTED
+
+
+def test_disconnected_client_does_not_interrupt_reply_bookkeeping():
+    from tests.unit_tests.inference.coordinator_test_utils import make_coordinator_direct
+
+    coord = make_coordinator_direct()
+    coord.known_clients = {b"client"}
+    coord.router_socket = unittest.mock.Mock()
+    coord.router_socket.send_multipart.side_effect = zmq.ZMQError(zmq.EHOSTUNREACH)
+    coord.request_id_to_client_id = {7: b"client"}
+    coord.request_id_to_client_request_id = {7: 70}
+    coord.client_request_to_request_id = {(b"client", 70): 7}
+    coord.request_id_to_rank = {7: b"rank_0"}
+    coord._pending_counts[0] = 1
+    coord.disaggregated_runtime = None
+    HANDLERS[Headers.REQUEST_ERROR](
+        coord, b"rank_0", [Headers.REQUEST_ERROR.value, 7, "failed", True], []
+    )
+    assert not coord.known_clients
+    assert not coord.request_id_to_client_id
+    assert coord._pending_counts[0] == 0
+    coord.router_socket.send_multipart.side_effect = zmq.ZMQError(zmq.EINVAL)
+    with pytest.raises(zmq.ZMQError):
+        coord._send_to_client([b"client", b"payload"])
+
+
+def test_coordinator_registers_client_kv_handoff_handlers():
+    assert Headers.SUBMIT_REQUEST_WITH_KV in HANDLERS
+    assert Headers.RELEASE_KV in HANDLERS
+
+
+def test_invalid_role_registration_replies_without_raising():
+    coordinator = unittest.mock.MagicMock()
+    coordinator.disaggregated_runtime = None
+    coordinator.is_disaggregated_inference.return_value = False
+
+    HANDLERS[Headers.REGISTER_ROLE](
+        coordinator, b"engine", [Headers.REGISTER_ROLE.value, "prefill", "nixl", []], []
+    )
+
+    reply = msgpack.unpackb(
+        coordinator.router_socket.send_multipart.call_args.args[0][1], raw=False
+    )
+    assert Headers(reply[0]) == Headers.REQUEST_ERROR
+
+
+def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator():
+    coordinator = unittest.mock.MagicMock(
+        known_clients={b"client"},
+        enable_prefix_caching=False,
+        next_request_id=0,
+        request_id_to_client_id={},
+        request_id_to_client_request_id={},
+        client_request_to_request_id={},
+    )
+
+    coordinator.is_disaggregated_inference.return_value = True
+    coordinator._send_to_client = DataParallelInferenceCoordinator._send_to_client.__get__(
+        coordinator
+    )
+    coordinator._handlers = HANDLERS
+    submissions = [
+        [
+            b"client",
+            msgpack.packb([Headers.SUBMIT_REQUEST.value, request_id, {}, None]),
+            msgpack.packb([1]),
+            msgpack.packb(None),
+            msgpack.packb(media),
+            msgpack.packb(None),
+        ]
+        for request_id, media in [(7, {"image": [b"image"]}), (8, None)]
+    ]
+    coordinator.router_socket.recv_multipart.side_effect = [
+        *submissions,
+        [b"client", msgpack.packb([Headers.SHUTDOWN.value])],
+    ]
+
+    DataParallelInferenceCoordinator.start(coordinator)
+
+    coordinator.disaggregated_runtime.route_submit.assert_called_once_with(
+        0, msgpack.packb([1]), {}, [], msgpack.packb(None)
+    )
+    assert coordinator.next_request_id == 1
+    assert coordinator.client_request_to_request_id == {(b"client", 8): 0}
+    destination, payload = coordinator.router_socket.send_multipart.call_args.args[0]
+    assert destination == b"client"
+    assert msgpack.unpackb(payload, raw=False) == [
+        Headers.REQUEST_ERROR.value,
+        7,
+        "native disaggregation does not support multimodal requests",
+        True,
+    ]
+
+
+class _StubCoordinator:
+    """Minimal stand-in exposing only what the submit handlers touch."""
+
+    is_disaggregated_inference = DataParallelInferenceCoordinator.is_disaggregated_inference
+    _send_to_client = DataParallelInferenceCoordinator._send_to_client
+
+    def __init__(self, identity=b"engine-0"):
+        self.disaggregated_runtime = None
+        self.known_clients = {b"client-0"}
+        self.next_request_id = 100
+        self.request_id_to_client_id = {}
+        self.request_id_to_client_request_id = {}
+        self.client_request_to_request_id = {}
+        self.request_id_to_rank = {}
+        self.identities_of_data_parallel_ranks = [identity]
+        self.identity_to_rank_index = {identity: 0}
+        self._pending_counts = np.zeros(1, dtype=np.int64)
+        self._identity = identity
+        self.sent = []
+
+    def get_least_loaded_data_parallel_rank(self):
+        return self._identity
+
+    def _send_to_engine(self, identity, frames):
+        # Mirrors the real signature: a list of frames, metadata first. Passing
+        # raw bytes here would splay one frame per byte, so assert the shape.
+        assert isinstance(frames, list), f"expected a frame list, got {type(frames).__name__}"
+        self.sent.append((identity, frames))
+        return True
+
+
+@pytest.mark.parametrize("native_disaggregation", [False, True])
+def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame(native_disaggregation):
+    """Client -> coordinator -> engine for a KV handoff, asserting the framing.
+
+    The prompt must never be decoded by the coordinator: it is forwarded as the
+    opaque body frame the client packed, byte for byte. Native coordinators
+    reject external handoffs before routing or allocating request state.
+    """
+    prompt_tokens = [11, 22, 33, 44]
+    kv_meta = {"agent": "nixl-0"}
+    src_block_ids = [7, 8]
+
+    # --- client side: build the frames without needing a live socket ---
+    client = InferenceClient.__new__(InferenceClient)
+    client.next_request_id = 5
+    request_id, frames = InferenceClient._make_kv_handoff_request(
+        client, prompt_tokens, SamplingParams(num_tokens_to_generate=4), kv_meta, src_block_ids
+    )
+    assert request_id == 5
+    assert len(frames) == 3, "KV handoff must be framed as [metadata, prompt, src_block_ids]"
+
+    metadata = msgpack.unpackb(frames[0], raw=False)
+    assert metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    assert len(metadata) == 4, "only constant-size fields belong in the metadata frame"
+    assert metadata[1] == request_id
+    assert metadata[3] == kv_meta
+    assert msgpack.unpackb(frames[1], raw=False) == prompt_tokens
+    assert msgpack.unpackb(frames[2], raw=False) == src_block_ids
+
+    # --- coordinator side: route it ---
+    coordinator = _StubCoordinator()
+    if native_disaggregation:
+        coordinator.disaggregated_runtime = object()
+        coordinator.router_socket = unittest.mock.Mock()
+    handler = HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV]
+    assert handler(coordinator, b"client-0", metadata, frames[1:]) is None
+
+    if native_disaggregation:
+        assert coordinator.sent == []
+        assert coordinator.next_request_id == 100
+        assert not coordinator.request_id_to_client_id
+        assert not coordinator.request_id_to_client_request_id
+        assert not coordinator.client_request_to_request_id
+        assert not coordinator.request_id_to_rank
+        assert coordinator._pending_counts[0] == 0
+        coordinator.router_socket.send_multipart.assert_called_once()
+        destination, error_frame = coordinator.router_socket.send_multipart.call_args.args[0]
+        header, rejected_id, reason, source_safe = msgpack.unpackb(error_frame, raw=False)
+        assert destination == b"client-0"
+        assert header == Headers.REQUEST_ERROR.value and rejected_id == request_id
+        assert "Client-supplied KV handoffs" in reason
+        assert "native coordinator" in reason and "use SUBMIT_REQUEST" in reason
+        assert source_safe is True
+        return
+
+    assert len(coordinator.sent) == 1
+    identity, out_frames = coordinator.sent[0]
+    assert identity == b"engine-0"
+    assert len(out_frames) == 3
+    # Both body frames are forwarded untouched -- not re-packed.
+    assert out_frames[1] is frames[1]
+    assert out_frames[2] is frames[2]
+
+    engine_metadata = msgpack.unpackb(out_frames[0], raw=False)
+    assert engine_metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    server_request_id = engine_metadata[1]
+    assert coordinator.request_id_to_client_request_id[server_request_id] == request_id
+    assert coordinator.request_id_to_rank[server_request_id] == b"engine-0"
+    assert coordinator._pending_counts[0] == 1
+
+    # --- engine side: the bodies are decoded here, for the first time ---
+    assert msgpack.unpackb(out_frames[1], raw=False) == prompt_tokens
+    assert msgpack.unpackb(out_frames[2], raw=False) == src_block_ids
+
+
+def test_kv_handoff_metadata_frame_does_not_grow_with_sequence_length():
+    """The metadata frame is the only one the coordinator decodes, so its size
+    must not follow the prompt. Build the same request at two prompt lengths and
+    require the metadata frame to be byte-identical in length."""
+    client = InferenceClient.__new__(InferenceClient)
+    sizes = []
+    for n_blocks in (1, 64):
+        client.next_request_id = 5
+        _, frames = InferenceClient._make_kv_handoff_request(
+            client,
+            list(range(n_blocks * 64)),
+            SamplingParams(num_tokens_to_generate=4),
+            {"agent": "nixl-0"},
+            list(range(n_blocks)),
+        )
+        sizes.append(len(frames[0]))
+    assert sizes[0] == sizes[1], (
+        f"metadata frame grew with prompt length ({sizes[0]} -> {sizes[1]} bytes); "
+        "something sequence-dependent leaked into it"
+    )
+
+
+def test_kv_handoff_rejects_legacy_single_frame_payload():
+    """A pre-split single-frame payload must be rejected, not silently mis-read."""
+    coordinator = _StubCoordinator()
+    legacy = [Headers.SUBMIT_REQUEST_WITH_KV.value, 1, [1, 2], {}, {}, []]
+    HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV](coordinator, b"client-0", legacy, [])
+    assert coordinator.sent == []
+
+
 class DummyTokenizer:
     """Dummy tokenizer."""
 
@@ -58,6 +328,7 @@ class DummyTokenizer:
         self.bos = bos
         self.eod = eod
         self.pad = pad
+        self.detokenize_calls = []
 
     def tokenize(self, prompt):
         if isinstance(prompt, str):
@@ -67,6 +338,7 @@ class DummyTokenizer:
     def detokenize(self, tokens, skip_special_tokens: bool = False):
         if isinstance(tokens, torch.Tensor):
             tokens = tokens.tolist()
+        self.detokenize_calls.append(list(tokens))
         if skip_special_tokens and self.eod in tokens:
             tokens = [tok for tok in tokens if tok != self.eod]
         return " ".join(str(tok) for tok in tokens)
@@ -103,10 +375,13 @@ class DummyEngine(DynamicInferenceEngine):
     def __init__(self):
         """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
+        self.failed_request_ids: List[int] = []
         self.requests: Dict[int, RequestEntry] = {}
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
+        self._disagg_config = None
+        self._kv_transfer_role = None
         self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
@@ -148,8 +423,12 @@ class DummyEngine(DynamicInferenceEngine):
         pass
 
     def add_request(
-        self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
-    ) -> asyncio.Future[DynamicInferenceRequestRecord]:
+        self,
+        request_id: int,
+        prompt: str,
+        sampling_params: Optional[SamplingParams] = None,
+        offload_params=None,
+    ) -> asyncio.Future[DynamicInferenceRequest]:
         """Dummy add_request."""
 
         # Mock tokenization to prevent `prompt_tokens == None`.
@@ -177,7 +456,7 @@ class DummyEngine(DynamicInferenceEngine):
         await asyncio.sleep(0)
 
         # Finish "active" requests.
-        finished_request_records = []
+        finished_requests = []
         to_remove = []
         for request_id, entry in self.requests.items():
             request = entry.record[-1]
@@ -187,16 +466,14 @@ class DummyEngine(DynamicInferenceEngine):
                     continue
                 request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
-                finished_request_records.append(entry.record)
-                entry.future.set_result(entry.record)
+                finished_request = self._complete_request(entry)
+                finished_requests.append(finished_request)
                 to_remove.append(request_id)
-                # Send signal to coordinator.
+                # Send signal to coordinator, framed the way a real engine does.
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
-                        use_bin_type=True,
+                    self.socket_for_receiving_requests.send_multipart(
+                        _engine_reply_frames([finished_request.serialize()])
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -212,7 +489,7 @@ class DummyEngine(DynamicInferenceEngine):
 
         return {
             "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "finished_requests": finished_requests,
             "step_time": 0.01,
             "cuda_graph_request_count": 1,
         }
@@ -507,8 +784,11 @@ class TestCoordinator:
                 for result in results:
                     if deserialize:
                         assert isinstance(result, DynamicInferenceRequest)
+                        assert result.generated_text == ""
                     else:
                         assert isinstance(result, dict)
+                        assert result["generated_text"] == ""
+                        assert "requests" not in result
 
             await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
@@ -778,6 +1058,76 @@ def _make_routing_coordinator(
 class TestRoutingPolicies:
     """Unit tests for routing behavior under different policies and load conditions."""
 
+    @pytest.mark.parametrize(
+        "loads,affinity,capacity,alpha,expected",
+        [
+            ([2, 0], None, None, 0.0, b"a"),
+            ([0, 0], None, None, 0.0, b"z"),
+            ([0, 2], None, [0.25, 0.75], 1.0, b"a"),
+            ([2, 0], None, [0.5, 0.5], 0.0, b"a"),
+            ([0, 0], None, [0.5, 0.5], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 1.0, b"a"),
+            ([0, 0], [1.0, 1.0], [0.25, 1.0], 1.0, b"z"),
+        ],
+    )
+    def test_stateless_selection(self, loads, affinity, capacity, alpha, expected):
+        identities = [b"z", b"a"]  # Rank order, not lexical identity order.
+        loads = np.array(loads)
+        affinity = None if affinity is None else np.array(affinity)
+        capacity = None if capacity is None else np.array(capacity)
+        for array in (loads, affinity, capacity):
+            if array is not None:
+                array.flags.writeable = False
+        assert (
+            select_engine(
+                identities,
+                loads,
+                affinity_scores=affinity,
+                available_fractions=capacity,
+                routing_alpha=alpha,
+            )
+            == expected
+        )
+        assert identities == [b"z", b"a"]
+        with pytest.raises(RuntimeError, match="No engines connected"):
+            select_engine([], np.array([]))
+
+    @pytest.mark.parametrize("header", [Headers.RELEASE_KV, Headers.RELEASE_KV_OWNER])
+    def test_handoff_release_retries_after_source_disconnect(self, header):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.instance_id = "source-instance"
+        coord.known_clients = {b"client"}
+        for request_id, owner in ((7, "old"), (8, "replacement")):
+            coord.handoff_ownership.offer(request_id, b"rank-0")
+            assert coord.handoff_ownership.claim(request_id, owner) is HandoffClaimStatus.ACCEPTED
+        # Routing eviction is not evidence that the source freed its allocations.
+        coord._remove_engine(b"rank-0")
+        metadata = (
+            [header.value, 7, coord.instance_id]
+            if header == Headers.RELEASE_KV
+            else [header.value, coord.instance_id, "old"]
+        )
+        coord.router_socket = unittest.mock.MagicMock(
+            send_multipart=unittest.mock.MagicMock(side_effect=zmq.ZMQError(zmq.EHOSTUNREACH))
+        )
+        HANDLERS[header](coord, b"client", metadata, [])
+        # Only delivery to the source was attempted; no successful ACK to the client.
+        assert coord.router_socket.send_multipart.call_count == 1
+        assert coord.router_socket.send_multipart.call_args.args[0][0] == b"rank-0"
+        assert coord.handoff_ownership.source_engine(7) == b"rank-0"
+        assert coord.handoff_ownership.claim(7, "other") is HandoffClaimStatus.REJECTED
+
+        coord._handle_rank_registration(b"rank-0")
+        coord.router_socket.send_multipart.reset_mock(side_effect=True)
+        HANDLERS[header](coord, b"client", metadata, [])
+        release, ack = coord.router_socket.send_multipart.call_args_list
+        assert release.args[0][0] == b"rank-0"
+        assert msgpack.unpackb(release.args[0][1]) == [Headers.RELEASE_KV.value, 7]
+        assert ack.args[0][0] == b"client"
+        assert coord.handoff_ownership.source_engine(7) is None
+        assert coord.handoff_ownership.source_engine(8) == b"rank-0"
+
     def test_no_prefix_caching_uses_load_balanced(self):
         """When prefix caching is off, routing goes to the least-loaded rank."""
         coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
@@ -833,20 +1183,20 @@ class TestRoutingPolicies:
         assert chosen == b"rank-1"
 
     def test_free_capacity_wins_when_prefix_rank_is_full(self):
-        """A free rank wins when the prefix-matched rank is full and alpha is low."""
+        """A free rank wins when the prefix-matched rank is saturated."""
         coord = _make_routing_coordinator(
             num_ranks=2,
             enable_prefix_caching=True,
             policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
         )
-        coord.prefix_caching_routing_alpha = 0.1
+        coord.prefix_caching_routing_alpha = 0.5
         coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 10
 
         fake_hash = 42
         _set_hash_rank(coord, fake_hash, b"rank-0", 1)
 
-        # score(rank-0) = 0.1*1 + 0.9*(0/10) = 0.1
-        # score(rank-1) = 0.1*0 + 0.9*(10/10) = 0.9
+        # mean 5 -> relative_load [+1, -1]; scores tie at 0.5 and the tiebreak
+        # goes to the least loaded rank.
         chosen = coord.get_best_data_parallel_rank([fake_hash])
         assert chosen == b"rank-1"
 
@@ -869,21 +1219,31 @@ class TestRoutingPolicies:
         """A removed engine's queued replies still deliver; never-connected senders assert."""
 
         def reply(fid):
-            return [
-                Headers.ENGINE_REPLY.value,
-                [{"request_id": fid, "generated_tokens": [1], "sampling_params": {}}],
+            """An ENGINE_REPLY as (metadata, body frames), matching the wire format.
+
+            The metadata frame carries only the routing key and the detokenize
+            flag; the finished request travels as an opaque body frame.
+            """
+            metadata = [Headers.ENGINE_REPLY.value, [[fid, True]]]
+            bodies = [
+                msgpack.packb(
+                    {"request_id": fid, "generated_tokens": [10, 11, 12], "sampling_params": {}},
+                    use_bin_type=True,
+                )
             ]
+            return metadata, bodies
 
         coord = _make_routing_coordinator(num_ranks=2)
         coord.tokenizer = DummyTokenizer()
         coord.request_id_to_client_id = {11: b"client-A"}
         coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
         coord.request_id_to_rank = {}
         coord.router_socket = unittest.mock.MagicMock()
 
         # A sender that never registered is a protocol violation.
         with pytest.raises(AssertionError, match="never-connected"):
-            handle_engine_reply(coord, b"impostor", reply(11))
+            handle_engine_reply(coord, b"impostor", *reply(11))
         assert coord.router_socket.send_multipart.call_count == 0
         assert 11 in coord.request_id_to_client_id
 
@@ -891,7 +1251,90 @@ class TestRoutingPolicies:
         # reply can still arrive - and must reach its client.
         coord._remove_engine(b"rank-0")
         with caplog.at_level(logging.WARNING):
-            handle_engine_reply(coord, b"rank-0", reply(11))
+            handle_engine_reply(coord, b"rank-0", *reply(11))
         assert "removed engine" in caplog.text
+        assert coord.tokenizer.detokenize_calls == [[10, 11, 12]]
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id
+
+        # A duplicated or delayed completion cannot be routed after the first
+        # reply releases its client mapping, but it must not kill the coordinator.
+        with caplog.at_level(logging.WARNING):
+            handle_engine_reply(coord, b"rank-0", *reply(11))
+        assert "duplicate or late ENGINE_REPLY" in caplog.text
+        assert coord.router_socket.send_multipart.call_count == 1
+
+    def test_unsafe_terminal_error_keeps_routing_until_safety_ack(self):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {11: b"client-A"}
+        coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
+        coord.request_id_to_rank = {11: b"rank-0"}
+        coord._pending_counts[0] = 1
+
+        HANDLERS[Headers.REQUEST_ERROR](
+            coord, b"rank-0", [Headers.REQUEST_ERROR.value, 11, "failed", False], []
+        )
+
+        assert coord.request_id_to_client_id == {11: b"client-A"}
+        assert coord.request_id_to_client_request_id == {11: 7}
+        assert coord.client_request_to_request_id == {(b"client-A", 7): 11}
+        assert coord.request_id_to_rank == {11: b"rank-0"}
+        assert coord._pending_counts[0] == 1
+
+        HANDLERS[Headers.REQUEST_ABORTED](
+            coord, b"rank-0", [Headers.REQUEST_ABORTED.value, 11, True], []
+        )
+
+        assert coord.request_id_to_client_id == {}
+        assert coord.request_id_to_client_request_id == {}
+        assert coord.client_request_to_request_id == {}
+        assert coord.request_id_to_rank == {}
+        assert coord._pending_counts[0] == 0
+
+    def test_late_partial_reply_is_ignored(self, caplog):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {}
+        coord.request_id_to_client_request_id = {}
+
+        with caplog.at_level(logging.WARNING):
+            HANDLERS[Headers.ENGINE_REPLY_PARTIAL](
+                coord,
+                b"rank-0",
+                [Headers.ENGINE_REPLY_PARTIAL.value, [11]],
+                [msgpack.packb({"request_id": 11}, use_bin_type=True)],
+            )
+
+        assert "late ENGINE_REPLY_PARTIAL" in caplog.text
+        coord.router_socket.send_multipart.assert_not_called()
+
+
+def test_engine_reply_defaults_to_detokenizing():
+    """A client that says nothing still gets its reply detokenized.
+
+    Coordinator-side detokenization was unconditional before reply bodies became
+    opaque frames. Keeping the default on means the frames change is invisible to
+    clients that relied on it; only a client that opts out pays nothing for it.
+    """
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    metadata = msgpack.unpackb(
+        _engine_reply_frames([{"request_id": 3, "sampling_params": SamplingParams().serialize()}])[
+            0
+        ],
+        raw=False,
+    )
+    assert metadata[1] == [[3, True]]
+
+
+def test_engine_reply_honours_an_opt_out():
+    """A client that detokenizes for itself lets the coordinator skip the body."""
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    params = SamplingParams(detokenize_generations=False).serialize()
+    metadata = msgpack.unpackb(
+        _engine_reply_frames([{"request_id": 4, "sampling_params": params}])[0], raw=False
+    )
+    assert metadata[1] == [[4, False]]

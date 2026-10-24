@@ -8,7 +8,11 @@ import transformer_engine.pytorch as te
 from transformer_engine.pytorch import is_mxfp8_available, is_nvfp4_available
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 
-from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+    _GTP_PARAMS,
+    GTPShardedParam,
+    reset_gtp_state,
+)
 from tests.unit_tests.test_utilities import Utils
 
 # ---------------------------------------------------------------------------
@@ -32,9 +36,18 @@ def reset_fp8_state():
 
 @pytest.fixture(autouse=True)
 def reset_gtp_globals():
-    """Reset GTP mutable class-level state between tests."""
+    """Reset GTP mutable class-level state between tests.
+
+    Defers to the production reset so this cannot drift as new class-level state is added.
+    Note it only clears the process-global cursors: the chain links themselves live on the
+    params (``prev_w`` / ``_recompute_prev`` / ``_ag_ticket_*``, set once in
+    ``_init_gtp_runtime_attrs``), so a test that reuses modules across cases would inherit
+    stale links. Every GTP test builds fresh modules for this reason.
+    """
     yield
-    GTPShardedParam._chain_state = {}
+    reset_gtp_state()
+    # Not part of the production reset: every GTP param ever built stays in it (and allocated).
+    _GTP_PARAMS.clear()
 
 
 # ---------------------------------------------------------------------------

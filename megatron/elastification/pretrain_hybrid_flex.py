@@ -46,13 +46,20 @@ from megatron.training import (
     get_args,
     get_timers,
     get_tokenizer,
+    get_train_state,
     inprocess_restart,
     pretrain,
     print_rank_0,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -164,6 +171,7 @@ def model_provider(
         hybrid_layer_pattern=args.hybrid_layer_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        logit_dtype=getattr(args, 'logit_dtype', None),
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
@@ -317,7 +325,7 @@ def loss_func(
 
     alpha = args.loss_alpha
 
-    (output_tensor, (param_loss, extra_reporting_dict)) = output_tensor
+    output_tensor, (param_loss, extra_reporting_dict) = output_tensor
 
     if param_loss is not None:
         if param_loss > 0:
@@ -390,15 +398,20 @@ def loss_func(
         return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
-def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42):
+def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42, training=True):
 
     dp_size = get_data_parallel_world_size()
     grad_accumulation_steps = get_current_global_batch_size() // (get_micro_batch_size() * dp_size)
     global _global_choice_counter
 
     # DP-specific seeding
+    train_state = get_train_state()
+    iteration = train_state.iteration
+    # Match the router's schedule for evaluation after the last executed step.
+    if not training and iteration > train_state.resume_iteration:
+        iteration -= 1
     rng = np.random.RandomState(
-        base_seed + _global_choice_counter + grad_accumulation_steps * args.curr_iteration * 10
+        base_seed + _global_choice_counter + grad_accumulation_steps * iteration * 10
     )
     if choices is None:
         choice = rng.uniform(0, 1)
@@ -459,12 +472,15 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        (tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen) = (
-            get_batch(data_iterator)
+        tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(
+            data_iterator
         )
     timers('batch-generator').stop()
 
-    if get_grad_acc_based_random_choice(args=args) < args.original_model_sample_prob:
+    if (
+        get_grad_acc_based_random_choice(args=args, training=model.training)
+        < args.original_model_sample_prob
+    ):
         # Funnel "full-model sample" through the regular router-driven path
         # with budget=1.0. flextron_forward unconditionally reads
         # flextron_kwargs['budget'], so an empty dict would KeyError here.
@@ -482,7 +498,7 @@ def forward_step(data_iterator, model: HybridModel):
         budget_probs = [float(p) for p in budget_probs]
         budget_probs = [p / sum(budget_probs) for p in budget_probs]
         selected_budget = get_grad_acc_based_random_choice(
-            args=args, choices=args.budget_list, prob=budget_probs
+            args=args, choices=args.budget_list, prob=budget_probs, training=model.training
         )
         flextron_kwargs = {'budget': selected_budget}
 
@@ -508,6 +524,7 @@ def is_dataset_built_on_rank(vp_stage=None):
 
 
 def core_gpt_dataset_config_from_args(args):
+    cfg = get_run_config()
     tokenizer = get_tokenizer()
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -516,7 +533,7 @@ def core_gpt_dataset_config_from_args(args):
     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
     return GPTDatasetConfig(
-        random_seed=args.seed,
+        random_seed=cfg.rng.seed,
         sequence_length=args.seq_length,
         blend=blend,
         blend_per_split=blend_per_split,
@@ -618,6 +635,7 @@ if __name__ == "__main__":
     )
 
     full_config = pretrain_cfg_container_from_args(args)
+    set_run_config(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

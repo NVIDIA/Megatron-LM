@@ -16,9 +16,12 @@ Gradient copy from GPU to CPU, CPU optimizer step, and subsequent parameter copy
 
 `--chunked-optimizer-state-offload` keeps a configurable fraction of optimizer tensor state and
 master weights in pinned CPU memory between updates, while the optimizer update itself still runs
-on GPU. Tensor state is restored and updated in bounded parameter chunks. All selected master
-weights use one full restore window and remain on CUDA across every state chunk during an update or
-distributed-checkpoint state initialization.
+on GPU. Tensor state is restored and updated in bounded parameter chunks. A master the optimizer
+owns, precision-aware FusedAdam's `state['master_param']` (an fp32 copy or the int16 remainder of a
+BF16 parameter), is part of that tensor state: only the optimizer's own update reads it, so it is
+staged, updated and copied back with its chunk. MCore-owned master weights, which MCore's
+main-to-model copies read after the update, use one full restore window and remain on CUDA across
+every state chunk during an update or distributed-checkpoint state initialization.
 
 ```bash
 --chunked-optimizer-state-offload
@@ -29,11 +32,12 @@ distributed-checkpoint state initialization.
 
 A chunk size of `0` restores all selected tensor state for one update and therefore does not bound
 the temporary tensor-state peak; argument validation emits a warning for this setting. A positive
-size bounds that tensor-state window, but never the full selected master-weight window described
-above. The fraction is an approximate byte fraction because a parameter and all of its optimizer
-state are an atomic bundle. Partial selection prioritizes bundles that actually include a separate
-master before state-only bundles; precision-aware FusedAdam can own a separate master for native
-FP32 DistributedOptimizer shards too.
+size bounds that tensor-state window, optimizer-owned masters included, but never the full
+MCore-owned master-weight window described above. The fraction is an approximate byte fraction
+because a parameter and all of its optimizer state are an atomic bundle. Partial selection
+prioritizes bundles that actually include a separate master before state-only bundles;
+precision-aware FusedAdam can own a separate master for native FP32 DistributedOptimizer shards
+too.
 Supported paths are Adam with `DistributedOptimizer`, and BF16 Muon with compact-layout
 `LayerWiseDistributedOptimizer`; BF16 and FP8 parameter gather are supported. Full-iteration and
 optimizer CUDA graphs are not supported while the fraction is nonzero. When optimizer state is
@@ -51,21 +55,30 @@ next chunk, optimizer compute for the current chunk, and D2H for the previous ch
 The normal tensor-state staging bound is therefore about
 `2 * optimizer_state_offload_chunk_size_mb` per manager that is actively stepping, not one
 chunk; a single parameter's atomic tensor-state payload can exceed the target and produces a
-runtime warning. LayerWise has at most one non-empty Muon child, so its internal state manager uses
-the same two-slot bound. In the outer split Muon + Adam chain, however, a sibling
-`DistributedOptimizer` can retain its first prefetched chunk while the LayerWise manager owns two
-slots. The aggregate across those two managers can therefore still approach
-`3 * optimizer_state_offload_chunk_size_mb`; the 256 MiB example can hold about 768 MiB during
-that overlap window. Temporary state and master windows are allocated on the current compute
-stream so their reserved memory returns to the same allocator pool used by forward/backward; the
-H2D stream waits for both that compute stream and the D2H stream before writing them. D2H
-completion does not block the host at the forward boundary.
+runtime warning. Each window is one byte buffer per device shared by every state dtype, so
+chunks that mix FP32 and BF16 state or masters reuse it rather than adding to the bound. A chain
+of managers, such as dense and expert `DistributedOptimizer` children or the outer split Muon +
+Adam chain, steps them one after another: only the first child restores its first chunk ahead of
+the update, and each later child restores its own when its step begins.
+LayerWise has at most one non-empty Muon child, so its internal state manager uses the same
+two-slot bound and counts as the first child of the outer chain.
 
-Every `ChainedOptimizer` recursively shares one copy-stream pair across its LayerWise and sibling
-`DistributedOptimizer` managers, including ordinary Adam dense/expert chains. Stream sharing
-serializes transfer order but does not merge managers' two-slot pools. LayerWise starts its single
-managed child's first state chunk during gradient finalization, then pipelines that child's later
-chunks with optimizer compute. A host synchronization is used only for synchronous
+A chain shares one pair of staging windows across its managers and keeps it alive while the
+children step, so each child hands its windows to the next one instead of freeing them. Freeing
+would not bound the chain: a window whose last D2H copy is still in flight stays unusable to the
+caching allocator until that copy finishes, so the next child would allocate its own, and every
+child's window could stay resident until the chain finished. The handover needs no extra wait,
+because every H2D already waits for the shared D2H stream. The chain therefore stays within one
+manager's two windows, whatever each child's state dtypes. The windows are freed when the
+chain's step ends. Temporary state and master windows are allocated on the current compute stream
+so their reserved memory returns to the same allocator pool used by forward/backward; the H2D
+stream waits for both that compute stream and the D2H stream before writing them. D2H completion
+does not block the host at the forward boundary.
+
+Every `ChainedOptimizer` recursively shares one copy-stream pair and one two-slot staging pool
+across its LayerWise and sibling `DistributedOptimizer` managers, including ordinary Adam
+dense/expert chains. LayerWise starts its single managed child's first state chunk during gradient
+finalization, then pipelines that child's later chunks with optimizer compute. A host synchronization is used only for synchronous
 distributed-checkpoint access and one-time lazy state initialization.
 
 Selected master bindings and supported full-size state bindings become CPU tensors as soon as their
