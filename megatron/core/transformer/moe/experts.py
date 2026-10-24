@@ -345,10 +345,12 @@ class TEGroupedMLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
+        # The fused grouped-MLP kernels are FP8/NVFP4-only. A --te-precision-config-file override
+        # that turns the experts bf16 therefore disables fusion; a quantized override (e.g. MXFP8
+        # experts under a global NVFP4 recipe) keeps fusion and is applied by entering the module's
+        # own quantization autocast around the fused call (see _fused_quant_context), exactly as
+        # TEGroupedLinear.forward does on the unfused path. Fusion spans fc1 and fc2, so either one
+        # opting out ends it.
         self._with_fused_impl: bool = (
             self.config.use_transformer_engine_op_fuser
             and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
@@ -875,6 +877,28 @@ class TEGroupedMLP(MegatronModule):
         self._ensure_main_grad(self.linear_fc1)
         self._ensure_main_grad(self.linear_fc2)
 
+    def _fused_quant_context(self):
+        """Quantization autocast for the fused grouped-MLP call.
+
+        The TE op fuser builds its quantizers from the ambient autocast recipe, not from the
+        per-module ``te_quant_params`` that ``TEGroupedLinear.forward`` would apply on the unfused
+        path. Enter the same per-module context here so a --te-precision-config-file override
+        (e.g. MXFP8 experts under a global NVFP4 recipe) is honored by the fused kernels and their
+        backward. Fusion spans fc1 and fc2, so both must carry the same override.
+        """
+        from megatron.core.extensions.transformer_engine import _get_fp8_autocast_for_quant_params
+
+        qparams_fc1 = getattr(self.linear_fc1, "te_quant_params", None)
+        qparams_fc2 = getattr(self.linear_fc2, "te_quant_params", None)
+        if qparams_fc1 is None and qparams_fc2 is None:
+            return nullcontext()
+        if qparams_fc1 != qparams_fc2:
+            raise RuntimeError(
+                "Fused GroupedMLP requires linear_fc1 and linear_fc2 to share the same "
+                f"quantization override; got {qparams_fc1} and {qparams_fc2}."
+            )
+        return _get_fp8_autocast_for_quant_params(qparams_fc1, self.training)
+
     def _fused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -962,7 +986,7 @@ class TEGroupedMLP(MegatronModule):
         fused_group_mlp_manager = off_interface(
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         )
-        with fused_group_mlp_manager as permuted_local_hidden_states:
+        with self._fused_quant_context(), fused_group_mlp_manager as permuted_local_hidden_states:
             # NCCL-EP zero-copy is active exactly when ``output_buffer`` is not None, and then the
             # fused-MLP input aliases the persistent symm buffer (also the fc2 output combine
             # reads), whose storage is non-resizable — so skip the force-release in that case.
