@@ -23,6 +23,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -50,6 +51,71 @@ def process_group_collection(distributed_setup):
     model_parallel_cuda_manual_seed(1234)
     yield process_group_collection
     destroy_model_parallel()
+
+
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_ep_overlap_mtp_depth_validation(process_group_collection, mtp_num_layers, overlap):
+    """Validate global MTP depth even on a chunk without an MTP block."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        mtp_num_layers=mtp_num_layers,
+        gradient_accumulation_fusion=False,
+    )
+    config.overlap_moe_expert_parallel_comm = overlap
+    module = torch.nn.Linear(16, 16)
+    module.mtp_process = False
+    ddp_config = DistributedDataParallelConfig(use_megatron_fsdp=True, megatron_fsdp_version=2)
+    validate = mcore_fsdp_adapter.FullyShardedDataParallelV2._validate_config
+    if overlap and mtp_num_layers == 2:
+        with pytest.raises(ValueError, match="requires mtp_num_layers <= 1"):
+            validate(config, ddp_config, module, process_group_collection, False)
+    else:
+        validate(config, ddp_config, module, process_group_collection, False)
+
+
+@pytest.mark.parametrize(
+    "pipeline_size,mtp_num_layers,tied,wrapped",
+    [
+        (2, 1, True, False),
+        (2, 1, True, True),
+        (1, 1, True, True),
+        (2, None, True, True),
+        (2, 0, True, True),
+        (2, 1, False, True),
+    ],
+)
+def test_tied_mtp_pipeline_validation(
+    process_group_collection, pipeline_size, mtp_num_layers, tied, wrapped
+):
+    """Reject only PP + MTP + tied embeddings, including wrapped input-stage chunks."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=pipeline_size,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        mtp_num_layers=mtp_num_layers,
+        gradient_accumulation_fusion=False,
+    )
+    module = torch.nn.Linear(16, 16)
+    module.share_embeddings_and_output_weights = tied
+    # Even the input stage, which owns no MTP block, must reject this topology.
+    module.pre_process = True
+    module.mtp_process = False
+    if wrapped:
+        module = Float16Module(config, module)
+    ddp_config = DistributedDataParallelConfig(use_megatron_fsdp=True, megatron_fsdp_version=2)
+    validate = mcore_fsdp_adapter.FullyShardedDataParallelV2._validate_config
+    if pipeline_size > 1 and mtp_num_layers and tied:
+        with pytest.raises(ValueError, match=r"PP > 1 with MTP and tied embeddings.*8330"):
+            validate(config, ddp_config, module, process_group_collection, False)
+    else:
+        validate(config, ddp_config, module, process_group_collection, False)
 
 
 @pytest.mark.launch_on_gb200
