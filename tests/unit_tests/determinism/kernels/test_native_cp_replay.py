@@ -16,9 +16,32 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_token_prediction import bind_native_mtp_cp_group, roll_tensor
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, bytes_equal
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, _restore_torch_settings, _snapshot_torch_settings
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_cudnn_fixture_restoration_respects_frozen_settings(monkeypatch, changed):
+    """Restoring an unchanged snapshot must not write frozen flags or skip real changes."""
+    snapshot = _snapshot_torch_settings()
+    initial = tuple(not value if changed else value for value in snapshot["cudnn"])
+    writes = []
+
+    class CudnnState:
+        deterministic, benchmark, allow_tf32 = initial
+
+        def __setattr__(self, name, value):
+            assert changed, "Unchanged frozen flags must not be assigned"
+            writes.append(name)
+            object.__setattr__(self, name, value)
+
+    state = CudnnState()
+    monkeypatch.setattr(torch.backends, "cudnn", state)
+    _restore_torch_settings(snapshot)
+    names = ("deterministic", "benchmark", "allow_tf32")
+    assert tuple(getattr(state, name) for name in names) == snapshot["cudnn"]
+    assert writes == (list(names) if changed else [])
 
 
 @pytest.fixture
