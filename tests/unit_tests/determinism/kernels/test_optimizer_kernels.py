@@ -6,6 +6,8 @@ Adam update. These run once per step on every parameter, so any drift here chang
 whole trajectory even when the model kernels are deterministic.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -35,6 +37,24 @@ class TestGradNormAndClip:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("bf16", [False, True])
+    @pytest.mark.parametrize("expert", [False, True])
+    def test_param_norm_uses_model_precision(self, monkeypatch, run_config, bf16, expert):
+        """Config-owned precision selects the same weights as the legacy norm path."""
+        from megatron.training.utils import common_utils
+
+        # Deliberately disagree with legacy args to exercise config ownership.
+        monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(bf16=not bf16))
+        run_config.model.transformer.bf16 = bf16
+        model = torch.nn.Linear(2, 1, bias=False, device="cuda", dtype=torch.bfloat16)
+        model.weight.data.fill_(3)
+        model.weight.main_param = torch.full_like(model.weight, 4, dtype=torch.float32)
+        model.weight.allreduce = not expert
+        expected = (2 * (4 if bf16 else 3) ** 2) ** 0.5
+        norms = [common_utils.calc_params_l2_norm(model) for _ in range(3)]
+        assert norms == [norms[0]] * 3
+        assert norms[0] == pytest.approx(expected)
 
     @pytest.mark.parametrize("norm_type", [2, float("inf")])
     def test_get_grad_norm_fp32_replays(self, norm_type):

@@ -79,7 +79,8 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
         csa_dense_mode=False,
     )
 
-    assert _get_indexer_logging_layer_counts(args) == (3, 2)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (3, 2)
 
 
 @pytest.mark.parametrize("fsdp2", [False, True])
@@ -99,7 +100,12 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
         else training.DistributedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
     )
     builder = Mock()
-    run_config.model = SimpleNamespace(get_builder_cls=lambda: Mock(return_value=builder))
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=run_config.model.transformer, seq_length=16, vocab_size=128
+    )
+    monkeypatch.setattr(run_config.model, "get_builder_cls", lambda: Mock(return_value=builder))
     monkeypatch.setattr(training, "get_args", lambda: args)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
@@ -134,13 +140,14 @@ def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
         csa_dense_mode=False,
     )
 
-    assert _get_indexer_logging_layer_counts(args) == (5, 5)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 5)
 
     args.mtp_use_repeated_layer = True
-    assert _get_indexer_logging_layer_counts(args) == (5, 3)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 3)
 
     args.csa_dense_mode = True
-    assert _get_indexer_logging_layer_counts(args) == (5, 0)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 0)
 
 
 def test_indexer_logging_uses_normalized_hybrid_layer_positions():
@@ -161,7 +168,8 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     expected_ratios = [0, 0, 4, 128, 0, 4, 128, 0, 4]
     assert args.csa_compress_ratios == expected_ratios
     assert config_kwargs["csa_compress_ratios"] == expected_ratios
-    assert _get_indexer_logging_layer_counts(args) == (6, 3)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (6, 3)
 
 
 class TestTraining:
@@ -339,6 +347,7 @@ class TestPackedSampleAccounting:
     ):
         """Sequence shards count each sample once for progress and sample-based LR schedules."""
         import megatron.training.training as training
+        from megatron.core.transformer import TransformerConfig
 
         args = SimpleNamespace(
             gtp_remat_num_sequence_shards=num_sequence_shards,
@@ -351,6 +360,15 @@ class TestPackedSampleAccounting:
             micro_batch_size=2,
             train_iters=None,
             train_samples=10_000,
+        )
+        monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 8)
+        run_config.model.transformer = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            context_parallel_size=total_cp,
+            tensor_parallel_num_weight_shards=weight_shards,
+            tensor_parallel_num_sequence_shards=num_sequence_shards,
         )
         run_config.train = TrainingConfig(micro_batch_size=2, train_samples=10_000)
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)

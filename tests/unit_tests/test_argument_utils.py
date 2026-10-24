@@ -115,7 +115,7 @@ def test_hash_moe_vocab_is_initialized_before_config_conversion(
     args.padded_vocab_size = 100352
     tokenizer = SimpleNamespace(vocab_size=100003)
     monkeypatch.setattr(global_vars, '_GLOBAL_TOKENIZER', None)
-    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args: tokenizer)
+    monkeypatch.setattr(global_vars, 'build_tokenizer', lambda _args, **kwargs: tokenizer)
 
     global_vars._build_tokenizer(args)
     config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
@@ -1350,32 +1350,43 @@ class TestMegatronMixedPrecisionArguments:
 
 
 def _make_args(**overrides):
-    """Build the minimum Namespace required by pretrain_cfg_container_from_args.
+    """Build CLI defaults with a small valid callback model.
 
     These fields have non-trivial CLI→config name mappings or boolean inversions
     that pretrain_cfg_container_from_args handles explicitly.
     """
-    defaults = {
-        # CheckpointConfig boolean inversions (legacy-style --no-* flags)
-        "no_save_optim": False,
-        "no_save_rng": False,
-        "no_load_optim": False,
-        "no_load_rng": False,
-        # CheckpointConfig custom argparse dest names
-        "ckpt_fully_parallel_save": True,
-        "ckpt_fully_parallel_load": False,
-        # ProfilingConfig: use_nsys_profiler is exposed as --profile on the CLI
-        "profile": False,
-        # RerunStateMachineConfig: field is check_for_nan_in_loss, CLI flag is check_for_nan_in_loss_and_grad
-        "check_for_nan_in_loss_and_grad": True,
-    }
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    defaults = vars(parser.parse_args([]))
+    defaults.update(
+        {
+            "num_layers": 2,
+            "hidden_size": 16,
+            "num_attention_heads": 4,
+            "max_position_embeddings": 64,
+            "params_dtype": torch.float32,
+            # CheckpointConfig boolean inversions (legacy-style --no-* flags)
+            "no_save_optim": False,
+            "no_save_rng": False,
+            "no_load_optim": False,
+            "no_load_rng": False,
+            # CheckpointConfig custom argparse dest names
+            "ckpt_fully_parallel_save": True,
+            "ckpt_fully_parallel_load": False,
+            # ProfilingConfig: use_nsys_profiler is exposed as --profile on the CLI
+            "profile": False,
+            # RerunStateMachineConfig: field is check_for_nan_in_loss, CLI flag is check_for_nan_in_loss_and_grad
+            "check_for_nan_in_loss_and_grad": True,
+        }
+    )
     defaults.update(overrides)
     return Namespace(**defaults)
 
 
 @pytest.fixture
 def mock_optimizer_config():
-    return MagicMock(spec=OptimizerConfig)
+    return OptimizerConfig()
 
 
 @pytest.fixture
@@ -1407,20 +1418,22 @@ class TestPretrainContainerFromArgsStructure:
     @patch("megatron.training.training.get_megatron_optimizer_config")
     def test_optimizer_config_comes_from_helper(self, mock_opt, mock_ddp):
         """Test that optimizer config comes from get_megatron_optimizer_config."""
-        mock_optimizer = MagicMock(spec=OptimizerConfig)
+        mock_optimizer = OptimizerConfig(lr=0.123, weight_decay=0.456)
         mock_opt.return_value = (mock_optimizer, {})
         mock_ddp.return_value = MagicMock(spec=DistributedDataParallelConfig)
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
         mock_opt.assert_called_once_with(args)
-        assert result.optimizer is mock_optimizer
+        assert result.optimizer.lr == mock_optimizer.lr
+        assert result.optimizer.weight_decay == mock_optimizer.weight_decay
+        assert result.optimizer.params_dtype == result.model.transformer.params_dtype
 
     @patch("megatron.training.training.get_megatron_ddp_config")
     @patch("megatron.training.training.get_megatron_optimizer_config")
     def test_ddp_config_comes_from_helper(self, mock_opt, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
-        mock_opt.return_value = (MagicMock(spec=OptimizerConfig), {})
+        mock_opt.return_value = (OptimizerConfig(), {})
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
@@ -1429,9 +1442,7 @@ class TestPretrainContainerFromArgsStructure:
 
     @pytest.mark.parametrize("enabled", [False, True])
     def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
-        parser = ArgumentParser()
-        add_megatron_arguments(parser)
-        args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
+        args = _make_args(use_megatron_fsdp=enabled, fake_process_group=enabled)
         monkeypatch.setattr(
             "megatron.training.training.get_megatron_optimizer_config",
             lambda args: (OptimizerConfig(), {}),

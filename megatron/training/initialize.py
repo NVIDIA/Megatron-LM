@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from megatron.core import mpu, tensor_parallel, tuning
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
@@ -47,7 +48,12 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.global_vars import get_run_config, get_train_state, initialize_runtime_services
+from megatron.training.config import PretrainConfigContainer
+from megatron.training.global_vars import (
+    get_run_config,
+    get_train_state,
+    initialize_runtime_services,
+)
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -93,8 +99,10 @@ def initialize_megatron(
     cfg = get_run_config()
     # Resolve runtime config before distributed initialization and RNG setup.
     cfg.finalize()
+    # Inference's args-only entrypoints keep their existing input boundary. Training
+    # supplies a typed model config, including callback-based applications.
+    model_config = cfg.model.transformer if isinstance(cfg, PretrainConfigContainer) else args
     transformer_config = getattr(cfg.model, "transformer", None)
-    # Legacy model-provider entrypoints do not construct a model config yet.
     tp_comm_overlap = (
         transformer_config.tp_comm_overlap
         if transformer_config is not None
@@ -137,16 +145,18 @@ def initialize_megatron(
             result_rejected_tracker_filename=args.result_rejected_tracker_filename,
         )
 
-    if args.batch_invariant_mode:
-        backend = args.batch_invariant_backend
-        collective = args.batch_invariant_collective
+    if model_config.batch_invariant_mode:
+        backend = model_config.batch_invariant_backend
+        collective = model_config.batch_invariant_collective
         print_rank_0(
             f"Enabling batch invariant mode globally (backend={backend}, collective={collective})"
         )
         enable_batch_invariant_mode(backend, collective)
 
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
-    tuning.install(_triton_autotune_config_from_args(args), deterministic=args.deterministic_mode)
+    tuning.install(
+        _triton_autotune_config_from_args(args), deterministic=model_config.deterministic_mode
+    )
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -158,6 +168,7 @@ def initialize_megatron(
             get_position_embedding_ranks,
             store,
             skip_model_parallel_init=skip_model_parallel_init,
+            model_config=model_config,
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -177,7 +188,7 @@ def initialize_megatron(
                 cfg.rng.data_parallel_random_init,
                 cfg.rng.te_rng_tracker,
                 cfg.rng.inference_rng_tracker,
-                use_cudagraphable_rng=args.cuda_graph_impl != "none",
+                use_cudagraphable_rng=model_config.cuda_graph_impl != "none",
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,
                 tp_group=seed_tp_group,
@@ -186,7 +197,11 @@ def initialize_megatron(
             )
 
         # Setup MoE aux loss scale value.
-        if args.num_experts is not None:
+        num_experts = (
+            cfg.model.transformer.num_moe_experts
+            if isinstance(cfg, PretrainConfigContainer) else args.num_experts
+        )
+        if num_experts is not None:
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 
             MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
@@ -197,10 +212,10 @@ def initialize_megatron(
     args = get_args()
     if cfg.dist.lazy_mpu_init:
         # TODO is this still a necessary option?
-        args.use_cpu_initialization = True
+        model_config.use_cpu_initialization = True
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals
-        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+        mpu.set_tensor_model_parallel_world_size(model_config.tensor_model_parallel_size)
         # and return function for external DDP manager
         # to call when it has DDP initialized
         mpu.set_tensor_model_parallel_rank(args.rank)
@@ -342,10 +357,14 @@ def _initialize_tp_communicators(
 
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+                            skip_model_parallel_init=False, *, model_config=None):
     """Initialize torch.distributed and core model parallel."""
     cfg = get_run_config()
     args = get_args()
+    if model_config is None:
+        # Direct inference/bootstrap callers have not constructed a training model config.
+        cfg = get_run_config()
+        model_config = cfg.model.transformer if isinstance(cfg, PretrainConfigContainer) else args
 
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
@@ -365,7 +384,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             device_id = None
 
         # Set to non-default stream for cudagraph capturing.
-        if args.cuda_graph_impl == "transformer_engine":
+        if model_config.cuda_graph_impl == "transformer_engine":
             torch.cuda.set_stream(torch.cuda.Stream())
 
         # Set flight recorder env vars if specified.
@@ -415,7 +434,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         init_process_group_kwargs = {
             'backend': cfg.dist.distributed_backend,
             'store': store,
-            'world_size': args.world_size,
+            'world_size': safe_get_world_size(),
             'rank': args.rank,
             'timeout': timedelta(minutes=cfg.dist.distributed_timeout_minutes),
         }
@@ -443,7 +462,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
-            if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+            if model_config.gtp_weight_remat_size > 1 or model_config.expert_gtp_weight_remat_size > 1:
                 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
                 assert HAVE_GTP, (
@@ -455,20 +474,20 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
             # Expert grid: world_size must be divisible by ETP * EP * PP * EGTP_remat.
             mpu.initialize_model_parallel(
-                args.tensor_model_parallel_size,
-                args.pipeline_model_parallel_size,
-                args.virtual_pipeline_model_parallel_size,
-                pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
+                model_config.tensor_model_parallel_size,
+                model_config.pipeline_model_parallel_size,
+                model_config.virtual_pipeline_model_parallel_size,
+                pipeline_model_parallel_comm_backend=model_config.pipeline_model_parallel_comm_backend,
                 use_sharp=cfg.dist.use_sharp,
-                gtp_remat_size=args.gtp_weight_remat_size,
-                expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
-                gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
-                context_parallel_size=args.context_parallel_size,
-                hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
-                expert_model_parallel_size=args.expert_model_parallel_size,
+                gtp_remat_size=model_config.gtp_weight_remat_size,
+                expert_gtp_remat_size=model_config.expert_gtp_weight_remat_size,
+                gtp_remat_num_sequence_shards=model_config.gtp_remat_num_sequence_shards,
+                context_parallel_size=model_config.context_parallel_size,
+                hierarchical_context_parallel_sizes=model_config.hierarchical_context_parallel_sizes,
+                hybrid_context_parallel=model_config.hybrid_context_parallel,
+                expert_model_parallel_size=model_config.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
-                expert_tensor_parallel_size=args.expert_tensor_parallel_size,
+                expert_tensor_parallel_size=model_config.expert_tensor_parallel_size,
                 distributed_timeout_minutes=cfg.dist.distributed_timeout_minutes,
                 nccl_communicator_config_path=cfg.dist.nccl_communicator_config_path,
                 order='tp-cp-ep-dp-pp' if not cfg.dist.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
@@ -572,7 +591,9 @@ def write_args_to_tensorboard():
             writer.add_text(arg, str(getattr(args, arg)), global_step=get_train_state().iteration)
 
 
-def set_jit_fusion_options(tp_size=None):
+def set_jit_fusion_options(
+    config: TransformerConfig, *, sequence_length: int, micro_batch_size: int, tp_size=None
+):
     """Set PyTorch JIT layer fusion options."""
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
@@ -593,45 +614,46 @@ def set_jit_fusion_options(tp_size=None):
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
-    _warmup_jit_function(tp_size=tp_size)
+    _warmup_jit_function(
+        config, sequence_length=sequence_length, micro_batch_size=micro_batch_size, tp_size=tp_size
+    )
 
 
-def _warmup_jit_function(tp_size=None):
+def _warmup_jit_function(
+    config: TransformerConfig, *, sequence_length: int, micro_batch_size: int, tp_size=None
+):
     """Compilie JIT functions before the main training steps"""
-    cfg = get_run_config()
-    args = get_args()
-    if args.bf16:
+    if config.bf16:
         dtype = torch.bfloat16
-    elif args.fp16:
+    elif config.fp16:
         dtype = torch.float16
     else:
         dtype = torch.float32
 
     # Check if TE activation function is used (in which case, no need to warmup custom fusions)
-    use_te_activation_func = getattr(args, 'use_te_activation_func', False)
-    gated_linear_unit = getattr(args, 'gated_linear_unit', False)
+    use_te_activation_func = config.use_te_activation_func
+    gated_linear_unit = config.gated_linear_unit
+    swiglu = gated_linear_unit and config.activation_func is torch.nn.functional.silu
 
     # Warmup bias_swiglu: swiglu activation (F.silu + GLU)
     warmup_bias_swiglu = (
         not use_te_activation_func
-        and args.swiglu
-        and args.bias_swiglu_fusion
+        and swiglu
+        and config.bias_activation_fusion
     )
 
     warmup_bias_gelu = (
         not use_te_activation_func
-        and not args.swiglu
-        and not getattr(args, 'quick_geglu', False)
+        and config.activation_func is torch.nn.functional.gelu
         and not gated_linear_unit
-        and args.bias_gelu_fusion
+        and config.bias_activation_fusion
     )
 
     warmup_bias_geglu = (
         not use_te_activation_func
-        and not args.swiglu
-        and not getattr(args, 'quick_geglu', False)
+        and config.activation_func is torch.nn.functional.gelu
         and gated_linear_unit
-        and args.bias_gelu_fusion
+        and config.bias_activation_fusion
     )
 
     # NOTE: the torch.rand draws and the fused bias+dropout+add warmup below
@@ -643,13 +665,13 @@ def _warmup_jit_function(tp_size=None):
     # Only the bias_swiglu/bias_gelu/bias_geglu calls are gated on arguments:
     # they consume no RNG, so skipping them cannot perturb determinism.
     bias = torch.rand(
-        args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
+        config.ffn_hidden_size // config.tensor_model_parallel_size, dtype=dtype, device="cuda"
     )
     input = torch.rand(
         (
-            args.seq_length // args.context_parallel_size,
-            cfg.train.micro_batch_size,
-            args.ffn_hidden_size // args.tensor_model_parallel_size,
+            sequence_length // config.context_parallel_size,
+            micro_batch_size,
+            config.ffn_hidden_size // config.tensor_model_parallel_size,
         ),
         dtype=dtype,
         device="cuda",
@@ -683,25 +705,25 @@ def _warmup_jit_function(tp_size=None):
     del bias, input
 
     # Warmup fused bias+dropout+add. Intentionally NOT gated on
-    # args.bias_dropout_fusion: the fused train calls consume RNG for the
+    # config.bias_dropout_fusion: the fused train calls consume RNG for the
     # dropout mask, and conditioning them would shift downstream determinism
     # relative to the historical behavior encoded in the golden values.
-    if args.sequence_parallel:
+    if config.sequence_parallel:
         # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
-        seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
+        seq_length = sequence_length // (tp_size or config.tensor_model_parallel_size)
     else:
-        seq_length = args.seq_length
+        seq_length = sequence_length
     input = torch.rand(
-        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
+        (seq_length // config.context_parallel_size, micro_batch_size, config.hidden_size),
         dtype=dtype,
         device="cuda",
     )
     residual = torch.rand(
-        (seq_length // args.context_parallel_size, cfg.train.micro_batch_size, args.hidden_size),
+        (seq_length // config.context_parallel_size, micro_batch_size, config.hidden_size),
         dtype=dtype,
         device="cuda",
     )
-    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
+    bias = torch.rand((config.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
     dropout_rate = 0.1
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation

@@ -22,11 +22,19 @@ from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
     inference_cfg_container_from_args,
+    model_config_from_args,
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
 from megatron.training.config import DistributedInitConfig
-from megatron.training.config.training_config import TokenizerConfig
+from megatron.training.config.training_config import TokenizerConfig, ValidationConfig
+from megatron.training.models import (
+    BertModelConfig,
+    GPTModelConfig,
+    LLaVAModelConfig,
+    MimoModelConfig,
+    T5ModelConfig,
+)
 
 
 @pytest.fixture
@@ -39,6 +47,7 @@ def isolated_globals(monkeypatch):
 def _runtime_args():
     return Namespace(
         rank=0,
+        world_size=2,
         global_batch_size=8,
         micro_batch_size=2,
         data_parallel_size=2,
@@ -52,6 +61,36 @@ def _runtime_args():
         exit_signal_handler_for_training=False,
         disable_jit_fuser=False,
     )
+
+
+@pytest.mark.parametrize(
+    "source,expected_world_size",
+    [("process_group", 12), ("environment", 8), ("slurm", 16), ("default", 1)],
+)
+def test_batch_finalization_uses_core_world_size(
+    monkeypatch, run_config, source, expected_world_size
+):
+    # The container already exists; launch metadata is resolved at runtime, not captured in it.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: source == "process_group")
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 12)
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.setenv("SLURM_NTASKS", "16")
+    if source in ("slurm", "default"):
+        monkeypatch.delenv("WORLD_SIZE")
+    if source == "default":
+        monkeypatch.delenv("SLURM_NTASKS")
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    run_config.train.micro_batch_size = 2
+
+    warning = (
+        pytest.warns(UserWarning, match="Defaulting to world size 1")
+        if source == "default"
+        else nullcontext()
+    )
+    with warning:
+        run_config.finalize()
+    assert run_config.train.global_batch_size == 2 * expected_world_size
+    assert run_config.validation.eval_global_batch_size == 2 * expected_world_size
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
@@ -138,7 +177,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
-    args.rank, args.world_size = 0, 4
+    args.rank, args.world_size = 0, 999
     # These topology values are normally resolved by validate_args.
     args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
     args.gtp_remat_num_sequence_shards = 1
@@ -146,6 +185,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     args.expert_tensor_parallel_size = 1
     original_args = vars(args).copy()
     # Keep the legacy defaults different so an accidental args read is detected.
+    monkeypatch.setenv("WORLD_SIZE", "4")
     run_config.dist = DistributedInitConfig(
         distributed_backend="gloo",
         distributed_timeout_minutes=37,
@@ -365,12 +405,18 @@ def test_runtime_service_order_and_microbatch_inputs(
 ):
     args = _runtime_args()
     cfg = run_config
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     cfg.train.global_batch_size = 8
     cfg.train.micro_batch_size = 2
     # Runtime services must use the container even when legacy args disagree.
     args.global_batch_size = 99
     args.micro_batch_size = 99
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    cfg.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=32,
+        vocab_size=128,
+    )
     if not use_bootstrap:
         global_vars.set_args(args)
         global_vars.set_run_config(cfg)
@@ -391,7 +437,14 @@ def test_runtime_service_order_and_microbatch_inputs(
 
         def record(received_args, service=name, **kwargs):
             assert received_args is args
-            assert kwargs == ({"include_training": True} if service == "_set_telemetry" else {})
+            expected = {
+                "_set_telemetry": {"include_training": True},
+                "_build_tokenizer": {
+                    "tensor_model_parallel_size": 1,
+                    "make_vocab_size_divisible_by": 128,
+                },
+            }
+            assert kwargs == expected.get(service, {})
             calls.append(service)
 
         monkeypatch.setattr(global_vars, name, record)
@@ -441,6 +494,407 @@ def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_g
     assert cfg.tokenizer.padded_vocab_size == 128
 
 
+@pytest.mark.parametrize(
+    "world_size, mimo_llm_world_size, parallel_kwargs, expected_dp, expected_batch",
+    [
+        (8, None, {"tensor_model_parallel_size": 2}, 4, 4),
+        (16, 8, {"tensor_model_parallel_size": 2}, 4, 4),
+        (
+            32,
+            None,
+            {
+                "tensor_model_parallel_size": 2,
+                "pipeline_model_parallel_size": 2,
+                "pipeline_dtype": torch.float32,
+                "context_parallel_size": 2,
+            },
+            4,
+            4,
+        ),
+        (
+            16,
+            None,
+            {
+                "tensor_model_parallel_size": 2,
+                "tensor_parallel_num_weight_shards": 8,
+                "sequence_parallel": True,
+                "tensor_parallel_num_sequence_shards": 4,
+                "context_parallel_size": 4,
+            },
+            1,
+            2,
+        ),
+        (
+            64,
+            32,
+            {
+                "tensor_model_parallel_size": 2,
+                "pipeline_model_parallel_size": 2,
+                "pipeline_dtype": torch.float32,
+                "tensor_parallel_num_weight_shards": 8,
+                "sequence_parallel": True,
+                "tensor_parallel_num_sequence_shards": 4,
+                "context_parallel_size": 4,
+            },
+            1,
+            2,
+        ),
+    ],
+)
+def test_training_batch_topology_uses_model_config(
+    monkeypatch,
+    run_config,
+    world_size,
+    mimo_llm_world_size,
+    parallel_kwargs,
+    expected_dp,
+    expected_batch,
+):
+    from examples.mimo.training.builder import MimoBuildConfig
+
+    args = _runtime_args()
+    args.world_size = args.mimo_llm_world_size = 999
+    args.data_parallel_size = args.batch_parallel_size = 999
+    original_args = vars(args).copy()
+    monkeypatch.setattr(
+        "megatron.training.config.container.safe_get_world_size", lambda: world_size
+    )
+    monkeypatch.setattr(global_vars, "safe_get_world_size", lambda: world_size)
+    run_config.train.micro_batch_size = 2
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    run_config.model = MimoBuildConfig(
+        transformer=TransformerConfig(
+            num_layers=2, hidden_size=32, num_attention_heads=4, **parallel_kwargs
+        ),
+        seq_length=32,
+        vocab_size=128,
+        mimo_llm_world_size=mimo_llm_world_size,
+    )
+    microbatches = Mock()
+    monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)
+    for name in (
+        "_set_wandb_writer",
+        "_set_telemetry",
+        "_set_tensorboard_writer",
+        "_set_one_logger",
+        "_set_adlr_autoresume",
+        "_set_timers",
+        "_set_energy_monitor",
+        "_set_train_state",
+    ):
+        monkeypatch.setattr(global_vars, name, Mock())
+    monkeypatch.setattr(global_vars, "_detect_gpu_identity", Mock(return_value={}))
+    telemetry = []
+    monkeypatch.setattr(
+        global_vars,
+        "_set_telemetry",
+        lambda args, **kwargs: telemetry.append(global_vars.build_telemetry_resource_attrs(args)),
+    )
+    run_config.finalize()
+    global_vars.initialize_runtime_services(args, build_tokenizer=False, training=True)
+    assert vars(args) == original_args
+    assert run_config.get_model_world_size() == (mimo_llm_world_size or world_size)
+    assert run_config.get_data_parallel_size() == expected_dp
+    assert run_config.get_batch_parallel_size() == expected_batch
+    assert microbatches.call_args.kwargs['data_parallel_size'] == expected_batch
+    assert telemetry[0]['dl.data_parallel.size'] == expected_dp
+    assert telemetry[0]['dl.tensor_parallel.size'] == 2
+    assert telemetry[0]['megatron.hidden_size'] == 32
+    assert telemetry[0] == global_vars.build_telemetry_resource_attrs(args)
+
+
+@pytest.mark.parametrize("known_vocab", [None, 512])
+@pytest.mark.parametrize(
+    "model_cls", [BertModelConfig, T5ModelConfig, LLaVAModelConfig, MimoModelConfig]
+)
+def test_callback_model_config_owns_shared_inputs(
+    monkeypatch, isolated_globals, run_config, known_vocab, model_cls
+):
+    """Callback applications keep a typed model without selecting a GPT/Hybrid builder."""
+    import megatron.training.argument_utils as adapters
+    from megatron.training.config import PretrainConfigContainer
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.max_position_embeddings = 2048
+    args.mimo_llm_world_size = 8
+    args.encoder_num_layers = 3
+    args.padded_vocab_size = known_vocab
+    transformer = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+    convert = Mock(return_value=transformer)
+    monkeypatch.setattr(adapters, "core_transformer_config_from_args", convert)
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 16)
+
+    model = model_config_from_args(args, model_config_cls=model_cls)
+    convert.assert_called_once_with(args)
+    cfg = run_config
+    cfg.model = model
+    resolve_tokenizer_vocab_size(cfg, 256)
+    args.padded_vocab_size = 999
+    args.max_position_embeddings = 32
+
+    assert type(cfg.model) is model_cls
+    assert cfg.model.transformer is transformer
+    assert cfg.model.seq_length == 2048
+    if model_cls is MimoModelConfig:
+        assert cfg.model.mimo_llm_world_size == 8
+        assert cfg.get_model_world_size() == 8
+    else:
+        assert not hasattr(cfg.model, "mimo_llm_world_size")
+        assert cfg.get_model_world_size() == 16
+    if model_cls is BertModelConfig:
+        assert cfg.model.bert_binary_head == args.bert_binary_head
+        assert not hasattr(cfg.model, "hybrid_layer_pattern")
+        assert not hasattr(cfg.model, "rotary_percent")
+    if model_cls is T5ModelConfig:
+        assert cfg.model.encoder_num_layers == 3
+        assert not hasattr(cfg.model, "hybrid_layer_pattern")
+    assert cfg.model.vocab_size == (256 if known_vocab is None else known_vocab)
+    restored = PretrainConfigContainer.from_dict(cfg.to_dict())
+    assert type(restored.model) is model_cls
+    assert restored.to_dict() == cfg.to_dict()
+
+
+@pytest.mark.parametrize(
+    "section, name, value, error",
+    [
+        ("checkpoint", "ckpt_format", "torch", "requires torch_dist"),
+        ("dist", "use_torch_fsdp2", True, "not FSDP"),
+        ("ddp", "use_megatron_fsdp", True, "not FSDP"),
+        ("dist", "use_tp_pp_dp_mapping", True, "TP-PP-DP mapping"),
+    ],
+)
+def test_native_gtp_sequence_sharding_validates_cross_config_inputs(
+    run_config, section, name, value, error
+):
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            tensor_model_parallel_size=2,
+            tensor_parallel_num_weight_shards=8,
+            sequence_parallel=True,
+            tensor_parallel_num_sequence_shards=4,
+            context_parallel_size=4,
+        ),
+        seq_length=32,
+    )
+    run_config.validate()
+    owner = getattr(run_config, section)
+    assert hasattr(owner, name)
+    setattr(owner, name, value)
+    with pytest.raises(ValueError, match=error):
+        run_config.validate()
+
+
+def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config):
+    from megatron.training import training
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.skip_train = True
+    run_config.validation.skip_train = True
+    args.moe_use_upcycling = True
+    args.moe_upcycling_granularity = 2
+    args.num_experts = 2
+    args.expert_model_parallel_size = 1
+    args.ffn_hidden_size = 64
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            ffn_hidden_size=64,
+            num_moe_experts=2,
+        ),
+        seq_length=16,
+        vocab_size=128,
+    )
+    monkeypatch.setattr(training, "get_args", lambda: args)
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(training, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(training, "checkpoint_exists", lambda path: False)
+    monkeypatch.setattr(torch.distributed, "barrier", Mock())
+    built_configs = []
+
+    class ReachedDenseModel(Exception):
+        pass
+
+    def build(*unused, config, **kwargs):
+        built_configs.append(config)
+        if len(built_configs) == 2:
+            raise ReachedDenseModel
+        return [SimpleNamespace()]
+
+    monkeypatch.setattr(training, "get_model", build)
+    with pytest.raises(ReachedDenseModel):
+        training.setup_model_and_optimizer(
+            Mock(), model_provider_func=Mock(), cfg_container=run_config
+        )
+    assert built_configs[0] is run_config.model.transformer
+    assert built_configs[1].num_moe_experts is None
+    assert built_configs[1].expert_model_parallel_size == 1
+    assert built_configs[1].ffn_hidden_size == 128
+    assert run_config.model.transformer.num_moe_experts == 2
+    assert run_config.model.transformer.ffn_hidden_size == 64
+
+
+@pytest.mark.parametrize("family", ["bert", "t5"])
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("binary_head", [False, True])
+def test_callbacks_construct_from_registered_model_config(
+    monkeypatch, isolated_globals, family, inference, binary_head
+):
+    """Direct callbacks, including converters that bypass get_model, use the same owner."""
+    import importlib
+
+    provider = importlib.import_module(f"examples.{family}.pretrain_{family}")
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
+    args.max_position_embeddings, args.padded_vocab_size = 64, 128
+    args.params_dtype = torch.float32
+    args.main_grads_dtype = args.main_params_dtype = torch.float32
+    args.exp_avg_dtype = args.exp_avg_sq_dtype = torch.float32
+    args.encoder_num_layers = 2
+    args.relative_attention_num_buckets = 32
+    args.relative_attention_max_distance = 128
+    args.bert_binary_head = binary_head
+    model_cls = BertModelConfig if family == "bert" else T5ModelConfig
+    model = model_config_from_args(args, model_config_cls=model_cls)
+    cfg = (
+        inference_cfg_container_from_args(args, model)
+        if inference
+        else pretrain_cfg_container_from_args(args, model)
+    )
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(provider, "get_args", lambda: args)
+    build = Mock()
+    monkeypatch.setattr(provider, "BertModel" if family == "bert" else "T5Model", build)
+    for name in (
+        "hidden_size",
+        "num_layers",
+        "padded_vocab_size",
+        "max_position_embeddings",
+        "untie_embeddings_and_output_weights",
+        "fp16_lm_cross_entropy",
+        "position_embedding_type",
+        "rotary_percent",
+        "bert_binary_head",
+        "encoder_num_layers",
+        "relative_attention_num_buckets",
+        "relative_attention_max_distance",
+    ):
+        delattr(args, name)
+
+    provider.model_provider()
+
+    assert build.call_args.kwargs["config"] is cfg.model.transformer
+    assert build.call_args.kwargs["vocab_size"] == 128
+    assert build.call_args.kwargs["max_sequence_length"] == 64
+    assert build.call_args.kwargs["share_embeddings_and_output_weights"] is True
+    if family == "bert":
+        assert build.call_args.kwargs["add_binary_head"] is binary_head
+        assert build.call_args.kwargs["num_tokentypes"] == (2 if binary_head else 0)
+        batch = tuple(object() for _ in range(6))
+        monkeypatch.setattr(provider, "get_batch", lambda _: batch)
+        monkeypatch.setattr(provider, "get_timers", Mock())
+        forward = Mock()
+        provider.forward_step(None, forward)
+        assert forward.call_args.kwargs["tokentype_ids"] is (batch[1] if binary_head else None)
+
+        dataset_config = Mock()
+        monkeypatch.setattr(provider, "BERTMaskedWordPieceDatasetConfig", dataset_config)
+        monkeypatch.setattr(provider, "build_tokenizer", Mock())
+        dataset_builder = Mock()
+        dataset_builder.return_value.build.return_value = (None, None, None)
+        monkeypatch.setattr(provider, "BlendedMegatronDatasetBuilder", dataset_builder)
+        provider.train_valid_test_datasets_provider([1, 1, 1])
+        assert dataset_config.call_args.kwargs["classification_head"] is binary_head
+    else:
+        assert build.call_args.kwargs["encoder_config"].num_layers == 2
+        assert build.call_args.kwargs["relative_attention_num_buckets"] == 32
+        assert build.call_args.kwargs["relative_attention_max_distance"] == 128
+
+
+def test_model_precision_is_derived_centrally(monkeypatch, run_config):
+    from megatron.core.optimizer import OptimizerConfig
+
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 1)
+    run_config.train.micro_batch_size = 1
+
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        ),
+        seq_length=64,
+    )
+    run_config.finalize()
+    runtime_optimizer = OptimizerConfig()
+    runtime_optimizer = run_config.finalize_optimizer_config(runtime_optimizer)
+    for config in (run_config.optimizer, runtime_optimizer):
+        assert config.bf16 and not config.fp16
+        assert config.params_dtype is torch.bfloat16
+
+    # The recipe also changes an optimizer-derived precision flag, not just metadata.
+    run_config.model.transformer.fp8_recipe = "tensorwise"
+    runtime_optimizer = OptimizerConfig(use_precision_aware_optimizer=True, fp8_recipe="delayed")
+    assert runtime_optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+    runtime_optimizer = run_config.finalize_optimizer_config(runtime_optimizer)
+    assert runtime_optimizer.fp8_recipe == "tensorwise"
+    assert not runtime_optimizer.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+
+def test_llava_callback_consumes_its_model_config(monkeypatch, isolated_globals, run_config):
+    import pretrain_vlm
+
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    pretrain_vlm.add_vlm_extra_args(parser)
+    args = parser.parse_args([])
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 32, 4
+    args.encoder_num_layers = 1
+    args.max_position_embeddings, args.padded_vocab_size = 64, 128
+    args.seq_length, args.decoder_seq_length = 16, 32
+    args.params_dtype = torch.float32
+    args.ckpt_format = "torch"
+    cfg = run_config
+    cfg.model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    cfg.model.rotary_base = 12345
+    cfg.model.rope_scaling = True
+    monkeypatch.setattr(pretrain_vlm, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_vlm.context_parallel, "get_padding", lambda *a: 0)
+    monkeypatch.setattr(pretrain_vlm.parallel_state, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(pretrain_vlm.parallel_state, "is_pipeline_last_stage", lambda: True)
+    build = Mock()
+    monkeypatch.setattr(pretrain_vlm, "LLaVAModel", build)
+    args.rotary_base = 999
+    args.use_rope_scaling = False
+    args.padded_vocab_size = 999
+
+    pretrain_vlm.model_provider()
+
+    assert build.call_args.kwargs["language_vocab_size"] == 128
+    assert build.call_args.kwargs["language_rotary_base"] == 12345
+    assert build.call_args.kwargs["language_rope_scaling"] is True
+    assert build.call_args.kwargs["language_transformer_config"].hidden_size == 32
+    assert build.call_args.kwargs["vision_transformer_config"].num_layers == 1
+    assert cfg.model.transformer.num_layers == 2
+
+
 @pytest.mark.parametrize("eval_batch_sizes", [None, (16, 4)])
 @pytest.mark.parametrize("schedule", [None, "0:8 32:16"])
 @pytest.mark.parametrize("rl", [False, True])
@@ -460,7 +914,7 @@ def test_native_batch_defaults_preserve_explicit_eval_sizes(
     run_config.validate()
     run_config.validate()
     assert run_config.to_dict() == before
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=2))
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.finalize()
     # Runtime re-entry must not apply derivations a second time.
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
@@ -474,7 +928,8 @@ def test_native_batch_defaults_preserve_explicit_eval_sizes(
 
 @pytest.mark.parametrize("mode", ["constant", "decrease", "schedule"])
 def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run_config, mode):
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=2))
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.train.micro_batch_size = 2
     run_config.train.global_batch_size = 10
     run_config.train.decrease_batch_size_if_needed = mode == "decrease"
@@ -494,6 +949,7 @@ def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run
 
 @pytest.mark.parametrize("invalid_policy", ["eval", "rl"])
 def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_config, invalid_policy):
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.train.micro_batch_size = 3
     if invalid_policy == "eval":
         run_config.validation.eval_micro_batch_size = 4
@@ -505,11 +961,65 @@ def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_conf
     before = deepcopy(run_config.to_dict())
     run_config.validate()
     assert run_config.to_dict() == before
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", Namespace(batch_parallel_size=2))
     with pytest.raises(error, match=message):
         run_config.finalize()
     assert run_config.to_dict() == before
     assert not run_config._finalized
+
+
+@pytest.mark.parametrize("world_size, mimo_llm_world_size", [(0, None), (-1, None), (4, 8), (4, 0)])
+def test_training_topology_rejects_invalid_rank_counts(
+    monkeypatch, run_config, world_size, mimo_llm_world_size
+):
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    monkeypatch.setattr(
+        "megatron.training.config.container.safe_get_world_size", lambda: world_size
+    )
+    run_config.model = MimoModelConfig(
+        transformer=run_config.model.transformer,
+        seq_length=run_config.model.seq_length,
+        mimo_llm_world_size=mimo_llm_world_size,
+    )
+    run_config.train.micro_batch_size = 1
+    before = deepcopy(run_config.to_dict())
+    with pytest.raises(ValueError, match="Training model world size must fit"):
+        run_config.finalize()
+    assert run_config.to_dict() == before
+    assert not run_config._finalized
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"tensor_model_parallel_size": 0}, "Parallel sizes must be positive"),
+        ({"pipeline_model_parallel_size": 0}, "Parallel sizes must be positive"),
+        ({"context_parallel_size": 0}, "Parallel sizes must be positive"),
+        ({"gtp_weight_remat_size": 0}, "Parallel sizes must be positive"),
+        ({"tensor_parallel_num_sequence_shards": 0}, "must be positive"),
+        (
+            {"tensor_parallel_num_sequence_shards": 2, "gtp_weight_remat_size": 2},
+            "Runtime context-parallel size",
+        ),
+        (
+            {
+                "context_parallel_size": 2,
+                "gtp_weight_remat_size": 3,
+                "tensor_parallel_num_sequence_shards": 2,
+            },
+            "must divide",
+        ),
+        ({"tensor_model_parallel_size": 3}, "world_size .* must be divisible"),
+    ],
+)
+def test_parallel_size_helpers_reject_invalid_topology(monkeypatch, run_config, overrides, error):
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 8)
+    for name, value in overrides.items():
+        monkeypatch.setattr(run_config.model.transformer, name, value)
+    before = deepcopy(run_config.to_dict())
+    for helper in (run_config.get_data_parallel_size, run_config.get_batch_parallel_size):
+        with pytest.raises(ValueError, match=error):
+            helper()
+    assert run_config.to_dict() == before
 
 
 @pytest.mark.parametrize("adapter", [gpt_config_from_args, hybrid_config_from_args])
@@ -545,6 +1055,141 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
     assert model.as_dict() == legacy_model.as_dict()
     assert cfg.tokenizer.padded_vocab_size == legacy_args.padded_vocab_size
     assert global_vars.get_tokenizer().vocab_size == legacy_tokenizer.vocab_size
+
+
+@pytest.mark.parametrize(
+    "adapter", [gpt_config_from_args, hybrid_config_from_args, BertModelConfig, LLaVAModelConfig]
+)
+@pytest.mark.parametrize("pad_vocab", [False, True])
+@pytest.mark.parametrize("padded_vocab", [None, 768])
+def test_training_tokenizer_padding_uses_model_inputs(
+    monkeypatch, isolated_globals, adapter, pad_vocab, padded_vocab
+):
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.rank, args.world_size = 0, 2
+    args.tokenizer_type = "NullTokenizer"
+    args.vocab_size = 129
+    args.pad_vocab_size = pad_vocab
+    args.padded_vocab_size = padded_vocab
+    args.max_position_embeddings = 64
+    args.tensor_model_parallel_size = 1
+    args.make_vocab_size_divisible_by = 128
+    transformer = TransformerConfig(
+        num_layers=2, hidden_size=128, num_attention_heads=4, tensor_model_parallel_size=2
+    )
+    if adapter in (BertModelConfig, LLaVAModelConfig):
+        model = adapter(
+            transformer=transformer,
+            seq_length=64,
+            vocab_size=padded_vocab if padded_vocab is not None or pad_vocab else args.vocab_size,
+        )
+    else:
+        model = adapter(args, config=transformer)
+    model.make_vocab_size_divisible_by = 256
+    cfg = SimpleNamespace(model=model, tokenizer=TokenizerConfig(), dist=DistributedInitConfig())
+    global_vars.set_args(args)
+    global_vars.set_run_config(cfg)
+    for service in ("_set_wandb_writer", "_set_telemetry", "initialize_training_runtime_services"):
+        monkeypatch.setattr(global_vars, service, Mock())
+
+    global_vars.initialize_runtime_services(args, training=True)
+    resolve_tokenizer_vocab_size(cfg, args.padded_vocab_size)
+
+    expected = padded_vocab if padded_vocab is not None else (512 if pad_vocab else None)
+    assert args.padded_vocab_size == cfg.tokenizer.padded_vocab_size == expected
+    assert cfg.model.vocab_size == (129 if expected is None else expected)
+    assert global_vars.get_tokenizer().vocab_size == 129
+    assert args.tensor_model_parallel_size == 1
+    assert args.make_vocab_size_divisible_by == 128
+
+
+@pytest.mark.parametrize("share_embeddings", [False, True])
+def test_gpt_embedding_groups_use_registered_model(monkeypatch, isolated_globals, share_embeddings):
+    import pretrain_gpt
+
+    cfg = SimpleNamespace(
+        model=GPTModelConfig(
+            transformer=TransformerConfig(
+                num_layers=3,
+                hidden_size=128,
+                num_attention_heads=4,
+                pipeline_model_parallel_size=3,
+                pipeline_dtype=torch.float32,
+                pipeline_model_parallel_layout="Et*3|m|L",
+                mtp_num_layers=1,
+            ),
+            seq_length=64,
+            share_embeddings_and_output_weights=share_embeddings,
+        )
+    )
+    global_vars.set_run_config(cfg)
+    global_vars.set_args(Namespace(untie_embeddings_and_output_weights=share_embeddings))
+
+    assert pretrain_gpt.get_embedding_ranks([0, 2, 4]) == (
+        [0, 2, 4] if share_embeddings else [0, 2]
+    )
+    assert pretrain_gpt.get_embedding_ranks([7]) == [7]
+
+
+@pytest.mark.parametrize("module_name", ["pretrain_gpt", "pretrain_hybrid"])
+@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+def test_dataset_helpers_use_registered_model(
+    monkeypatch, isolated_globals, run_config, module_name, sequence_packing_scheduler
+):
+    import importlib
+
+    entrypoint = importlib.import_module(module_name)
+    parser = ArgumentParser()
+    arguments.add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.seq_length = 32
+    args.data_parallel_size = 999
+    args.sequence_packing_scheduler = None if sequence_packing_scheduler else "dp_balanced"
+    transformer = TransformerConfig(
+        num_layers=3,
+        hidden_size=128,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+        context_parallel_size=2,
+        hybrid_context_parallel=True,
+        pipeline_model_parallel_size=3,
+        pipeline_dtype=torch.float32,
+        pipeline_model_parallel_layout="Et*3|m|L",
+        mtp_num_layers=1,
+    )
+    transformer.sequence_packing_scheduler = sequence_packing_scheduler
+    cfg = run_config
+    cfg.model = GPTModelConfig(transformer=transformer, seq_length=64)
+    # TP=2, PP=3, CP=2 gives DP=2 independently of the stale CLI topology.
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 24)
+    global_vars.set_args(args)
+    monkeypatch.setattr(entrypoint, "build_tokenizer", Mock())
+    monkeypatch.setattr(entrypoint, "get_blend_and_blend_per_split", lambda args: (None, None))
+    monkeypatch.setattr(entrypoint, "GPTDatasetConfig", SimpleNamespace)
+
+    dataset = entrypoint.core_gpt_dataset_config_from_args(args)
+    assert dataset.context_parallel_size == 2
+    assert dataset.sequence_parallel_size == 2
+    assert dataset.hybrid_context_parallel is True
+    assert dataset.data_parallel_size == 2
+    assert dataset.sequence_length == 32  # Actual data length, not position capacity.
+
+    monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(entrypoint.mpu, "get_pipeline_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        entrypoint.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
+    )
+    monkeypatch.setattr(entrypoint, "is_first_or_last_pipeline_stage", lambda stage: False)
+    assert entrypoint.is_dataset_built_on_rank() is (sequence_packing_scheduler is None)
+    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True) is (
+        sequence_packing_scheduler is None
+    )
+    assert args.data_parallel_size == 999
+    assert args.context_parallel_size == args.tensor_model_parallel_size == 1
+    assert args.mtp_num_layers is None
 
 
 def test_explicit_model_vocabulary_is_not_overwritten(monkeypatch, isolated_globals):
@@ -716,6 +1361,10 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     args.vocab_size = 133
     args.padded_vocab_size = 512 if vocabulary == "checkpoint" else None
     args.batch_parallel_size = 2
+    args.world_size = 2
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 128, 4
+    args.params_dtype = torch.float32
     args.micro_batch_size = 2
     args.main_grads_dtype = torch.float32
     args.main_params_dtype = torch.float32
@@ -728,12 +1377,14 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
         model.vocab_size = 768
     elif vocabulary == "custom":
         model = None
+        args.pad_vocab_size = False
     cfg = (
         pretrain_cfg_container_from_args(args, model)
         if training
         else inference_cfg_container_from_args(args, build_model_config=False)
     )
-    cfg.model = model
+    if model is not None or not training:
+        cfg.model = model
     global_vars.set_args(args)
     global_vars.set_run_config(cfg)
     events = []
@@ -748,11 +1399,11 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
     monkeypatch.setattr(cfg, "finalize", finalize_inputs)
     build = global_vars._build_tokenizer
 
-    def tokenize(received_args):
+    def tokenize(received_args, **kwargs):
         assert events == ["finalize"]
         assert cfg.logger.log_interval == 17
         events.append("tokenizer")
-        return build(received_args)
+        return build(received_args, **kwargs)
 
     monkeypatch.setattr(global_vars, "_build_tokenizer", tokenize)
     expected_vocab = {"tokenizer": 256, "checkpoint": 512, "explicit": 768}

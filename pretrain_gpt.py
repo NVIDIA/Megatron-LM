@@ -58,7 +58,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
@@ -102,33 +102,33 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    cfg = get_run_config()
 
-    if args.sequence_packing_scheduler is not None:
+    if cfg.model.transformer.sequence_packing_scheduler is not None:
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
-            vpp_size=config.virtual_pipeline_model_parallel_size,
+            vpp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
-                layout=config.pipeline_model_parallel_layout,
-                mtp_num_layers=config.mtp_num_layers,
+                layout=cfg.model.transformer.pipeline_model_parallel_layout,
+                mtp_num_layers=cfg.model.transformer.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
         )
 
-    cp_size = args.context_parallel_size
+    cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
+        layout=cfg.model.transformer.pipeline_model_parallel_layout,
+        mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = cfg.model.transformer.hybrid_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -159,7 +159,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         micro_batch_size=args.micro_batch_size,
         seq_length=args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
-        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
@@ -310,6 +310,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     # Get the batch.
@@ -394,7 +395,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     with stimer:
         if return_schedule_plan:
             assert (
-                args.overlap_moe_expert_parallel_comm
+                cfg.model.transformer.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             schedule_plan = model.build_schedule_plan(
                 tokens,
@@ -423,19 +424,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
-    args = get_args()
-    config = core_transformer_config_from_args(args)
+    cfg = get_run_config()
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif args.sequence_packing_scheduler is not None:
+    elif cfg.model.transformer.sequence_packing_scheduler is not None:
         # The scheduler sends packing metadata to middle PP stages itself and requires that
         # only the first and last stages hold a data iterator.
         return is_first_or_last_pipeline_stage(vp_stage)
     elif is_packed_sequence:
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
+        layout=cfg.model.transformer.pipeline_model_parallel_layout,
+        mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
@@ -478,10 +478,13 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "fast_cache_load": args.dataloader_fast_cache_load,
         "sequences_per_dataset": sequences_per_dataset,
         "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
-        "context_parallel_size": args.context_parallel_size,
-        "data_parallel_size": args.data_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "context_parallel_size": cfg.model.transformer.context_parallel_size,
+        "data_parallel_size": cfg.get_data_parallel_size(),
+        "sequence_parallel_size": (
+            cfg.model.transformer.tensor_model_parallel_size
+            * cfg.model.transformer.sequence_parallel
+        ),
+        "hybrid_context_parallel": cfg.model.transformer.hybrid_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
@@ -566,11 +569,10 @@ def get_embedding_ranks(pp_ranks: List[int]):
     """Get the embedding ranks."""
     embedding_ranks = [pp_ranks[0]]
     if len(pp_ranks) > 1:
-        args = get_args()
-        if not args.untie_embeddings_and_output_weights:
+        cfg = get_run_config()
+        if cfg.model.share_embeddings_and_output_weights:
             embedding_ranks.append(pp_ranks[-1])
-        config = core_transformer_config_from_args(args)
-        mtp_ranks = get_mtp_ranks(pp_ranks, config)
+        mtp_ranks = get_mtp_ranks(pp_ranks, cfg.model.transformer)
         embedding_ranks.extend(mtp_ranks)
     embedding_ranks = list(set(embedding_ranks))
     embedding_ranks = sorted(embedding_ranks)

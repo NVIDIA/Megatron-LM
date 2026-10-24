@@ -59,7 +59,7 @@ from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
@@ -102,9 +102,9 @@ def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
     args = get_args()
-    config = core_transformer_config_from_args(args)
+    cfg = get_run_config()
 
-    if args.sequence_packing_scheduler is not None:
+    if cfg.model.transformer.sequence_packing_scheduler is not None:
         (
             tokens,
             labels,
@@ -115,17 +115,17 @@ def get_batch(data_iterator, vp_stage=None):
             padding_mask,
         ) = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
-            vpp_size=config.virtual_pipeline_model_parallel_size,
+            vpp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
-                layout=config.pipeline_model_parallel_layout,
-                mtp_num_layers=config.mtp_num_layers,
+                layout=cfg.model.transformer.pipeline_model_parallel_layout,
+                mtp_num_layers=cfg.model.transformer.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
         )
         return ContextParallelBatch.from_single_layout(
-            config.linear_cp_layout,
+            cfg.model.transformer.linear_cp_layout,
             {
                 "tokens": tokens,
                 "labels": labels,
@@ -137,18 +137,18 @@ def get_batch(data_iterator, vp_stage=None):
             packed_seq_params,
         )
 
-    cp_size = args.context_parallel_size
+    cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
+        layout=cfg.model.transformer.pipeline_model_parallel_layout,
+        mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = cfg.model.transformer.hybrid_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -156,9 +156,9 @@ def get_batch(data_iterator, vp_stage=None):
         and not has_cu_seqlens
     ):
         return ContextParallelBatch(
-            boundary_layout=config.linear_cp_layout,
-            batches_by_layout={config.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
-            packed_seq_params_by_layout={config.linear_cp_layout: None},
+            boundary_layout=cfg.model.transformer.linear_cp_layout,
+            batches_by_layout={cfg.model.transformer.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
+            packed_seq_params_by_layout={cfg.model.transformer.linear_cp_layout: None},
         )
 
     batch = {}
@@ -183,7 +183,7 @@ def get_batch(data_iterator, vp_stage=None):
         micro_batch_size=args.micro_batch_size,
         seq_length=args.seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
-        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
@@ -200,21 +200,27 @@ def get_batch(data_iterator, vp_stage=None):
         }
 
     additional_layouts = set()
-    if cp_size > 1 and config.linear_cp_layout != config.attention_cp_layout:
-        additional_layouts.add(config.attention_cp_layout)
+    if (
+        cp_size > 1
+        and cfg.model.transformer.linear_cp_layout != cfg.model.transformer.attention_cp_layout
+    ):
+        additional_layouts.add(cfg.model.transformer.attention_cp_layout)
     return get_batches_on_this_cp_rank(
         batch,
-        boundary_layout=config.linear_cp_layout,
+        boundary_layout=cfg.model.transformer.linear_cp_layout,
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
         additional_layouts=additional_layouts,
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
-        sequence_parallel=config.sequence_parallel,
+        sequence_parallel=cfg.model.transformer.sequence_parallel,
         tp_group=mpu.get_tensor_model_parallel_group(),
         tp_cp_group=(
             mpu.get_tensor_and_context_parallel_group()
-            if config.sequence_parallel and config.tensor_model_parallel_size > 1
+            if (
+                cfg.model.transformer.sequence_parallel
+                and cfg.model.transformer.tensor_model_parallel_size > 1
+            )
             else None
         ),
         tokens_per_sample=args.seq_length,
@@ -384,19 +390,18 @@ def forward_step(data_iterator, model: HybridModel):
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
-    args = get_args()
-    config = core_transformer_config_from_args(args)
+    cfg = get_run_config()
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif args.sequence_packing_scheduler is not None:
+    elif cfg.model.transformer.sequence_packing_scheduler is not None:
         # The scheduler sends packing metadata to middle PP stages itself and requires that
         # only the first and last stages hold a data iterator.
         return is_first_or_last_pipeline_stage(vp_stage)
     elif is_packed_sequence:
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
-        layout=config.pipeline_model_parallel_layout,
-        mtp_num_layers=config.mtp_num_layers,
+        layout=cfg.model.transformer.pipeline_model_parallel_layout,
+        mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
@@ -439,10 +444,13 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         fast_cache_load=args.dataloader_fast_cache_load,
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
-        context_parallel_size=args.context_parallel_size,
-        data_parallel_size=args.data_parallel_size,
-        sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        context_parallel_size=cfg.model.transformer.context_parallel_size,
+        data_parallel_size=cfg.get_data_parallel_size(),
+        sequence_parallel_size=(
+            cfg.model.transformer.tensor_model_parallel_size
+            * cfg.model.transformer.sequence_parallel
+        ),
+        hybrid_context_parallel=cfg.model.transformer.hybrid_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
         varlen_sbhd_validation=args.varlen_sbhd_validation,

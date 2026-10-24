@@ -2337,6 +2337,8 @@ def _add_network_size_args(parser):
         "cp_comm_type",
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
+        "gtp_remat_nccl_ub",  # existing distributed-training CLI flags
+        "gtp_expert_remat_nccl_ub",
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
         "params_dtype",

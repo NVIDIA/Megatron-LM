@@ -15,8 +15,11 @@ from megatron.core.enums import ModelType
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.vocab_utils import model_vocab_size
+from megatron.training.argument_utils import model_config_from_args
+from megatron.training.models import BertModelConfig
 from megatron.training.global_vars import (
     get_run_config,
     set_run_config,
@@ -36,9 +39,10 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     print_rank_0('building BERT model ...')
 
     args = get_args()
+    cfg = get_run_config()
     if config is None:
-        config = core_transformer_config_from_args(args)
-    num_tokentypes = 2 if args.bert_binary_head else 0
+        config = cfg.model.transformer
+    num_tokentypes = 2 if cfg.model.bert_binary_head else 0
 
     if args.spec is None:
         transformer_layer_spec = bert_layer_with_transformer_engine_spec #default spec
@@ -51,11 +55,11 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
     model = BertModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
+        vocab_size=model_vocab_size(cfg.model),
+        max_sequence_length=cfg.model.seq_length,
         num_tokentypes=num_tokentypes,
-        add_binary_head=args.bert_binary_head,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        add_binary_head=cfg.model.bert_binary_head,
+        share_embeddings_and_output_weights=cfg.model.share_embeddings_and_output_weights,
         parallel_output=True,
         pre_process=pre_process,
         post_process=post_process,
@@ -117,7 +121,7 @@ def loss_func(loss_mask, sentence_order, output_tensor):
 
 def forward_step(data_iterator, model):
     """Forward step."""
-    args = get_args()
+    cfg = get_run_config()
     timers = get_timers()
 
     # Get the batch.
@@ -126,7 +130,7 @@ def forward_step(data_iterator, model):
         data_iterator)
     timers('batch-generator').stop()
 
-    if not args.bert_binary_head:
+    if not cfg.model.bert_binary_head:
         types = None
 
     # Forward pass through the model.
@@ -162,7 +166,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         masking_do_permutation=False,
         masking_use_longer_ngrams=False,
         masking_use_geometric_distribution=False,
-        classification_head=args.bert_binary_head,
+        classification_head=cfg.model.bert_binary_head,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
@@ -188,7 +192,8 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
-    full_config = pretrain_cfg_container_from_args(args)
+    model_cfg = model_config_from_args(args, model_config_cls=BertModelConfig)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(full_config, train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,

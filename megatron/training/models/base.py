@@ -1,10 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import abc
-import functools
 import importlib
-import inspect
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
@@ -13,50 +11,6 @@ from megatron.core.enums import ModelType
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
-
-# Hooks and callbacks that each run attaches to the live config. Not to be serialized.
-_RUNTIME_FIELDS = frozenset(
-    {
-        "pre_wrap_hooks",
-        "post_wrap_hooks",
-        "timers",
-        "finalize_model_grads_func",
-        "grad_scale_func",
-        "moe_grad_scale_func",
-        "mtp_grad_scale_func",
-        "no_sync_func",
-        "grad_sync_func",
-        "param_sync_func",
-    }
-)
-
-
-def _encode_callable(value: Callable) -> dict[str, Any] | None:
-    """Serialize a callable so that it can be deserialized with `instantiate()`."""
-
-    if isinstance(value, functools.partial):
-        inner = _encode_callable(value.func)
-        if inner is None:
-            return None
-        encoded: dict[str, Any] = {
-            "_target_": inner["_target_"],
-            "_partial_": True,
-            "_args_": list(value.args),
-        }
-        encoded.update(value.keywords)
-        return encoded
-
-    module = inspect.getmodule(value)
-    qualname = getattr(value, "__qualname__", None)
-    if module is None or qualname is None:
-        return None
-    # Encode only paths that resolve back to `value`; a bound method's path drops its instance.
-    resolved = module
-    for part in qualname.split("."):
-        resolved = getattr(resolved, part, None)
-    if resolved != value:
-        return None
-    return {"_target_": f"{module.__name__}.{qualname}", "_call_": False}
 
 
 @runtime_checkable
@@ -77,11 +31,11 @@ class Serializable(Protocol):
 class ModelConfig:
     """Base class for model configurations.
 
-    Each model type (GPT, T5, Hybrid, etc.) defines a concrete subclass with its
+    Each builder-backed model type (GPT, Hybrid, etc.) defines a concrete subclass with its
     own model-specific parameters. This class is a pure data container - all model
     construction logic lives in the corresponding ``ModelBuilder`` subclass.
 
-    Subclasses must define:
+    Builder-backed subclasses define:
         - ``builder``: a ``ClassVar[str]`` with the full import path to the
           associated ``ModelBuilder`` (e.g.
           ``'megatron.bridge.models.hybrid.HybridModelBuilder'``).
@@ -143,33 +97,13 @@ class ModelConfig:
         - All dataclass fields, including nested dataclasses
         """
 
-        def _as_dict(config):
-            result = {
-                "_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}",
-            }
-            for f in dataclass_fields(config):
-                if f.name.startswith("_") or f.name in _RUNTIME_FIELDS:
-                    continue
-                value = getattr(config, f.name)
+        from megatron.training.config.utils import serialize_dataclass
 
-                if callable(value) and not is_dataclass(value):
-                    # Encode module-level callables (e.g. activation_func, layer-spec functions)
-                    # so they survive serialization instead of silently reverting to the default.
-                    encoded = _encode_callable(value)
-                    if encoded is not None:
-                        result[f.name] = encoded
-                    continue
-
-                if is_dataclass(value):
-                    result[f.name] = _as_dict(value)  # recurse on nested dataclasses
-                elif hasattr(value, "as_dict"):
-                    result[f.name] = value.as_dict()
-                else:
-                    result[f.name] = value
-
-            return result
-
-        result = _as_dict(self)
+        result = serialize_dataclass(
+            self,
+            skip_fields=frozenset({"pre_wrap_hooks", "post_wrap_hooks"}),
+            encode_callables=True,
+        )
         result["_builder_"] = self.builder  # Serialize the builder path
         return result
 
@@ -201,21 +135,28 @@ class ModelConfig:
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
             filtered_data = {k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")}
 
-            # recurse on serialized nested dataclasses; resolve encoded callables
-            subconfigs = {}
-            for k, v in filtered_data.items():
-                if isinstance(v, dict) and "_target_" in v:
-                    if v.get("_call_", True) is False or v.get("_partial_", False):
-                        from megatron.training.config.instantiate_utils import instantiate
-                        subconfigs[k] = instantiate(v)
-                    else:
-                        subconfigs[k] = _from_dict(v)
-            filtered_data.update(subconfigs)
+            return config_cls(**{key: _from_value(value) for key, value in filtered_data.items()})
 
-            return config_cls(**filtered_data)
+        def _from_value(value):
+            if isinstance(value, dict):
+                if "_target_" in value:
+                    if (
+                        value.get("_call_", True) is False
+                        or value.get("_partial_", False)
+                        or "_args_" in value
+                    ):
+                        from megatron.training.config.instantiate_utils import instantiate
+
+                        return instantiate(value)
+                    return _from_dict(value)
+                return {key: _from_value(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return type(value)(_from_value(item) for item in value)
+            return value
 
         result = _from_dict(data)
-        result.builder = data["_builder_"]
+        if "_builder_" in data:
+            result.builder = data["_builder_"]
 
         return result
 

@@ -135,6 +135,14 @@ class MegatronCheckpointSaverBase:
 
         self.margs = margs
 
+    def build_model_config(self):
+        """Select the model family before initializing shared runtime services."""
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import BertModelConfig
+
+        config_cls = BertModelConfig if self.md.model_type == "BERT" else None
+        return model_config_from_args(self.margs, model_config_cls=config_cls)
+
     def initialize_megatron_env(self):
         """
         Initialize Megatron global variables and fused kernels.
@@ -151,7 +159,7 @@ class MegatronCheckpointSaverBase:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        cfg = inference_cfg_container_from_args(self.margs, self.build_model_config())
         set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')

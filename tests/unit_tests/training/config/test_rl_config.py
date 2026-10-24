@@ -245,7 +245,9 @@ def test_validate_run_at_every_call_site():
     class TransformerModelConfig(ModelConfig):
         builder: typing.ClassVar[str] = "tests.transformer"
         transformer: types.SimpleNamespace = dataclasses.field(
-            default_factory=lambda: types.SimpleNamespace(cuda_graph_impl="none")
+            default_factory=lambda: types.SimpleNamespace(
+                cuda_graph_impl="none", gtp_remat_num_sequence_shards=1
+            )
         )
 
     def container(model=None, rl=None, **rl_kwargs):
@@ -381,6 +383,8 @@ def test_model_setup_uses_owned_ddp_config(
     monkeypatch, run_config, native_builder, perform_rl_step
 ):
     from megatron.training import arguments, global_vars, training
+    from megatron.training.models import GPTModelConfig
+    from megatron.training.state import TrainState
 
     parser = argparse.ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -388,7 +392,9 @@ def test_model_setup_uses_owned_ddp_config(
     # The container, not legacy args, owns the RL policy.
     args.perform_rl_step = not perform_rl_step
     args.batch_parallel_size = 1
+    args.world_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
+    monkeypatch.setattr(global_vars, "_GLOBAL_TRAIN_STATE", TrainState())
     run_config.rl = RLConfig(
         perform_rl_step=perform_rl_step, rl_offload_optimizer_during_inference=True
     )
@@ -418,9 +424,11 @@ def test_model_setup_uses_owned_ddp_config(
 
     if native_builder:
         builder = types.SimpleNamespace(build_distributed_models=construct)
-        run_config.model = types.SimpleNamespace(get_builder_cls=lambda: lambda cfg: builder)
+        run_config.model = GPTModelConfig(
+            transformer=run_config.model.transformer, vocab_size=128, seq_length=16
+        )
+        monkeypatch.setattr(run_config.model, "get_builder_cls", lambda: lambda cfg: builder)
     else:
-        run_config.model = None
         monkeypatch.setattr(training, "get_model", construct)
     # Runtime initialization owns finalization; model setup only consumes its result.
     run_config.train.micro_batch_size = 1
@@ -428,5 +436,5 @@ def test_model_setup_uses_owned_ddp_config(
     run_config.finalize()
     with pytest.raises(ReachedConstruction):
         training.setup_model_and_optimizer(
-            Mock(), model_provider_func=Mock(), cfg_container=run_config
+            Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
         )

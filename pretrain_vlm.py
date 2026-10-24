@@ -38,7 +38,8 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
+from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
     set_run_config,
@@ -72,13 +73,14 @@ def model_provider(
         model (megatron.core.models.multimodal.llava_model.LLaVAModel): A multimodal model
     """
     args = get_args()
+    cfg = get_run_config()
     vision_model_type = "clip"
 
     assert (
         args.ckpt_format == 'torch'
     ), "Only ckpt-format torch is supported for VLM training currently."
     assert not (
-        args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1
+        cfg.model.transformer.context_parallel_size > 1 and cfg.model.transformer.pipeline_model_parallel_size > 1
     ), "PP+CP is not yet supported by this script. \
     Current mock dataset does not support natively packed sequence dataset required for correct PP comm shapes."
 
@@ -109,9 +111,9 @@ def model_provider(
         )
     mp_padding_needed = context_parallel.get_padding(
         decoder_seq_len,
-        args.context_parallel_size,
-        args.tensor_model_parallel_size,
-        args.sequence_parallel,
+        cfg.model.transformer.context_parallel_size,
+        cfg.model.transformer.tensor_model_parallel_size,
+        cfg.model.transformer.sequence_parallel,
         args.decoder_tp_comm_overlap,
         args.decoder_seq_length,
     )
@@ -121,28 +123,26 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
     if config is None:
-        language_transformer_config = core_transformer_config_from_args(get_args())
+        language_transformer_config = deepcopy(cfg.model.transformer)
     else:
-        language_transformer_config = config
+        language_transformer_config = deepcopy(config)
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
-    else:
-        language_transformer_config.num_layers = args.num_layers
     if args.decoder_tp_comm_overlap:
         assert (
-            args.transformer_impl == "transformer_engine"
+            language_transformer_config.transformer_impl == "transformer_engine"
         ), "TransformerEngine is needed to support Decoder TP Comm overlap"
         language_transformer_config.tp_comm_overlap = args.decoder_tp_comm_overlap
 
     if args.spec is not None:
         language_transformer_layer_spec = import_module(args.spec)
-    elif args.transformer_impl == "transformer_engine":
+    elif language_transformer_config.transformer_impl == "transformer_engine":
         language_transformer_layer_spec = decoder_model_with_transformer_engine_default_spec(
-            args.num_experts, args.moe_grouped_gemm
+            language_transformer_config.num_moe_experts, language_transformer_config.moe_grouped_gemm
         )
     else:  # transformer_impl == "local"
         language_transformer_layer_spec = decoder_model_with_local_default_spec(
-            args.num_experts, args.moe_grouped_gemm
+            language_transformer_config.num_moe_experts, language_transformer_config.moe_grouped_gemm
         )
 
     # Prepare mask type for any required padding to support CP/SP sequence sharding.
@@ -166,7 +166,7 @@ def model_provider(
                 AttnMaskType.padding
             )
 
-    if args.transformer_impl == "transformer_engine":
+    if language_transformer_config.transformer_impl == "transformer_engine":
         vision_transformer_layer_spec = get_vit_layer_with_transformer_engine_spec()
     else:  # transformer_impl == "local"
         vision_transformer_layer_spec = get_vit_layer_with_local_spec()
@@ -204,14 +204,14 @@ def model_provider(
     )
 
     language_max_sequence_length = args.decoder_seq_length
-    if args.context_parallel_size > 1:
+    if language_transformer_config.context_parallel_size > 1:
         if args.use_packed_sequence or mp_padding_needed > 0:
             # Use THD data format
             language_max_sequence_length = args.decoder_seq_length * args.micro_batch_size
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=model_vocab_size(cfg.model),
         language_max_sequence_length=language_max_sequence_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
@@ -220,11 +220,11 @@ def model_provider(
         vision_projection_layer_spec=vision_projection_modules,
         vision_projection_type=vision_projection_type,
         parallel_output=parallel_output,
-        language_position_embedding_type=args.position_embedding_type,
-        language_rotary_percent=args.rotary_percent,
-        language_rotary_base=args.rotary_base,
-        language_rope_scaling=args.use_rope_scaling,
-        language_rope_scaling_factor=args.rope_scaling_factor,
+        language_position_embedding_type=cfg.model.position_embedding_type,
+        language_rotary_percent=cfg.model.rotary_percent,
+        language_rotary_base=cfg.model.rotary_base,
+        language_rope_scaling=cfg.model.rope_scaling,
+        language_rope_scaling_factor=cfg.model.rope_scaling_factor,
         pre_process=parallel_state.is_pipeline_first_stage(),
         post_process=parallel_state.is_pipeline_last_stage(),
         add_encoder=parallel_state.is_pipeline_first_stage(),
@@ -502,7 +502,11 @@ if __name__ == "__main__":
     args = parse_and_validate_args(
         extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import LLaVAModelConfig
+
+    model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(
         full_config,

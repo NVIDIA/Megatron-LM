@@ -178,6 +178,12 @@ def parse_args_and_detect_vlm(
     args = get_args()
 
     is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
+    if is_vlm and getattr(args, "mimo_checkpoint_prefix_map", None) is None:
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import LLaVAModelConfig
+
+        # This entrypoint discovers the model family only after distributed startup.
+        get_run_config().model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     # Tiling and dynamic_resolution are mutually exclusive at inference, so
     # use --use-tiling explicitly.
     if getattr(args, 'use_tiling', False):

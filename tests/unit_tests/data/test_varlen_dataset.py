@@ -692,7 +692,19 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
     )
 
 
-def test_sbhd_validation_dataloader_uses_default_collate(run_config):
+@pytest.fixture
+def loader_model_config(run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+    )
+    return run_config.model.transformer
+
+
+def test_sbhd_validation_dataloader_uses_default_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -724,13 +736,14 @@ def test_sbhd_validation_dataloader_uses_default_collate(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_thd_dataloader_uses_identity_collate(run_config):
+def test_thd_dataloader_uses_identity_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
@@ -755,13 +768,14 @@ def test_thd_dataloader_uses_identity_collate(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_packing_scheduler_dataloader_yields_microbatches(run_config):
+def test_packing_scheduler_dataloader_yields_microbatches(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2

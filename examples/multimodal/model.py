@@ -24,7 +24,8 @@ from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import model_vocab_size
 
 
 def model_provider(
@@ -41,7 +42,7 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
-        config: Optional transformer config. If None, will be created from args.
+        config: Optional transformer config. Defaults to cfg.model.transformer.
         pg_collection: Optional process group collection. If None, will use default.
         parallel_output (bool): Enable parallel model output.
 
@@ -49,6 +50,7 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
+    cfg = get_run_config()
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
@@ -108,7 +110,7 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    base_config = config or core_transformer_config_from_args(get_args())
+    base_config = deepcopy(config if config is not None else cfg.model.transformer)
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = not getattr(args, "no_calculate_per_token_loss", False)
@@ -125,16 +127,16 @@ def model_provider(
     )
 
     if language_model_type.startswith("hf://"):
-        assert args.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
-        assert args.pipeline_model_parallel_size < 2, "Huggingface models do not support --pipeline-model-parallel-size > 1"
-        assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
-        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert base_config.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
+        assert base_config.pipeline_model_parallel_size < 2, "Huggingface models do not support --pipeline-model-parallel-size > 1"
+        assert not base_config.sequence_parallel, "Huggingface models do not support --sequence-parallel"
+        assert base_config.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
     if language_model_type.startswith("hf://"):
         language_transformer_layer_spec = None
     elif use_te:
         # Padding mask needed for SP/CP.
-        padding = args.context_parallel_size > 1 and args.sequence_parallel
+        padding = base_config.context_parallel_size > 1 and base_config.sequence_parallel
         if args.spec is not None:
             language_transformer_layer_spec = import_module(args.spec)
         # Resolve the same model-name aliases used by the configuration builders.
@@ -142,12 +144,12 @@ def model_provider(
             language_transformer_layer_spec = get_hybrid_layer_spec_te(
                 config=language_config, padding=padding
             )
-        elif getattr(args, 'num_experts', None):
+        elif language_config.num_moe_experts is not None:
             language_transformer_layer_spec = get_gpt_decoder_block_spec(
                 language_config,
                 use_transformer_engine=use_te,
-                normalization=args.normalization,
-                qk_l2_norm=getattr(args, 'qk_l2_norm', False),
+                normalization=language_config.normalization,
+                qk_l2_norm=language_config.qk_l2_norm,
             )
         else:
             language_transformer_layer_spec = get_layer_spec_te(
@@ -165,7 +167,7 @@ def model_provider(
     if vision_model_type not in ("pixtral-vit", "pixtral-vit-large"):
         vision_config.add_bias_linear = True
     if vision_model_type.startswith("hf://"):
-        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert base_config.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
     if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
         if use_te:
@@ -265,7 +267,7 @@ def model_provider(
     model = LLaVAModel(
         language_transformer_config=language_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=model_vocab_size(cfg.model),
         language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
@@ -276,9 +278,9 @@ def model_provider(
         allow_missing_vision_projection_checkpoint=args.allow_missing_vision_projection_checkpoint,
         allow_llm_only_checkpoint=args.allow_llm_only_checkpoint,
         parallel_output=parallel_output,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        language_position_embedding_type=args.position_embedding_type,
-        language_rotary_percent=args.rotary_percent,
+        share_embeddings_and_output_weights=cfg.model.share_embeddings_and_output_weights,
+        language_position_embedding_type=cfg.model.position_embedding_type,
+        language_rotary_percent=cfg.model.rotary_percent,
         pre_process=pre_process,
         post_process=post_process,
         add_encoder=add_encoder,
@@ -286,11 +288,11 @@ def model_provider(
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
-        language_rotary_base=args.rotary_base,
-        language_rope_scaling=args.use_rope_scaling,
-        language_rope_scaling_factor=args.rope_scaling_factor,
-        hybrid_layer_pattern=args.hybrid_layer_pattern,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        language_rotary_base=cfg.model.rotary_base,
+        language_rope_scaling=cfg.model.rope_scaling,
+        language_rope_scaling_factor=cfg.model.rope_scaling_factor,
+        hybrid_layer_pattern=cfg.model.hybrid_layer_pattern,
+        fp16_lm_cross_entropy=cfg.model.fp16_lm_cross_entropy,
         image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
         conv_merging=getattr(args, "conv_merging", False),

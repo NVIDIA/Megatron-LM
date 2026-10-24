@@ -23,8 +23,14 @@ SUPPORTED_TOKENIZERS = [
 logger = logging.getLogger(__name__)
 
 
-def build_tokenizer(args, **kwargs):
-    """Initialize tokenizer."""
+def build_tokenizer(
+    args,
+    *,
+    tensor_model_parallel_size: int | None = None,
+    make_vocab_size_divisible_by: int | None = None,
+    **kwargs,
+):
+    """Initialize tokenizer, with optional model-owned vocabulary padding inputs."""
     if args.tokenizer_type not in SUPPORTED_TOKENIZERS:
         raise ValueError(
             f"tokenizer_type {args.tokenizer_type} is not supported. "
@@ -114,7 +120,12 @@ def build_tokenizer(args, **kwargs):
 
         # Add vocab size (if not already set from a checkpoint).
         if args.pad_vocab_size:
-            _set_padded_vocab_size(args, tokenizer)
+            _set_padded_vocab_size(
+                args,
+                tokenizer,
+                tensor_model_parallel_size=tensor_model_parallel_size,
+                make_vocab_size_divisible_by=make_vocab_size_divisible_by,
+            )
 
         return tokenizer
 
@@ -128,17 +139,33 @@ def build_tokenizer(args, **kwargs):
 
     # Add vocab size (if not already set from a checkpoint).
     if args.pad_vocab_size:
-        _set_padded_vocab_size(args, tokenizer)
+        _set_padded_vocab_size(
+            args,
+            tokenizer,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            make_vocab_size_divisible_by=make_vocab_size_divisible_by,
+        )
 
     return tokenizer
 
 
-def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
+def vocab_size_with_padding(
+    orig_vocab_size,
+    args,
+    logging_enabled=True,
+    *,
+    tensor_model_parallel_size: int | None = None,
+    make_vocab_size_divisible_by: int | None = None,
+):
     """Pad vocab size so it is divisible by model parallel size and
     still having GPU friendly size."""
 
     after = orig_vocab_size
-    multiple = args.make_vocab_size_divisible_by * args.tensor_model_parallel_size
+    if tensor_model_parallel_size is None:
+        tensor_model_parallel_size = args.tensor_model_parallel_size
+    if make_vocab_size_divisible_by is None:
+        make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
+    multiple = make_vocab_size_divisible_by * tensor_model_parallel_size
     after = int(math.ceil(after / multiple) * multiple)
     if args.rank == 0 and logging_enabled:
         logger.info(
@@ -149,7 +176,18 @@ def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     return after
 
 
-def _set_padded_vocab_size(args, tokenizer):
+def _set_padded_vocab_size(
+    args,
+    tokenizer,
+    *,
+    tensor_model_parallel_size: int | None = None,
+    make_vocab_size_divisible_by: int | None = None,
+):
     """Sets padded vocab size if None."""
     if getattr(args, "padded_vocab_size", None) is None:
-        args.padded_vocab_size = vocab_size_with_padding(tokenizer.vocab_size, args)
+        args.padded_vocab_size = vocab_size_with_padding(
+            tokenizer.vocab_size,
+            args,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            make_vocab_size_divisible_by=make_vocab_size_divisible_by,
+        )

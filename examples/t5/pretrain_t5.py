@@ -26,8 +26,9 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_transformer_engine_block_spec,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
     set_run_config,
@@ -90,15 +91,15 @@ def model_provider(
         T5Model: The returned T5 model
     """
 
-    args = get_args()
-    
+    cfg = get_run_config()
+
     if config is None:
-        config = core_transformer_config_from_args(args)
+        config = cfg.model.transformer
 
     encoder_config = deepcopy(config)
-    encoder_config.num_layers = args.encoder_num_layers
+    encoder_config.num_layers = cfg.model.encoder_num_layers
 
-    if args.pipeline_model_parallel_size > 1:
+    if config.pipeline_model_parallel_size > 1:
         raise ValueError("Pipeline parallelism is not supported for T5.")
 
     encoder_layers_per_pipeline = (
@@ -106,10 +107,10 @@ def model_provider(
     )
     decoder_layers_per_pipeline = config.num_layers // config.pipeline_model_parallel_size
 
-    if args.transformer_impl == "local":
+    if config.transformer_impl == "local":
         en_block_spec = get_t5_encoder_with_local_block_spec(encoder_layers_per_pipeline)
         de_block_spec = get_t5_decoder_with_local_block_spec(decoder_layers_per_pipeline)
-    elif args.transformer_impl == "transformer_engine":
+    elif config.transformer_impl == "transformer_engine":
         en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(
             encoder_layers_per_pipeline
         )
@@ -123,17 +124,17 @@ def model_provider(
         encoder_config=encoder_config,
         transformer_encoder_layer_spec=en_block_spec,
         transformer_decoder_layer_spec=de_block_spec,
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
+        vocab_size=model_vocab_size(cfg.model),
+        max_sequence_length=cfg.model.seq_length,
         pre_process=pre_process,
         post_process=post_process,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        fp16_lm_cross_entropy=cfg.model.fp16_lm_cross_entropy,
         parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent,
-        relative_attention_num_buckets=args.relative_attention_num_buckets,
-        relative_attention_max_distance=args.relative_attention_max_distance,
+        share_embeddings_and_output_weights=cfg.model.share_embeddings_and_output_weights,
+        position_embedding_type=cfg.model.position_embedding_type,
+        rotary_percent=cfg.model.rotary_percent,
+        relative_attention_num_buckets=cfg.model.relative_attention_num_buckets,
+        relative_attention_max_distance=cfg.model.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
     )
@@ -276,7 +277,11 @@ if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
-    full_config = pretrain_cfg_container_from_args(args)
+    from megatron.training.argument_utils import model_config_from_args
+    from megatron.training.models import T5ModelConfig
+
+    model_cfg = model_config_from_args(args, model_config_cls=T5ModelConfig)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(
         full_config,

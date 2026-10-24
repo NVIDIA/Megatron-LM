@@ -2,22 +2,20 @@
 
 """FLOPs must use the decoder's final attention type for every MTP depth."""
 
-from types import SimpleNamespace
-
 import pytest
+import torch
 
+from megatron.core.transformer import TransformerConfig
+from megatron.training.models import GPTModelConfig
 from megatron.training.training import num_floating_point_operations
 
 
-def _make_args(**overrides):
-    args = SimpleNamespace(
+def _make_config(**overrides):
+    kwargs = dict(
         attention_output_gate=True,
-        decoder_seq_length=None,
         experimental_attention_variant="gdn",
         ffn_hidden_size=16,
-        group_query_attention=True,
         hidden_size=8,
-        hybrid_layer_pattern=None,
         kv_channels=4,
         linear_attention_freq=4,
         linear_conv_kernel_dim=4,
@@ -33,16 +31,14 @@ def _make_args(**overrides):
         mtp_num_layers=None,
         multi_latent_attention=False,
         num_attention_heads=2,
-        num_experts=4,
+        num_moe_experts=4,
         num_layers=40,
         num_query_groups=1,
-        padded_vocab_size=32,
-        seq_length=8,
-        swiglu=True,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
     )
-    for name, value in overrides.items():
-        setattr(args, name, value)
-    return args
+    kwargs.update(overrides)
+    return GPTModelConfig(transformer=TransformerConfig(**kwargs), vocab_size=32, seq_length=64)
 
 
 def _expected_flops(tokens, squared_lengths, layer_counts, mtp_depth):
@@ -104,7 +100,7 @@ def test_mtp_repeats_final_decoder_attention_type(
 ):
     pattern = [1, 1, 1, 0] * 10 if num_layers == 40 else [1, 1, 1]
     original_pattern = pattern.copy()
-    args = _make_args(
+    config = _make_config(
         num_layers=num_layers,
         mtp_num_layers=mtp_depth,
         linear_attention_freq=4 if pattern_form == "int" else pattern,
@@ -112,12 +108,16 @@ def test_mtp_repeats_final_decoder_attention_type(
     )
     stats, tokens, squared_lengths = _batch_stats(layout)
 
-    actual = num_floating_point_operations(args, batch_size=3, **stats)
+    actual = num_floating_point_operations(config, batch_size=3, sequence_length=8, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, expected_counts, mtp_depth or 0)
     # Keep T fixed and change only Q to isolate the number of full-attention layers.
     merged = num_floating_point_operations(
-        args, batch_size=3, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=tokens**2
+        config,
+        batch_size=3,
+        sequence_length=8,
+        total_real_tokens_in_batch=tokens,
+        seqlen_squared_sum_in_batch=tokens**2,
     )
     assert merged - actual == 48 * expected_counts[1] * (tokens**2 - squared_lengths)
     # A list describes decoder layers only; counting MTP must not append to it.
@@ -127,16 +127,16 @@ def test_mtp_repeats_final_decoder_attention_type(
 @pytest.mark.parametrize("layout", ["bshd", "thd"])
 @pytest.mark.parametrize("mtp_depth", [None, 0, 1, 2])
 def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
-    args = _make_args(
+    config = _make_config(
         experimental_attention_variant=None,
         linear_attention_freq=None,
         num_layers=3,
-        num_experts=None,
+        num_moe_experts=None,
         mtp_num_layers=mtp_depth,
     )
     stats, tokens, squared_lengths = _batch_stats(layout)
     depth = mtp_depth or 0
 
-    actual = num_floating_point_operations(args, batch_size=3, **stats)
+    actual = num_floating_point_operations(config, batch_size=3, sequence_length=8, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, (0, 3 + depth, 3 + depth, 0), depth)
