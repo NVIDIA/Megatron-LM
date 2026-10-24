@@ -1352,6 +1352,72 @@ class TestDistributedOptimizer:
                 dp_zero_optim_A, dp_zero_optim_B, same_dp_group, raise_if_different=True
             )
 
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="distributed optimizer torch_dist formats require PyTorch 2.6a0 or later",
+    )
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
+    def test_load_state_dict_keeps_allocated_optimizer_state(
+        self, tmp_path_dist_ckpt, sharding_type
+    ):
+        """Loading into allocated state fills it in place, without a second state copy."""
+        Utils.initialize_model_parallel(2, 2, order='tp-pp-dp')
+        metadata = {'distrib_optim_sharding_type': sharding_type}
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_load_state_dict_keeps_allocated_optimizer_state', sync=True
+        ) as ckpt_dir:
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2, tp=2, pp=2, initialize_fn=initialize_pp_agnostic_model
+            )
+            save(
+                optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict(), metadata=metadata),
+                ckpt_dir,
+            )
+            dp_zero_optim_A = get_param_state_dp_zero(optimizer_A)
+            groups_A = self._unwrap_distributed_optimizer(optimizer_A).optimizer.param_groups
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3, tp=2, pp=2, initialize_fn=initialize_pp_agnostic_model
+            )
+            for group in self._unwrap_distributed_optimizer(optimizer_B).optimizer.param_groups:
+                group['lr'] = 0.5
+            state_dict = load(
+                optimizer_B.sharded_state_dict(
+                    model_B[0].sharded_state_dict(), metadata=metadata, is_loading=True
+                ),
+                ckpt_dir,
+            )
+
+            inner_B = self._unwrap_distributed_optimizer(optimizer_B).optimizer
+            state_tensors = [
+                tensor
+                for param_state in inner_B.state.values()
+                for tensor in param_state.values()
+                if torch.is_tensor(tensor) and tensor.is_cuda
+            ]
+            assert state_tensors
+            data_ptrs = [t.data_ptr() for t in state_tensors]
+
+            optimizer_B.load_state_dict(state_dict)
+
+            # The state is loaded in place: re-loading it through the inner optimizer
+            # would reallocate it (TE FusedAdam) and hold a second copy during the load.
+            assert [
+                tensor.data_ptr()
+                for param_state in inner_B.state.values()
+                for tensor in param_state.values()
+                if torch.is_tensor(tensor) and tensor.is_cuda
+            ] == data_ptrs
+            assert [group['lr'] for group in inner_B.param_groups] == [
+                group['lr'] for group in groups_A
+            ]
+            assert self.check_equal_dp_zero_state(
+                dp_zero_optim_A,
+                get_param_state_dp_zero(optimizer_B),
+                same_dp_group=True,
+                raise_if_different=True,
+            )
+
     @staticmethod
     def _unwrap_distributed_optimizer(optimizer):
         if isinstance(optimizer, ChainedOptimizer):
