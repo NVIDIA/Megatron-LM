@@ -1,8 +1,10 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
+import tempfile
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy
 
@@ -12,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 class Split(Enum):
+    """Dataset partition used for training, validation, and testing."""
+
     train = 0
     valid = 1
     test = 2
@@ -19,7 +23,6 @@ class Split(Enum):
 
 def compile_helpers():
     """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
-    import os
     import subprocess
 
     command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]
@@ -90,3 +93,27 @@ def get_blend_from_list(
     prefix_per_dataset = [rppd.strip() for rppd in raw_prefix_per_dataset]
 
     return prefix_per_dataset, weight_per_dataset
+
+
+def save_index_cache(
+    path_to_description: str, description: str, indices: Dict[str, numpy.ndarray]
+) -> None:
+    """Publish complete index files before their cache description.
+
+    Args:
+        path_to_description (str): Path to the cache description.
+        description (str): The dataset's unique description.
+        indices (Dict[str, numpy.ndarray]): Index arrays keyed by their cache paths.
+    """
+    # Stage on the same filesystem so interrupted writes never replace a complete index.
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(path_to_description)) as temporary_dir:
+        for path, index in indices.items():
+            numpy.save(
+                os.path.join(temporary_dir, os.path.basename(path)), index, allow_pickle=True
+            )
+        with open(
+            os.path.join(temporary_dir, os.path.basename(path_to_description)), "wt"
+        ) as writer:
+            writer.write(description)
+        for path in (*indices, path_to_description):
+            os.replace(os.path.join(temporary_dir, os.path.basename(path)), path)
