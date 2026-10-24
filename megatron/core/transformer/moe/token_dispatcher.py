@@ -1104,12 +1104,15 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
 
+    @torch.compiler.disable
     def setup_metadata(
         self,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
     ):
+        # Keep the EP collective and host scalar read out of compiled preprocessing:
+        # compiler CUDA synchronization can otherwise race HybridEP initialization.
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
 
