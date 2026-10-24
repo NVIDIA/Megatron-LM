@@ -548,9 +548,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 )
                                 model_param.clear_high_precision_init_val()
                             else:
-                                shard_main_param = model_param.float().view(-1)[
-                                    param_range.start : param_range.end
-                                ]
+                                # Detach first: `.float()` on a quantized parameter that requires
+                                # grad records a grad_fn, so the resulting shard is a non-leaf
+                                # tensor. torch.optim.Optimizer.__init__ (reached through
+                                # HybridDeviceOptimizer with --optimizer-cpu-offload) rejects it
+                                # with "can't optimize a non-leaf Tensor". Same fix as the fp32
+                                # branch above; the master copy never needs autograd history.
+                                shard_main_param = (
+                                    model_param.detach()
+                                    .float()
+                                    .view(-1)[param_range.start : param_range.end]
+                                )
                         else:
                             shard_main_param = shard_model_param.clone().float()
 
