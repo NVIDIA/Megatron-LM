@@ -240,58 +240,6 @@ def test_deepepv2_initializes_optional_transport_without_v1(monkeypatch, availab
         assert manager._fused_a2a is fused_a2a
 
 
-def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
-    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
-    manager = object.__new__(_HybridEPManager)
-    manager._fused_a2a = fused_a2a
-    manager.config = SimpleNamespace(
-        moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
-    )
-    manager.group = object()
-    manager.num_experts = 2
-    manager.router_topk = 1
-    manager.moe_expert_rank_capacity_factor = None
-    manager.drop_and_pad = False
-
-    routing_map = torch.tensor([[True, False], [False, False]])
-    probs = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
-
-    manager.setup_metadata(routing_map, probs)
-
-    assert torch.equal(manager.topk_idx, torch.tensor([[0], [-1]], dtype=torch.int16))
-
-
-def test_hybridep_dense_input_requires_backend_support(monkeypatch):
-    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
-    manager = object.__new__(_HybridEPManager)
-    manager._fused_a2a = fused_a2a
-    manager.config = SimpleNamespace(
-        moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
-    )
-    manager.group = object()
-    manager.num_experts = 4
-    manager.router_topk = 2
-    manager.moe_expert_rank_capacity_factor = None
-    manager.drop_and_pad = False
-
-    with pytest.raises(RuntimeError, match="does not support dense topk_idx metadata"):
-        manager.setup_metadata(torch.tensor([[0, 2]], dtype=torch.int16), torch.ones(1, 4))
-
-
-def test_flex_dense_metadata_preserves_invalid_routes():
-    dispatcher = object.__new__(MoEFlexTokenDispatcher)
-    dispatcher.tp_size = 2
-    dispatcher.ep_size = 2
-    dispatcher.num_local_experts = 2
-    routing_map = torch.tensor([[0, -1], [3, 1]], dtype=torch.int16)
-    probs = torch.ones((2, 4))
-
-    expanded_routes, _ = dispatcher._initialize_metadata(routing_map, probs)
-
-    expected = torch.tensor([[0, 2, -1, -1], [5, 7, 1, 3]], dtype=torch.int16)
-    assert torch.equal(expanded_routes, expected)
-
-
 @pytest.mark.parametrize("manager_cls", [_DeepepManager, _DeepepV2Manager, _NCCLEPManager])
 def test_dense_required_manager_accepts_dense_indices(monkeypatch, manager_cls):
     manager = object.__new__(manager_cls)
@@ -836,6 +784,7 @@ def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
 
 def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.group = object()
     manager.num_local_experts = 2
     manager.num_experts = 4
@@ -852,7 +801,7 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
     manager.moe_expert_rank_capacity_factor = None
     manager.capacity_factor = None
     manager.drop_and_pad = False
-    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.dense_routing_supported = fused_a2a.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
         manager.dense_routing_supported
         and manager.config.moe_hybridep_routing_map_mode == "indices"
@@ -886,8 +835,9 @@ def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
 
 
 def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.config = SimpleNamespace(
         moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
     )
@@ -897,7 +847,7 @@ def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
     manager.moe_expert_rank_capacity_factor = None
     manager.capacity_factor = None
     manager.drop_and_pad = False
-    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.dense_routing_supported = fused_a2a.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
         manager.dense_routing_supported
         and manager.config.moe_hybridep_routing_map_mode == "indices"
@@ -915,8 +865,9 @@ def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch
     """Dense ids must follow the bool map even when probs are nonzero outside the selected
     routes (direct callers and the dispatcher test helper pass full-width weights); a topk over
     probs would pick expert 1 here and drop the token's only real route."""
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.config = SimpleNamespace(
         moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
     )
@@ -926,7 +877,7 @@ def test_hybridep_indices_mode_honors_bool_map_with_full_width_probs(monkeypatch
     manager.moe_expert_rank_capacity_factor = None
     manager.capacity_factor = None
     manager.drop_and_pad = False
-    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.dense_routing_supported = fused_a2a.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
         manager.dense_routing_supported
         and manager.config.moe_hybridep_routing_map_mode == "indices"
@@ -990,8 +941,9 @@ def test_hybridep_dropless_excludes_padding_rows(monkeypatch):
     """Dropless HybridEP drops padded tokens in the dispatcher (the router keeps them routed):
     padding rows lose their routes and weights, valid rows are untouched. The mask arrives
     batch-first [b, s] and is transposed to the sequence-first token order."""
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.config = SimpleNamespace(
         moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="bool"
     )
@@ -1025,7 +977,7 @@ def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
     """With pad-to-capacity the routing map is the capacity mask (a token can carry more than
     topk assignments); the indices-mode topk reconstruction would drop the padded assignments
     while tokens_per_expert still declares the full capacity, so the bool map must be kept."""
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
     num_tokens, num_experts, topk, capacity_factor = 64, 2, 1, 2.0
     manager = object.__new__(_HybridEPManager)
     manager.config = SimpleNamespace(
@@ -1033,6 +985,7 @@ def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
         moe_hybridep_routing_map_mode="indices",
         moe_router_topk=topk,
     )
+    manager._fused_a2a = fused_a2a
     manager.group = SimpleNamespace(size=lambda: 1)
     manager.num_experts = num_experts
     manager.num_local_experts = num_experts
@@ -1059,8 +1012,9 @@ def test_hybridep_indices_mode_keeps_bool_map_with_pad_to_capacity(monkeypatch):
 
 
 def test_hybridep_dense_input_requires_backend_support(monkeypatch):
-    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
     manager = object.__new__(_HybridEPManager)
+    manager._fused_a2a = fused_a2a
     manager.config = SimpleNamespace(
         moe_hybridep_pad_variable_tokens=False, moe_hybridep_routing_map_mode="indices"
     )
@@ -1070,7 +1024,7 @@ def test_hybridep_dense_input_requires_backend_support(monkeypatch):
     manager.moe_expert_rank_capacity_factor = None
     manager.capacity_factor = None
     manager.drop_and_pad = False
-    manager.dense_routing_supported = token_dispatcher.HAVE_HYBRIDEP_DENSE_ROUTING
+    manager.dense_routing_supported = fused_a2a.HAVE_HYBRIDEP_DENSE_ROUTING
     manager.use_dense_routing_for_bool_map = (
         manager.dense_routing_supported
         and manager.config.moe_hybridep_routing_map_mode == "indices"

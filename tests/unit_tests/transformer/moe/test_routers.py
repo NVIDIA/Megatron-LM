@@ -76,7 +76,7 @@ def test_dense_route_indices_dtype(
     monkeypatch, backend, routing_map_mode, num_experts, capacity_factor, expected_dtype
 ):
     monkeypatch.setattr(router_module, "fused_topk_with_score_function_supports_topk_indices", True)
-    monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    monkeypatch.setattr("megatron.core.transformer.moe.fused_a2a.HAVE_HYBRIDEP_DENSE_ROUTING", True)
     router = SimpleNamespace(
         config=SimpleNamespace(
             moe_router_fusion=True,
@@ -942,7 +942,9 @@ class TestTop2Router:
     def test_hybridep_dense_routing_keeps_padding_rows_routed(self, monkeypatch):
         """The router does not drop padded rows for any dispatcher: dropless HybridEP excludes
         them itself in _HybridEPManager.setup_metadata. Here the mask only feeds the losses."""
-        monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+        monkeypatch.setattr(
+            "megatron.core.transformer.moe.fused_a2a.HAVE_HYBRIDEP_DENSE_ROUTING", True
+        )
         self.router = self.router.cuda()
         self.router.config.moe_router_fusion = True
         self.router.config.moe_token_dispatcher_type = "flex"
