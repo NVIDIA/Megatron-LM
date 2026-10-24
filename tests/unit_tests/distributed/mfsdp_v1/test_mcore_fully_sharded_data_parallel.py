@@ -13,7 +13,7 @@ from torch.testing import assert_close
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.fp8_utils import HAVE_TE
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
@@ -1364,7 +1364,7 @@ class TestFsdpNonUnitBucketPreservation:
 
         # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
         # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
-        # matches the production default in mcore_fsdp_adapter.py.
+        # matches the production default in mcore_adapter.py.
         fsdp_model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
