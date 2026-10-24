@@ -315,8 +315,9 @@ def forward_step_calc_loss(
     forward_data_store,
     cp_group_size=None,
     is_last_stage=None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Calculate the loss and number of tokens for forward_step()"""
+    """Calculate loss from CP-local sums/counts and return the local token count."""
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -344,9 +345,18 @@ def forward_step_calc_loss(
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
-                    # Protect against division by zero when all tokens are masked
-                    #   in a microbatch.
-                    output_tensor /= torch.clamp(num_tokens, min=1)
+                    num_tokens_for_loss = num_tokens
+                    if cp_group_size > 1:
+                        if cp_group is None:
+                            # Compatibility for callers that do not yet pass an explicit CP group.
+                            cp_group = parallel_state.get_context_parallel_group()
+                        # Keep the returned count and reporting metrics local. CP shards of one
+                        # sample must share a denominator, including shards with no valid tokens.
+                        num_tokens_for_loss = num_tokens.clone()
+                        torch.distributed.all_reduce(num_tokens_for_loss, group=cp_group)
+                        # DDP averages over DP x CP; compensate for its CP factor.
+                        output_tensor *= cp_group_size
+                    output_tensor /= torch.clamp(num_tokens_for_loss, min=1)
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
@@ -419,6 +429,7 @@ def forward_step(
     current_microbatch=None,
     vp_stage=None,
     is_last_stage=True,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Forward step for passed-in model.
 
@@ -487,6 +498,8 @@ def forward_step(
             Whether it is the last stage. Defaults to True.
             Also considering virtual stages.
             In case of PP/VPP, is_last_stage/is_vp_last_stage.
+        cp_group (ProcessGroup, optional):
+            Context parallel group for the loss denominator reduction.
 
     Returns:
         Tensor or list[Tensor]: The output object(s) from the forward step.
@@ -543,6 +556,7 @@ def forward_step(
         forward_data_store,
         cp_group_size,
         is_last_stage,
+        cp_group=cp_group,
     )
 
     if unwrap_output_tensor:
@@ -840,6 +854,7 @@ def forward_backward_no_pipelining(
                     collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                     current_microbatch=i,
+                    cp_group=pg_collection.cp,
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
@@ -867,6 +882,7 @@ def forward_backward_no_pipelining(
                 first_val_step, forward_only, num_microbatches == 1
             ),
             current_microbatch=num_microbatches - 1,
+            cp_group=pg_collection.cp,
         )
 
         total_num_tokens += num_tokens
@@ -1415,6 +1431,7 @@ def forward_backward_pipelining_with_interleaving(
             forward_data_store,
             config,
             cp_group_size=cp_size,
+            cp_group=cp_group,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
@@ -2401,6 +2418,7 @@ def forward_backward_pipelining_without_interleaving(
             forward_data_store,
             config,
             cp_group_size=cp_size,
+            cp_group=cp_group,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
@@ -2447,6 +2465,7 @@ def forward_backward_pipelining_without_interleaving(
             forward_data_store,
             config,
             cp_group_size=cp_size,
+            cp_group=cp_group,
             collect_non_loss_data=collect_non_loss_data,
             checkpoint_activations_microbatch=checkpoint_activations_microbatch,
             is_first_microbatch=check_first_val_step(
