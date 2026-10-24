@@ -292,6 +292,7 @@ class EngineLoopMixin:
         cuda_graph_request_count = None
 
         if step_result is not None:
+            self._metrics_counters["engine_steps_total"] += 1
             active_request_ids = step_result["active_request_ids"]
             finished_request_ids = step_result["finished_request_ids"]
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")

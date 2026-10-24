@@ -547,6 +547,73 @@ def handle_cuda_profiler_signal(coordinator, sender_identity, metadata, bodies):
     coordinator._broadcast_to_engines(metadata)
 
 
+@message_handler(Headers.GET_METRICS)
+def handle_get_metrics(coordinator, sender_identity, metadata, bodies):
+    """Ask every engine for its metrics on behalf of a client.
+
+    Sent by ``InferenceClient.get_metrics``. The reply, METRICS_REPLY, goes back once every
+    engine connected now has answered (see handle_engine_metrics).
+
+    ``metadata``: ``[header, client_query_id]``.
+    ``bodies``: empty.
+    """
+    if sender_identity not in coordinator.known_clients:
+        logging.warning("Coordinator: ignoring GET_METRICS from unknown client.")
+        return
+    query_id = coordinator.metrics_query_counter
+    coordinator.metrics_query_counter += 1
+    query = {
+        "client": sender_identity,
+        "client_query_id": metadata[1],
+        "pending": set(coordinator.identities_of_data_parallel_ranks),
+        "replies": {},
+    }
+    coordinator.metrics_queries[query_id] = query
+    coordinator._broadcast_to_engines([Headers.GET_METRICS.value, query_id])
+    _maybe_send_metrics_reply(coordinator, query_id)
+
+
+@message_handler(Headers.ENGINE_METRICS)
+def handle_engine_metrics(coordinator, sender_identity, metadata, bodies):
+    """Collect one engine's metrics; reply to the client once every engine has answered.
+
+    Sent by the engine (model-parallel rank 0 of each data parallel rank) in reply to
+    GET_METRICS.
+
+    ``metadata``: ``[header, query_id, metrics]``, ``metrics`` a dict of counters and gauges.
+    ``bodies``: empty.
+    """
+    query = coordinator.metrics_queries.get(metadata[1])
+    if query is None:
+        return
+    query["pending"].discard(sender_identity)
+    query["replies"][sender_identity] = metadata[2]
+    _maybe_send_metrics_reply(coordinator, metadata[1])
+
+
+def _maybe_send_metrics_reply(coordinator, query_id):
+    """Send METRICS_REPLY for query_id once no connected engine is still pending."""
+    query = coordinator.metrics_queries[query_id]
+    # An engine removed since the query was sent will never answer.
+    query["pending"] &= set(coordinator.identities_of_data_parallel_ranks)
+    if query["pending"]:
+        return
+    del coordinator.metrics_queries[query_id]
+    replies = {
+        identity.decode("utf-8", errors="replace"): metrics
+        for identity, metrics in query["replies"].items()
+    }
+    coordinator._send_to_client(
+        [
+            query["client"],
+            msgpack.packb(
+                [Headers.METRICS_REPLY.value, query["client_query_id"], replies],
+                use_bin_type=True,
+            ),
+        ]
+    )
+
+
 @message_handler(Headers.ENGINE_REPLY)
 def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
     """Route completed requests from an engine back to their originating clients.

@@ -73,10 +73,18 @@ class Transport(IntEnum):
     KV_HANDOFF_COMPLETE = 81  # Internal MP-wide decode admission decision.
 
 
+class Metrics(IntEnum):
+    """Pull-based engine metrics: client -> coordinator -> every engine, and back."""
+
+    GET_METRICS = 100  # Client asks the coordinator; the coordinator asks every engine.
+    ENGINE_METRICS = 101  # An engine's counters, sent to the coordinator.
+    METRICS_REPLY = 102  # The coordinator's per-engine counters, sent to the client.
+
+
 # All header categories. To add a new class of headers, define a new IntEnum in
 # its own (disjoint) numeric range and append it here; nothing else needs to
 # change. Ranges are spaced out to leave room for growth within each category.
-HEADER_ENUMS = (Connection, Request, Control, Lifecycle, Transport)
+HEADER_ENUMS = (Connection, Request, Control, Lifecycle, Transport, Metrics)
 
 
 class UnknownHeaderError(Exception):

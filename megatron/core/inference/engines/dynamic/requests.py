@@ -91,6 +91,7 @@ class RequestIntakeMixin:
         if request.status == Status.COMPLETED:
             request.add_event_finish()
             self.finished_request_count += 1
+            self._metrics_counters["requests_finished_total"] += 1
         else:
             assert (
                 request.status == Status.FAILED

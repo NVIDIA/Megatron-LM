@@ -5,8 +5,9 @@ try:
     from .chat_completions import bp as ChatCompletions
     from .completions import bp as Completions
     from .health import bp as Health
+    from .metrics import bp as Metrics
     from .profile import bp as Profile
 
-    __all__ = [Completions, ChatCompletions, Health, Profile]
+    __all__ = [Completions, ChatCompletions, Health, Metrics, Profile]
 except ImportError:
     __all__ = []

@@ -345,6 +345,7 @@ class StepPostProcessingMixin:
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
+                    self._metrics_counters["generation_tokens_total"] += len(tokens)
                     first_token_event = None
                     if self.track_generated_token_events:
                         for token in tokens:

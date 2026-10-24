@@ -275,6 +275,10 @@ class DataParallelInferenceCoordinator:
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()
         self.handoff_ownership = HandoffOwnership()
+        # In-flight GET_METRICS queries: query id -> {"client", "client_query_id",
+        # "pending" (engine identities yet to reply), "replies" (identity -> counters)}.
+        self.metrics_queries = {}
+        self.metrics_query_counter = 0
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)

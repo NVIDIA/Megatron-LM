@@ -545,6 +545,22 @@ class CoordinatorMixin:
                 serialized[key] = None
         return serialized
 
+    def _metrics_snapshot(self) -> Dict[str, int]:
+        """This engine's lifetime counters and current gauges, for /metrics.
+
+        Counters only grow, so a client reads them at the start and end of a window and
+        divides the difference by its length.
+        """
+        context = self.context
+        return {
+            **self._metrics_counters,
+            "prompt_tokens_total": context.metrics_prompt_tokens_total,
+            "prompt_tokens_cached_total": context.metrics_prompt_tokens_cached_total,
+            "requests_running": context.total_request_count - context.paused_request_count,
+            "requests_paused": context.paused_request_count,
+            "requests_waiting": len(self.waiting_request_ids),
+        }
+
     def _try_send_streaming_partials(self) -> None:
         """Send pending token deltas to the inference coordinator.
 
@@ -935,6 +951,15 @@ class CoordinatorMixin:
                 torch.cuda.cudart().cudaProfilerStart()
             elif header == Headers.STOP_CUDA_PROFILER:
                 torch.cuda.cudart().cudaProfilerStop()
+            elif header == Headers.GET_METRICS:
+                # Every MP rank has the same counters; the MP coordinator answers for them.
+                if self.is_mp_coordinator:
+                    self.socket_for_receiving_requests.send(
+                        msgpack.packb(
+                            [Headers.ENGINE_METRICS.value, data[1], self._metrics_snapshot()],
+                            use_bin_type=True,
+                        )
+                    )
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)

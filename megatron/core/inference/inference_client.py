@@ -4,7 +4,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -114,6 +114,9 @@ class InferenceClient:
         self.socket = socket
         self.deserialize = deserialize
         self.completion_futures = {}
+        # GET_METRICS query id -> future resolved by METRICS_REPLY.
+        self.metrics_futures = {}
+        self.next_metrics_query_id = 0
         self.request_submission_times = {}
         self.next_request_id = 0
         self.coordinator_instance_id: str | None = None
@@ -611,6 +614,10 @@ class InferenceClient:
                         DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
                     completion_future.set_result(completed_request)
+                elif header == Headers.METRICS_REPLY:
+                    future = self.metrics_futures.pop(data[1], None)
+                    if future is not None and not future.done():
+                        future.set_result(data[2])
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
                     request_id = data[1]
                     stream = self.streams.get(request_id)
@@ -686,6 +693,22 @@ class InferenceClient:
         payload = [signal.value, *args]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
+
+    async def get_metrics(self) -> Dict[str, Dict[str, int]]:
+        """Ask every engine for its lifetime counters and current gauges.
+
+        The coordinator forwards GET_METRICS to each data parallel engine, which answers at
+        its next step, and replies once all have answered.
+
+        Returns:
+            Engine identity -> that engine's metrics (see DynamicInferenceEngine._metrics_snapshot).
+        """
+        query_id = self.next_metrics_query_id
+        self.next_metrics_query_id += 1
+        future = asyncio.get_running_loop().create_future()
+        self.metrics_futures[query_id] = future
+        self._send_signal_to_engines(Headers.GET_METRICS, query_id)
+        return await future
 
     def pause_engines(self):
         """Sends PAUSE to all engines via coordinator.

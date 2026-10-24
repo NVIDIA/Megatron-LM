@@ -455,6 +455,13 @@ class DynamicInferenceEngine(
         self.request_counter = Counter()
         self.finished_request_count = 0
         self.evicted_request_count = 0
+        # Lifetime counters for /metrics (see _metrics_snapshot); never reset.
+        if not hasattr(self, "_metrics_counters"):
+            self._metrics_counters = {
+                "generation_tokens_total": 0,
+                "requests_finished_total": 0,
+                "engine_steps_total": 0,
+            }
         # Staging is drained by now (checked above), so the backlog peak starts over.
         self._staging_tasks_peak = 0
 

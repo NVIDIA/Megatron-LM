@@ -3424,6 +3424,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.lifetime_prefill_token_count = 0
             self.async_sched_step_count = 0
             self.async_sched_compaction_step_count = 0
+        # Lifetime counters for the engine's /metrics; never reset.
+        if not hasattr(self, "metrics_prompt_tokens_total"):
+            self.metrics_prompt_tokens_total = 0
+            self.metrics_prompt_tokens_cached_total = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -4224,7 +4228,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
+        self.metrics_prompt_tokens_total += effective_prefill_chunk_length
         if self.enable_prefix_caching:
+            self.metrics_prompt_tokens_cached_total += prefix_skip_tokens
             self.prefix_cache_prefill_computed_tokens += effective_prefill_chunk_length
             self.prefix_cache_prefill_skipped_tokens += prefix_skip_tokens
         self.total_request_count += 1
