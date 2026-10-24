@@ -813,7 +813,7 @@ class MegatronLiteEngine(BaseEngine):
             )
         result = self.runtime.forward_backward(
             self.handle,
-            iter(runtime_batches),
+            self._iter_runtime_batches(runtime_batches, forward_only=forward_only),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
@@ -839,6 +839,22 @@ class MegatronLiteEngine(BaseEngine):
                 for key, value in metrics.items()
             },
         }
+
+    def _iter_runtime_batches(self, batches, *, forward_only):
+        # In PP1 each next forward follows the preceding microbatch's backward.
+        # Release only unused allocator segments, including old-LP leftovers at
+        # the first training boundary; never drop live graphs or weight caches.
+        release = (
+            not forward_only
+            and self.device_name == "cuda"
+            and self.engine_config.pp == 1
+            and self.engine_config.impl == "vllm"
+            and self._resolve_model_name() == "deepseek_v41"
+        )
+        for batch in batches:
+            if release:
+                _release_inactive_cuda_cache()
+            yield batch
 
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
         """Flatten a jagged no-padding batch to a model-agnostic ``PackedBatch``.

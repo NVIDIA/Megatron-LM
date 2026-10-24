@@ -9,7 +9,7 @@ from megatron.lite.model.deepseek_v41.lite.components.block import DS41Block
 from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model as NativeModel
 
 from .attention import build_attention
-from .head import head_logits, log_softmax
+from .head import head_logits, token_log_probs
 from .mhc import aggregate, joint, post_mix
 from .moe import MegaMoE
 from .norm import ModelNorm
@@ -76,27 +76,35 @@ class DeepseekV41Model(NativeModel):
         from .weights import clear
 
         clear(enabled=torch.is_grad_enabled())  # inference does not retain cross-layer encodings
-        if labels is None or not self.layout.has_head:
-            return super().forward(
-                *args,
-                labels=labels,
-                loss_mask=loss_mask,
-                calculate_entropy=calculate_entropy,
-                **kwargs,
+        return super().forward(
+            *args, labels=labels, loss_mask=loss_mask, calculate_entropy=calculate_entropy, **kwargs
+        )
+
+    def _head_output(self, collapsed, rows, labels, loss_mask, temperature, calculate_entropy):
+        if labels is None:
+            return super()._head_output(
+                collapsed, rows, labels, loss_mask, temperature, calculate_entropy
             )
         if self.ps.tp_size != 1:
             raise NotImplementedError('Deployment log-probs currently require TP1')
-        output = super().forward(*args, labels=None, loss_mask=loss_mask, **kwargs)
-        distribution = log_softmax(output.pop('logits'))
-        picked = distribution.gather(-1, labels.reshape(-1, 1)).squeeze(-1)
+        picked, entropy = token_log_probs(
+            collapsed,
+            self.head.weight,
+            labels,
+            chunk_size=getattr(self.impl, 'head_chunk_size', 1024),
+            dtype=self.head.logits_dtype,
+            temperature=temperature,
+            calculate_entropy=calculate_entropy,
+        )
         mask = torch.ones_like(picked) if loss_mask is None else loss_mask.reshape(-1).to(picked)
-        output.update(
+        output = dict(
+            rows=torch.arange(rows, device=collapsed.device) + self.ps.cp_rank * rows,
             log_probs=picked,
             loss=-(picked * mask).sum() / mask.sum().clamp_min(1),
             valid_mask=mask.bool(),
         )
         if calculate_entropy:
-            output['entropy'] = -(distribution.exp() * distribution).sum(-1)
+            output['entropy'] = entropy
         return output
 
     def _build_attention(self, config, index):

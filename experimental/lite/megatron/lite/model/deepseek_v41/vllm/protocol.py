@@ -15,6 +15,7 @@ from megatron.lite.model.deepseek_v41.lite.protocol import (
 class ImplConfig(native.ImplConfig):
     attention_core: str = "flashmla"
     head_dtype: str = "float32"
+    head_chunk_size: int = 1024
     attention_deterministic_backward: bool = True
 
 
@@ -23,7 +24,13 @@ def validate_impl_cfg_keys(values):
         {
             k: v
             for k, v in values.items()
-            if k not in ("attention_core", "head_dtype", "attention_deterministic_backward")
+            if k
+            not in (
+                "attention_core",
+                "head_dtype",
+                "head_chunk_size",
+                "attention_deterministic_backward",
+            )
         }
     )
 
@@ -42,6 +49,8 @@ def build_model(model_cfg, *, impl_cfg):
 
     from .model import DeepseekV41Model
 
+    if not isinstance(impl_cfg.head_chunk_size, int) or impl_cfg.head_chunk_size < 0:
+        raise ValueError("head_chunk_size must be a nonnegative integer (0 disables chunking)")
     if getattr(impl_cfg, "attention_core", "flashmla") not in ("flashmla", "mega"):
         raise ValueError("attention_core must be 'flashmla' or 'mega'")
 

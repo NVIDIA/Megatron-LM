@@ -133,3 +133,34 @@ def test_release_only_synchronizes_and_returns_unused_allocator_blocks(memory_mo
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     memory_module.release_inactive_cuda_cache()
     assert calls == ["synchronize", "empty_cache"]
+
+
+@pytest.mark.parametrize(
+    'forward_only,pp,impl,device,releases',
+    [
+        (False, 1, 'vllm', 'cuda', 3),
+        (True, 1, 'vllm', 'cuda', 0),
+        (False, 2, 'vllm', 'cuda', 0),
+        (False, 1, 'lite', 'cuda', 0),
+        (False, 1, 'vllm', 'cpu', 0),
+    ],
+)
+def test_microbatch_cache_boundary_preserves_order_and_references(
+    engine_module, monkeypatch, forward_only, pp, impl, device, releases
+):
+    engine = object.__new__(engine_module.MegatronLiteEngine)
+    engine.engine_config = SimpleNamespace(pp=pp, impl=impl)
+    engine.device_name = device
+    engine._resolve_model_name = lambda: 'deepseek_v41'
+    calls = []
+    monkeypatch.setattr(
+        engine_module, '_release_inactive_cuda_cache', lambda: calls.append('release')
+    )
+    batches = [object() for _ in range(3)]
+    iterator = engine._iter_runtime_batches(batches, forward_only=forward_only)
+    assert not calls  # no eager release before the runtime requests a forward
+    for index, actual in enumerate(iterator):
+        assert actual is batches[index]
+        if releases:
+            assert len(calls) == index + 1
+    assert len(calls) == releases

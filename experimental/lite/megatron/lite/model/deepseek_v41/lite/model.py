@@ -247,27 +247,32 @@ class DeepseekV41Model(MegatronModule):
                 hidden.dtype
             )
             collapsed = self.norm(collapsed)
-            logits = self.head(collapsed)[0]
-            if float(temperature) != 1:
-                logits = logits / float(temperature)
-            output = {"rows": torch.arange(rows, device=ids.device) + self.ps.cp_rank * rows}
-            if labels is None:
-                output["logits"] = logits.squeeze(1)
-                return output
-            token_loss = vocab_parallel_cross_entropy(
-                logits.float(), labels.reshape(rows, 1), tp_group=self.ps.tp_group
-            ).squeeze(1)
-            mask = (
-                torch.ones_like(token_loss)
-                if loss_mask is None
-                else loss_mask.reshape(-1).to(token_loss.dtype)
+            return self._head_output(
+                collapsed, rows, labels, loss_mask, temperature, calculate_entropy
             )
-            output.update(
-                log_probs=-token_loss,
-                loss=(token_loss * mask).sum() / mask.sum().clamp_min(1),
-                valid_mask=mask.bool(),
-            )
-            if calculate_entropy:
-                logp = logits.float().log_softmax(-1)
-                output["entropy"] = -(logp.exp() * logp).sum(-1).squeeze(1)
+
+    def _head_output(self, collapsed, rows, labels, loss_mask, temperature, calculate_entropy):
+        logits = self.head(collapsed)[0]
+        if float(temperature) != 1:
+            logits = logits / float(temperature)
+        output = {"rows": torch.arange(rows, device=collapsed.device) + self.ps.cp_rank * rows}
+        if labels is None:
+            output["logits"] = logits.squeeze(1)
             return output
+        token_loss = vocab_parallel_cross_entropy(
+            logits.float(), labels.reshape(rows, 1), tp_group=self.ps.tp_group
+        ).squeeze(1)
+        mask = (
+            torch.ones_like(token_loss)
+            if loss_mask is None
+            else loss_mask.reshape(-1).to(token_loss.dtype)
+        )
+        output.update(
+            log_probs=-token_loss,
+            loss=(token_loss * mask).sum() / mask.sum().clamp_min(1),
+            valid_mask=mask.bool(),
+        )
+        if calculate_entropy:
+            logp = logits.float().log_softmax(-1)
+            output["entropy"] = -(logp.exp() * logp).sum(-1).squeeze(1)
+        return output
