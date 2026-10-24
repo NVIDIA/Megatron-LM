@@ -571,6 +571,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                 kwargs["adam_w_mode"] = config.decoupled_weight_decay
                 adam_cls = Adam
 
+            te_has_remainder_arg = config.use_precision_aware_optimizer and is_te_min_version(
+                "2.1.0.dev0"
+            )
             if config.use_precision_aware_optimizer:
                 kwargs.update(
                     {
@@ -594,7 +597,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                         }
                     )
 
-                if is_te_min_version("2.1.0.dev0"):
+                if te_has_remainder_arg:
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
 
             optimizer = adam_cls(**kwargs)
@@ -606,6 +609,12 @@ def _get_megatron_optimizer_based_on_param_groups(
                             if config is None or not config.use_precision_aware_optimizer:
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            elif te_has_remainder_arg:
+                                # TE >= 2.1 requires the per-parameter remainder flag;
+                                # FP32 parameters still use full master weights.
+                                opt.initialize_state(
+                                    p, opt.store_param_remainders and p.dtype == torch.bfloat16
+                                )
                             else:
                                 opt.initialize_state(p)
 
