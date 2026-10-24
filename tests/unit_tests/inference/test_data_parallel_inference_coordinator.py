@@ -358,6 +358,9 @@ class DummyContext:
     def get_active_request_count(self) -> int:
         return self.active_cnt
 
+    def remove_vlm_request_data(self, request_id: int) -> None:
+        pass
+
 
 class DummyController:
     """Dummy inference controller."""
@@ -377,6 +380,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.waiting_request_ids = deque()
         self.failed_request_ids: List[int] = []
         self.requests: Dict[int, RequestEntry] = {}
+        self.finished_request_count = 0
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
