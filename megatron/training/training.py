@@ -3117,6 +3117,8 @@ def setup_model_and_optimizer(
     if args.ckpt_convert_format is not None:
         load_ckpt_format = args.ckpt_format
         args.ckpt_format = args.ckpt_convert_format
+        if args.ckpt_format != "torch_dist":
+            args.verify_integrity = False
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
         update_use_dist_ckpt(args)
 
