@@ -56,7 +56,7 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
-from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from ..distributed.fsdp.mcore_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank

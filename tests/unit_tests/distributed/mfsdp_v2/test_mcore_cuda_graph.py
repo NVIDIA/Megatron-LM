@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_adapter import FullyShardedDataParallel
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer

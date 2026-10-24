@@ -28,7 +28,7 @@
       "finalize_model_grads:accessor:parallel_state.get_tensor_and_data_parallel_group",
       "finalize_model_grads:accessor:parallel_state.get_tensor_model_parallel_group"
     ],
-    "megatron/core/distributed/fsdp/mcore_fsdp_adapter.py": [
+    "megatron/core/distributed/fsdp/mcore_adapter.py": [
       "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_data_parallel_group",
       "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_data_parallel_group",
       "FullyShardedDataParallelV1._init_dist_index:accessor:parallel_state.get_data_parallel_group",

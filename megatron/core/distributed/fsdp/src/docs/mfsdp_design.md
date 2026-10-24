@@ -230,7 +230,7 @@ def fully_shard_compat(...fsdp2 args...):
 ### MCore Adapter
 
 This rewrite should be mostly transparent to users of
-megatron/core/distributed/fsdp/mcore_fsdp_adapter.py. We’ll implement the adapter using
+megatron/core/distributed/fsdp/mcore_adapter.py. We’ll implement the adapter using
 the new API.
 
 However, certain features may behave differently. For example,
