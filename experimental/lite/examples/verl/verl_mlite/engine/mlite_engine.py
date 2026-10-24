@@ -20,6 +20,8 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite import qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
+from verl_mlite.optimizer_memory import prewarm_grad_stats_groups as _prewarm_grad_stats_groups
+from verl_mlite.optimizer_memory import release_inactive_cuda_cache as _release_inactive_cuda_cache
 
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
@@ -311,6 +313,14 @@ class MegatronLiteEngine(BaseEngine):
                 self.handle._optimizer, self._mlite_config.optimizer
             )
 
+        # Initialize the optimizer's *actual* GN groups while rollout is still
+        # asleep. First-use NCCL allocations can otherwise OOM after actor bwd.
+        if self.handle._optimizer is not None and self.device_name == "cuda":
+            _release_inactive_cuda_cache()
+            _prewarm_grad_stats_groups(
+                self.handle._optimizer, torch.device("cuda", torch.cuda.current_device())
+            )
+
         self.to(
             device="cpu",
             model=self.is_param_offload_enabled,
@@ -332,6 +342,8 @@ class MegatronLiteEngine(BaseEngine):
 
     def optimizer_step(self):
         self._require_initialized()
+        if self.device_name == "cuda":
+            _release_inactive_cuda_cache()
         _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
         return grad_norm
 
