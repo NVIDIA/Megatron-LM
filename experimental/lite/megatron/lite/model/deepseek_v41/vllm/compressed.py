@@ -30,6 +30,7 @@ def metadata(lengths, ratio, device):
         ring_slots=(doc * ratio + pos.remainder(ratio)).to(device),
         slots=torch.where(closing, starts[doc] + pos // ratio, -1).to(device),
         closers=closing.nonzero().flatten().to(device),
+        closing=closing.to(device),
         lengths=torch.tensor([total], dtype=torch.int32, device=device),
         table=torch.arange((total + 63) // 64, dtype=torch.int32, device=device)[None],
         documents=n.numel(),
@@ -39,6 +40,24 @@ def metadata(lengths, ratio, device):
         query_positions=pos.to(device),
         query_requests=doc.to(device),
     )
+
+
+class _BoundaryRows(torch.autograd.Function):
+    """``latent[closers]`` (the mega core's input) with a sort-free backward.
+
+    Boundary rows are unique and ascending, so the gradient fills them in order by a
+    masked scatter instead of the sort-based deterministic advanced-indexing VJP."""
+
+    @staticmethod
+    def forward(ctx, latent, closers, closing):
+        ctx.save_for_backward(closing)
+        return latent.index_select(0, closers)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (closing,) = ctx.saved_tensors
+        mask = closing[:, None].expand(closing.shape[0], grad.shape[1])
+        return grad.new_zeros(mask.shape).masked_scatter_(mask, grad), None, None
 
 
 def pool_vjp(raw, weight, ratio, grad, eps, closers=None):
@@ -249,7 +268,7 @@ def source(attention, x, qr, qa, rope, documents, emit):
         emit('indexer_k_values', keys[0])
         emit('indexer_k_scales', keys[1])
         # The mega core inserts and quantizes the boundary-row latent itself.
-        return decoded, keys, records, latent[m.closers]
+        return decoded, keys, records, _BoundaryRows.apply(latent, m.closers, m.closing)
 
     decoded, keys, records, latent = state.resolve(layer, policy.kv, ('vllm_kv', geometry), produce)
 

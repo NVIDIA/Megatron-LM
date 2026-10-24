@@ -139,3 +139,17 @@ def test_deterministic_mode_selects_the_fixed_order_dkv(monkeypatch, determinist
     layout = SimpleNamespace(cp_group=None, positions=torch.arange(2))
     attention.mega_forward(module, torch.zeros(2, 1, 4), layout, None, None)
     assert seen['deterministic'] is deterministic and seen['cp_group'] is None
+
+
+def test_boundary_rows_backward_matches_indexing_without_sort():
+    from megatron.lite.model.deepseek_v41.vllm import compressed
+
+    torch.manual_seed(93)
+    m = compressed.metadata([5, 0, 6, 9], 2, 'cpu')
+    latent = torch.randn(20, 8, requires_grad=True)
+    rows = compressed._BoundaryRows.apply(latent, m.closers, m.closing)
+    torch.testing.assert_close(rows, latent[m.closers], rtol=0, atol=0)
+    grad = torch.randn_like(rows)
+    (actual,) = torch.autograd.grad(rows, latent, grad)
+    (expected,) = torch.autograd.grad(latent[m.closers], latent, grad)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
