@@ -2,7 +2,7 @@
 #!/usr/bin/env python3
 """
 GitHub PR Review Reminder Automation
-Requirements: pip install PyGithub slack-sdk requests
+Requirements: pip install codeowners PyGithub slack-sdk requests
 Usage: GH_TOKEN=ghp_... SLACK_TOKEN=xoxb-... SLACK_WEBHOOK_URL=https://... REPO=NVIDIA/Megatron-LM python github_pr_reminder.py
 """
 
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import List
 
 import requests
-from codeowner_approval_policy import get_exempt_owners
+from check_codeowners_approval import get_exempt_owners
 from github import Github
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

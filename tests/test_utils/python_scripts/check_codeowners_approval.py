@@ -47,11 +47,17 @@ import os
 import sys
 from functools import lru_cache
 
-from codeowner_approval_policy import get_exempt_owners
 from codeowners import CodeOwners
 from github import Github, GithubException
 
 logger = logging.getLogger(__name__)
+
+_AUTHOR_EXEMPT_OWNERS = {"tdene": frozenset({"@NVIDIA/reinforcement-learning"})}
+
+
+def get_exempt_owners(author_login: str) -> frozenset[str]:
+    """Return fully qualified owners exempted for this pull request's author."""
+    return _AUTHOR_EXEMPT_OWNERS.get(author_login.casefold(), frozenset())
 
 
 def parse_args(argv=None):
