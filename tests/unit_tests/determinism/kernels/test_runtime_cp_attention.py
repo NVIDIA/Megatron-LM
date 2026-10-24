@@ -1,11 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Replay packed attention while switching its runtime CP topology.
+"""Replay attention across activation offload and runtime CP transitions.
 
 Comparisons are bit-exact for repeated execution at the *same* CP size, including after
 intervening microbatches with other CP sizes. Different reduction topologies are not
 required to produce identical bits. The real RoPE, TE attention, and projection kernels
-run here; no compute kernel is mocked.
+run here; no compute kernel is mocked. Offload replays also compare against resident
+execution across warmup and steady state for supported Q/K input layouts.
 """
 
 from contextlib import contextmanager
@@ -74,6 +75,106 @@ def _assert_same_replay(reference, actual):
         assert expected.keys() == observed.keys()
         for name in expected:
             assert bytes_equal(expected[name], observed[name]), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
+@pytest.mark.parametrize("fraction", [0.5, 1.0])
+@pytest.mark.parametrize("input_layout", ["qk_norm", "rope"])
+def test_core_attention_offload_replays_bit_exact(input_layout, fraction, monkeypatch):
+    """Unpacked attention inputs must replay across warmup and steady-state offload."""
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+
+    if not HAVE_TE:
+        pytest.skip("requires Transformer Engine")
+
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface as off_interface,
+    )
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        PipelineOffloadManager,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    monkeypatch.setattr(
+        te_dpa, "_attention_backends", dict(te_dpa._attention_backends, attention_params=None)
+    )
+    Utils.initialize_model_parallel()
+    off_interface.reset_instance()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        qk_norm = input_layout == "qk_norm"
+
+        def build_model(offload):
+            config = TransformerConfig(
+                num_layers=3,
+                hidden_size=256,
+                num_attention_heads=4,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                attention_backend=AttnBackend.fused,
+                attention_dropout=0.0,
+                hidden_dropout=0.0,
+                qk_layernorm=qk_norm,
+                deterministic_mode=True,
+                fine_grained_activation_offloading=offload,
+                offload_modules=["core_attn", "attn_proj"] if offload else None,
+                activation_offload_fraction=fraction,
+                min_offloaded_tensor_size=1024,
+            )
+            return (
+                GPTModel(
+                    config,
+                    get_gpt_layer_with_transformer_engine_spec(qk_layernorm=qk_norm),
+                    vocab_size=512,
+                    max_sequence_length=512,
+                    position_embedding_type="learned_absolute" if qk_norm else "rope",
+                )
+                .cuda()
+                .bfloat16()
+            )
+
+        inputs = dict(
+            input_ids=torch.arange(512, device="cuda").unsqueeze(0),
+            position_ids=torch.arange(512, device="cuda").unsqueeze(0),
+            attention_mask=None,
+        )
+        baseline = build_model(False)
+        reference = assert_module_replays_bit_exact(baseline, inputs, replays=2)
+        model = build_model(True)
+        model.load_state_dict(baseline.state_dict())
+        del baseline
+        # Each replay is a new iteration: the first discovers groups, subsequent
+        # iterations apply the fraction and reserve the per-module margin groups.
+        model.register_forward_pre_hook(lambda _module, _args: off_interface.reset())
+        actual = assert_module_replays_bit_exact(
+            model,
+            inputs,
+            replays=3,
+            contention=True,
+            what=f"core attention offload {input_layout}, fraction={fraction}",
+        )
+        _assert_same_replay(reference, actual)
+        assert actual[1], "must compare parameter gradients as well as logits"
+        assert te_dpa._attention_backends["use_fused_attention"]
+        assert PipelineOffloadManager.get_instance().offload_summary_total_bytes > 0
+    finally:
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")

@@ -1,5 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     unfused_grouped_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import (
+    _with_dsa_gqa_attention,
     dsa_stack_spec,
     gdp_dsa_stack_spec,
 )
@@ -157,7 +162,7 @@ def test_dsa_stack_spec_uses_dsa_grouped_self_attention():
 
 
 def test_dsa_stack_spec_does_not_mutate_upstream_hybrid_spec():
-    """The spec is derived by deep copy; upstream's shared spec must be untouched."""
+    """The derived attention branch must leave upstream's shared spec untouched."""
     upstream_module = hybrid_stack_spec.submodules.attention_layer.submodules.self_attention.module
     assert upstream_module is not DSGroupedSelfAttention
 
@@ -170,7 +175,7 @@ def test_gdp_dsa_stack_spec_uses_dsa_grouped_self_attention():
 def test_gdp_dsa_stack_spec_does_not_mutate_upstream_gdp_spec():
     """gated_delta_product_stack_spec shares hybrid_stack_spec's attention_layer object.
 
-    Deriving either DSA stack therefore has to deep copy first, or swapping the module on one
+    Deriving either DSA stack must copy the modified branch, or swapping the module on one
     would swap it on the other and on upstream's spec as well.
     """
     upstream = gated_delta_product_stack_spec.submodules.attention_layer
@@ -180,6 +185,59 @@ def test_gdp_dsa_stack_spec_does_not_mutate_upstream_gdp_spec():
 def test_the_two_dsa_stacks_keep_their_own_mamba_mixers():
     """Only the attention layer is DSA's to change; the mixers are what distinguish the stacks."""
     assert gdp_dsa_stack_spec.submodules.mamba_layer != dsa_stack_spec.submodules.mamba_layer
+
+
+def test_derived_dsa_specs_have_independent_attention_and_indexer_containers():
+    first = _with_dsa_gqa_attention(hybrid_stack_spec)
+    second = _with_dsa_gqa_attention(hybrid_stack_spec)
+    first_attention = first.submodules.attention_layer.submodules.self_attention
+    second_attention = second.submodules.attention_layer.submodules.self_attention
+    first_attention.module = object()
+    assert second_attention.module is DSGroupedSelfAttention
+    assert (
+        hybrid_stack_spec.submodules.attention_layer.submodules.self_attention.module
+        is not DSGroupedSelfAttention
+    )
+    first_indexer = first_attention.submodules.core_attention.submodules.indexer
+    second_indexer = second_attention.submodules.core_attention.submodules.indexer
+    first_indexer.submodules.linear_q.params["probe"] = True
+    assert "probe" not in second_indexer.submodules.linear_q.params
+
+
+def test_dsa_stack_specs_import_without_transformer_engine():
+    """The basic pip install must import specs without the optional TE package."""
+    script = textwrap.dedent("""
+        import importlib.abc
+        import sys
+
+        class MissingTE(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.')[0] == 'transformer_engine':
+                    raise ModuleNotFoundError('TE is not installed', name=fullname)
+
+        sys.meta_path.insert(0, MissingTE())
+        from megatron.core.extensions.transformer_engine import HAVE_TE
+        from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import (
+            dsa_stack_spec, gdp_dsa_stack_spec,
+        )
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+            DSGroupedSelfAttention,
+        )
+        assert not HAVE_TE
+        for spec in (dsa_stack_spec, gdp_dsa_stack_spec):
+            assert (
+                spec.submodules.attention_layer.submodules.self_attention.module
+                is DSGroupedSelfAttention
+            )
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _causal_mask(seqlen: int, device: torch.device):
