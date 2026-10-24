@@ -2258,9 +2258,16 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            assert micro_batch_size == 1, "Scheduler THD graphs require micro_batch_size=1."
         self.model = model
         self.config = config
-        self.seq_length = seq_length
+        self.seq_length = (
+            config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
+            if getattr(config, "sequence_packing_scheduler", None) is not None
+            and config.pad_packed_seq_alignment is not None
+            else seq_length
+        )
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.pg_collection = pg_collection
@@ -2463,7 +2470,9 @@ class TECudaGraphHelper:
                     )
                     if rotary_seq_len not in rotary_pos_emb_cache:
                         rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                            rotary_seq_len,
+                            packed_seq=getattr(self.config, "sequence_packing_scheduler", None)
+                            is not None,
                         )
                     return rotary_pos_emb_cache[rotary_seq_len]
                 else:
@@ -2661,6 +2670,10 @@ class TECudaGraphHelper:
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
         else:
+            # Keep the source-batch bound when dp_balanced produces fewer packs.
+            # With a fixed source batch and MBS=1, each aligned packed schedule is
+            # a subsequence of this capture order, preserving the existing input
+            # buffer lifetimes without wrapping around the captured graph list.
             self.num_microbatches = get_num_microbatches()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(

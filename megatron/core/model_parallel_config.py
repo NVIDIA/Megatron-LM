@@ -2,13 +2,18 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, ContextManager, Literal, Optional
+from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
 
 from megatron.core.tensor_parallel.gtp_parallel_layout import (
     resolve_tensor_parallel_sequence_shards,
 )
+
+
+def _parse_pad_packed_seq_alignment(value):
+    """Parse an integer packed-token alignment or the fixed-capacity value 'max'."""
+    return value if value == "max" else int(value)
 
 
 def resolve_tensor_parallel_weight_shards(
@@ -157,6 +162,16 @@ class ModelParallelConfig:
     """
     Scheduler for sequence packing and hybrid context parallel.
     dp_balanced: DP-balanced scheduler for sequence packing.
+    """
+
+    pad_packed_seq_alignment: Optional[Union[int, Literal["max"]]] = field(
+        default=None, metadata={"argparse_meta": {"type": _parse_pad_packed_seq_alignment}}
+    )
+    """Pad scheduler THD tensors to a local token alignment, or to capacity with 'max'.
+
+    Padding occupies a separate physical document with no valid tokens. It is
+    excluded from loss, indexer training and MoE routing. Apply the same setting
+    in eager mode when comparing against CUDA graph execution.
     """
 
     expert_model_parallel_size: int = 1
@@ -545,6 +560,26 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.pad_packed_seq_alignment is not None:
+            self.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+                self.pad_packed_seq_alignment
+            )
+            assert self.sequence_packing_scheduler == "dp_balanced"
+            assert self.max_seqlen_per_dp_cp_rank is not None
+            if self.pad_packed_seq_alignment != "max":
+                assert 0 < self.pad_packed_seq_alignment <= self.max_seqlen_per_dp_cp_rank
+            alignment = (
+                self.max_seqlen_per_dp_cp_rank
+                if self.pad_packed_seq_alignment == "max"
+                else self.pad_packed_seq_alignment
+            )
+            if self.context_parallel_size > 1:
+                assert alignment % 2 == 0, "Packed padding must preserve zigzag CP alignment."
+            if self.sequence_parallel:
+                assert (
+                    alignment % self.tensor_model_parallel_size == 0
+                ), "Packed padding must preserve sequence-parallel TP divisibility."
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")

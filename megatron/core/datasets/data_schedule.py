@@ -16,7 +16,7 @@ from megatron.core.datasets.data_schedule_utils import (
     get_batch_and_global_seqlens,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, pad_packed_batch_to_capacity
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
@@ -361,6 +361,7 @@ class BasePackingScheduler:
         cp_size: int,
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
+        max_num_seqs: Optional[int] = None,
     ):
         """
         Args:
@@ -374,6 +375,7 @@ class BasePackingScheduler:
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
+        self.max_num_seqs = max_num_seqs
 
     def get_required_sample_keys(self):
         """Return the required key of each batch."""
@@ -444,7 +446,9 @@ class DpBalancedScheduler(BasePackingScheduler):
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks and (
+                self.max_num_seqs is None or len(single_microbatch) < self.max_num_seqs
+            ):
                 single_microbatch.append(i)
                 sum_seqlen += sample_id_seqlens[i][1]
             else:
@@ -720,6 +724,14 @@ def wrap_data_iterator(
             if config.virtual_pipeline_model_parallel_size is None
             else config.microbatch_group_size_per_vp_stage
         ),
+        # Reserve a document when token padding can append a dummy tail. Enforce
+        # the metadata bound before routing instead of falling back mid-pipeline.
+        max_num_seqs=(
+            config.thd_max_packed_sequences
+            - int(getattr(config, "pad_packed_seq_alignment", None) is not None)
+            if getattr(config, "thd_max_packed_sequences", None) is not None
+            else None
+        ),
     )
 
     (
@@ -745,6 +757,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    config=None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -908,18 +921,44 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
 
-    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
-    # get the correct result.
-    # TODO: Revert this workaround once TE fixes the issue.
+    pad_to_capacity = config is not None and (
+        config.pad_packed_seq_alignment is not None
+        or getattr(config, "thd_max_packed_sequences", None) is not None
+    )
+    # Keep the legacy TE workaround outside the fixed-capacity path. Graph padding
+    # needs the original logical offsets so internal padding and dummy tails never
+    # become real tokens in attention or indexer-loss metadata.
+    logical_cu_seqlens = cu_seqlens if pad_to_capacity else cu_seqlens_padded
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
+        cu_seqlens_q=logical_cu_seqlens,
+        cu_seqlens_kv=logical_cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
     )
+
+    if pad_to_capacity:
+        alignment = config.pad_packed_seq_alignment
+        local_capacity = padding_mask.shape[-1]
+        if alignment == "max":
+            local_capacity = config.max_seqlen_per_dp_cp_rank
+        elif alignment is not None:
+            local_capacity = ((local_capacity + alignment - 1) // alignment) * alignment
+        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+            pad_packed_batch_to_capacity(
+                tokens,
+                labels,
+                loss_mask,
+                position_ids,
+                packed_seq_params,
+                padding_mask,
+                local_capacity=local_capacity,
+                cp_size=cp_group.size(),
+                max_num_seqs=getattr(config, "thd_max_packed_sequences", None),
+            )
+        )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
     return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask

@@ -1246,6 +1246,190 @@ _unique_buffer_counts = {}
 
 
 class TestTECudaGraphHelper:
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("chunks", [1, 2])
+    def test_scheduler_thd_replay_preserves_pipeline_inputs(self, monkeypatch, chunks):
+        """Changing packed microbatch counts must preserve outputs and every gradient."""
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+            set_current_microbatch,
+        )
+        from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
+
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=2,
+            context_parallel_size=2,
+            virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+        )
+        # Match training initialization: DDP keeps AccumulateGrad nodes alive,
+        # so construct and warm up on the non-default training stream.
+        training_stream = torch.cuda.Stream()
+        training_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(training_stream):
+            monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+            monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+            monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+            monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+            model_parallel_cuda_manual_seed(321)
+            init_num_microbatches_calculator(
+                rank=0,
+                global_batch_size=4,
+                micro_batch_size=1,
+                data_parallel_size=1,
+                decrease_batch_size_if_needed=False,
+            )
+            config = TransformerConfig(
+                num_layers=2 * chunks,
+                hidden_size=64,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                cuda_graph_impl="transformer_engine",
+                thd_max_packed_sequences=4,
+                cuda_graph_modules=[CudaGraphModule.attn],
+                cuda_graph_dynamic_microbatches=True,
+                sequence_packing_scheduler="dp_balanced",
+                max_seqlen_per_dp_cp_rank=16,
+                pad_packed_seq_alignment="max",
+                cuda_graph_warmup_steps=1,
+                use_te_rng_tracker=True,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                pipeline_dtype=torch.bfloat16,
+                pipeline_model_parallel_size=2,
+                context_parallel_size=2,
+                virtual_pipeline_model_parallel_size=chunks if chunks > 1 else None,
+                microbatch_group_size_per_vp_stage=2,
+                attention_backend=AttnBackend.fused,
+                deterministic_mode=True,
+                attention_dropout=0.0,
+                hidden_dropout=0.0,
+            )
+            models = []
+            for chunk in range(chunks):
+                model = GPTModel(
+                    config=config,
+                    transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                    vocab_size=128,
+                    max_sequence_length=32,
+                    parallel_output=True,
+                    position_embedding_type="rope",
+                    vp_stage=chunk if chunks > 1 else None,
+                ).cuda()
+                models.append(
+                    DistributedDataParallel(
+                        config,
+                        DistributedDataParallelConfig(),
+                        model,
+                        disable_bucketing=True,
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    )
+                )
+            helper = TECudaGraphHelper(models, config, 32, 1, optimizers=[])
+            rotary = models[0].module.rotary_pos_emb(32, packed_seq=True)
+            physical = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32, device="cuda")
+            packed = []
+            for valid_end in (32, 24):
+                valid = physical.clone()
+                valid[-1] = valid_end
+                packed.append(
+                    PackedSeqParams(
+                        qkv_format="thd",
+                        cu_seqlens_q=valid,
+                        cu_seqlens_kv=valid.clone(),
+                        cu_seqlens_q_padded=physical,
+                        cu_seqlens_kv_padded=physical.clone(),
+                        max_seqlen_q=32,
+                        max_seqlen_kv=32,
+                        pad_between_seqs=True,
+                    )
+                )
+            inputs, expected, expected_params = {}, {}, {}
+            for chunk, callables in enumerate(helper.callables_per_chunk):
+                layer = callables[0]
+                for mb in range(4):
+                    hidden = torch.randn(
+                        16, 1, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True
+                    )
+                    inputs[chunk, mb] = hidden.detach().clone()
+                    output, _ = layer(
+                        hidden,
+                        attention_mask=None,
+                        rotary_pos_emb=rotary,
+                        packed_seq_params=packed[mb % 2],
+                    )
+                    value = output.detach().clone()
+                    output[: 12 if mb % 2 else 16].float().sum().backward()
+                    expected[chunk, mb] = value, hidden.grad.detach().clone()
+                    if mb in (1, 3):
+                        expected_params[chunk, mb + 1] = {
+                            name: param.main_grad.detach().clone()
+                            for name, param in layer.named_parameters()
+                            if param.requires_grad
+                        }
+                models[chunk].zero_grad_buffer()
+            del hidden, output
+            try:
+                helper.create_cudagraphs()
+                assert helper.graphs_created()
+                for count in (4, 2, 4):
+                    _, _, warmup, _ = get_pp_rank_microbatches(
+                        count, chunks, 2, p2p_communicator=helper.p2p_communicator
+                    )
+                    order = convert_schedule_table_to_order(
+                        warmup, chunks, get_schedule_table(count, chunks, 2)
+                    )
+                    forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
+                    for entry in order:
+                        chunk = abs(entry) - 1
+                        layer = helper.callables_per_chunk[chunk][0]
+                        if entry > 0:
+                            mb = forwards[chunk]
+                            forwards[chunk] += 1
+                            set_current_microbatch(models[chunk], mb)
+                            hidden = inputs[chunk, mb].clone().requires_grad_(True)
+                            output, _ = layer(
+                                hidden,
+                                attention_mask=None,
+                                rotary_pos_emb=rotary,
+                                packed_seq_params=packed[mb % 2],
+                            )
+                            torch.testing.assert_close(
+                                output[: 12 if mb % 2 else 16],
+                                expected[chunk, mb][0][: 12 if mb % 2 else 16],
+                                msg=f"output count={count} chunk={chunk} mb={mb}",
+                            )
+                            pending[chunk, mb] = hidden, output
+                        else:
+                            mb = backwards[chunk]
+                            backwards[chunk] += 1
+                            hidden, output = pending.pop((chunk, mb))
+                            output[: 12 if mb % 2 else 16].float().sum().backward()
+                            torch.testing.assert_close(
+                                hidden.grad,
+                                expected[chunk, mb][1],
+                                msg=f"input grad count={count} chunk={chunk} mb={mb}",
+                            )
+                    assert not pending
+                    for chunk, callables in enumerate(helper.callables_per_chunk):
+                        actual = {
+                            name: param.main_grad
+                            for name, param in callables[0].named_parameters()
+                            if param.requires_grad
+                        }
+                        assert actual.keys() == expected_params[chunk, count].keys()
+                        for name, grad in actual.items():
+                            torch.testing.assert_close(
+                                grad,
+                                expected_params[chunk, count][name],
+                                msg=f"parameter {name} count={count} chunk={chunk}",
+                            )
+                        models[chunk].zero_grad_buffer()
+            finally:
+                if helper.graphs_created():
+                    helper.delete_cuda_graphs()
+        torch.cuda.current_stream().wait_stream(training_stream)
+
     def setup_method(self, method):
         # Initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)

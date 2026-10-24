@@ -115,6 +115,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
+            config=config,
         )
 
     cp_size = args.context_parallel_size
