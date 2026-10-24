@@ -53,6 +53,27 @@ class _RecomputedMLP(nn.Module):
         return te_checkpoint(self.fc2, F.gelu(x), use_reentrant=self.use_reentrant)
 
 
+class _RecomputedBlockWithOwnedProj(nn.Module):
+    """Block that checkpoints only its ``proj`` submodule.
+
+    When the block is an FsdpModule, the checkpoint recomputes ``proj`` without re-entering
+    the block's forward hooks, like MultiTokenPredictionLayer.eh_proj under the root.
+    """
+
+    def __init__(self, device, use_reentrant: bool | None) -> None:
+        super().__init__()
+        self.proj = te.Linear(64, 64, params_dtype=torch.bfloat16, device=device)
+        self.mlp = _make_mlp(device)
+        self.use_reentrant = use_reentrant
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the block, checkpointing ``proj`` unless use_reentrant is None."""
+        if self.use_reentrant is None:
+            return self.mlp(self.proj(x))
+        # TE's checkpoint restores the MXFP8 autocast state during recomputation.
+        return self.mlp(te_checkpoint(self.proj, x, use_reentrant=self.use_reentrant))
+
+
 _ZERO3_PLACEMENTS = Placements(
     dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
 )
@@ -321,6 +342,84 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
             losses.append(loss.detach())
             grads.append([parameter.grad.to_local().clone() for parameter in model.parameters()])
             optimizer.step()
+        weights = [parameter.to_local().clone() for parameter in model.parameters()]
+        return losses, grads, weights
+
+    expected_losses, expected_grads, expected_weights = train(*build(None))
+    losses, grads, weights = train(*build(use_reentrant))
+    torch.testing.assert_close(losses, expected_losses, rtol=0, atol=0)
+    torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+def test_mxfp8_recompute_inside_fsdp_module_matches_no_recompute(
+    distributed_setup, use_reentrant
+):
+    """Recomputing a submodule of a root FsdpModule regathers its rowwise planes on demand.
+
+    With sharded compute weights, backward unshards the root with columnwise planes only.
+    The checkpoint inside the root's forward recomputes only ``proj``, without re-entering
+    the root's pre_forward, so the root's rowwise planes must be gathered when ``proj`` runs
+    again. Replicated compute weights keep both planes and are covered by
+    test_mxfp8_activation_recompute_matches_no_recompute.
+    """
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+
+    recipe = MXFP8BlockScaling()
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+
+    def build(use_reentrant):
+        with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+            torch.manual_seed(2026)
+            model = _RecomputedBlockWithOwnedProj(device, use_reentrant)
+        with fully_shard_context(device=device):
+            fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        optimizer = FusedAdam(model.parameters(), lr=0.01)
+        fully_shard_optimizer(optimizer)
+        return model, optimizer
+
+    def proj_planes(model):
+        """Return whether the root's unsharded (rowwise, columnwise) planes are allocated."""
+        [group] = [
+            g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
+        ]
+        unsharded = group._unsharded_model_weight
+        return unsharded.is_rowwise_allocated, unsharded.is_columnwise_allocated
+
+    torch.manual_seed(1234 + distributed_setup.rank)
+    inputs = torch.randn(3, 32, 64, dtype=torch.bfloat16, device=device)
+
+    def train(model, optimizer):
+        """Return per-step losses and sharded gradients, and the final sharded weights."""
+        recomputed = []
+        if model.use_reentrant is not None:
+            # Registered after fully_shard(), so this runs after any FSDP hook on proj.
+            def check_recompute(_module, _args):
+                if torch._C._current_graph_task_id() != -1:
+                    assert proj_planes(model)[0], "proj recomputed without rowwise planes"
+                    recomputed.append(True)
+
+            model.proj.register_forward_pre_hook(check_recompute)
+        losses, grads = [], []
+        for x in inputs:
+            optimizer.zero_grad(set_to_none=True)
+            # Reentrant checkpointing produces gradients only for inputs requiring grad.
+            x = x.clone().requires_grad_()
+            with te.autocast(recipe=recipe):
+                output = model(x)
+            loss = output.float().square().mean()
+            loss.backward()
+            assert proj_planes(model) == (False, False)
+            losses.append(loss.detach())
+            grads.append([parameter.grad.to_local().clone() for parameter in model.parameters()])
+            optimizer.step()
+        if model.use_reentrant is not None:
+            assert len(recomputed) == len(inputs)
         weights = [parameter.to_local().clone() for parameter in model.parameters()]
         return losses, grads, weights
 
