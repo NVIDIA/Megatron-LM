@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     is_nccl_ep_bootstrapped,
+    make_hybrid_ep_buffer,
     nccl_ep_combine,
     nccl_ep_dispatch,
     nccl_ep_finalize,
@@ -1041,6 +1042,7 @@ class _HybridEPManager(_DispatchManager):
         num_experts: int,
         config: TransformerConfig,
         router_topk: Optional[int] = None,
+        owns_buffer: bool = False,
     ):
         """
         Initialize the HybridEP dispatcher.
@@ -1052,7 +1054,14 @@ class _HybridEPManager(_DispatchManager):
             num_experts (int): The total number of experts in the group.
             config (TransformerConfig): The configuration for the transformer model.
             router_topk (int, optional): The top-k width after expert-TP expansion.
+            owns_buffer (bool): Stage through a buffer of this manager's own, built lazily on
+                the first dispatch, instead of the process-wide one. A caller running several
+                dispatches at once needs that: HybridEP's cached replay reads buffer-resident
+                single-slot staging from offset 0, so a second dispatch into the same buffer
+                invalidates the first one's handle.
         """
+        self.owns_buffer = owns_buffer
+        self.buffer = None
         self.group = group
         self.num_local_experts = num_local_experts
         self.num_experts = num_experts
@@ -1251,6 +1260,19 @@ class _HybridEPManager(_DispatchManager):
             hidden_states = torch.cat(
                 [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
             )
+        if self.owns_buffer and self.buffer is None:
+            num_tokens, hidden_dim = hidden_states.shape[-2:]
+            self.buffer = make_hybrid_ep_buffer(
+                self.group,
+                hidden_dim,
+                num_tokens,
+                self.num_local_experts,
+                num_sms_dispatch_api=self.config.moe_flex_dispatcher_num_sms,
+                num_sms_combine_api=self.config.moe_flex_dispatcher_num_sms,
+                num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
+                num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
+            )
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
@@ -1268,6 +1290,7 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
                 topk_idx=self.topk_idx,
                 num_of_experts=self.num_experts,
+                buffer=self.buffer,
             )
         )
         if has_rank_capacity:
@@ -1277,12 +1300,13 @@ class _HybridEPManager(_DispatchManager):
             self.over_budget |= over_budget
         # Dynamic dispatch resolves the permuted size from tokens_per_expert.sum().
 
-        if self.num_permuted_tokens is None:
+        if not self.drop_and_pad or has_rank_capacity:
+            # Unconditional outside drop_and_pad, where setup_metadata already fixed the counts:
+            # the old form left it unset for a caller that pins num_permuted_tokens itself.
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+        if self.num_permuted_tokens is None:
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if has_rank_capacity:
-            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
     def combine(
@@ -1297,6 +1321,7 @@ class _HybridEPManager(_DispatchManager):
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
             fused=self.config.moe_permute_fusion_into_hybridep,
+            buffer=self.buffer,
         )
         if (
             self._padded_num_tokens is not None
@@ -2118,6 +2143,103 @@ def nccl_ep_release_context() -> None:
     nccl_ep_finalize()
 
 
+def make_dispatch_manager(
+    config: TransformerConfig,
+    group: torch.distributed.ProcessGroup,
+    num_local_experts: int,
+    tp_size: int,
+    ep_size: int,
+    *,
+    owns_buffer: bool = False,
+):
+    """Build the dispatch manager ``config.moe_flex_dispatcher_backend`` names.
+
+    This is the one place a flex backend name is turned into an implementation. Anything that
+    needs the collectives -- the flex dispatcher, or a schedule driving them itself -- goes
+    through here, so a new backend reaches every caller at once.
+
+    Args:
+        config (TransformerConfig): The model config; its ``moe_flex_dispatcher_backend``
+            selects the backend.
+        group (torch.distributed.ProcessGroup): The ETPxEP group to communicate over.
+        num_local_experts (int): Experts owned by this rank.
+        tp_size (int): Expert-tensor-parallel size; the top-k width and the expert count are
+            both expanded by it.
+        ep_size (int): Expert-parallel size, read only by the TPxEP > 1 preconditions.
+        owns_buffer (bool): Ask for a manager with staging of its own, for a caller that runs
+            several dispatches at once. Backends whose staging is process-wide refuse it.
+
+    Returns:
+        tuple: ``(manager, cudagraph_attrs)`` -- the manager, and the attribute paths a CUDA
+        graph has to treat as inputs, relative to the owner that stores it as
+        ``_comm_manager``.
+    """
+    backend = config.moe_flex_dispatcher_backend
+    router_topk = tp_size * config.moe_router_topk
+    num_experts = tp_size * config.num_moe_experts
+
+    # FIRST, so a typo is reported as a typo: the owns_buffer refusal below would otherwise
+    # answer it with "that backend stages through process-wide buffers", which is not true.
+    if backend not in ("deepep", "deepepv2", "hybridep", "ncclep"):
+        raise ValueError(
+            f"Invalid backend: {backend}"
+            "Please set --moe-flex-dispatcher-backend to deepep, deepepv2, hybridep, or ncclep"
+        )
+
+    if backend == "hybridep":
+        if config.moe_virtual_expert_load_balance:
+            # It rebases the expert counts onto the runtime experts and takes no owns_buffer,
+            # so a caller staging several dispatches at once cannot be served one.
+            if owns_buffer:
+                raise NotImplementedError(
+                    "moe_virtual_expert_load_balance has no per-manager HybridEP buffer, so it "
+                    "cannot serve a caller that owns its dispatch staging."
+                )
+            manager = _VirtualExpertHybridEPManager(
+                group=group,
+                num_local_experts=num_local_experts,
+                num_experts=num_experts,
+                config=config,
+                router_topk=router_topk,
+            )
+        else:
+            manager = _HybridEPManager(
+                group=group,
+                num_local_experts=num_local_experts,
+                num_experts=num_experts,
+                config=config,
+                router_topk=router_topk,
+                owns_buffer=owns_buffer,
+            )
+        return manager, [
+            '_comm_manager.token_probs',
+            '_comm_manager.routing_map',
+            '_comm_manager.topk_idx',
+        ]
+
+    # The other three take one argument list and expose one pair of CUDA-graph attributes;
+    # only ncclep already holds a buffer per manager, so only it can own one.
+    manager_cls, label, can_own_buffer = {
+        "ncclep": (_NCCLEPManager, "NCCL EP", True),
+        "deepep": (_DeepepManager, "DeepEP", False),
+        "deepepv2": (_DeepepV2Manager, "DeepEP v2", False),
+    }[backend]
+    if owns_buffer and not can_own_buffer:
+        raise NotImplementedError(
+            f"the {backend!r} flex backend stages through process-wide buffers, so it cannot "
+            "serve a caller with several dispatches in flight at once; use hybridep or ncclep."
+        )
+    assert tp_size * ep_size > 1, f"{label} dispatcher requires TPxEP > 1"
+    manager = manager_cls(
+        group=group,
+        num_local_experts=num_local_experts,
+        router_topk=router_topk,
+        num_experts=num_experts,
+        config=config,
+    )
+    return manager, ['_comm_manager.token_probs', '_comm_manager.token_indices']
+
+
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """A flexible token dispatcher that abstracts the underlying tensor and expert
     parallelism. It uses a single communication group over all TP and EP ranks,
@@ -2144,59 +2266,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
-        if self.config.moe_flex_dispatcher_backend == "deepep":
-            assert self.tp_size * self.ep_size > 1, "DeepEP dispatcher requires TPxEP > 1"
-            self._comm_manager = _DeepepManager(
-                group=self.tp_ep_group,
-                num_local_experts=self.num_local_experts,
-                router_topk=self.tp_size * self.config.moe_router_topk,
-                num_experts=self.tp_size * self.config.num_moe_experts,
-                config=self.config,
-            )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
-        elif self.config.moe_flex_dispatcher_backend == "deepepv2":
-            assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
-            self._comm_manager = _DeepepV2Manager(
-                group=self.tp_ep_group,
-                num_local_experts=self.num_local_experts,
-                router_topk=self.tp_size * self.config.moe_router_topk,
-                num_experts=self.tp_size * self.config.num_moe_experts,
-                config=self.config,
-            )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
-        elif self.config.moe_flex_dispatcher_backend == "hybridep":
-            manager_cls = (
-                _VirtualExpertHybridEPManager
-                if self.config.moe_virtual_expert_load_balance
-                else _HybridEPManager
-            )
-            self._comm_manager = manager_cls(
-                group=self.tp_ep_group,
-                num_local_experts=self.num_local_experts,
-                num_experts=self.tp_size * self.config.num_moe_experts,
-                config=self.config,
-                router_topk=self.tp_size * self.config.moe_router_topk,
-            )
-            self.cudagraph_attrs = [
-                '_comm_manager.token_probs',
-                '_comm_manager.routing_map',
-                '_comm_manager.topk_idx',
-            ]
-        elif self.config.moe_flex_dispatcher_backend == "ncclep":
-            assert self.tp_size * self.ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
-            self._comm_manager = _NCCLEPManager(
-                group=self.tp_ep_group,
-                num_local_experts=self.num_local_experts,
-                router_topk=self.tp_size * self.config.moe_router_topk,
-                num_experts=self.tp_size * self.config.num_moe_experts,
-                config=self.config,
-            )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
-        else:
-            raise ValueError(
-                f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend to deepep, deepepv2, hybridep, or ncclep"
-            )
+        self._comm_manager, self.cudagraph_attrs = make_dispatch_manager(
+            self.config, self.tp_ep_group, self.num_local_experts, self.tp_size, self.ep_size
+        )
 
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Attach virtual-expert backward work to the MoE layer input when enabled."""
