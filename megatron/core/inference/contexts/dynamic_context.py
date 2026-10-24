@@ -51,6 +51,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
+    resolve_inference_moe_dispatcher_type,
 )
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
@@ -853,15 +854,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
+        inference_dispatcher_type = resolve_inference_moe_dispatcher_type(model_config)
         self._nccl_ep_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
-            and model_config.inference_moe_token_dispatcher_type == 'nccl'
+            and inference_dispatcher_type == 'nccl'
         )
 
         # are we using the inference_optimized nvls ep dispatcher for MoEs?
         self._nvls_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
-            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+            and inference_dispatcher_type == 'nvls'
         )
 
         # are we using the training a2a dispatcher for MoEs?
