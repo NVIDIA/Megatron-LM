@@ -159,9 +159,11 @@ class _MXFP8Linear(torch.autograd.Function):
             activation, weight = ctx.saved_tensors
         perm = getattr(ctx, 'row_perm', None)
         if perm is not None:
-            # Output column j is natural row perm[j]: un-permute the gradient once.
+            # Output column j is natural row perm[j]: un-permute the gradient once. A gather by
+            # the inverse permutation, since index_copy_ takes the sort-based index_put path
+            # under deterministic algorithms.
             flat = grad.reshape(-1, grad.shape[-1])
-            grad = torch.empty_like(flat).index_copy_(1, perm, flat)
+            grad = flat.index_select(1, torch.argsort(perm))
         dx, dw, _ = linear_vjp(ctx, grad, activation, weight)
         return dx, dw, None, None, None
 
