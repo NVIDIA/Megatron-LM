@@ -81,6 +81,34 @@ def _minimal_training_args(monkeypatch):
     return args
 
 
+@pytest.mark.parametrize("rotary_base,rotary_percent", [(10000, 1.0), (500000, 0.5)])
+def test_dsa_indexer_receives_model_rope_settings(monkeypatch, rotary_base, rotary_percent):
+    args = _minimal_training_args(monkeypatch)
+    args.params_dtype = torch.bfloat16
+    args.experimental_attention_variant = 'dsa'
+    args.add_bias_linear = False
+    args.bias_gelu_fusion = False
+    args.apply_rope_fusion = False
+    args.dsa_kernel_backend = 'reference'
+    args.dsa_indexer_mode = 'simplified'
+    args.dsa_indexer_n_heads = 1
+    args.dsa_indexer_head_dim = 64
+    args.dsa_indexer_topk = 8
+    args.group_query_attention = True
+    args.num_query_groups = 1
+    args.kv_channels = 64
+    args.rotary_base = rotary_base
+    args.rotary_percent = rotary_percent
+    args.rotary_seq_len_interpolation_factor = 2.0
+
+    config = core_transformer_config_from_args(args)
+
+    assert config.rope_type == 'rope'
+    assert config.rotary_base == rotary_base
+    assert config.rotary_percent == rotary_percent
+    assert config.rotary_seq_len_interpolation_factor == 2.0
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()

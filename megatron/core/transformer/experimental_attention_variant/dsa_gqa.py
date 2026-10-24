@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -30,6 +31,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_using_quantization_scales
+
+try:
+    import deep_select
+except ImportError:
+    deep_select = None
+
+# pylint: disable=line-too-long,missing-class-docstring,missing-function-docstring
 
 
 def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_heads: int):
@@ -45,6 +54,18 @@ def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_
     key = key.repeat_interleave(repeat_factor, dim=2)
     value = value.repeat_interleave(repeat_factor, dim=2)
     return key, value
+
+
+def _paged_cache_rows(
+    cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    token_positions: torch.Tensor,
+    block_size_tokens: int,
+) -> torch.Tensor:
+    """Gather logical token positions from one request's paged cache."""
+    physical_blocks = block_table_row[token_positions // block_size_tokens].long()
+    local_positions = token_positions % block_size_tokens
+    return cache[physical_blocks, local_positions]
 
 
 @dataclass(frozen=True)
@@ -466,6 +487,57 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             self._apply_rope(k, use_rope=use_rope, packed_seq_params=packed_seq_params),
         )
 
+    def _apply_rope_dynamic(
+        self, q: torch.Tensor, inference_context, *, indexer_key: bool = False
+    ) -> torch.Tensor:
+        """Apply indexer RoPE using each dynamic token's absolute request position."""
+        if self.rotary_pos_emb is None or self.index_rotary_dim == 0:
+            return q
+        active_tokens = inference_context.active_token_count
+        rotary_seq_len = (
+            1
+            if active_tokens == 0
+            else int(inference_context.token_to_position_in_request[:active_tokens].max().item())
+            + 1
+        )
+        if _dsa_rope_setting(self.config, "rope_type") == "rope":
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False), 1.0
+        else:
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
+        q_nope, q_pe = torch.split(
+            q, [self.index_head_dim - self.index_rotary_dim, self.index_rotary_dim], dim=-1
+        )
+        q_pe = q_pe.clone()
+        if active_tokens > 0:
+            positions = (
+                inference_context.gpu_view.token_to_position_in_request[:active_tokens]
+                if indexer_key
+                else inference_context.gpu_view.token_to_pos_ids[:active_tokens]
+            )
+            q_pe[:active_tokens] = apply_rotary_pos_emb(
+                q_pe[:active_tokens],
+                rotary_pos_emb[positions],
+                config=self.config,
+                cu_seqlens=None,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+            )
+        q = torch.cat((q_nope, q_pe), dim=-1)
+        if active_tokens < q.size(0):
+            q[active_tokens:] = 0
+        return q
+
+    def forward_qk_dynamic(
+        self, hidden_states: torch.Tensor, use_rope: bool, inference_context
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project dynamic tokens to indexer Q/K with absolute-position RoPE."""
+        q, k = self.forward_qk(hidden_states, use_rope=False)
+        if not use_rope:
+            return q, k
+        return self._apply_rope_dynamic(q, inference_context), self._apply_rope_dynamic(
+            k, inference_context, indexer_key=True
+        )
+
 
 class _DSAZeroParamDependency(torch.autograd.Function):
     """Attach zero indexer grads without reading overlap-gathered parameter storage."""
@@ -495,6 +567,65 @@ def _simplified_index_scores(
         torch.einsum("qbd,kbd->bqk", q_index[:, :, 0, :].float(), main_key[:, :, 0, :].float())
         * softmax_scale
     )
+
+
+def _deepselect_decode_supported(device: torch.device, topk: int) -> bool:
+    """The pinned DeepSelect CUDA build contains SM100a/SM103a kernels with K <= 4096."""
+    return (
+        deep_select is not None
+        and device.type == "cuda"
+        and 0 < topk <= 4096
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
+    )
+
+
+def _simplified_decode_topk(
+    scores: torch.Tensor,
+    context_lengths: torch.Tensor,
+    topk: int,
+    *,
+    batch_invariant_mode: bool = False,
+) -> torch.Tensor:
+    """Select decode tokens with DeepSelect, falling back to PyTorch on unsupported inputs.
+
+    Pass FP32/BF16 scores to DeepSelect without changing their precision. Each
+    row's true end fixes the valid range used for tie breaking across batches,
+    including BF16's batch/width-dependent kernel dispatch. The output order is
+    deterministic but differs from stable argsort's score-then-position order.
+    The PyTorch fallback uses stable argsort only in batch-invariant mode.
+    """
+    if scores.numel() == 0:
+        return torch.full((scores.size(0), topk), -1, dtype=torch.int32, device=scores.device)
+    if scores.dtype in (torch.float32, torch.bfloat16) and _deepselect_decode_supported(
+        scores.device, topk
+    ):
+        alignment = deep_select.get_stride_requirement()[0] // scores.element_size()
+        aligned_width = (scores.size(1) + alignment - 1) // alignment * alignment
+        # DeepSelect's CUDA kernels require the padded width to be strictly < 2^23.
+        if aligned_width < 2**23:
+            if scores.stride(1) != 1 or scores.stride(0) % alignment or scores.data_ptr() % 16:
+                scores = F.pad(scores, (0, aligned_width - scores.size(1)), value=-torch.inf)
+            with torch.cuda.device(scores.device):
+                _, indices = deep_select.topk(
+                    scores,
+                    topk,
+                    end=context_lengths.to(torch.int32).contiguous(),
+                    indices_type=torch.int32,
+                    sorted_index=False,
+                    return_value=False,
+                    idx_oob_fill_value=-1,
+                )
+            return indices.contiguous()
+
+    if batch_invariant_mode:
+        indices = scores.argsort(dim=-1, descending=True, stable=True)[:, :topk].to(torch.int32)
+        indices.masked_fill_(indices >= context_lengths[:, None], -1)
+    else:
+        indices = scores.topk(min(topk, scores.size(-1)), dim=-1).indices.to(torch.int32)
+    # Keep the attention kernel's shared-memory capacity fixed for short contexts.
+    if indices.size(1) < topk:
+        indices = F.pad(indices, (0, topk - indices.size(1)), value=-1)
+    return indices.contiguous()
 
 
 def _simplified_qk_topk_naive(
@@ -674,6 +805,161 @@ class DSGQACoreAttention(MegatronModule):
         return unfused_grouped_dsa_fn(
             query, key, value, topk_indices, self.softmax_scale, mask=sparse_attention_mask
         )
+
+    def forward_dynamic(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        hidden_states: torch.Tensor,
+        inference_context: DynamicInferenceContext,
+        packed_seq_params: Optional[PackedSeqParams],
+        provider_layer_number: int,
+        block_table: torch.Tensor,
+        use_indexer_rope: bool = False,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Run mixed dynamic inference with training prefill and paged CuTe decode."""
+        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_decode_kernel import (
+            dsa_gqa_decode_attention,
+            dsa_gqa_decode_indexer_score,
+        )
+
+        assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
+        if self.config.dsa_fwd_use_dense_attn:
+            raise NotImplementedError("Dynamic DSA-GQA requires sparse indexer routing.")
+        if self.config.dsa_indexer_mode != "simplified":
+            raise NotImplementedError("Dynamic DSA-GQA supports the simplified indexer only.")
+        if query.dim() == 3:
+            query = query.unsqueeze(1)
+        elif query.dim() != 4:
+            raise ValueError(f"Dynamic DSA-GQA expected THD/SBHD query, got {query.shape}.")
+
+        total_tokens, batch_size, num_query_heads, _ = query.shape
+        assert batch_size == 1, "Dynamic DSA-GQA expects packed tokens with batch=1."
+        output = value_cache.new_zeros((total_tokens, 1, num_query_heads * value_cache.size(-1)))
+        request_count = inference_context.get_active_request_count()
+        if request_count == 0:
+            return output
+
+        state_data = inference_context.active_attn_metadata["mha_metadata"].state_data
+        query_lengths = state_data["query_lengths"][:request_count].to(torch.long)
+        kv_lengths = state_data["kv_seq_lengths"][:request_count].to(torch.long)
+        query_offsets, _ = inference_context.cu_query_lengths()
+        query_offsets = query_offsets[: request_count + 1].to(torch.long)
+        active_tokens = inference_context.active_token_count
+        # The inference engine carries packing metadata in its dynamic context;
+        # ordinary model wrappers need not also construct PackedSeqParams.
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.total_tokens is not None
+            and packed_seq_params.total_tokens != active_tokens
+        ):
+            raise RuntimeError(
+                f"Dynamic DSA-GQA received {packed_seq_params.total_tokens} packed tokens, "
+                f"but the inference context has {active_tokens}."
+            )
+
+        indexer_hidden_states = hidden_states.detach()
+        if _simplified_indexer_uses_main_input_norm(self.config):
+            indexer_hidden_states = _normalized_indexer_input(
+                indexer_hidden_states, indexer_input_norm
+            )
+
+        index_q, current_index_key = self.indexer.forward_qk_dynamic(
+            indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+        )
+        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
+        index_key_cache, index_block_table = inference_context.dsa_key_cache(provider_layer_number)
+
+        num_decode_requests = inference_context.num_decode_requests
+        if num_decode_requests:
+            decode_lengths = query_lengths[:num_decode_requests]
+            if not bool((decode_lengths == 1).all().item()):
+                raise NotImplementedError(
+                    "The CuTe decode indexer currently supports one query token per request."
+                )
+            max_context_length = int(kv_lengths[:num_decode_requests].max().item())
+            if _deepselect_decode_supported(query.device, self.indexer.index_topk):
+                # Write DeepSelect's row alignment padding in the score kernel, avoiding
+                # a full score-buffer copy between the indexer and TopK.
+                alignment = deep_select.get_stride_requirement()[0] // torch.float32.itemsize
+                max_context_length = (max_context_length + alignment - 1) // alignment * alignment
+            decode_context_lengths = kv_lengths[:num_decode_requests].to(torch.int32).contiguous()
+            decode_scores = torch.empty(
+                (num_decode_requests, max_context_length), dtype=torch.float32, device=query.device
+            )
+            dsa_gqa_decode_indexer_score(
+                index_q[:num_decode_requests, 0, 0, :].contiguous(),
+                index_key_cache,
+                index_block_table[:num_decode_requests].to(torch.int32).contiguous(),
+                decode_context_lengths,
+                out=decode_scores,
+            )
+            decode_topk = _simplified_decode_topk(
+                decode_scores,
+                decode_context_lengths,
+                self.indexer.index_topk,
+                batch_invariant_mode=self.config.batch_invariant_mode,
+            )
+            decode_output = value_cache.new_empty(
+                (num_decode_requests, num_query_heads, value_cache.size(-1))
+            )
+            dsa_gqa_decode_attention(
+                query[:num_decode_requests, 0],
+                key_cache,
+                value_cache,
+                block_table[:num_decode_requests].to(torch.int32).contiguous(),
+                decode_topk.contiguous(),
+                decode_context_lengths,
+                self.softmax_scale,
+                out=decode_output,
+            )
+            output[:num_decode_requests, 0] = decode_output.flatten(1)
+
+        request_kv_offsets = inference_context.gpu_view.request_kv_length_offsets[
+            :request_count
+        ].to(torch.long)
+        for prefill_request_idx in range(num_decode_requests, request_count):
+            query_start = int(query_offsets[prefill_request_idx].item())
+            query_end = int(query_offsets[prefill_request_idx + 1].item())
+            query_length = query_end - query_start
+            kv_length = int(kv_lengths[prefill_request_idx].item())
+            if (
+                int(request_kv_offsets[prefill_request_idx].item()) != 0
+                or query_length != kv_length
+            ):
+                raise NotImplementedError(
+                    "Training-path prefill reuse currently requires an uncached full prompt."
+                )
+            positions = torch.arange(kv_length, device=query.device)
+            request_key = _paged_cache_rows(
+                key_cache,
+                block_table[prefill_request_idx],
+                positions,
+                inference_context.block_size_tokens,
+            ).unsqueeze(1)
+            request_value = _paged_cache_rows(
+                value_cache,
+                block_table[prefill_request_idx],
+                positions,
+                inference_context.block_size_tokens,
+            ).unsqueeze(1)
+            output[query_start:query_end] = self.forward(
+                query=query[query_start:query_end],
+                key=request_key,
+                value=request_value,
+                attention_mask=None,
+                hidden_states=hidden_states[query_start:query_end],
+                use_indexer_rope=use_indexer_rope,
+                indexer_input_norm=indexer_input_norm,
+                attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=None,
+            )
+
+        if is_using_quantization_scales(self.config):
+            output[inference_context.padding_slice] = 0.0
+        return output
 
     def _forward_min_memory(
         self,
@@ -888,3 +1174,36 @@ class DSGroupedSelfAttention(SelfAttention):
             ),
             "indexer_input_norm": indexer_input_norm,
         }
+
+    def _dynamic_core_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context,
+        block_table: torch.Tensor,
+        attn_mask_type: AttnMaskType,
+        attention_bias: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+        hidden_states: torch.Tensor,
+        use_indexer_rope: bool,
+        indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
+    ) -> torch.Tensor:
+        """Dispatch dynamic batching to the mixed prefill/decode DSA path."""
+        if inference_context.using_cuda_graph_this_step():
+            raise NotImplementedError("Dynamic DSA-GQA does not yet support CUDA graphs.")
+
+        provider_layer_number = self.layer_number - self._get_pp_layer_offset_for_inference()
+        return self.core_attention.forward_dynamic(
+            query=query,
+            key_cache=key,
+            value_cache=value,
+            hidden_states=hidden_states,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            provider_layer_number=provider_layer_number,
+            block_table=block_table,
+            use_indexer_rope=use_indexer_rope,
+            indexer_input_norm=indexer_input_norm,
+        )

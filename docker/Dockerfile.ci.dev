@@ -18,7 +18,7 @@ ENV UV_LINK_MODE=copy
 RUN bash -ex <<"EOF"
     apt-get update
     # DeepGEMM/DeepJIT requires elfutils/libdwfl.h for its exception support.
-    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime libdw-dev
+    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime libdw-dev pciutils
     apt-get clean
     python -m venv /opt/jet
     ARCH=$(uname -m)
@@ -133,6 +133,8 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS},target=/root/.cach
     bash -ex <<"EOF"
     export TMS_CUDA_MAJOR="$("${CUDA_HOME:-/usr/local/cuda}"/bin/nvcc --version | sed -n 's/.*release \([0-9][0-9]*\).*/\1/p' | head -1)"
     test -n "$TMS_CUDA_MAJOR"
+    # DeepSelect must select its CUDA backend even when the build host has no GPU.
+    export DEEP_SELECT_BUILD_TARGET_PLATFORM=CUDA
     # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
     # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
     # include path) and scope the build to the target archs. Skipped for the LTS image.
