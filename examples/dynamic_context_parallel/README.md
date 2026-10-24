@@ -2,35 +2,39 @@
 
 ## Bounded CPU runtime planner (PP1/VPP1)
 
-The optional runtime planner replaces the native arbitrary-CP heuristic with the
-reviewed `dcp-scheduler` lightweight planner. Install the audited source revision:
+Cost models and solvers are bundled in MCore; no external `dcp-scheduler` package
+is required. Model selection is independent of solver selection. For example,
+add these flags to a compatible native-DCP training configuration:
 
 ```bash
-pip install 'dcp-scheduler[acceleration] @ git+https://github.com/xiaoyao0115/dcp-scheduler.git@a55b345f20462182b2c4bb00fbc488a414dd5961'
-```
-
-For the provisional Qwen3.5 cost adapter, use:
-
-```bash
---dynamic-cp-runtime-model dcp_scheduler.adapters:qwen35_new_core_model \
---dynamic-cp-runtime-model-options /path/to/model-options.json \
---dynamic-cp-runtime-solver-options /path/to/solver-options.json \
+--dynamic-cp-runtime-model calibrated_attention \
+--dynamic-cp-runtime-model-options '{"hardware":"gb200","query_heads":32,"kv_heads":4,"head_dim":128,"layer_count":48,"allow_provisional":true}' \
 --dynamic-cp-runtime-trace-dir /path/to/telemetry
 ```
 
-`model-options.json` contains `{"fa_remainder": <contents of fa_remainder.json>,
-"kernel_backend": "numba"}`. The model is specific to W32/EP4/local16K and the
-Qwen3.5 4+1 proxy; do not use it as a universal predictor or treat mixed-stack
-predictions as GPU measurements. Other models can supply the same pure-CPU
-factory contract. The solver retains the original powers packing as its incumbent,
-uses a cooperative 0.8-second budget and scores at most four candidates. This is
-not a hard deadline: mandatory scoring can overrun, and late plans wait at consumption.
-`solver-options.json` configures `LightweightOptions`, e.g. `time_budget_s`,
-`max_scored_candidates`, `max_guide_candidates` and `cp_floors`.
-`--dynamic-cp-runtime-solver module:factory` can instead inject a CPU planner
-factory called as `factory(geometry, model, **solver_options)`. It must provide
-`geometry`, `plan_padded(padded, logical_lengths=..., incumbent_rows=...)` and
-`last_statistics`. Physical dataset padding and logical costs remain separate.
+The geometry above is illustrative and must match the trained model. The
+`calibrated_attention` model covers per-layer FA core costs, not projections or
+the rest of an arbitrary model; transfer to eager/native is provisional. The
+alternative `qwen35_gb200` includes the frozen W32/EP4/local16K five-layer
+proxy's (3 GDN + 2 FA)
+paired FA remainder/GDN/non-attention parameters, not a universal Qwen model.
+Neither is a substitute for GPU validation. Numba acceleration is optional.
+
+With no solver flag, the lightweight arbitrary-width planner uses a cooperative
+0.8-second budget and scores at most four candidates; mandatory work may overrun.
+To select the communication-agnostic DynamicUSP Stage 1/count-search policy:
+
+```bash
+--dynamic-cp-runtime-solver dynamic_usp \
+--dynamic-cp-runtime-solver-options '{"candidate_count":4,"outlier_threshold":1.0}'
+```
+
+This policy retains the upstream power-of-two candidate widths. It uses the
+selected cost model, not the upstream USP calibration, and does not choose an
+attention implementation. Both solvers retain the configured powers incumbent
+when their search does not predict an improvement. Model/solver options accept a
+JSON object or file path; custom `module:factory` hooks are still supported.
+See the [runtime contracts and model limits](../../megatron/core/datasets/dcp_runtime_scheduler/README.md).
 
 The existing DataLoader keeps each DP rank's sample stream. `wrap_data_iterator`
 buffers one future global batch on the host and gathers its logical/physical lengths
