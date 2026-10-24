@@ -390,11 +390,10 @@ def forward_step(data_iterator, model: HybridModel):
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     """Whether the dataset should be built on the current rank."""
-    args = get_args()
     cfg = get_run_config()
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif args.sequence_packing_scheduler is not None:
+    elif cfg.model.transformer.sequence_packing_scheduler is not None:
         # The scheduler sends packing metadata to middle PP stages itself and requires that
         # only the first and last stages hold a data iterator.
         return is_first_or_last_pipeline_stage(vp_stage)
@@ -446,7 +445,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
         context_parallel_size=cfg.model.transformer.context_parallel_size,
-        data_parallel_size=args.data_parallel_size,
+        data_parallel_size=cfg.get_data_parallel_size(),
         sequence_parallel_size=(
             cfg.model.transformer.tensor_model_parallel_size
             * cfg.model.transformer.sequence_parallel

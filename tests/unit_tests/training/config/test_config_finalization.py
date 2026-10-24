@@ -77,7 +77,8 @@ def test_validation_is_read_only_and_finalization_runs_once(
     assert copy.deepcopy(cfg)._finalized
 
 
-def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config):
+@pytest.mark.parametrize("invalid_policy", ["ddp_offload", "model_pipeline"])
+def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_config, invalid_policy):
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     transformer = TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4)
     transformer.cuda_graph_impl = "transformer_engine"
@@ -85,17 +86,35 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
     run_config.rl = RLConfig(perform_rl_step=True, rl_offload_optimizer_during_inference=True)
-    run_config.ddp.fp8_param_gather = True
-    run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+    if invalid_policy == "ddp_offload":
+        run_config.ddp.fp8_param_gather = True
+        run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
+        error, message = ValueError, "parameters share the gradient-buffer storage"
+    else:
+        # Native recipes can edit model layout before startup; validate it before RNG derivation.
+        transformer.num_layers = 4
+        transformer.pipeline_model_parallel_size = 2
+        transformer.virtual_pipeline_model_parallel_size = 3
+        monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
+        error, message = AssertionError, "Make sure the number of model chunks"
     before = copy.deepcopy(run_config.to_dict())
-    with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-        run_config.finalize()
-    assert run_config.to_dict() == before
-    assert not run_config._finalized
-    assert not run_config.rng.te_rng_tracker
+    for check in (run_config.validate, run_config.validate, run_config.finalize):
+        with pytest.raises(error, match=message):
+            check()
+        assert run_config.to_dict() == before
+        assert not run_config._finalized
+        assert not run_config.rng.te_rng_tracker
+
+    if invalid_policy == "model_pipeline":
+        with pytest.raises(error, match=message):
+            run_config.model.finalize()
+        assert run_config.to_dict() == before
 
     # A rejected configuration remains editable and can be finalized after correction.
-    run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+    if invalid_policy == "ddp_offload":
+        run_config.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+    else:
+        transformer.virtual_pipeline_model_parallel_size = 2
     run_config.finalize()
     assert run_config._finalized
     assert run_config.ddp.grad_buffer_offload

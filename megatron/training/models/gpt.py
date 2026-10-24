@@ -217,20 +217,8 @@ class GPTModelConfig(ModelConfig):
         else:
             super().__setattr__(name, value)
 
-    def finalize(self) -> None:
-        """One time validation to run once config is ready to be used by builder."""
-
-        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
-            self.transformer.finalize()
-
-        if self.transformer.cuda_graph_impl != "none" and "transformer_engine" in (
-            self.transformer.transformer_impl, self.transformer.cuda_graph_impl
-        ):
-            assert self.transformer.use_te_rng_tracker, (
-                "Transformer engine's RNG tracker is required for cudagraphs, it can be "
-                "enabled with use_te_rng_tracker=True'."
-            )
-
+    def validate(self) -> None:
+        """Check model layout without mutation or runtime-derived RNG settings."""
         vp_size = self.transformer.virtual_pipeline_model_parallel_size
         is_pipeline_asymmetric = (
             self.transformer.account_for_embedding_in_pipeline_split
@@ -244,6 +232,21 @@ class GPTModelConfig(ModelConfig):
             p_size = self.transformer.pipeline_model_parallel_size
             assert (self.transformer.num_layers // p_size) % vp_size == 0, (
                 "Make sure the number of model chunks is the same across all pipeline stages."
+            )
+
+    def finalize(self) -> None:
+        """Finalize nested model settings after the run has propagated its RNG policy."""
+        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
+            self.transformer.finalize()
+
+        # Standalone model finalization retains the same layout checks as container startup.
+        self.validate()
+        if self.transformer.cuda_graph_impl != "none" and "transformer_engine" in (
+            self.transformer.transformer_impl, self.transformer.cuda_graph_impl
+        ):
+            assert self.transformer.use_te_rng_tracker, (
+                "Transformer engine's RNG tracker is required for cudagraphs, it can be "
+                "enabled with use_te_rng_tracker=True'."
             )
 
 

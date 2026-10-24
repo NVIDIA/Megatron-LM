@@ -1134,7 +1134,10 @@ def test_gpt_embedding_groups_use_registered_model(monkeypatch, isolated_globals
 
 
 @pytest.mark.parametrize("module_name", ["pretrain_gpt", "pretrain_hybrid"])
-def test_dataset_helpers_use_registered_model(monkeypatch, isolated_globals, module_name):
+@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+def test_dataset_helpers_use_registered_model(
+    monkeypatch, isolated_globals, run_config, module_name, sequence_packing_scheduler
+):
     import importlib
 
     entrypoint = importlib.import_module(module_name)
@@ -1142,7 +1145,8 @@ def test_dataset_helpers_use_registered_model(monkeypatch, isolated_globals, mod
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.seq_length = 32
-    args.data_parallel_size = 2
+    args.data_parallel_size = 999
+    args.sequence_packing_scheduler = None if sequence_packing_scheduler else "dp_balanced"
     transformer = TransformerConfig(
         num_layers=3,
         hidden_size=128,
@@ -1156,13 +1160,12 @@ def test_dataset_helpers_use_registered_model(monkeypatch, isolated_globals, mod
         pipeline_model_parallel_layout="Et*3|m|L",
         mtp_num_layers=1,
     )
-    cfg = SimpleNamespace(
-        model=GPTModelConfig(transformer=transformer, seq_length=64),
-        rng=SimpleNamespace(seed=1234),
-        validation=ValidationConfig(),
-    )
+    transformer.sequence_packing_scheduler = sequence_packing_scheduler
+    cfg = run_config
+    cfg.model = GPTModelConfig(transformer=transformer, seq_length=64)
+    # TP=2, PP=3, CP=2 gives DP=2 independently of the stale CLI topology.
+    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 24)
     global_vars.set_args(args)
-    global_vars.set_run_config(cfg)
     monkeypatch.setattr(entrypoint, "build_tokenizer", Mock())
     monkeypatch.setattr(entrypoint, "get_blend_and_blend_per_split", lambda args: (None, None))
     monkeypatch.setattr(entrypoint, "GPTDatasetConfig", SimpleNamespace)
@@ -1180,7 +1183,11 @@ def test_dataset_helpers_use_registered_model(monkeypatch, isolated_globals, mod
         entrypoint.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
     )
     monkeypatch.setattr(entrypoint, "is_first_or_last_pipeline_stage", lambda stage: False)
-    assert entrypoint.is_dataset_built_on_rank()
+    assert entrypoint.is_dataset_built_on_rank() is (sequence_packing_scheduler is None)
+    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True) is (
+        sequence_packing_scheduler is None
+    )
+    assert args.data_parallel_size == 999
     assert args.context_parallel_size == args.tensor_model_parallel_size == 1
     assert args.mtp_num_layers is None
 

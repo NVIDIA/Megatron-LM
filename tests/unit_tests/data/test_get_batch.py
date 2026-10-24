@@ -1618,12 +1618,23 @@ def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_schedule
     tp_rank = mpu.get_tensor_model_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
 
-    args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
-    config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+    # Deliberately stale CLI settings must not control config-owned dataset placement.
+    args = SimpleNamespace(
+        sequence_packing_scheduler=None if sequence_packing_scheduler else "dp_balanced"
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler=sequence_packing_scheduler,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+    )
     vp_stages = [None] if vp_size is None else range(vp_size)
     with (
         patch.object(script, "get_args", return_value=args),
-        patch.object(script, "core_transformer_config_from_args", return_value=config),
+        patch.object(
+            script,
+            "get_run_config",
+            return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        ),
     ):
         for vp_stage in vp_stages:
             built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
