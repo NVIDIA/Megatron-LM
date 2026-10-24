@@ -3612,6 +3612,12 @@ def _add_experimental_args(parser):
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
+    group.add_argument("--no-megatron-fsdp-padded-shards", action="store_false", default=True,
+                       dest="megatron_fsdp_padded_shards",
+                       help="Megatron-FSDP v2 only. Pack each parameter group without padding and "
+                       "split it into generally unequal per-rank shards at row boundaries (32-row "
+                       "block boundaries for MXFP8), instead of padding every group to equal shards. "
+                       "Not compatible with --use-nccl-ub.")
     group.add_argument(
             '--megatron-fsdp-enable-fine-grained-param-gather',
             action='store_true',
