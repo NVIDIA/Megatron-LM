@@ -152,13 +152,16 @@ class InferenceBatchDimensions:
         local_batch_dims,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         ep_zmq_communicator=None,
-    ) -> Optional["InferenceBatchDimensions"]:
+    ) -> "InferenceBatchDimensions":
         """Adjust CUDA graph batch dimensions for expert parallelism.
 
-        All-reduce-max the token count and non-decode flag across the EP group.
-        If any rank has a prefill (non-decode) step, all ranks fall back to eager
-        mode (return None) — the non-CG path handles variable token counts via
-        use_allgather_v. Otherwise return adjusted dims with the max token count.
+        All-reduce-max the token count, the prefill request count and the decode request
+        count across the EP group and return those maxima as the batch dimensions every
+        rank matches against. Identical dimensions make every rank select the same CUDA
+        graph, which is what the NCCL AllGather dispatcher's graph path requires (equal
+        token counts on all ranks); a rank with fewer real tokens, or no prefill of its
+        own, pads to the shared graph. Prefill and mixed steps therefore run under CUDA
+        graphs too instead of forcing the whole group to eager mode.
 
         Args:
             local_batch_dims: The local batch dimensions to adjust.
@@ -172,45 +175,39 @@ class InferenceBatchDimensions:
                       torch.distributed.all_reduce on a GPU tensor.
 
         Returns:
-            InferenceBatchDimensions with max token count, or None for eager mode.
+            InferenceBatchDimensions holding the EP-wide maximum of each dimension.
         """
         ep_size = get_pg_size(ep_group)
         if ep_size <= 1:
             return local_batch_dims
 
-        is_non_decode = local_batch_dims.prefill_req_count > 0
-
+        local_values = (
+            local_batch_dims.token_count,
+            local_batch_dims.prefill_req_count,
+            local_batch_dims.decode_req_count,
+        )
         if ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
-            max_token_count, max_is_non_decode = ep_zmq_communicator.sync_all_reduce_max(
-                local_batch_dims.token_count, int(is_non_decode)
+            max_token_count, max_prefill_req_count, max_decode_req_count = (
+                ep_zmq_communicator.sync_all_reduce_max(*local_values)
             )
         else:
             sync_tensor = torch.tensor(
-                [local_batch_dims.token_count, int(is_non_decode)],
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                local_values, dtype=torch.int32, device=torch.cuda.current_device()
             )
             torch.distributed.all_reduce(
                 sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group
             )
-            sync_tensor = sync_tensor.cpu()
-            max_token_count = int(sync_tensor[0].item())
-            max_is_non_decode = int(sync_tensor[1].item())
+            max_token_count, max_prefill_req_count, max_decode_req_count = (
+                int(v) for v in sync_tensor.cpu().tolist()
+            )
 
-        is_any_ep_rank_in_non_decode = max_is_non_decode == 1
-
-        if is_any_ep_rank_in_non_decode:
-            return None  # any rank has prefill → eager mode
-
-        adjusted_batch_dim = InferenceBatchDimensions(
+        return InferenceBatchDimensions(
             token_count=max_token_count,
-            prefill_req_count=local_batch_dims.prefill_req_count,
-            decode_req_count=local_batch_dims.decode_req_count,
+            prefill_req_count=max_prefill_req_count,
+            decode_req_count=max_decode_req_count,
         )
-
-        return adjusted_batch_dim
 
 
 def _batch_invariant_token_align(token_count: int) -> int:
@@ -761,9 +758,6 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_batch_dimensions_list: List of available CUDA graph batch dimensions
             strict: If False, prefill slots can be used for prefill or decode requests.
                    If True, prefill slots can only be used for prefill requests.
-            decode_only_cuda_graphs: Used by expert parallel matching. If this is true,
-            and one of the EP ranks is running a non-decode step, we elect to run in
-            eager mode instead of matching a decode-only cuda graph.
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
@@ -785,16 +779,10 @@ class CUDAGraphBatchDimensionBuilder:
 
         if match_ep_token_counts:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
-            # across the EP group so graph selection is consistent.
+            # across the EP group so every rank matches against identical dimensions.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
                 real_batch_dim, ep_group=ep_group, ep_zmq_communicator=ep_zmq_communicator
             )
-
-            if adjusted_batch_dim is None:
-                # we hit this scenario if decode_only_cuda_graphs is true,
-                # and one of the EP ranks is running a non-decode step
-                # in that case, all ranks have to run in eager mode
-                return None
         else:
             adjusted_batch_dim = real_batch_dim
 

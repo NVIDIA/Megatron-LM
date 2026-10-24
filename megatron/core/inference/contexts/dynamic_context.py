@@ -51,6 +51,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
+    resolve_inference_moe_dispatcher_type,
 )
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
@@ -853,15 +854,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
+        inference_dispatcher_type = resolve_inference_moe_dispatcher_type(model_config)
         self._nccl_ep_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
-            and model_config.inference_moe_token_dispatcher_type == 'nccl'
+            and inference_dispatcher_type == 'nccl'
         )
 
         # are we using the inference_optimized nvls ep dispatcher for MoEs?
         self._nvls_dispatcher = (
             get_pg_size(self.expert_model_parallel_group) > 1
-            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+            and inference_dispatcher_type == 'nvls'
         )
 
         # are we using the training a2a dispatcher for MoEs?
@@ -871,9 +873,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             and model_config.transformer_impl == "transformer_engine"
         )
 
-        # We only allow non-decode cuda graphs for the nvls dispatcher
-        force_disable_non_decode_cuda_graphs = (
-            self._nccl_ep_dispatcher or self._training_ep_dispatcher
+        # The nccl AllGather dispatcher's graph path needs equal token counts on every EP
+        # rank; match_graph_config all-reduces the batch dimensions across the EP group so
+        # all ranks select the same graph, which makes prefill/mixed graphs valid for nccl
+        # as well. Other implementations keep the decode-only restriction: they run the
+        # training token dispatcher, whatever the inference dispatcher setting says.
+        force_disable_non_decode_cuda_graphs = self._training_ep_dispatcher or (
+            self._nccl_ep_dispatcher and model_config.transformer_impl != "inference_optimized"
         )
 
         self.use_cuda_graphs_for_non_decode_steps = (
@@ -989,14 +995,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.is_tensor_state_allocated = False
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
-
-        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
-        # so it can mask out CUDA-graph padding tokens during routing. The
-        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
-        # dispatcher requires equal token counts across ranks already.
-        if self._nvls_dispatcher:
-            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
         pool_size = self.kv_block_allocator.pool_size
@@ -1632,6 +1630,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # only one is active per step, so sharing storage is safe.
         self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
         self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+
+        # Bind the GPU real-token-count tensor onto the EP dispatcher class so it can
+        # mask out CUDA-graph padding tokens during routing. Like the bindings above it
+        # is redone on every allocation: a RECOMPUTE resume replaces gpu_view, and the
+        # CUDA graphs recaptured afterwards must read the new tensor.
+        if self._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
+        elif self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Deferred Mamba GPU operations.  Populated by add_request() /
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
@@ -2494,7 +2501,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         We setup minimal state such that initialize_attention_state and the forward
         pass can run without error.
 
-        Called AFTER the EP sync so graph_dimensions reflects the agreed-upon graph.
+        Called with a fixed one-request decode shape before the EP sync; the sync in
+        initialize_attention_state may then pad this rank into the graph the EP group
+        agreed on, including a prefill/mixed graph when another rank prefills.
         """
         N_decode = graph_dimensions.decode_req_count
         N_prefill = graph_dimensions.prefill_req_count
@@ -2597,7 +2606,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ), "Dummy expert model parallel steps should not be creating cuda graphs."
 
         # If in CUDA graph creation mode, add dummy requests for CUDA graph capture.
-        # EP dummy requests are added AFTER the EP sync below.
+        # EP dummy requests (idle EP ranks) are added just below, BEFORE the EP sync in
+        # match_graph_config, which may then pad this rank into the graph the group selects.
         if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
         elif is_expert_parallel_dummy_cuda_graph_step:

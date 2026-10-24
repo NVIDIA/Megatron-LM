@@ -381,6 +381,40 @@ class TestNCCLAllGatherDispatcher:
         expected = (global_hidden[offset : offset + local_tokens].float() * ep_size).bfloat16()
         torch.testing.assert_close(combined, expected)
 
+    def test_cuda_graph_path_masks_padding_rows(self):
+        """On the CUDA-graph path every rank is padded to the graph's token count; rows from
+        the context's real token count on get routing -1 so they skip the experts."""
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        if ep_size == 1:
+            pytest.skip("The CUDA-graph gather path only runs with EP > 1")
+        rank = torch.distributed.get_rank()
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        num_experts = NANOV3_BASE["num_moe_experts"]
+        graph_tokens, real_tokens = 16, 5 + rank  # rank r has 5 + r real tokens
+
+        NCCLAllGatherDispatcher._use_allgather_v = False
+        NCCLAllGatherDispatcher.set_real_token_count_tensor(
+            torch.tensor([real_tokens], dtype=torch.int32, device="cuda")
+        )
+        try:
+            hidden = torch.randn(graph_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+            probs = torch.randn(graph_tokens, topk, device="cuda", dtype=torch.float32)
+            dispatcher.routing_map = torch.randint(
+                0, num_experts, (graph_tokens, topk), device="cuda"
+            )
+            dispatcher.token_dispatch(hidden, probs)
+        finally:
+            NCCLAllGatherDispatcher.set_real_token_count_tensor(None)
+
+        gathered = dispatcher.routing_map.view(ep_size, graph_tokens, topk)
+        for r in range(ep_size):
+            assert (gathered[r, : 5 + r] >= 0).all()
+            assert (gathered[r, 5 + r :] == -1).all()
+
 
 # ──────────────────────────────────────────────────────────────────────
 # NVLSAllGatherVDispatcher

@@ -426,13 +426,14 @@ class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
     @pytest.mark.internal
     @torch.inference_mode()
     def test_nccl_dummy_bailout_with_prefill_peer(self, peer_state):
-        """Verify the dummy-rank bail-out path with the NCCL dispatcher.
+        """Verify the dummy-rank bail-out path with the NCCL dispatcher and decode-only
+        graphs.
 
-        With the NCCL dispatcher (match_ep_token_counts=True), when any EP
-        rank has prefill requests, adjust_batch_dims_for_expert_parallelism
-        returns None (forcing eager mode) for ALL ranks. A dummy rank then
-        bails out of initialize_attention_state early (padded_batch_dimensions
-        is not set).
+        With the NCCL dispatcher (match_ep_token_counts=True) the EP sync raises every
+        rank's batch dimensions to the group maxima; with only decode graphs captured no
+        graph fits a peer's prefill, so match_graph_config returns None (eager mode) for
+        ALL ranks. A dummy rank then bails out of initialize_attention_state early
+        (padded_batch_dimensions is not set).
 
         This test verifies that:
           - The dummy rank correctly falls back to model.forward (the real
@@ -480,6 +481,73 @@ class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
             self._assert_dynamic_inference_shape(model, ctx, ep_rank, peer_state)
         self._assert_cuda_graphs_were_replayed(
             False, ep_rank, f"decode-only graphs, peer_state={peer_state}"
+        )
+
+    # ------------------------------------------------------------------
+    # Prefill/mixed graphs under the NCCL dispatcher: every rank pads into one graph
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "peer_state", [PREFILL, MIXED], ids=[f"peer={s}" for s in [PREFILL, MIXED]]
+    )
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_nccl_prefill_peer_pads_every_rank_into_one_mixed_graph(self, peer_state):
+        """With non-decode graphs enabled, a prefill on one EP rank makes every rank
+        (dummy ranks included) replay the same mixed graph, since the NCCL dispatcher's
+        graph path needs equal token counts on all ranks.
+
+        Even EP ranks are dummy; odd EP ranks have the parametrized peer_state.
+        """
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        is_even = ep_rank % 2 == 0
+
+        model = self._build_model(inference_moe_token_dispatcher_type='nccl')
+        ctx = self._build_context(
+            model,
+            use_cuda_graphs_for_non_decode_steps=True,
+            max_requests=64,
+            max_tokens=512,
+            cuda_graph_max_tokens=64,
+            reserve_recurrent_state_dummy_slot=True,
+        )
+        self._capture_all_cuda_graphs(model, ctx)
+
+        if not is_even:
+            ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[peer_state])
+
+        if is_even:
+            ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        else:
+            ctx.initialize_attention_state()
+
+        assert ctx.using_cuda_graph_this_step(), (
+            f"EP rank {ep_rank}: expected a CUDA graph match with non-decode graphs and "
+            f"peer_state={peer_state}"
+        )
+        padded = ctx.padded_batch_dimensions
+        assert (
+            padded.prefill_req_count > 0
+        ), f"EP rank {ep_rank}: expected to be padded into a mixed graph, got {padded}"
+        # Every rank selected the same graph.
+        dims = torch.tensor(
+            [padded.token_count, padded.prefill_req_count, padded.decode_req_count],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        dims_max, dims_min = dims.clone(), dims.clone()
+        torch.distributed.all_reduce(dims_max, op=torch.distributed.ReduceOp.MAX, group=ep_group)
+        torch.distributed.all_reduce(dims_min, op=torch.distributed.ReduceOp.MIN, group=ep_group)
+        assert torch.equal(dims_max, dims_min), f"EP ranks selected different graphs: {padded}"
+        if not is_even:
+            assert not ctx.is_decode_only()
+
+        self._assert_dynamic_inference_shape(
+            model, ctx, ep_rank, "dummy" if is_even else peer_state
+        )
+        self._assert_cuda_graphs_were_replayed(
+            True, ep_rank, f"non-decode graphs, peer_state={peer_state}"
         )
 
     # ------------------------------------------------------------------

@@ -5,14 +5,16 @@ Inference token dispatchers for MoE expert parallelism.
 
 Two dispatchers are provided, selected via config.inference_moe_token_dispatcher_type:
 
-  NCCLAllGatherDispatcher ('nccl', default)
+  NCCLAllGatherDispatcher ('nccl')
     Standard NCCL AllGather/ReduceScatter. All EP ranks must contribute the same
-    token count per step; decode-only CUDA graphs are forced automatically.
+    token count per step, which the dynamic context guarantees by selecting the same
+    CUDA graph (decode-only or prefill/mixed) on every rank. Works on any GPU.
 
-  NVLSAllGatherVDispatcher ('nvls')
+  NVLSAllGatherVDispatcher ('nvls', default)
     Variable-count NVLS AllGather-V/ReduceScatter-V via multimem kernels. Supports
     different token counts per rank per step. Requires Hopper+ GPUs with NVLink and
-    symmetric memory. Opt-in.
+    symmetric memory; resolve_inference_moe_dispatcher_type substitutes 'nccl' on
+    older GPUs.
 
 InferenceAllGatherDispatcherBase is a minimal base used solely for isinstance checks
 and to hold _valid_tokens_tensor — the shared interface that mcore_fused_moe reads to
@@ -21,6 +23,7 @@ update_metadata method, invoked from the first instance's token_dispatch so the
 per-step metadata kernel is captured inside the CUDA graph.
 """
 
+import logging
 import operator
 from functools import reduce
 from typing import List, Optional
@@ -29,6 +32,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference.communication.torch_symm_triton import (
+    is_device_nvls_capable,
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
@@ -49,6 +53,61 @@ from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDisp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_inference_moe_dispatcher_type(config: TransformerConfig) -> str:
+    """Return the inference MoE dispatcher type to use on the current device.
+
+    `config.inference_moe_token_dispatcher_type` defaults to 'nvls', whose multimem
+    collectives need Hopper or newer. On an older GPU (A100) that default would fail at the
+    first dispatch, so every reader of the setting resolves it through this function. The
+    setting only applies to ``transformer_impl='inference_optimized'``; other
+    implementations get it back unchanged. When expert parallelism is on and the current
+    device lacks NVLS, it rewrites the config to
+    'nccl' once (with a warning) so every later reader sees the same value. It reads the
+    capability of the current device, so it must be called after the process has selected
+    its GPU (model construction time), not at config construction time.
+
+    Raises:
+        ValueError: when the config enables a feature that only the NVLS dispatcher
+            provides (``batch_invariant_mode`` with EP, shared-expert overlap with MoE
+            latent projections, ``inference_flashinfer_mxfp8_token_capacity``) on a
+            device without NVLS.
+    """
+    dispatcher_type = config.inference_moe_token_dispatcher_type
+    if (
+        dispatcher_type != 'nvls'
+        or config.transformer_impl != 'inference_optimized'
+        or config.expert_model_parallel_size <= 1
+        or not torch.cuda.is_available()
+        or is_device_nvls_capable(torch.device("cuda", torch.cuda.current_device()))
+    ):
+        return dispatcher_type
+    device_name = torch.cuda.get_device_name()
+    if config.batch_invariant_mode:
+        raise ValueError(
+            "batch_invariant_mode with inference-optimized MoE and expert parallelism "
+            f"requires the NVLS dispatcher, which {device_name} does not support."
+        )
+    if config.moe_latent_size is not None and config.moe_shared_expert_overlap:
+        raise ValueError(
+            "Shared expert overlap with MoE latent projections requires the NVLS inference "
+            f"dispatcher, which {device_name} does not support."
+        )
+    if config.inference_flashinfer_mxfp8_token_capacity is not None:
+        raise ValueError(
+            "inference_flashinfer_mxfp8_token_capacity requires the NVLS inference "
+            f"dispatcher, which {device_name} does not support."
+        )
+    logger.warning(
+        "inference_moe_token_dispatcher_type='nvls' needs NVLS (compute capability >= 9); "
+        "using 'nccl' on %s.",
+        device_name,
+    )
+    config.inference_moe_token_dispatcher_type = 'nccl'
+    return 'nccl'
 
 
 class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
@@ -109,7 +168,8 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
     Two modes, selected by _use_allgather_v (set from the context each step):
 
     CG path (use_allgather_v=False): all EP ranks contribute the same token count,
-    guaranteed by decode-only CUDA graphs. Standard AllGather/ReduceScatter.
+    guaranteed by the dynamic context selecting the same CUDA graph on every EP rank
+    (decode-only as well as prefill/mixed graphs). Standard AllGather/ReduceScatter.
 
     Non-CG path (use_allgather_v=True): ranks may have different token counts
     (prefill). Each rank pads its tensors to max_tokens, runs a standard AllGather,
@@ -136,6 +196,29 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
+        # Rank inside pg_collection.tp, for the SP offset of the padding mask (as in the
+        # NVLS dispatcher).
+        self.sp_rank = get_pg_rank(pg_collection.tp)
+
+    _real_token_count_tensor: Optional[torch.Tensor] = None
+
+    @classmethod
+    def set_real_token_count_tensor(cls, tensor: torch.Tensor) -> None:
+        """Bind the context's GPU real-token-count tensor (see the NVLS dispatcher).
+
+        Called by DynamicInferenceContext after allocate_buffers. On the CUDA-graph path
+        the rows from this count on are graph padding, and their routing is masked.
+        """
+        cls._real_token_count_tensor = tensor
+
+    @classmethod
+    def modify_real_token_count_for_mtp(cls, mtp_token_count: int) -> None:
+        """Point the padding mask at an MTP forward's row count (see the NVLS dispatcher)."""
+        assert cls._real_token_count_tensor is not None, (
+            "real-token-count tensor not wired; DynamicInferenceContext must "
+            "call set_real_token_count_tensor first"
+        )
+        cls._real_token_count_tensor.fill_(mtp_token_count)
 
     @classmethod
     def allocate_buffers(cls) -> None:
@@ -143,8 +226,10 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
 
         Called once at model init from the dynamic context. Must run outside any
         CUDA graph capture so update_metadata can write to a stable address during
-        replay without triggering allocations inside the graph.
+        replay without triggering allocations inside the graph. Clears the padding
+        mask's token-count binding, which the context sets again afterwards.
         """
+        cls._real_token_count_tensor = None
         device = torch.cuda.current_device()
         InferenceAllGatherDispatcherBase._valid_tokens_tensor = torch.zeros(
             1, dtype=torch.int32, device=device
@@ -205,7 +290,13 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             self.update_metadata(hidden_states.shape[0])
 
         if not self.__class__._use_allgather_v:
-            # CG path: equal token counts, standard gather.
+            # CG path: equal token counts, standard gather. Every rank is padded to the
+            # graph's token count; mask the padding rows' routing (-1) so they skip the
+            # expert GEMMs, as the NVLS dispatcher does.
+            if self.__class__._real_token_count_tensor is not None:
+                mask_routing_padding(
+                    self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+                )
             with torch.no_grad():
                 self.routing_map = gather_from_sequence_parallel_region(
                     self.routing_map, group=self.tp_ep_group

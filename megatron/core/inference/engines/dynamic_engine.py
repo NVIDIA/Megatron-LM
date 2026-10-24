@@ -575,6 +575,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
         self._initialize_disaggregation_state()
+        # Coordinator mode with EP > 1 creates the EP ZMQ communicator (see
+        # run_engine_with_coordinator); it stays None for in-process engines. Owned by the
+        # process, not by a generation, so it survives reset().
+        self.expert_parallel_zmq_communicator = None
+        # Under the nccl EP dispatcher: whether any EP rank runs a non-decode step this
+        # iteration (agreed in _agree_ep_step_kind right before the step branches).
+        self._ep_step_has_non_decode = False
         # Initialize engine.
         self.reset()
 
@@ -3708,12 +3715,104 @@ class DynamicInferenceEngine(AbstractEngine):
             and token_capacity_available
         )
 
+    def _needs_ep_step_kind_agreement(self) -> bool:
+        """Whether the EP group must agree on the step kind before each step.
+
+        Only the nccl dispatcher's prefill/mixed CUDA graphs pad a decode-only rank into a
+        non-decode layout. Without them (non-decode graphs disabled, or no graphs at all) a
+        step with a prefill on any rank runs eagerly with per-rank token counts, a
+        decode-only rank keeps its decode-only layout, and the local overlap decision
+        stands as before.
+        """
+        context = self.context
+        return bool(
+            context._nccl_ep_dispatcher
+            and context.use_cuda_graphs_for_non_decode_steps
+            and context.cuda_graph_batch_dimensions_list
+        )
+
     def _should_run_async_sched_overlap(self) -> bool:
         """Return whether this step should use overlap ordering.
+
+        With the nccl expert-parallel dispatcher and its prefill/mixed CUDA graphs every EP
+        rank runs the same CUDA graph, so a prefill on any rank pads the others to a mixed
+        graph. The overlap ordering
+        assumes a decode-only step on this rank, so the decision is made for the whole EP
+        group: if any rank is about to prefill, or the forward still pending on this rank
+        was not decode-only, every rank takes the no-overlap ordering this step.
 
         Returns:
             bool: Whether the next step can use overlap ordering.
         """
+        overlap = self._local_async_sched_overlap_decision()
+        if overlap and self._needs_ep_step_kind_agreement():
+            # Agreed for the whole EP group beforehand (_agree_ep_step_kind in the
+            # coordinator loop, which idle ranks reach too, or
+            # _agree_ep_step_kind_collective in async_forward otherwise): a prefill on any
+            # rank pads this rank into a mixed graph, which the overlap ordering cannot
+            # consume, so it takes the no-overlap ordering that step.
+            overlap = not self._ep_step_has_non_decode
+        return overlap
+
+    def _local_step_is_non_decode(self, local_schedulable: int) -> bool:
+        """This rank's input to the EP step-kind agreement: whether its step may run a
+        non-decode graph.
+
+        True when the forward whose output is still pending was not decode-only, or when
+        a waiting request may enter the batch this step. The latter follows the local
+        ordering decision: on the overlap ordering nothing is scheduled, so the step is
+        decode-only; on the no-overlap ordering the waiting head is scheduled after the
+        pending output is consumed, and even a head that is not admissible right now may
+        fit once that bookkeeping frees room, so the rank reports a possible prefill.
+        A rank without waiting requests reports decode-only whatever ordering it takes.
+        """
+        if local_schedulable <= 0:
+            return False
+        if self._async_sched_pending_forward_is_non_decode():
+            return True
+        if not self.waiting_request_ids:
+            return False
+        return not self._local_async_sched_overlap_decision()
+
+    async def _agree_ep_step_kind(self, local_schedulable: int) -> None:
+        """Agree across the EP group whether this iteration's step is non-decode anywhere.
+
+        Called from the coordinator loop right before a rank either steps (``async_step``)
+        or runs a dummy forward, so every rank, idle ones included, takes part in exactly
+        one reduction per iteration. The MAX is stored for
+        ``_should_run_async_sched_overlap``.
+        """
+        if (
+            not self._needs_ep_step_kind_agreement()
+            or self.context.config.async_sched_mode != AsyncScheduleMode.ASYNC
+        ):
+            return
+        local_non_decode = int(self._local_step_is_non_decode(local_schedulable))
+        if self.ep_world_size > 1:
+            # Every EP rank reaches this point in the same iteration, so the wait is bounded
+            # by their skew: a blocking exchange like match_graph_config's batch dimension
+            # sync, not the polling all_reduce_max, whose 1 ms sleeps add up per token.
+            agreed = self.expert_parallel_zmq_communicator.sync_all_reduce_max(local_non_decode)
+        else:
+            agreed = local_non_decode
+        self._ep_step_has_non_decode = bool(agreed)
+
+    def _agree_ep_step_kind_collective(self) -> None:
+        """Same agreement for engines driven without the coordinator (``run_engine``,
+        ``step``), where every EP rank steps each iteration and no ZMQ communicator exists:
+        a MAX all-reduce of one integer over the EP process group."""
+        local_non_decode = int(self._local_step_is_non_decode(local_schedulable=1))
+        ep_group = self.pg_collection.ep
+        if get_pg_size(ep_group) > 1:
+            flag = torch.tensor(
+                [local_non_decode], dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=ep_group)
+            local_non_decode = int(flag.item())
+        self._ep_step_has_non_decode = bool(local_non_decode)
+
+    def _local_async_sched_overlap_decision(self) -> bool:
+        """This rank's own view of whether the next step is a pure decode step."""
         # No-overlap also handles the first decode-only forward after prefill:
         # pending prefill output must be resolved before preparing its decode rows.
         # Paused requests and insufficient KV capacity likewise require complete
@@ -3729,6 +3828,20 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.enable_chunked_prefill:
             return not self._can_schedule_chunked_prefill(req)
         return not self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
+
+    def _async_sched_pending_forward_is_non_decode(self) -> bool:
+        """Whether the forward whose output is still pending ran as a non-decode step.
+
+        Under the nccl dispatcher a rank with only decode requests can still have run a
+        mixed graph because another EP rank prefilled; its pending logits then have the
+        non-decode layout and must be consumed by the no-overlap ordering.
+        """
+        if not self.controller._async_sched_forward.is_valid:
+            return False
+        context = self.context
+        if context.using_cuda_graph_this_step():
+            return context.padded_batch_dimensions.prefill_req_count > 0
+        return context.num_prefill_requests > 0
 
     def _pending_prefill_block_hashes(self) -> set[int]:
         """Return hashes reserved by work whose KV is not yet ready for reuse."""
@@ -4083,6 +4196,11 @@ class DynamicInferenceEngine(AbstractEngine):
             step_nvtx_range = "Decode" if self.context.num_prefill_requests == 0 else "Prefill"
             controller_kwargs = {}
         elif mode == AsyncScheduleMode.ASYNC:
+            if (
+                self._needs_ep_step_kind_agreement()
+                and self.expert_parallel_zmq_communicator is None
+            ):
+                self._agree_ep_step_kind_collective()
             run_async_overlap = self._should_run_async_sched_overlap()
             step_nvtx_range = "AsyncOverlap" if run_async_overlap else "AsyncNoOverlap"
             controller_kwargs = {
@@ -5062,7 +5180,7 @@ class DynamicInferenceEngine(AbstractEngine):
             socket.close(linger=0)
         if hasattr(self, 'zmq_sockets'):
             self.zmq_sockets.clear()
-        if hasattr(self, "expert_parallel_zmq_communicator"):
+        if getattr(self, "expert_parallel_zmq_communicator", None) is not None:
             self.expert_parallel_zmq_communicator.close()
         if hasattr(self, "world_zmq_communicator"):
             self.world_zmq_communicator.close()
@@ -5228,6 +5346,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
+                        await self._agree_ep_step_kind(local_schedulable)
                         if local_schedulable > 0:
                             await self.async_step()
                         else:
