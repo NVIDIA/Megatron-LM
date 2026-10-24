@@ -299,14 +299,14 @@ class TestMcoreMoE:
         ids=["default", "explicit-shortcut", "other-types", "root-only"],
     )
     def test_shortcut_ownership_and_weight_lifetime(self, unit_modules, shard_shortcut):
-        """The ordinary module traversal must match shortcut calls without order overrides."""
+        """Skip helper-only containers inside shortcuts, but shard ordinary sibling layers."""
         config = TransformerConfig(
-            num_layers=2,
+            num_layers=3,
             hidden_size=64,
             num_attention_heads=4,
             num_moe_experts=4,
             expert_model_parallel_size=2,
-            moe_layer_freq=[0, 1],
+            moe_layer_freq=[0, 1, 0],
             moe_token_dispatcher_type="alltoall",
             moe_router_topk=2,
             moe_grouped_gemm=True,
@@ -328,7 +328,7 @@ class TestMcoreMoE:
             hybrid_stack_spec=wide_residual_hybrid_stack_spec,
             vocab_size=128,
             max_sequence_length=8,
-            hybrid_layer_pattern="*E",
+            hybrid_layer_pattern="*E*",
             pg_collection=self.process_group_collection,
         ).cuda()
         block = model.decoder.layers[0]
@@ -352,7 +352,10 @@ class TestMcoreMoE:
         assert isinstance(block, FsdpModule) == shard_shortcut
         assert not isinstance(block.compute_layer, FsdpModule)
         assert not isinstance(block.moe_layer, FsdpModule)
+        assert not isinstance(block.moe_layer.mlp, FsdpModule)
         assert isinstance(block.moe_layer.mlp.experts, FsdpModule)
+        shard_ordinary_layer = unit_modules is None or TransformerLayer in unit_modules
+        assert isinstance(model.module.decoder.layers[1], FsdpModule) == shard_ordinary_layer
         for child in (
             block.compute_layer.residual_read_self_attn,
             block.compute_layer.residual_write_self_attn,

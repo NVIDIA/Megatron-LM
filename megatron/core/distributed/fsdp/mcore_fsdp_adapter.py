@@ -731,35 +731,41 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             grad_scale=expert_grad_scale,
                             **common_fully_shard_kwargs,
                         )
-            # ShortcutMoEBlock calls compute_layer.forward_pre_attn_and_core_attn(),
-            # moe_layer._pre_mlp_layernorm_and_residual(), and mlp.route()/dispatch()
-            # directly. Their __call__ hooks never run, so these modules must not own
-            # FSDP shards. Their enclosing FSDP unit gathers their weights.
-            # Experts keep their expert-DP units above; other explicitly selected children
-            # (e.g. a norm called through __call__) can still be separate units.
-            shortcut_inner_modules = {
-                child
-                for block in module.modules()
-                if isinstance(block, ShortcutMoEBlock)
-                for child in (block.compute_layer, block.moe_layer, block.moe_layer.mlp)
-            }
-            for submodule in reversed(list(module.modules())):
-                if submodule in shortcut_inner_modules:
-                    continue
-                if submodule is module:
-                    # The root is always sharded after selected child units so it is not
-                    # wrapped twice when its type also appears in fsdp_unit_modules.
-                    continue
-                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
-                    if config.init_model_with_meta_device:
-                        _materialize_owned_meta_modules(submodule, device)
-                    fully_shard(
-                        submodule,
-                        mesh=dp_mesh,
-                        placements=dense_placements,
-                        grad_scale=dense_grad_scale,
-                        **common_fully_shard_kwargs,
-                    )
+            dense_units = []
+            visited = set()
+
+            def collect_dense_units(submodule, inside_shortcut=False):
+                if submodule in visited:
+                    return
+                visited.add(submodule)
+
+                # Shortcut blocks call these containers through helpers, bypassing
+                # their module hooks. Still visit children that run through __call__.
+                called_via_helpers = inside_shortcut and isinstance(
+                    submodule, (TransformerLayer, MambaLayer, MoELayer)
+                )
+                if (
+                    submodule is not module
+                    and not called_via_helpers
+                    and isinstance(submodule, tuple(fsdp_unit_modules))
+                ):
+                    dense_units.append(submodule)
+
+                inside_shortcut = inside_shortcut or isinstance(submodule, ShortcutMoEBlock)
+                for child in submodule.children():
+                    collect_dense_units(child, inside_shortcut)
+
+            collect_dense_units(module)
+            for submodule in reversed(dense_units):
+                if config.init_model_with_meta_device:
+                    _materialize_owned_meta_modules(submodule, device)
+                fully_shard(
+                    submodule,
+                    mesh=dp_mesh,
+                    placements=dense_placements,
+                    grad_scale=dense_grad_scale,
+                    **common_fully_shard_kwargs,
+                )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
