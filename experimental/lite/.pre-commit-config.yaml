@@ -13,4 +13,4 @@ repos:
     language: python
     additional_dependencies: ["black==24.4.2"]
     files: ^experimental/lite/.*\.py$
-    args: ["--skip-magic-trailing-comma", "--skip-string-normalization"]
+    args: ["--skip-magic-trailing-comma", "--skip-string-normalization", "--required-version=24.4.2"]
