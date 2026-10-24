@@ -153,7 +153,11 @@ class FullyParallelSaveStrategyWrapper:
             and self.validate_access_integrity
         ):
             # First time applying the parallelization
-            validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
+            checkpoint_group = self.base_strategy.process_group
+            validate_sharding_integrity(
+                determine_global_metadata(sharded_state_dict, process_group=checkpoint_group)[1],
+                process_group=checkpoint_group,
+            )
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
         end = time()
@@ -195,6 +199,7 @@ class FullyParallelLoadStrategyWrapper:
         per_rank_object_load: bool = False,
         pg_cache_path: Optional[str] = None,
         pg_cache_create: bool = False,
+        checkpoint_process_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.base_strategy = strategy
         if parallelization_group is None:
@@ -214,6 +219,7 @@ class FullyParallelLoadStrategyWrapper:
         # distribution is read from disk and the all_gather_object is skipped.
         self.pg_cache_path = pg_cache_path
         self.pg_cache_create = pg_cache_create
+        self.checkpoint_process_group = checkpoint_process_group
 
         self.cached_distribution: Optional[ShardDistribution] = None
         self.cached_global_metadata: Optional[Metadata] = None
@@ -356,7 +362,9 @@ class FullyParallelLoadStrategyWrapper:
             # No object exchange: each rank already loaded every object it needs.
             all_loaded_objects = loaded_objects
         else:
-            all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
+            all_loaded_objects = exchange_loaded_objects_gather_object(
+                loaded_objects, process_group=self.checkpoint_process_group
+            )
             if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
                 missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
                 raise CheckpointingException(
