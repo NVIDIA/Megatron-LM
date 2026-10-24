@@ -1118,7 +1118,7 @@ class TestMultiTokenPredictionLayer:
     @pytest.mark.parametrize("layout", ["unpacked", "packed", "padded_packed"])
     @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
     def test_get_embeddings_rolls_padding_mask(self, tp, cp, layout, cp_layout):
-        """Shifted sequence ends and existing padding stay excluded at every MTP depth."""
+        """Token-side rolls retain a full CP-local mask with every invalid token excluded."""
         if Utils.world_size < tp * cp:
             pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
         torch.manual_seed(_SEED)
@@ -1188,7 +1188,6 @@ class TestMultiTokenPredictionLayer:
                 for row, length in enumerate(row_lengths):
                     expected[row, start : start + max(length - depth, 0)] = False
             expected = expected.index_select(-1, index)
-            expected = expected.chunk(tp, dim=-1)[tp_rank].contiguous()
             passed = torch.tensor(
                 [torch.equal(shifted_mask, expected), torch.equal(padding_mask, original_mask)],
                 dtype=torch.int32,

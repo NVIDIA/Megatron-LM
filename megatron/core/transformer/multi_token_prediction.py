@@ -3339,10 +3339,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
 
-        # Keep the full CP-local mask for the next MTP depth; only the Transformer
-        # consumes an SP shard alongside its sequence-parallel hidden states.
+        # Token-side rolls retain the full CP-local mask. Precomputed embeddings
+        # may already carry an SP mask, so only shard full-length metadata here.
         transformer_padding_mask = padding_mask
-        if padding_mask is not None and self.config.sequence_parallel:
+        if (
+            padding_mask is not None
+            and padding_mask.shape[1] != hidden_states.shape[0]
+            and self.config.sequence_parallel
+        ):
             transformer_padding_mask = (
                 scatter_to_sequence_parallel_region(
                     padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
