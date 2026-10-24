@@ -507,7 +507,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/gated_delta_net/gdn.py",
             "megatron/core/ssm/gated_delta_net/gdn2.py",
         ),
-        tests=(K + "test_ssm_kernels.py", K + "test_gated_norm.py", C + "test_hybrid_model.py"),
+        tests=(
+            K + "test_ssm_kernels.py",
+            K + "test_gated_norm.py",
+            K + "test_gdn_muon.py",
+            C + "test_hybrid_model.py",
+        ),
         kind="torch.compile",
         notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
