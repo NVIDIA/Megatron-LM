@@ -892,7 +892,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         This method un-permutes the tokens back to their original order,
         reshapes the tensor to its original shape, and adds the shared
-        expert output if enabled.
+        expert output if enabled. It then releases the router probabilities
+        stored by `dispatch_preprocess`, which this forward no longer needs.
 
         Args:
             permutated_local_input_tokens (torch.Tensor): Permuted hidden states from token combine.
@@ -919,6 +920,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
+
+        # Drop the reference to the router probs stored in `dispatch_preprocess`. Only this
+        # forward reads them (in `combine_preprocess`); kept until the next forward through the
+        # layer, they pin this forward's autograd graph. Under full activation recompute that is
+        # every MoE layer's recomputed graph for the rest of the backward pass.
+        self.probs = None
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):
