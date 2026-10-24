@@ -719,62 +719,44 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            if expert_dp_mesh is not None:
-                for submodule in module.modules():
-                    if isinstance(submodule, MoELayer):
-                        if config.init_model_with_meta_device:
-                            _materialize_owned_meta_modules(submodule.experts, device)
-                        fully_shard(
-                            submodule.experts,
-                            mesh=expert_dp_mesh,
-                            placements=expert_placements,
-                            grad_scale=expert_grad_scale,
-                            **common_fully_shard_kwargs,
-                        )
-            dense_units = []
-            visited = set()
-
-            def collect_dense_units(submodule, inside_shortcut=False):
-                if submodule in visited:
-                    return
-                visited.add(submodule)
-
-                # Shortcut blocks call these containers through helpers, bypassing
-                # their module hooks. Still visit children that run through __call__.
-                called_via_helpers = inside_shortcut and isinstance(
+            # Pre-order: select units and their meshes before sharding any parameters.
+            dense_sharding = (dp_mesh, dense_placements, dense_grad_scale)
+            units_to_shard = {module: dense_sharding}
+            shortcut_modules = set()
+            for submodule in module.modules():
+                if isinstance(submodule, ShortcutMoEBlock):
+                    shortcut_modules.update(submodule.modules())
+                if expert_dp_mesh is not None and isinstance(submodule, MoELayer):
+                    units_to_shard[submodule.experts] = (
+                        expert_dp_mesh,
+                        expert_placements,
+                        expert_grad_scale,
+                    )
+                # These containers run through helpers inside a shortcut block.
+                if submodule in shortcut_modules and isinstance(
                     submodule, (TransformerLayer, MambaLayer, MoELayer)
-                )
-                if (
-                    submodule is not module
-                    and not called_via_helpers
-                    and isinstance(submodule, tuple(fsdp_unit_modules))
                 ):
-                    dense_units.append(submodule)
+                    continue
+                if isinstance(submodule, tuple(fsdp_unit_modules)):
+                    units_to_shard.setdefault(submodule, dense_sharding)
 
-                inside_shortcut = inside_shortcut or isinstance(submodule, ShortcutMoEBlock)
-                for child in submodule.children():
-                    collect_dense_units(child, inside_shortcut)
-
-            collect_dense_units(module)
-            for submodule in reversed(dense_units):
+            # Post-order: children claim their parameters before their parents.
+            def shard_selected_unit(submodule):
+                sharding = units_to_shard.pop(submodule, None)
+                if sharding is None:
+                    return
+                mesh, placements, grad_scale = sharding
                 if config.init_model_with_meta_device:
                     _materialize_owned_meta_modules(submodule, device)
                 fully_shard(
                     submodule,
-                    mesh=dp_mesh,
-                    placements=dense_placements,
-                    grad_scale=dense_grad_scale,
+                    mesh=mesh,
+                    placements=placements,
+                    grad_scale=grad_scale,
                     **common_fully_shard_kwargs,
                 )
-            if config.init_model_with_meta_device:
-                _materialize_owned_meta_modules(module, device)
-            fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=dense_placements,
-                grad_scale=dense_grad_scale,
-                **common_fully_shard_kwargs,
-            )
+
+            module.apply(shard_selected_unit)
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
