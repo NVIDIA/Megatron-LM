@@ -133,6 +133,39 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
         _materialize_meta_module(submodule, device)
 
 
+def _collect_fsdp_units(
+    module: nn.Module,
+    fsdp_unit_modules: tuple[Type[nn.Module], ...],
+    include_experts: bool,
+    inside_shortcut: bool = False,
+    units_to_shard: list[nn.Module] | None = None,
+) -> list[nn.Module]:
+    """Collect FSDP units in pre-order, excluding helper-invoked shortcut containers.
+
+    The initial call includes the root. Recursive calls share the output list and
+    carry the shortcut context without retaining a separate descendant collection.
+    """
+    if units_to_shard is None:
+        units_to_shard = [module]
+    # Shortcut blocks call these containers through helpers.
+    if (
+        isinstance(module, fsdp_unit_modules)
+        and not (inside_shortcut and isinstance(module, (TransformerLayer, MambaLayer, MoELayer)))
+        and module not in units_to_shard
+    ):
+        units_to_shard.append(module)
+    if include_experts and isinstance(module, MoELayer):
+        if module.experts not in units_to_shard:
+            units_to_shard.append(module.experts)
+
+    inside_shortcut = inside_shortcut or isinstance(module, ShortcutMoEBlock)
+    for child in module.children():
+        _collect_fsdp_units(
+            child, fsdp_unit_modules, include_experts, inside_shortcut, units_to_shard
+        )
+    return units_to_shard
+
+
 class FullyShardedDataParallelV1(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -720,37 +753,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = nullcontext(active_context)
         with construction_context:
             # Pre-order: collect only the modules to shard.
-            units_to_shard = [module]
+            units_to_shard = _collect_fsdp_units(
+                module, tuple(fsdp_unit_modules), include_experts=expert_dp_mesh is not None
+            )
 
-            def collect_units(submodule, inside_shortcut=False):
-                if expert_dp_mesh is not None and isinstance(submodule, MoELayer):
-                    if submodule.experts not in units_to_shard:
-                        units_to_shard.append(submodule.experts)
-                # Shortcut blocks call these containers through helpers.
-                if (
-                    isinstance(submodule, tuple(fsdp_unit_modules))
-                    and not (
-                        inside_shortcut
-                        and isinstance(submodule, (TransformerLayer, MambaLayer, MoELayer))
-                    )
-                    and submodule not in units_to_shard
-                ):
-                    units_to_shard.append(submodule)
-
-                inside_shortcut = inside_shortcut or isinstance(submodule, ShortcutMoEBlock)
-                for child in submodule.children():
-                    collect_units(child, inside_shortcut)
-
-            collect_units(module)
-
-            # Post-order: children claim their parameters before their parents.
-            def shard_selected_units(submodule, parent=None):
-                for child in submodule.children():
-                    shard_selected_units(child, submodule)
-                if submodule not in units_to_shard:
-                    return
-                units_to_shard.remove(submodule)
-                is_expert = isinstance(parent, MoELayer) and submodule is parent.experts
+            # Reverse pre-order: children claim their parameters before their parents.
+            for submodule in reversed(units_to_shard):
+                is_expert = any(
+                    isinstance(parent, MoELayer) and submodule is parent.experts
+                    for parent in module.modules()
+                )
                 if config.init_model_with_meta_device:
                     _materialize_owned_meta_modules(submodule, device)
                 fully_shard(
@@ -761,7 +773,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     **common_fully_shard_kwargs,
                 )
 
-            shard_selected_units(module)
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:

@@ -75,6 +75,7 @@ class TestMcoreMoE:
         "shortcut, custom_units, overlap, recompute_norms, wide_residual",
         [
             (False, False, False, False, False),
+            (False, True, False, False, False),
             (True, False, False, False, False),
             (True, True, False, False, False),
             (True, True, True, False, False),
@@ -86,6 +87,7 @@ class TestMcoreMoE:
         ],
         ids=[
             "standard",
+            "standard-custom-units",
             "shortcut",
             "shortcut-custom-units",
             "shortcut-custom-units-overlap",
@@ -180,13 +182,9 @@ class TestMcoreMoE:
         reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
         fsdp_unit_modules = None
         if custom_units:
-            fsdp_unit_modules = [
-                ShortcutMoEBlock,
-                TransformerLayer,
-                MoETransformerLayer,
-                MoELayer,
-                type(model.decoder.layers[0].shortcut_pre_mlp_layernorm),
-            ]
+            fsdp_unit_modules = [ShortcutMoEBlock, TransformerLayer, MoETransformerLayer, MoELayer]
+            if shortcut:
+                fsdp_unit_modules.append(type(model.decoder.layers[0].shortcut_pre_mlp_layernorm))
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
