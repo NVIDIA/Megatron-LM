@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
+import functools
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -16,7 +18,7 @@ from megatron.core.models.common.embeddings import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -139,6 +141,25 @@ def _simplified_indexer_uses_main_input_norm(config: TransformerConfig) -> bool:
     sees is the same either way.
     """
     return getattr(config, "dsa_indexer_mode", "standard") == "simplified"
+
+
+def _reuses_qkv_layernorm_output(linear_qkv, config: TransformerConfig) -> bool:
+    """Whether the indexer can take its input from the norm fused into ``linear_qkv``.
+
+    The fused QKV module then also returns the normalized activation its GEMM consumed, so the
+    indexer skips recomputing that norm. Otherwise (unfused norm, a module without the option,
+    or quantized QKV, where returning the norm output would undo TE's fused quantized norm) the
+    indexer recomputes it with ``_normalized_indexer_input``.
+    """
+    if config.experimental_attention_variant != "dsa":
+        return False
+    if not _simplified_indexer_uses_main_input_norm(config):
+        return False
+    if config.fp8 is not None or config.fp4 is not None or config.quant_recipe is not None:
+        return False
+    builder = linear_qkv.func if isinstance(linear_qkv, functools.partial) else linear_qkv
+    supports = getattr(builder, "supports_layernorm_output", None)
+    return supports is not None and supports(config)
 
 
 def _dsa_recomputes(config, module: str) -> bool:
@@ -842,7 +863,23 @@ class DSGroupedSelfAttention(SelfAttention):
 
     # The DSA core attention and its indexer are declared in dsa_layer_specs.py rather than
     # assembled here, so the composition is readable from the spec alone. This class adds only
-    # the indexer's extra forward inputs; construction is SelfAttention's unchanged.
+    # the indexer's extra forward inputs and, when the QKV norm is fused, asks linear_qkv to
+    # return that norm's output for the indexer.
+
+    def __init__(
+        self, config: TransformerConfig, submodules: SelfAttentionSubmodules, *args, **kwargs
+    ) -> None:
+        reuse_qkv_layernorm_output = _reuses_qkv_layernorm_output(submodules.linear_qkv, config)
+        if reuse_qkv_layernorm_output:
+            submodules = dataclasses.replace(
+                submodules,
+                linear_qkv=functools.partial(submodules.linear_qkv, return_layernorm_output=True),
+            )
+        super().__init__(config, submodules, *args, **kwargs)
+        self.reuse_qkv_layernorm_output = reuse_qkv_layernorm_output
+
+    def _needs_qkv_layernorm_output(self) -> bool:
+        return self.reuse_qkv_layernorm_output
 
     def _use_indexer_rope(
         self, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin
@@ -875,11 +912,17 @@ class DSGroupedSelfAttention(SelfAttention):
         rotary_pos_cos_sin,
         attn_mask_type: AttnMaskType,
         packed_seq_params: Optional[PackedSeqParams],
+        qkv_layernorm_output: Optional[torch.Tensor] = None,
     ) -> dict:
         if self.config.experimental_attention_variant != "dsa":
             return {}
         indexer_input_norm = None
-        if _simplified_indexer_uses_main_input_norm(self.config):
+        if self.reuse_qkv_layernorm_output:
+            # The fused QKV norm's output is the indexer's input: nothing left to normalize.
+            if qkv_layernorm_output is None:
+                raise RuntimeError("linear_qkv was built to return its norm output but did not.")
+            hidden_states = qkv_layernorm_output
+        elif _simplified_indexer_uses_main_input_norm(self.config):
             indexer_input_norm = _indexer_input_norm_spec(self.linear_qkv, self.config)
         return {
             "hidden_states": hidden_states,

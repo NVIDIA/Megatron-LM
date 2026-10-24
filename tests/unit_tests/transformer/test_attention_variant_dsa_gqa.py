@@ -1056,3 +1056,209 @@ def test_transformer_config_accepts_min_memory_sparse_forward_dense_loss():
 
         assert not config.dsa_fwd_use_dense_attn
         assert not config.dsa_indexer_use_sparse_loss
+
+
+def _dsa_attention_config(**overrides):
+    kwargs = dict(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=16,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="min-memory-torch",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+        add_bias_linear=False,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+    )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
+
+
+def _build_dsa_self_attention(config, stack_spec=None):
+    from megatron.core.transformer.spec_utils import build_module
+
+    stack_spec = dsa_stack_spec if stack_spec is None else stack_spec
+    spec = stack_spec.submodules.attention_layer.submodules.self_attention
+    return build_module(spec, config=config, layer_number=1).cuda()
+
+
+def _record_core_attention_inputs(module):
+    """Record the indexer inputs DSA core attention receives, then run it unchanged."""
+    records = []
+    forward = module.core_attention.forward
+
+    def _recording_forward(*args, **kwargs):
+        records.append((kwargs["hidden_states"].detach().clone(), kwargs.get("indexer_input_norm")))
+        return forward(*args, **kwargs)
+
+    module.core_attention.forward = _recording_forward
+    return records
+
+
+def test_dsa_qkv_layernorm_reuse_opt_in_rules():
+    from functools import partial
+
+    from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+        _reuses_qkv_layernorm_output,
+    )
+
+    class _Fused:
+        @classmethod
+        def supports_layernorm_output(cls, config):
+            return True
+
+    class _NoOption:
+        pass
+
+    def _config(**overrides):
+        kwargs = dict(
+            experimental_attention_variant="dsa",
+            dsa_indexer_mode="simplified",
+            fp8=None,
+            fp4=None,
+            quant_recipe=None,
+        )
+        kwargs.update(overrides)
+        return SimpleNamespace(**kwargs)
+
+    assert _reuses_qkv_layernorm_output(_Fused, _config())
+    assert _reuses_qkv_layernorm_output(partial(_Fused, stride=1), _config())
+    assert not _reuses_qkv_layernorm_output(_NoOption, _config())
+    assert not _reuses_qkv_layernorm_output(_Fused, _config(dsa_indexer_mode="standard"))
+    assert not _reuses_qkv_layernorm_output(_Fused, _config(experimental_attention_variant=None))
+    # Quantized QKV keeps TE's fused quantized norm; the indexer recomputes the norm instead.
+    assert not _reuses_qkv_layernorm_output(_Fused, _config(fp8="hybrid"))
+    assert not _reuses_qkv_layernorm_output(_Fused, _config(fp4="e2m1"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("inference_spec", [False, True])
+def test_dsa_indexer_reuses_fused_qkv_norm_output(monkeypatch, inference_spec):
+    """The reused norm output matches the recomputed indexer input, and so do the scores."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+    from megatron.core.transformer.experimental_attention_variant import dsa_gqa
+    from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import (
+        _with_dsa_gqa_attention,
+    )
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        overrides = dict(params_dtype=torch.bfloat16, bf16=True)
+        if inference_spec:
+            overrides["transformer_impl"] = "inference_optimized"
+        config = _dsa_attention_config(**overrides)
+        stack_spec = (
+            _with_dsa_gqa_attention(hybrid_inference_stack_spec) if inference_spec else None
+        )
+
+        torch.manual_seed(0)
+        reusing = _build_dsa_self_attention(config, stack_spec)
+        with monkeypatch.context() as patch:
+            patch.setattr(dsa_gqa, "_reuses_qkv_layernorm_output", lambda *args: False)
+            recomputing = _build_dsa_self_attention(config, stack_spec)
+        recomputing.load_state_dict(reusing.state_dict())
+        with torch.no_grad():
+            reusing.linear_qkv.layer_norm_weight.uniform_(0.5, 1.5)
+            recomputing.linear_qkv.layer_norm_weight.copy_(reusing.linear_qkv.layer_norm_weight)
+        assert reusing.reuse_qkv_layernorm_output and reusing.linear_qkv.return_layernorm_output
+        assert not recomputing.reuse_qkv_layernorm_output
+        assert not recomputing.linear_qkv.return_layernorm_output
+
+        reused_inputs = _record_core_attention_inputs(reusing)
+        recomputed_inputs = _record_core_attention_inputs(recomputing)
+        hidden_states = torch.randn(16, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        reusing.eval()
+        recomputing.eval()
+        with torch.no_grad():
+            reusing(hidden_states, attention_mask=None)
+            recomputing(hidden_states, attention_mask=None)
+
+        (reused, reused_norm), (raw, recomputed_norm) = reused_inputs[0], recomputed_inputs[0]
+        assert reused_norm is None and recomputed_norm is not None
+        recomputed = _simplified_indexer_input(raw, recomputed_norm)
+        torch.testing.assert_close(reused, recomputed)
+
+        indexer = reusing.core_attention.indexer
+        with torch.no_grad():
+            reused_q, reused_k = indexer.forward_qk(reused, use_rope=False)
+            recomputed_q, recomputed_k = indexer.forward_qk(recomputed, use_rope=False)
+        torch.testing.assert_close(
+            _simplified_index_scores(reused_q, reused_k, indexer.softmax_scale),
+            _simplified_index_scores(recomputed_q, recomputed_k, indexer.softmax_scale),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dsa_qkv_layernorm_reuse_keeps_main_path_gradients(monkeypatch):
+    """Training: the detached indexer input leaves the attention path's gradients unchanged."""
+    from megatron.core.transformer.experimental_attention_variant import dsa_gqa
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = _dsa_attention_config()
+        torch.manual_seed(0)
+        reusing = _build_dsa_self_attention(config)
+        with monkeypatch.context() as patch:
+            patch.setattr(dsa_gqa, "_reuses_qkv_layernorm_output", lambda *args: False)
+            recomputing = _build_dsa_self_attention(config)
+        recomputing.load_state_dict(reusing.state_dict())
+        assert reusing.reuse_qkv_layernorm_output
+
+        hidden_states = torch.randn(16, 2, config.hidden_size, device="cuda")
+        grads = []
+        for module in (reusing, recomputing):
+            module.train()
+            inputs = hidden_states.clone().requires_grad_(True)
+            output, _ = module(inputs, attention_mask=None)
+            output.float().square().sum().backward()
+            grads.append(
+                (
+                    inputs.grad,
+                    module.linear_qkv.weight.grad,
+                    module.linear_qkv.layer_norm_weight.grad,
+                )
+            )
+        for reused_grad, recomputed_grad in zip(*grads):
+            assert reused_grad is not None and torch.isfinite(reused_grad).all()
+            torch.testing.assert_close(reused_grad, recomputed_grad, atol=1e-4, rtol=1e-4)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_non_dsa_self_attention_does_not_request_the_qkv_norm_output():
+    from megatron.core.transformer.spec_utils import build_module
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_query_groups=1,
+            kv_channels=16,
+            add_bias_linear=False,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+        )
+        spec = hybrid_stack_spec.submodules.attention_layer.submodules.self_attention
+        module = build_module(spec, config=config, layer_number=1).cuda()
+        assert not module._needs_qkv_layernorm_output()
+        assert not module.linear_qkv.return_layernorm_output
+        hidden_states = torch.randn(16, 2, config.hidden_size, device="cuda")
+        assert len(module.linear_qkv(hidden_states)) == 2
+        assert len(module.get_query_key_value_tensors(hidden_states)) == 3
+    finally:
+        Utils.destroy_model_parallel()

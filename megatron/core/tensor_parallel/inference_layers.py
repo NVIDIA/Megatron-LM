@@ -148,6 +148,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        return_layernorm_output: bool = False,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -165,9 +166,18 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             tp_group=tp_group,
             name=name,
             pg_collection=pg_collection,
+            return_layernorm_output=return_layernorm_output,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
+        if return_layernorm_output and self.tp_size > 1:
+            # With TP > 1 the normalized input is all-gathered into a reused symmetric buffer
+            # (or arrives pre-normalized from the fused reduce-scatter), so there is no local
+            # normalized activation to return.
+            raise NotImplementedError(
+                "return_layernorm_output with --transformer-impl=inference_optimized requires "
+                "tensor_model_parallel_size == 1."
+            )
 
         assert (
             output_size % self.tp_size == 0
@@ -193,6 +203,11 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
+
+    @classmethod
+    def supports_layernorm_output(cls, config: TransformerConfig) -> bool:
+        """Whether ``return_layernorm_output=True`` is supported: only without TP sharding."""
+        return config.tensor_model_parallel_size == 1
 
     def set_barrier_before_all_gather(self, value: bool = True) -> None:
         """Request a barrier before this layer's input all-gather reuses the buffer.
@@ -243,9 +258,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
             return x
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+    def forward(self, x: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         """
         Forward pass.
+
+        Returns ``(output, None)``, or ``(output, None, layernorm_output)`` when built with
+        ``return_layernorm_output``, matching TELayerNormColumnParallelLinear.
         """
         # Necessary conditions to ensure we are executing the fused rs-add-rmsnorm-ag
         # in the preceeding RowParallelLinear layer.
@@ -258,6 +276,8 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         if self.tp_size == 1:
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            if self.return_layernorm_output:
+                return _apply_linear(x, self.weight, self.config), None, x
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 
