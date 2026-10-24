@@ -1052,6 +1052,15 @@ class TransformerConfig(ModelParallelConfig):
     ``moe_use_grouped_tensor=True`` to use its CUDA-graph-safe GroupedTensor path.
     """
 
+    moe_use_torch_grouped_wgrad: bool = False
+    """Use PyTorch grouped weight gradients for eligible eager SM90 BF16 TE experts.
+
+    Forward and input gradients continue to use TE grouped GEMM. Unsupported cases,
+    including FP8/FP4, bias, gradient-accumulation fusion, delayed weight gradients,
+    CPU offload, grouped parameter storage, expert TP/GTP, and CUDA graphs, use the
+    original TE implementation. Requires a PyTorch grouped-matmul operator (2.9+).
+    """
+
     moe_use_grouped_tensor: bool = False
     """Use Transformer Engine's native GroupedTensor path for grouped MoE GEMMs.
 

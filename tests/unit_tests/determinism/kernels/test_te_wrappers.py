@@ -230,6 +230,41 @@ class TestTEWrappers:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    def test_te_grouped_linear_torch_wgrad_replays(self):
+        """Replay the opt-in Megatron wrapper, including all expert gradients."""
+        if torch.cuda.get_device_capability() != (9, 0):
+            pytest.skip("torch grouped wgrad currently targets SM90")
+        if not (hasattr(torch, "_grouped_mm") or hasattr(torch.nn.functional, "grouped_mm")):
+            pytest.skip("requires a grouped matmul operator")
+        module = TEGroupedLinear(
+            4,
+            64,
+            128,
+            parallel_mode="column",
+            config=_config(
+                hidden_size=64,
+                ffn_hidden_size=128,
+                num_attention_heads=4,
+                num_query_groups=4,
+                kv_channels=16,
+                num_moe_experts=4,
+                moe_grouped_gemm=True,
+                moe_use_torch_grouped_wgrad=True,
+                gradient_accumulation_fusion=False,
+            ),
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        seeded()
+        inputs = {
+            "x": torch.randn(147, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True),
+            "m_splits": torch.tensor([0, 1, 17, 129]),
+        }
+        assert_module_replays_bit_exact(module, inputs, contention=True, what="TE torch grouped dW")
+
     def test_te_column_parallel_linear_replays(self):
         seeded()
         module = TEColumnParallelLinear(
