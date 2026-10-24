@@ -1059,7 +1059,9 @@ class TestNVLSAllGatherVDispatcher:
         finalize), the fused FC2-input quantization uses approximate reciprocals regardless
         of FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH, and the GEMMs differ in rounding of the
         FC1 output and accumulation order.
-        Until those are aligned the exact comparison is an expected failure.
+        Until those are aligned the exact comparison is an expected failure;
+        ``test_flashinfer_value_pass_matches_generation`` reaches bitwise parity by
+        running the generation kernel in the training forward instead.
         """
         from megatron.core import fp4_utils
         from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -1152,6 +1154,124 @@ class TestNVLSAllGatherVDispatcher:
             base_local_tokens=500,
             outlier_tokens=True,
         )
+
+    @pytest.mark.parametrize("recipe", ["nvfp4-squared_relu", "nvfp4-swiglu", "mxfp8"])
+    def test_flashinfer_value_pass_matches_generation(self, monkeypatch, recipe):
+        """``moe_inference_training_forward`` makes training equal FlashInfer generation.
+
+        The FlashInfer routed kernels cannot match TE training (see the expected failure
+        above for NVFP4), so the training forward runs the generation kernel instead, on
+        weights rebuilt from the parameters, and TE's recompute supplies the backward.
+        The training layer keeps its own router and reaches generation's dispatcher and
+        kernel through the value pass; the forward must equal generation bitwise.
+        """
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.inference import utils as inference_utils
+        from megatron.core.inference.moe.flashinfer_mxfp8 import HAVE_FLASHINFER_ROUTED_MXFP8
+        from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        mxfp8 = recipe == "mxfp8"
+        if mxfp8:
+            if torch.cuda.get_device_capability()[0] != 10:
+                pytest.skip("FlashInfer routed MXFP8 MoE requires SM100/SM103")
+            if not HAVE_FLASHINFER_ROUTED_MXFP8:
+                pytest.skip("FlashInfer routed MXFP8 MoE is unavailable")
+            # Routed MXFP8 JIT-compiles without flashinfer-jit-cache; the layer's check
+            # only guards production against the compile time.
+            monkeypatch.setattr(
+                inference_utils, "check_flashinfer_jit_cache_installed", lambda **_: None
+            )
+            recipe_overrides = dict(
+                fp8="hybrid", fp8_recipe="mxfp8", fp8_param=True, use_cpu_initialization=False
+            )
+        else:
+            _skip_unless_flashinfer_nvfp4()
+            recipe_overrides = dict(
+                inference_moe_nvfp4_recipe="per_token",
+                **_NVFP4_ACTIVATIONS[recipe.removeprefix("nvfp4-")],
+            )
+        if Utils.world_size < 2:
+            pytest.skip("NVLS batch-invariant MoE requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+
+        torch.manual_seed(2029)
+        torch.cuda.manual_seed(2029)
+        common = dict(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+            # Local CUDA graphs disable MoE recompute, which the value pass needs.
+            cuda_graph_impl="none",
+            inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+            **recipe_overrides,
+        )
+        config = _make_base_config(**common)
+        training_config = _make_base_config(
+            **common,
+            moe_inference_training_forward=True,
+            recompute_granularity="selective",
+            recompute_modules=["moe"],
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+        )
+
+        def _fp8_context(layer_config, is_init=False):
+            if not mxfp8:
+                return contextlib.nullcontext()
+            return get_fp8_context(layer_config, 0, is_init=is_init)
+
+        with _fp8_context(config, is_init=True):
+            layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        with _fp8_context(training_config, is_init=True):
+            training_layer = (
+                get_inference_optimized_moe_spec()(config=training_config).cuda().eval()
+            )
+        training_layer.load_state_dict(layer.state_dict())
+        if mxfp8:
+            quantize_model_to_mxfp8(layer, backend="triton")
+
+        value_passes = {"value": 0}
+        orig_value_pass = training_layer.experts._inference_training_forward_pass
+
+        def _tracked_value_pass(*args, **kwargs):
+            value_passes["value"] += 1
+            return orig_value_pass(*args, **kwargs)
+
+        monkeypatch.setattr(
+            training_layer.experts, "_inference_training_forward_pass", _tracked_value_pass
+        )
+
+        local_tokens = 17 + torch.distributed.get_rank()
+        hidden_states = torch.randn(
+            local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+            with _fp8_context(config), InferenceMode.active():
+                inference_output, _ = layer(hidden_states.clone())
+            with _fp8_context(training_config):
+                training_output, _ = training_layer(hidden_states.clone())
+
+        assert value_passes["value"] == 1, "training did not run the FlashInfer value pass"
+        torch.testing.assert_close(training_output, inference_output, atol=0, rtol=0)
 
 
 # ──────────────────────────────────────────────────────────────────────

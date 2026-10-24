@@ -30,7 +30,11 @@ from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_qui
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
-from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+from megatron.core.inference.quantization.utils import (
+    _has_mxfp8_storage,
+    _to_bf16,
+    resolve_mxfp8_backend,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -1406,6 +1410,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
+        self._inference_training_forward = config.moe_inference_training_forward
+        # Driven by MoELayer, which owns the distinction between the pass that
+        # produces the layer output and the recompute pass that builds the
+        # backward graph. See MoELayer._inference_pass_is_value.
+        self._in_inference_recompute = False
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1494,6 +1503,63 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     )
             q_list.append(mxfp8.data)
             s_list.append(mxfp8.scale)
+        return MXFP8Tensor(
+            data=torch.stack(q_list, dim=0).contiguous(),
+            scale=torch.stack(s_list, dim=0).contiguous(),
+            dtype=source_dtype,
+            backend=backend,
+        )
+
+    def _expert_params_use_te_mxfp8(self) -> bool:
+        """Whether the live expert parameters carry TE MXFP8 storage.
+
+        The training counterpart of :meth:`_expert_weights_use_mxfp8`, which
+        looks for MCore ``MXFP8Tensor``. A training process never has those:
+        ``quantize_model_to_mxfp8`` is what produces them and it deletes the
+        ``nn.Parameter`` it replaces, so it only runs on an inference model that
+        will never see an optimizer. Training instead holds TE's own MXFP8
+        parameters, which is what this detects.
+        """
+        return InferenceGroupedMLP._require_uniform_weight_format(
+            (
+                _has_mxfp8_storage(getattr(getattr(self, linear_name), f"weight{expert_index}"))
+                for linear_name, _ in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS
+                for expert_index in range(self.num_local_experts)
+            ),
+            "MXFP8",
+        )
+
+    def _mxfp8_training_stack(self, linear_name: str, backend: str) -> MXFP8Tensor:
+        """Quantize the live expert parameters into generation's stacked layout.
+
+        Re-derived every forward rather than built once, because unlike the BF16
+        and inference MXFP8 stacks this is not a view of the parameters: MXFP8
+        storage is a lossy function of them, so a cached copy goes stale the
+        moment the optimizer steps and the kernel would read last step's weights
+        while reporting nothing.
+
+        Bitwise agreement with generation rests on taking the same route to the
+        same bits. ``quantize_model_to_mxfp8`` dequantizes TE storage to BF16
+        and re-quantizes with ``MXFP8Tensor.from_bf16``; ``_to_bf16`` and the
+        call below are that same pair, on the same weights, with the backend
+        ``resolve_mxfp8_backend`` picks for this grouped-GEMM backend.
+
+        Quantization is per expert, matching generation, which quantizes one
+        parameter at a time before stacking. Batching it into a single call
+        would be cheaper and the 32-element blocks do not cross rows, so it
+        should be bit-identical -- but the scale layout is swizzled, and
+        reshaping a swizzled scale is not a view. Left per expert until a test
+        pins the batched form.
+        """
+        linear = getattr(self, linear_name)
+        q_list, s_list = [], []
+        source_dtype: torch.dtype | None = None
+        for i in range(self.num_local_experts):
+            bf16 = _to_bf16(getattr(linear, f'weight{i}'))
+            source_dtype = source_dtype or bf16.dtype
+            quantized = MXFP8Tensor.from_bf16(bf16, backend=backend)
+            q_list.append(quantized.data)
+            s_list.append(quantized.scale)
         return MXFP8Tensor(
             data=torch.stack(q_list, dim=0).contiguous(),
             scale=torch.stack(s_list, dim=0).contiguous(),
@@ -1608,6 +1674,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
         prepare_routed_nvfp4_weights(self._fc1_weight, self._fc2_weight, out=self._nvfp4_weights)
         return True
 
+    def refresh_cache(self) -> None:
+        """Requantize the per-token NVFP4 expert weights after a refit.
+
+        Refit writes the BF16 stacks, so without this the NVFP4 kernel keeps
+        serving the weights quantized at the first forward.
+        """
+        super().refresh_cache()
+        if self.refresh_flashinfer_nvfp4_weights():
+            # Requantization is asynchronous. Synchronize before another stream replays
+            # graphs that read these derived weight buffers.
+            torch.cuda.synchronize()
+
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
@@ -1662,31 +1740,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
             "inference_grouped_gemm_backend=vllm or torch."
         )
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
-        if self._uses_mxfp8_weights:
-            output = flashinfer_routed_mxfp8_moe(
+        if self._uses_mxfp8_weights or self._nvfp4_weights is not None:
+            output = self._flashinfer_routed_forward(
                 hidden_states,
                 routing_map,
                 probs,
-                self._fc1_weight,
-                self._fc2_weight,
-                num_experts=self.num_local_experts * self.ep_group.size(),
-                local_expert_offset=self.ep_group.rank() * self.num_local_experts,
-                activation_type=self._flashinfer_activation_type.value,
-                out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
-                token_capacity=self._flashinfer_mxfp8_token_capacity,
-                use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
-            )
-            return output, None
-        if self._nvfp4_weights is not None:
-            output = flashinfer_routed_nvfp4_moe(
-                hidden_states,
-                routing_map,
-                probs,
-                self._nvfp4_weights,
-                num_experts=self.num_local_experts * self.ep_group.size(),
-                local_expert_offset=self.ep_group.rank() * self.num_local_experts,
-                activation_type=self._flashinfer_activation_type.value,
-                out=(NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None),
+                mxfp8_weights=(
+                    (self._fc1_weight, self._fc2_weight) if self._uses_mxfp8_weights else None
+                ),
+                nvfp4_weights=self._nvfp4_weights,
                 token_capacity=self._flashinfer_mxfp8_token_capacity,
                 use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
             )
@@ -1708,6 +1770,59 @@ class InferenceGroupedMLP(TEGroupedMLP):
             output=None,
         )[0]
         return output, None
+
+    def _flashinfer_routed_forward(
+        self,
+        hidden_states,
+        routing_map,
+        probs,
+        *,
+        mxfp8_weights=None,
+        nvfp4_weights=None,
+        token_capacity=None,
+        use_bounded_rows=False,
+    ):
+        """Run the routed MXFP8 or per-token NVFP4 FlashInfer MoE on the given weights.
+
+        Shared by generation and the training value pass so that both feed the
+        kernel the same routing. The kernels sum each token's routes in the order
+        of its top-k entries, and float addition is not associative, so the
+        entries are sorted by expert id first: generation's router lists them by
+        probability and the training router's map by expert id, which would
+        otherwise differ in the last bit.
+        """
+        routing_map, order = routing_map.sort(dim=-1)
+        probs = probs.gather(-1, order)
+        num_experts = self.num_local_experts * self.ep_group.size()
+        local_expert_offset = self.ep_group.rank() * self.num_local_experts
+        out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        if mxfp8_weights is not None:
+            fc1_weight, fc2_weight = mxfp8_weights
+            return flashinfer_routed_mxfp8_moe(
+                hidden_states,
+                routing_map,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                num_experts=num_experts,
+                local_expert_offset=local_expert_offset,
+                activation_type=self._flashinfer_activation_type.value,
+                out=out,
+                token_capacity=token_capacity,
+                use_bounded_rows=use_bounded_rows,
+            )
+        return flashinfer_routed_nvfp4_moe(
+            hidden_states,
+            routing_map,
+            probs,
+            nvfp4_weights,
+            num_experts=num_experts,
+            local_expert_offset=local_expert_offset,
+            activation_type=self._flashinfer_activation_type.value,
+            out=out,
+            token_capacity=token_capacity,
+            use_bounded_rows=use_bounded_rows,
+        )
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
@@ -1747,6 +1862,79 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _dense_routing_to_topk(self, routing_map, probs):
+        """Convert the training router's dense outputs to the inference kernels' topk form.
+
+        InferenceTopKRouter returns ``[tokens, topk]`` expert indices only while
+        InferenceMode is active; in training it defers to TopKRouter, which
+        returns a boolean ``[tokens, num_experts]`` map alongside dense probs.
+        The inference kernels take indices, so convert.
+
+        The selection is read from the map rather than from the top probabilities,
+        because expert_bias and group_topk choose experts on adjusted scores and
+        those need not be the largest entries of ``probs``. Ties in the boolean
+        map resolve to ascending expert id, which keeps the order deterministic.
+        """
+        if routing_map.dtype != torch.bool:
+            return routing_map, probs
+        topk = self.config.moe_router_topk
+        indices = routing_map.to(torch.uint8).topk(topk, dim=-1).indices
+        return indices, probs.gather(1, indices)
+
+    def _inference_training_forward_pass(self, hidden_states, probs, routing_map):
+        """Run generation's FlashInfer expert kernel as the training value pass.
+
+        The kernel reads a derived copy of the expert weights rather than a view of
+        the parameters: Major-K-shuffled MXFP8 repacked from TE's MXFP8 storage, or
+        NVFP4 quantized from the BF16 parameters. The copy is rebuilt from the live
+        parameters on every call and not kept, because a cached one would serve the
+        weights from before the last optimizer step and still produce a plausible
+        number.
+
+        The weights take the same route to the same bits as generation's. MXFP8:
+        dequantize TE storage and requantize with ``MXFP8Tensor.from_bf16``, as
+        ``quantize_model_to_mxfp8`` does at load, then repack. NVFP4: quantize the
+        BF16 stacks with ``prepare_routed_nvfp4_weights``, as the first inference
+        forward does.
+        """
+        assert routing_map is not None, "routing_map is required for the training forward."
+        routing_map, probs = self._dense_routing_to_topk(routing_map, probs)
+        mxfp8_weights = nvfp4_weights = None
+        with torch.no_grad():
+            if self._nvfp4_recipe is not None:
+                nvfp4_weights = prepare_routed_nvfp4_weights(
+                    *(
+                        torch.stack(
+                            [
+                                getattr(getattr(self, linear_name), f"weight{i}").detach()
+                                for i in range(self.num_local_experts)
+                            ]
+                        )
+                        for linear_name, _ in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS
+                    )
+                )
+            else:
+                if not self._expert_params_use_te_mxfp8():
+                    raise RuntimeError(
+                        "moe_inference_training_forward runs the FlashInfer routed MXFP8 or "
+                        "per-token NVFP4 kernel, but this MoE layer's expert weights are BF16. "
+                        "Select both expert projections of every MoE layer in the TE MXFP8 "
+                        "precision recipe, or set inference_moe_nvfp4_recipe."
+                    )
+                backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
+                mxfp8_weights = tuple(
+                    prepare_routed_mxfp8_weights(self._mxfp8_training_stack(linear_name, backend))
+                    for linear_name, _ in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS
+                )
+        output = self._flashinfer_routed_forward(
+            hidden_states,
+            routing_map,
+            probs,
+            mxfp8_weights=mxfp8_weights,
+            nvfp4_weights=nvfp4_weights,
+        )
+        return output, None
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -1756,7 +1944,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass with backend-selected inference grouped GEMMs:
 
-        - Training: delegates to parent TEGroupedMLP.
+        - Training: delegates to parent TEGroupedMLP, except that with
+          ``moe_inference_training_forward`` the value pass runs the inference
+          kernel and only the recompute pass takes the TE path.
         - Inference + FlashInfer: fused BF16 or routed MXFP8 MoE. tokens_per_expert
           is not used in this path; the FlashInfer kernels operate directly on routing_map.
         - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
@@ -1773,9 +1963,26 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
 
         if not InferenceMode.is_active():
-            assert (
-                not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
-            ), "MXFP8 inference optimized is not compatible with training / colocated RL."
+            # Train/generation parity mode: the value-producing forward runs the
+            # same kernel generation uses, while the recompute pass takes the TE
+            # path to build the backward graph.
+            if self._inference_training_forward:
+                if not self._in_inference_recompute:
+                    return self._inference_training_forward_pass(
+                        permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+                    )
+            else:
+                # What this rejects is the *inference* MXFP8 representation,
+                # which quantize_model_to_mxfp8 installs by deleting the
+                # nn.Parameter it replaces -- fine for a model that will never
+                # see an optimizer, fatal for one that will. Parity mode never
+                # installs it: the value pass quantizes into a scratch stack and
+                # leaves the parameters alone, and the recompute pass below runs
+                # TE, which owns its own MXFP8. So the exemption covers both of
+                # its passes, not just the one that returned above.
+                assert (
+                    not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
+                ), "MXFP8 inference optimized is not compatible with training / colocated RL."
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
