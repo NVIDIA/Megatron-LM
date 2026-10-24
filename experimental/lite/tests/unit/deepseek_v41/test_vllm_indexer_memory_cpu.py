@@ -17,7 +17,9 @@ def test_indexer_diagnostics_are_lazy_and_preserve_topk(monkeypatch):
     w = torch.ones(4, 32)
     keys = (torch.zeros(4, 64, dtype=torch.uint8), torch.zeros(4, 4, dtype=torch.uint8))
 
-    def topk(values, starts, ends, out, *args):
+    def topk(values, starts, ends, out, *args, zero_starts=False):
+        # Rows are local to each logits chunk; DeepSelect needs that promise.
+        assert zero_starts
         assert torch.equal(values, logits[ends.long() - 1])
         out[:, :2] = values.topk(2).indices
 
