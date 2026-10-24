@@ -719,44 +719,41 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            # Pre-order: select units and their meshes before sharding any parameters.
-            dense_sharding = (dp_mesh, dense_placements, dense_grad_scale)
-            units_to_shard = {module: dense_sharding}
+            # Pre-order: collect only the modules to shard.
+            units_to_shard = {module}
             shortcut_modules = set()
             for submodule in module.modules():
                 if isinstance(submodule, ShortcutMoEBlock):
                     shortcut_modules.update(submodule.modules())
                 if expert_dp_mesh is not None and isinstance(submodule, MoELayer):
-                    units_to_shard[submodule.experts] = (
-                        expert_dp_mesh,
-                        expert_placements,
-                        expert_grad_scale,
-                    )
+                    units_to_shard.add(submodule.experts)
                 # These containers run through helpers inside a shortcut block.
                 if submodule in shortcut_modules and isinstance(
                     submodule, (TransformerLayer, MambaLayer, MoELayer)
                 ):
                     continue
                 if isinstance(submodule, tuple(fsdp_unit_modules)):
-                    units_to_shard.setdefault(submodule, dense_sharding)
+                    units_to_shard.add(submodule)
 
             # Post-order: children claim their parameters before their parents.
-            def shard_selected_unit(submodule):
-                sharding = units_to_shard.pop(submodule, None)
-                if sharding is None:
+            def shard_selected_units(submodule, parent=None):
+                for child in submodule.children():
+                    shard_selected_units(child, submodule)
+                if submodule not in units_to_shard:
                     return
-                mesh, placements, grad_scale = sharding
+                units_to_shard.remove(submodule)
+                is_expert = isinstance(parent, MoELayer) and submodule is parent.experts
                 if config.init_model_with_meta_device:
                     _materialize_owned_meta_modules(submodule, device)
                 fully_shard(
                     submodule,
-                    mesh=mesh,
-                    placements=placements,
-                    grad_scale=grad_scale,
+                    mesh=expert_dp_mesh if is_expert else dp_mesh,
+                    placements=expert_placements if is_expert else dense_placements,
+                    grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
                     **common_fully_shard_kwargs,
                 )
 
-            module.apply(shard_selected_unit)
+            shard_selected_units(module)
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
