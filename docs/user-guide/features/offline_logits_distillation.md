@@ -118,8 +118,10 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
 
 ## Assumptions and Restrictions
 
-- The student run must use the **same random seed and data pipeline** as the teacher run
-  that produced the cached log-probs, so the global sample ordering matches.
+- The student run must use the **same data seed and data pipeline** as the teacher run
+  that produced the cached log-probs, so the global sample ordering matches. Set the same
+  `--data-seed` in both runs to vary their model `--seed` independently; without
+  `--data-seed`, the data seed defaults to `--seed`.
 - Teacher data must be saved with payload `format_version >= 2` for full DP/MBS/GBS
   resharding support. Older `format_version == 1` shards are still readable but are
   restricted to DP-only resharding, via a legacy reader slated for removal once existing

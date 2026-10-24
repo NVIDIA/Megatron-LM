@@ -298,7 +298,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
             train_samples = int(train_iters) * int(global_batch_size)
 
     identifiers = OrderedDict()
-    identifiers["seed"] = cfg.rng.seed
+    identifiers["seed"] = cfg.rng.effective_data_seed
     identifiers["train_samples"] = train_samples
     identifiers["blend"] = _blend_identifiers(args)
 
