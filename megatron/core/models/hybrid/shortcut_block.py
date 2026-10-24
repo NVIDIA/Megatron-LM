@@ -32,7 +32,7 @@ from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequ
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualRead
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
 
 # Layer symbols that may precede a shortcut MoE
