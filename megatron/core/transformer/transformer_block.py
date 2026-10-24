@@ -3,7 +3,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Set, Union, cast
+from typing import Dict, List, Optional, Set, Union, cast
 
 import torch
 from torch import Tensor
@@ -38,7 +38,7 @@ from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
-from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.utils import sharded_state_dict_default, validate_extra_layer_kwargs
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -537,6 +537,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
         *,
+        extra_layer_kwargs: Optional[Dict[str, Optional[Tensor]]] = None,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
     ):
@@ -575,6 +576,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
+            extra_layer_kwargs (Dict[str, Optional[Tensor]], optional): Extra keyword
+                arguments forwarded unchanged to every layer, e.g. a conditioning
+                embedding for DiT/AdaLN-style layers. Values must be Tensors or None.
+                The key set should be stable for a given model forward path, while the
+                Tensor values may change per microbatch. Under full activation recompute,
+                Tensor values are passed as checkpoint inputs so their gradients are
+                preserved. None (default) keeps the existing behavior.
 
         Returns:
             Union[Tensor, Tuple[Tensor, List[Tensor]]]:
@@ -586,6 +594,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                   corresponding to hidden states after each layer in
                   extract_layer_indices.
         """
+        extra_layer_kwargs = validate_extra_layer_kwargs(extra_layer_kwargs)
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Remove 'dynamic_inference_decode_only' from kwargs if present
@@ -704,6 +713,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    extra_layer_kwargs=extra_layer_kwargs,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -740,7 +750,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # manager actually exists. Plain TransformerLayer (and its
                     # MoETransformerLayer subclass) doesn't accept this kwarg, and
                     # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
-                    extra_layer_kwargs = (
+                    mhc_kwargs = (
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
                     with self.offload_context, inner_quantization_context:
@@ -758,6 +768,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            **mhc_kwargs,
                             **extra_layer_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)

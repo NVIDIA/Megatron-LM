@@ -604,6 +604,32 @@ def is_layer_window_attention(
     )
 
 
+def validate_extra_layer_kwargs(
+    extra_layer_kwargs: Optional[Dict[str, Optional[torch.Tensor]]],
+) -> Dict[str, Optional[torch.Tensor]]:
+    """Validate extra kwargs that a transformer block forwards to every layer.
+
+    Keys must be str and values must be Tensors or None. Returns an empty dict when
+    given None. Keys colliding with block-provided kwargs raise TypeError at the
+    layer call.
+    """
+    if extra_layer_kwargs is None:
+        return {}
+    if not isinstance(extra_layer_kwargs, dict):
+        raise TypeError(
+            f"extra_layer_kwargs must be a dict, got {type(extra_layer_kwargs).__name__}"
+        )
+    for key, value in extra_layer_kwargs.items():
+        if not isinstance(key, str):
+            raise TypeError(f"extra_layer_kwargs keys must be str, got {type(key).__name__}")
+        if value is not None and not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"extra_layer_kwargs['{key}'] must be a torch.Tensor or None, "
+                f"got {type(value).__name__}"
+            )
+    return extra_layer_kwargs
+
+
 def precision_aware_checkpoint(
     function: Callable[..., Any],
     config: 'TransformerConfig',
