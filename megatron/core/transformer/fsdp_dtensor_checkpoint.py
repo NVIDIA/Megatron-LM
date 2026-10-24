@@ -555,6 +555,113 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     return model_state_dict, optimizer_state_dict
 
 
+def handle_mamba_in_state_dict(
+    model, model_state_dict, optimizer_state_dict, *, checkpoint_metadata=None
+):
+    """Expose Mamba's fused weights and Adam moments in the component checkpoint layout.
+
+    Match ``MambaMixer.sharded_state_dict``: the input projection contains
+    ``z/x/B/C/dt`` and the convolution contains ``x/B/C``. Returned sections alias
+    the original FSDP storage, so the same transformation supports save and load.
+    Convolution checkpoint names remain stable across the move from a ``conv1d``
+    submodule to direct ``conv1d_weight`` / ``conv1d_bias`` parameters.
+    On load, ``checkpoint_metadata`` is DCP's ``state_dict_metadata`` mapping.
+    Preserve fused keys found there for older native FSDP checkpoints; new saves
+    always use the component layout. Legacy fused loading retains its original
+    TP layout requirements and does not make cross-TP resharding safe.
+    """
+    from megatron.core.ssm.mamba_mixer import MambaMixer
+
+    splits = {}
+    for path, module in model.named_modules():
+        if not isinstance(module, MambaMixer):
+            continue
+        prefix = _strip_wrapper_prefixes(path)
+        prefix = f"{prefix}." if prefix else ""
+        conv_sizes = [
+            module.d_inner,
+            module.ngroups * module.d_state,
+            module.ngroups * module.d_state,
+        ]
+        splits[f"{prefix}in_proj.weight"] = (
+            f"{prefix}in_proj.weight",
+            [module.d_inner, *conv_sizes, module.nheads],
+            ["z", "x", "B", "C", "dt"],
+        )
+        for leaf in ("weight", "bias"):
+            # Only the live parameter spelling is registered; disk keys always use a dot.
+            name = f"conv1d_{leaf}" if hasattr(module, f"conv1d_{leaf}") else f"conv1d.{leaf}"
+            splits[f"{prefix}{name}"] = (f"{prefix}conv1d.{leaf}", conv_sizes, ["x", "B", "C"])
+
+    if not splits:
+        return model_state_dict, optimizer_state_dict
+
+    if checkpoint_metadata is not None:
+        legacy_keys = {
+            _strip_wrapper_prefixes(key)
+            for key in model_state_dict
+            if f"model.{key}" in checkpoint_metadata
+        }
+        splits = {key: spec for key, spec in splits.items() if key not in legacy_keys}
+        if not splits:
+            return model_state_dict, optimizer_state_dict
+
+    parameters = {
+        _strip_wrapper_prefixes(name): parameter for name, parameter in model.named_parameters()
+    }
+
+    def sections(key, data):
+        normalized = _strip_wrapper_prefixes(key)
+        checkpoint_key, sizes, names = splits[normalized]
+        wrapper = key[: len(key) - len(normalized)]
+        tensors = split_fused_fsdp_param(data, parameters[normalized], sizes)
+        return {f"{wrapper}{checkpoint_key}.{name}": tensor for name, tensor in zip(names, tensors)}
+
+    model_state_dict = model_state_dict.copy()
+    for key in list(model_state_dict):
+        if _strip_wrapper_prefixes(key) in splits:
+            model_state_dict.update(sections(key, model_state_dict.pop(key)))
+
+    if optimizer_state_dict is not None:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        states = {}
+        for key, state in optimizer_state_dict.get("state", {}).items():
+            if _strip_wrapper_prefixes(key) not in splits:
+                states[key] = state
+                continue
+            # Scalar metadata (e.g. step) is shared; tensor moments must use the
+            # same component views as the parameter, including for AMSGrad.
+            normalized = _strip_wrapper_prefixes(key)
+            checkpoint_key, _, names = splits[normalized]
+            wrapper = key[: len(key) - len(normalized)]
+            for name in names:
+                states[f"{wrapper}{checkpoint_key}.{name}"] = state.copy()
+            for moment in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                if moment not in state:
+                    continue
+                for component_key, tensor in sections(key, state[moment]).items():
+                    states[component_key][moment] = tensor
+        optimizer_state_dict["state"] = states
+
+        # Converted checkpoints associate group metadata with component names too.
+        # Keep the group dictionaries shared with the raw loading template so DCP
+        # restores learning rates/step counters before the fused optimizer reload.
+        if "param_to_group_meta" in optimizer_state_dict:
+            groups = {}
+            for key, group in optimizer_state_dict["param_to_group_meta"].items():
+                normalized = _strip_wrapper_prefixes(key)
+                if normalized not in splits:
+                    groups[key] = group
+                    continue
+                checkpoint_key, _, names = splits[normalized]
+                wrapper = key[: len(key) - len(normalized)]
+                for name in names:
+                    groups[f"{wrapper}{checkpoint_key}.{name}"] = group
+            optimizer_state_dict["param_to_group_meta"] = groups
+
+    return model_state_dict, optimizer_state_dict
+
+
 def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False, split_dim=0):
     """Split a fused Megatron-FSDP parameter along ``split_dim`` into per-section DTensors.
 
