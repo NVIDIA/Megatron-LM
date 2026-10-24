@@ -79,6 +79,7 @@ main() {
 
     # Install Python
     apt-get update
+    apt-get install -y --no-install-recommends ca-certificates
     apt-get install -y software-properties-common
     add-apt-repository ppa:deadsnakes/ppa -y
     apt-get install -y python$PYTHON_VERSION-dev python$PYTHON_VERSION-venv
@@ -136,7 +137,7 @@ main() {
         fi
     
         # Install uv
-        UV_VERSION="0.7.2"
+        UV_VERSION="0.13.5"
         curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 
         # Create virtual environment and install dependencies
