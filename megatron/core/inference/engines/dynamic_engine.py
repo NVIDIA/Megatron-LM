@@ -1035,7 +1035,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self._has_deferred_image_encodes = False
             return
         try:
-            self._encode_deferred_requests(deferred)
+            self._encode_deferred_image_requests(deferred)
         finally:
             # Anything still waiting without embeddings (after an exception above, or a
             # request failed further down) is picked up by the next pass.
@@ -1044,7 +1044,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 for request in deferred
             )
 
-    def _encode_deferred_requests(self, deferred: List[DynamicVLMInferenceRequest]) -> None:
+    def _encode_deferred_image_requests(self, deferred: List[DynamicVLMInferenceRequest]) -> None:
         """Encode, register or fail the given waiting requests (see _encode_waiting_images)."""
         encoded: Dict[int, Tensor] = {}
         failed: Dict[int, Exception] = {}
