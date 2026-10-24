@@ -39,6 +39,40 @@ except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
 
 
+@pytest.mark.parametrize('fused', [False, True])
+@pytest.mark.parametrize('deterministic', [False, True])
+def test_deterministic_aux_loss_uses_ordered_reduction(monkeypatch, fused, deterministic):
+    """Deterministic execution must not dispatch TE's atomic scalar reduction."""
+    from megatron.core.transformer.moe import moe_utils
+
+    calls = []
+
+    def fused_loss(**kwargs):
+        calls.append(kwargs)
+        return kwargs['probs'].sum() * 0.25
+
+    monkeypatch.setattr(torch, 'are_deterministic_algorithms_enabled', lambda: deterministic)
+    monkeypatch.setattr(moe_utils, 'HAVE_TE', True)
+    monkeypatch.setattr(moe_utils, 'fused_moe_aux_loss', fused_loss)
+    probs = torch.tensor([[0.2, 0.8], [0.7, 0.3]], requires_grad=True)
+    counts = torch.tensor([1.0, 1.0])
+    value = moe_utils.switch_load_balancing_loss_func(
+        probs,
+        counts,
+        total_num_tokens=2,
+        topk=1,
+        num_experts=2,
+        moe_aux_loss_coeff=0.1,
+        fused=fused,
+    )
+    assert len(calls) == int(fused and not deterministic)
+    reference = probs.sum() * 0.25 if calls else (probs.sum(0) * counts).sum() * 0.05
+    torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    value.backward()
+    expected_grad = 0.25 if calls else 0.05
+    torch.testing.assert_close(probs.grad, torch.full_like(probs, expected_grad), rtol=0, atol=0)
+
+
 class AuxlossTestContainer(MoEModelTestContainer):
     def partition_input(self, input):
         partitioned_input = input.chunk(
