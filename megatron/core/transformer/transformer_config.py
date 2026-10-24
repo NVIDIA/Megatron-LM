@@ -189,6 +189,10 @@ class TransformerConfig(ModelParallelConfig):
     differ bitwise. On the training side this is enforced via TransformerEngine's
     NVTE_FLASH_ATTN_V2/V3/V4 selection environment variables."""
 
+    pp_attention_super_block_tiles: int = 8
+    """Key tiles of 128 per super-block of the PP attention backend. Part of the output bytes:
+    training and serving must use the same value."""
+
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
@@ -1720,6 +1724,45 @@ class TransformerConfig(ModelParallelConfig):
         new_config.__dict__ = deepcopy(config.__dict__, {id(config): new_config})
         return new_config
 
+    def _validate_pp_attention(self) -> None:
+        """Reject settings the PP attention backend does not support."""
+        if self.attention_backend != AttnBackend.pp:
+            return
+        if self.pp_attention_super_block_tiles < 1:
+            raise ValueError("pp_attention_super_block_tiles must be >= 1")
+        if self.kv_channels not in (128, 256):
+            raise ValueError(f"PP attention needs kv_channels 128 or 256, got {self.kv_channels}")
+        if not self.bf16:
+            raise ValueError("PP attention supports bf16 only")
+        rejected = {
+            "fp8_dot_product_attention": self.fp8_dot_product_attention,
+            "fp8_multi_head_attention": self.fp8_multi_head_attention,
+            "window_size": self.window_size is not None,
+            "attn_logit_softcapping": self.attn_logit_softcapping is not None,
+            "softmax_type": self.softmax_type != 'vanilla',
+            "attention_dropout": self.attention_dropout != 0.0,
+            "apply_query_key_layer_scaling": self.apply_query_key_layer_scaling,
+            "multi_latent_attention": self.multi_latent_attention,
+        }
+        bad = [name for name, hit in rejected.items() if hit]
+        if bad:
+            raise ValueError(f"PP attention does not support: {', '.join(bad)}")
+        if self.context_parallel_size > 1:
+            types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            if any(t not in ("all_gather", "a2a") for t in types):
+                raise ValueError(
+                    "PP attention supports cp_comm_type 'all_gather' or 'a2a', "
+                    f"got {self.cp_comm_type!r}"
+                )
+            heads = (self.num_attention_heads, self.num_query_groups or self.num_attention_heads)
+            per_rank = self.tensor_model_parallel_size * self.context_parallel_size
+            if "a2a" in types and any(n % per_rank for n in heads):
+                raise ValueError(
+                    "PP attention a2a needs heads per TP rank divisible by the cp size"
+                )
+
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
@@ -1763,6 +1806,7 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+        self._validate_pp_attention()
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0

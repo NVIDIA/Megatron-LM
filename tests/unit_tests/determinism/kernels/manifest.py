@@ -939,6 +939,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "atomics). Bit-exact replay is tracked as a follow-up; parity tests live in "
         "tests/unit_tests/transformer/experimental_attention_variant/.",
     ),
+    KernelEntry(
+        name="pp_attention",
+        sources=(
+            "megatron/core/transformer/pp/prefill_kernel.py",
+            "megatron/core/transformer/pp/autograd.py",
+        ),
+        tests=("tests/unit_tests/transformer/test_pp_attention_training.py",),
+        kind="external-lib",
+        notes="CuTe DSL forward with a fixed key-tile fold order; backward is FlashAttention-4 "
+        "_flash_attn_bwd (deterministic=True at head dim 128). The tests assert bitwise forward "
+        "and gradients across repeats, dense vs packed, and CP vs single rank. They need a "
+        "compute capability 10.x GPU with CUTLASS DSL and FlashAttention-4 and skip otherwise.",
+    ),
     # ---------------------------------------------------------------- DSA min-memory backends
     KernelEntry(
         name="dsa_min_memory_triton",

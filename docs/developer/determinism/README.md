@@ -24,6 +24,8 @@ This reference includes:
 - [`testing.md`](./testing.md): the kernel determinism test suite, the kernel
   registry, and the pull-request gate that requires a bit-exact test for every
   kernel change
+- [`pp_attention.md`](./pp_attention.md): the PP attention backend and its
+  numerics contract
 - [`glossary.md`](./glossary.md): definitions and abbreviations
 
 The roadmap is tracked dynamically in
