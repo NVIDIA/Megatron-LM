@@ -30,6 +30,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines import dynamic_engine as dynamic_engine_module
 from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
@@ -73,6 +74,7 @@ def _make_engine(
         active_token_count=0,
         max_tokens=8,
         chunked_prefill_request_id=-1,
+        _nccl_ep_dispatcher=False,
     )
     model_config = SimpleNamespace(
         expert_model_parallel_size=1, num_moe_experts=None, moe_enable_routing_replay=False
@@ -85,6 +87,8 @@ def _make_engine(
     engine.enable_chunked_prefill = False
     engine.num_speculative_tokens = 0
     engine.materialize_only_last_token_logits = True
+    engine.expert_parallel_zmq_communicator = None
+    engine._ep_step_has_non_decode = False
 
     for name, value in overrides.items():
         if name.startswith("context_"):
@@ -166,6 +170,166 @@ def test_should_run_async_sched_overlap(can_prepare, has_waiting, availability, 
     engine.context.can_prepare_requests.assert_called_once_with()
     assert list(engine.waiting_request_ids) == ([10] if has_waiting else [])
     assert request.cg_wait_iters == 3
+
+
+def _make_nccl_ep_engine(peer_non_decode, *, local_overlap=True):
+    """An engine on a 2-rank nccl EP group (coordinator mode) whose peer reports
+    `peer_non_decode`."""
+    engine = _make_engine()
+    engine.context._nccl_ep_dispatcher = True
+    engine.context.use_cuda_graphs_for_non_decode_steps = True
+    engine.context.cuda_graph_batch_dimensions_list = [object()]
+    engine.context.using_cuda_graph_this_step = mock.Mock(return_value=False)
+    engine.waiting_request_ids = deque()
+    engine.context.can_prepare_requests.return_value = local_overlap
+    engine.controller._async_sched_forward = SimpleNamespace(is_valid=False)
+    engine.ep_world_size = 2
+    communicator = mock.Mock()
+    communicator.sync_all_reduce_max = mock.Mock(
+        side_effect=lambda value: max(value, int(peer_non_decode))
+    )
+    engine.expert_parallel_zmq_communicator = communicator
+    return engine, communicator
+
+
+def _agree(engine, local_schedulable):
+    asyncio.run(engine._agree_ep_step_kind(local_schedulable))
+
+
+@pytest.mark.parametrize("peer_non_decode", [False, True])
+def test_agree_ep_step_kind_follows_the_ep_group(peer_non_decode):
+    """Under the nccl EP dispatcher a prefill on any rank sends every rank to no-overlap."""
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode)
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_called_once_with(0)
+    assert engine._ep_step_has_non_decode is peer_non_decode
+    assert engine._should_run_async_sched_overlap() is (not peer_non_decode)
+
+
+def _about_to_prefill(engine):
+    engine.waiting_request_ids = deque([10])
+    engine.get_request = mock.Mock(return_value=SimpleNamespace(remaining_prompt_tokens=[1]))
+    engine._can_schedule_non_chunked_prefill = mock.Mock(return_value=True)
+
+
+def test_agree_ep_step_kind_reports_its_own_prefill_to_the_ep_group():
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=False)
+    _about_to_prefill(engine)
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_called_once_with(1)
+    assert engine._should_run_async_sched_overlap() is False
+
+
+def test_agree_ep_step_kind_does_not_propagate_bookkeeping_without_waiting_requests():
+    """Pause bookkeeping keeps this rank on no-overlap locally, but with nothing waiting
+    the step stays decode-only, so the group is not told to leave the overlap ordering."""
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=False, local_overlap=False)
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_called_once_with(0)
+    assert engine._should_run_async_sched_overlap() is False  # still local no-overlap
+
+
+def test_agree_ep_step_kind_reports_a_possible_prefill_on_the_no_overlap_path():
+    """A rank on the no-overlap ordering schedules after consuming the pending output,
+    so a waiting request that does not fit right now may still be admitted this step:
+    the group must hear about that possible prefill."""
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=False, local_overlap=False)
+    engine.waiting_request_ids = deque([10])
+    engine._can_schedule_non_chunked_prefill = mock.Mock(return_value=False)
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_called_once_with(1)
+    engine._can_schedule_non_chunked_prefill.assert_not_called()
+    assert engine._should_run_async_sched_overlap() is False
+
+
+def test_agree_ep_step_kind_stays_decode_only_when_the_waiting_head_does_not_fit():
+    """On the overlap ordering nothing is scheduled, so a waiting request that cannot be
+    admitted leaves the step decode-only for the group."""
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=False)
+    _about_to_prefill(engine)
+    engine._can_schedule_non_chunked_prefill.return_value = False
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_called_once_with(0)
+    assert engine._should_run_async_sched_overlap() is True
+
+
+def test_agree_ep_step_kind_reports_a_padded_mixed_forward_still_pending():
+    """A decode-only rank that ran a mixed graph (because a peer prefilled) must resolve
+    that forward on the no-overlap ordering, and tells the group so."""
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=False)
+    engine.controller._async_sched_forward = SimpleNamespace(is_valid=True)
+    engine.context.using_cuda_graph_this_step.return_value = True
+    engine.context.padded_batch_dimensions = SimpleNamespace(prefill_req_count=1)
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_called_once_with(1)
+    assert engine._should_run_async_sched_overlap() is False
+
+
+def test_agree_ep_step_kind_runs_on_idle_ranks_too():
+    """An idle rank (dummy forward) joins the reduction with 0 so the ZMQ exchange stays
+    in lockstep with the ranks that step; its local probes are not consulted."""
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=True, local_overlap=False)
+
+    _agree(engine, local_schedulable=0)
+
+    communicator.sync_all_reduce_max.assert_called_once_with(0)
+    assert engine._ep_step_has_non_decode is True
+    engine.context.can_prepare_requests.assert_not_called()
+
+
+def test_agree_ep_step_kind_is_skipped_without_the_nccl_dispatcher():
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=True, local_overlap=True)
+    engine.context._nccl_ep_dispatcher = False
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_not_called()
+    # Without nccl EP the overlap decision is the local one, as before.
+    assert engine._should_run_async_sched_overlap() is True
+
+
+@pytest.mark.parametrize(
+    "non_decode_graphs, graph_list",
+    [(False, [object()]), (True, [])],
+    ids=["non_decode_graphs_disabled", "no_cuda_graphs"],
+)
+def test_agree_ep_step_kind_is_skipped_without_non_decode_graphs(non_decode_graphs, graph_list):
+    """Without prefill/mixed graphs a peer's prefill runs eagerly and leaves this rank's
+    decode-only layout alone, so the nccl group does not agree and the local decision stands."""
+    engine, communicator = _make_nccl_ep_engine(peer_non_decode=True, local_overlap=True)
+    engine.context.use_cuda_graphs_for_non_decode_steps = non_decode_graphs
+    engine.context.cuda_graph_batch_dimensions_list = graph_list
+
+    _agree(engine, local_schedulable=1)
+
+    communicator.sync_all_reduce_max.assert_not_called()
+    assert engine._should_run_async_sched_overlap() is True
+
+
+def test_agree_ep_step_kind_collective_without_coordinator():
+    """Engines without the coordinator agree over the EP process group instead of ZMQ."""
+    engine, _ = _make_nccl_ep_engine(peer_non_decode=False)
+    _about_to_prefill(engine)
+    engine.expert_parallel_zmq_communicator = None
+    engine.pg_collection = SimpleNamespace(ep=None)
+
+    with mock.patch.object(dynamic_engine_module, "get_pg_size", return_value=1):
+        engine._agree_ep_step_kind_collective()
+
+    assert engine._ep_step_has_non_decode is True
+    assert engine._should_run_async_sched_overlap() is False
 
 
 def test_async_sched_overlap_probe_uses_non_mutating_cuda_graph_match():
@@ -304,6 +468,7 @@ def test_async_forward_routes_one_controller_iteration(
     engine._should_run_async_sched_overlap = mock.Mock(return_value=run_async_overlap)
     engine.context = SimpleNamespace(
         config=SimpleNamespace(async_sched_mode=mode),
+        _nccl_ep_dispatcher=False,
         step_count=4,
         prefix_cache_lru_clock=7,
         active_token_count=2,
