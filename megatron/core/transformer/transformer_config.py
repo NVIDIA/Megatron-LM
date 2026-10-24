@@ -1518,6 +1518,14 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8' with inference_grouped_gemm_backend='torch' or 'vllm'. Set to
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
+    inference_moe_triton_router: bool = False
+    """Route sigmoid MoE inference with Triton top-k kernels instead of the compiled
+    PyTorch router. Applies to InferenceTopKRouter with sigmoid scores, an expert bias,
+    fp32 logits and gradients disabled; group-limited routing, router replay,
+    moe_router_fusion and batch-invariant mode keep the compiled path. Top-k up to 32
+    runs as one fused kernel; probabilities match the compiled path bitwise for top-k
+    below eight and to within the last fp32 bit otherwise. Off by default."""
+
     inference_flashinfer_mxfp8_token_capacity: int | None = None
     """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
     NVFP4 MoE (inference_moe_nvfp4_recipe).
