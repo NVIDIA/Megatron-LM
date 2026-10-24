@@ -81,9 +81,17 @@ def get_blend_from_list(
                 weight = None
             weight_per_dataset.append(weight)
 
-        is_none = map(lambda _: _ is None, weight_per_dataset)
+        # Materialize into a list: a map object is a single-use iterator, so
+        # sharing it between any(...) and all(...) would leave all(...) to
+        # inspect only the elements any(...) had not yet consumed. That made
+        # the validation below order-dependent (e.g. [30.0, None] would slip
+        # through while [None, 30.0] would raise).
+        is_none = [weight is None for weight in weight_per_dataset]
         if any(is_none):
-            assert all(is_none)
+            assert all(is_none), (
+                "either every dataset must be given a (parseable) weight or none of them "
+                "may be; a blend mixing weighted and bare prefixes is not supported"
+            )
             weight_per_dataset = None
             raw_prefix_per_dataset = blend
 
