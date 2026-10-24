@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import inspect
 import warnings
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
@@ -1156,33 +1157,243 @@ def process_mtp_loss(
         counts (``None`` when not training). Everything that allocates [s, b, v] tensors for
         one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
         """
-        mtp_logits, _ = output_layer(head_hidden, weight=output_weight, runtime_gather_output=False)
-        if scale_logits_fn is not None:
-            mtp_logits = scale_logits_fn(mtp_logits)
-        if is_observing_tensor("mtp_logits"):
-            observe_tensor(
-                output_layer,
-                f"mtp_logits.{mtp_layer_number}",
-                "mtp_logits",
-                mtp_logits,
-                tp_shard_dim=-1,
-                sequence_dim=0,
-                batch_dim=1,
+        chunk_size = config.mtp_loss_chunk_size
+        skip_masked_tokens = config.mtp_loss_skip_masked_tokens
+        if chunk_size is None and not skip_masked_tokens:
+            mtp_logits, _ = output_layer(
+                head_hidden, weight=output_weight, runtime_gather_output=False
             )
-        mtp_preds = None
-        if loss_returns_argmax:
-            head_loss, mtp_preds = compute_language_model_loss(
-                head_labels, mtp_logits, return_argmax=True
+            if scale_logits_fn is not None:
+                mtp_logits = scale_logits_fn(mtp_logits)
+            if is_observing_tensor("mtp_logits"):
+                observe_tensor(
+                    output_layer,
+                    f"mtp_logits.{mtp_layer_number}",
+                    "mtp_logits",
+                    mtp_logits,
+                    tp_shard_dim=-1,
+                    sequence_dim=0,
+                    batch_dim=1,
+                )
+            mtp_preds = None
+            if loss_returns_argmax:
+                head_loss, mtp_preds = compute_language_model_loss(
+                    head_labels, mtp_logits, return_argmax=True
+                )
+            else:
+                head_loss = compute_language_model_loss(head_labels, mtp_logits)
+            correct = total = None
+            if is_training:
+                correct, total = _compute_mtp_acceptance_counts(
+                    mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
+                )
+            head_loss = layer_loss_mask * head_loss
+            return head_loss, correct, total
+
+        sequence_parallel_size = get_pg_size(tp_group) if config.sequence_parallel else 1
+        local_sequence_length = head_hidden.size(0)
+        expected_sequence_length = local_sequence_length * sequence_parallel_size
+        if head_labels.size(1) != expected_sequence_length:
+            raise ValueError(
+                f"MTP labels have sequence length {head_labels.size(1)}, expected "
+                f"{expected_sequence_length} from hidden states with local sequence length "
+                f"{local_sequence_length} and sequence-parallel size {sequence_parallel_size}."
             )
-        else:
-            head_loss = compute_language_model_loss(head_labels, mtp_logits)
-        correct = total = None
-        if is_training:
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
+
+        loss_chunks_by_rank: list[list[Tensor]] = [[] for _ in range(sequence_parallel_size)]
+        correct = torch.zeros((), dtype=torch.float32, device=head_hidden.device)
+        total = torch.zeros((), dtype=torch.float32, device=head_hidden.device)
+        recomputing = False
+
+        @contextmanager
+        def _recompute_context():
+            nonlocal recomputing
+            recomputing = True
+            try:
+                yield
+            finally:
+                recomputing = False
+
+        def _checkpoint_contexts():
+            return nullcontext(), _recompute_context()
+
+        @contextmanager
+        def _disable_output_sequence_parallel():
+            sequence_parallel = getattr(output_layer, "sequence_parallel", False)
+            if sequence_parallel:
+                output_layer.sequence_parallel = False
+            try:
+                yield
+            finally:
+                if sequence_parallel:
+                    output_layer.sequence_parallel = True
+
+        def _project_and_compute_loss(
+            chunk_hidden: Tensor,
+            chunk_labels: Tensor,
+            chunk_number: int,
+            disable_sequence_parallel: bool = False,
+        ) -> tuple[Tensor, Tensor]:
+            output_context = (
+                _disable_output_sequence_parallel() if disable_sequence_parallel else nullcontext()
             )
+            with output_context:
+                chunk_logits, _ = output_layer(
+                    chunk_hidden, weight=output_weight, runtime_gather_output=False
+                )
+            if scale_logits_fn is not None:
+                chunk_logits = scale_logits_fn(chunk_logits)
+            if is_observing_tensor("mtp_logits") and not recomputing:
+                observe_tensor(
+                    output_layer,
+                    f"mtp_logits.{mtp_layer_number}.{chunk_number}",
+                    "mtp_logits",
+                    chunk_logits,
+                    tp_shard_dim=-1,
+                    sequence_dim=0,
+                    batch_dim=1,
+                )
+            if loss_returns_argmax:
+                chunk_loss, chunk_preds = compute_language_model_loss(
+                    chunk_labels, chunk_logits, return_argmax=True
+                )
+            else:
+                chunk_loss = compute_language_model_loss(chunk_labels, chunk_logits)
+                if is_training:
+                    tp_size = get_pg_size(tp_group)
+                    if tp_size > 1:
+                        chunk_preds = _vocab_parallel_argmax(chunk_logits, tp_group, tp_size)
+                    else:
+                        chunk_preds = torch.argmax(chunk_logits, dim=-1)
+                else:
+                    chunk_preds = torch.empty(0, dtype=torch.long, device=chunk_logits.device)
+            return chunk_loss, chunk_preds
+
+        if skip_masked_tokens:
+            if config.sequence_parallel:
+                head_hidden = tensor_parallel.gather_from_sequence_parallel_region(
+                    head_hidden, tensor_parallel_output_grad=False, group=tp_group
+                )
+            flat_hidden = head_hidden.transpose(0, 1).reshape(-1, head_hidden.size(-1))
+            flat_labels = head_labels.reshape(-1)
+            flat_loss_mask = layer_loss_mask.reshape(-1)
+            selected = flat_loss_mask.bool()
+            selected_indices = selected.nonzero(as_tuple=False).squeeze(-1)
+            selected_hidden = flat_hidden[selected]
+            selected_labels = flat_labels[selected]
+            selected_loss_mask = flat_loss_mask[selected]
+
+            if selected_hidden.size(0) == 0:
+                projection_weight = (
+                    output_weight if output_weight is not None else output_layer.weight
+                )
+                anchor = head_hidden.reshape(-1)[:1].sum() * 0
+                anchor = anchor + projection_weight.reshape(-1)[:1].sum() * 0
+                head_loss = torch.zeros_like(layer_loss_mask, dtype=torch.float32) + anchor
+                return (
+                    head_loss,
+                    (correct if is_training else None),
+                    (total if is_training else None),
+                )
+
+            compact_chunk_size = chunk_size or selected_hidden.size(0)
+            compact_loss_chunks = []
+            for chunk_number, start in enumerate(
+                range(0, selected_hidden.size(0), compact_chunk_size)
+            ):
+                end = min(start + compact_chunk_size, selected_hidden.size(0))
+
+                def compute_compact_chunk(hidden, labels, current_chunk_number=chunk_number):
+                    return _project_and_compute_loss(
+                        hidden.unsqueeze(1),
+                        labels.unsqueeze(0),
+                        current_chunk_number,
+                        disable_sequence_parallel=True,
+                    )
+
+                if torch.is_grad_enabled():
+                    chunk_loss, chunk_preds = checkpoint(
+                        compute_compact_chunk,
+                        selected_hidden[start:end],
+                        selected_labels[start:end],
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                        context_fn=_checkpoint_contexts,
+                    )
+                else:
+                    chunk_loss, chunk_preds = compute_compact_chunk(
+                        selected_hidden[start:end], selected_labels[start:end]
+                    )
+                compact_loss_chunks.append(chunk_loss.reshape(-1) * selected_loss_mask[start:end])
+                if is_training:
+                    with torch.no_grad():
+                        correct += (
+                            (chunk_preds.reshape(-1) == selected_labels[start:end]).sum().float()
+                        )
+                        total += end - start
+
+            compact_loss = torch.cat(compact_loss_chunks)
+            head_loss = torch.zeros_like(flat_loss_mask, dtype=compact_loss.dtype).scatter(
+                0, selected_indices, compact_loss
+            )
+            return (
+                head_loss.reshape_as(layer_loss_mask),
+                (correct if is_training else None),
+                (total if is_training else None),
+            )
+
+        for chunk_number, start in enumerate(range(0, local_sequence_length, chunk_size)):
+            end = min(start + chunk_size, local_sequence_length)
+            chunk_length = end - start
+            chunk_labels = torch.cat(
+                [
+                    head_labels[
+                        :, rank * local_sequence_length + start : rank * local_sequence_length + end
+                    ]
+                    for rank in range(sequence_parallel_size)
+                ],
+                dim=1,
+            )
+            chunk_loss_mask = torch.cat(
+                [
+                    layer_loss_mask[
+                        :, rank * local_sequence_length + start : rank * local_sequence_length + end
+                    ]
+                    for rank in range(sequence_parallel_size)
+                ],
+                dim=1,
+            )
+
+            def compute_chunk(hidden, labels, current_chunk_number=chunk_number):
+                return _project_and_compute_loss(hidden, labels, current_chunk_number)
+
+            if torch.is_grad_enabled():
+                chunk_loss, chunk_preds = checkpoint(
+                    compute_chunk,
+                    head_hidden[start:end],
+                    chunk_labels,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                    context_fn=_checkpoint_contexts,
+                )
+            else:
+                chunk_loss, chunk_preds = compute_chunk(head_hidden[start:end], chunk_labels)
+
+            for rank, rank_loss in enumerate(torch.split(chunk_loss, chunk_length, dim=1)):
+                loss_chunks_by_rank[rank].append(rank_loss)
+
+            if is_training:
+                with torch.no_grad():
+                    labels_match = chunk_labels.transpose(0, 1).contiguous()
+                    mask_match = chunk_loss_mask.transpose(0, 1).contiguous().bool()
+                    correct += ((chunk_preds == labels_match) & mask_match).sum().float()
+                    total += mask_match.sum().float()
+
+        head_loss = torch.cat(
+            [torch.cat(rank_chunks, dim=1) for rank_chunks in loss_chunks_by_rank], dim=1
+        )
         head_loss = layer_loss_mask * head_loss
-        return head_loss, correct, total
+        return head_loss, (correct if is_training else None), (total if is_training else None)
 
     # Early backward: fwd(head) -> bwd(head) per depth so at most one head's logits/softmax is
     # resident at a time. Needs a live graph and cannot run inside CUDA-graph capture/warmup.

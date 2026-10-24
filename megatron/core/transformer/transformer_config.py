@@ -119,6 +119,22 @@ class TransformerConfig(ModelParallelConfig):
     [seq, batch, hidden] gradient of the head input is kept and injected into the main backward.
     No recomputation is involved; total FLOPs are unchanged."""
 
+    mtp_loss_chunk_size: Optional[int] = None
+    """Maximum local sequence length per MTP vocabulary projection and cross-entropy chunk.
+
+    When set, MTP loss checkpointing recomputes each chunk during backward instead of retaining
+    full-sequence vocabulary logits and softmax activations. Under sequence parallelism this is
+    the number of local sequence rows per tensor-parallel rank. ``None`` disables chunking.
+    """
+
+    mtp_loss_skip_masked_tokens: bool = False
+    """Skip MTP vocabulary projection and cross entropy for tokens masked out of the loss.
+
+    This compacts the hidden states before the LM head and scatters the selected losses back to
+    the original token layout. It can be combined with ``mtp_loss_chunk_size`` to bound both the
+    number of projected tokens and the peak vocabulary-sized activation.
+    """
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -1763,6 +1779,11 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        if self.mtp_loss_chunk_size is not None and self.mtp_loss_chunk_size <= 0:
+            raise ValueError(
+                f"mtp_loss_chunk_size must be positive or None, got {self.mtp_loss_chunk_size}."
+            )
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
