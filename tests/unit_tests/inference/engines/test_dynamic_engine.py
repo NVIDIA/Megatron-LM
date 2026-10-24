@@ -134,8 +134,17 @@ def test_add_request_rejects_unsupported_media_before_tokenization(kwargs, modal
 def test_validate_input_modalities_rejects_unsupported_audio():
     wrapper = _ImageOnlyCapabilityWrapper()
 
-    with pytest.raises(ValueError, match="does not support audio inputs"):
+    with pytest.raises(NotImplementedError, match="supports_audio") as exc_info:
         wrapper.validate_input_modalities("audio")
+    assert "audio prefill" in str(exc_info.value)
+
+    wrapper.supports_image = False
+    with pytest.raises(ValueError, match="does not support image inputs"):
+        wrapper.validate_input_modalities("image")
+    with pytest.raises(ValueError, match="does not support video inputs"):
+        wrapper.validate_input_modalities("video")
+    with pytest.raises(ValueError, match="Unknown input modality"):
+        wrapper.validate_input_modalities("depth")
 
 
 def _build_mock_vlm_engine(image_embeddings):
