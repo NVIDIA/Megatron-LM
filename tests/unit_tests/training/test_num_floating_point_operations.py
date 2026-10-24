@@ -140,3 +140,89 @@ def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
     actual = num_floating_point_operations(args, batch_size=3, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, (0, 3 + depth, 3 + depth, 0), depth)
+
+
+def _make_dsv4_args(pattern, **overrides):
+    """A small HybridModel whose FLOPs have independently calculated coefficients."""
+    args = _make_args(
+        hybrid_layer_pattern=pattern,
+        experimental_attention_variant=None,
+        num_layers=len(pattern.split('/')[0].replace('|', '')),
+        seq_length=256,
+        multi_latent_attention=True,
+        group_query_attention=False,
+        q_lora_rank=2,
+        # Config derives this dimension from v_head_dim; args may retain this stale default.
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=8,
+        output_projection_groups=2,
+        output_projection_lora_rank=3,
+        csa_window_size=2,
+        csa_dense_mode=False,
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=4,
+        dsa_indexer_topk=2,
+        mamba_state_dim=4,
+        mamba_head_dim=2,
+        mamba_num_groups=1,
+        mamba_num_heads=2,
+        gdp_num_householder=1,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+@pytest.mark.parametrize('symbol', ['W', 'C', 'H'])
+@pytest.mark.parametrize('packed', [False, True])
+def test_dsv4_attention_flops_use_pattern_and_real_token_statistics(symbol, packed):
+    args = _make_dsv4_args(symbol)
+    # BSHD: two L=256 sequences. Packed: L=128 and L=384 in a padded allocation.
+    tokens = 512
+    squared_lengths = 128**2 + 384**2 if packed else 2 * 256**2
+    stats = (
+        dict(total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=squared_lengths)
+        if packed
+        else {}
+    )
+    if symbol != 'C':
+        args.dsa_indexer_n_heads = args.dsa_indexer_head_dim = args.dsa_indexer_topk = None
+    # Per-layer projection coefficient is 218 MACs; window is 64. C adds
+    # compressor/indexer coefficients 256/160 and a capped sparse core. H adds
+    # compressor coefficient 128 and a 1/128 compressed-attention core.
+    coefficients = {'W': (1692, 0), 'C': (4572, 12), 'H': (2460, 0.75)}
+    token_coefficient, core_coefficient = coefficients[symbol]
+    expected = (token_coefficient + 1536) * tokens + core_coefficient * squared_lengths
+    if symbol == 'C':
+        expected -= 1536 * tokens**2 / squared_lengths
+    before = vars(args).copy()
+    assert num_floating_point_operations(args, batch_size=2, **stats) == int(expected)
+    assert vars(args) == before
+    if packed:
+        args.seq_length = 2048
+        assert num_floating_point_operations(args, batch_size=32, **stats) == int(expected)
+
+
+def test_dsv4_flops_count_repeated_mtp_attention_and_projection():
+    args = _make_dsv4_args('W-E/C-/C-', mtp_num_layers=None)
+    tokens, squared_lengths = 512, 2 * 256**2
+    # Pattern: W + 2*C + 3*dense MLP + 1*MoE; two MTP norms/projections,
+    # three logits projections. The actual repeated pattern owns MTP depth.
+    expected = 27636 * tokens + 24 * squared_lengths - 3072 * tokens**2 / squared_lengths
+    assert num_floating_point_operations(args, batch_size=2) == int(expected)
+    assert args.mtp_num_layers is None
+
+
+def test_dsv4_dense_csa_flops_do_not_require_an_indexer():
+    args = _make_dsv4_args(
+        'C',
+        csa_dense_mode=True,
+        dsa_indexer_n_heads=None,
+        dsa_indexer_head_dim=None,
+        dsa_indexer_topk=None,
+    )
+    # Dense ratio-4 CSA: projections/window/compressor=538 MACs per token,
+    # plus the full compressed attention core; logits add1536 FLOPs per token.
+    expected = (6 * 538 + 1536) * 512 + 24 * (2 * 256**2)
+    assert num_floating_point_operations(args, batch_size=2) == expected
