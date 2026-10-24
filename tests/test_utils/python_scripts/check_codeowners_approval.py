@@ -1,4 +1,39 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Adapted from noamelf/codeowner-multi-approval-action/check_code_owners_approval.py.
+# Original revision: ab1d2dc274612ab9439b96538f30e88be2570f49 (v0.1).
+# https://github.com/noamelf/codeowner-multi-approval-action/blob/ab1d2dc274612ab9439b96538f30e88be2570f49/check_code_owners_approval.py
+# Byte-identical upstream source at MIT-licensed revision:
+# ff4f388f021bdb1bb3653c2b09e3e84f3885f50c
+# https://github.com/noamelf/codeowner-multi-approval-action/blob/ff4f388f021bdb1bb3653c2b09e3e84f3885f50c/check_code_owners_approval.py
+# License: MIT. The original v0.1 tree did not include a license file.
+# https://github.com/noamelf/codeowner-multi-approval-action/blob/ff4f388f021bdb1bb3653c2b09e3e84f3885f50c/LICENSE
+# Local modifications: author-specific approval exemption, shared policy integration,
+# and fail-closed handling of GitHub API errors.
+#
+# The upstream copyright and license notice follows:
+#
+# MIT License
+#
+# Copyright (c) 2025 noamelf
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Require every CODEOWNERS owner to approve, subject to explicit author exemptions.
 
