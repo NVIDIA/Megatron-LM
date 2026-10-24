@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """CPU geometry, capacity and validated MCore rank-row contracts."""
 
 from __future__ import annotations

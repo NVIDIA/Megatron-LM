@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Memoized exact pack costs and physical-capacity constraints."""
 
 from __future__ import annotations

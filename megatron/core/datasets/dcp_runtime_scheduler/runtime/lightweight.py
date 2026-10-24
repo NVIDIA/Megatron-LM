@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Frozen CPU prediction kernel; provenance is recorded in ORIGIN.json."""
 
 from __future__ import annotations

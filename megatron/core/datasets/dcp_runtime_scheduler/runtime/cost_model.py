@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Cost-model protocol and PP1 forward/backward timeline construction."""
 
 from __future__ import annotations
