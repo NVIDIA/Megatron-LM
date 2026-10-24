@@ -233,7 +233,9 @@ def test_deepepv2_initializes_optional_transport_without_v1(monkeypatch, availab
         moe_flex_dispatcher_num_sms=None,
     )
     if not available:
-        with pytest.raises(ImportError, match="DeepEP v2 is not installed"):
+        with pytest.raises(
+            ImportError, match=r"DeepEP v2 \(deep_ep\.ElasticBuffer\) is unavailable"
+        ):
             _DeepepV2Manager(object(), 4, 2, 8, config)
     else:
         manager = _DeepepV2Manager(object(), 4, 2, 8, config)
