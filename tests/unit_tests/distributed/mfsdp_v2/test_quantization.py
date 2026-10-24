@@ -58,11 +58,10 @@ class _RecomputedMLP(nn.Module):
 
 
 class _RecomputedBlockWithOwnedProj(nn.Module):
-    """Block whose own ``proj`` is recomputed together with a wrapped ``mlp``.
+    """Block that checkpoints only its ``proj`` submodule.
 
-    Wrapping ``mlp`` but not ``proj`` leaves ``proj`` owned by the block's FsdpModule, while
-    the checkpoint recomputes ``proj`` without re-entering that FsdpModule's forward hooks,
-    like MultiTokenPredictionLayer.eh_proj under the root.
+    When the block is an FsdpModule, the checkpoint recomputes ``proj`` without re-entering
+    the block's forward hooks, like MultiTokenPredictionLayer.eh_proj under the root.
     """
 
     def __init__(self, device, use_reentrant: bool | None) -> None:
@@ -71,15 +70,12 @@ class _RecomputedBlockWithOwnedProj(nn.Module):
         self.mlp = _make_mlp(device)
         self.use_reentrant = use_reentrant
 
-    def _block(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.proj(x))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the block, checkpointing it unless use_reentrant is None."""
+        """Run the block, checkpointing ``proj`` unless use_reentrant is None."""
         if self.use_reentrant is None:
-            return self._block(x)
+            return self.mlp(self.proj(x))
         # TE's checkpoint restores the MXFP8 autocast state during recomputation.
-        return te_checkpoint(self._block, x, use_reentrant=self.use_reentrant)
+        return self.mlp(te_checkpoint(self.proj, x, use_reentrant=self.use_reentrant))
 
 
 _ZERO3_PLACEMENTS = Placements(
@@ -378,15 +374,15 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
 @pytest.mark.launch_on_gb200
 @requires_mxfp8
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
-def test_mxfp8_recompute_of_unwrapped_owned_weight_matches_no_recompute(
+def test_mxfp8_recompute_inside_fsdp_module_matches_no_recompute(
     distributed_setup, use_reentrant
 ):
-    """Recomputing a root-owned weight regathers its rowwise planes on demand.
+    """Recomputing a submodule of a root FsdpModule regathers its rowwise planes on demand.
 
-    ``proj`` belongs to the root FsdpModule. With sharded compute weights, backward unshards
-    the root with columnwise planes only, and recomputation re-enters just the wrapped ``mlp``,
-    so the root's rowwise planes must be gathered when ``proj`` runs again. Replicated compute
-    weights keep both planes and are covered by
+    With sharded compute weights, backward unshards the root with columnwise planes only.
+    The checkpoint inside the root's forward recomputes only ``proj``, without re-entering
+    the root's pre_forward, so the root's rowwise planes must be gathered when ``proj`` runs
+    again. Replicated compute weights keep both planes and are covered by
     test_mxfp8_activation_recompute_matches_no_recompute.
     """
     device = distributed_setup.device
@@ -401,14 +397,13 @@ def test_mxfp8_recompute_of_unwrapped_owned_weight_matches_no_recompute(
             torch.manual_seed(2026)
             model = _RecomputedBlockWithOwnedProj(device, use_reentrant)
         with fully_shard_context(device=device):
-            fully_shard(model.mlp, mesh=mesh, placements=_ZERO3_PLACEMENTS)
             fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
         optimizer = FusedAdam(model.parameters(), lr=0.01)
         fully_shard_optimizer(optimizer)
         return model, optimizer
 
     def proj_planes(model):
-        """Return whether the root's unsharded (rowwise, columnwise) proj planes are allocated."""
+        """Return whether the root's unsharded (rowwise, columnwise) planes are allocated."""
         [group] = [
             g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
         ]
