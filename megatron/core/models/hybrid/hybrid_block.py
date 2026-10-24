@@ -383,6 +383,18 @@ class HybridStack(MegatronModule):
             else None
         )
 
+        # Own this norm at the decoder boundary so text embeddings and MiMo's assembled
+        # modality embeddings take the same path. MTP has its own embedding normalization.
+        self.input_norm = (
+            TENorm(
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+            )
+            if self.config.post_embedding_rmsnorm and self.pre_process and not self.is_mtp_layer
+            else None
+        )
+
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_norm = TENorm(
@@ -596,6 +608,13 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        if self.input_norm is not None:
+            # TE may normalize in the parameter dtype; retain the incoming residual precision.
+            residual_dtype = hidden_states.dtype
+            hidden_states = apply_module(self.input_norm)(hidden_states)
+            if hidden_states.dtype != residual_dtype:
+                hidden_states = hidden_states.to(dtype=residual_dtype)
 
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(

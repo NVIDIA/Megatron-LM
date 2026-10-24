@@ -296,6 +296,14 @@ class TransformerConfig(ModelParallelConfig):
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
+    post_embedding_rmsnorm: bool = False
+    """Normalize the main hybrid decoder input before it enters the residual stream.
+
+    Applies once on the first decoder stage, including externally assembled multimodal
+    embeddings, before residual-stream expansion. Does not apply to MTP auxiliary stacks.
+    Requires RMSNorm normalization and is disabled by default.
+    """
+
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
@@ -1763,6 +1771,9 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        if self.post_embedding_rmsnorm and self.normalization != "RMSNorm":
+            raise ValueError("post_embedding_rmsnorm requires normalization='RMSNorm'.")
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0

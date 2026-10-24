@@ -22,6 +22,7 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -547,6 +548,31 @@ class TestTEWrappers:
         x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
+        )
+
+    @pytest.mark.parametrize("fp32_residual", [False, True])
+    def test_hybrid_decoder_entry_norm_replays(self, fp32_residual):
+        seeded()
+        config = _config(
+            normalization="RMSNorm",
+            post_embedding_rmsnorm=True,
+            fp32_residual_connection=fp32_residual,
+        )
+        module = HybridStack(
+            config=config,
+            submodules=HybridStackSubmodules(),
+            layer_config_list=[],
+            post_process=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        ).cuda()
+        dtype = torch.float32 if fp32_residual else torch.bfloat16
+        x = torch.randn(TOKENS, 2, HIDDEN, device="cuda", dtype=dtype, requires_grad=True)
+        assert_module_replays_bit_exact(
+            module,
+            {"hidden_states": x, "attention_mask": None},
+            replays=3,
+            contention=True,
+            what=f"HybridStack.input_norm[fp32_residual={fp32_residual}]",
         )
 
     @pytest.mark.skipif(TEFusedMLP is None, reason="TE operation-based MLP is unavailable")
