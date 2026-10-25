@@ -58,11 +58,45 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import RLConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
+from megatron.training.state import TrainState
+from megatron.training.training import _pop_samples_seen
 from tests.unit_tests.test_utilities import Utils
 
 BATCH = 2
 SEQ = 4
 VOCAB = 768
+
+
+def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
+    """Refit uses RLConfig while shard layout remains a launch argument."""
+    rl_config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
+    monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+    args = SimpleNamespace(inference_shards="tp=1,role=prefill+tp=1,role=decode", world_size=2)
+    model, inference_model = object(), object()
+    with (
+        patch.object(rl_utils, "disagg_refit_pools", return_value=(2, 1)) as pools,
+        patch.object(rl_utils, "prepare_swap_model_weights") as prepare,
+        patch.object(rl_utils, "swap_model_weights") as swap,
+    ):
+        assert rl_utils.refit_inference_model(model, inference_model, args) == 2
+    pools.assert_called_once_with(args.inference_shards, args.world_size)
+    prepare.assert_called_once_with(
+        src_model=model,
+        target_model=inference_model,
+        num_dst_pools=2,
+        dst_pool_index=1,
+        execution_batch_bytes=4096,
+    )
+    swap.assert_called_once_with(
+        model,
+        inference_model,
+        "nccl",
+        num_dst_pools=2,
+        dst_pool_index=1,
+        execution_batch_bytes=4096,
+    )
+    with rl_utils.inference_model_alloc_context():
+        pass
 
 
 class MockModel(LanguageModule):
@@ -463,6 +497,7 @@ class TestRLUtils:
         get_environment_rollouts to consume banked groups without inference."""
         n_prompts = 4
         fake_groups = [[f"group_{i}"] for i in range(n_prompts)]
+        train_state = TrainState(iteration=1)
         loop = asyncio.new_event_loop()
 
         async def gen():
@@ -478,7 +513,8 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "colocated_inference", colocated)
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", rollout_generator)
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
-        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(curr_iteration=1))
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace())
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
         monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
         monkeypatch.setattr(
             rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
@@ -583,9 +619,10 @@ class TestRLUtils:
             use_distributed_optimizer=True,
             fp8="hybrid",
             fp8_recipe="mxfp8",
-            reuse_grad_buf_for_mxfp8_param_ag=True,
         )
         cfg = pretrain_cfg_container_from_args(args)
+        # Global setup validates the config, so introduce the invalid combination afterward.
+        cfg.ddp.reuse_grad_buf_for_mxfp8_param_ag = True
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
             cfg.validate()
         assert not cfg.ddp.grad_buffer_offload
@@ -598,13 +635,15 @@ class TestRLUtils:
         with pytest.raises(SystemExit):
             parse_args(ignore_unknown_args=False)
 
-    def _patch_rl_inference_mode_deps(self, monkeypatch, args, rl_config):
+    def _patch_rl_inference_mode_deps(self, monkeypatch, args, rl_config, *, iteration=0):
         interface = MagicMock()
         interface.resume.return_value = object()
         interface.suspend.return_value = object()
         loop = SimpleNamespace(run_until_complete=MagicMock())
+        train_state = TrainState(iteration=iteration)
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
         monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
         monkeypatch.setattr(
@@ -656,13 +695,12 @@ class TestRLUtils:
         model = [SimpleNamespace(config=config, module=lang_module)]
         args = SimpleNamespace(
             num_experts=num_experts,
-            curr_iteration=11,
             cuda_graph_impl="local",
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
         interface, _ = self._patch_rl_inference_mode_deps(
-            monkeypatch, args, RLConfig(rl_training_cuda_graphs=False)
+            monkeypatch, args, RLConfig(rl_training_cuda_graphs=False), iteration=11
         )
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
         monkeypatch.setattr(rl_utils, "toggle_cuda_graphs", toggle_cuda_graphs)
@@ -678,6 +716,7 @@ class TestRLUtils:
             call(lang_module, "local"),
             call(lang_module, "none"),
         ]
+        interface.set_generation_epoch.assert_called_once_with(11)
         expected_modules = (
             [
                 CudaGraphModule.mamba,
@@ -710,12 +749,9 @@ class TestRLUtils:
         eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
         advancing iteration, so its evals log against the global step (see PR #6043)."""
         args = SimpleNamespace(
-            do_train=do_train,
-            skip_train=skip_train,
-            world_size=1,
-            cuda_graph_impl="none",
-            seq_length=SEQ,
+            skip_train=skip_train, world_size=1, cuda_graph_impl="none", seq_length=SEQ
         )
+        train_state = TrainState(do_train=do_train)
         rl_config = RLConfig(
             rl_prompts_per_eval=1,
             rl_default_temperature=1.0,
@@ -727,6 +763,7 @@ class TestRLUtils:
         wandb_writer = MagicMock()
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
         monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
@@ -1067,6 +1104,66 @@ class TestRLUtils:
         )
         torch.testing.assert_close(truncated_from_above, expected_above)
         torch.testing.assert_close(truncated_from_below, expected_below)
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="train_rl.py's loss_func runs on CUDA"
+    )
+    @pytest.mark.parametrize("packing", [False, True])
+    def test_forward_step_reports_samples_seen(self, monkeypatch, packing):
+        """train_rl.py's loss function reports the microbatch's sequence count as _samples_seen:
+        the sequences packed into the bin, or the batch size; the loop sums the reports."""
+        with patch("logging.basicConfig"):  # train_rl.py reconfigures the root logger on import
+            import train_rl
+
+        class Timer:  # the straggler detector: a context manager that also takes bdata=
+            def __call__(self, **kwargs):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        tokens = torch.zeros(3, SEQ + 1, dtype=torch.long, device="cuda")
+        values = torch.zeros(3, SEQ, device="cuda")
+        monkeypatch.setattr(train_rl, "stimer", Timer())
+        monkeypatch.setattr(train_rl, "get_timers", MagicMock)
+        monkeypatch.setattr(train_rl, "get_rerun_state_machine", MagicMock)
+        monkeypatch.setattr(train_rl, "get_rl_runtime_state", rl_utils.RLRuntimeState)
+        monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
+        monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
+        monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
+        monkeypatch.setattr(
+            train_rl,
+            "get_run_config",
+            lambda: SimpleNamespace(rl=RLConfig(rl_use_sequence_packing=packing)),
+        )
+        monkeypatch.setattr(
+            train_rl,
+            "get_args",
+            lambda: SimpleNamespace(
+                check_for_nan_in_loss_and_grad=False, check_for_spiky_loss=False
+            ),
+        )
+        if packing:
+            seq_indices = [11, 12, 13, 14, 15]
+            monkeypatch.setattr(
+                train_rl,
+                "load_packed_data_by_index",
+                lambda *a: (tokens, values, values, values, tokens, values, None, [0], [SEQ])
+                + (seq_indices, MagicMock()),
+            )
+            batch, expected = (torch.tensor(0),), len(seq_indices)
+        else:
+            mask = torch.zeros(3, SEQ + 1, device="cuda")  # forward_step drops its first column
+            batch, expected = (tokens, values, values, mask, tokens, values, values), 3
+
+        _, loss_fn = train_rl.forward_step(iter([batch]), MagicMock())
+        report = loss_fn(values)[2]
+
+        assert report["_samples_seen"].item() == expected
+        assert _pop_samples_seen([report, dict(report)]).item() == 2 * expected
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

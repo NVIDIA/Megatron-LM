@@ -763,6 +763,19 @@ class TestArgumentGroupFactoryHelpers:
         result = factory._extract_type(Optional[str])
         assert result == {"type": str}
 
+    @pytest.mark.parametrize('annotation', [int | None, None | int, Union[None, int]])
+    def test_extract_type_optional_order(self, annotation):
+        factory = ArgumentGroupFactory(DummyConfig)
+        assert factory._extract_type(annotation) == {"type": int}
+
+    @pytest.mark.parametrize(
+        'annotation', [int | list[int | None] | None, int | None | list[int | None]]
+    )
+    def test_extract_type_ambiguous_union_needs_metadata(self, annotation):
+        factory = ArgumentGroupFactory(DummyConfig)
+        with pytest.raises(TypeInferenceError, match="Unions not supported by argparse"):
+            factory._extract_type(annotation)
+
     def test_extract_type_list(self):
         """Test type extraction for list types."""
         factory = ArgumentGroupFactory(DummyConfig)
@@ -1061,6 +1074,19 @@ class TestArgumentGroupFactoryArgparseMeta:
 
         with pytest.raises(ArgumentError, match="invalid choice"):
             args = parser.parse_args(['--unsupported-with-metadata', 'baz'])
+
+    def test_eval_iters_cli_remains_scalar(self, capsys):
+        from megatron.training.config import ValidationConfig
+
+        parser = ArgumentParser(exit_on_error=False)
+        ArgumentGroupFactory(ValidationConfig).build_group(parser)
+
+        assert parser.parse_args([]).eval_iters == 100
+        assert parser.parse_args(['--eval-iters', '7']).eval_iters == 7
+        with pytest.raises(ArgumentError, match="invalid int value"):
+            parser.parse_args(['--eval-iters', 'invalid'])
+        assert ValidationConfig(eval_iters=[7, None]).eval_iters == [7, None]
+        assert 'Inferring the appropriate argparse argument type' not in capsys.readouterr().out
 
 
 class TestMegatronNetworkArgumentGeneration:
@@ -1398,8 +1424,25 @@ class TestPretrainContainerFromArgsStructure:
         mock_ddp.return_value = mock_ddp_instance
         args = _make_args()
         result = pretrain_cfg_container_from_args(args)
-        mock_ddp.assert_called_once_with(args)
+        mock_ddp.assert_called_once_with(args, use_torch_fsdp2=False)
         assert result.ddp is mock_ddp_instance
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
+        monkeypatch.setattr(
+            "megatron.training.training.get_megatron_optimizer_config",
+            lambda args: (OptimizerConfig(), {}),
+        )
+
+        cfg = pretrain_cfg_container_from_args(args)
+
+        assert args.use_megatron_fsdp is enabled
+        assert cfg.ddp.use_megatron_fsdp is enabled
+        assert cfg.dist.fake_process_group is enabled
+        assert not hasattr(cfg.dist, "use_megatron_fsdp")
 
 
 class TestCheckpointConfigMapping:

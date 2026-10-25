@@ -40,7 +40,6 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 try:
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
@@ -277,6 +276,17 @@ def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
     return _compute_loss_scale(config, device)
 
 
+def _set_mtp_loss_scale(config, device: torch.device, num_microbatches: int) -> None:
+    """Publish the MTP loss scale so MTP backward (deferred or early) matches the main loss."""
+    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    loss_scale = _get_mtp_loss_scale(config, device)
+    if config.calculate_per_token_loss:
+        MTPLossAutoScaler.set_loss_scale(loss_scale)
+    else:
+        MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+
 def _get_experimental_attention_variant_loss_scale_func(config):
     """Get the loss scale hook for experimental attention variants."""
     loss_scale_func = getattr(config, 'experimental_attention_variant_loss_scale_func', None)
@@ -306,8 +316,6 @@ def forward_step_calc_loss(
     is_last_stage=None,
 ):
     """Calculate the loss and number of tokens for forward_step()"""
-
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -370,13 +378,7 @@ def forward_step_calc_loss(
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
         # Calculate the loss scale based on mtp_grad_scale_func if available,
         # else fall back to grad_scale_func, else default to 1.
-        device = get_tensor_device(output_tensor)
-        loss_scale = _get_mtp_loss_scale(config, device)
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MTPLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        _set_mtp_loss_scale(config, get_tensor_device(output_tensor), num_microbatches)
 
     # Set the loss scale for any experimental attention-variant auxiliary loss.
     experimental_attention_variant_loss_scale_func = (
@@ -388,10 +390,6 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             experimental_attention_variant_loss_scale_func(loss_scale)
         else:
-            # TODO: This path assumes static CP across outstanding pipeline microbatches.
-            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
-            # changes, carry the scale per autograd context instead of via a
-            # process-wide scaler hook.
             cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
             experimental_attention_variant_loss_scale_func(
                 loss_scale * cp_size_for_scaling / num_microbatches
@@ -489,7 +487,6 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -506,6 +503,18 @@ def forward_step(
 
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
+
+    # With mtp_loss_early_backward the MTP heads run their backward inside the forward pass,
+    # so the MTP loss scale must already be current before the model is called. The scale is
+    # refreshed again after the forward (below) for the deferred path.
+    if (
+        getattr(config, 'mtp_num_layers', None) is not None
+        and getattr(config, 'mtp_loss_early_backward', False)
+        and torch.cuda.is_available()
+    ):
+        _set_mtp_loss_scale(
+            config, torch.device('cuda', torch.cuda.current_device()), num_microbatches
+        )
 
     if config.enable_autocast:
         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
@@ -792,24 +801,6 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
-        )
-    elif config.hybrid_context_parallel:
-        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            output_tensor_grad,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            first_val_step,
-            forward_only,
-            no_sync_func,
-            total_num_tokens,
-            check_first_val_step,
-            model_type,
         )
     else:
         with no_sync_func():

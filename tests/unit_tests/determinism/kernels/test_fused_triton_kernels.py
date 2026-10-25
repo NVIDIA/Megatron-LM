@@ -9,8 +9,9 @@
 * ``fused_moe_residual_add``: elementwise with unique stores -- forward and backward replay and
   agree bit for bit with the two unfused adds it replaces.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
-  ``triton.autotune``; forward and backward replay in sbhd and thd layouts, at a head count the
-  autotuned ``BLOCK_H`` divides and at one it does not, plus a check that the result does not
+  ``triton.autotune``; forward and backward replay in sbhd and thd layouts (the query kernels in
+  both RoPE output layouts), at a head count the autotuned ``BLOCK_H`` divides and at one it does
+  not, plus a check that the result does not
   depend on ``BLOCK_H`` at all -- a replay cannot see that, because Triton caches the config the
   first call chose.
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
@@ -324,7 +325,8 @@ def _pinned_block_h(block_h):
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("variant", ["out_of_place", "inplace"])
 @pytest.mark.parametrize("heads", [32, 12])
-def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
+@pytest.mark.parametrize("remove_interleaving", [False, True])
+def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads, remove_interleaving):
     seeded()
     nope_dim, emb_dim = 128, 64
     dtype = torch.bfloat16
@@ -342,10 +344,21 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads):
     fn = fused_mla_rope_out_of_place if variant == "out_of_place" else fused_mla_rope_inplace
 
     def run(t):
-        return fn(t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens)
+        return fn(
+            t,
+            cos,
+            sin,
+            nope_dim,
+            emb_dim,
+            cu_seqlens_q=cu_seqlens,
+            remove_interleaving=remove_interleaving,
+        )
 
     outputs, _ = assert_replays_bit_exact(
-        run, (t,), replays=3, what=f"fused_mla_rope_{variant}[{layout}]"
+        run,
+        (t,),
+        replays=3,
+        what=f"fused_mla_rope_{variant}[{layout}, remove_interleaving={remove_interleaving}]",
     )
     assert torch.isfinite(outputs["out"]).all()
 

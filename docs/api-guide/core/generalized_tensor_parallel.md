@@ -98,7 +98,7 @@ Contrast with FSDP: FSDP gathers at module-group granularity in full precision w
 
 CG compatibility is designed-in from day one, not retrofitted. The entire sync / buffer / chain architecture is shaped around making **captured fwd/bwd replays produce identical bit-for-bit behavior** — without the usual capture-vs-eager pitfalls that force other weight-sharding schemes to either disable CG or require special handling.
 
-- **Chains never cross-link across the capture axis** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`, plus the eager-only grouped-expert chains of §3.4). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
+- **Chains never cross-link across the capture axis** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`, plus the separate grouped-expert FC1 and FC2 chains of §3.4). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
 - **`torch.cuda.Event(external=True)`** for `ag_event` / `rs_event` — the events survive CG capture boundaries and can be waited on from replay-time streams.
 - **Idempotent ticket cache**: `GTPWeightCache.get(ticket)` keeps `slot.buf` set even after `release()`, so replays read the same buffer address as capture. `clear()` drops buffers while keeping tickets valid → supports CG re-capture with lazy re-allocation.
 - **Allocate-in-pool at creation** (`set_cuda_graph_mempool` + `cuda_graph_pool_allocation`): GRAPHED-chain AG/RS buffers and quantized weight storage are allocated **directly into the CG memory pool** at first creation (during warmup, before capture), so no CUDA allocations happen inside the captured graph and no post-hoc reallocation/clone is needed. UNGRAPHED buffers stay in regular allocator memory.
@@ -261,6 +261,7 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `async_reduction` | `True` | Async wgrad reduce-scatter; disable for easier debugging. |
 | `calculate_per_token_loss` | `False` | Must mirror `config.calculate_per_token_loss` (SUM vs MEAN RS). |
 | `graph_wgrad_ring_size` | `2` | Persistent wgrad ring slots per scheduling domain (§3.6). Increase if capture rejects same-key writers. |
+| `eager_wgrad_ring_size` | `2` | Persistent eager wgrad slots per scheduling/shape domain. Increase to delay buffer reuse at the cost of memory; set before the first backward. |
 
 ### 2.2 Required flags
 
@@ -329,7 +330,8 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=1, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
-  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2)
+  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2,
+  eager_wgrad_ring_size=2)
 ```
 
 (`pad_for_alignment=1` here because this example is BF16 with no quantization-tile
@@ -347,6 +349,7 @@ update_gtp_config(
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
     reduce_scatter_with_fp32_accumulation=False,  # wgrad RS: BF16 all-to-all + FP32 sum (§2.6)
     graph_wgrad_ring_size=2,      # Persistent wgrad slots per graph scheduling domain
+    eager_wgrad_ring_size=2,      # Persistent eager wgrad slots; independent of gather buffers
 )
 ```
 
@@ -731,9 +734,9 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 #### Grouped-expert chains (one-block-ahead)
 
-*Problem.* A chain gives every all-gather exactly **one consume-step of runway** — layer *i*'s AG hides behind layer *i−1*'s GEMM — which suffices only while the transfer stays inside the NVLink domain. Routed-expert weights fail that test twice over: by **volume**, a block gathers `2 × num_experts / EP` expert weights — NCCL-coalesced into just **two** all-gathers, one per role — so those two transfers carry most of the block's bytes; by **distance**, `EGTP_remat` is the group that leaves the NVLink domain. The expert transfer therefore stays partly exposed in **every** MoE block, and the exposure grows as expert count rises and per-GEMM time falls.
+*Problem.* A chain gives every all-gather exactly **one consume-step of runway** — layer *i*'s AG hides behind layer *i−1*'s GEMM — which suffices only while the transfer stays inside the NVLink domain. Routed-expert weights fail that test twice over: by **volume**, a block gathers `2 × num_experts / EP` expert weights — NCCL-coalesced into just **two** all-gathers, one for FC1 and one for FC2 — so those two transfers carry most of the block's bytes; by **distance**, `EGTP_remat` is the group that leaves the NVLink domain. The expert transfer therefore stays partly exposed in **every** MoE block, and the exposure grows as expert count rises and per-GEMM time falls.
 
-*Design.* When MoE is *not* captured, `linear_fc1` and `linear_fc2` each get their own homogeneous chain (`GTP_remat_grouped_fc1_ungraphed` / `GTP_remat_grouped_fc2_ungraphed`) instead of sharing the general `UNGRAPHED` chain. A homogeneous chain links the **same weight role of consecutive MoE blocks**, so `next_w` points a whole block ahead rather than one GEMM ahead. The roles stay in *separate* chains deliberately: merging them would link `layer_N.fc1 → layer_N.fc2 → layer_{N+1}.fc1 → …`, so `fc1` would prefetch the **same block's** `fc2` — one GEMM of runway again — and only `fc2` would reach across the block boundary.
+*Design.* In eager and CUDA-graph modes, `linear_fc1` and `linear_fc2` each get their own homogeneous chain (`GTP_remat_grouped_fc1_{graphed,ungraphed}` / `GTP_remat_grouped_fc2_{graphed,ungraphed}`) instead of sharing the general chain. A homogeneous chain links the **same weight role of consecutive MoE blocks**, so `next_w` points a whole block ahead rather than one GEMM ahead. The roles stay in *separate* chains deliberately: merging them would link `layer_N.fc1 → layer_N.fc2 → layer_{N+1}.fc1 → …`, so `fc1` would prefetch the **same block's** `fc2` — one GEMM of runway again — and only `fc2` would reach across the block boundary.
 
 *Result.* The win is **resource overlap**, not faster compute and not a faster network:
 
@@ -742,7 +745,7 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 - **Cost** — one extra buffer per weight role (see *mandatory double buffering* below). No extra collectives, no change to the math.
 - **Bound** — same transfers, same GEMMs, only a different schedule, so the recovered time is exactly the transfer that used to sit on the critical path.
 
-The figure below puts both schedules on one time axis, aligned at *block start* (**top:** shared chain, **bottom:** per-role chains). **Shaded bands** mark which resource is idle — red where one side waits, green where both are busy; **dashed arrows** trace each gather from the GEMM that launches it to the GEMM that consumes it; the **arrow at the right** is the recovered time, equal to the two hatched `STALL` bars above it.
+The figure below puts both schedules on one time axis, aligned at *block start* (**top:** shared chain, **bottom:** separate grouped-expert FC1 and FC2 chains). **Shaded bands** mark which resource is idle — red where one side waits, green where both are busy; **dashed arrows** trace each gather from the GEMM that launches it to the GEMM that consumes it; the **arrow at the right** is the recovered time, equal to the two hatched `STALL` bars above it.
 
 ![GTP grouped-expert AG prefetch — one-step-ahead vs one-block-ahead](../../images/generalized_tensor_parallel/0725_gtp_grouped_oneblock_prefetch.png)
 
@@ -754,11 +757,11 @@ Three consequences:
   - fix: a chain-position **parity (0,1,0,1…)** is folded into the cache key, so consecutive blocks alternate between **exactly two** buffers (counter cleared by `reset_gtp_state()`);
   - without it the prefetch would **overwrite the weight the running GEMM is still reading** — a silent-correctness bug, not a crash;
   - the hazard is not exclusive to grouped chains — *any* chain whose neighbours share a key has it. Grouped chains are same-key throughout, so they take the blanket counter; others take the narrower `_ensure_no_shared_buffer_with` check, which allocates only where the collision is real (see *Buffer / memory management*).
-- **Eager only** — the optimization disables itself under CUDA-graph capture:
-  - `_classify_param_chain` evaluates `graphed = _FULL_ITERATION or ("moe" in cuda_graph_modules)` **before** the split, and returns the plain `GRAPHED` chain when it is true;
-  - so with `--cuda-graph-impl full_iteration` **every** param is `GRAPHED` — expert weights included — and they keep the ordinary one-step-ahead prefetch;
-  - why it must: `cuda_graphs.py` drains with `wait_async_comms(GTPChain.GRAPHED.value)`, matching the id **literally**, so a weight in `GTP_remat_grouped_fc1_ungraphed` would never be joined at the graph boundary — a **correctness** hazard, not just a lost overlap;
-  - lifting it would mean draining by chain-id *prefix* (`_chain_is_grouped`) or registering the grouped streams before capture — neither is done today.
+- **CUDA-graph integration.** The supplement to #6057 preserves the role split in full-iteration and local graphs:
+  - graph boundaries drain **all captured chains**, while leaving eager chains outside the capture;
+  - the runner registers the shared grouped AG/RS streams and routes gradient-ready hooks to each parameter's actual RS stream;
+  - captured RS outputs retain exclusive ownership, and local-graph wgrad rings keep FC1/FC2 storage separate even when their shapes match;
+  - forward links connect the same role in the next block; backward links reverse that order. The chain heads still gather on demand. The available overlap depends on computation and communication duration; it is not a guarantee that all communication is hidden.
 
 ### 3.5 GTP_remat + Multi-Token Prediction (MTP)
 
@@ -872,6 +875,19 @@ The two modes differ only in release timing and the storage required to make ear
 *Result and cost.* The ring owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail remains zero (§3.7 covers why that permanent zero has to be excluded from `num_zeros`), and a non-ring producer is copied into the logical view before reduce-scatter. The bounded memory cost is up to `graph_wgrad_ring_size` full unsharded wgrad buffers for each matching scheduling/shape domain, rather than one buffer per layer. The default ring size of two is sufficient when each graph has one same-key writer: one slot may remain an in-flight RS input while the next graph writes the other, and reuse waits on the older slot's `ready_event`. A larger ring is needed only when one graph contains multiple same-key writers whose reduce-scatter inputs can be live together. Capture rejects unsafe same-slot reuse instead of silently aliasing it.
 
 The feature applies only to **local/partial CUDA graphs** and is enabled automatically. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
+
+Eager callers that request persistent wgrad storage use a separate ring controlled by
+`eager_wgrad_ring_size` (default 2, minimum 1). On the first persistent-buffer request
+in a domain, all matching registered parameters are bound to fixed slots in registration
+order using the shared allocator and the same round-robin rule as CUDA graphs. Domains keep
+communication, shape, dtype, and expert index separate; grouped FC1 and FC2 have separate
+rings. Each domain allocates the smaller of the configured depth and its writer count.
+Before reuse, the previous owner finalizes any pending reduction and the compute stream
+waits on the slot's completion event. A deeper ring delays reuse and may improve overlap,
+at the cost of additional unsharded gradient buffers. It does not change gather-buffer
+double buffering, and a repeated backward for the same parameter still reuses its bound
+slot. Configure the depth before the first backward; `reset_gtp_state()` clears both the
+slots and their assignments.
 
 ### 3.7 Per-parameter alignment padding
 
