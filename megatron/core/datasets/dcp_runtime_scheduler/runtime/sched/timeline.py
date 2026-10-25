@@ -27,55 +27,6 @@ class TimelineModel:
     def scalar(self):
         return self.program is None
 
-    @classmethod
-    def from_evaluator(cls, evaluator):
-        """Build from a dcp_scheduler TrainingEvaluator (PP1/VPP1, no token models)."""
-        o = evaluator.options
-        if o.get('pp_size', 1) != 1 or o.get('vpp_size', 1) != 1:
-            raise ValueError('fast timeline supports PP1/VPP1 only')
-        for key in (
-            'forward_local_token_models',
-            'backward_local_token_models',
-            'forward_ep_group_token_models',
-            'backward_ep_group_token_models',
-        ):
-            if o.get(key):
-                raise ValueError('token-dependent non-attention models are not supported')
-        program = o.get('execution_program')
-        if program is not None:
-            if len(program) != 1:
-                raise ValueError('program mode supports one virtual stage')
-            ops = (
-                tuple(_freeze_op(op) for op in program[0]['forward']),
-                tuple(_freeze_op(op) for op in program[0]['backward']),
-            )
-            return cls(
-                o['world_size'],
-                o['ep_size'],
-                o['layer_count'],
-                0.0,
-                0.0,
-                float(o.get('iteration_tail_ms', 0.0)),
-                bool(o.get('first_forward_dp_cp_sync', True)),
-                ops,
-            )
-        fwd = o.get('forward_non_attention_ms_per_layer', 0.0)
-        bwd = o.get('backward_non_attention_ms_per_layer', 0.0)
-        if isinstance(fwd, (list, tuple)):
-            fwd = fwd[0]
-        if isinstance(bwd, (list, tuple)):
-            bwd = bwd[0]
-        return cls(
-            o['world_size'],
-            o['ep_size'],
-            o['layer_count'],
-            float(fwd),
-            float(bwd),
-            float(o.get('iteration_tail_ms', 0.0)),
-            bool(o.get('first_forward_dp_cp_sync', True)),
-            None,
-        )
-
     # ------------------------------------------------------------------ state
     def initial_state(self):
         n = self.blocks if self.scalar else self.world_size
@@ -103,12 +54,6 @@ class TimelineModel:
         for index, groups in enumerate(rounds):
             state = self.advance(state, groups, index == 0)
         return self.makespan(state)
-
-    def microbatch_time(self, groups, state=None):
-        """Time added to the slowest block by one microbatch from a given (or idle) state."""
-        base = state if state is not None else self.initial_state()
-        new = self.advance(base, groups, state is None)
-        return max(new) - max(base)
 
     # ---------------------------------------------------------------- scalar
     def _scalar_phase(self, state, groups, phase):
@@ -157,30 +102,3 @@ class TimelineModel:
                     m = max(t[start : start + cp]) + g[4][payload]
                     t[start : start + cp] = [m] * cp
         return t
-
-
-def _freeze_op(op):
-    if 'cost' in op:
-        return ('cp', op['cost'])
-    return (op['sync'], float(op['duration_ms']))
-
-
-def costed_groups(rounds):
-    """Convert rebuilt dcp_scheduler rounds (with cost fields) into the tuple form."""
-    result = []
-    for row in rounds:
-        groups, start = [], 0
-        for g in row:
-            program = g.get('program_costs_ms_by_stage')
-            groups.append(
-                (
-                    start,
-                    int(g['cp']),
-                    float(g['forward_cost_ms']),
-                    float(g.get('backward_cost_ms', 0.0)),
-                    dict(program[0]) if program else None,
-                )
-            )
-            start += int(g['cp'])
-        result.append(groups)
-    return result

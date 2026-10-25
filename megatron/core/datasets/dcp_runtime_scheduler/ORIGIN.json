@@ -5,7 +5,8 @@
   "adaptations": [
     "remove historical heads/schema compatibility/report production",
     "retain the selected numerical operations and coefficient values",
-    "extract only runtime parameters; original validation reports remain in the source repository"
+    "extract only runtime parameters; original validation reports remain in the source repository",
+    "remove unused offline adapters and signature estimates; share sequence-cap and Python/Numba dispatch implementations"
   ],
   "source_python_sha256": {
     "runtime/lightweight.py": "86720aded0f19a6a45d4fb10752ed7228a12ddb9c4dd41d78d9087df4d85cc17",

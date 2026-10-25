@@ -9,6 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.core.datasets import dcp_schedule_prefetch as prefetch
+from megatron.core.datasets.dcp_runtime_scheduler.attention.dispatch import (
+    dispatch_backend,
+    dispatch_chain,
+)
 from megatron.core.datasets.dcp_runtime_scheduler.models import (
     AttentionCostModel,
     CorePredictor,
@@ -24,6 +28,7 @@ from megatron.core.datasets.dcp_runtime_scheduler.runtime.planner import (
     RuntimeScheduleError,
     validate_rows,
 )
+from megatron.core.datasets.dcp_runtime_scheduler.runtime.sched.costs import PackCostModel
 
 
 def _geometry(world=8, capacity=1024, ep=2):
@@ -120,3 +125,29 @@ def test_explicit_solver_options_remain_supported():
         time_budget_s=0.25, max_scored_candidates=2, max_guide_candidates=2, cp_floors=(1, 3, 5, 8)
     )
     assert options.cp_floors == (1, 3, 5, 8)
+
+
+def test_pack_costs_enforce_sequence_cap_without_a_wrapper():
+    geometry = _geometry()
+    model = QuadraticCostModel(geometry)
+    costs = PackCostModel(geometry, model.forward, model.backward, max_group_seqs=2)
+    assert costs.fits((16, 16), 8)
+    assert not costs.fits((16, 16, 16), 8)
+    assert not costs.fits((geometry.capacity(8) + 1,), 8)
+
+
+@pytest.mark.parametrize('backend', ['python', 'numba'])
+@pytest.mark.parametrize(
+    'units,slots,expected',
+    [
+        ((), 4, (0.0, 0, 0, 0, 0)),
+        ((1, 4, 2), 4, (4.5, 1, 4, 3, 4)),
+        ((4,) * 9, 4, (13.5, 3, 12, 9, 4)),
+        ((8, 1, 3), 1, (13.5, 3, 12, 3, 8)),
+    ],
+)
+def test_shared_python_numba_dispatch_keeps_exact_chain_quantities(backend, units, slots, expected):
+    if backend == 'numba':
+        pytest.importorskip('numba')
+    with dispatch_backend(backend):
+        assert dispatch_chain(units, slots, 0.5) == expected

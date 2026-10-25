@@ -7,8 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .sched.costs import PackCostModel
-
 
 class RuntimeScheduleError(RuntimeError):
     """Raised when the runtime scheduler cannot produce a valid schedule (every rank raises the same error in Megatron)."""
@@ -194,22 +192,3 @@ def dummy_tokens_per_group(
         ]
         for row in groups
     ]
-
-
-@dataclass
-class CappedPackCostModel(PackCostModel):
-    """``PackCostModel`` whose capacity rule also enforces the per-group sequence cap.
-
-    ``sched.scheduler.RuntimeScheduler`` honours ``max_group_seqs`` itself, but the vendored ``sched.polish.Polisher`` only asks
-    ``fits()`` before moving a sequence into a group, so its eliminate / relocate moves could grow a group past
-    ``thd_max_packed_sequences`` (the THD capacity MCore materialises) and ``validate_rows`` would then fail the whole step.
-    Enforcing the cap in ``fits()`` keeps every polish move within the cap without editing the byte-identical ``sched/``.
-    With ``max_group_seqs=None`` the rule is exactly ``PackCostModel.fits`` (harness parity).
-    """
-
-    max_group_seqs: Optional[int] = None
-
-    def fits(self, lengths, cp):
-        if self.max_group_seqs is not None and len(lengths) > self.max_group_seqs:
-            return False
-        return super().fits(lengths, cp)

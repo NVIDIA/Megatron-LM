@@ -10,13 +10,13 @@ from dataclasses import dataclass, replace
 
 from .cost_model import build_timeline
 from .planner import (
-    CappedPackCostModel,
     RuntimePlan,
     RuntimeScheduleError,
     dummy_tokens_per_group,
     encode_rows,
     validate_rows,
 )
+from .sched.costs import PackCostModel
 
 
 @dataclass(frozen=True)
@@ -63,7 +63,7 @@ class LightweightRuntimePlanner:
         self.last_statistics = {}
 
     def _new_costs(self):
-        return CappedPackCostModel(
+        return PackCostModel(
             self.geometry,
             self.model.forward,
             self.model.backward,
@@ -73,7 +73,6 @@ class LightweightRuntimePlanner:
                 if getattr(self.model, "placement_invariant", False)
                 else self.geometry.world_size
             ),
-            signature_estimates=False,
             max_group_seqs=self.geometry.max_group_seqs or 64,
         )
 

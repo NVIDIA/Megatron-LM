@@ -50,49 +50,12 @@ def kv_units(pieces, mask, q_heads, R_bwd) -> list:
     return out
 
 
-def greedy_chain(units, P, rho) -> tuple:
-    """Greedy wave duration with the critical slot's unit and tile counts."""
-    import heapq
-
-    from .dispatch import accelerated_chain
-
-    compiled = accelerated_chain(units, P, rho)
-    if compiled is not None:
-        return compiled
-    costs = [(float(rho) + float(k), int(k)) for k in units]
-    N = len(costs)
-    if N == 0:
-        return (0.0, 0, 0, 0, 0)
-    jmax = max((k for _, k in costs))
-    if N <= int(P):
-        c, k = max(costs, key=lambda t: t[0])
-        return (c, 1, k, N, jmax)
-    if costs[0][0] > 0 and all((pair == costs[0] for pair in costs)):
-        count = ceil_div(N, P)
-        end = 0.0
-        for _ in range(count):
-            end += costs[0][0]
-        return (end, count, count * costs[0][1], N, jmax)
-    heap = [(0.0, i) for i in range(int(P))]
-    heapq.heapify(heap)
-    n_units = [0] * int(P)
-    tiles = [0] * int(P)
-    end_t, end_i = (0.0, 0)
-    for c, k in costs:
-        e, i = heap[0]
-        e += c
-        n_units[i] += 1
-        tiles[i] += k
-        heapq.heapreplace(heap, (e, i))
-        if e > end_t:
-            end_t, end_i = (e, i)
-    return (end_t, n_units[end_i], tiles[end_i], N, jmax)
-
-
 @lru_cache(maxsize=1024)
 def kernel_dispatch(units, P, rho):
-    span, n_chain, chain_tiles, count, maximum = greedy_chain(units, P, rho)
-    return (span, n_chain, chain_tiles, count, maximum)
+    """Greedy wave duration with the critical slot's unit and tile counts."""
+    from .dispatch import dispatch_chain
+
+    return dispatch_chain(units, P, rho)
 
 
 @lru_cache(maxsize=4096)

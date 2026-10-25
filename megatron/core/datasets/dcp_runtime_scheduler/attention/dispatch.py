@@ -75,3 +75,9 @@ def accelerated_chain(units, slots, rho):
     if _BACKEND.get() == "python":
         return None
     return compiled_chain(units, slots, rho)
+
+
+def dispatch_chain(units, slots, rho):
+    """Shared integer-tile dispatch for Python and optional Numba execution."""
+    result = accelerated_chain(units, slots, rho)
+    return _chain(units, int(slots), float(rho)) if result is None else result
