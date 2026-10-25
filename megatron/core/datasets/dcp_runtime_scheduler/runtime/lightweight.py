@@ -111,13 +111,16 @@ class LightweightRuntimePlanner:
 
     def _fill_pack(self, anchor, pending, cp, storage):
         """All proposal families use the same ordered physical-capacity check."""
-        ids, used = [anchor], storage[cp][anchor]
+        stored = storage[cp]
+        limit = self.geometry.max_group_seqs or 64
+        capacity = self.geometry.capacity(cp)
+        ids, used = [anchor], stored[anchor]
         for i in pending:
-            if len(ids) >= (self.geometry.max_group_seqs or 64):
+            if len(ids) >= limit:
                 break
-            if i != anchor and used + storage[cp][i] <= self.geometry.capacity(cp):
+            if i != anchor and used + stored[i] <= capacity:
                 ids.append(i)
-                used += storage[cp][i]
+                used += stored[i]
         return ids, used
 
     def _expand(self, row, lengths, widths=None, cost_aware=False):
