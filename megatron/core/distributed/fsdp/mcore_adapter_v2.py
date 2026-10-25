@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -51,6 +51,9 @@ try:
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+        named_checkpoint_parameters,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
         current_fully_shard_context,
     )
@@ -58,6 +61,7 @@ try:
         copy_parameter_attributes,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        get_containing_parameter_group,
         sync_model_weights_from_main_weights,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_sharding_strategy
@@ -317,13 +321,36 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
 
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        """Expose global DTensor views only at the checkpoint boundary."""
+        state_dict = super().state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
+        for name, parameter in named_checkpoint_parameters(self.module):
+            key = prefix + name
+            if key in state_dict:
+                state_dict[key] = parameter
+        return state_dict
+
     def load_state_dict(self, state_dict, strict=True):
-        """Load main weights and refresh the buffers used for forward compute."""
-        super().load_state_dict(state_dict, strict=strict)
-        # DCP writes into FP32 main-weight DTensors. BF16 and quantized compute
-        # buffers have separate storage and must be refreshed before the first
-        # resumed forward, just as they are after every optimizer step.
-        sync_model_weights_from_main_weights(self.module.parameters())
+        """
+        Load the state dictionary into the module.
+        """
+        custom_state_dict = {}
+        for key, value in state_dict.items():
+            if self.config.fp8 and key.endswith('._extra_state'):
+                # Skip extra state keys
+                continue
+            custom_state_dict[f"module.{key}"] = value
+
+        if self.config.fp8 or self.config.gated_linear_unit:
+            strict = False
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Loading state_dict with strict=False due to fp8 configuration. "
+                "This is expected as some keys may not match exactly.",
+            )
+
+        self.module.load_state_dict(custom_state_dict, strict=strict)
 
     @staticmethod
     def _validate_config(
@@ -508,10 +535,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         grads = []
         for parameter in self.parameters():
             if parameter.grad is not None:
+                group = get_containing_parameter_group(parameter)
+                assert group is not None, "Missing MFSDP gradient layout."
+                buffer = group.pre_optimizer_main_grad
+                assert buffer is not None, "Missing MFSDP gradient buffer."
                 assert not any(
-                    placement.is_partial() for placement in parameter.grad.placements
+                    placement.is_partial() for placement in buffer.placements
                 ), "MFSDP v2 gradient scaling requires finalized gradients."
-                grads.append(parameter.grad.to_local())
+                grads.append(parameter.grad)
         if grads:
             torch._foreach_mul_(grads, scaling_factor)
 
