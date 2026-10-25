@@ -2884,6 +2884,17 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
+            # Eager steps and TE's side-stream warmup can leave AccumulateGrad nodes alive that
+            # reference a stream outside the capture. A leaf whose weight gradient is written out
+            # of band and returned to autograd as None (e.g. virtual-expert runtime weights) gets
+            # no gradient that could move its node onto the capturing stream, so autograd's
+            # end-of-backward sync with that stream would cross the capture boundary. Match the
+            # local and full-iteration capture paths: let autograd redirect stale streams to the
+            # capturing stream and skip such syncs. Intentionally leave this process-global
+            # setting enabled, as those paths do; the API has no getter for restoring its
+            # previous value.
+            if hasattr(torch.autograd.graph, "set_override_stale_capture_stream"):
+                torch.autograd.graph.set_override_stale_capture_stream(True)
             with rng_context:
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
