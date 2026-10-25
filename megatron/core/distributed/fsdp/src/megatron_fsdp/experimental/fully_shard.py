@@ -18,24 +18,64 @@ import dataclasses
 import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 
+import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext, current_fully_shard_context
+from .context import FsdpContext
 from .module import FsdpModule
 from .placement import ShardLayout
 from .schedule import SchedulePolicy
 
-# TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
-# Scope management and shared runtime state are separate responsibilities (SRP):
-# https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html
-# Keep this alias for now to avoid changing callers and limit this PR's scope.
-fully_shard_context = FsdpContext
+_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
 MeshAxis = int | str
+
+
+@contextmanager
+def fully_shard_context(
+    device: torch.device | None = None,
+    use_symmetric_memory: bool = False,
+    unify_communication_stream: bool = False,
+    parameter_to_owner: dict[nn.Parameter, int] | None = None,
+    caller_managed_grad_sync: bool = False,
+) -> Iterator[FsdpContext]:
+    """Construct FSDP modules with shared runtime state, finalizing on successful exit.
+
+    The yielded :class:`FsdpContext` remains available to the modules after this
+    construction scope ends. See that class for the construction options.
+    """
+    if _FSDP_CONTEXT.get() is not None:
+        raise RuntimeError("fully_shard_context does not support nesting.")
+    context = FsdpContext(
+        device=device,
+        use_symmetric_memory=use_symmetric_memory,
+        unify_communication_stream=unify_communication_stream,
+        parameter_to_owner=parameter_to_owner,
+        caller_managed_grad_sync=caller_managed_grad_sync,
+    )
+    token = _FSDP_CONTEXT.set(context)
+    try:
+        yield context
+        context.finalize()
+    finally:
+        _FSDP_CONTEXT.reset(token)
+
+
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
 
 
 @dataclasses.dataclass(frozen=True)
