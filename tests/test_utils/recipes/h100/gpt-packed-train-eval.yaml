@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{packing_mode}_{environment}_{platforms}"
+  name: "{test_case}_{environment}_{platforms}"
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -17,15 +17,17 @@ spec:
     export PYTHONPATH="$(pwd):${{PYTHONPATH:-}}"
     export UV_NO_SYNC=1
     for repeat in $(seq 1 {n_repeat}); do
-      uv run --no-sync python \
-        tests/functional_tests/test_cases/gpt/{test_case}/run_test.py \
-        --packing-mode {packing_mode} \
-        --output-path {assets_dir}/packed-{packing_mode}-${{repeat}}
+      # The launcher selects one workload by test_case; run both modes here.
+      for packing_mode in static dynamic; do
+        uv run --no-sync python \
+          tests/functional_tests/test_cases/gpt/{test_case}/run_test.py \
+          --packing-mode "${{packing_mode}}" \
+          --output-path "{assets_dir}/packed-${{packing_mode}}-${{repeat}}"
+      done
     done
 products:
   - test_case: [gpt_packed_train_eval]
     products:
-      - packing_mode: [static, dynamic]
-        environment: [dev]
+      - environment: [dev]
         scope: [mr-github]
         platforms: [dgx_h100]
