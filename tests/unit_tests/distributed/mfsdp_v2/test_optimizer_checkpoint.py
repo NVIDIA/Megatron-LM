@@ -11,7 +11,10 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.tensor import DTensor
 
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel,
+    FullyShardedDataParallelV2,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
@@ -63,7 +66,7 @@ def _shard_and_build_optimizer(
     module: torch.nn.Module,
     *,
     precision_aware: bool = False,
-) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
+) -> tuple[FullyShardedDataParallelV2, FullyShardedOptimizer]:
     """Shard ``module`` with MFSDP v2 and build its :class:`FullyShardedOptimizer`.
 
     Args:
@@ -101,6 +104,7 @@ def _shard_and_build_optimizer(
         exp_avg_sq_dtype=torch.bfloat16 if precision_aware else torch.float32,
     )
     optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
+    assert isinstance(model, FullyShardedDataParallelV2)
     assert isinstance(optimizer, FullyShardedOptimizer)
     return model, optimizer
 
@@ -117,7 +121,7 @@ def _build_model_and_optimizer(
     *,
     zero_init: bool,
     precision_aware: bool = False,
-) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
+) -> tuple[FullyShardedDataParallelV2, FullyShardedOptimizer]:
     """Build an MFSDP v2 sharded transformer block and its :class:`FullyShardedOptimizer`."""
     block = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
         device="cuda", dtype=config.params_dtype
@@ -131,7 +135,7 @@ def _build_model_and_optimizer(
 
 def _build_tied_model_and_optimizer(
     config: TransformerConfig, pg_collection: ProcessGroupCollection, *, zero_init: bool
-) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
+) -> tuple[FullyShardedDataParallelV2, FullyShardedOptimizer]:
     """Build an MFSDP v2 sharded :class:`_TiedLinears` and its :class:`FullyShardedOptimizer`."""
     module = _TiedLinears(config).to(device="cuda", dtype=config.params_dtype)
     if zero_init:
@@ -140,7 +144,7 @@ def _build_tied_model_and_optimizer(
 
 
 def _train_step(
-    config: TransformerConfig, model: FullyShardedDataParallel, optimizer: FullyShardedOptimizer
+    config: TransformerConfig, model: FullyShardedDataParallelV2, optimizer: FullyShardedOptimizer
 ) -> None:
     """Run one optimizer step so the weights and the optimizer state become non-trivial."""
     model.zero_grad_buffer()
@@ -152,7 +156,7 @@ def _train_step(
     assert success
 
 
-def _tied_parameter_names(model: FullyShardedDataParallel) -> set[str]:
+def _tied_parameter_names(model: FullyShardedDataParallelV2) -> set[str]:
     """Return every name a parameter of ``model`` is reachable under more than once."""
     names_by_parameter: dict[int, set[str]] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
@@ -183,7 +187,7 @@ def _assert_tensors_identical(expected: torch.Tensor, actual: torch.Tensor, what
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"{what}: value mismatch")
 
 
-def _snapshot_model_state(model: FullyShardedDataParallel) -> dict[str, torch.Tensor]:
+def _snapshot_model_state(model: FullyShardedDataParallelV2) -> dict[str, torch.Tensor]:
     """Clone the model weights, keyed as the checkpoint state dict is.
 
     DTensor entries are cloned as DTensors so the comparison can check the global shape and
@@ -200,6 +204,8 @@ def _snapshot_optimizer_state(optimizer: FullyShardedOptimizer) -> dict[str, dic
     """Clone this rank's optimizer state, keyed by globally unique parameter name."""
     snapshot: dict[str, dict[str, Any]] = {}
     for param, state in optimizer.optimizer.state.items():
+        assert not isinstance(param, DTensor), "Checkpoint wrapper leaked into runtime parameters"
+        assert all(not isinstance(value, DTensor) for value in state.values())
         fqn = get_global_unique_param_name(optimizer.model_chunks, param)
         snapshot[fqn] = {
             key: (value.clone() if torch.is_tensor(value) else value)
@@ -221,7 +227,7 @@ def _snapshot_param_group_hyperparameters(optimizer: FullyShardedOptimizer) -> l
 
 
 def _assert_model_matches_snapshot(
-    model: FullyShardedDataParallel, model_snapshot: dict[str, torch.Tensor]
+    model: FullyShardedDataParallelV2, model_snapshot: dict[str, torch.Tensor]
 ) -> bool:
     """Assert the model's local weights equal the snapshot.
 
@@ -298,6 +304,10 @@ class TestOptimizerCheckpoint:
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
+        assert model_snapshot and all(
+            isinstance(model_snapshot[name], DTensor)
+            for name, _ in source_model.module.named_parameters()
+        )
         state_snapshot = _snapshot_optimizer_state(source_optimizer)
         param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
         assert {group["step"] for group in param_group_snapshot} == {source_steps}
@@ -307,9 +317,7 @@ class TestOptimizerCheckpoint:
             empty_local = sum(
                 1
                 for param in source_model.parameters()
-                if param.requires_grad
-                and isinstance(param, DTensor)
-                and param.to_local().numel() == 0
+                if param.requires_grad and _local_numel(param) == 0
             )
             empty_local_counts = [None] * world_size
             torch.distributed.all_gather_object(empty_local_counts, empty_local)
@@ -342,6 +350,7 @@ class TestOptimizerCheckpoint:
             # optimizer's momentum buffers are restored by this call alone; load_state_dict
             # then reinstalls the param-group hyperparameters.
             dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+            destination_model.load_state_dict(load_state_dict["model"])
             destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
         local_nonempty = _assert_model_matches_snapshot(destination_model, model_snapshot)
@@ -396,6 +405,10 @@ class TestOptimizerCheckpoint:
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
+        assert model_snapshot and all(
+            isinstance(model_snapshot[name], DTensor)
+            for name, _ in source_model.module.named_parameters()
+        )
         state_snapshot = _snapshot_optimizer_state(source_optimizer)
         param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
 
@@ -433,6 +446,7 @@ class TestOptimizerCheckpoint:
             }
             preprocess_state_dict_for_uneven_dtensor(load_state_dict)
             dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+            destination_model.load_state_dict(load_state_dict["model"])
             destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
         _assert_model_matches_snapshot(destination_model, model_snapshot)

@@ -54,7 +54,7 @@ def _gather_parameter_shards(tensor):
     # Packed FSDP shards can own unequal row counts, including empty shards.
     # DTensor.full_tensor() assumes ordinary per-parameter Shard(0) partitions.
     shards = [None] * dist.get_world_size()
-    dist.all_gather_object(shards, tensor.to_local().detach().cpu())
+    dist.all_gather_object(shards, tensor.detach().cpu())
     return torch.cat(shards, dim=0).to(tensor.device)
 
 

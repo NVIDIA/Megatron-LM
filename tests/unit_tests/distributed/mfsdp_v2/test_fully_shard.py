@@ -14,7 +14,7 @@ import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -359,8 +359,7 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     Backward completes ``fc2`` before recomputing ``fc1``. Without suppressing
     forward prefetch during recomputation, ``fc1`` unshards ``fc2`` again after
-    its backward hook has run, leaving ``fc2.weight`` as an unsharded Parameter
-    instead of a sharded DTensor at the end of backward.
+    its backward hook has run, leaving ``fc2.weight`` unsharded at the end of backward.
     """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -372,14 +371,15 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
         fully_shard(model.fc2, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
+    sharded_parameters = dict(model.named_parameters())
     x = torch.randn(2, 8, device=device, requires_grad=True)
     model(x).sum().backward()
 
     # Without the forward-prefetch suppression, ``fc1``'s recomputed forward
     # would unshard ``fc2`` after ``fc2``'s backward already resharded it,
-    # leaving an unsharded Parameter here.
-    assert isinstance(model.fc1.weight, DTensor)
-    assert isinstance(model.fc2.weight, DTensor)
+    # leaving different parameter objects from those exposed to the optimizer.
+    for name, parameter in model.named_parameters():
+        assert parameter is sharded_parameters[name]
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
@@ -691,10 +691,8 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
         model(x).sum().backward()
     model(x).sum().backward()
 
-    assert isinstance(model.weight.grad, DTensor)
-    local_grad = model.weight.grad.to_local()
-    expected = torch.full_like(local_grad, float(world_size + 1))
-    torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
+    expected = torch.full((1, 1), float(world_size + 1), device=device)
+    torch.testing.assert_close(model.weight.grad, expected, rtol=0, atol=0)
 
 
 def test_rejects_optimizer_placements_larger_than_model_weight_placements(distributed_setup):

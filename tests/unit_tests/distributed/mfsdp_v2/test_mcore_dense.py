@@ -2,7 +2,9 @@
 
 """Dense MCore adapter and optimizer integration tests for MFSDP v2."""
 
+import copy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -12,8 +14,13 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.checkpoint import (
+    named_checkpoint_parameters,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -26,6 +33,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.training.utils import common_utils
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -88,7 +96,7 @@ def test_mxfp8_parameters(process_group_collection):
         module=block,
         pg_collection=process_group_collection,
     )
-    # FSDP installs DTensor shards; check the parameters used for compute.
+    # FSDP installs local shards; check the parameters used for compute.
     parameters = []
     for module in model.module.modules():
         if not isinstance(module, FsdpModule):
@@ -143,7 +151,7 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
     parameters = dict(wrapped.module.named_parameters())
     assert parameters
     for name, parameter in parameters.items():
-        local_parameter = parameter.to_local()
+        local_parameter = parameter
 
         # Some parameters use module-specific initializers, so only check those
         # initialized by the configured init method.
@@ -635,8 +643,8 @@ def test_gradient_clipping_reaches_global_norm(
     parameters = [
         parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
     ]
-    assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
-    expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+    assert all(not isinstance(parameter.grad, DTensor) for parameter in parameters)
+    expected_pre_clip_norm = global_norm([p.grad for p in parameters])
     assert (
         expected_pre_clip_norm > clip_grad
     ), "Test gradients must exceed the clipping threshold to exercise clipping."
@@ -646,5 +654,123 @@ def test_gradient_clipping_reaches_global_norm(
     assert success
     torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
     torch.testing.assert_close(
-        global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
+        global_norm([p.grad for p in parameters]), clip_grad, rtol=1e-3, atol=0
     )
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+@pytest.mark.parametrize("trainable_only", [False, True])
+def test_log_params_norm_uses_local_shards(
+    process_group_collection, monkeypatch, strategy, trainable_only
+):
+    """Parameter logging matches full weights, including aliases and frozen parameters."""
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+    torch.manual_seed(1234)
+    module = torch.nn.Module()
+    module.first = torch.nn.Linear(5, 7, device="cuda")
+    module.second = torch.nn.Linear(7, 3, device="cuda")
+    module.alias = module.first
+    module.second.bias.requires_grad_(False)
+    expected_squared = sum(
+        parameter.detach().float().square().sum()
+        for parameter in module.parameters()
+        if not trainable_only or parameter.requires_grad
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy=strategy,
+        ),
+        module=module,
+        pg_collection=process_group_collection,
+    )
+    monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=True))
+
+    # Keep the DTensor norm interface used by MFSDP v1 working as well.
+    runtime_parameters = dict(model.module.named_parameters())
+    checkpoint_parameters = {
+        runtime_parameters[name]: parameter
+        for name, parameter in named_checkpoint_parameters(model.module)
+        if name in runtime_parameters
+        and (not trainable_only or runtime_parameters[name].requires_grad)
+    }
+    assert common_utils.calc_dtensor_params_l2_norm(
+        checkpoint_parameters.values()
+    ) == pytest.approx(expected_squared.sqrt().item())
+
+    def reject_dtensor(*args, **kwargs):
+        pytest.fail("Parameter logging must not create checkpoint DTensors")
+
+    monkeypatch.setattr(DBuffer, "get_dtensor", reject_dtensor)
+    actual_squared = common_utils.calc_params_l2_norm(
+        model, return_squared_tensor=True, trainable_only=trainable_only
+    )
+    torch.testing.assert_close(actual_squared.reshape(()), expected_squared)
+    actual = common_utils.calc_params_l2_norm(model, trainable_only=trainable_only)
+    assert actual == pytest.approx(expected_squared.sqrt().item())
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+def test_per_token_gradients_match_reference(process_group_collection, strategy):
+    """Finalize accumulated local gradients by the global token count, then update weights."""
+    config = TransformerConfig(
+        num_layers=1, hidden_size=16, num_attention_heads=4, calculate_per_token_loss=True
+    )
+    torch.manual_seed(1234)
+    reference = torch.nn.Linear(5, 7, device="cuda")
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy=strategy,
+        ),
+        module=copy.deepcopy(reference),
+        pg_collection=process_group_collection,
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            optimizer="sgd", lr=0.01, weight_decay=0.0, sgd_momentum=0.0, clip_grad=0.0
+        ),
+        [model],
+    )
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+    batches = [torch.randn(Utils.rank + 1 + i, 5, device="cuda") for i in range(2)]
+
+    def full_tensor(local):
+        if strategy == "no_shard":
+            return local
+        shards = [None] * Utils.world_size
+        torch.distributed.all_gather_object(shards, local.detach().cpu())
+        return torch.cat(shards).to(local.device)
+
+    token_count = sum(batch.shape[0] for batch in batches)
+    global_tokens = torch.tensor(token_count, device="cuda")
+    torch.distributed.all_reduce(global_tokens)
+    for _ in range(3):
+        model.zero_grad_buffer()
+        optimizer.zero_grad()
+        reference_optimizer.zero_grad()
+        batch_iter = iter(batches)
+        run_forward_backward_on_microbatches(
+            model, lambda: model(next(batch_iter)).square().sum(), num_microbatches=2
+        )
+        finalize_model_grads(
+            [model],
+            torch.tensor(token_count, device="cuda"),
+            pg_collection=process_group_collection,
+        )
+        for batch in batches:
+            reference(batch).square().sum().backward()
+        for parameter in reference.parameters():
+            torch.distributed.all_reduce(parameter.grad)
+            parameter.grad.div_(global_tokens)
+        for actual, expected in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(full_tensor(actual.grad), expected.grad)
+        success, _, _ = optimizer.step()
+        assert success
+        reference_optimizer.step()
+        for actual, expected in zip(model.parameters(), reference.parameters()):
+            torch.testing.assert_close(full_tensor(actual), expected)
