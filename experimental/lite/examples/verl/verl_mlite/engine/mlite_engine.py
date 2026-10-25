@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 import weakref
+from contextlib import contextmanager
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -811,14 +812,15 @@ class MegatronLiteEngine(BaseEngine):
                 "router_replay_mode='R3' requires routed_experts on every "
                 "actor micro-batch in a step."
             )
-        result = self.runtime.forward_backward(
-            self.handle,
-            self._iter_runtime_batches(runtime_batches, forward_only=forward_only),
-            loss_fn=runtime_loss_fn,
-            num_microbatches=num_micro_batches,
-            forward_only=forward_only,
-            router_replay={"action": "replay"} if replay_enabled else None,
-        )
+        with self._runtime_cache_boundaries(forward_only=forward_only):
+            result = self.runtime.forward_backward(
+                self.handle,
+                iter(runtime_batches),
+                loss_fn=runtime_loss_fn,
+                num_microbatches=num_micro_batches,
+                forward_only=forward_only,
+                router_replay={"action": "replay"} if replay_enabled else None,
+            )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
         metrics = dict(result.metrics)
@@ -840,10 +842,10 @@ class MegatronLiteEngine(BaseEngine):
             },
         }
 
-    def _iter_runtime_batches(self, batches, *, forward_only):
-        # In PP1 each next forward follows the preceding microbatch's backward.
-        # Release only unused allocator segments, including old-LP leftovers at
-        # the first training boundary; never drop live graphs or weight caches.
+    @contextmanager
+    def _runtime_cache_boundaries(self, *, forward_only):
+        # Retain old-LP admission once; reclaim after every completed PP1 bwd,
+        # including the tail, without a new explicit synchronize or collective.
         release = (
             not forward_only
             and self.device_name == "cuda"
@@ -851,10 +853,27 @@ class MegatronLiteEngine(BaseEngine):
             and self.engine_config.impl == "vllm"
             and self._resolve_model_name() == "deepseek_v41"
         )
-        for batch in batches:
-            if release:
-                _release_inactive_cuda_cache()
-            yield batch
+        if not release:
+            yield
+            return
+        _release_inactive_cuda_cache()
+        extras = self.handle._extras
+        had_hook = "post_backward_hook" in extras
+        previous = extras.get("post_backward_hook")
+
+        def completed():
+            _release_inactive_cuda_cache(synchronize=False)
+            if previous is not None:
+                previous()
+
+        extras["post_backward_hook"] = completed
+        try:
+            yield
+        finally:
+            if had_hook:
+                extras["post_backward_hook"] = previous
+            else:
+                extras.pop("post_backward_hook", None)
 
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
         """Flatten a jagged no-padding batch to a model-agnostic ``PackedBatch``.

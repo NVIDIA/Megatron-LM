@@ -4,9 +4,10 @@ import torch
 import torch.distributed as dist
 
 
-def release_inactive_cuda_cache() -> None:
+def release_inactive_cuda_cache(*, synchronize: bool = True) -> None:
     """Let colocated rollout/NCCL reuse allocator blocks, never live tensors."""
-    torch.cuda.synchronize()
+    if synchronize:
+        torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
 

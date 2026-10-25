@@ -136,31 +136,131 @@ def test_release_only_synchronizes_and_returns_unused_allocator_blocks(memory_mo
 
 
 @pytest.mark.parametrize(
-    'forward_only,pp,impl,device,releases',
+    "forward_only,pp,impl,device,enabled",
     [
-        (False, 1, 'vllm', 'cuda', 3),
-        (True, 1, 'vllm', 'cuda', 0),
-        (False, 2, 'vllm', 'cuda', 0),
-        (False, 1, 'lite', 'cuda', 0),
-        (False, 1, 'vllm', 'cpu', 0),
+        (False, 1, "vllm", "cuda", True),
+        (True, 1, "vllm", "cuda", False),
+        (False, 2, "vllm", "cuda", False),
+        (False, 1, "lite", "cuda", False),
+        (False, 1, "vllm", "cpu", False),
     ],
 )
-def test_microbatch_cache_boundary_preserves_order_and_references(
-    engine_module, monkeypatch, forward_only, pp, impl, device, releases
+@pytest.mark.parametrize("external_loss", [False, True])
+@pytest.mark.parametrize("existing_hook", [False, True])
+def test_real_runtime_releases_after_each_backward_including_tail_without_extra_sync(
+    engine_module,
+    memory_module,
+    monkeypatch,
+    forward_only,
+    pp,
+    impl,
+    device,
+    enabled,
+    external_loss,
+    existing_hook,
 ):
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+
     engine = object.__new__(engine_module.MegatronLiteEngine)
     engine.engine_config = SimpleNamespace(pp=pp, impl=impl)
     engine.device_name = device
-    engine._resolve_model_name = lambda: 'deepseek_v41'
+    engine._resolve_model_name = lambda: "deepseek_v41"
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(
+        engine_module, "_release_inactive_cuda_cache", memory_module.release_inactive_cuda_cache
+    )
+    parameter = torch.nn.Parameter(torch.tensor([1.25, -0.0]))
+    parameter.register_hook(lambda grad: calls.append("backward"))
+
+    def forward(model, batch):
+        calls.append("forward")
+        return {"loss": (model * batch).square().sum()}
+
+    previous = lambda: calls.append("previous")
+    extras = {"forward_step": forward}
+    if existing_hook:
+        extras["post_backward_hook"] = previous
+    handle = SimpleNamespace(
+        _extras=extras,
+        _model=parameter,
+        _optimizer=None,
+        _parallel_state=SimpleNamespace(pp_size=1),
+    )
+    engine.handle = handle
+    runtime = object.__new__(MegatronLiteRuntime)
+    batches = [torch.tensor(0.5), torch.tensor(1.0), torch.tensor(2.0)]
+    loss_fn = (lambda out, batch: (out["loss"], {})) if external_loss else None
+    rng = torch.get_rng_state()
+    with engine._runtime_cache_boundaries(forward_only=forward_only):
+        actual = runtime.forward_backward(
+            handle, iter(batches), loss_fn, num_microbatches=3, forward_only=forward_only
+        )
+    expected = ["sync", "empty_cache"] if enabled else []
+    for _ in batches:
+        expected.append("forward")
+        if not forward_only:
+            expected.append("backward")
+            if enabled:
+                expected.append("empty_cache")
+            if existing_hook:
+                expected.append("previous")
+    assert calls == expected  # tail release precedes runtime return, no next(iterator).
+    assert extras.get("post_backward_hook") is (previous if existing_hook else None)
+    assert ("post_backward_hook" in extras) == existing_hook
+    assert torch.equal(rng, torch.get_rng_state())
+    reference = torch.nn.Parameter(parameter.detach().clone())
+    other = SimpleNamespace(
+        _extras={"forward_step": lambda m, b: {"loss": (m * b).square().sum()}},
+        _model=reference,
+        _optimizer=None,
+        _parallel_state=SimpleNamespace(pp_size=1),
+    )
+    baseline = runtime.forward_backward(
+        other, iter(batches), loss_fn, num_microbatches=3, forward_only=forward_only
+    )
+    assert torch.equal(
+        actual.model_output.loss.view(torch.int32), baseline.model_output.loss.view(torch.int32)
+    )
+    if not forward_only:
+        assert torch.equal(parameter.grad.view(torch.int32), reference.grad.view(torch.int32))
+
+
+@pytest.mark.parametrize("existing_hook", [False, True])
+def test_backward_error_restores_prior_hook_without_releasing_failed_microbatch(
+    engine_module, monkeypatch, existing_hook
+):
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+
+    engine = object.__new__(engine_module.MegatronLiteEngine)
+    engine.engine_config = SimpleNamespace(pp=1, impl="vllm")
+    engine.device_name = "cuda"
+    engine._resolve_model_name = lambda: "deepseek_v41"
     calls = []
     monkeypatch.setattr(
-        engine_module, '_release_inactive_cuda_cache', lambda: calls.append('release')
+        engine_module, "_release_inactive_cuda_cache", lambda **kw: calls.append(kw)
     )
-    batches = [object() for _ in range(3)]
-    iterator = engine._iter_runtime_batches(batches, forward_only=forward_only)
-    assert not calls  # no eager release before the runtime requests a forward
-    for index, actual in enumerate(iterator):
-        assert actual is batches[index]
-        if releases:
-            assert len(calls) == index + 1
-    assert len(calls) == releases
+    previous = lambda: None
+    extras = {"forward_step": lambda m, b: {"loss": torch.tensor(1.0)}}
+    if existing_hook:
+        extras["post_backward_hook"] = previous
+    engine.handle = SimpleNamespace(
+        _extras=extras, _model=None, _optimizer=None, _parallel_state=SimpleNamespace(pp_size=1)
+    )
+    with pytest.raises(RuntimeError, match="does not require grad"):
+        with engine._runtime_cache_boundaries(forward_only=False):
+            object.__new__(MegatronLiteRuntime).forward_backward(
+                engine.handle, iter([None]), None, num_microbatches=1
+            )
+    assert calls == [{}]  # admission only; failed backward is not a successful boundary.
+    assert extras.get("post_backward_hook") is (previous if existing_hook else None)
+    assert ("post_backward_hook" in extras) == existing_hook
+
+
+def test_post_backward_empty_cache_does_not_add_explicit_synchronize(memory_module, monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    memory_module.release_inactive_cuda_cache(synchronize=False)
+    assert calls == ["empty_cache"]

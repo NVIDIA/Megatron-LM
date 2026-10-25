@@ -612,6 +612,7 @@ class MegatronLiteRuntime(RuntimeBase):
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=loss_fn,
                     forward_only=forward_only,
+                    post_backward_hook=handle._extras.get("post_backward_hook"),
                 )
             finally:
                 if replay_driver is not None:
