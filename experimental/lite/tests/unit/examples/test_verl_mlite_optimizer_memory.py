@@ -145,6 +145,7 @@ def test_release_only_synchronizes_and_returns_unused_allocator_blocks(memory_mo
         (False, 1, "vllm", "cpu", False),
     ],
 )
+@pytest.mark.parametrize("policy", ["off", "threshold", "always"])
 @pytest.mark.parametrize("external_loss", [False, True])
 @pytest.mark.parametrize("existing_hook", [False, True])
 def test_real_runtime_releases_after_each_backward_including_tail_without_extra_sync(
@@ -158,14 +159,22 @@ def test_real_runtime_releases_after_each_backward_including_tail_without_extra_
     enabled,
     external_loss,
     existing_hook,
+    policy,
 ):
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
     engine = object.__new__(engine_module.MegatronLiteEngine)
-    engine.engine_config = SimpleNamespace(pp=pp, impl=impl)
+    engine.engine_config = SimpleNamespace(pp=pp, impl=impl, post_backward_cache_policy=policy)
     engine.device_name = device
     engine._resolve_model_name = lambda: "deepseek_v41"
     calls = []
+    free_values = iter([3 * 2**30, 4 * 2**30, 8 * 2**30])
+
+    def free_memory():
+        calls.append("free_query")
+        return next(free_values), 184 * 2**30
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", free_memory)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     monkeypatch.setattr(
@@ -198,11 +207,13 @@ def test_real_runtime_releases_after_each_backward_including_tail_without_extra_
             handle, iter(batches), loss_fn, num_microbatches=3, forward_only=forward_only
         )
     expected = ["sync", "empty_cache"] if enabled else []
-    for _ in batches:
+    for index, _ in enumerate(batches):
         expected.append("forward")
         if not forward_only:
             expected.append("backward")
-            if enabled:
+            if enabled and policy == "threshold":
+                expected.append("free_query")
+            if enabled and (policy == "always" or (policy == "threshold" and index == 0)):
                 expected.append("empty_cache")
             if existing_hook:
                 expected.append("previous")
@@ -234,7 +245,7 @@ def test_backward_error_restores_prior_hook_without_releasing_failed_microbatch(
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
     engine = object.__new__(engine_module.MegatronLiteEngine)
-    engine.engine_config = SimpleNamespace(pp=1, impl="vllm")
+    engine.engine_config = SimpleNamespace(pp=1, impl="vllm", post_backward_cache_policy="always")
     engine.device_name = "cuda"
     engine._resolve_model_name = lambda: "deepseek_v41"
     calls = []
@@ -264,3 +275,15 @@ def test_post_backward_empty_cache_does_not_add_explicit_synchronize(memory_modu
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     memory_module.release_inactive_cuda_cache(synchronize=False)
     assert calls == ["empty_cache"]
+
+
+def test_post_backward_policy_default_never_queries_or_clears_cuda(memory_module, monkeypatch):
+    def forbidden():
+        raise AssertionError("off policy touched CUDA allocator")
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", forbidden)
+    monkeypatch.setattr(torch.cuda, "empty_cache", forbidden)
+    monkeypatch.setattr(torch.cuda, "synchronize", forbidden)
+    assert memory_module.release_post_backward_cache("off") is False
+    with pytest.raises(ValueError, match="Unknown post-backward"):
+        memory_module.release_post_backward_cache("typo")

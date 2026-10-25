@@ -23,6 +23,7 @@ from verl_mlite import qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 from verl_mlite.optimizer_memory import prewarm_grad_stats_groups as _prewarm_grad_stats_groups
 from verl_mlite.optimizer_memory import release_inactive_cuda_cache as _release_inactive_cuda_cache
+from verl_mlite.optimizer_memory import release_post_backward_cache as _release_post_backward_cache
 
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
@@ -844,8 +845,7 @@ class MegatronLiteEngine(BaseEngine):
 
     @contextmanager
     def _runtime_cache_boundaries(self, *, forward_only):
-        # Retain old-LP admission once; reclaim after every completed PP1 bwd,
-        # including the tail, without a new explicit synchronize or collective.
+        # Retain old-LP admission once; post-bwd reclamation is separately opt-in.
         release = (
             not forward_only
             and self.device_name == "cuda"
@@ -857,12 +857,17 @@ class MegatronLiteEngine(BaseEngine):
             yield
             return
         _release_inactive_cuda_cache()
+        policy = getattr(self.engine_config, "post_backward_cache_policy", "off")
+        if policy == "off":
+            yield
+            return
+        free_gib = getattr(self.engine_config, "post_backward_cache_free_gib", 4.0)
         extras = self.handle._extras
         had_hook = "post_backward_hook" in extras
         previous = extras.get("post_backward_hook")
 
         def completed():
-            _release_inactive_cuda_cache(synchronize=False)
+            _release_post_backward_cache(policy, free_gib)
             if previous is not None:
                 previous()
 

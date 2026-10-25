@@ -11,6 +11,18 @@ def release_inactive_cuda_cache(*, synchronize: bool = True) -> None:
     torch.cuda.empty_cache()
 
 
+def release_post_backward_cache(policy: str, free_gib: float = 4.0) -> bool:
+    """Optionally release inactive blocks; never synchronize or touch live tensors."""
+    if policy == "off":
+        return False
+    if policy not in ("threshold", "always"):
+        raise ValueError(f"Unknown post-backward cache policy: {policy!r}")
+    if policy == "threshold" and torch.cuda.mem_get_info()[0] >= free_gib * 2**30:
+        return False
+    release_inactive_cuda_cache(synchronize=False)
+    return True
+
+
 def prewarm_grad_stats_groups(optimizer, device) -> None:
     """Materialize Core's lazy GN communicators before rollout fills the device.
 

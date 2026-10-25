@@ -216,3 +216,27 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+
+def test_post_backward_cache_policy_defaults_off_and_explicit_threshold():
+    config = _engine_config()
+    assert config.post_backward_cache_policy == "off"
+    assert config.post_backward_cache_free_gib == 4.0
+    assert (
+        _engine_config(post_backward_cache_policy="threshold").post_backward_cache_policy
+        == "threshold"
+    )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"post_backward_cache_policy": "typo"},
+        {"post_backward_cache_free_gib": -1},
+        {"post_backward_cache_free_gib": float("nan")},
+        {"post_backward_cache_free_gib": float("inf")},
+    ],
+)
+def test_post_backward_cache_policy_rejects_bad_configuration(values):
+    with pytest.raises(ValueError, match="post_backward_cache"):
+        _engine_config(**values)
