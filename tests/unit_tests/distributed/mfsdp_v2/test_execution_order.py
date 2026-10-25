@@ -3,6 +3,7 @@
 """Coverage for occurrence-based FSDP prefetch and weak module ownership."""
 
 import gc
+from types import SimpleNamespace
 from unittest.mock import Mock
 from weakref import ref
 
@@ -11,6 +12,7 @@ from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionOrder,
+    PrefetchMode,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
@@ -29,7 +31,7 @@ def test_prefetch_replays_occurrences(budget, expected):
     modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
     prefetched = []
     for module in modules:
-        module.phase = Phase.FORWARD
+        module.context = SimpleNamespace(prefetch_mode=PrefetchMode.RECORD_REPLAY)
         # Prefetch passes the successor's compute phase; record only which module it targets.
         module._unshard_parameter_groups.side_effect = (
             lambda _phase, target=module: prefetched.append(target)
@@ -42,6 +44,7 @@ def test_prefetch_replays_occurrences(budget, expected):
     for _ in range(2):
         for index, (module, targets) in enumerate(zip(sequence, expected)):
             prefetched.clear()
+            order.advance((ref(module), Phase.FORWARD))
             FsdpModule._prefetch_parameter_groups(module, order, budget)
             assert prefetched == [modules[index] for index in targets]
             assert order.position == index + 1
@@ -96,8 +99,9 @@ def test_iteration_and_weak_references():
     assert [module_ref() for module_ref in order] == [first, None, first, None]
     order.advance()
     assert order[order.position]() is None
-    first.phase = Phase.FORWARD
+    first.context = SimpleNamespace(prefetch_mode=PrefetchMode.RECORD_REPLAY)
     prefetch_order = ExecutionOrder((module_ref, Phase.FORWARD) for module_ref in order)
+    prefetch_order.advance((ref(first), Phase.FORWARD))
     with pytest.raises(RuntimeError, match="destroyed"):
         FsdpModule._prefetch_parameter_groups(first, prefetch_order, None)
     assert prefetch_order.position == 1

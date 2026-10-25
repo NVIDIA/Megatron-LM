@@ -1026,6 +1026,12 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.megatron_fsdp_record_iteration:
+        assert args.use_megatron_fsdp and args.megatron_fsdp_version == 2, \
+            '--megatron-fsdp-record-iteration requires --use-megatron-fsdp --megatron-fsdp-version 2'
+        assert args.cuda_graph_impl == "none", \
+            '--megatron-fsdp-record-iteration does not support CUDA graphs'
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -3077,6 +3083,10 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
+    group.add_argument('--megatron-fsdp-record-iteration', action='store_true',
+                       help='Record the first MFSDP v2 training iteration and replay its prefetch '
+                       'order in subsequent iterations. Requires a fixed module-call schedule '
+                       'and CUDA graphs disabled. Evaluation gathers on demand.')
     group.add_argument('--no-use-layer-wise-param-layout',
                        action='store_false',
                        dest='use_layer_wise_param_layout',

@@ -7,6 +7,9 @@ from unittest import mock
 
 import pytest
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    PrefetchMode,
+)
 from megatron.training import training as training_mod
 
 
@@ -139,3 +142,30 @@ def test_train_step_supports_bare_distributed_optimizer_for_mxfp8_staging():
         _run(model=model, optimizer=optimizer)
 
     optimizer._copy_main_params_to_param_buffer.assert_called_once_with()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("forward_only", [False, True])
+@pytest.mark.parametrize("initial_mode", [PrefetchMode.PRESET, PrefetchMode.DEMAND])
+def test_mfsdp_iteration_scope_restores_validation_mode(enabled, forward_only, initial_mode):
+    """The flag gates capture; validation restores the training mode even on failure."""
+    context = SimpleNamespace(prefetch_mode=initial_mode)
+    model = [SimpleNamespace(module=SimpleNamespace(context=context))]
+    args = SimpleNamespace(megatron_fsdp_record_iteration=enabled)
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "fsdp_iteration") as capture,
+    ):
+        with pytest.raises(ValueError, match="failed schedule"):
+            with training_mod._mfsdp_iteration(model, forward_only=forward_only):
+                assert context.prefetch_mode is (
+                    PrefetchMode.DEMAND if enabled and forward_only else initial_mode
+                )
+                raise ValueError("failed schedule")
+        assert context.prefetch_mode is initial_mode
+        if enabled and not forward_only:
+            capture.assert_called_once_with(context)
+            capture.return_value.__enter__.assert_called_once()
+            capture.return_value.__exit__.assert_called_once()
+        else:
+            capture.assert_not_called()

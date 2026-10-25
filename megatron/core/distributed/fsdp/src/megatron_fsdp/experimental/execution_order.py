@@ -14,6 +14,7 @@
 
 """Weakly held construction or recorded module execution sequences."""
 
+import enum
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Generic, TypeVar
 from weakref import ref
@@ -88,6 +89,26 @@ class ExecutionOrder(Generic[T]):
         result = self._items[self._position]
         self._position += 1
         return result
+
+
+class PrefetchMode(enum.Enum):
+    """Source of the parameter prefetch order.
+
+    PRESET uses a phase-tagged forward/backward order defined during construction,
+    without requiring an iteration scope. Prefetch stays within each phase;
+    recomputation gathers on demand.
+    RECORD_REPLAY applies only inside training iteration scopes. It records
+    phase-tagged module calls in the first scope and prefetches from that order
+    in later scopes. Recording gathers on demand. Scope exit switches to DEMAND,
+    retaining the captured order for the next training scope.
+    DEMAND gathers parameters only when needed, without recording, replaying, or
+    prefetching. Forward-only callers temporarily use this mode so validation does
+    not consume the training order.
+    """
+
+    PRESET = enum.auto()
+    RECORD_REPLAY = enum.auto()
+    DEMAND = enum.auto()
 
 
 ExecutionEvent = tuple[ref["FsdpModule"], Phase]

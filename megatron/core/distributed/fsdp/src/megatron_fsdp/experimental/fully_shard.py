@@ -25,6 +25,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext, current_fully_shard_context
+from .execution_order import ExecutionEvent, ExecutionOrder, PrefetchMode
 from .module import FsdpModule
 from .schedule import SchedulePolicy
 
@@ -193,6 +194,30 @@ def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
         yield
     finally:
         context.is_last_microbatch = previous_state
+
+
+@contextmanager
+def iteration(context: FsdpContext) -> Iterator[ExecutionOrder[ExecutionEvent]]:
+    """Capture one training iteration, then reset and validate each replay."""
+    context.ensure_finalized()
+    if context.prefetch_mode is PrefetchMode.RECORD_REPLAY:
+        raise RuntimeError("Cannot enter an already active FSDP iteration.")
+    order = context.execution_order
+    if context.iteration_captured:
+        order.reset_cursor()
+    else:
+        order = context.execution_order = ExecutionOrder[ExecutionEvent]()
+    context.prefetch_mode = PrefetchMode.RECORD_REPLAY
+    try:
+        yield order
+        if context.iteration_captured and order.position != len(order):
+            raise RuntimeError("FSDP iteration ended before consuming its captured order.")
+        context.iteration_captured = True
+    except BaseException:
+        context.iteration_captured = False
+        raise
+    finally:
+        context.prefetch_mode = PrefetchMode.DEMAND
 
 
 def _attach_mixin(module: nn.Module) -> None:

@@ -23,3 +23,5 @@ class Phase(enum.Enum):
     RESTING = enum.auto()
     FORWARD = enum.auto()
     BACKWARD = enum.auto()
+    # Recorded recomputation uses FORWARD parameter materialization.
+    RECOMPUTE = enum.auto()
