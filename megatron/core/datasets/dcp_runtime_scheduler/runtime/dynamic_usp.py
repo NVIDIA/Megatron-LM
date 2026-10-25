@@ -8,15 +8,14 @@ import math
 import time
 
 from .hot_switch import HotSwitchOptions, HotSwitchScheduler, InfeasibleLayout
-from .lightweight import LightweightRuntimePlanner
-from .planner import RuntimePlan, RuntimeScheduleError, encode_rows, validate_rows
+from .planner import RuntimePlan, RuntimePlanner, RuntimeScheduleError, encode_rows, validate_rows
 
 
-class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
+class DynamicUSPRuntimePlanner(RuntimePlanner):
     """Optional solver sharing the existing cost wrapper and padded-input contract.
 
-    Only ``plan`` is replaced. Inherited input validation, pack-cost memoization
-    and timeline construction are unchanged; the lightweight search is not run.
+    Both solvers share model injection, validation, pricing and rank-row output.
+    Neither solver inherits the other's search algorithm.
     This adapter never selects or initializes an attention communication backend.
     """
 

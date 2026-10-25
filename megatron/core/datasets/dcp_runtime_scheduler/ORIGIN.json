@@ -8,7 +8,8 @@
     "extract only runtime parameters; original validation reports remain in the source repository",
     "remove unused offline adapters and signature estimates; share sequence-cap and Python/Numba dispatch implementations",
     "flatten scalar attention evaluation and share forward/backward geometry validation; remove unused fitting diagnostics, preserving all consumed coefficients",
-    "share solver pack filling, guide/exact layout pricing, input validation and result construction; remove unused offline plan fields"
+    "share solver pack filling, guide/exact layout pricing, input validation and result construction; remove unused offline plan fields",
+    "group cost models and coefficient files under models; share RuntimePlanner without one solver inheriting the other; move scoring timeline into runtime; formulas, parameters and public factory names unchanged"
   ],
   "source_python_sha256": {
     "runtime/lightweight.py": "86720aded0f19a6a45d4fb10752ed7228a12ddb9c4dd41d78d9087df4d85cc17",
@@ -33,9 +34,9 @@
     "e2e/models/fa_remainder.json": "5a36d8f33258b5720d3a2bc80acf2a36d20e0a451aee6eb888a96d5956b57f0b"
   },
   "runtime_parameters_sha256": {
-    "attention/gb200.json": "c66c6abe5e37f1a61161980dbba6943b96a18a7da814bab8446cd517e3aefddc",
-    "attention/gb300.json": "520b2f993773a17a917fc54d41f73ef00d3d86afe617a2b53b446f5d020dc37a",
-    "qwen35.json": "c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc"
+    "models/attention/gb200.json": "c66c6abe5e37f1a61161980dbba6943b96a18a7da814bab8446cd517e3aefddc",
+    "models/attention/gb300.json": "520b2f993773a17a917fc54d41f73ef00d3d86afe617a2b53b446f5d020dc37a",
+    "models/qwen35.json": "c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc"
   },
   "dynamic_usp": {
     "repository": "https://github.com/mazhuoru/DynamicUSP",

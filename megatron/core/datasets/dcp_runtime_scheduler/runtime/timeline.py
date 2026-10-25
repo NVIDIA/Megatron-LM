@@ -5,7 +5,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:
+    from .planner import RuntimePlanGeometry
 
 
 @dataclass(frozen=True)
@@ -102,3 +105,43 @@ class TimelineModel:
                     m = max(t[start : start + cp]) + g[4][payload]
                     t[start : start + cp] = [m] * cp
         return t
+
+
+def _freeze_op(op):
+    if "cost" in op:
+        return ("cp", op["cost"])
+    return (op["sync"], float(op["duration_ms"]))
+
+
+def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
+    """Program-mode timeline from ``model.timing()`` or a scalar timeline when it is None."""
+    timing = model.timing()
+    if timing is None:
+        return TimelineModel(
+            geometry.world_size,
+            geometry.ep_size,
+            int(getattr(model, "layer_count", 1)),
+            float(getattr(model, "forward_non_attention_ms", 0.0)),
+            float(getattr(model, "backward_non_attention_ms", 0.0)),
+            0.0,
+            True,
+            None,
+        )
+    programs = timing["execution_program"]
+    if len(programs) != 1:
+        raise ValueError("program mode supports one virtual stage (PP1/VPP1)")
+    program = programs[0]
+    ops = (
+        tuple(_freeze_op(op) for op in program["forward"]),
+        tuple(_freeze_op(op) for op in program["backward"]),
+    )
+    return TimelineModel(
+        geometry.world_size,
+        geometry.ep_size,
+        int(program["layer_count"]),
+        0.0,
+        0.0,
+        float(timing.get("iteration_tail_ms", 0.0)),
+        True,
+        ops,
+    )

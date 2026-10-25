@@ -10,6 +10,22 @@ prediction traces stay in the source repository. Coefficients are unchanged;
 the scalar evaluator shares geometry/dispatch validation and contains no
 offline composer or fitting diagnostics.
 
+The two solvers have the same structure: an injected cost model plus a search
+algorithm. Model and solver selection are independent; neither solver inherits
+the other's search or owns a private copy of a timing model.
+
+```text
+models/                     # all cost-model code and coefficient files
+  attention/                # FA model, frozen F/B formulas and GB200/GB300 data
+  qwen35.py, qwen35.json     # mixed FA/GDN model
+  usp_calib_v1.py, *.json    # temporary upstream U8 cost model
+  base.py, cache.py         # shared model interface and memoized pack costs
+runtime/                    # scheduling only
+  lightweight.py            # arbitrary-CP candidate search
+  dynamic_usp.py, hot_switch.py  # DynamicUSP allocation/count search
+  planner.py, timeline.py   # common validation, rank rows and complete-step scoring
+```
+
 The worker runs this package directly by file path, without importing the
 Megatron/PyTorch parent packages. A persistent leader-only CPU process solves one
 batch ahead; the training process owns data reads and distributed calls. The

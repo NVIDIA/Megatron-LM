@@ -9,30 +9,54 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.core.datasets import dcp_schedule_prefetch as prefetch
-from megatron.core.datasets.dcp_runtime_scheduler.attention.dispatch import (
-    dispatch_backend,
-    dispatch_chain,
-)
 from megatron.core.datasets.dcp_runtime_scheduler.models import (
     AttentionCostModel,
     CorePredictor,
+    make_model,
     qwen35_new_core_model,
 )
-from megatron.core.datasets.dcp_runtime_scheduler.runtime.cost_model import QuadraticCostModel
+from megatron.core.datasets.dcp_runtime_scheduler.models.attention.dispatch import (
+    dispatch_backend,
+    dispatch_chain,
+)
+from megatron.core.datasets.dcp_runtime_scheduler.models.base import (
+    DcpCostModel,
+    QuadraticCostModel,
+)
+from megatron.core.datasets.dcp_runtime_scheduler.models.cache import PackCostModel
+from megatron.core.datasets.dcp_runtime_scheduler.runtime.dynamic_usp import (
+    DynamicUSPRuntimePlanner,
+)
 from megatron.core.datasets.dcp_runtime_scheduler.runtime.lightweight import (
     LightweightOptions,
     LightweightRuntimePlanner,
 )
 from megatron.core.datasets.dcp_runtime_scheduler.runtime.planner import (
     RuntimePlanGeometry,
+    RuntimePlanner,
     RuntimeScheduleError,
     validate_rows,
 )
-from megatron.core.datasets.dcp_runtime_scheduler.runtime.sched.costs import PackCostModel
 
 
 def _geometry(world=8, capacity=1024, ep=2):
     return RuntimePlanGeometry(world, capacity, ep, tuple(range(1, world + 1)), 2 * world, 64)
+
+
+@pytest.mark.parametrize("planner_type", [LightweightRuntimePlanner, DynamicUSPRuntimePlanner])
+@pytest.mark.parametrize("model_name", ["calibrated_attention", "qwen35_gb200", "usp_calib_v1"])
+def test_models_and_schedulers_share_one_injected_contract(planner_type, model_name):
+    geometry = RuntimePlanGeometry(32, 16384, 4, (8, 16, 32), 64, 64)
+    options = {"allow_provisional": True} if model_name != "qwen35_gb200" else {}
+    model = make_model(model_name, geometry, **options)
+    planner = planner_type(geometry, model)
+    assert isinstance(model, DcpCostModel)
+    assert isinstance(planner, RuntimePlanner)
+    assert planner.model is model
+    assert not issubclass(DynamicUSPRuntimePlanner, LightweightRuntimePlanner)
+    plan = planner.plan_padded({0: 2304, 1: 1408}, logical_lengths={0: 2300, 1: 1400})
+    validate_rows(plan.rows, {0: 2304, 1: 1408}, geometry, 8)
+    assert plan.predicted_ms > 0
 
 
 @pytest.mark.parametrize('cp', [1, 2, 3, 5, 6, 7, 8])

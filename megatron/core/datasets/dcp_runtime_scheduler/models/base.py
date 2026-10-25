@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Cost-model protocol and PP1 forward/backward timeline construction."""
+"""Shared cost-model protocol and geometry-only smoke model."""
 
 from __future__ import annotations
 
@@ -15,15 +15,13 @@ from typing import (
     runtime_checkable,
 )
 
-from .sched.timeline import TimelineModel
-
 if TYPE_CHECKING:
-    from .planner import RuntimePlanGeometry
+    from ..runtime.planner import RuntimePlanGeometry
 
 
 @runtime_checkable
 class DcpCostModel(Protocol):
-    """Callable contract consumed by ``sched.costs.PackCostModel`` and the planner."""
+    """Callable contract consumed by ``models.cache.PackCostModel`` and the planner."""
 
     name: str
     source_hashes: Dict[str, str]
@@ -89,43 +87,3 @@ class QuadraticCostModel:
 
     def check_domain(self, geometry, config) -> None:
         return None
-
-
-def _freeze_op(op):
-    if "cost" in op:
-        return ("cp", op["cost"])
-    return (op["sync"], float(op["duration_ms"]))
-
-
-def build_timeline(model, geometry: "RuntimePlanGeometry") -> TimelineModel:
-    """Program-mode timeline from ``model.timing()`` or a scalar timeline when it is None."""
-    timing = model.timing()
-    if timing is None:
-        return TimelineModel(
-            geometry.world_size,
-            geometry.ep_size,
-            int(getattr(model, "layer_count", 1)),
-            float(getattr(model, "forward_non_attention_ms", 0.0)),
-            float(getattr(model, "backward_non_attention_ms", 0.0)),
-            0.0,
-            True,
-            None,
-        )
-    programs = timing["execution_program"]
-    if len(programs) != 1:
-        raise ValueError("program mode supports one virtual stage (PP1/VPP1)")
-    program = programs[0]
-    ops = (
-        tuple(_freeze_op(op) for op in program["forward"]),
-        tuple(_freeze_op(op) for op in program["backward"]),
-    )
-    return TimelineModel(
-        geometry.world_size,
-        geometry.ep_size,
-        int(program["layer_count"]),
-        0.0,
-        0.0,
-        float(timing.get("iteration_tail_ms", 0.0)),
-        True,
-        ops,
-    )

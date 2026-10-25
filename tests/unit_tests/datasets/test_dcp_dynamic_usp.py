@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.core.datasets import dcp_schedule_prefetch as prefetch
-from megatron.core.datasets.dcp_runtime_scheduler.runtime.cost_model import QuadraticCostModel
+from megatron.core.datasets.dcp_runtime_scheduler.models.base import QuadraticCostModel
 from megatron.core.datasets.dcp_runtime_scheduler.runtime.dynamic_usp import (
     DynamicUSPRuntimePlanner,
 )

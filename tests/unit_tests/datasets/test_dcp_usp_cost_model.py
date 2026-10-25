@@ -14,9 +14,9 @@ import torch
 from megatron.core.datasets import dcp_runtime_worker
 from megatron.core.datasets import dcp_schedule_prefetch as prefetch
 from megatron.core.datasets.dcp_runtime_scheduler.models import make_model
-from megatron.core.datasets.dcp_runtime_scheduler.runtime.cost_model import build_timeline
+from megatron.core.datasets.dcp_runtime_scheduler.models.usp_calib_v1 import USPCalibV1CostModel
 from megatron.core.datasets.dcp_runtime_scheduler.runtime.planner import RuntimePlanGeometry
-from megatron.core.datasets.dcp_runtime_scheduler.usp_calib_v1 import USPCalibV1CostModel
+from megatron.core.datasets.dcp_runtime_scheduler.runtime.timeline import build_timeline
 
 
 def _geometry(world=32):

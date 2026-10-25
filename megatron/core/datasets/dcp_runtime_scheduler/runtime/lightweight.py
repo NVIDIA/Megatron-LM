@@ -6,17 +6,9 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
-from .cost_model import build_timeline
-from .planner import (
-    RuntimePlan,
-    RuntimeScheduleError,
-    dummy_tokens_per_group,
-    encode_rows,
-    validate_rows,
-)
-from .sched.costs import PackCostModel
+from .planner import RuntimePlanner, RuntimeScheduleError, encode_rows, validate_rows
 
 
 @dataclass(frozen=True)
@@ -37,7 +29,7 @@ class LightweightOptions:
             raise ValueError("max_guide_candidates must be a positive integer")
 
 
-class LightweightRuntimePlanner:
+class LightweightRuntimePlanner(RuntimePlanner):
     """No offline solver, CP-SAT, GPU search, or iterative global polishing.
 
     Deterministic FFD and cost-per-token candidates cover different pack widths.
@@ -47,58 +39,11 @@ class LightweightRuntimePlanner:
     An optional authenticated incumbent can be injected by the MCore caller.
     """
 
-    def __init__(self, geometry, cost_model, options=None):
-        geometry = replace(geometry, allowed_cp_sizes=tuple(sorted(set(geometry.allowed_cp_sizes))))
-        self.geometry = geometry
-        self.model = cost_model
+    def __init__(self, geometry, cost_model, options=None) -> None:
         self.options = options or LightweightOptions()
         if not any(floor <= geometry.world_size for floor in self.options.cp_floors):
             raise ValueError("cp_floors must include a width no larger than world_size")
-        cost_model.check_domain(geometry, None)
-        self.timeline = build_timeline(cost_model, geometry)
-        prepare = getattr(cost_model, "prepare_guide", None)
-        if prepare is not None:
-            prepare(geometry.allowed_cp_sizes)
-        self.costs = self._new_costs()
-        self.last_statistics = {}
-
-    def _new_costs(self):
-        return PackCostModel(
-            self.geometry,
-            self.model.forward,
-            self.model.backward,
-            getattr(self.model, "program_costs", None),
-            placement_period=(
-                None
-                if getattr(self.model, "placement_invariant", False)
-                else self.geometry.world_size
-            ),
-            max_group_seqs=self.geometry.max_group_seqs or 64,
-        )
-
-    def _start_plan(self, lengths):
-        lengths = dict(lengths)
-        if not lengths or any(
-            type(i) is not int or i < 0 or type(n) is not int or n <= 0 for i, n in lengths.items()
-        ):
-            raise ValueError(
-                "lengths must map nonnegative integer IDs to positive integer logical lengths"
-            )
-        self.model.clear()
-        self.costs = self._new_costs()
-        return lengths
-
-    def _make_plan(self, rounds, lengths, predicted, begin):
-        rows = encode_rows(rounds, self.geometry.world_size)
-        groups = validate_rows(rows, lengths, self.geometry, min(self.geometry.allowed_cp_sizes))
-        return RuntimePlan(
-            rows=rows,
-            groups=groups,
-            predicted_ms=predicted,
-            planning_s=time.perf_counter() - begin,
-            microbatches=len(rows),
-            dummy_tokens=dummy_tokens_per_group(groups, lengths, self.geometry),
-        )
+        super().__init__(geometry, cost_model)
 
     def _packing_tables(self, lengths):
         return (
@@ -294,25 +239,6 @@ class LightweightRuntimePlanner:
             rounds.append(row)
         return rounds
 
-    def _costed(self, rounds, lengths, guide=None):
-        out = []
-        for row in rounds:
-            start, groups = 0, []
-            for group in row:
-                cp = group["cp"]
-                values = tuple(lengths[i] for i in group["sample_ids"])
-                value = (
-                    (0.0, 0.0, guide(values, cp, ranks=tuple(range(start, start + cp))))
-                    if guide is not None
-                    else self.costs.pack(values, cp, start)
-                )
-                if value is None:
-                    raise RuntimeScheduleError(f"cost model rejected CP{cp} pack {values}")
-                groups.append((start, cp, *value))
-                start += cp
-            out.append(groups)
-        return out
-
     def _guide(self, rounds, lengths):
         # Candidate ordering only; acceptance ALWAYS uses exact injected E2E costs.
         guide = getattr(self.model, "guide_program_costs", None)
@@ -476,53 +402,5 @@ class LightweightRuntimePlanner:
             exact_scoring_s=elapsed - generation_s - balance_s,
             pack_cost_stats=dict(self.costs.stats),
             algorithm="FFD + all-width work/token + EP-aligned proposals + bounded guide + exact E2E acceptance + rank rotation",
-        )
-        return plan
-
-    def plan_padded(self, padded_lengths, *, logical_lengths=None, incumbent_rows=None):
-        """MCore input [(global_sample_id, dataset-padded length)]; pure CPU.
-
-        No LM shift is inferred. Exact logical lengths are optional and must ceil
-        to the supplied padded lengths. Otherwise the cost input is explicitly
-        the padded upper bound, not fabricated logical lengths.
-        """
-        items = list(padded_lengths.items() if hasattr(padded_lengths, "items") else padded_lengths)
-        padded = dict(items)
-        if (
-            len(padded) != len(items)
-            or not padded
-            or any(
-                type(i) is not int
-                or i < 0
-                or type(n) is not int
-                or n <= 0
-                or n % self.geometry.dataset_alignment
-                for i, n in items
-            )
-        ):
-            raise ValueError("unique nonnegative IDs and dataset-aligned positive lengths required")
-        logical = padded if logical_lengths is None else dict(logical_lengths)
-        if logical.keys() != padded.keys() or any(
-            type(n) is not int
-            or n <= 0
-            or (n + self.geometry.dataset_alignment - 1)
-            // self.geometry.dataset_alignment
-            * self.geometry.dataset_alignment
-            != padded[i]
-            for i, n in logical.items()
-        ):
-            raise ValueError(
-                "logical lengths must match every padded input after dataset alignment"
-            )
-        incumbent = None
-        if incumbent_rows is not None:
-            groups = validate_rows(
-                incumbent_rows, padded, self.geometry, min(self.geometry.allowed_cp_sizes)
-            )
-            incumbent = [[dict(cp=cp, sample_ids=ids) for _, cp, ids in row] for row in groups]
-        plan = self.plan(logical, incumbent_rounds=incumbent)
-        validate_rows(plan.rows, padded, self.geometry, min(self.geometry.allowed_cp_sizes))
-        self.last_statistics["cost_length_source"] = (
-            "after_lm_logical" if logical_lengths is not None else "dataset_padded_upper_bound"
         )
         return plan
