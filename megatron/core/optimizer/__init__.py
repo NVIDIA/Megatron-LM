@@ -7,6 +7,7 @@ from dataclasses import astuple
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
 
@@ -868,7 +869,7 @@ def _get_megatron_emerging_optimizer(
                 override['optimizer'] = config.muon_scalar_optimizer
     config_overrides.update(default_param_overrides)
 
-    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
+    # Build param groups and bucket by optimizer, expert parallelism, and Muon's FSDP mesh.
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
     all_param_groups = _get_param_groups(
         model_chunks, config, config_overrides, param_group_process_group
@@ -877,7 +878,16 @@ def _get_megatron_emerging_optimizer(
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
         is_expert = group['is_expert_parallel'] and not use_layer_wise
-        grouped_param_groups[(opt_name, is_expert)].append(group)
+        if is_mfsdp_v2 and opt_name == eopt_name:
+            # With EP=1, expert parameters can have allreduce=True while their FSDP
+            # buffers still use a separate mesh. Owner planning requires one mesh per Muon.
+            params_by_mesh: dict[DeviceMesh, list[torch.nn.Parameter]] = defaultdict(list)
+            for param in group['params']:
+                params_by_mesh[param.device_mesh].append(param)
+            for mesh, params in params_by_mesh.items():
+                grouped_param_groups[(opt_name, is_expert, mesh)].append(dict(group, params=params))
+        else:
+            grouped_param_groups[(opt_name, is_expert, None)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
@@ -905,7 +915,7 @@ def _get_megatron_emerging_optimizer(
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
         # e.g., Muon). This includes scalar optimizers like Adam or Lion.
         not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
-        for (opt_name, _), groups in grouped_param_groups.items()
+        for (opt_name, _, _), groups in grouped_param_groups.items()
         if groups
     ):
         # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
@@ -930,14 +940,14 @@ def _get_megatron_emerging_optimizer(
             if non_layer_wise_buffers:
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
-    # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
+    # Build an optimizer for each bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
     # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
     # — that is, the LayerWise optimizer only owns Muon-managed matrix parameters,
     # and the rest go through DistOpt's standard byte-level shard machinery.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
-    for (opt_name, is_expert), groups in grouped_param_groups.items():
+    for (opt_name, is_expert, _), groups in grouped_param_groups.items():
         if not groups:
             continue
 

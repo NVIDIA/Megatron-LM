@@ -65,8 +65,12 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
-@pytest.mark.parametrize("optimizer_name", ["adam", "muon"])
-def test_build_train_step_and_clip(process_group_collections, distributed_setup, optimizer_name):
+@pytest.mark.parametrize(
+    ("optimizer_name", "layer_pattern"), [("adam", "*E"), ("muon", "*E"), ("muon", "*-*E")]
+)
+def test_build_train_step_and_clip(
+    process_group_collections, distributed_setup, optimizer_name, layer_pattern
+):
     """Shard experts over expert-DP and clip their combined gradients."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
@@ -75,12 +79,12 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
     # initialization instead uses the globally configured EP=2 rank in its RNG seed.
     config = TransformerConfig(
-        num_layers=2,
+        num_layers=len(layer_pattern),
         hidden_size=64,
         num_attention_heads=4,
         num_moe_experts=4,
         expert_model_parallel_size=2,
-        moe_layer_freq=[0, 1],
+        moe_layer_freq=[int(layer == "E") for layer in layer_pattern],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_grouped_gemm=True,
@@ -101,7 +105,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E",
+        hybrid_layer_pattern=layer_pattern,
         pg_collection=reference_process_group_collection,
     ).cuda()
     model = HybridModel(
@@ -109,7 +113,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E",
+        hybrid_layer_pattern=layer_pattern,
         pg_collection=process_group_collection,
     ).cuda()
     model.load_state_dict(reference_model.state_dict(), strict=False)
@@ -139,7 +143,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         pg_collection=process_group_collection,
     )
     assert isinstance(model.module, FsdpModule)
-    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+    assert isinstance(model.module.decoder.layers[-1].mlp.experts, FsdpModule)
 
     optimizer_config = OptimizerConfig(
         optimizer=optimizer_name,

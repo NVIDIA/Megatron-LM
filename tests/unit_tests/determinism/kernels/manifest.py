@@ -550,13 +550,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
             "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
+            "tests/unit_tests/distributed/mfsdp_v2/test_checkpoint.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
         "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
         "test_mcore_muon.py replays jointly clipped Muon/Adam steps after checkpoint restore "
-        "and checks loss curves, gradient norms, momentum, and Adam moments exactly.",
+        "and checks loss curves, gradient norms, momentum, and Adam moments exactly. "
+        "test_checkpoint.py extends exact replay to dense/MoE models with expert parallelism.",
     ),
     KernelEntry(
         name="tensor_metric_l2",

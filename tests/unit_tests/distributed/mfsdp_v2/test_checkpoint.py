@@ -41,7 +41,10 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+    handle_experts_in_state_dict,
+    handle_swiglu_in_state_dict,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
@@ -486,7 +489,10 @@ def test_metadata_attach_issues_no_collectives(
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
-def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_size):
+@pytest.mark.parametrize(("optimizer_name", "layer_pattern"), [("adam", "*E"), ("muon", "*-*E")])
+def test_ep_fsdp_checkpoint_roundtrip(
+    distributed_setup, tmp_path_dist_ckpt, ep_size, optimizer_name, layer_pattern
+):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
     Use MCore's existing global expert names and optimizer checkpoint format.
@@ -495,6 +501,8 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
     world_size, rank = Utils.world_size, Utils.rank
     if world_size % ep_size:
         pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
+    if optimizer_name == "muon":
+        pytest.importorskip("emerging_optimizers")
 
     Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
     try:
@@ -505,7 +513,7 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
             torch.manual_seed(seed)
             model_parallel_cuda_manual_seed(seed)
             config = TransformerConfig(
-                num_layers=2,
+                num_layers=len(layer_pattern),
                 hidden_size=64,
                 num_attention_heads=4,
                 num_moe_experts=8,
@@ -521,6 +529,12 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 use_cpu_initialization=False,
                 bf16=True,
                 params_dtype=torch.bfloat16,
+                gated_linear_unit=optimizer_name == "muon",
+                activation_func=(
+                    torch.nn.functional.silu
+                    if optimizer_name == "muon"
+                    else torch.nn.functional.gelu
+                ),
                 hidden_dropout=0.0,
                 attention_dropout=0.0,
                 attention_backend=AttnBackend.unfused,
@@ -530,7 +544,7 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=128,
                 max_sequence_length=8,
-                hybrid_layer_pattern="*E",
+                hybrid_layer_pattern=layer_pattern,
                 pg_collection=groups,
             ).cuda()
             model = FullyShardedDataParallel(
@@ -549,16 +563,19 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
             )
             optimizer = get_megatron_optimizer(
                 OptimizerConfig(
-                    optimizer="adam",
+                    optimizer=optimizer_name,
                     lr=0.001,
                     weight_decay=0.1,
                     bf16=True,
                     params_dtype=torch.bfloat16,
                     use_distributed_optimizer=False,
-                    clip_grad=0.0,
-                    use_precision_aware_optimizer=True,
-                    exp_avg_dtype=torch.bfloat16,
-                    exp_avg_sq_dtype=torch.bfloat16,
+                    clip_grad=0.01 if optimizer_name == "muon" else 0.0,
+                    muon_split_qkv=False,
+                    use_precision_aware_optimizer=optimizer_name == "adam",
+                    exp_avg_dtype=(torch.bfloat16 if optimizer_name == "adam" else torch.float32),
+                    exp_avg_sq_dtype=(
+                        torch.bfloat16 if optimizer_name == "adam" else torch.float32
+                    ),
                 ),
                 [model],
                 use_gloo_process_groups=False,
@@ -587,30 +604,47 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 losses.append(loss)
             return losses
 
-        def checkpoint_state(model, optimizer, *, is_loading=False):
-            state = {
-                "model": handle_experts_in_state_dict(
-                    model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
-                ),
-                "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
-            }
+        def checkpoint_state(model, optimizer_state):
+            state = {"model": model.state_dict_for_save_checkpoint(), "optimizer": optimizer_state}
+            if model.config.gated_linear_unit:
+                state["model"], state["optimizer"] = handle_swiglu_in_state_dict(
+                    model.module, state["model"], state["optimizer"]
+                )
+            state["model"] = handle_experts_in_state_dict(
+                state["model"], model.config.num_moe_experts
+            )
             preprocess_state_dict_for_uneven_dtensor(state)
             return state
 
         train(source, source_optimizer)
-        with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:
-            dcp.save(checkpoint_state(source, source_optimizer), checkpoint_id=path)
+        with TempNamedDir(
+            tmp_path_dist_ckpt / f"ep{ep_size}_{optimizer_name}_mcore_roundtrip", sync=True
+        ) as path:
+            dcp.save(
+                checkpoint_state(source, source_optimizer.sharded_state_dict({})),
+                checkpoint_id=path,
+            )
             destination, destination_optimizer = build(seed=987)
             raw_model_state = destination.state_dict_for_save_checkpoint()
-            state = checkpoint_state(destination, destination_optimizer, is_loading=True)
+            raw_optimizer_state = destination_optimizer.sharded_state_dict({}, is_loading=True)
+            state = checkpoint_state(destination, raw_optimizer_state)
             dcp.load(state, checkpoint_id=path)
             destination.load_state_dict(raw_model_state)
-            destination_optimizer.load_state_dict(state["optimizer"])
+            destination_optimizer.load_state_dict(raw_optimizer_state)
 
         expected_losses = train(source, source_optimizer)
         actual_losses = train(destination, destination_optimizer)
         torch.testing.assert_close(
             torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
         )
+        expected_state = source_optimizer.sharded_state_dict({})["state"]
+        actual_state = destination_optimizer.sharded_state_dict({})["state"]
+        assert actual_state.keys() == expected_state.keys()
+        for name, param_state in expected_state.items():
+            assert actual_state[name].keys() == param_state.keys()
+            for key, value in param_state.items():
+                torch.testing.assert_close(
+                    actual_state[name][key].to_local(), value.to_local(), rtol=0, atol=0
+                )
     finally:
         Utils.destroy_model_parallel()
