@@ -3036,7 +3036,7 @@ def unwrap_model(model, module_instances=None):
     if module_instances is None:
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-        from megatron.core.distributed.fsdp.mcore_adapter import (
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
             FullyShardedDataParallelV1,
             FullyShardedDataParallelV2,
         )

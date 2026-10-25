@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from megatron.core.distributed.fsdp.mcore_adapter import FullyShardedDataParallelV1
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
