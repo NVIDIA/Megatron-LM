@@ -288,7 +288,7 @@ def get_batches_on_this_cp_rank(
                 tokens_per_sample,
                 use_logical_qkv_seqlens=layout == "zigzag",
                 pad_between_seqs=(zigzag_metadata.pad_between_seqs if layout == "zigzag" else None),
-                tp_cp_group=tp_cp_group if is_hybrid_cp else None,
+                tp_cp_group=tp_cp_group if dynamic_cp else None,
             )
             for layout, layout_batch in batches_by_layout.items()
         }
@@ -352,7 +352,7 @@ def get_batches_on_this_cp_rank(
             layout,
             cp_size,
             tokens_per_sample,
-            tp_cp_group=tp_cp_group if is_hybrid_cp else None,
+            tp_cp_group=tp_cp_group if dynamic_cp else None,
         )
         for layout in requested_layouts
     }

@@ -929,7 +929,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         )
 
     def _prepare_qkv(
-        self, x, conv_state=None, seq_idx=None, l2_norm_in_kernel=False,
+        self,
+        x,
+        conv_state=None,
+        seq_idx=None,
+        l2_norm_in_kernel=False,
         runtime_cp: _GDPRuntimeCP | None = None,
     ):
         """Run the causal conv on the VKQ slice and split/reshape it into query, key,
