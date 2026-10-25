@@ -20,7 +20,6 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
@@ -37,27 +36,12 @@ MeshAxis = int | str
 
 
 @contextmanager
-def fully_shard_context(
-    device: torch.device | None = None,
-    use_symmetric_memory: bool = False,
-    unify_communication_stream: bool = False,
-    parameter_to_owner: dict[nn.Parameter, int] | None = None,
-    caller_managed_grad_sync: bool = False,
-) -> Iterator[FsdpContext]:
-    """Construct FSDP modules with shared runtime state, finalizing on successful exit.
-
-    The yielded :class:`FsdpContext` remains available to the modules after this
-    construction scope ends. See that class for the construction options.
-    """
+def fully_shard_context(context: FsdpContext) -> Iterator[FsdpContext]:
+    """Activate ``context`` for FSDP construction, finalizing it on successful exit."""
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
-    context = FsdpContext(
-        device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        unify_communication_stream=unify_communication_stream,
-        parameter_to_owner=parameter_to_owner,
-        caller_managed_grad_sync=caller_managed_grad_sync,
-    )
+    if context._is_finalized:
+        raise RuntimeError("Cannot enter fully_shard_context after construction is finalized.")
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context

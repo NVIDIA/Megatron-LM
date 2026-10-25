@@ -72,9 +72,7 @@ class FsdpContext:
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
-            raise ValueError(
-                f"fully_shard_context/FsdpContext requires a CUDA device, got {device}."
-            )
+            raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
         self.is_last_microbatch = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
@@ -162,7 +160,7 @@ class FsdpContext:
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use fully_shard_context(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
+            "Use FsdpContext(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
             "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
