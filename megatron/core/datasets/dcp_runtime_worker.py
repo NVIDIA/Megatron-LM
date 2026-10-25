@@ -54,6 +54,7 @@ def _initialize_planner(spec):
         model = _AttentionWorkModel(geometry=geometry, **spec['model_options'])
     elif spec['model'] in (
         'calibrated_attention',
+        'usp_calib_v1',
         'qwen35_gb200',
         'dcp_scheduler.adapters:qwen35_new_core_model',
     ):
@@ -101,6 +102,8 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
             dict(enumerate(padded)), logical_lengths=logical, incumbent_rows=baseline_rows
         )
         rows, statistics, predicted_ms = plan.rows, planner.last_statistics, plan.predicted_ms
+    metadata = getattr(planner.model, 'metadata', None)
+    model_metadata = metadata() if callable(metadata) else None
     torch = sys.modules.get('torch')
     cuda_initialized = bool(torch is not None and torch.cuda.is_initialized())
     distributed_initialized = bool(torch is not None and torch.distributed.is_initialized())
@@ -110,6 +113,7 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
         rows=rows,
         statistics=statistics,
         predicted_ms=predicted_ms,
+        model_metadata=model_metadata,
         planner_options=(
             asdict(planner.options)
             if is_dataclass(getattr(planner, 'options', None))

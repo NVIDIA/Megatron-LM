@@ -27,6 +27,11 @@ Available in-tree models:
   its explicit mixed-stack/padding-transfer limitations, not a general Qwen
   configuration or a precision guarantee. The global partition must remain
   contiguous and the tail policy `extend_last` for that recipe.
+- `usp_calib_v1`: temporary use of DynamicUSP's original default U8 all-to-all
+  plus ring cost profile, including its **synthetic 44-layer shape**, MoE,
+  replay, tier factors and global constant. The formulas and calibration table
+  are unchanged, not refitted for Qwen or native P2P. `allow_provisional=true`
+  is required. The model does not enable Ulysses or all-to-all communication.
 
 Example extra flags for a standard-FA NVL72 run (alongside the native DCP,
 varlen, packed-padding and parallelism arguments):
@@ -62,8 +67,28 @@ The injected model supplies scheduling work and complete-step candidate scores;
 no heads, attention implementation or communication backend is selected by this
 solver. The configured incumbent is retained if no candidate is predicted faster.
 
-The original USP cost profiles, optional profile-specific fixed-topology Stage 2,
-PP/VPP simulation, CLI and calibration assets are not imported. Existing
+The temporary upstream-cost recipe keeps CP powers of two with a minimum of 8:
+
+```bash
+--min-dynamic-context-parallel-size 8 \
+--dynamic-cp-runtime-model usp_calib_v1 \
+--dynamic-cp-runtime-model-options '{"allow_provisional":true}' \
+--dynamic-cp-runtime-solver dynamic_usp \
+--dynamic-cp-runtime-solver-options '{"candidate_count":4,"outlier_threshold":1.0}'
+```
+
+For a 32-rank DPxCP domain, both candidates and the incumbent are restricted to
+CP8/16/32; CP24 is not supported. This recipe currently accepts DPxCP=8/16/32.
+Execution continues to use the existing native P2P path (`cp_comm_type=p2p`),
+not the modeled U8 all-to-all. This intentional mismatch is a temporary scheduling
+proxy pending upstream updates: predictions are **not** P2P latency or speedup
+evidence. Worker/consume telemetry records the model name, source hashes and
+this scope. Switching to an updated model does not require changing the worker,
+prefetcher or communication implementation.
+
+Only the default `usp_calib_v1` formulas and its original table are imported;
+custom profile options, optional profile-specific fixed-topology Stage 2,
+PP/VPP simulation, CLI and calibration tools are not imported. Existing
 PP1/VPP1 restrictions, the CPU worker, async lookahead and sync control are
 unchanged. No external `hot_switch_solver` installation is needed. Upstream
 revision and license are recorded in `DYNAMIC_USP_NOTICE.txt`.

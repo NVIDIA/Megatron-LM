@@ -234,6 +234,7 @@ class DcpSchedulePrefetcher:
             queue_depth=0,
             queue_depth_at_submit=1,
             predicted_ms=result['predicted_ms'],
+            model_metadata=result.get('model_metadata'),
             statistics=result['statistics'],
             rows=result['rows'],
             solver=self.spec.get('solver'),
@@ -306,12 +307,18 @@ def runtime_spec(
     """Build a CPU-only, serializable planner specification from model configuration."""
     factory = getattr(config, 'dynamic_cp_runtime_model', None)
     options = _json_options(getattr(config, 'dynamic_cp_runtime_model_options', None))
+    minimum = config.min_dynamic_context_parallel_size
+    allowed = tuple(range(minimum, world_size + 1))
+    if factory == 'usp_calib_v1':
+        if world_size not in (8, 16, 32) or minimum not in (8, 16, 32) or minimum > world_size:
+            raise ValueError('usp_calib_v1 requires DPxCP and minimum CP in (8, 16, 32)')
+        allowed = tuple(cp for cp in (8, 16, 32) if minimum <= cp <= world_size)
     return dict(
         geometry=dict(
             world_size=world_size,
             tokens_per_rank=config.max_seqlen_per_dp_cp_rank,
             ep_size=getattr(config, 'expert_model_parallel_size', 1),
-            allowed_cp_sizes=tuple(range(config.min_dynamic_context_parallel_size, world_size + 1)),
+            allowed_cp_sizes=allowed,
             dataset_alignment=2 * world_size,
             max_group_seqs=min(max_num_seqs, 64) if max_num_seqs is not None else 64,
         ),

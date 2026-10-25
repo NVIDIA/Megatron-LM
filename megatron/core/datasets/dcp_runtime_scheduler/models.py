@@ -218,6 +218,10 @@ def make_model(name, geometry, **options):
     """Resolve an in-tree model name without importing the Megatron package."""
     if name == 'calibrated_attention':
         return AttentionCostModel(geometry, **options)
+    if name == 'usp_calib_v1':
+        from .usp_calib_v1 import USPCalibV1CostModel
+
+        return USPCalibV1CostModel(geometry, **options)
     if name in ('qwen35_gb200', 'dcp_scheduler.adapters:qwen35_new_core_model'):
         return qwen35_new_core_model(**options)
     raise ValueError(f'Unknown in-tree DCP cost model: {name}')

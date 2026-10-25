@@ -1,7 +1,9 @@
-The generic hot-switch allocator in runtime/hot_switch.py is adapted from:
+The generic hot-switch allocator and the temporary default cost profile are adapted from:
 https://github.com/mazhuoru/DynamicUSP
 Commit: 1ff97a4ae0beb5e088fadb9e112265bdd194b24d
 Source: src/hot_switch_solver/gbs/{allocator,bounds,placement,search}.py
+Source: src/hot_switch_solver/profiles/usp_calib_v1.py (default scalar formulas)
+Asset: src/hot_switch_solver/profiles/calib_table_v1.json (verbatim)
 
 The upstream license is reproduced verbatim below.
 

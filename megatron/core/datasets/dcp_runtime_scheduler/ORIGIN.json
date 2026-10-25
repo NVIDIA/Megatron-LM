@@ -37,18 +37,23 @@
   "dynamic_usp": {
     "repository": "https://github.com/mazhuoru/DynamicUSP",
     "commit": "1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
-    "scope": "Generic solve_gbs Stage 1 allocation and microbatch-count search",
+    "scope": "Generic solve_gbs Stage 1 and temporary default usp_calib_v1 cost proxy",
     "adaptations": [
       "remove head and communication-specific constraints; caller supplies legal group sizes",
       "use the existing injected cost model and physical-capacity predicate",
       "retain the original aligned power-of-two allocation policy",
-      "omit profile-specific Stage 2, prediction assets, CLI and pipeline simulation"
+      "port default usp_calib_v1 scalar costs with unchanged synthetic shape and calibration table; provisional proxy for native P2P",
+      "omit custom profile options, profile-specific Stage 2, CLI and pipeline simulation"
     ],
     "source_python_sha256": {
       "gbs/allocator.py": "7f9e3da37e6d613a46d504f2677a6e9c8a920af9b393f729ab6222647fbc2a8a",
       "gbs/bounds.py": "8ec1410c93b9760b394c5ccaef03a0713ba61e602a55848e1a829a89136ff3ee",
       "gbs/placement.py": "c3d33039a108e72caa67abc632c89f78d706e1b1b83e0da2ca8e2b150f06ed1b",
-      "gbs/search.py": "f3235b85347b2e111b219722969c5bef562f253c5ce9e67410d56f5eeec2aa9e"
+      "gbs/search.py": "f3235b85347b2e111b219722969c5bef562f253c5ce9e67410d56f5eeec2aa9e",
+      "profiles/usp_calib_v1.py": "a2dbcff0099936e283b2386783861d7191c5319e1cf9e22a8bff30f33207329d"
+    },
+    "source_files_sha256": {
+      "profiles/calib_table_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7"
     }
   }
 }
