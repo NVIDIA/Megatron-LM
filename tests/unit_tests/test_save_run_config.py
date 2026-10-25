@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import save_checkpoint

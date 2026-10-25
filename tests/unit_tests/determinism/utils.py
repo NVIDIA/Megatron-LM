@@ -289,7 +289,7 @@ def maybe_fsdp_wrap(model: torch.nn.Module, parallelism: dict) -> torch.nn.Modul
     """If ``parallelism["FSDP"] > 1``, wrap ``model`` with Megatron-FSDP.
 
     Uses the production path from ``megatron/training/training.py``: the
-    ``FullyShardedDataParallel`` adapter from ``mcore_adapter``, with the
+    ``FullyShardedDataParallel`` adapter from ``mcore_fsdp_adapter``, with the
     ``ProcessGroupCollection`` derived from the current ``parallel_state``.
     This means TP/PP/CP/EP groups already initialised by
     ``Utils.initialize_model_parallel`` are honoured automatically — FSDP
@@ -299,7 +299,7 @@ def maybe_fsdp_wrap(model: torch.nn.Module, parallelism: dict) -> torch.nn.Modul
         return model
 
     from megatron.core.distributed import DistributedDataParallelConfig
-    from megatron.core.distributed.fsdp.mcore_adapter import FullyShardedDataParallel
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()

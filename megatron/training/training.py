@@ -51,7 +51,7 @@ from megatron.core.distributed import (
     TorchFullyShardedDataParallelConfig,
     finalize_model_grads,
 )
-from megatron.core.distributed.fsdp.mcore_adapter import (
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel,
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
