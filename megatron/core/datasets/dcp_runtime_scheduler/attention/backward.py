@@ -95,13 +95,14 @@ class BackwardModel(AttentionModel):
             raise ValueError("Unsupported frozen backward formula")
         self.static_us = float(self.cp1.get("static_us_per_slot", 0.155))
 
+    @lru_cache(maxsize=8192)
     def _clock(self, tile_ms, const_ms, frequency):
         lam = float(self.law["lambda"])
         scaled, unscaled = tile_ms + (1.0 - lam) * const_ms, lam * const_ms
         factor = self.f0 / float(frequency) if frequency else 1.0
         return scaled * factor + unscaled
 
-    @lru_cache(maxsize=8192)
+    @lru_cache(maxsize=200000)
     def _kernel(self, profile, mask, pieces, storage):
         q_heads, kv_heads, head_dim = self.geometries[profile]
         cs = self.cp1["geometries"][profile][mask]
@@ -144,7 +145,7 @@ class BackwardModel(AttentionModel):
         return tile_ms, const_ms, static, (hq + hkv) * 0.001
 
     @lru_cache(maxsize=8192)
-    def _glue(self, profile, mq, mkv, pieces, nbytes):
+    def _glue(self, profile, mq, mkv, count, q_tokens, kv_tokens, nbytes):
         q_heads, kv_heads, head_dim = self.geometries[profile]
         glue = self.ring["glue"]
         prep = glue["prep"]
@@ -152,16 +153,10 @@ class BackwardModel(AttentionModel):
             float(prep.get("p0_us", 0.0))
             + float(prep.get("p_q_us_per_MiB_q", 0.0)) * float(mq)
             + float(prep.get("p_kv_us_per_MiB_kv", 0.0)) * float(mkv)
-            + float(prep.get("p_n_us_per_piece", 0.0)) * len(pieces)
+            + float(prep.get("p_n_us_per_piece", 0.0)) * count
         )
         hq, hkv = helper_terms(
-            glue["helpers"]["by_head_dim"],
-            head_dim,
-            q_heads,
-            kv_heads,
-            sum(q for q, _ in pieces),
-            sum(kv for _, kv in pieces),
-            len(pieces),
+            glue["helpers"]["by_head_dim"], head_dim, q_heads, kv_heads, q_tokens, kv_tokens, count
         )
         accumulate = glue.get("accumulate") or {}
         acc_us = float(accumulate.get("a0_us", 0.0)) + float(
@@ -174,6 +169,29 @@ class BackwardModel(AttentionModel):
         )
         rest = prep_us + acc_us + float(glue.get("memset_us", 0.0)) + copy_us
         return hq + hkv, rest
+
+    @lru_cache(maxsize=16384)
+    def _step(self, profile, section, pieces, q_physical, mq, mkv, nbytes):
+        """Reuse clock-independent ring costs across candidate scores and batches."""
+        tile, const, static, _ = self._kernel(
+            profile, "causal" if section == "diagonal" else "rectangle", pieces, q_physical
+        )
+        if self.static_per_call:
+            const = float(self.fit.get("shares", {}).get(profile, 1.0)) * (
+                (const - static) * self.scale
+            )
+        else:
+            const *= self.scale
+        helpers, rest = self._glue(
+            profile,
+            mq / 2.0 if section == "upper" else mq,
+            mkv / 2.0 if section == "lower" else mkv,
+            len(pieces),
+            sum(q for q, _ in pieces),
+            sum(kv for _, kv in pieces),
+            nbytes,
+        )
+        return tile * self.scale, const, helpers, rest, nbytes
 
     def _predict(self, profile, storage, cp, lengths, padded, frequency, clock_law):
         ratio = self.f0 / frequency if frequency else 1.0
@@ -196,27 +214,17 @@ class BackwardModel(AttentionModel):
         for rank in range(cp):
             row = []
             for index, step in enumerate(reversed(rounds[rank * cp : (rank + 1) * cp])):
-                section, pieces = step["section"], step["pieces"]
-                tile, const, static, _ = self._kernel(
-                    profile,
-                    "causal" if section == "diagonal" else "rectangle",
-                    pieces,
-                    step["q_physical"],
-                )
-                if self.static_per_call:
-                    const = float(self.fit.get("shares", {}).get(profile, 1.0)) * (
-                        (const - static) * self.scale
+                row.append(
+                    self._step(
+                        profile,
+                        step["section"],
+                        step["pieces"],
+                        step["q_physical"],
+                        mq,
+                        mkv,
+                        sizes[index],
                     )
-                else:
-                    const *= self.scale
-                helpers, rest = self._glue(
-                    profile,
-                    mq / 2.0 if section == "upper" else mq,
-                    mkv / 2.0 if section == "lower" else mkv,
-                    pieces,
-                    sizes[index],
                 )
-                row.append((tile * self.scale, const, helpers, rest, sizes[index]))
             per_rank.append(row)
 
         def glue_us(helpers, rest):
