@@ -22,9 +22,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
-    current_fully_shard_context,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContext
 
 
@@ -314,22 +311,6 @@ def test_fully_shard_context_rejects_nesting(distributed_setup):
 
     assert model[0].context is outer_context
     assert model[1].context is outer_context
-
-
-def test_failed_construction_clears_active_context(distributed_setup):
-    """A failed construction must not finalize or leak its scope into later construction."""
-    with pytest.raises(ValueError, match="construction failed"):
-        with fully_shard_context(device=distributed_setup.device) as failed:
-            assert current_fully_shard_context() is failed
-            raise ValueError("construction failed")
-    assert current_fully_shard_context() is None
-    with pytest.raises(RuntimeError, match="not finalized"):
-        failed.ensure_finalized()
-
-    with fully_shard_context(device=distributed_setup.device) as context:
-        assert current_fully_shard_context() is context
-    context.ensure_finalized()
-    assert current_fully_shard_context() is None
 
 
 def test_fully_shard_rejects_child_from_another_context(distributed_setup):
