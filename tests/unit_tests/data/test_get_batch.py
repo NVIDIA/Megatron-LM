@@ -989,7 +989,7 @@ def test_dynamic_cp_group_resolution_prefers_the_scheduled_group():
     "local_cp_size, group_func, match",
     [
         (None, lambda group_size: _mock_group(2), "local_cp_size is required"),
-        (torch.tensor([2]), None, "hybrid_cp_group_func is required"),
+        (torch.tensor([2]), None, "dynamic_cp_group_func is required"),
         (torch.tensor([4]), lambda group_size: _mock_group(2), "does not match local_cp_size"),
     ],
 )

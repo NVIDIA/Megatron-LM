@@ -2402,7 +2402,9 @@ class DSAIndexer(MegatronModule):
                 k = self.k_norm(k)
             # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
             k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-            k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv, cp_group=cp_group)
+            k = self._apply_rope(
+                k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv, cp_group=cp_group
+            )
             # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
             k = k.reshape(seqlen, bsz, self.index_head_dim)
 
