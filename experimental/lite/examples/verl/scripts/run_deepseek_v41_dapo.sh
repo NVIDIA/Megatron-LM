@@ -241,6 +241,8 @@ COMMAND=(
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=adam"
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=${RECOMPUTE:-full}"
   "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=True"
+  # Deterministic sparse-attention backward needs a 26.55 GiB workspace at 32K (OOM).
+  "+actor_rollout_ref.actor.engine.impl_cfg.attention_deterministic_backward=${ACTOR_ATTN_DETERMINISTIC_BWD:-False}"
   "+actor_rollout_ref.actor.engine.impl_cfg.attention_core=${DSV41_ATTENTION_CORE}"
   "+actor_rollout_ref.actor.engine.impl_cfg.head_dtype=${DSV41_HEAD_DTYPE}"
   # rollout: resident vLLM, BI=1 sparse arm, DEP per node
