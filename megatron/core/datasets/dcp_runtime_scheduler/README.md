@@ -6,7 +6,9 @@ and parameters. It does not need the external `dcp-scheduler` repository.
 `ORIGIN.json` identifies the source commit, original parameter artifacts and
 hashes of the three runtime parameter files. Only selected formulas and consumed
 coefficients are packaged; historical heads, calibration reports and detailed
-prediction traces stay in the source repository. Coefficients are unchanged.
+prediction traces stay in the source repository. Coefficients are unchanged;
+the scalar evaluator shares geometry/dispatch validation and contains no
+offline composer or fitting diagnostics.
 
 The worker runs this package directly by file path, without importing the
 Megatron/PyTorch parent packages. A persistent leader-only CPU process solves one

@@ -9,7 +9,6 @@ This module does not import PyTorch or execute CUDA/communication operations.
 from __future__ import annotations
 
 import hashlib
-import heapq
 import json
 from functools import lru_cache
 from pathlib import Path
@@ -23,8 +22,8 @@ SECTION_MASK = {'diagonal': 'causal', 'lower': 'rectangle', 'upper': 'rectangle'
 DEFAULT_CLOCK_LAW = 'alpha'
 
 PARAMETER_HASHES = {
-    'attention/gb200.json': '7f4ccc3da6665f4eed70e00847fb0f3b874eb44ced8639f3e806854658939a66',
-    'attention/gb300.json': '75f8377ad93976a36c08841c5c05bbea195b730a085c5bc0afe08668f2f10197',
+    'attention/gb200.json': 'c66c6abe5e37f1a61161980dbba6943b96a18a7da814bab8446cd517e3aefddc',
+    'attention/gb300.json': '520b2f993773a17a917fc54d41f73ef00d3d86afe617a2b53b446f5d020dc37a',
     'qwen35.json': 'c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc',
 }
 
@@ -79,11 +78,6 @@ def layout_extend_last(lengths, cp_size, storage_tokens, alignment, dataset_alig
             f'padded lengths {padded} are not divisible by 2 x cp = {2 * cp}: alignment {align} does not support the zigzag layout at cp {cp}'
         )
     return padded
-
-
-def cp1_pieces(lengths):
-    """cp = 1: one causal call over the pack, pieces (L_i, L_i) of valid tokens."""
-    return [(int(v), int(v)) for v in lengths]
 
 
 @lru_cache(maxsize=256)
@@ -163,22 +157,6 @@ def slots_for(head_dim, p_hw, half_occupancy_head_dim=HEAD_DIM_HALF_OCCUPANCY):
     return int(p_hw) if int(head_dim) < int(half_occupancy_head_dim) else max(1, int(p_hw) // 2)
 
 
-def q_blocks(tq, tile=TILE, block_rows=BLOCK_ROWS):
-    """Physical Q blocks covered by a valid-token tile count."""
-    return ceil_div(tq, block_rows // tile)
-
-
-def causal_block_kv(tq, tile=TILE, block_rows=BLOCK_ROWS):
-    """KV tiles walked by each forward Q block under the causal mask."""
-    tq = int(tq)
-    return [min(2 * b, tq) for b in range(1, q_blocks(tq, tile, block_rows) + 1)]
-
-
-def rect_block_kv(tq, tkv, tile=TILE, block_rows=BLOCK_ROWS):
-    """kv tiles walked by every Q block of a no-mask q x kv block: tkv for each of the q_blocks(tq) blocks."""
-    return [int(tkv)] * q_blocks(int(tq), tile, block_rows)
-
-
 def active_pieces(pieces):
     """(q_tokens, kv_tokens) pieces with q > 0 and kv > 0, pack order kept."""
     return [(int(q), int(kv)) for q, kv in pieces if int(q) > 0 and int(kv) > 0]
@@ -191,89 +169,26 @@ def units_kv(pieces, mask, q_heads, tile=TILE, block_rows=BLOCK_ROWS):
     out = []
     for q, kv in active_pieces(pieces):
         tq, tkv = (tile_of(q, tile), tile_of(kv, tile))
+        blocks = ceil_div(tq, block_rows // tile)
         per_piece = (
-            causal_block_kv(tq, tile, block_rows)
-            if mask == 'causal'
-            else rect_block_kv(tq, tkv, tile, block_rows)
+            [min(2 * b, tq) for b in range(1, blocks + 1)] if mask == 'causal' else [tkv] * blocks
         )
-        for _head in range(int(q_heads)):
-            out.extend(per_piece)
+        out.extend(per_piece * int(q_heads))
     return out
 
 
 def makespan(kv_tiles, P, rho):
     """Greedy kernel-wave duration in rho-plus-tile units, in dispatch order."""
-    from .dispatch import accelerated_chain
+    from .dispatch import dispatch_chain
 
-    compiled = accelerated_chain(kv_tiles, P, rho)
-    if compiled is not None:
-        return compiled[0]
-    rho = float(rho)
-    costs = [rho + float(k) for k in kv_tiles]
-    if not costs:
-        return 0.0
-    P = int(P)
-    if P <= 0:
+    if int(P) <= 0:
         raise ValueError('P must be positive')
-    if len(costs) <= P:
-        return max(costs)
-    if costs[0] > 0 and all((cost == costs[0] for cost in costs)):
-        finish = 0.0
-        for _ in range(ceil_div(len(costs), P)):
-            finish += costs[0]
-        return finish
-    heap = [0.0] * P
-    end = 0.0
-    for cost in costs:
-        finish = heap[0] + cost
-        heapq.heapreplace(heap, finish)
-        if finish > end:
-            end = finish
-    return end
-
-
-def j_max(kv_tiles):
-    """kv tiles of the longest unit (the J_max of the ``+ jmax`` form)."""
-    return max((int(k) for k in kv_tiles), default=0)
+    return dispatch_chain(kv_tiles, P, rho)[0]
 
 
 def static_ms(n_active, us_per_slot, thd_max):
     """The fixed static-batch term: every empty cu_seqlens slot of the thd_max-sized static batch costs us_per_slot."""
     return float(us_per_slot) * 0.001 * (int(thd_max) - int(n_active))
-
-
-def f5_wall(
-    cset,
-    pieces,
-    S_tokens,
-    mask,
-    q_heads,
-    head_dim,
-    *,
-    p_hw,
-    static_us_per_slot,
-    thd_max,
-    n_static=None,
-    tile=TILE,
-    block_rows=BLOCK_ROWS,
-    half_occupancy_head_dim=HEAD_DIM_HALF_OCCUPANCY,
-):
-    """CP1 wall: k0 + b*S + tau*wave + last-wave tail + static sequence slots."""
-    kv = units_kv(pieces, mask, q_heads, tile, block_rows)
-    P = slots_for(head_dim, int(cset.get('P_hw', p_hw)), half_occupancy_head_dim)
-    span = makespan(kv, P, float(cset['rho_kvtiles']))
-    n_active = len(active_pieces(pieces))
-    n_st = n_active if n_static is None else int(n_static)
-    k0 = float(cset['k0_ms'])
-    bS = float(cset['b_S_ms_per_token']) * float(S_tokens)
-    sched = float(cset['tau_ms_per_kvtile']) * span
-    beyond = len(kv) > P
-    jm_tiles = j_max(kv)
-    tj = float(cset.get('tau_jmax_ms_per_kvtile') or 0.0)
-    jm = tj * jm_tiles if tj and beyond else 0.0
-    st = static_ms(n_st, static_us_per_slot, thd_max)
-    wall = k0 + bS + sched + jm + st
-    return wall
 
 
 def topology_class_for_cp(topology, cp_size):
@@ -294,20 +209,93 @@ def topology_class_for_cp(topology, cp_size):
     return (name, role)
 
 
-class ForwardModel:
+class AttentionModel:
+    """Shared frozen-parameter, geometry and physical-layout contract."""
+
+    def __init__(self, hardware, phase):
+        self.data, self.parameter_sha256 = load_parameters(f'attention/{hardware}.json')
+        if self.data['hardware'] != hardware:
+            raise ValueError('Calibration hardware mismatch')
+        self.fit = self.data[phase]
+        self.phase = phase
+        self.data_sha256 = self.data['source_sha256']
+        self.head, self.head_status = self.fit['head'], self.fit['head_status']
+        self.known_limits = self.fit['known_limits']
+        self.topology = self.data['topology']
+        self.alignment_default = int(self.data['layout']['alignment_default'])
+        self.production_default_clock_mhz = self.data['production_clock_mhz']
+        cp1 = self.fit['cp1']
+        self.thd_max = int(cp1.get('thd_max', cp1.get('static', {}).get('thd_max', 64)))
+        keys = (
+            ('q_heads', 'kv_heads', 'head_dim')
+            if phase == 'backward'
+            else ('query_heads', 'kv_heads', 'head_dim')
+        )
+        self.geometries = {
+            name: tuple(int(g[k]) for k in keys)
+            for name, g in cp1.get('geometry_params', cp1['geometries']).items()
+        }
+        self._profile_by_shape = {shape: name for name, shape in self.geometries.items()}
+
+    def geometry_profile(self, query_heads, kv_heads, head_dim):
+        key = int(query_heads), int(kv_heads), int(head_dim)
+        if key not in self._profile_by_shape:
+            raise ValueError(f'No {self.phase} coefficient set for geometry {key}')
+        return self._profile_by_shape[key]
+
+    def structure_for_cp(self, cp):
+        """Use the pinned communication class or its recorded topology rule."""
+        if cp < 2:
+            raise ValueError('The ring layer requires CP >= 2')
+        ring = self.fit['ring']
+        structure = ring['structure_of_cp'].get(str(cp))
+        if structure is None:
+            structure, _ = topology_class_for_cp(self.topology, cp)
+        if structure not in ring['W0']:
+            raise ValueError(f'No communication coefficients for {structure!r}')
+        return structure
+
+    def predict_time_ms(
+        self,
+        lengths,
+        cp_size,
+        *,
+        query_heads,
+        kv_heads,
+        head_dim,
+        storage_tokens,
+        sequence_alignment=None,
+        dataset_alignment=1,
+        clock_law=DEFAULT_CLOCK_LAW,
+        use_production_default_clock=False,
+    ):
+        """Scalar execution of the frozen formula; no prediction trace allocation."""
+        if clock_law not in ('alpha', 'two_term'):
+            raise ValueError('Unsupported clock input')
+        values = tuple(int(n) for n in lengths)
+        cp, storage = int(cp_size), int(storage_tokens)
+        if len(values) > self.thd_max:
+            raise ValueError('Pack exceeds static sequence slots')
+        profile = self.geometry_profile(query_heads, kv_heads, head_dim)
+        alignment = (
+            self.alignment_default if sequence_alignment is None else int(sequence_alignment)
+        )
+        padded = layout_extend_last(values, cp, storage, alignment, dataset_alignment)
+        frequency = (
+            float(self.production_default_clock_mhz[self.phase])
+            if use_production_default_clock
+            else None
+        )
+        return self._predict(profile, storage, cp, values, padded, frequency, clock_law)
+
+
+class ForwardModel(AttentionModel):
     """Selected forward CP1 wave and ring formulas; no historical heads or traces."""
 
     def __init__(self, hardware: str):
-        data, self.parameter_sha256 = load_parameters('attention/' + hardware + '.json')
-        if data['hardware'] != hardware:
-            raise ValueError('Calibration hardware mismatch')
-        fit = data['forward']
-        self.hardware, self.direction = hardware, 'forward'
-        self.data_sha256 = data['source_sha256']
-        self.head, self.head_status = fit['head'], fit['head_status']
-        self.known_limits = fit['known_limits']
-        self.topology = data['topology']
-        cp1, constants = fit['cp1'], data['constants']
+        super().__init__(hardware, 'forward')
+        fit = self.fit
+        cp1, constants = fit['cp1'], self.data['constants']
         self.tile = int(cp1.get('tile', constants['tile_tokens']))
         self.block_rows = int(cp1.get('block_rows', constants['block_rows']))
         if self.block_rows % self.tile:
@@ -316,66 +304,16 @@ class ForwardModel:
         self.half_occupancy_head_dim = None if half is None else int(half)
         self.p_hw = int(cp1['P_hw'])
         self.static_us_per_slot = float(cp1['static_us_per_slot'])
-        self.thd_max = int(cp1['thd_max'])
-        self.geometries = cp1['geometries']
-        self._profile_by_shape = {
-            (int(g['query_heads']), int(g['kv_heads']), int(g['head_dim'])): name
-            for name, g in self.geometries.items()
-        }
         self.o_graph, self.ring = fit['o_graph'], fit['ring']
         self.ring_kernel_scale = float(fit['kernel_scale'])
         self.clock = fit['clock']
         self.f0_mhz = float(self.clock['f0_mhz'])
         self.alpha = float(self.clock['alpha'])
         self.two_term_s = float(self.clock['two_term_s'])
-        self.production_default_clock_mhz = data['production_clock_mhz']
-        self.alignment_default = int(data['layout']['alignment_default'])
-        self.calibrated_cps = tuple(self.ring['calibrated_cps'])
         self.sequential_pair_structure = self.ring['sequential_pair_structure']
-        self.structure_of_cp = {int(k): v for k, v in self.ring['structure_of_cp'].items()}
         self.kappa_W0 = float(self.ring['kappa_W0'])
         self.kappa_W0_pair = float(self.ring.get('kappa_W0_sequential_pair', 0.0))
         self._kernel_cache = {}
-
-    def kernel_scale(self, cp_size, *, law='alpha', use_production_default=False):
-        """Frozen production clock scaling; communication terms stay unscaled."""
-        if law not in ('alpha', 'two_term'):
-            raise ValueError('Unsupported forward clock law')
-        if not use_production_default:
-            return None, None
-        ratio = float(self.f0_mhz) / float(self.production_default_clock_mhz['forward'])
-        if law == 'two_term':
-            scale = float(self.two_term_s) * ratio + (1.0 - float(self.two_term_s))
-        else:
-            scale = ratio ** float(self.alpha)
-        return scale, None
-
-    def geometry_profile(self, query_heads, kv_heads, head_dim):
-        """Name of the calibrated geometry profile for (query_heads, kv_heads, head_dim); ValueError when none exists."""
-        key = (int(query_heads), int(kv_heads), int(head_dim))
-        name = self._profile_by_shape.get(key)
-        if name is None:
-            known = ', '.join(
-                (
-                    f'{n} {q}/{kv}/{d}'
-                    for (q, kv, d), n in sorted(
-                        self._profile_by_shape.items(), key=lambda kv_: kv_[1]
-                    )
-                )
-            )
-            raise ValueError(
-                f'no WP-G3 cuda_graph coefficient set for geometry {key[0]}/{key[1]}/{key[2]} on {self.hardware}; calibrated: {known}'
-            )
-        return name
-
-    def cp1_set(self, profile, mask):
-        if mask not in MASKS:
-            raise ValueError(f'mask must be one of {MASKS}, got {mask!r}')
-        return self.geometries[profile][mask]
-
-    def geometry_params(self, profile):
-        entry = self.geometries[profile]
-        return (int(entry['query_heads']), int(entry['kv_heads']), int(entry['head_dim']))
 
     def f5(self, profile, mask, pieces, S_tokens, n_static=None):
         """Tile-rounded, cached fused-attention wall at the reference clock."""
@@ -386,63 +324,40 @@ class ForwardModel:
 
     @lru_cache(maxsize=8192)
     def _f5_tiles(self, profile, mask, tiles, S_tokens, n_static):
-        q_heads, _kv, head_dim = self.geometry_params(profile)
+        q_heads, _kv, head_dim = self.geometries[profile]
         pieces = [(q * self.tile, kv * self.tile) for q, kv in tiles]
-        return f5_wall(
-            self.cp1_set(profile, mask),
-            pieces,
-            S_tokens,
-            mask,
-            q_heads,
-            head_dim,
-            p_hw=self.p_hw,
-            static_us_per_slot=self.static_us_per_slot,
-            thd_max=self.thd_max,
-            n_static=n_static,
-            tile=self.tile,
-            block_rows=self.block_rows,
-            half_occupancy_head_dim=self.half_occupancy_head_dim,
+        coefficients = self.fit['cp1']['geometries'][profile][mask]
+        units = units_kv(pieces, mask, q_heads, self.tile, self.block_rows)
+        slots = slots_for(
+            head_dim, int(coefficients.get('P_hw', self.p_hw)), self.half_occupancy_head_dim
         )
+        span = makespan(units, slots, float(coefficients['rho_kvtiles']))
+        k0 = float(coefficients['k0_ms'])
+        bS = float(coefficients['b_S_ms_per_token']) * float(S_tokens)
+        schedule = float(coefficients['tau_ms_per_kvtile']) * span
+        tau = float(coefficients.get('tau_jmax_ms_per_kvtile') or 0.0)
+        tail = tau * max(units, default=0) if tau and len(units) > slots else 0.0
+        static = static_ms(
+            len(pieces) if n_static is None else int(n_static),
+            self.static_us_per_slot,
+            self.thd_max,
+        )
+        return k0 + bS + schedule + tail + static
 
     def o_graph_ms(self, P_q, profile):
         """Per-call overhead from physical Q bytes, excluded from kernel scaling."""
-        q_heads, _kv, head_dim = self.geometry_params(profile)
+        q_heads, _kv, head_dim = self.geometries[profile]
         mib = float(P_q) * (q_heads * head_dim) * 2.0 / MIB
         return (float(self.o_graph['o0_us']) + float(self.o_graph['o1_us_per_MiB']) * mib) * 0.001
-
-    def structure_for_cp(self, cp_size):
-        """Frozen communication structure for an arbitrary CP width."""
-        cp = int(cp_size)
-        if cp < 2:
-            raise ValueError('the ring layer needs cp >= 2')
-        structure = self.structure_of_cp.get(cp)
-        if structure is None:
-            if cp == 2 and self.sequential_pair_structure:
-                structure = self.sequential_pair_structure
-            elif self.topology:
-                structure, _role = topology_class_for_cp(self.topology, cp)
-            elif cp <= 4:
-                structure = 'cp4_concurrent_intra_node'
-            else:
-                structure = 'nvl72_domain'
-        if structure not in self.ring['W0']:
-            raise ValueError(
-                f'communication structure {structure!r} has no W0 coefficients on head {self.head!r} ({self.hardware} / {self.direction})'
-            )
-        return (structure, cp not in self.calibrated_cps)
 
     def ring_terms(self, cp_size, storage_tokens, profile):
         """Communication/glue terms shared by every rank, in milliseconds."""
         cp, S = (int(cp_size), int(storage_tokens))
-        q_heads, kv_heads, head_dim = self.geometry_params(profile)
-        structure, _ = self.structure_for_cp(cp)
+        q_heads, kv_heads, head_dim = self.geometries[profile]
+        structure = self.structure_for_cp(cp)
         w0 = self.ring['W0'][structure]
         payload_bytes = 2 * S * kv_heads * head_dim * 2
-        bytes_by_step = [int(payload_bytes)] * int(cp)
-        W0_us_by_step = [
-            float(w0['latency_us']) + float(w0['us_per_byte']) * b for b in bytes_by_step
-        ]
-        W0_us = W0_us_by_step[0]
+        W0_us = float(w0['latency_us']) + float(w0['us_per_byte']) * int(payload_bytes)
         x = S * (q_heads * head_dim)
         mib = x * 2 / MIB
         chain0 = (
@@ -454,10 +369,7 @@ class ForwardModel:
         sequential = structure == self.sequential_pair_structure
         kappa = self.kappa_W0_pair if sequential else self.kappa_W0
         W0_ms = W0_us * 0.001
-        W0_by_step_ms = [w * 0.001 for w in W0_us_by_step]
-        stretch_by_step_ms = [kappa * w for w in W0_by_step_ms]
-        constant = len(set(bytes_by_step)) == 1
-        stretch_total_ms = cp * stretch_by_step_ms[0] if constant else sum(stretch_by_step_ms)
+        stretch_ms = kappa * W0_ms
         return {
             'cp': cp,
             'sequential_pair': sequential,
@@ -465,8 +377,7 @@ class ForwardModel:
             'chain0_comm_ms': chain0 * 0.001,
             'gmid_ms': gmid * 0.001,
             'tail_ms': cp * c_tail * mib * 0.001,
-            'stretch_by_step_ms': stretch_by_step_ms,
-            'stretch_total_ms': stretch_total_ms,
+            'stretch_ms': stretch_ms,
         }
 
     def first_exchange(self, terms, k0_ms):
@@ -500,35 +411,17 @@ class ForwardModel:
             self._kernel_cache[key] = hit
         return hit
 
-    def predict_time_ms(
-        self,
-        lengths,
-        cp_size,
-        *,
-        query_heads,
-        kv_heads,
-        head_dim,
-        storage_tokens,
-        sequence_alignment=None,
-        dataset_alignment=1,
-        clock_law=DEFAULT_CLOCK_LAW,
-        use_production_default_clock=False,
-    ):
-        """Scalar-only execution of the SAME frozen formula; no trace allocation."""
-        cp, S = (int(cp_size), int(storage_tokens))
-        values = tuple((int(n) for n in lengths))
-        if len(values) > self.thd_max:
-            raise ValueError('pack exceeds CUDA-graph static sequence slots')
-        profile = self.geometry_profile(query_heads, kv_heads, head_dim)
-        alignment = (
-            self.alignment_default if sequence_alignment is None else int(sequence_alignment)
-        )
-        padded = layout_extend_last(values, cp, S, alignment, dataset_alignment)
-        clock_scale, _ = self.kernel_scale(
-            cp, law=clock_law, use_production_default=use_production_default_clock
-        )
+    def _predict(self, profile, S, cp, values, padded, frequency, clock_law):
+        clock_scale = None
+        if frequency:
+            ratio = self.f0_mhz / frequency
+            clock_scale = (
+                self.two_term_s * ratio + (1.0 - self.two_term_s)
+                if clock_law == 'two_term'
+                else ratio**self.alpha
+            )
         if cp == 1:
-            wall = self.f5(profile, 'causal', cp1_pieces(values), S)
+            wall = self.f5(profile, 'causal', [(v, v) for v in values], S)
             og = self.o_graph_ms(S, profile)
             return wall if clock_scale is None else og + (wall - og) * clock_scale
         terms = self.ring_terms(cp, S, profile)
@@ -541,7 +434,7 @@ class ForwardModel:
             k[item['rank']][item['step']] = kr * scale
         sums = [sum(row) for row in k]
         crit = max(range(cp), key=lambda rank: sums[rank])
-        kernel = sums[crit] + terms['stretch_total_ms']
+        kernel = sums[crit] + cp * terms['stretch_ms']
         glue = terms['chain0_comm_ms'] + (cp - 2) * terms['gmid_ms'] + terms['tail_ms']
-        first_exchange = self.first_exchange(terms, k[crit][0] + terms['stretch_by_step_ms'][0])
+        first_exchange = self.first_exchange(terms, k[crit][0] + terms['stretch_ms'])
         return kernel + glue + first_exchange

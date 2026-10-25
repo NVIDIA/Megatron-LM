@@ -76,6 +76,30 @@ class LightweightRuntimePlanner:
             max_group_seqs=self.geometry.max_group_seqs or 64,
         )
 
+    def _start_plan(self, lengths):
+        lengths = dict(lengths)
+        if not lengths or any(
+            type(i) is not int or i < 0 or type(n) is not int or n <= 0 for i, n in lengths.items()
+        ):
+            raise ValueError(
+                "lengths must map nonnegative integer IDs to positive integer logical lengths"
+            )
+        self.model.clear()
+        self.costs = self._new_costs()
+        return lengths
+
+    def _make_plan(self, rounds, lengths, predicted, begin):
+        rows = encode_rows(rounds, self.geometry.world_size)
+        groups = validate_rows(rows, lengths, self.geometry, min(self.geometry.allowed_cp_sizes))
+        return RuntimePlan(
+            rows=rows,
+            groups=groups,
+            predicted_ms=predicted,
+            planning_s=time.perf_counter() - begin,
+            microbatches=len(rows),
+            dummy_tokens=dummy_tokens_per_group(groups, lengths, self.geometry),
+        )
+
     def _packing_tables(self, lengths):
         return (
             {i: self.costs.min_cp(n) for i, n in lengths.items()},
@@ -84,6 +108,17 @@ class LightweightRuntimePlanner:
                 for cp in self.geometry.allowed_cp_sizes
             },
         )
+
+    def _fill_pack(self, anchor, pending, cp, storage):
+        """All proposal families use the same ordered physical-capacity check."""
+        ids, used = [anchor], storage[cp][anchor]
+        for i in pending:
+            if len(ids) >= (self.geometry.max_group_seqs or 64):
+                break
+            if i != anchor and used + storage[cp][i] <= self.geometry.capacity(cp):
+                ids.append(i)
+                used += storage[cp][i]
+        return ids, used
 
     def _expand(self, row, lengths, widths=None, cost_aware=False):
         world = self.geometry.world_size
@@ -134,7 +169,6 @@ class LightweightRuntimePlanner:
         """Pack tokens globally, then tile whole groups into exact-world rows."""
         pending = sorted(lengths, key=lambda i: (-lengths[i], i))
         allowed = self.geometry.allowed_cp_sizes
-        limit = self.geometry.max_group_seqs or 64
         minimums, storage = tables or self._packing_tables(lengths)
         groups = []
         while pending:
@@ -142,13 +176,7 @@ class LightweightRuntimePlanner:
             minimum = minimums[anchor]
             target = min(self.geometry.world_size, minimum + width_extra)
             cp = next((c for c in allowed if c >= max(target, floor)), allowed[-1])
-            ids = [anchor]
-            used = storage[cp][anchor]
-            for i in pending[1:]:
-                extra = storage[cp][i]
-                if len(ids) < limit and used + extra <= self.geometry.capacity(cp):
-                    ids.append(i)
-                    used += extra
+            ids, _ = self._fill_pack(anchor, pending, cp, storage)
             selected = set(ids)
             pending = [i for i in pending if i not in selected]
             groups.append(dict(cp=cp, sample_ids=ids))
@@ -202,20 +230,13 @@ class LightweightRuntimePlanner:
             return None
         pending = sorted(lengths, key=lambda i: (-lengths[i], i))
         groups = []
-        limit = self.geometry.max_group_seqs or 64
         while pending:
             anchor, best = pending[0], None
             for cp in widths:
                 used = storage[cp][anchor]
                 if used > self.geometry.capacity(cp):
                     continue
-                ids = [anchor]
-                for i in pending[1:]:
-                    if len(ids) == limit:
-                        break
-                    if used + storage[cp][i] <= self.geometry.capacity(cp):
-                        ids.append(i)
-                        used += storage[cp][i]
+                ids, _ = self._fill_pack(anchor, pending, cp, storage)
                 values = tuple(lengths[i] for i in ids)
                 useful = sum(values)
                 key = self._group_work(values, cp) / useful, -useful, cp
@@ -234,7 +255,6 @@ class LightweightRuntimePlanner:
         rounds = []
         world = self.geometry.world_size
         allowed = sorted(self.geometry.allowed_cp_sizes)
-        cap_seqs = self.geometry.max_group_seqs or 64
         minimums, storage = tables or self._packing_tables(lengths)
         while pending:
             row, used = [], 0
@@ -247,15 +267,7 @@ class LightweightRuntimePlanner:
                 cp = next((c for c in allowed if max(cp_min, floor) <= c <= remaining), None)
                 if cp is None:
                     cp = max(c for c in allowed if cp_min <= c <= remaining)
-                ids = [anchor]
-                stored = storage[cp][anchor]
-                for i in pending:
-                    if i == anchor or len(ids) >= cap_seqs:
-                        continue
-                    extra = storage[cp][i]
-                    if stored + extra <= self.geometry.capacity(cp):
-                        ids.append(i)
-                        stored += extra
+                ids, _ = self._fill_pack(anchor, pending, cp, storage)
                 chosen = set(ids)
                 pending = [i for i in pending if i not in chosen]
                 row.append(dict(cp=cp, sample_ids=ids))
@@ -279,14 +291,18 @@ class LightweightRuntimePlanner:
             rounds.append(row)
         return rounds
 
-    def _costed(self, rounds, lengths):
+    def _costed(self, rounds, lengths, guide=None):
         out = []
         for row in rounds:
             start, groups = 0, []
             for group in row:
                 cp = group["cp"]
                 values = tuple(lengths[i] for i in group["sample_ids"])
-                value = self.costs.pack(values, cp, start)
+                value = (
+                    (0.0, 0.0, guide(values, cp, ranks=tuple(range(start, start + cp))))
+                    if guide is not None
+                    else self.costs.pack(values, cp, start)
+                )
                 if value is None:
                     raise RuntimeScheduleError(f"cost model rejected CP{cp} pack {values}")
                 groups.append((start, cp, *value))
@@ -298,17 +314,7 @@ class LightweightRuntimePlanner:
         # Candidate ordering only; acceptance ALWAYS uses exact injected E2E costs.
         guide = getattr(self.model, "guide_program_costs", None)
         if guide is not None and self.timeline.program is not None:
-            costed = []
-            for row in rounds:
-                start, groups = 0, []
-                for group in row:
-                    cp = group["cp"]
-                    values = tuple(lengths[i] for i in group["sample_ids"])
-                    program = guide(values, cp, ranks=tuple(range(start, start + cp)))
-                    groups.append((start, cp, 0.0, 0.0, program))
-                    start += cp
-                costed.append(groups)
-            return self.timeline.evaluate(costed), len(rounds)
+            return self.timeline.evaluate(self._costed(rounds, lengths, guide)), len(rounds)
         work = sum(
             sum(lengths[i] ** 2 for i in g["sample_ids"]) / g["cp"] for row in rounds for g in row
         )
@@ -353,15 +359,7 @@ class LightweightRuntimePlanner:
 
     def plan(self, lengths, *, incumbent_rounds=None):
         begin = time.perf_counter()
-        lengths = dict(lengths)
-        if not lengths or any(
-            type(i) is not int or i < 0 or type(n) is not int or n <= 0 for i, n in lengths.items()
-        ):
-            raise ValueError(
-                "lengths must map nonnegative integer IDs to positive integer logical lengths"
-            )
-        self.model.clear()
-        self.costs = self._new_costs()
+        lengths = self._start_plan(lengths)
         tables = self._packing_tables(lengths)
         candidates, seen, rejected = [], set(), []
         for floor in self.options.cp_floors:
@@ -455,9 +453,8 @@ class LightweightRuntimePlanner:
         else:
             changed_rows = 0
         balance_s = time.perf_counter() - balance_begin
-        rows = encode_rows(best[1], self.geometry.world_size)
-        groups = validate_rows(rows, lengths, self.geometry, min(self.geometry.allowed_cp_sizes))
-        elapsed = time.perf_counter() - begin
+        plan = self._make_plan(best[1], lengths, best[0], begin)
+        elapsed = plan.planning_s
         self.last_statistics = dict(
             candidate_count=len(candidates),
             generated_candidates=generated,
@@ -477,17 +474,7 @@ class LightweightRuntimePlanner:
             pack_cost_stats=dict(self.costs.stats),
             algorithm="FFD + all-width work/token + EP-aligned proposals + bounded guide + exact E2E acceptance + rank rotation",
         )
-        return RuntimePlan(
-            rows=rows,
-            groups=groups,
-            predicted_ms=best[0],
-            planning_s=elapsed,
-            greedy_s=elapsed,
-            polish_evaluations=0,
-            microbatches=len(rows),
-            cache_hit=False,
-            dummy_tokens=dummy_tokens_per_group(groups, lengths, self.geometry),
-        )
+        return plan
 
     def plan_padded(self, padded_lengths, *, logical_lengths=None, incumbent_rows=None):
         """MCore input [(global_sample_id, dataset-padded length)]; pure CPU.

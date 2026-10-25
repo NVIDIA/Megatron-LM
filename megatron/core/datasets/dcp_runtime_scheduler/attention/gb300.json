@@ -46,8 +46,8 @@
     ]
   },
   "production_clock_mhz": {
-    "backward": 1800.0,
-    "forward": 1770.0
+    "backward": 1800,
+    "forward": 1770
   },
   "forward": {
     "head": "g5_f6",
@@ -73,7 +73,7 @@
           "head_dim": 128,
           "causal": {
             "k0_ms": 0.02371613085,
-            "b_S_ms_per_token": 3.027868455e-06,
+            "b_S_ms_per_token": 0.000003027868455,
             "tau_ms_per_kvtile": 0.001193891162,
             "rho_kvtiles": 3.5,
             "tau_jmax_ms_per_kvtile": 0.0007579622568,
@@ -81,10 +81,10 @@
           },
           "rectangle": {
             "k0_ms": 0.02470634587,
-            "b_S_ms_per_token": 3.131044386e-06,
+            "b_S_ms_per_token": 0.000003131044386,
             "tau_ms_per_kvtile": 0.00116765918,
-            "rho_kvtiles": 3.0,
-            "tau_jmax_ms_per_kvtile": 0.0,
+            "rho_kvtiles": 3,
+            "tau_jmax_ms_per_kvtile": 0,
             "P_hw": 152
           }
         },
@@ -94,7 +94,7 @@
           "head_dim": 128,
           "causal": {
             "k0_ms": 0.0245169337,
-            "b_S_ms_per_token": 1.422169829e-06,
+            "b_S_ms_per_token": 0.000001422169829,
             "tau_ms_per_kvtile": 0.001227111946,
             "rho_kvtiles": 3.5,
             "tau_jmax_ms_per_kvtile": 0.000621545126,
@@ -102,10 +102,10 @@
           },
           "rectangle": {
             "k0_ms": 0.02583774379,
-            "b_S_ms_per_token": 1.494492661e-06,
+            "b_S_ms_per_token": 0.000001494492661,
             "tau_ms_per_kvtile": 0.001176593089,
-            "rho_kvtiles": 3.0,
-            "tau_jmax_ms_per_kvtile": 0.0,
+            "rho_kvtiles": 3,
+            "tau_jmax_ms_per_kvtile": 0,
             "P_hw": 152
           }
         },
@@ -115,18 +115,18 @@
           "head_dim": 256,
           "causal": {
             "k0_ms": 0.02578617144,
-            "b_S_ms_per_token": 3.030242202e-06,
+            "b_S_ms_per_token": 0.000003030242202,
             "tau_ms_per_kvtile": 0.001163102736,
-            "rho_kvtiles": 3.0,
+            "rho_kvtiles": 3,
             "tau_jmax_ms_per_kvtile": 0.0004260314352,
             "P_hw": 152
           },
           "rectangle": {
             "k0_ms": 0.02649395402,
-            "b_S_ms_per_token": 3.073633864e-06,
+            "b_S_ms_per_token": 0.000003073633864,
             "tau_ms_per_kvtile": 0.001172327198,
             "rho_kvtiles": 2.5,
-            "tau_jmax_ms_per_kvtile": 0.0,
+            "tau_jmax_ms_per_kvtile": 0,
             "P_hw": 152
           }
         }
@@ -145,14 +145,14 @@
       ],
       "sequential_pair_structure": "cp2_sequential_sendrecv",
       "structure_of_cp": {
-        "16": "nvl72_domain",
         "2": "cp2_sequential_sendrecv",
-        "32": "nvl72_domain",
         "4": "cp4_concurrent_intra_node",
-        "8": "nvl72_domain"
+        "8": "nvl72_domain",
+        "16": "nvl72_domain",
+        "32": "nvl72_domain"
       },
       "kappa_W0": 0.1221249723,
-      "kappa_W0_sequential_pair": 0.0,
+      "kappa_W0_sequential_pair": 0,
       "c_tail_us_per_MiB": 0.8541772554,
       "W0": {
         "cp2_sequential_sendrecv": {
@@ -161,7 +161,7 @@
             2
           ],
           "latency_us": 61.21377461,
-          "us_per_byte": 4.41180333e-06
+          "us_per_byte": 0.00000441180333
         },
         "cp4_concurrent_intra_node": {
           "bandwidth_GBps": 478.2507997,
@@ -169,7 +169,7 @@
             4
           ],
           "latency_us": 32.99570097,
-          "us_per_byte": 2.090953116e-06
+          "us_per_byte": 0.000002090953116
         },
         "nvl72_domain": {
           "bandwidth_GBps": 629.4336662,
@@ -178,24 +178,24 @@
             16
           ],
           "latency_us": 24.77553784,
-          "us_per_byte": 1.588729764e-06
+          "us_per_byte": 0.000001588729764
         }
       },
       "chain_0_comm": {
         "a0_us": 12.62133522,
         "a1_us_per_MiB": -0.1043574855,
-        "a1_us_per_elem": -1.990461072e-07
+        "a1_us_per_elem": -1.990461072e-7
       },
       "g_mid": {
         "b0_us": 16.11727153,
-        "b1_us_per_MiB": 0.0,
-        "b1_us_per_elem": 0.0
+        "b1_us_per_MiB": 0,
+        "b1_us_per_elem": 0
       }
     },
-    "kernel_scale": 1.0,
+    "kernel_scale": 1,
     "clock": {
-      "f0_mhz": 1770.0,
-      "alpha": 1.0,
+      "f0_mhz": 1770,
+      "alpha": 1,
       "two_term_s": 0.949
     }
   },
@@ -215,7 +215,7 @@
     ],
     "cp1": {
       "form": "F5b-1+jmax",
-      "f0_mhz": 1800.0,
+      "f0_mhz": 1800,
       "static_us_per_slot": 0.155,
       "u_treatment": "none",
       "structural": {
@@ -279,7 +279,7 @@
           "causal": {
             "status": "fitted",
             "k0_ms": 0.01468161293,
-            "b_S_ms_per_token": 5.38947091e-06,
+            "b_S_ms_per_token": 0.00000538947091,
             "tau_ms_per_tile": 0.002731519209,
             "rho_tiles": 1.5,
             "tau_jmax_ms_per_tile": 0.0009797171055
@@ -287,9 +287,9 @@
           "rectangle": {
             "status": "fitted",
             "k0_ms": 0.01576034141,
-            "b_S_ms_per_token": 5.565809465e-06,
+            "b_S_ms_per_token": 0.000005565809465,
             "tau_ms_per_tile": 0.002829545424,
-            "rho_tiles": 1.0,
+            "rho_tiles": 1,
             "tau_jmax_ms_per_tile": 0.0002778118605
           }
         },
@@ -297,7 +297,7 @@
           "causal": {
             "status": "fitted",
             "k0_ms": 0.0143877829,
-            "b_S_ms_per_token": 2.907317395e-06,
+            "b_S_ms_per_token": 0.000002907317395,
             "tau_ms_per_tile": 0.002742366597,
             "rho_tiles": 1.5,
             "tau_jmax_ms_per_tile": 0.001009926482
@@ -305,9 +305,9 @@
           "rectangle": {
             "status": "fitted",
             "k0_ms": 0.01542865812,
-            "b_S_ms_per_token": 2.933938832e-06,
+            "b_S_ms_per_token": 0.000002933938832,
             "tau_ms_per_tile": 0.00281945828,
-            "rho_tiles": 1.0,
+            "rho_tiles": 1,
             "tau_jmax_ms_per_tile": 0.0004594933248
           }
         },
@@ -315,17 +315,17 @@
           "causal": {
             "status": "fitted",
             "k0_ms": 0.03207827337,
-            "b_S_ms_per_token": 4.804575426e-06,
+            "b_S_ms_per_token": 0.000004804575426,
             "tau_ms_per_tile": 0.005776456865,
-            "rho_tiles": 3.0,
+            "rho_tiles": 3,
             "tau_jmax_ms_per_tile": 0.0004895047444
           },
           "rectangle": {
             "status": "fitted",
             "k0_ms": 0.03264031631,
-            "b_S_ms_per_token": 5.025612118e-06,
+            "b_S_ms_per_token": 0.000005025612118,
             "tau_ms_per_tile": 0.00514400364,
-            "rho_tiles": 3.0,
+            "rho_tiles": 3,
             "tau_jmax_ms_per_tile": 0.0003016153204
           }
         }
@@ -349,27 +349,27 @@
       }
     },
     "ring": {
-      "kernel_scale": 1.0,
+      "kernel_scale": 1,
       "structure_of_cp": {
-        "16": "nvl72_domain",
         "2": "cp2_sequential_sendrecv",
-        "32": "nvl72_domain",
         "4": "cp4_concurrent_intra_node",
-        "8": "nvl72_domain"
+        "8": "nvl72_domain",
+        "16": "nvl72_domain",
+        "32": "nvl72_domain"
       },
-      "f0_mhz": 1800.0,
+      "f0_mhz": 1800,
       "W0": {
         "cp2_sequential_sendrecv": {
           "latency_us": 59.80678058,
-          "us_per_byte": 4.345244794e-06
+          "us_per_byte": 0.000004345244794
         },
         "cp4_concurrent_intra_node": {
           "latency_us": 31.06524344,
-          "us_per_byte": 2.131320826e-06
+          "us_per_byte": 0.000002131320826
         },
         "nvl72_domain": {
           "latency_us": 27.36987535,
-          "us_per_byte": 1.576545231e-06
+          "us_per_byte": 0.000001576545231
         }
       },
       "X": {
@@ -388,77 +388,18 @@
         "scaled": false,
         "memset_us": 2.88,
         "prep": {
-          "fit": {
-            "bias": -3.194,
-            "max": 840.223,
-            "med": 14.397,
-            "n": 9000,
-            "p90": 69.02,
-            "wape": 20.027
-          },
-          "median_us": 149.224,
           "p0_us": 39.18612586,
           "p_kv_us_per_MiB_kv": 2.639446639,
           "p_n_us_per_piece": 0.06979351862,
-          "p_q_us_per_MiB_q": 0.3594504472,
-          "pinned_at_zero": [],
-          "se": [
-            0.8470378675,
-            0.006320376248,
-            0.03146307023,
-            0.02021362355
-          ]
+          "p_q_us_per_MiB_q": 0.3594504472
         },
         "accumulate": {
           "a0_us": 10.12232706,
-          "a_us_per_MiB_kv": 0.6488085992,
-          "fit": {
-            "bias": -15.337,
-            "max": 106.353,
-            "med": 46.81,
-            "n": 8280,
-            "p90": 73.431,
-            "wape": 42.143
-          },
-          "median_us": 20.24,
-          "pinned_at_zero": [],
-          "se": [
-            0.3062123497,
-            0.01381668321
-          ],
-          "with_q_term": {
-            "a0_us": 9.846947409,
-            "a_us_per_MiB_kv": 0.6411260305,
-            "a_us_per_MiB_q": 0.004436436792,
-            "fit": {
-              "bias": -14.959,
-              "max": 108.06,
-              "med": 46.781,
-              "n": 8280,
-              "p90": 75.789,
-              "wape": 42.55
-            }
-          }
+          "a_us_per_MiB_kv": 0.6488085992
         },
         "copy": {
           "c0_us": 1.341733828,
-          "c_us_per_MiB_bytes": 0.0,
-          "fit": {
-            "bias": -92.455,
-            "max": 98.282,
-            "med": 89.897,
-            "n": 828,
-            "p90": 94.364,
-            "wape": 92.455
-          },
-          "median_us": 0.0,
-          "pinned_at_zero": [
-            1
-          ],
-          "se": [
-            0.05568087806,
-            null
-          ]
+          "c_us_per_MiB_bytes": 0
         },
         "helpers": {
           "mode": "active_tokens",

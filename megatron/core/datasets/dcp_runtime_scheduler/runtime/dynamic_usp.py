@@ -9,13 +9,7 @@ import time
 
 from .hot_switch import HotSwitchOptions, HotSwitchScheduler, InfeasibleLayout
 from .lightweight import LightweightRuntimePlanner
-from .planner import (
-    RuntimePlan,
-    RuntimeScheduleError,
-    dummy_tokens_per_group,
-    encode_rows,
-    validate_rows,
-)
+from .planner import RuntimePlan, RuntimeScheduleError, encode_rows, validate_rows
 
 
 class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
@@ -73,13 +67,7 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
     def plan(self, lengths, *, incumbent_rounds=None) -> RuntimePlan:
         """Search hot-switch count candidates with the injected complete-step cost."""
         begin = time.perf_counter()
-        lengths = dict(lengths)
-        if not lengths or any(
-            type(i) is not int or i < 0 or type(n) is not int or n <= 0 for i, n in lengths.items()
-        ):
-            raise ValueError("lengths must map nonnegative integer IDs to positive lengths")
-        self.model.clear()
-        self.costs = self._new_costs()
+        lengths = self._start_plan(lengths)
         self.scheduler.last_candidates = []
 
         def score(rounds):
@@ -115,9 +103,6 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
             if best is None:
                 raise RuntimeScheduleError(f"hot-switch search: {error}") from error
 
-        rows = encode_rows(best[1], self.geometry.world_size)
-        groups = validate_rows(rows, lengths, self.geometry, min(self.geometry.allowed_cp_sizes))
-        elapsed = time.perf_counter() - begin
         self.last_statistics = dict(
             algorithm="DynamicUSP solve_gbs Stage 1 + injected complete-step cost",
             source_commit="1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
@@ -127,14 +112,4 @@ class DynamicUSPRuntimePlanner(LightweightRuntimePlanner):
             rejection=rejection,
             pack_cost_stats=dict(self.costs.stats),
         )
-        return RuntimePlan(
-            rows=rows,
-            groups=groups,
-            predicted_ms=best[0],
-            planning_s=elapsed,
-            greedy_s=elapsed,
-            polish_evaluations=0,
-            microbatches=len(rows),
-            cache_hit=False,
-            dummy_tokens=dummy_tokens_per_group(groups, lengths, self.geometry),
-        )
+        return self._make_plan(best[1], lengths, best[0], begin)

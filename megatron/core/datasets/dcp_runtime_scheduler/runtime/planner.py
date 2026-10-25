@@ -64,27 +64,8 @@ class RuntimePlan:
     groups: List[List[Tuple[int, int, List[int]]]]
     predicted_ms: float
     planning_s: float
-    greedy_s: float
-    polish_evaluations: int
     microbatches: int
-    cache_hit: bool
     dummy_tokens: List[List[int]] = field(default_factory=list)
-
-    def meta(self) -> dict:
-        """JSON-serialisable telemetry (no rows/groups)."""
-        return dict(
-            predicted_ms=self.predicted_ms,
-            planning_s=self.planning_s,
-            greedy_s=self.greedy_s,
-            polish_evaluations=self.polish_evaluations,
-            microbatches=self.microbatches,
-            cache_hit=self.cache_hit,
-            dummy_tokens=self.dummy_tokens,
-        )
-
-    def rounds(self) -> List[List[dict]]:
-        """The plan as ``sched`` rounds (``[[{'cp', 'sample_ids'}]]``, the scheduler's own representation)."""
-        return [[dict(cp=cp, sample_ids=list(ids)) for _, cp, ids in row] for row in self.groups]
 
 
 def encode_rows(rounds, world_size: int) -> List[List[List[int]]]:

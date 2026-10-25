@@ -85,10 +85,17 @@ def test_frozen_models_include_both_phases_for_odd_cp(model_name):
 @pytest.mark.parametrize(
     'case', json.loads(Path(__file__).with_name('dcp_frozen_costs.json').read_text())['cases']
 )
-def test_scalar_costs_match_the_frozen_reference(case):
+@pytest.mark.parametrize('kernel_backend', ['python', 'numba'])
+def test_scalar_costs_match_the_frozen_reference(case, kernel_backend):
+    if kernel_backend == 'numba':
+        pytest.importorskip('numba')
     hardware, geometry, cp, lengths, forward_ms, backward_ms = case
     predictor = CorePredictor(
-        hardware=hardware, query_heads=geometry[0], kv_heads=geometry[1], head_dim=geometry[2]
+        hardware=hardware,
+        query_heads=geometry[0],
+        kv_heads=geometry[1],
+        head_dim=geometry[2],
+        kernel_backend=kernel_backend,
     )
     assert predictor(lengths, cp) == {'forward_ms': forward_ms, 'backward_ms': backward_ms}
 
