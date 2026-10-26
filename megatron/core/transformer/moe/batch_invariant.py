@@ -9,6 +9,7 @@ from megatron.core import parallel_state
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_collective,
 )
+from megatron.core.transformer.moe.ep_invariant_combine import tree_combine
 
 
 def build_inverse_permutation_map(
@@ -70,9 +71,7 @@ def unpermute(
     """
     input_dtype = permuted_tokens.dtype
     if ep_invariant:
-        from megatron.core.transformer.moe import ep_invariant_combine as eic
-
-        out = eic.tree_combine(permuted_tokens, inverse_map[0], inverse_map[1], num_experts, probs)
+        out = tree_combine(permuted_tokens, inverse_map[0], inverse_map[1], num_experts, probs)
         return out.view(restore_shape).to(input_dtype)
     # Mirror the inference engine's summation tree exactly:
     # - When probs is None the activations were probability-weighted upstream

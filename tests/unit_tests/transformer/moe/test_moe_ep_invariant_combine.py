@@ -16,6 +16,14 @@ from tests.unit_tests.test_utilities import Utils
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
+def _pairwise_tree_sum(parts):
+    """Reference pairwise tree over a power-of-two number of tensors: (p0 + p1) + (p2 + p3) ..."""
+    assert parts and len(parts) & (len(parts) - 1) == 0, "expected a power-of-two count"
+    while len(parts) > 1:
+        parts = [parts[i] + parts[i + 1] for i in range(0, len(parts), 2)]
+    return parts[0]
+
+
 def _bits(t):
     return t.contiguous().view(torch.int32)
 
@@ -52,7 +60,7 @@ def _reference(idx, vals, experts, probs=None):
         leaves[e // leaf_size] = leaves[e // leaf_size] + torch.where(
             hit.any(1, keepdim=True), v, 0.0
         )
-    return eic.pairwise_tree_sum(leaves)
+    return _pairwise_tree_sum(leaves)
 
 
 def _training_inputs(idx, vals):
@@ -123,7 +131,7 @@ def test_rank_partials_same_bits_at_every_ep(experts):
         if experts % ep:
             continue
         parts = [_rank_partial(idx, vals, experts, ep, r) for r in range(ep)]
-        assert torch.equal(_bits(eic.pairwise_tree_sum(parts)), _bits(ref)), ep
+        assert torch.equal(_bits(_pairwise_tree_sum(parts)), _bits(ref)), ep
 
 
 def test_check_ep_size():
@@ -213,7 +221,7 @@ def test_inference_unpermute_same_bits_at_every_ep(monkeypatch):
     assert not ref[n:].any()  # rows past valid_tokens are zero
     for ep in (2, 4, 8):
         parts = [rank_out(ep, r, eic.num_leaf_blocks(experts) // ep) for r in range(ep)]
-        assert torch.equal(_bits(eic.pairwise_tree_sum(parts)), _bits(ref)), ep
+        assert torch.equal(_bits(_pairwise_tree_sum(parts)), _bits(ref)), ep
     # Flag off: unchanged (fp64 sum rounded to the fp32 rank partial).
     assert rank_out(1, 0, None).dtype == torch.float32
 

@@ -22,7 +22,7 @@ Adding an empty (+0.0) subtree is exact, so empty leaves and ranks do not change
 result; starting each leaf from +0.0 also turns -0.0 into +0.0 consistently.
 """
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -63,14 +63,6 @@ def check_ep_size(num_experts: int, ep_size: int) -> None:
             f"moe_ep_invariant_combine supports at most {1 << _MAX_LEVELS} leaf blocks "
             f"(got {num_leaf_blocks(num_experts)} for {num_experts} experts)."
         )
-
-
-def pairwise_tree_sum(parts: List[torch.Tensor]) -> torch.Tensor:
-    """Pairwise tree over a power-of-two number of tensors: (p0 + p1) + (p2 + p3) ..."""
-    assert parts and len(parts) & (len(parts) - 1) == 0, "expected a power-of-two count"
-    while len(parts) > 1:
-        parts = [parts[i] + parts[i + 1] for i in range(0, len(parts), 2)]
-    return parts[0]
 
 
 @triton.jit

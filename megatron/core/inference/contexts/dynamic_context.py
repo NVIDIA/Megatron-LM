@@ -868,7 +868,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
-                ep_invariant_combine=getattr(model_config, "moe_ep_invariant_combine", False),
+                ep_invariant_combine=model_config.moe_ep_invariant_combine,
             )
 
         # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
