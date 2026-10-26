@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
@@ -31,6 +32,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -43,11 +45,16 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
+from megatron.core.resharding import swap_model_weights
+from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    skip_if_sequence_packing_not_available,
+)
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig as _DynamicEngineTestConfig,
 )
@@ -709,8 +716,26 @@ _ASYNC_PAIR_SCENARIOS = (
         "model:hybrid-mamba",
         "interaction:mamba-state-compaction",
         config={"model_provider": "hybrid"},
-        signals=("hybrid", "metadata-compaction"),
+        signals=("hybrid", "mamba", "metadata-compaction"),
         prerequisite="mamba",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "hybrid-gdp",
+        "model:hybrid-gdp",
+        "interaction:gdp-state-compaction",
+        config={"model_provider": "hybrid", "ssm_mixer": "gdp"},
+        signals=("gdp", "hybrid", "metadata-compaction"),
+        prerequisite="gdp",
+        atol=5.0e-3,
+    ),
+    _pair_scenario(
+        "hybrid-gdn",
+        "model:hybrid-gdn",
+        "interaction:gdn-state-compaction",
+        config={"model_provider": "hybrid", "ssm_mixer": "gdn"},
+        signals=("gdn", "hybrid", "metadata-compaction"),
+        prerequisite="gdn",
         atol=5.0e-3,
     ),
     _pair_scenario(
@@ -733,6 +758,33 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("fp8",),
         prerequisite="fp8",
         atol=5.0e-3,
+        parity="reproducible",
+    ),
+    _pair_scenario(
+        "mxfp8-transformer-engine",
+        "precision:mxfp8",
+        config={"fp8": True, "fp8_recipe": "mxfp8", "hidden_size": 128},
+        signals=("fp8", "mxfp8"),
+        prerequisite="mxfp8",
+        atol=5.0e-3,
+        parity="reproducible",
+    ),
+    _pair_scenario(
+        "nvfp4-inference-moe",
+        "precision:nvfp4",
+        "implementation:inference-optimized",
+        "model:moe",
+        config={
+            "transformer_impl": "inference_optimized",
+            "hidden_size": 256,
+            "num_moe_experts": 2,
+            "use_moe_layer_spec": True,
+            "inference_grouped_gemm_backend": "flashinfer",
+            "inference_moe_nvfp4_recipe": "per_token",
+        },
+        signals=("inference-optimized", "moe", "nvfp4"),
+        prerequisite="nvfp4",
+        atol=5.0e-2,
         parity="reproducible",
     ),
     # Four heads of width 64 exercise FlashInfer's supported fused-RoPE kernel.
@@ -812,6 +864,22 @@ _ASYNC_PARALLEL_SCENARIOS = (
         signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
     ),
     _pair_scenario(
+        "moe-ep2-etp2",
+        "model:moe",
+        "topology:ep",
+        "topology:etp",
+        "interaction:moe-etp-streaming",
+        config={
+            "expert_model_parallel_size": 2,
+            "expert_tensor_parallel_size": 2,
+            "num_moe_experts": 4,
+            "use_moe_layer_spec": True,
+            "transformer_impl": "transformer_engine",
+        },
+        signals=("etp", "moe", "parallel", "transformer-engine"),
+        prerequisite="transformer-engine",
+    ),
+    _pair_scenario(
         "optimized-tp2-sp",
         "interaction:optimized-tp-sp",
         "seed:shared-across-dp",
@@ -838,6 +906,33 @@ _PROMPT_LENGTHS = (9, 5, 12, 7, 10, 6, 11)
 _OUTPUT_LENGTHS = (10, 5, 9, 7, 11, 6, 8)
 _REQUEST_WAVES = ((0, 1, 2), (3, 4), (5, 6))
 
+_STREAMING_SIGNAL_COUNTERS = {
+    "cuda-graph": "cuda_graph_steps",
+    "flashinfer": "sampling-backend:flashinfer",
+    "fp8": "fp8-quantized-forwards",
+    "full-logits": "full-logits-forward",
+    "fused-rope": "fused-rope-kernel",
+    "gdn": "module-forward:gdn",
+    "gdp": "module-forward:gdp",
+    "gpt": "module-forward:gpt",
+    "hybrid": "module-forward:hybrid",
+    "inference-optimized": "module-forward:inference-optimized",
+    "logprobs": "log-probs-calculations",
+    "mamba": "module-forward:mamba",
+    "mxfp8": "fp8-quantized-forwards",
+    "nvfp4": "nvfp4-kernel-forwards",
+    "moe": "module-forward:moe",
+    "nccl-dispatch": "nccl-token-dispatches",
+    "parallel": "module-forward:parallel",
+    "etp": "tp-column-partition-forwards",
+    "processed-logprobs": "log-probs-kernel",
+    "softmax-sink": "sink-correction-calls",
+    "swa-all": "swa-kernel-calls",
+    "swa-alternating": "swa-kernel-calls",
+    "top-n": "log-probs-calculations",
+    "transformer-engine": "module-forward:transformer-engine",
+}
+
 
 def _check_scenario_prerequisite(scenario):
     if scenario.prerequisite == "flashinfer":
@@ -846,6 +941,10 @@ def _check_scenario_prerequisite(scenario):
         available, reason = _check_mamba_sequence_packing_support()
         if not available:
             pytest.skip(reason)
+    elif scenario.prerequisite == "gdp":
+        skip_if_sequence_packing_not_available("gdp")
+    elif scenario.prerequisite == "gdn" and not HAVE_FLA:
+        pytest.skip("FLA is not installed")
     elif scenario.prerequisite == "transformer-engine":
         if not is_te_min_version("2.2.0"):
             pytest.skip("Transformer Engine 2.2.0 is required")
@@ -853,6 +952,19 @@ def _check_scenario_prerequisite(scenario):
         available, reason = check_fp8_support()
         if not available:
             pytest.skip(reason)
+    elif scenario.prerequisite == "mxfp8":
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("MXFP8 requires Blackwell or newer")
+        available, reason = check_fp8_support()
+        if not available:
+            pytest.skip(reason)
+    elif scenario.prerequisite == "nvfp4":
+        from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("per-token NVFP4 MoE requires Blackwell or newer")
+        if not HAVE_FLASHINFER_ROUTED_NVFP4:
+            pytest.skip("FlashInfer per-token NVFP4 MoE is unavailable")
 
 
 def _sampling_params_for_request(scenario, request_id, prompt_length):
@@ -1310,9 +1422,14 @@ def _instrument_scenario_runtime(env, scenario, runtime):
         "inference-optimized": lambda name, module: name.startswith("Inference")
         and "inference_layers" in module,
         "fp8": lambda name, module: name.startswith("TE") or "transformer_engine" in module,
-        "hybrid": lambda name, module: name == "MambaMixer",
+        "hybrid": lambda name, module: name
+        in {"GatedDeltaNet", "GatedDeltaProductMixer", "MambaMixer"},
+        "mamba": lambda name, module: name == "MambaMixer",
+        "gdp": lambda name, module: name == "GatedDeltaProductMixer",
+        "gdn": lambda name, module: name == "GatedDeltaNet",
         "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
         "parallel": lambda name, module: "ParallelLinear" in name
+        or "ParallelGroupedLinear" in name
         or name in {"ColumnParallelLinear", "RowParallelLinear"},
     }
     active_tags = set(scenario.signals) & watched_modules.keys()
@@ -1320,6 +1437,19 @@ def _instrument_scenario_runtime(env, scenario, runtime):
     for module in model.modules():
         class_name = type(module).__name__
         module_name = type(module).__module__
+        if "nvfp4" in scenario.signals and class_name == "InferenceGroupedMLP":
+            original_flashinfer_forward = module._flashinfer_forward
+
+            def traced_nvfp4_forward(
+                *args, _module=module, _forward=original_flashinfer_forward, **kwargs
+            ):
+                result = _forward(*args, **kwargs)
+                assert _module._nvfp4_weights is not None
+                assert not _module._uses_mxfp8_weights
+                runtime["nvfp4-kernel-forwards"] += 1
+                return result
+
+            module._flashinfer_forward = traced_nvfp4_forward
         if "softmax-sink" in scenario.signals and class_name == "SelfAttention":
             _instrument_attention_runtime(module, runtime)
         if "parallel" in scenario.signals and (
@@ -1347,15 +1477,29 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                         name = type(_module).__name__
                         weight = getattr(_module, "weight", None)
                         group = getattr(_module, "tp_group", None)
+                        if group is None:
+                            group = getattr(_module, "_tp_group", None)
                         size = torch.distributed.get_world_size(group) if group is not None else 1
-                        if weight is not None and "ColumnParallelLinear" in name:
+                        if "ColumnParallelGroupedLinear" in name:
+                            assert _module.explicit_expert_comm
+                            runtime["tp-column-partition-forwards"] += int(size > 1)
+                        elif "RowParallelGroupedLinear" in name:
+                            assert _module.explicit_expert_comm
+                            runtime["tp-row-partition-forwards"] += int(size > 1)
+                        elif weight is not None and "ColumnParallelLinear" in name:
                             output_size = getattr(
                                 _module, "output_size", getattr(_module, "out_features", None)
                             )
                             runtime["tp-column-partition-forwards"] += int(
                                 size > 1
                                 and output_size is not None
-                                and weight.shape[0] * size == output_size
+                                and (
+                                    weight.shape[0] * size == output_size
+                                    or (
+                                        getattr(weight, "tensor_model_parallel", False)
+                                        and getattr(weight, "partition_dim", None) == 0
+                                    )
+                                )
                             )
                         elif weight is not None and "RowParallelLinear" in name:
                             input_size = getattr(
@@ -1364,7 +1508,13 @@ def _instrument_scenario_runtime(env, scenario, runtime):
                             runtime["tp-row-partition-forwards"] += int(
                                 size > 1
                                 and input_size is not None
-                                and weight.shape[1] * size == input_size
+                                and (
+                                    weight.shape[1] * size == input_size
+                                    or (
+                                        getattr(weight, "tensor_model_parallel", False)
+                                        and getattr(weight, "partition_dim", None) == 1
+                                    )
+                                )
                             )
 
                 module.register_forward_pre_hook(record_module)
@@ -1456,15 +1606,56 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         config.update(scenario.config)
         config["async_sched_mode"] = mode
         env = cls._build_test_env(_DynamicEngineTestConfig(**config))
+        refit_source = None
+        if "suspend-resume" in scenario.signals:
+            model = env.engine.controller.inference_wrapped_model.model
+            refit_env = cls._build_test_env(_DynamicEngineTestConfig(**config))
+            refit_source = refit_env.engine.controller.inference_wrapped_model.model
+            with torch.no_grad():
+                next(refit_source.parameters()).view(-1)[0].add_(1)
+            assert not torch.equal(next(refit_source.parameters()), next(model.parameters()))
         env.requests = _make_scenario_requests(
             env, scenario, stop_tokens=stop_tokens, termination_token=termination_token
         )
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
+            runtime["streaming-counter-steps"] = {}
+            runtime["streaming-live-request-ids"] = set()
+            runtime["streaming-partial-steps"] = set()
+            runtime["suspend-resume-streamed-request-ids"] = set()
+            runtime["streaming-token-history"] = {}
             _instrument_scenario_runtime(env, scenario, runtime)
+            for request in env.requests:
+                request.sampling_params.streaming = True
+                request.sampling_params.streaming_interval = 1
+            env.engine.use_coordinator = True
+            env.engine.is_mp_coordinator = (
+                parallel_state.get_tensor_model_parallel_rank() == 0
+                and parallel_state.get_pipeline_model_parallel_rank() == 0
+            )
+            if env.engine.is_mp_coordinator:
+                env.engine.socket_for_receiving_requests = mock.MagicMock()
+
+        watched_counters = {
+            "model-forward",
+            *(
+                _STREAMING_SIGNAL_COUNTERS[signal]
+                for signal in scenario.signals
+                if signal in _STREAMING_SIGNAL_COUNTERS
+            ),
+        }
 
         def step():
             context = env.engine.context
+            step_id = runtime["steps"] + 1
+            before = {key: runtime[key] for key in watched_counters}
+            spec_steps_before = env.engine._spec_steps
+            prefix_skipped_before = env.engine._prefill_tokens_skipped
+            sent_before = (
+                len(env.engine.socket_for_receiving_requests.send_multipart.call_args_list)
+                if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator
+                else 0
+            )
             runtime["max_active"] = max(
                 runtime["max_active"], context.total_request_count - context.paused_request_count
             )
@@ -1472,7 +1663,42 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             result = env.engine.step_modern()
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
+            counter_steps = runtime.setdefault("streaming-counter-steps", {})
+            for key in watched_counters:
+                if runtime[key] > before[key]:
+                    counter_steps.setdefault(key, set()).add(step_id)
+            if env.engine._spec_steps > spec_steps_before:
+                counter_steps.setdefault("mtp", set()).add(step_id)
+            if env.engine._prefill_tokens_skipped > prefix_skipped_before:
+                counter_steps.setdefault("prefix-hit", set()).add(step_id)
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
+            if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator:
+                for call in env.engine.socket_for_receiving_requests.send_multipart.call_args_list[
+                    sent_before:
+                ]:
+                    frames = call.args[0]
+                    header, _ = msgpack.unpackb(frames[0], raw=False)
+                    if header != Headers.ENGINE_REPLY_PARTIAL.value:
+                        continue
+                    runtime["streaming-partial-steps"].add(step_id)
+                    for frame in frames[1:]:
+                        partial = msgpack.unpackb(frame, raw=False)
+                        request_id = partial["request_id"]
+                        assert request_id in env.engine.requests
+                        assert partial["new_tokens"]
+                        history = runtime["streaming-token-history"].setdefault(request_id, [])
+                        history.extend(partial["new_tokens"])
+                        request = env.engine.get_request(request_id)
+                        if request.status not in (Status.COMPLETED, Status.FAILED):
+                            runtime["streaming-live-request-ids"].add(request_id)
+                            if request_id in runtime.get("suspend-resume-request-ids", ()):
+                                runtime["suspend-resume-streamed-request-ids"].add(request_id)
+                        if request.sampling_params.return_log_probs:
+                            assert len(partial["new_tokens"]) == len(partial["new_log_probs"])
+                            assert len(partial["new_tokens"]) == len(partial["new_top_n_logprobs"])
+                        else:
+                            assert "new_log_probs" not in partial
+                            assert "new_top_n_logprobs" not in partial
             for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
                 if request.request_id == 1 and any(
@@ -1504,14 +1730,22 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
             step()
             if wave_idx == 0 and "suspend-resume" in scenario.signals:
+                runtime["suspend-resume-request-ids"] = set(env.engine.requests)
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
                 pending_before_suspend = env.engine.controller._async_sched_forward.is_valid
                 runtime["pending-before-suspend"] += int(pending_before_suspend)
+                # Mirror the coordinator's stable states around the real lifecycle methods.
+                env.engine.state = EngineState.PAUSED
                 env.engine.suspend()
+                env.engine.state = EngineState.SUSPENDED
+                swap_model_weights(refit_source, model, "nccl")
+                assert torch.equal(next(refit_source.parameters()), next(model.parameters()))
+                runtime["weight-refit"] += 1
                 runtime["pending-after-suspend"] += int(
                     env.engine.controller._async_sched_forward.is_valid
                 )
                 env.engine.resume()
+                env.engine.state = EngineState.RUNNING
                 for request_id in env.engine.resume_request_ids:
                     env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
@@ -1525,6 +1759,27 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         while env.engine.has_unfinished_requests():
             step()
             assert runtime["steps"] < 400, f"{scenario.name} did not converge"
+
+        if mode == AsyncScheduleMode.ASYNC and env.engine.is_mp_coordinator:
+            partial_steps = runtime["streaming-partial-steps"]
+            histories = runtime["streaming-token-history"]
+            assert partial_steps
+            assert histories
+            assert partial_steps & runtime["streaming-counter-steps"]["model-forward"]
+            for request_id, history in histories.items():
+                final_tokens = env.requests[request_id].generated_tokens
+                assert history == final_tokens[: len(history)]
+                assert request_id in runtime["streaming-live-request-ids"]
+            for signal in scenario.signals:
+                counter = _STREAMING_SIGNAL_COUNTERS.get(signal)
+                if counter is not None:
+                    assert partial_steps & runtime["streaming-counter-steps"][counter]
+            if "mtp" in scenario.signals:
+                assert partial_steps & runtime["streaming-counter-steps"]["mtp"]
+            if "prefix-hit" in scenario.signals:
+                assert partial_steps & runtime["streaming-counter-steps"]["prefix-hit"]
+            if "suspend-resume" in scenario.signals:
+                assert runtime["suspend-resume-streamed-request-ids"]
         return env, runtime
 
     @staticmethod
@@ -1575,6 +1830,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
+            assert runtime["weight-refit"] == 1
             if "recompute" in signals:
                 assert runtime["pending-after-suspend"] == 0
                 assert runtime["pending-after-resume"] == 0
@@ -1760,6 +2016,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["mamba-state-commits"] > 0
             assert runtime["mamba-state-compactions"] > 0
             assert runtime["module-forward:hybrid"] > 0
+        for model_family in ("mamba", "gdp", "gdn"):
+            if model_family in signals:
+                assert runtime[f"module-forward:{model_family}"] > 0
         if "transformer-engine" in signals:
             assert model_config.transformer_impl == "transformer_engine"
             assert runtime["module-forward:transformer-engine"] > 0
@@ -1772,6 +2031,19 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["fp8-context-forwards"] > 0
             assert runtime["fp8-quantized-forwards"] > 0
             assert runtime["fp8-recipe-forwards"] > 0
+        if "mxfp8" in signals:
+            assert str(model_config.fp8_recipe).lower().endswith("mxfp8")
+        if "nvfp4" in signals:
+            assert model_config.inference_moe_nvfp4_recipe == "per_token"
+            assert (
+                getattr(
+                    model_config.inference_grouped_gemm_backend,
+                    "value",
+                    model_config.inference_grouped_gemm_backend,
+                )
+                == "flashinfer"
+            )
+            assert runtime["nvfp4-kernel-forwards"] > 0
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
             assert model_config.hidden_size // model_config.num_attention_heads == 64
@@ -1837,6 +2109,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 model_config.tensor_model_parallel_size > 1
                 or model_config.pipeline_model_parallel_size > 1
                 or model_config.expert_model_parallel_size > 1
+                or model_config.expert_tensor_parallel_size > 1
             )
             assert runtime["module-forward:parallel"] > 0
             if model_config.tensor_model_parallel_size > 1:
@@ -1860,11 +2133,12 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 assert runtime["pipeline-logits-broadcasts"] > 0
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
-            assert context._nccl_ep_dispatcher
-            # Inference MoE may dispatch through split execution helpers that
-            # bypass nn.Module forward hooks. The live dispatcher calls below
-            # are the feature-owning runtime boundary.
-            assert runtime["nccl-token-dispatches"] > 0
+            assert runtime["module-forward:moe"] > 0
+        if "etp" in signals:
+            assert model_config.expert_tensor_parallel_size > 1
+            assert parallel_state.get_expert_tensor_parallel_world_size() == 2
+            assert runtime["tp-column-partition-forwards"] > 0
+            assert runtime["tp-row-partition-forwards"] > 0
         if "nccl-dispatch" in signals:
             assert model_config.expert_model_parallel_size > 1
             assert model_config.inference_moe_token_dispatcher_type == "nccl"
@@ -2014,7 +2288,7 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             tensor_model_parallel_size=config.get("tensor_model_parallel_size", 1),
             pipeline_model_parallel_size=config.get("pipeline_model_parallel_size", 1),
             expert_model_parallel_size=config.get("expert_model_parallel_size", 1),
-            expert_tensor_parallel_size=1,
+            expert_tensor_parallel_size=config.get("expert_tensor_parallel_size", 1),
         )
         try:
             assert parallel_state.get_tensor_model_parallel_world_size() == config.get(
@@ -2025,6 +2299,9 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             )
             assert parallel_state.get_expert_model_parallel_world_size() == config.get(
                 "expert_model_parallel_size", 1
+            )
+            assert parallel_state.get_expert_tensor_parallel_world_size() == config.get(
+                "expert_tensor_parallel_size", 1
             )
             if scenario.name == "tp2-pp2-sp-dp2":
                 assert parallel_state.get_data_parallel_world_size() == 2
