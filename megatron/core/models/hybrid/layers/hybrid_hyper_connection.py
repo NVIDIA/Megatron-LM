@@ -70,6 +70,11 @@ class HyperConnectionHybridLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
                 input_ids=input_ids,
+                # This wrapper already added the n-gram memory to the n-stream tensor,
+                # before the read gate; the inner layer must not add it a second time.
+                # Only passed when Engram is on: an unrecognized non-tensor kwarg would
+                # otherwise reach the inner layer's CUDA-graph machinery on every mHC run.
+                **({"skip_engram": True} if self.config.engram_enabled else {}),
             )
         else:
             # Mamba-like layers only consume the common HybridStack arguments.
@@ -171,6 +176,16 @@ class HyperConnectionHybridLayer(MegatronModule):
         input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
+        # The n-gram memory is added to the n-stream tensor *before* the read gate: its
+        # output belongs to the residual streams, not to the wrapped layer's branch delta.
+        # The wrapper has to do it because both inner paths below bypass that part of
+        # TransformerLayer.forward -- the fast path calls the sublayer helpers directly,
+        # and the fallback path passes skip_engram=True.
+        if getattr(self.inner_layer, "engram", None) is not None:
+            hidden_states = self.inner_layer._maybe_apply_engram(
+                hidden_states, input_ids, packed_seq_params
+            )
+
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
         )

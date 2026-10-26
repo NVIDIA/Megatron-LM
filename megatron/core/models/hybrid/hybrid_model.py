@@ -256,6 +256,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
             parsed.main_pattern, self.config.moe_num_hash_layers
         )
+        if (
+            self.config.engram_enabled
+            and self.config.moe_num_hash_layers > 0
+            and self.config.sequence_parallel
+        ):
+            # Both consume the same input_ids kwarg, in different layouts: hash routing wants
+            # the sequence-parallel shard of the token IDs, while Engram hashes the full TP-local
+            # row (n-grams cross shard boundaries) and slices the hashes for SP itself.
+            raise ValueError(
+                "Engram cannot be combined with hash-routed MoE layers (moe_num_hash_layers > 0) "
+                "under sequence parallelism."
+            )
 
         if self.mtp_num_depths > 0:
             if self.config.mtp_num_layers is None:
@@ -624,11 +636,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Hash routing consumes batch-major token IDs. Under sequence parallelism,
         # shard them with decoder activations so each TP rank hashes its local tokens.
+        # Engram also consumes the token IDs, but unsharded: it hashes the full row and slices
+        # the hashes for sequence parallelism itself (the combination of both under SP is
+        # rejected in __init__).
         hash_input_ids = None
-        if self.config.moe_num_hash_layers > 0:
+        if self.config.moe_num_hash_layers > 0 or self.config.engram_enabled:
             hash_input_ids = input_ids
         if (
             self.config.sequence_parallel
+            and not self.config.engram_enabled
             and decoder_input is not None
             and hash_input_ids is not None
             and hash_input_ids.shape[1] != decoder_input.shape[0]
@@ -716,6 +732,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     )
                 padding_mask_by_layout[layout] = layout_mask
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
+
+        if self.config.engram_enabled:
+            # Checked here rather than in the Engram layers: every pipeline stage runs this,
+            # so an unsupported input fails the job instead of hanging the stages that do not
+            # own an Engram layer in their pipeline collectives.
+            if inference_context is not None:
+                raise ValueError("Engram does not support inference or generation.")
+            if input_ids is None:
+                raise ValueError("Engram requires input token IDs on every pipeline stage.")
 
         # Run decoder.
         backbone_context = (

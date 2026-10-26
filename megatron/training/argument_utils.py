@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.models.engram import EngramConfig
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
@@ -640,6 +641,9 @@ def gpt_config_from_args(
     else:
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     kwargs["tp_comm_overlap_cfg"] = getattr(args, "tp_comm_overlap_cfg", None)
     if args.spec is not None:
@@ -751,6 +755,10 @@ def hybrid_config_from_args(
         if not isinstance(hybrid_stack_spec, ModuleSpec):
             raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
+
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)

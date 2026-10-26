@@ -488,6 +488,12 @@ class HybridStack(MegatronModule):
         router = getattr(getattr(inner_layer, "mlp", None), "router", None)
         return bool(getattr(router, "is_hash_layer", False))
 
+    @staticmethod
+    def _uses_engram(layer: torch.nn.Module) -> bool:
+        """Return whether a (possibly mHC-wrapped) TransformerLayer owns an Engram memory."""
+        inner_layer = getattr(layer, "inner_layer", layer)
+        return getattr(inner_layer, "engram", None) is not None
+
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -784,6 +790,11 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=layer_padding_mask,
                                 )
+                                if input_ids is not None and self._uses_engram(layer):
+                                    # Engram hashes raw token IDs; thread them only to the
+                                    # layers that own a memory so the others keep their exact
+                                    # kwarg set (TE CUDA graphs fix it at capture).
+                                    layer_kwargs["input_ids"] = input_ids
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                                 if residual_stream_recompute_context is not None:

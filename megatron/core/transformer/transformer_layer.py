@@ -286,6 +286,8 @@ class TransformerLayerSubmodules:
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
+        engram (Union[ModuleSpec, type]): Optional residual injection before attention. Kept last
+            to preserve the established positional constructor order.
     """
 
     input_layernorm: LayerNormBuilder = IdentityOp
@@ -305,6 +307,10 @@ class TransformerLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # Keep extension points after the established positional fields for backward compatibility.
+    # Engram consumes the real multi-stream residual before native mHC applies H_pre.
+    engram: Union[ModuleSpec, type] = IdentityOp
 
 
 class BaseTransformerLayer(ABC):
@@ -393,6 +399,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+
+        self.engram = None
+        if submodules.engram is not IdentityOp and not is_mtp_layer:
+            # MTP layers use their own local layer numbering, which would collide with the
+            # decoder's global Engram layer IDs; Engram never attaches to MTP layers.
+            if not isinstance(submodules.engram, ModuleSpec):
+                raise TypeError("The Engram composition point must be a ModuleSpec or IdentityOp.")
+            engram_spec = submodules.engram
+            engram_config = engram_spec.params.get("engram_config")
+            if engram_config is None:
+                raise ValueError("The Engram ModuleSpec must provide engram_config.")
+            if self.layer_number in engram_config.layer_ids:
+                self.engram = build_module(
+                    engram_spec,
+                    config=self.config,
+                    layer_number=self.layer_number,
+                    pg_collection=pg_collection,
+                )
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -785,6 +809,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
+        skip_engram: bool = False,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -807,10 +832,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
             input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
-                signature for the MLP phase. Self-attention does not consume them; hash-routed
+                signature for the MLP phase. Self-attention does not consume them; an Engram
+                memory on this layer hashes them before the input layernorm, and hash-routed
                 MoE layers use them later in ``_forward_mlp``.
             residual_stream_recompute_context (ResidualStreamRecomputeContext, optional):
                 Call-local ordered replay state for configured residual connections.
+            skip_engram (bool): Set by an outer hyper-connection wrapper that already added the
+                Engram memory to its n-stream tensor.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -823,6 +851,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             # Whole-layer batch-first mask shape, taken before MLP chunking splits the mask, so TE
             # CUDA graph capture reserves (and replay passes) a mask of the layer's input shape.
             self._padding_mask_shape_seen = tuple(padding_mask.shape)
+
+        if not skip_engram:
+            # skip_engram=True means an outer hyper-connection wrapper already added the memory
+            # residual to the n-stream tensor, before its read gate.
+            hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
+
         if residual_stream_recompute_context is None:
             input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
         else:
@@ -879,6 +913,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     ):
         """Run the training path through pre-attention and core attention."""
         assert self.supports_two_stage_attention()
+        assert self.engram is None, (
+            "Engram is not wired into the two-stage attention path (fine-grained 1F1B / "
+            "attention-MLP overlap). Running it here would silently drop the Engram residual."
+        )
 
         input_layernorm_output, residual, attn_state = self._run_input_layernorm(
             hidden_states, residual_stream_recompute_context=residual_stream_recompute_context
@@ -1122,6 +1160,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
 
         return hidden_states, context
+
+    def _maybe_apply_engram(self, hidden_states, input_ids, packed_seq_params=None):
+        """Add the Engram residual for the layers that carry an Engram module.
+
+        Unsupported inputs are rejected by GPTModel.forward, which every pipeline stage
+        executes; raising here would only fire on the stages that own an Engram layer and
+        would hang the remaining stages in their pipeline collectives.
+        """
+        engram = getattr(self, "engram", None)
+        if engram is None:
+            return hidden_states
+        return hidden_states + engram(hidden_states, input_ids, packed_seq_params)
 
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
