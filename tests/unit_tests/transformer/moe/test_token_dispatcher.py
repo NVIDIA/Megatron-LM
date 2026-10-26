@@ -45,6 +45,70 @@ from tests.unit_tests.test_utilities import (
 )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_HYBRIDEP_DENSE_ROUTING,
+    reason="requires CUDA and HybridEP dense routing",
+)
+def test_hybridep_explicit_capacity_and_dynamic_retry():
+    """Overflow, recover dynamically, then use an explicit budget without losing gradients."""
+    Utils.initialize_model_parallel(expert_model_parallel_size=4)
+    try:
+        group = parallel_state.get_expert_model_parallel_group()
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            expert_model_parallel_size=4,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_expert_rank_capacity_factor=1.0,
+            moe_grouped_gemm=True,
+            moe_use_grouped_tensor=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        manager = _HybridEPManager(group, 1, 4, model_config)
+        tokens = 256  # Explicit budgets must satisfy grouped-tensor alignment.
+        ids = torch.zeros((tokens, 1), device="cuda", dtype=torch.int64)
+        probs = torch.zeros((tokens, 4), device="cuda", dtype=torch.float32)
+        probs[:, 0] = 1
+        # All ranks route to expert 0: a factor of 1 cannot hold the aggregate load.
+        for factor, capacity, overflow in (
+            (1.0, None, True),
+            (None, None, False),  # PagedStashRunner's dropless retry.
+            (1.0, None, True),  # Restore the ordinary configured budget.
+            (None, tokens, True),  # Explicit budgets must also report overflow.
+            (None, tokens * group.size(), False),
+            (None, None, False),  # An explicit budget must not leak into the next dispatch.
+        ):
+            manager.moe_expert_rank_capacity_factor = factor
+            manager.over_budget.zero_()
+            manager.setup_metadata(ids, probs)
+            hidden = torch.full(
+                (tokens, 128),
+                group.rank() + 1,
+                device="cuda",
+                dtype=torch.bfloat16,
+                requires_grad=True,
+            )
+            dispatched = manager.dispatch(hidden, rank_capacity=capacity)
+            restored = manager.combine(dispatched)
+            any_overflow = manager.over_budget.to(torch.int32)
+            torch.distributed.all_reduce(any_overflow, group=group)
+            assert bool(any_overflow.item()) == overflow
+            if not overflow:
+                torch.testing.assert_close(restored, hidden, rtol=0, atol=0)
+                restored.backward(torch.ones_like(restored))
+                torch.testing.assert_close(hidden.grad, torch.ones_like(hidden), rtol=0, atol=0)
+        torch.cuda.synchronize()
+    finally:
+        reset_hybrid_ep_buffer()
+        Utils.destroy_model_parallel()
+
+
 def test_pad_routing_map_does_not_modify_input():
     routing_map = torch.tensor(
         [[True, False], [False, True], [False, False], [False, False]], dtype=torch.bool
@@ -538,6 +602,12 @@ def is_deep_ep_available():
     return HAVE_DEEP_EP
 
 
+def is_deep_ep_v2_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP_V2
+
+    return HAVE_DEEP_EP_V2
+
+
 def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
@@ -878,8 +948,8 @@ def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):
 
 
 @pytest.mark.skipif(
-    not is_deep_ep_available() and not is_hybrid_ep_available(),
-    reason="Deep EP and Hybrid EP are not available",
+    not is_deep_ep_available() and not is_deep_ep_v2_available() and not is_hybrid_ep_available(),
+    reason="Deep EP, Deep EP v2 and Hybrid EP are not available",
 )
 class TestFlexDispatcher:
     def setup_method(self, method):
@@ -954,7 +1024,9 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep", "ncclep"])
+    @pytest.mark.parametrize(
+        "moe_flex_dispatcher_backend", ["deepep", "deepepv2", "hybridep", "ncclep"]
+    )
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_forward_backward(
         self,
@@ -966,6 +1038,8 @@ class TestFlexDispatcher:
     ):
         if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
             pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "deepepv2" and not is_deep_ep_v2_available():
+            pytest.skip("Deep EP v2 is not available")
         if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
         if moe_flex_dispatcher_backend == "ncclep" and not is_nccl_ep_available():

@@ -6,13 +6,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from megatron.core import full_cuda_graph
 from megatron.core import parallel_state as ps
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
 from megatron.core.tensor_parallel import gtp_cuda_graphs, gtp_symmetric_memory
 from megatron.core.transformer import cuda_graphs
-from megatron.core.transformer.moe import fused_a2a, token_dispatcher
+from megatron.core.transformer.moe import fused_a2a, token_dispatcher, virtual_expert_load_balancer
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
@@ -115,14 +116,43 @@ def test_resource_owners_register_teardown():
         communication.index(token_dispatcher._release_nccl_ep_symm_buffers),
     ]
     assert positions == sorted(positions)
+    assert virtual_expert_load_balancer._finalize_virtual_experts in communication
     graphs = callbacks[ps.TeardownStage.RELEASE_CUDA_GRAPHS]
     assert cuda_graphs.release_all_cuda_graphs in graphs
-    assert FullCudaGraphWrapper.reset_cuda_graph in graphs
+    assert full_cuda_graph._release_full_cuda_graphs in graphs
     assert OptimizerCudaGraphWrapper.reset_cuda_graph in graphs
     release_pools = gtp_symmetric_memory.deregister_and_clear_gtp_symm_pools
     assert release_pools in communication
     assert ps._MODEL_PARALLEL_TEARDOWN_ABORT_CALLBACKS[release_pools] is release_pools
     assert gtp._destroy_gtp_state in callbacks[ps.TeardownStage.RESET_STATE]
+
+
+def test_virtual_expert_teardown_resolves_finalize_at_call_time(monkeypatch):
+    # Replacing finalize after the teardown callback is registered must still take effect.
+    finalize = Mock()
+    monkeypatch.setattr(
+        virtual_expert_load_balancer.VirtualExpertLoadBalancer, "finalize", finalize
+    )
+
+    virtual_expert_load_balancer._finalize_virtual_experts()
+
+    finalize.assert_called_once_with()
+
+
+def test_full_cuda_graph_teardown_without_graph_skips_rerun_state_machine(monkeypatch):
+    get_rerun_state_machine = Mock()
+    monkeypatch.setattr(full_cuda_graph, "get_rerun_state_machine", get_rerun_state_machine)
+    monkeypatch.setattr(FullCudaGraphWrapper, "cuda_graph", {"training": None, "validation": None})
+    monkeypatch.setattr(FullCudaGraphWrapper, "curr_iteration", {"training": 3, "validation": 1})
+    monkeypatch.setattr(FullCudaGraphWrapper, "result", {"training": object(), "validation": None})
+
+    full_cuda_graph._release_full_cuda_graphs()
+
+    # Without a captured graph there are no deferred validations to clear, and teardown
+    # must not initialize the rerun state machine.
+    get_rerun_state_machine.assert_not_called()
+    assert FullCudaGraphWrapper.curr_iteration == {"training": 0, "validation": 0}
+    assert FullCudaGraphWrapper.result == {"training": None, "validation": None}
 
 
 @pytest.mark.parametrize("abort", [False, True])
@@ -360,4 +390,13 @@ def test_hybridep_rebuilds_buffer_for_new_group(monkeypatch):
         assert fused_a2a._hybrid_ep_buffer.group is group
     assert [buffer.group for buffer in created] == [first_group, second_group]
     fused_a2a.reset_fused_a2a_buffers()
+    assert fused_a2a._hybrid_ep_buffer is None
+
+
+def test_reset_fused_a2a_buffers_drops_every_buffer(monkeypatch):
+    for name in ("_buffer", "_elastic_buffer", "_hybrid_ep_buffer"):
+        monkeypatch.setattr(fused_a2a, name, object())
+    fused_a2a.reset_fused_a2a_buffers()
+    assert fused_a2a._buffer is None
+    assert fused_a2a._elastic_buffer is None
     assert fused_a2a._hybrid_ep_buffer is None

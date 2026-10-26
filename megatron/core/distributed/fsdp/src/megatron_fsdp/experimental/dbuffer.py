@@ -24,8 +24,10 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
+from . import layout_builder
 from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import BlockAtomic, TensorAtomic
+from .range import Range, intersect_ranges
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,8 +124,9 @@ class DBuffer:
         self.placements = placements
 
         self.layout = layout
-        self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
-        self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
+        local_range = self.layout.get_local_range(self.mesh, self.placements)
+        self.offset = local_range.start
+        self.local_buffer = torch.empty(local_range.numel, dtype=dtype, device=device)
 
     @classmethod
     def empty(
@@ -138,7 +141,7 @@ class DBuffer:
     ) -> "DBuffer":
         """Build a RowAtomic or BlockAtomic layout and allocate its local buffer.
 
-        For TensorAtomic, use ``GlobalLayout.build_for_tensor_atomic`` and pass
+        For TensorAtomic, use ``layout_builder.build_for_tensor_atomic`` and pass
         the resulting layout to the DBuffer constructor.
 
         Args:
@@ -149,7 +152,7 @@ class DBuffer:
             device: Device for the local buffer.
             block_size: Number of consecutive rows kept together on one rank.
         """
-        layout = GlobalLayout.build_for_row_atomic(
+        layout = layout_builder.build_for_row_atomic(
             tensor_shapes, dp_size=mesh.size(), block_size=block_size
         )
         return cls(mesh, placements, layout, dtype, device)
@@ -170,6 +173,15 @@ class DBuffer:
         return hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
             self.local_buffer
         )
+
+    @property
+    def is_allocated(self) -> bool:
+        """Whether the local buffer has backing storage.
+
+        ``release_storage()`` clears this and ``reallocate_storage()`` restores it.
+        Empty local buffers are always allocated.
+        """
+        return self.local_buffer.numel() == 0 or self.local_buffer.untyped_storage().nbytes() > 0
 
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
@@ -195,20 +207,15 @@ class DBuffer:
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
-        tensor_start = self.layout.tensor_to_offset[tensor_index]
-        tensor_end = tensor_start + self.layout.tensor_shapes[tensor_index].numel()
-        buffer_start = self.offset
-        buffer_end = self.offset + self.local_buffer.numel()
-
-        overlap_start = max(tensor_start, buffer_start)
-        overlap_end = min(tensor_end, buffer_end)
-        if overlap_start >= overlap_end:
+        tensor_range = self.layout.get_tensor_range(tensor_index)
+        owned_range = intersect_ranges(tensor_range, Range(self.offset, self.local_buffer.numel()))
+        if owned_range.numel == 0:
             return None
 
         return _OwnedRange(
-            numel=overlap_end - overlap_start,
-            tensor_relative_offset=overlap_start - tensor_start,
-            buffer_relative_offset=overlap_start - buffer_start,
+            numel=owned_range.numel,
+            tensor_relative_offset=owned_range.start - tensor_range.start,
+            buffer_relative_offset=owned_range.start - self.offset,
         )
 
     @classmethod
@@ -245,10 +252,10 @@ class DBuffer:
         if not local_buffer.is_contiguous():
             raise ValueError("local_buffer must be contiguous for collective operations.")
 
-        offset, local_numel = layout.get_local_range(mesh, placements)
-        if local_buffer.numel() != local_numel:
+        local_range = layout.get_local_range(mesh, placements)
+        if local_buffer.numel() != local_range.numel:
             raise ValueError(
-                f"Expected local_buffer with {local_numel} elements, got "
+                f"Expected local_buffer with {local_range.numel} elements, got "
                 f"{local_buffer.numel()}."
             )
 
@@ -256,7 +263,7 @@ class DBuffer:
         buffer.mesh = mesh
         buffer.placements = placements
         buffer.layout = layout
-        buffer.offset = offset
+        buffer.offset = local_range.start
         buffer.local_buffer = local_buffer
         return buffer
 
@@ -276,12 +283,12 @@ class DBuffer:
         _validate_placements(placements)
         if self.placements == placements:
             return self
-        offset, local_numel = self.layout.get_local_range(self.mesh, placements)
-        local_offset = offset - self.offset
-        if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
+        local_range = self.layout.get_local_range(self.mesh, placements)
+        local_offset = local_range.start - self.offset
+        if local_offset < 0 or local_offset + local_range.numel > self.local_buffer.numel():
             raise ValueError("DBuffer.view() requires a range contained in its local buffer.")
         return DBuffer.from_local(
-            self.local_buffer.narrow(0, local_offset, local_numel),
+            self.local_buffer.narrow(0, local_offset, local_range.numel),
             self.mesh,
             placements,
             self.layout,
@@ -304,7 +311,7 @@ class DBuffer:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             layout: Prebuilt layout matching the input tensor shapes and order. If
-                omitted, build a RowAtomic layout. Use the GlobalLayout builders
+                omitted, build a RowAtomic layout. Use the functions in ``layout_builder``
                 to supply a TensorAtomic or BlockAtomic layout.
 
         Returns:
@@ -322,7 +329,7 @@ class DBuffer:
 
         tensor_shapes = tuple(tensor.shape for tensor in tensors)
         if layout is None:
-            layout = GlobalLayout.build_for_row_atomic(tensor_shapes, dp_size=mesh.size())
+            layout = layout_builder.build_for_row_atomic(tensor_shapes, dp_size=mesh.size())
         elif layout.tensor_shapes != tensor_shapes:
             raise ValueError("Layout tensor shapes must match the input tensors in order.")
         buffer = cls(
