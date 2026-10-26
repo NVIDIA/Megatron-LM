@@ -489,9 +489,10 @@ def test_metadata_attach_issues_no_collectives(
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
 @pytest.mark.parametrize(("optimizer_name", "layer_pattern"), [("adam", "*E"), ("muon", "*-*E")])
 def test_ep_fsdp_checkpoint_roundtrip(
-    distributed_setup, tmp_path_dist_ckpt, ep_size, optimizer_name, layer_pattern
+    distributed_setup, tmp_path_dist_ckpt, ep_size, optimizer_name, layer_pattern, activation
 ):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
@@ -529,10 +530,10 @@ def test_ep_fsdp_checkpoint_roundtrip(
                 use_cpu_initialization=False,
                 bf16=True,
                 params_dtype=torch.bfloat16,
-                gated_linear_unit=optimizer_name == "muon",
+                gated_linear_unit=activation == "swiglu",
                 activation_func=(
                     torch.nn.functional.silu
-                    if optimizer_name == "muon"
+                    if activation == "swiglu"
                     else torch.nn.functional.gelu
                 ),
                 hidden_dropout=0.0,
@@ -569,7 +570,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
                     bf16=True,
                     params_dtype=torch.bfloat16,
                     use_distributed_optimizer=False,
-                    clip_grad=0.01 if optimizer_name == "muon" else 0.0,
+                    clip_grad=0.0,
                     muon_split_qkv=False,
                     use_precision_aware_optimizer=optimizer_name == "adam",
                     exp_avg_dtype=(torch.bfloat16 if optimizer_name == "adam" else torch.float32),
@@ -618,7 +619,8 @@ def test_ep_fsdp_checkpoint_roundtrip(
 
         train(source, source_optimizer)
         with TempNamedDir(
-            tmp_path_dist_ckpt / f"ep{ep_size}_{optimizer_name}_mcore_roundtrip", sync=True
+            tmp_path_dist_ckpt / f"ep{ep_size}_{optimizer_name}_{activation}_mcore_roundtrip",
+            sync=True,
         ) as path:
             dcp.save(
                 checkpoint_state(source, source_optimizer.sharded_state_dict({})),

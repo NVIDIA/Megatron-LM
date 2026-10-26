@@ -1670,35 +1670,33 @@ class ChainedOptimizer(MegatronOptimizer):
             not in DistributedOptimizer.checkpoint_fully_reshardable_formats
         ) or not metadata.get('chained_optim_avoid_prefix', False)
 
-        if self.chained_optimizers and all(
+        is_fsdp = bool(self.chained_optimizers) and all(
             isinstance(optimizer, FullyShardedOptimizer) for optimizer in self.chained_optimizers
-        ):
-            # FSDP checkpoint transforms operate on one FQN-keyed state mapping.
-            # Muon and Adam own disjoint parameters, so their states can share it.
-            self._synchronize_steps()
-            state: ShardedStateDict = {"state": {}, "param_to_group_meta": {}}
-            for optimizer in self.chained_optimizers:
-                optimizer_state = optimizer.sharded_state_dict(
-                    model_sharded_state_dict, is_loading, **kwargs
-                )
-                for key in state:
-                    state[key].update(optimizer_state[key])
-            return state
-
+        )
         if len(self.chained_optimizers) == 1:
+            if is_fsdp:
+                self._synchronize_steps()
             return self.chained_optimizers[0].sharded_state_dict(
                 model_sharded_state_dict, is_loading, **kwargs
             )
         else:
             self._synchronize_steps()
-            sharded_state_dict = {}
+            sharded_state_dict: ShardedStateDict = (
+                {"state": {}, "param_to_group_meta": {}} if is_fsdp else {}
+            )
             for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
                 optim_state_dict = optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
-                if should_add_prefix:
-                    add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
-                sharded_state_dict[optimizer_idx] = optim_state_dict
+                if is_fsdp:
+                    # FSDP transforms use one FQN-keyed mapping. Each optimizer owns
+                    # disjoint parameters, so their states can share it.
+                    for key in sharded_state_dict:
+                        sharded_state_dict[key].update(optim_state_dict[key])
+                else:
+                    if should_add_prefix:
+                        add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                    sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 
     def load_state_dict(self, state_dict):
@@ -2026,7 +2024,7 @@ class ChainedOptimizer(MegatronOptimizer):
             if len(parameters) == 0:
                 continue
 
-            use_decoupled_grad = self._uses_decoupled_grad(parameters)
+            use_decoupled_grad = optimizer._uses_decoupled_grad(parameters)
 
             main_params = []
             params_by_grad_norm_group = {}
