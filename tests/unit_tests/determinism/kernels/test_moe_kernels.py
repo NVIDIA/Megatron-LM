@@ -1242,7 +1242,7 @@ class TestMoEModules:
         reason="MXFP8 parameter storage needs Blackwell",
     )
     def test_vllm_mxfp8_weight_stacking_replays(self):
-        """The mixed-precision vLLM path builds canonical expert stacks bit-exactly."""
+        """The vLLM path validates and builds swizzled expert stacks bit-exactly."""
         from types import SimpleNamespace
 
         from megatron.core.inference.moe import InferenceGroupedGemmBackend

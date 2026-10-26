@@ -94,6 +94,93 @@ def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
     assert config.expert_model_parallel_size == 2
 
 
+@pytest.mark.parametrize(
+    ("decode_only", "capacity", "expected"),
+    [(True, 32, True), (True, 31, False), (False, 32, False), (True, None, False)],
+)
+def test_dynamic_controller_hands_off_bounded_mxfp8_policy(decode_only, capacity, expected):
+    """The real controller enables bounded rows only for a safe decode step."""
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+
+    logits = torch.empty(1, 2, 8)
+    context = SimpleNamespace(
+        max_requests=8,
+        is_decode_only=lambda: decode_only,
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        padded_active_token_count=2,
+        has_vlm_data=False,
+    )
+    wrapped_model = SimpleNamespace(
+        inference_context=context, run_one_forward_step=lambda inference_input: logits
+    )
+    controller = SimpleNamespace(
+        inference_wrapped_model=wrapped_model,
+        model_config=SimpleNamespace(
+            inference_flashinfer_mxfp8_token_capacity=capacity, expert_model_parallel_size=2
+        ),
+        num_speculative_tokens=1,
+        model_is_pipeline_parallel=False,
+        _enable_cuda_graph=False,
+        _select_async_sched_routing_buffer=lambda: None,
+    )
+    input_ids = torch.zeros((1, 2), dtype=torch.int64)
+    position_ids = torch.arange(2).unsqueeze(0)
+
+    TextGenerationController._dynamic_step_forward_logits(controller, input_ids, position_ids)
+
+    assert InferenceMode.use_bounded_mxfp8_rows() is expected
+    assert controller._all_logits_cuda is logits
+
+
+def test_expert_hands_bounded_policy_and_fp32_nvls_buffer_to_routed_kernel(monkeypatch):
+    """The production expert forwards controller state and dispatcher storage."""
+    from megatron.core.transformer.moe import experts
+
+    captured = {}
+    rsv = torch.empty(64, 128, dtype=torch.float32)
+
+    def routed_mxfp8_moe(*args, **kwargs):
+        captured.update(kwargs)
+        return kwargs["out"]
+
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(experts, "flashinfer_routed_mxfp8_moe", routed_mxfp8_moe)
+    monkeypatch.setattr(
+        experts.NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(lambda cls: rsv)
+    )
+    grouped_mlp = SimpleNamespace(
+        _uses_mxfp8_weights=True,
+        _fc1_weight=object(),
+        _fc2_weight=object(),
+        _activation_clamp_scale=None,
+        _flashinfer_activation_type=SimpleNamespace(value=6),
+        _nvls_dispatcher=True,
+        _flashinfer_mxfp8_token_capacity=64,
+        num_local_experts=2,
+        ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 1),
+    )
+
+    with InferenceMode.active():
+        InferenceMode.set_bounded_mxfp8_rows(True)
+        output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
+            grouped_mlp,
+            torch.empty(64, 128, dtype=torch.bfloat16),
+            torch.zeros(64, 2, dtype=torch.int64),
+            torch.zeros(64, 2, dtype=torch.float32),
+        )
+
+    assert output is rsv
+    assert bias is None
+    assert captured["out"] is rsv
+    assert captured["out"].dtype == torch.float32
+    assert captured["token_capacity"] == 64
+    assert captured["use_bounded_rows"] is True
+    assert captured["num_experts"] == 4
+    assert captured["local_expert_offset"] == 2
+
+
 def test_flashinfer_mxfp8_config_accepts_batch_invariant_mode():
     config = _make_bounded_mxfp8_config(
         batch_invariant_mode=True,
@@ -246,6 +333,19 @@ def _blackwell_or_newer() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 
+def _prepare_routed_mxfp8_weight(weight: torch.Tensor):
+    from megatron.core.inference.moe.flashinfer_mxfp8 import prepare_routed_mxfp8_weights
+
+    quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
+    stacked = MXFP8Tensor(
+        data=torch.stack([expert.data for expert in quantized]).contiguous(),
+        scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
+        backend="triton",
+        dtype=weight.dtype,
+    )
+    return prepare_routed_mxfp8_weights(stacked)
+
+
 @pytest.mark.skipif(
     not HAVE_FLASHINFER_ROUTED_MXFP8 or not _blackwell_or_newer(),
     reason="FlashInfer routed MXFP8 requires Blackwell and FlashInfer >= 0.6.4",
@@ -253,31 +353,17 @@ def _blackwell_or_newer() -> bool:
 @pytest.mark.parametrize("local_expert_offset", [0, 2, 4, 6])
 def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
     """A token's local-EP output must not depend on its batch or row position."""
-    from megatron.core.inference.moe.flashinfer_mxfp8 import (
-        flashinfer_routed_mxfp8_moe,
-        prepare_routed_mxfp8_weights,
-    )
-    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.inference.moe.flashinfer_mxfp8 import flashinfer_routed_mxfp8_moe
 
     torch.manual_seed(1234)
     num_experts, hidden_size, intermediate_size, topk = 8, 256, 256, 2
 
-    def _prepare_weight(weight: torch.Tensor):
-        quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
-        stacked = MXFP8Tensor(
-            data=torch.stack([expert.data for expert in quantized]).contiguous(),
-            scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
-            backend="triton",
-            dtype=torch.bfloat16,
-        )
-        return prepare_routed_mxfp8_weights(stacked)
-
-    fc1_weight = _prepare_weight(
+    fc1_weight = _prepare_routed_mxfp8_weight(
         torch.randn(
             num_experts, intermediate_size, hidden_size, device="cuda", dtype=torch.bfloat16
         )[local_expert_offset : local_expert_offset + 2]
     )
-    fc2_weight = _prepare_weight(
+    fc2_weight = _prepare_routed_mxfp8_weight(
         torch.randn(
             num_experts, hidden_size, intermediate_size, device="cuda", dtype=torch.bfloat16
         )[local_expert_offset : local_expert_offset + 2]
@@ -321,6 +407,94 @@ def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
         for expert in target_experts.tolist()
     ):
         assert torch.count_nonzero(output_alone).item() == 0
+
+
+@pytest.mark.skipif(
+    not HAVE_FLASHINFER_ROUTED_MXFP8 or not _blackwell_or_newer(),
+    reason="FlashInfer routed MXFP8 requires Blackwell and FlashInfer >= 0.6.4",
+)
+def test_bounded_flashinfer_mxfp8_executes_live_prefix_into_fp32_output(monkeypatch):
+    """Bounded decode quantizes and executes only live rows into the NVLS-shaped buffer."""
+    from megatron.core.inference.moe import flashinfer_mxfp8
+
+    torch.manual_seed(4321)
+    full_rows, token_capacity = 128, 37
+    num_experts, hidden_size, intermediate_size, topk = 4, 256, 256, 2
+    fc1_weight = _prepare_routed_mxfp8_weight(
+        torch.randn(
+            num_experts, intermediate_size, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+    )
+    fc2_weight = _prepare_routed_mxfp8_weight(
+        torch.randn(
+            num_experts, hidden_size, intermediate_size, device="cuda", dtype=torch.bfloat16
+        )
+    )
+    hidden_states = torch.randn(full_rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    routing_map = torch.stack(
+        [
+            torch.arange(full_rows, device="cuda", dtype=torch.int64) % num_experts,
+            (torch.arange(full_rows, device="cuda", dtype=torch.int64) + 1) % num_experts,
+        ],
+        dim=1,
+    )
+    probabilities = torch.empty(full_rows, topk, device="cuda", dtype=torch.float32)
+    probabilities[:, 0] = 0.625
+    probabilities[:, 1] = 0.375
+
+    with torch.no_grad():
+        full_output = flashinfer_mxfp8.flashinfer_routed_mxfp8_moe(
+            hidden_states,
+            routing_map,
+            probabilities,
+            fc1_weight,
+            fc2_weight,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=6,
+        )
+
+    observed = {}
+    real_quantize = flashinfer_mxfp8.quantize_routed_mxfp8_input
+
+    def tracked_quantize(selected_hidden_states, padded_hidden_size):
+        quantized, scale = real_quantize(selected_hidden_states, padded_hidden_size)
+        observed["input_rows"] = selected_hidden_states.shape[0]
+        observed["data"] = quantized
+        observed["scale"] = scale
+        return quantized, scale
+
+    monkeypatch.setattr(flashinfer_mxfp8, "quantize_routed_mxfp8_input", tracked_quantize)
+    output_buffer = torch.full(
+        (full_rows, hidden_size), float("nan"), device="cuda", dtype=torch.float32
+    )
+    output_ptr = output_buffer.data_ptr()
+    with torch.no_grad():
+        bounded_output = flashinfer_mxfp8.flashinfer_routed_mxfp8_moe(
+            hidden_states,
+            routing_map,
+            probabilities,
+            fc1_weight,
+            fc2_weight,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=6,
+            out=output_buffer,
+            token_capacity=token_capacity,
+            use_bounded_rows=True,
+        )
+
+    assert observed["input_rows"] == token_capacity
+    assert observed["data"].shape == (token_capacity, hidden_size)
+    assert observed["data"].dtype == torch.float8_e4m3fn
+    assert observed["scale"].shape == (token_capacity, hidden_size // 32)
+    assert observed["scale"].dtype == torch.uint8
+    assert torch.count_nonzero(observed["data"].view(torch.uint8)).item() > 0
+    assert torch.count_nonzero(observed["scale"]).item() > 0
+    assert bounded_output is output_buffer
+    assert bounded_output.data_ptr() == output_ptr
+    assert torch.equal(bounded_output[:token_capacity], full_output[:token_capacity].float())
+    assert torch.isnan(bounded_output[token_capacity:]).all()
 
 
 def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
