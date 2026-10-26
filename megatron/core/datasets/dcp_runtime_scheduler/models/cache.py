@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 
 @dataclass
 class PackCostModel:
+    """Memoize physical pack costs and enforce capacity and sequence-count limits."""
+
     config: object  # dcp_scheduler SchedulerConfig (alignments, tokens_per_rank, ...)
     forward: object  # callable(lengths, cp, ranks=) -> ms per layer
     backward: object | None = None
@@ -25,13 +27,16 @@ class PackCostModel:
     # ------------------------------------------------------------ capacity
     @property
     def tokens_per_rank(self):
+        """Return the physical token capacity of one rank."""
         return self.config.tokens_per_rank
 
     @property
     def allowed(self):
+        """Return the CP widths available in the runtime geometry."""
         return tuple(self.config.allowed_cp_sizes)
 
     def stored(self, length, cp):
+        """Return the cached physically padded token count for one sequence."""
         key = (length, cp)
         value = self._stored.get(key)
         if value is None:
@@ -39,17 +44,21 @@ class PackCostModel:
         return value
 
     def capacity(self, cp):
+        """Return the physical token capacity across a CP group."""
         return cp * self.tokens_per_rank
 
     def stored_total(self, lengths, cp):
+        """Sum physically padded token counts for a proposed pack."""
         return sum(self.stored(n, cp) for n in lengths)
 
     def fits(self, lengths, cp):
+        """Check the pack against sequence-count and physical-token limits."""
         if self.max_group_seqs is not None and len(lengths) > self.max_group_seqs:
             return False
         return self.stored_total(lengths, cp) <= self.capacity(cp)
 
     def min_cp(self, length):
+        """Find the first allowed CP width that can store the sequence."""
         value = self._min_cp.get(length)
         if value is None:
             for cp in self.allowed:

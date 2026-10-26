@@ -78,6 +78,7 @@ class CorePredictor:
         return result
 
     def metadata(self):
+        """Report coefficient provenance, prediction geometry and transfer limitations."""
         return dict(
             hardware=self.hardware,
             geometry=list(self.geometry),
@@ -151,18 +152,22 @@ class AttentionCostModel:
         return result['forward_ms'], result['backward_ms']
 
     def forward(self, lengths, cp, *, ranks=None):
+        """Predict per-layer FA core forward time in milliseconds for one CP pack."""
         return self._costs(tuple(lengths), cp)[0]
 
     def backward(self, lengths, cp, *, ranks=None):
+        """Predict per-layer FA core backward time in milliseconds for one CP pack."""
         return self._costs(tuple(lengths), cp)[1]
 
     def program_costs(self, lengths, cp, *, ranks=None):
+        """Return named FA costs consumed by the forward/backward timeline."""
         fwd, bwd = self._costs(tuple(lengths), cp)
         return dict(att_f=fwd, att_b=bwd)
 
     guide_program_costs = program_costs
 
     def timing(self):
+        """Describe the layer program and supplied non-attention remainders."""
         return dict(
             execution_program=[
                 dict(
@@ -188,13 +193,16 @@ class AttentionCostModel:
         )
 
     def clear(self):
+        """Clear memoized pack predictions before a new global batch."""
         self._costs.cache_clear()
 
     def check_domain(self, geometry, config=None):
+        """Require the planner geometry used to initialize this model."""
         if geometry != self.geometry:
             raise ValueError('Cost model and runtime planner geometry differ')
 
     def metadata(self):
+        """Report predictor provenance and its provisional timing scope."""
         return dict(
             core=self.core.metadata(),
             provisional=True,

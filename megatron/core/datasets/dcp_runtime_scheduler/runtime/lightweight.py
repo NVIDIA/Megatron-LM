@@ -13,6 +13,8 @@ from .planner import RuntimePlanner, RuntimeScheduleError, encode_rows, validate
 
 @dataclass(frozen=True)
 class LightweightOptions:
+    """Bound candidate generation, exact scoring and cooperative planning time."""
+
     time_budget_s: float = 0.8
     max_scored_candidates: int = 4
     cp_floors: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)

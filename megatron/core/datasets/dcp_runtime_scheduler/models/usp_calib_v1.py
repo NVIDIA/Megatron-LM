@@ -42,6 +42,7 @@ class USPCalibV1CostModel:
         }
 
     def check_domain(self, geometry, config=None):
+        """Validate the parent geometry and CP widths against the upstream profile."""
         if geometry != self.geometry or geometry.world_size not in self.supported_cp_sizes:
             raise ValueError("usp_calib_v1 requires a DPxCP domain of 8, 16 or 32 ranks")
         if not geometry.allowed_cp_sizes or any(
@@ -127,15 +128,19 @@ class USPCalibV1CostModel:
         return result
 
     def forward(self, lengths, cp, *, ranks=None):
+        """Return the upstream proxy mean forward time per synthetic layer."""
         return self.components(tuple(lengths), cp)["forward_ms"] / self.layer_count
 
     def backward(self, lengths, cp, *, ranks=None):
+        """Return the upstream proxy mean backward time per synthetic layer."""
         return self.components(tuple(lengths), cp)["backward_ms"] / self.layer_count
 
     def program_costs(self, lengths, cp, *, ranks=None):
+        """Return named forward/backward block costs for the timeline."""
         return dict(block_f=self.forward(lengths, cp), block_b=self.backward(lengths, cp))
 
     def timing(self):
+        """Describe the upstream block program and global iteration-tail constant."""
         return dict(
             iteration_tail_ms=self.table["global"]["C_global_clean_ms"],
             execution_program=[
@@ -148,9 +153,11 @@ class USPCalibV1CostModel:
         )
 
     def clear(self):
+        """Clear memoized upstream component costs before a new global batch."""
         self.components.cache_clear()
 
     def metadata(self):
+        """Record the original U8 calibration and provisional P2P transfer scope."""
         return dict(
             name=self.name,
             source_commit="1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
