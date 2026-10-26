@@ -616,7 +616,9 @@ class ProcessGroupCollection:
                     if 'intra_dist_opt' not in pg_set:
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
-                            "pg_collection. Please explicitly set it to None if you don't need it."
+                            "pg_collection. Set it to the ranks of one distributed-optimizer "
+                            "instance, over which the gradient statistics are reduced. None "
+                            "reduces them over the default (WORLD) group, which is deprecated."
                         )
                     intra_dist_opt_group = pg_collection.intra_dist_opt
                 else:
