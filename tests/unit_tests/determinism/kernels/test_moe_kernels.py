@@ -1203,9 +1203,9 @@ class TestMoEModules:
         The MXFP8 op-fuser case covers the fused input release path changed in this PR.
         """
         if op_fuser and (
-            not is_te_min_version("2.14.0") or torch.cuda.get_device_capability()[0] < 10
+            not is_te_min_version("2.21.0") or torch.cuda.get_device_capability()[0] < 10
         ):
-            pytest.skip("MXFP8 op-fuser offloading needs TE >= 2.14 and Blackwell")
+            pytest.skip("MXFP8 op-fuser dispatch needs TE >= 2.21 and Blackwell")
         self._init()
         seeded()
         PipelineOffloadManager.reset_instance()
