@@ -411,6 +411,9 @@ class LightweightRuntimePlanner(RuntimePlanner):
             candidate_generation_s=generation_s,
             exact_scoring_s=elapsed - generation_s - balance_s,
             pack_cost_stats=dict(self.costs.stats),
-            algorithm="FFD + all-width work/token + EP-aligned proposals + bounded guide + exact E2E acceptance + rank rotation",
+            algorithm=(
+                "FFD + all-width work/token + EP-aligned proposals + bounded guide "
+                "+ exact E2E acceptance + rank rotation"
+            ),
         )
         return plan

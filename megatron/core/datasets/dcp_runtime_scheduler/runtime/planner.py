@@ -14,7 +14,7 @@ from .timeline import build_timeline
 
 
 class RuntimeScheduleError(RuntimeError):
-    """Raised when the runtime scheduler cannot produce a valid schedule (every rank raises the same error in Megatron)."""
+    """Invalid runtime schedule; every Megatron rank raises the same error."""
 
 
 def _ceil_to(value: int, unit: int) -> int:
@@ -38,7 +38,8 @@ class RuntimePlanGeometry:
             raise ValueError("world_size and tokens_per_rank must be >= 1")
         if self.ep_size < 1 or self.world_size % self.ep_size:
             raise ValueError(
-                f"expert_model_parallel_size ({self.ep_size}) must divide dp_size*cp_size ({self.world_size})"
+                f"expert_model_parallel_size ({self.ep_size}) must divide "
+                f"dp_size*cp_size ({self.world_size})"
             )
         if not self.allowed_cp_sizes or any(
             not 1 <= cp <= self.world_size for cp in self.allowed_cp_sizes
@@ -52,8 +53,7 @@ class RuntimePlanGeometry:
             raise ValueError("max_group_seqs must be >= 1 when set")
 
     def stored_length(self, length: int, cp: int) -> int:
-        """Tokens one sequence occupies in a CP-``cp`` pack: the dataset padding (``dataset_alignment``) followed by MCore's
-        re-padding to a multiple of ``2*cp`` (``_pack_sequences``)."""
+        """Physical tokens after dataset alignment and CP re-padding by _pack_sequences."""
         aligned = _ceil_to(int(length), self.dataset_alignment)
         return _ceil_to(aligned, 2 * int(cp))
 
@@ -119,7 +119,7 @@ def validate_rows(
 ) -> List[List[Tuple[int, int, List[int]]]]:
     """Check every invariant MCore relies on; return the decoded groups per microbatch.
 
-    Raises :class:`RuntimeScheduleError` naming the microbatch, rank and reason instead of letting MCore fail on an
+    Raises :class:`RuntimeScheduleError` naming the microbatch, rank and reason before an
     IndexError / assert deep inside ``build_packed_microbatches``.
     """
     if not rows:
@@ -162,11 +162,12 @@ def validate_rows(
                 stored += geometry.stored_length(lengths[i], cp)
             if stored > geometry.capacity(cp):
                 raise RuntimeScheduleError(
-                    f"microbatch {m}: group at rank {start} (cp={cp}) stores {stored} tokens, capacity {geometry.capacity(cp)}"
+                    f"microbatch {m}: group at rank {start} (cp={cp}) stores {stored} tokens, "
+                    f"capacity {geometry.capacity(cp)}"
                 )
             seen.extend(ids)
-        # a run of equal lists is contiguous by construction; the only way MCore's member_ranks check can fail is an id
-        # appearing in two non-adjacent groups, which the multiset check below catches as a duplicate
+        # Equal-list runs are contiguous by construction. The multiset check below catches
+        # any ID appearing in two non-adjacent groups as a duplicate.
         decoded.append(groups)
     if sorted(seen) != sorted(lengths):
         counts: Dict[int, int] = {}

@@ -190,7 +190,8 @@ class ModelParallelConfig:
     """
 
     dynamic_cp_runtime_model: Optional[str] = None
-    """In-tree cost model ('calibrated_attention', 'qwen35_gb200' or 'usp_calib_v1'), or a CPU factory
+    """In-tree cost model ('calibrated_attention', 'qwen35_gb200' or 'usp_calib_v1'),
+    or a CPU factory
     ('package.module:factory') for the bounded runtime DCP solver. Replaces the default
     heuristic when set; PP1/VPP1 only. Uses the existing aligned, power-of-two CP groups.
     No external scheduler package is needed.

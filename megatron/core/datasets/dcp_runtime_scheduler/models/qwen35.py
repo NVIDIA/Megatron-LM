@@ -314,7 +314,10 @@ class Qwen35CoreCostModel:
             name=self.name,
             source_hashes=self.source_hashes,
             core=getattr(self.core_predictor, 'metadata', lambda: None)(),
-            proposal_guide='frozen-predictor queries indexed by CP, sequence count and sum of squared lengths; final scores exact',
+            proposal_guide=(
+                'frozen-predictor queries indexed by CP, sequence count '
+                'and sum of squared lengths; final scores exact'
+            ),
             non_attention=self.non_attention,
             fa_remainder=self.fa_remainder,
             gdn=self.gdn.metadata(),
@@ -328,5 +331,8 @@ class Qwen35CoreCostModel:
                 'cp1_fa_remainder_transferred_to_cp2_32',
                 'cp1_remainder_does_not_measure_multicp_contiguous_zigzag_conversion',
             ],
-            scope='attention modules plus measured fixed non-attention; prediction, not GPU E2E measurement',
+            scope=(
+                'attention modules plus measured fixed non-attention; '
+                'prediction, not GPU E2E measurement'
+            ),
         )
