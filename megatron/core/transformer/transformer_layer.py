@@ -768,6 +768,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _forward_attention(
         self,
+        # PyTorch's full-backward hooks only track positional inputs. Pass the
+        # activation positionally so MFSDP can release weights promptly.
+        # Supporting keyword inputs would require a custom autograd hook,
+        # adding complexity to MFSDP.
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,

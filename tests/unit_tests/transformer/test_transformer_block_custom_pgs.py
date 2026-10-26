@@ -343,8 +343,8 @@ class TestTransformerBlockWithProcessGroups:
         hidden_states_custom = hidden_states.clone().detach().requires_grad_(True)
 
         # Forward passes
-        output_default = default_block(hidden_states=hidden_states_default, attention_mask=None)
-        output_custom = custom_block(hidden_states=hidden_states_custom, attention_mask=None)
+        output_default = default_block(hidden_states_default, attention_mask=None)
+        output_custom = custom_block(hidden_states_custom, attention_mask=None)
         # Verify outputs match
         torch.testing.assert_close(
             output_default,
@@ -462,7 +462,7 @@ class TestTransformerBlockWithProcessGroups:
         )
         hidden_states.retain_grad()
 
-        output_custom = custom_block(hidden_states=hidden_states, attention_mask=None)
+        output_custom = custom_block(hidden_states, attention_mask=None)
 
         assert (
             output_custom.shape[0] == sequence_length
@@ -569,9 +569,7 @@ class TestTransformerBlockWithProcessGroups:
             pg_collection=pg_collection,
         )
 
-        output_cp2_tp_2_dp_2 = transformer_block_cp2_tp2_dp_2(
-            hidden_states=hidden_states, attention_mask=None
-        )
+        output_cp2_tp_2_dp_2 = transformer_block_cp2_tp2_dp_2(hidden_states, attention_mask=None)
 
         assert output_cp2_tp_2_dp_2.shape == (
             sequence_length,
@@ -583,9 +581,7 @@ class TestTransformerBlockWithProcessGroups:
         )
 
         # pass as input to transformer_block_cp2_tp4
-        output_cp2_tp4 = transformer_block_cp2_tp4(
-            hidden_states=output_cp2_tp_2_dp_2, attention_mask=None
-        )
+        output_cp2_tp4 = transformer_block_cp2_tp4(output_cp2_tp_2_dp_2, attention_mask=None)
 
         assert output_cp2_tp4.shape == (
             sequence_length,
@@ -773,8 +769,8 @@ class TestTransformerBlockWithProcessGroups:
         hidden_states_2 = hidden_states.clone()
 
         # Forward passes through the same block
-        output_1 = block(hidden_states=hidden_states_1, attention_mask=None)
-        output_block_2 = block_2(hidden_states=hidden_states_2, attention_mask=None)
+        output_1 = block(hidden_states_1, attention_mask=None)
+        output_block_2 = block_2(hidden_states_2, attention_mask=None)
 
         torch.testing.assert_close(
             output_1,

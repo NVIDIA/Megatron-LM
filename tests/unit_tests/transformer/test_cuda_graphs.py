@@ -555,9 +555,7 @@ class TestParallelTransformerBlockCudagraphs:
         hidden_states = hidden_states.cuda()
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states = parallel_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask
-        )
+        hidden_states = parallel_transformer_block(hidden_states, attention_mask=attention_mask)
 
         for _ in range(num_layers):
             assert hasattr(parallel_transformer_block.layers[0], "cudagraph_manager")
@@ -691,9 +689,7 @@ class TestPackedSeqCudagraphs:
             requires_grad=True,
         )
 
-        eager_out = block(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
-        )
+        eager_out = block(hidden_states, attention_mask=None, packed_seq_params=packed_seq_params)
         hidden_states_metadata = hidden_states.cg_buffer_metadata
         assert hidden_states_metadata.is_cudagraph_input
         assert hidden_states_metadata.is_saved_for_backward
@@ -800,9 +796,7 @@ class TestPackedSeqCudagraphs:
         for shared_buffers in buffers_by_ptr.values():
             assert sum(not tensor.can_skip_replay_copy for tensor in shared_buffers) == 1
 
-        graphed_out = block(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
-        )
+        graphed_out = block(hidden_states, attention_mask=None, packed_seq_params=packed_seq_params)
         assert torch.equal(graphed_out, eager_out), (
             "CUDA graph replay output is not bitwise equal to eager output: "
             f"max_abs_diff={(graphed_out.float() - eager_out.float()).abs().max().item()}"

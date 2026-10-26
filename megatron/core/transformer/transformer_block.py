@@ -522,7 +522,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def forward(
         self,
+        # PyTorch's full-backward hooks only track positional inputs. Pass the
+        # activation positionally so MFSDP can release weights promptly.
+        # Supporting keyword inputs would require a custom autograd hook,
+        # adding complexity to MFSDP.
         hidden_states: Union[Tensor, WrappedTensor],
+        /,
         attention_mask: Optional[Tensor],
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
@@ -745,7 +750,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
-                            hidden_states=hidden_states,
+                            hidden_states,
                             attention_mask=attention_mask,
                             context=context,
                             context_mask=context_mask,

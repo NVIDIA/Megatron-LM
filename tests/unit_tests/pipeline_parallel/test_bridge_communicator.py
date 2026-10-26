@@ -656,12 +656,12 @@ class TestBridgeCommunicator:
         )
         output_grid_2 = None
         if grid_1 is not None and bridge_communicator.is_current_rank_in_grid(grid_1):
-            output_grid_1 = block_grid_1(hidden_states=hidden_states, attention_mask=None)
+            output_grid_1 = block_grid_1(hidden_states, attention_mask=None)
             bridge_communicator.send_forward(output_grid_1)
 
         if grid_2 is not None and bridge_communicator.is_current_rank_in_grid(grid_2):
             received_activation = bridge_communicator.recv_forward()
-            output_grid_2 = block_grid_2(hidden_states=received_activation, attention_mask=None)
+            output_grid_2 = block_grid_2(received_activation, attention_mask=None)
             factor = max(grid1_dp, grid2_dp) // min(grid1_dp, grid2_dp)
             expected_output_shape = (
                 sequence_length,
@@ -687,10 +687,8 @@ class TestBridgeCommunicator:
             dtype=dtype,
         )
 
-        global_block_1_output = global_block_1(hidden_states=hidden_states, attention_mask=None)
-        global_block_2_output = global_block_2(
-            hidden_states=global_block_1_output, attention_mask=None
-        )
+        global_block_1_output = global_block_1(hidden_states, attention_mask=None)
+        global_block_2_output = global_block_2(global_block_1_output, attention_mask=None)
 
         if grid_2 is not None and bridge_communicator.is_current_rank_in_grid(grid_2):
             if grid1_dp == grid2_dp:
