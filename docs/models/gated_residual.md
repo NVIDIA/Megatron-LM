@@ -51,11 +51,19 @@ it — the builder warns, since a spec that keeps the fused input layernorms wou
 normalize the streams twice.
 
 Constraints enforced at config validation: requires
-`transformer_impl='transformer_engine'`; CUDA graphs are rejected (per-layer
-capture of the hybrid hyper-connection wrapper is not implemented on this base,
-and whole-layer / full-iteration capture is not validated for this variant;
-`GatedResidualModule.produces_h_res = False` tells capture code that the
-`h_res` slot is `None`); `use_fused_mhc` is mHC-only; TP>1 without `sequence_parallel` warns (the replicated GR compute,
+`transformer_impl='transformer_engine'`; CUDA graphs are supported only as
+Transformer Engine per-layer capture (`--cuda-graph-impl transformer_engine`)
+with `cuda_graph_modules` restricted to `attn` and the MoE scopes (`moe`,
+`moe_router`, `moe_preprocess`). The hybrid hyper-connection wrapper
+(`HyperConnectionHybridLayer`) is the graph callable: an attention-type layer is
+captured as one whole-wrapper graph (read gate + layer + write-back), and an MoE
+layer under `moe_router` captures only the read gate plus the router prefix,
+with the experts and the write-back eager on replay
+(`GatedResidualModule.produces_h_res = False` makes capture and replay omit the
+`None` `h_res` slot). An attention layer followed by an MoE layer is captured as
+one grouped graph. Whole-layer capture (empty `cuda_graph_modules`), the `mlp` /
+`mamba` scopes, `cuda_graph_impl='local'` and full-iteration capture are
+rejected as not validated; `use_fused_mhc` is mHC-only; TP>1 without `sequence_parallel` warns (the replicated GR compute,
 ~10% of forward FLOPs at real scale, would be duplicated per TP rank).
 
 ## Fused kernels

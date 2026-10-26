@@ -1904,6 +1904,15 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         """
         if self.engram is not None:
             return False
+        return self.submodules_are_cuda_graph_capturable()
+
+    def submodules_are_cuda_graph_capturable(self) -> bool:
+        """Whether the attention and MLP submodules allow per-layer CUDA graph capture.
+
+        This is ``is_cuda_graph_capturable`` without the Engram rule. A caller that runs the
+        Engram lookup itself, outside the layer's graph (``HyperConnectionHybridLayer`` with
+        ``cuda_graph_capture_engram_host``), consults it for the remaining part of the layer.
+        """
         for submodule in (self.self_attention, self.cross_attention, self.mlp):
             predicate = getattr(submodule, "is_cuda_graph_capturable", None)
             if predicate is not None and not predicate():

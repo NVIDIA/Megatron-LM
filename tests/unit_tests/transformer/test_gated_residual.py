@@ -453,24 +453,54 @@ class TestGatedResidualConfigValidation:
         with pytest.raises(ValueError, match="hc_lowrank"):
             make_config(hc_lowrank=0)
 
-    def test_cuda_graphs_rejected(self):
-        with pytest.raises(ValueError, match="CUDA graphs"):
-            make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=["attn"])
+    def test_cuda_graphs_rejected_outside_the_validated_scopes(self):
+        # Only attn and the MoE scopes are validated for this variant.
+        with pytest.raises(ValueError, match="MoE scopes"):
+            make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=["mlp"])
+        with pytest.raises(ValueError, match="MoE scopes"):
+            make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=["mamba"])
+
+    def test_attn_scoped_cuda_graphs_accepted(self):
+        # attn captures each attention-type hybrid layer as one whole-wrapper graph whose
+        # only output is the n-stream hidden state, so the None h_res slot is never a graph
+        # output there.
+        cfg = make_config(
+            num_moe_experts=4,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=["attn", "moe_router", "moe_preprocess"],
+        )
+        assert cfg.cuda_graph_impl == "transformer_engine"
+        cfg = make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=["attn"])
+        assert cfg.cuda_graph_impl == "transformer_engine"
 
     def test_cuda_graphs_rejected_for_whole_layer_capture(self):
-        with pytest.raises(ValueError, match="CUDA graphs"):
+        with pytest.raises(ValueError, match="partial"):
             make_config(cuda_graph_impl="local")
 
-    def test_moe_scoped_partial_cuda_graphs_rejected(self):
-        # Per-layer capture goes through the hybrid hyper-connection wrapper, which is not
-        # graphable on this base, so even the MoE scopes are rejected rather than silently
-        # left eager. num_moe_experts keeps the generic moe_router validation out of the way.
-        with pytest.raises(ValueError, match="CUDA graphs"):
-            make_config(
-                num_moe_experts=4,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=["moe_router", "moe_preprocess"],
-            )
+    def test_cuda_graphs_rejected_for_full_iteration_capture(self):
+        with pytest.raises(ValueError, match="partial"):
+            make_config(cuda_graph_impl="full_iteration")
+
+    def test_cuda_graphs_rejected_when_every_layer_is_captured(self):
+        # An empty cuda_graph_modules (or the deprecated "full") means "capture the whole
+        # layer".
+        with pytest.raises(ValueError, match="MoE scopes"):
+            make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=[])
+        with pytest.raises(ValueError, match="MoE scopes"):
+            make_config(cuda_graph_impl="transformer_engine")
+
+    def test_moe_scoped_partial_cuda_graphs_accepted(self):
+        # The gated residual leaves the 4-tuple's h_res slot None. The hybrid wrapper's
+        # partial-MoE capture and replay key on HyperConnectionModule.produces_h_res and omit
+        # the slot, so this config is legal.
+        # num_moe_experts is required: the generic validation rejects a moe_router scope on
+        # a dense model ("moe cuda graph is only supported for MoE").
+        cfg = make_config(
+            num_moe_experts=4,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=["moe_router", "moe_preprocess"],
+        )
+        assert cfg.cuda_graph_impl == "transformer_engine"
 
     def test_gated_residual_module_produces_no_h_res(self):
         from megatron.core.transformer.gated_residual import GatedResidualModule

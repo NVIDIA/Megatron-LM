@@ -151,19 +151,33 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             or (self.training and self._te_cuda_graph_rotary_pos_emb_seen is None)
         ):
             inputs = signature(super()._forward_attention).bind(*args, **kwargs).arguments
-            self._te_cuda_graph_record_padding_mask_shape(inputs.get("padding_mask"))
-            rotary_pos_emb = inputs.get("rotary_pos_emb")
-            if (
-                self.training
-                and isinstance(rotary_pos_emb, Tensor)
-                and self._te_cuda_graph_rotary_pos_emb_seen is None
-            ):
-                # Capture reserves a rotary_pos_emb input of this layout and dtype.
-                self._te_cuda_graph_rotary_pos_emb_seen = (
-                    tuple(rotary_pos_emb.shape),
-                    rotary_pos_emb.dtype,
-                )
+            self._te_cuda_graph_record_input_layouts(
+                inputs.get("rotary_pos_emb"), inputs.get("padding_mask")
+            )
         return super()._forward_attention(*args, **kwargs)
+
+    def _te_cuda_graph_record_input_layouts(
+        self, rotary_pos_emb: Optional[Tensor], padding_mask: Optional[Tensor]
+    ) -> None:
+        """Record the layouts of the optional inputs that TE CUDA graph capture must reserve.
+
+        Called on every forward path into the layer (``_forward_attention`` and the raw-branch
+        calls of the hybrid hyper-connection wrapper), so the eager warmup steps see them
+        whichever path runs. A no-op unless this layer registered TE graph state.
+        """
+        if self.config.cuda_graph_impl != "transformer_engine":
+            return
+        self._te_cuda_graph_record_padding_mask_shape(padding_mask)
+        if (
+            self.training
+            and isinstance(rotary_pos_emb, Tensor)
+            and self._te_cuda_graph_rotary_pos_emb_seen is None
+        ):
+            # Capture reserves a rotary_pos_emb input of this layout and dtype.
+            self._te_cuda_graph_rotary_pos_emb_seen = (
+                tuple(rotary_pos_emb.shape),
+                rotary_pos_emb.dtype,
+            )
 
     def _te_cuda_graph_record_padding_mask_shape(self, padding_mask):
         if padding_mask is not None and self._te_cuda_graph_padding_mask_shape_seen is None:
@@ -263,7 +277,7 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         # chunking), which is also what replay passes. TE fixes the kwarg set at capture, so
         # replays must then always pass a mask; see _te_cuda_graph_replay for the all-False default.
         self._te_cuda_graph_padding_mask_shape = None
-        if self._moe_router_in_cuda_graph():
+        if self._padding_mask_in_cuda_graph():
             mask_shape = self._te_cuda_graph_padding_mask_shape_seen
             if mask_shape is not None:
                 self._te_cuda_graph_padding_mask_shape = tuple(mask_shape)
@@ -284,7 +298,7 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         """
         graph_mask_shape = self._te_cuda_graph_padding_mask_shape
         if graph_mask_shape is None:
-            if padding_mask is not None and self._moe_router_in_cuda_graph():
+            if padding_mask is not None and self._padding_mask_in_cuda_graph():
                 raise RuntimeError(
                     "padding_mask was passed to a TE CUDA graph that was captured without a "
                     "padding_mask input: no mask reached this layer during "
@@ -405,6 +419,25 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         expert's result (see TEPartialCaptureMoEMixin._te_cuda_graph_outputs_shared_expert)."""
         return self.mlp._te_cuda_graph_outputs_shared_expert()
 
+    def _padding_mask_in_cuda_graph(self) -> bool:
+        """Return True when a graphed part of this layer reads the padding mask.
+
+        The MoE router does (masked routing, z-loss, expert bias), and so does an attention
+        module that reads ``PackedSeqParams.padding_mask`` under static packed (THD) inputs
+        (``consumes_packed_padding_mask``, e.g. QSA's indexer loss): the graph rebuilds
+        PackedSeqParams from tensor inputs, so the mask has to be one of them. The layer's mask
+        covers the whole local sequence only without sequence parallelism (with it, the layer
+        receives the SP-scattered mask), so the attention case is limited to that.
+        """
+        if self._moe_router_in_cuda_graph():
+            return True
+        return (
+            self._attention_in_cuda_graph()
+            and self._is_thd_cuda_graph()
+            and not self.config.sequence_parallel
+            and getattr(self.self_attention, "consumes_packed_padding_mask", False)
+        )
+
     def _moe_router_in_cuda_graph(self) -> bool:
         """Return True when this layer's MoE router runs inside the TE CUDA graph."""
         return self.is_moe_layer and (
@@ -508,6 +541,9 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             # tensor comparison during capture. This restricts TE backend
             # selection for THD to cuDNN fused attention.
             pad_between_seqs=True,
+            # Graph input only when get_layer_static_inputs reserved it. The layer's mask is the
+            # whole local sequence only without sequence parallelism (with it, it is SP-scattered).
+            padding_mask=None if self.config.sequence_parallel else kwargs.get('padding_mask'),
         )
 
     def _te_cuda_graph_capture_forward(self, hidden_states: Tensor, *args, **kwargs):

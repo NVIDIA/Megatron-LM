@@ -607,13 +607,17 @@ class EngramConfig:
         # plus its all-to-all have data-dependent shapes, so no captured graph may contain an
         # Engram-hosting layer. Per-layer Transformer Engine capture guarantees that for any
         # explicit scope: a layer that hosts Engram declares itself uncapturable
-        # (TransformerLayer.is_cuda_graph_capturable) and _layer_is_graphable leaves it eager,
+        # (TransformerLayer.is_cuda_graph_capturable) and TE graph discovery leaves it eager,
         # while the other layers -- including the other attention-type layers under the
         # ``attn`` scope -- are captured. What stays rejected is cuda_graph_impl='local',
         # which attaches a graph manager to every layer at construction.
         # The whole-layer Transformer Engine scope (no cuda_graph_modules) stays rejected as
         # well: it would also capture the MoE expert all-to-all of every MoE layer, a
         # combination never validated with Engram.
+        # With cuda_graph_capture_engram_host (TransformerConfig, opt-in) the hybrid
+        # hyper-connection wrapper runs the Engram lookup eagerly in front of the host
+        # layer's graph and captures only the rest of that layer, so the lookup itself is
+        # still never inside a graph and the rules above are unchanged.
         if transformer_config.cuda_graph_impl not in ("none", "transformer_engine"):
             raise ValueError(
                 "Engram does not yet support cuda_graph_impl="
