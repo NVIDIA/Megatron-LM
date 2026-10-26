@@ -107,6 +107,7 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
                 exp_avg_sq_dtype=torch.bfloat16,
             ),
             [model],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()

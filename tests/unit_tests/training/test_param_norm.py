@@ -335,6 +335,7 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
                 use_distributed_optimizer=use_distributed_optimizer,
             ),
             [model],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         for param in model.parameters():

@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
@@ -362,7 +363,9 @@ def test_param_norm_linear(use_distributed_optimizer: bool):
         optimizer_config = OptimizerConfig(
             bf16=True, use_distributed_optimizer=use_distributed_optimizer
         )
-        _ = get_megatron_optimizer(optimizer_config, [model])
+        _ = get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        )
         for param in model.parameters():
             assert hasattr(param, 'main_param')
             if use_distributed_optimizer:
@@ -428,7 +431,9 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
         optimizer_config = OptimizerConfig(
             bf16=True, use_distributed_optimizer=use_distributed_optimizer
         )
-        _ = get_megatron_optimizer(optimizer_config, [model])
+        _ = get_megatron_optimizer(
+            optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        )
         for param in model.parameters():
             # Only bf16/fp16 parameters get main_param attribute.
             # Router weights are always fp32, so they won't have main_param.

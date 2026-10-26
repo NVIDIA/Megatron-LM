@@ -1642,6 +1642,7 @@ class TestMegatronFsdpGradStatsGroup:
             optimizer = get_megatron_optimizer(
                 OptimizerConfig(optimizer="adam", lr=1e-3, use_distributed_optimizer=True),
                 [fsdp_model],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             return optimizer.get_grad_stats_parallel_group()
         finally:
