@@ -368,10 +368,7 @@ class FsdpModule:
         """Return parameters to their sharded resting state after forward compute."""
         is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
-            groups_to_release = tuple(
-                group for group in self._parameter_groups if group.is_rowwise_unsharded
-            )
-            self._release_unsharded_storage(groups_to_release, rowwise_only=True)
+            self._release_unsharded_storage(rowwise_only=True)
         else:
             self.reshard()
         if self.phase is Phase.FORWARD:
@@ -387,20 +384,23 @@ class FsdpModule:
         """Reshard parameter groups and release unsharded storage after compute."""
         for group in self._parameter_groups:
             group.reshard_parameters()
-        self._release_unsharded_storage(self._parameter_groups)
+        self._release_unsharded_storage()
 
-    def _release_unsharded_storage(
-        self, groups: tuple[FsdpParameterGroup, ...], *, rowwise_only: bool = False
-    ) -> None:
-        """Release the selected groups' storage after the current compute finishes."""
-        if not groups:
+    def _release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
+        """Select and release gathered storage after the current compute finishes."""
+        groups_to_release = self._parameter_groups
+        if rowwise_only:
+            groups_to_release = tuple(
+                group for group in groups_to_release if group.is_rowwise_unsharded
+            )
+        if not groups_to_release:
             return
         allgather_stream = self.context.allgather_stream
         allgather_stream.wait_stream(self.context.current_stream())
         # Release on the all-gather stream where unsharded storage was allocated,
         # so no record_stream() call is required for the storage.
         with torch.cuda.stream(allgather_stream):
-            for group in groups:
+            for group in groups_to_release:
                 group.release_unsharded_storage(rowwise_only=rowwise_only)
 
     def pre_backward(self) -> None:
