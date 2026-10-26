@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import lru_cache
-from math import ceil, log2
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from math import ceil, isfinite, lcm
+from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -220,7 +220,11 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
         subsample_seqlens_padded = torch.cat(
             [
                 subsample_seqlens,
-                torch.zeros(max_sub_samples - num_local_subsamples, dtype=torch.int32).cuda(),
+                torch.zeros(
+                    (max_sub_samples - num_local_subsamples, *subsample_seqlens.shape[1:]),
+                    dtype=torch.int32,
+                    device=subsample_seqlens.device,
+                ),
             ],
             dim=0,
         )
@@ -256,6 +260,11 @@ def _get_global_seqlens_and_ids(subsample_seqlens: torch.Tensor, dp_group):
     global_ids_this_rank = global_ids[start_idx:end_idx]
 
     return global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+
+
+def _cp_sequence_alignment(cp_size: int, sequence_parallel_size: int = 1) -> int:
+    """Align global rows for both CP zigzag chunks and local sequence parallelism."""
+    return cp_size * lcm(2 if cp_size > 1 else 1, sequence_parallel_size)
 
 
 def _pack_sequences(
@@ -741,9 +750,9 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     batch = []
     for item in batch_list:
         if isinstance(item, dict):
-            batch.append(item)
+            batch.append(dict(item))
         elif isinstance(item, list):
-            batch.extend(item)
+            batch.extend(dict(sample) for sample in item)
         else:
             raise ValueError(f"Invalid item type: {type(item)}")
 
@@ -757,10 +766,19 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
     subsample_seqlens = torch.cat([sample["padded_seq_len"] for sample in batch]).to(
         dtype=torch.int32, device=torch.cuda.current_device()
     )
+    if include_original_seqlens:
+        original = torch.cat([sample['original_seq_len'] for sample in batch]).to(
+            dtype=torch.int32, device=subsample_seqlens.device
+        )
+        subsample_seqlens = torch.stack((subsample_seqlens, original), dim=1)
 
     global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
         _get_global_seqlens_and_ids(subsample_seqlens, dp_group)
     )
+
+    if include_original_seqlens:
+        padded, original = map(list, zip(*seqlens_gathered))
+        return batch, list(enumerate(padded)), global_ids_this_rank, offsets, padded, original
 
     return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
 
@@ -770,11 +788,226 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
 # =============================================================================
 
 
+def _dcp_communication_overhead(
+    compute_work: float,
+    local_tokens: float,
+    cp_size: int,
+    crosses_nvlink: bool,
+    communication_cost: Tuple[float, float],
+) -> float:
+    """Extra exposed ring communication, in the same token-squared units as compute."""
+    if not crosses_nvlink or cp_size == 1:
+        return 0.0
+    per_step = compute_work / cp_size
+    local, remote = (weight * local_tokens for weight in communication_cost)
+    # CP-1 exchanges overlap CP compute steps; subtract the local baseline.
+    return (cp_size - 1) * (max(per_step, remote) - max(per_step, local))
+
+
+def _dcp_communication_tokens(local_tokens, capacity, padding_alignment):
+    """Count physical payload rows, including the existing THD tail-padding policy."""
+    if padding_alignment == 'max':
+        return capacity
+    if padding_alignment is not None:
+        return ceil(local_tokens / padding_alignment) * padding_alignment
+    return local_tokens
+
+
+def _validate_dcp_nvlink_cost(nvlink_domains, communication_cost, total_gpus):
+    if nvlink_domains is not None and len(nvlink_domains) != total_gpus:
+        raise ValueError('nvlink_domains must contain one domain per DPxCP rank')
+    if (
+        len(communication_cost) != 2
+        or not all(isfinite(value) for value in communication_cost)
+        or not 0 <= communication_cost[0] <= communication_cost[1]
+    ):
+        raise ValueError('communication_cost requires finite 0 <= local <= remote weights')
+    return (
+        nvlink_domains is not None
+        and len(set(nvlink_domains)) > 1
+        and communication_cost[1] > communication_cost[0]
+    )
+
+
+def reorder_dcp_groups(
+    sample_id_group: List[List[int]],
+    sample_lengths: Dict[int, int],
+    nvlink_domains: Sequence[int],
+    communication_cost: Tuple[float, float] = (1024.0, 2304.0),
+    sequence_parallel_size: int = 1,
+    max_seq_len_per_rank: int | None = None,
+    padding_alignment: int | str | None = None,
+    align_group_starts: bool = False,
+) -> List[List[int]]:
+    """Compact/fill a rank layout, then greedily place whole packs within NVLink domains.
+
+    CP sizes and sample membership are preserved except when absorbing unused
+    ranks. A bounded dynamic program allocates spare ranks across packs. Compare
+    complete layouts before accepting a reorder; no external solver or measured
+    model is needed in the training path.
+    """
+    if not _validate_dcp_nvlink_cost(nvlink_domains, communication_cost, len(sample_id_group)):
+        return sample_id_group
+    groups = []
+    for samples in sample_id_group:
+        if not samples:
+            continue
+        if groups and groups[-1][1] == tuple(samples):
+            groups[-1] = (groups[-1][0] + 1, groups[-1][1])
+        else:
+            groups.append((1, tuple(samples)))
+    if not groups:
+        return sample_id_group
+
+    def legal_group(cp, start):
+        return not align_group_starts or (
+            cp & (cp - 1) == 0 and len(sample_id_group) % cp == 0 and start % cp == 0
+        )
+
+    boundaries_before = [0]
+    for a, b in zip(nvlink_domains, nvlink_domains[1:]):
+        boundaries_before.append(boundaries_before[-1] + (a != b))
+
+    @lru_cache(maxsize=None)
+    def pack_work(cp_size, samples):
+        alignment = _cp_sequence_alignment(cp_size, sequence_parallel_size)
+        local = [ceil(sample_lengths[sid] / alignment) * (alignment // cp_size) for sid in samples]
+        return sum(length**2 * cp_size for length in local), sum(local)
+
+    @lru_cache(maxsize=None)
+    def cost(group, start):
+        cp_size, samples = group
+        compute, tokens = pack_work(cp_size, samples)
+        tokens = _dcp_communication_tokens(tokens, capacity, padding_alignment)
+        boundaries = boundaries_before[start + cp_size - 1] - boundaries_before[start]
+        extra = _dcp_communication_overhead(
+            compute, tokens, cp_size, boundaries > 0, communication_cost
+        )
+        # Boundaries are a tie-break only: different cross-domain links can run concurrently.
+        return compute + extra, extra, boundaries * (cp_size - 1) * tokens
+
+    def score(ordered):
+        start, maximum, work, traffic = 0, 0.0, 0.0, 0.0
+        for group in ordered:
+            duration, _, cross_traffic = cost(group, start)
+            maximum = max(maximum, duration)
+            work += group[0] * duration
+            traffic += cross_traffic
+            start += group[0]
+        return maximum, work, traffic
+
+    def place(remaining):
+        fallback = sorted(remaining, key=lambda group: -group[0])
+        remaining, ordered, start = list(remaining), [], 0
+        while remaining:
+            eligible = [
+                index for index, group in enumerate(remaining) if legal_group(group[0], start)
+            ]
+            if not eligible:
+                return fallback
+            index = min(
+                eligible, key=lambda i: (*cost(remaining[i], start)[1:], -remaining[i][0], i)
+            )
+            group = remaining.pop(index)
+            ordered.append(group)
+            start += group[0]
+        return ordered
+
+    capacity = max_seq_len_per_rank
+    if capacity is None:
+        capacity = max(pack_work(*group)[1] for group in groups)
+    total_ranks = len(sample_id_group)
+
+    def allocate(ordered, limit=None):
+        # State is the occupied rank prefix. First minimize the bottleneck;
+        # then minimize total rank-work/traffic under that exact bottleneck.
+        # Keeping only one (max, sum) label in a single pass loses optimal ties
+        # when a later group hides the earlier prefix's maximum.
+        states, parents = {0: (0.0, 0.0)}, []
+        reserved = sum(cp for cp, _ in ordered)
+        for minimum, samples in ordered:
+            reserved -= minimum
+            next_states, previous = {}, {}
+            for start, prefix in states.items():
+                ends = (
+                    range(start + minimum, total_ranks - reserved + 1)
+                    if reserved
+                    else (total_ranks,)
+                )
+                for end in ends:
+                    cp = end - start
+                    if not legal_group(cp, start):
+                        continue
+                    # CP1 -> CP>1 can increase zigzag padding; do not assume
+                    # every expansion fits or that feasibility is monotone.
+                    if pack_work(cp, samples)[1] > capacity:
+                        continue
+                    duration, _, traffic = cost((cp, samples), start)
+                    if limit is not None and duration > limit:
+                        continue
+                    candidate = (
+                        (max(prefix[0], duration), prefix[1] + cp * duration)
+                        if limit is None
+                        else (prefix[0] + cp * duration, prefix[1] + traffic)
+                    )
+                    if end not in next_states or candidate < next_states[end]:
+                        next_states[end], previous[end] = candidate, start
+            states = next_states
+            parents.append(previous)
+        if total_ranks not in states:
+            raise ValueError('Cannot fill DPxCP ranks without exceeding per-rank token capacity')
+        end, filled = total_ranks, []
+        for (_, samples), previous in zip(reversed(ordered), reversed(parents)):
+            start = previous[end]
+            filled.append((end - start, samples))
+            end = start
+        return states[total_ranks], list(reversed(filled))
+
+    if sum(cp for cp, _ in groups) == total_ranks:
+        best = groups
+        if any(pack_work(*group)[1] > capacity for group in best):
+            raise ValueError('Cannot fill DPxCP ranks without exceeding per-rank token capacity')
+        best_score = score(best)
+    else:
+        # Allocating first can lock in an avoidable crossing. Try the existing
+        # order and one topology-aware order of the minimum-size packs; do not
+        # enumerate permutations or run an unbounded local search.
+        placed = place(groups)
+        orders = [groups] if placed == groups else [groups, placed]
+        canonical = sorted(groups, key=lambda group: -group[0])
+        if align_group_starts and canonical not in orders:
+            orders.append(canonical)
+        best, best_score = None, None
+        for ordered in orders:
+            try:
+                optimum, _ = allocate(ordered)
+                _, filled = allocate(ordered, optimum[0])
+            except ValueError:
+                if align_group_starts:
+                    continue
+                raise
+            candidate_score = score(filled)
+            if best is None or candidate_score < best_score:
+                best, best_score = filled, candidate_score
+        if best is None:
+            raise ValueError('Cannot fill DPxCP ranks without exceeding per-rank token capacity')
+    # A bounded set of orders, each with O(groups * ranks**2) exact rank allocation.
+    placed = place(best)
+    if score(placed) < best_score:
+        best = placed
+    return [list(samples) for cp, samples in best for _ in range(cp)]
+
+
 def next_hdp_group_packing_aware(
     sample_seqlens: List[Tuple[int, int]],
     total_gpus: int,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
+    allow_arbitrary_group_starts: bool = False,
+    sequence_parallel_size: int = 1,
+    nvlink_domains: Sequence[int] | None = None,
+    communication_cost: Tuple[float, float] = (1024.0, 2304.0),
+    padding_alignment: int | str | None = None,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -786,10 +1019,18 @@ def next_hdp_group_packing_aware(
        the local tallest sequence in the microbatch.
 
     The scheduler keeps the legacy invariant that each returned microbatch has
-    no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
-    it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank.
+    no empty DPxCP rank after the fill step.
+
+    ``allow_arbitrary_group_starts`` lets lightweight logical groups occupy any
+    free contiguous interval. Legacy ProcessGroups keep their pre-created,
+    size-aligned partitions.
+
+    Optional ``nvlink_domains`` identifies domains in parent-rank order. The
+    local/remote communication weights convert per-rank tokens to compute-proxy
+    units; only unhidden extra communication affects the primary score. They
+    are tunable reference coefficients, not hardware-independent timings.
     """
+    topology_aware = _validate_dcp_nvlink_cost(nvlink_domains, communication_cost, total_gpus)
     if not sample_seqlens:
         return (
             [[] for _ in range(total_gpus)],
@@ -799,10 +1040,33 @@ def next_hdp_group_packing_aware(
         )
 
     def cp_min_fn(seq_len: int) -> int:
-        return dcp_gpus_needed(seq_len, max_seq_len_per_rank, min_cp_size)
+        cp_size = dcp_gpus_needed(
+            seq_len,
+            max_seq_len_per_rank,
+            min_cp_size,
+            round_to_power_of_two=not allow_arbitrary_group_starts,
+        )
+        while cp_size <= total_gpus and per_rank_length(seq_len, cp_size) > max_seq_len_per_rank:
+            cp_size = cp_size + 1 if allow_arbitrary_group_starts else cp_size * 2
+        return cp_size
+
+    def per_rank_length(seq_len: int, cp_size: int) -> int:
+        alignment = _cp_sequence_alignment(cp_size, sequence_parallel_size)
+        return ((seq_len + alignment - 1) // alignment) * (alignment // cp_size)
 
     def workload(seq_len: int, cp_size: int) -> float:
-        return (seq_len * seq_len) / cp_size
+        return per_rank_length(seq_len, cp_size) ** 2 * cp_size
+
+    def communication(compute, tokens, members):
+        crosses = topology_aware and any(
+            nvlink_domains[rank] != nvlink_domains[members[0]] for rank in members[1:]
+        )
+        if crosses:
+            tokens = _dcp_communication_tokens(tokens, max_seq_len_per_rank, padding_alignment)
+        extra = _dcp_communication_overhead(
+            compute, tokens, len(members), crosses, communication_cost
+        )
+        return extra, (len(members) - 1) * tokens if crosses else 0.0
 
     sample_seqlens = sorted(sample_seqlens, key=lambda x: x[1], reverse=True)
     local_tall = sample_seqlens[0][1]
@@ -816,6 +1080,7 @@ def next_hdp_group_packing_aware(
     gpu_group_id: List[Optional[int]] = [None] * total_gpus
     group_members: Dict[int, List[int]] = {}
     group_size: Dict[int, int] = {}
+    group_compute: Dict[int, float] = {}
     next_gid = 0
 
     sample_id, seq_len = sample_seqlens[0]
@@ -829,18 +1094,44 @@ def next_hdp_group_packing_aware(
     members = list(range(cp_size))
     group_members[group_id] = members
     group_size[group_id] = cp_size
-    packing_sequence_len[group_id] = seq_len / cp_size
+    packing_sequence_len[group_id] = per_rank_length(seq_len, cp_size)
     per_gpu_cost = workload(seq_len, cp_size)
+    group_compute[group_id] = per_gpu_cost
+    extra, _ = communication(per_gpu_cost, packing_sequence_len[group_id], members)
     for rank in members:
         gpu_group_id[rank] = group_id
         micro_batches[rank].append(seq_len)
-        exec_times[rank] += per_gpu_cost
+        exec_times[rank] = per_gpu_cost + extra
         sample_ids_per_gpu[rank].append(sample_id)
 
     leftovers: List[Tuple[int, int]] = []
+
+    def candidate_score(compute, tokens, members, group_id=None):
+        # The packing cap remains a compute/capacity constraint, not a network penalty.
+        if (
+            max(
+                compute,
+                max((value for gid, value in group_compute.items() if gid != group_id), default=0),
+            )
+            > cap
+        ):
+            return None
+        extra, traffic = communication(compute, tokens, members)
+        if group_id is not None:
+            _, previous = communication(
+                group_compute[group_id], packing_sequence_len[group_id], members
+            )
+            traffic -= previous
+        other = max(
+            (exec_times[ranks[0]] for gid, ranks in group_members.items() if gid != group_id),
+            default=0.0,
+        )
+        return max(other, compute + extra), traffic
+
     for sample_id, seq_len in sample_seqlens[1:]:
         min_needed = cp_min_fn(seq_len)
         best = None
+        free_starts = [rank for rank, group in enumerate(gpu_group_id) if group is None]
 
         cp_size = min_needed
         while cp_size <= total_gpus:
@@ -849,33 +1140,39 @@ def next_hdp_group_packing_aware(
             for group_id, size in list(group_size.items()):
                 if size != cp_size:
                     continue
-                if packing_sequence_len.get(group_id, 0) + seq_len / cp_size > max_seq_len_per_rank:
+                if (
+                    packing_sequence_len.get(group_id, 0) + per_rank_length(seq_len, cp_size)
+                    > max_seq_len_per_rank
+                ):
                     continue
                 members = group_members[group_id]
-                member_set = set(members)
-                projected_max = max(
-                    time + per_gpu_cost if rank in member_set else time
-                    for rank, time in enumerate(exec_times)
+                score = candidate_score(
+                    group_compute[group_id] + per_gpu_cost,
+                    packing_sequence_len[group_id] + per_rank_length(seq_len, cp_size),
+                    members,
+                    group_id,
                 )
-                if projected_max <= cap and (best is None or projected_max < best[0]):
-                    best = (projected_max, cp_size, "add", group_id, None)
+                if score is not None and (best is None or score < best[0]):
+                    best = (score, cp_size, "add", group_id, None)
 
-            free_ranks = [
-                rank
-                for rank, assigned_group_id in enumerate(gpu_group_id)
-                if assigned_group_id is None
-            ]
-            if len(free_ranks) >= cp_size:
-                chosen_members = sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]
-                chosen_set = set(chosen_members)
-                projected_max = max(
-                    time + per_gpu_cost if rank in chosen_set else time
-                    for rank, time in enumerate(exec_times)
+            group_start_step = 1 if allow_arbitrary_group_starts else cp_size
+            for group_start in free_starts if len(free_starts) >= cp_size else ():
+                if group_start % group_start_step or group_start + cp_size > total_gpus:
+                    continue
+                chosen_members = list(range(group_start, group_start + cp_size))
+                if any(gpu_group_id[rank] is not None for rank in chosen_members):
+                    continue
+                score = candidate_score(
+                    per_gpu_cost, per_rank_length(seq_len, cp_size), chosen_members
                 )
-                if projected_max <= cap and (best is None or projected_max < best[0]):
-                    best = (projected_max, cp_size, "new", None, chosen_members)
+                if score is not None and (
+                    best is None
+                    or score < best[0]
+                    or (allow_arbitrary_group_starts and score == best[0] and best[2] == "add")
+                ):
+                    best = (score, cp_size, "new", None, chosen_members)
 
-            cp_size *= 2
+            cp_size = cp_size + 1 if allow_arbitrary_group_starts else cp_size * 2
 
         if best is None:
             leftovers.append((sample_id, seq_len))
@@ -885,21 +1182,27 @@ def next_hdp_group_packing_aware(
         per_gpu_cost = workload(seq_len, selected_cp_size)
         if action == "add":
             members = group_members[group_id]
-            packing_sequence_len[group_id] += seq_len / selected_cp_size
+            packing_sequence_len[group_id] += per_rank_length(seq_len, selected_cp_size)
+            group_compute[group_id] += per_gpu_cost
+            extra, _ = communication(
+                group_compute[group_id], packing_sequence_len[group_id], members
+            )
             for rank in members:
                 micro_batches[rank].append(seq_len)
-                exec_times[rank] += per_gpu_cost
+                exec_times[rank] = group_compute[group_id] + extra
                 sample_ids_per_gpu[rank].append(sample_id)
         else:
             group_id = next_gid
             next_gid += 1
             group_members[group_id] = chosen_members
             group_size[group_id] = selected_cp_size
-            packing_sequence_len[group_id] = seq_len / selected_cp_size
+            group_compute[group_id] = per_gpu_cost
+            packing_sequence_len[group_id] = per_rank_length(seq_len, selected_cp_size)
+            extra, _ = communication(per_gpu_cost, packing_sequence_len[group_id], chosen_members)
             for rank in chosen_members:
                 gpu_group_id[rank] = group_id
                 micro_batches[rank].append(seq_len)
-                exec_times[rank] += per_gpu_cost
+                exec_times[rank] = per_gpu_cost + extra
                 sample_ids_per_gpu[rank].append(sample_id)
 
     def fill_empty_gpus_once() -> bool:
@@ -927,7 +1230,17 @@ def next_hdp_group_packing_aware(
             group_start_rank = members[0]
             group_end_rank = members[-1]
             empty_rank = empty_ranks[0]
-            if group_end_rank + 1 > empty_rank or group_end_rank + needed_count >= total_gpus:
+            if (
+                group_start_rank % next_power
+                or group_end_rank + 1 > empty_rank
+                or empty_rank + needed_count > total_gpus
+                or any(
+                    min(other_members) > group_end_rank
+                    and (min(other_members) + needed_count) % group_size[other_group_id]
+                    for other_group_id, other_members in group_members.items()
+                    if other_group_id != group_id
+                )
+            ):
                 continue
 
             work_to_push = micro_batches[group_end_rank + 1 : empty_rank]
@@ -983,7 +1296,7 @@ def next_hdp_group_packing_aware(
         packed_sequence_len = 0.0
 
         for sample_id, seq_len in sample_seqlens:
-            per_rank_len = seq_len / total_gpus
+            per_rank_len = per_rank_length(seq_len, total_gpus)
             if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
                 selected.append((sample_id, seq_len))
                 packed_sequence_len += per_rank_len
@@ -1004,7 +1317,37 @@ def next_hdp_group_packing_aware(
         sample_ids_per_gpu = [list(selected_ids) for _ in range(total_gpus)]
         leftovers = next_leftovers
 
+    if topology_aware:
+        lengths = dict(sample_seqlens)
+        sample_ids_per_gpu = reorder_dcp_groups(
+            sample_ids_per_gpu,
+            lengths,
+            nvlink_domains,
+            communication_cost,
+            sequence_parallel_size,
+            max_seq_len_per_rank,
+            padding_alignment,
+            align_group_starts=not allow_arbitrary_group_starts,
+        )
+        micro_batches = [[lengths[sid] for sid in samples] for samples in sample_ids_per_gpu]
+        rank = 0
+        while rank < total_gpus:
+            end = rank + 1
+            while end < total_gpus and sample_ids_per_gpu[end] == sample_ids_per_gpu[rank]:
+                end += 1
+            members = list(range(rank, end))
+            compute = sum(workload(length, len(members)) for length in micro_batches[rank])
+            tokens = sum(per_rank_length(length, len(members)) for length in micro_batches[rank])
+            exec_times[rank:end] = [compute + communication(compute, tokens, members)[0]] * len(
+                members
+            )
+            rank = end
+
     while any(not micro_batch for micro_batch in micro_batches):
+        empty_ranks = [rank for rank, micro_batch in enumerate(micro_batches) if not micro_batch]
+        if not all(not micro_batches[rank] for rank in range(empty_ranks[0], total_gpus)):
+            fill_with_full_dpxcp_group()
+            break
         if not fill_empty_gpus_once():
             fill_with_full_dpxcp_group()
             break
@@ -1012,10 +1355,16 @@ def next_hdp_group_packing_aware(
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 
-def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_stage: int) -> List:
+def align_sample_id_groups(
+    sample_id_groups: List,
+    microbatch_group_size_per_vp_stage: int,
+    allow_arbitrary_group_starts: bool = False,
+    fill_empty_ranks: Callable[[List], List] | None = None,
+) -> List:
     """Align len(sample_id_groups) to microbatch_group_size_per_vp_stage when VPP is enabled.
 
-    Standalone version extracted from DefaultDynamicCPScheduler.
+    An optional fill callback assigns the spare ranks immediately after each
+    split, before the default expansion can lock in a larger CP size.
     """
     multiple = int(microbatch_group_size_per_vp_stage)
     remainder = (-len(sample_id_groups)) % multiple
@@ -1036,16 +1385,22 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
                 else:
                     break
             assert (
-                prev_cp_size == 0 or cp_size <= prev_cp_size
+                allow_arbitrary_group_starts or prev_cp_size == 0 or cp_size <= prev_cp_size
             ), f"split_group: CP size is not decreasing: prev={prev_cp_size}, cur={cp_size}"
             cu_ranks.append(start_rank + cp_size)
             prev_cp_size = cp_size
         if len(cu_ranks) == 2:
             return None, None
 
-        k = 0
-        while cu_ranks[k] < total_hdp_ranks // 2:
-            k += 1
+        if allow_arbitrary_group_starts:
+            k = min(
+                range(1, len(cu_ranks) - 1),
+                key=lambda index: abs(2 * cu_ranks[index] - total_hdp_ranks),
+            )
+        else:
+            k = 0
+            while cu_ranks[k] < total_hdp_ranks // 2:
+                k += 1
 
         old_mb = sample_id_group[: cu_ranks[k]] + [[] for _ in range(total_hdp_ranks - cu_ranks[k])]
         new_mb = sample_id_group[cu_ranks[k] :] + [[] for _ in range(cu_ranks[k])]
@@ -1054,6 +1409,19 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
         return new_mb, old_mb
 
     def fill_empty_by_expanding_cp(sample_id_group):
+        if fill_empty_ranks is not None:
+            return fill_empty_ranks(sample_id_group)
+        if allow_arbitrary_group_starts:
+            # A logical group can absorb any tail length, including one smaller
+            # than its current CP size. Repeating its rank assignment changes
+            # CP only; the two split microbatches retain disjoint sample IDs.
+            tail_start = next(i for i, samples in enumerate(sample_id_group) if not samples)
+            sample_id_group[tail_start:] = [
+                list(sample_id_group[tail_start - 1])
+                for _ in range(len(sample_id_group) - tail_start)
+            ]
+            return sample_id_group
+
         def fill_empty(sample_id_group):
             empty_size = sum(1 for x in sample_id_group if len(x) == 0)
             i = len(sample_id_group) - 1 - empty_size
@@ -1083,7 +1451,10 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
             return sample_id_group
 
         while len(sample_id_group[-1]) == 0:
+            filled_ranks = sum(bool(samples) for samples in sample_id_group)
             sample_id_group = fill_empty(sample_id_group)
+            if sum(bool(samples) for samples in sample_id_group) <= filled_ranks:
+                raise RuntimeError('Cannot fill VPP ranks by expanding the available CP groups')
         return sample_id_group
 
     attempts_since_split = 0
@@ -1111,7 +1482,14 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
 
 
 @lru_cache(maxsize=128)
-def dcp_gpus_needed(seq_len: int, max_seq_len_per_rank: int, min_cp_size: int = 1) -> int:
-    """Number of GPUs needed, rounded up to the next power of 2, lower-bounded by min_cp_size."""
-    raw = max(1, 2 ** ceil(log2(seq_len / max_seq_len_per_rank)))
+def dcp_gpus_needed(
+    seq_len: int,
+    max_seq_len_per_rank: int,
+    min_cp_size: int = 1,
+    round_to_power_of_two: bool = True,
+) -> int:
+    """Minimum GPUs needed, optionally rounded to the next power of two."""
+    raw = max(1, ceil(seq_len / max_seq_len_per_rank))
+    if round_to_power_of_two:
+        raw = 1 << (raw - 1).bit_length()
     return max(min_cp_size, raw)

@@ -1,0 +1,270 @@
+{
+  "schema": 1, "hardware": "gb300",
+  "source_sha256": "41747868ed35aaa61f1eb33e9a503fba23ba2d54166a3b0411a0d7d598b0e4c6",
+  "constants": {"tile_tokens": 128, "block_rows": 256, "head_dim_half_occupancy": 256},
+  "topology": {
+    "gpus_per_node": 4,
+    "class_by_role": {
+      "inter_node": "nvl72_domain", "intra_node": "cp4_concurrent_intra_node",
+      "pair": "cp2_sequential_sendrecv"
+    },
+    "classes": {
+      "cp2_sequential_sendrecv": {"cps": [2], "role": "pair"},
+      "cp4_concurrent_intra_node": {"cps": [4], "role": "intra_node"},
+      "nvl72_domain": {"cps": [8, 16, 32], "role": "inter_node"}
+    }
+  },
+  "layout": {"alignment_default": 128, "calibrated_storages": [4096, 8192, 16384]},
+  "production_clock_mhz": {"backward": 1800, "forward": 1770},
+  "forward": {
+    "head": "g5_f6", "head_status": "served",
+    "known_limits": [
+      "the cp2 (sequential send-then-recv pair) ring layer under-predicts: 7 of 9 f cells and 3 of 6 h cells fail (-1.6 .. -11 %, worst at 4K = the smallest walls)",
+      "the smallest 4K walls at low CP (llama3_70b 4K cp4 / cp8, qwen3_30b 8K cp4): the O_graph / glue share is largest, a 10-30 us absolute error is 5-10 %",
+      "P90-marginal single-sequence h cells at 16K (WAPE 3-5 %, P90 10.0-10.6; the light-L bins carry the error)",
+      "the d256 geometry (qwen3_5_397b) over-predicted by ~+4 % (the GB200 qwen3_5_397b known limit; qwen3_5_397b 16K cp16 fails on WAPE)",
+      "the clock law's single constant s = 0.949 is a pack-averaged simplification (kernel-level reads 0.864 / 0.900; long packs 0.74, short 0.94; P1.3.4) - immaterial at the sealed clocks (< 0.1 WAPE)"
+    ],
+    "cp1": {
+      "form": "F5_sim+jmax", "P_hw": 152, "tile": 128, "block_rows": 256,
+      "static_us_per_slot": 0.155, "thd_max": 64,
+      "geometries": {
+        "llama3_70b": {
+          "query_heads": 64, "kv_heads": 8, "head_dim": 128,
+          "causal": {
+            "k0_ms": 0.02371613085, "b_S_ms_per_token": 0.000003027868455,
+            "tau_ms_per_kvtile": 0.001193891162, "rho_kvtiles": 3.5,
+            "tau_jmax_ms_per_kvtile": 0.0007579622568, "P_hw": 152
+          },
+          "rectangle": {
+            "k0_ms": 0.02470634587, "b_S_ms_per_token": 0.000003131044386,
+            "tau_ms_per_kvtile": 0.00116765918, "rho_kvtiles": 3, "tau_jmax_ms_per_kvtile": 0,
+            "P_hw": 152
+          }
+        },
+        "qwen3_30b": {
+          "query_heads": 32, "kv_heads": 4, "head_dim": 128,
+          "causal": {
+            "k0_ms": 0.0245169337, "b_S_ms_per_token": 0.000001422169829,
+            "tau_ms_per_kvtile": 0.001227111946, "rho_kvtiles": 3.5,
+            "tau_jmax_ms_per_kvtile": 0.000621545126, "P_hw": 152
+          },
+          "rectangle": {
+            "k0_ms": 0.02583774379, "b_S_ms_per_token": 0.000001494492661,
+            "tau_ms_per_kvtile": 0.001176593089, "rho_kvtiles": 3, "tau_jmax_ms_per_kvtile": 0,
+            "P_hw": 152
+          }
+        },
+        "qwen3_5_397b": {
+          "query_heads": 32, "kv_heads": 2, "head_dim": 256,
+          "causal": {
+            "k0_ms": 0.02578617144, "b_S_ms_per_token": 0.000003030242202,
+            "tau_ms_per_kvtile": 0.001163102736, "rho_kvtiles": 3,
+            "tau_jmax_ms_per_kvtile": 0.0004260314352, "P_hw": 152
+          },
+          "rectangle": {
+            "k0_ms": 0.02649395402, "b_S_ms_per_token": 0.000003073633864,
+            "tau_ms_per_kvtile": 0.001172327198, "rho_kvtiles": 2.5, "tau_jmax_ms_per_kvtile": 0,
+            "P_hw": 152
+          }
+        }
+      }
+    },
+    "o_graph": {"o0_us": 23.70032488, "o1_us_per_MiB": 0.1917077047},
+    "ring": {
+      "calibrated_cps": [2, 4, 8, 16], "sequential_pair_structure": "cp2_sequential_sendrecv",
+      "structure_of_cp": {
+        "2": "cp2_sequential_sendrecv", "4": "cp4_concurrent_intra_node", "8": "nvl72_domain",
+        "16": "nvl72_domain", "32": "nvl72_domain"
+      },
+      "kappa_W0": 0.1221249723, "kappa_W0_sequential_pair": 0, "c_tail_us_per_MiB": 0.8541772554,
+      "W0": {
+        "cp2_sequential_sendrecv": {
+          "bandwidth_GBps": 226.6646823, "cps": [2], "latency_us": 61.21377461,
+          "us_per_byte": 0.00000441180333
+        },
+        "cp4_concurrent_intra_node": {
+          "bandwidth_GBps": 478.2507997, "cps": [4], "latency_us": 32.99570097,
+          "us_per_byte": 0.000002090953116
+        },
+        "nvl72_domain": {
+          "bandwidth_GBps": 629.4336662, "cps": [8, 16], "latency_us": 24.77553784,
+          "us_per_byte": 0.000001588729764
+        }
+      },
+      "chain_0_comm": {
+        "a0_us": 12.62133522, "a1_us_per_MiB": -0.1043574855, "a1_us_per_elem": -1.990461072e-7
+      },
+      "g_mid": {"b0_us": 16.11727153, "b1_us_per_MiB": 0, "b1_us_per_elem": 0}
+    },
+    "kernel_scale": 1, "clock": {"f0_mhz": 1770, "alpha": 1, "two_term_s": 0.949}
+  },
+  "backward": {
+    "head": "g5_bg5", "head_status": "served_round1_partially_validated",
+    "known_limits": [
+      "the pair / one-node layer: cp2 0 / 9 f cells and 1 / 6 h cells pass; cp2 pooled 8.18 / 26.09 / +6.00 on f (91 % of the rows over-predicted; qwen3_30b 4K / 8K / 16K +22.6 / +12.2 / +8.0, llama3_70b +17.5 / +10.1 / +7.6) and 7.88 / 21.87 / +5.06 on h - the GB200 round-2 picture (ROUND2_CLOSEOUT_BWD.md section 5)",
+      "the P90 pack spread: pooled WAPE at the 5 % reading (f 5.00, h 4.72) with the bias inside +3 %, but the per-cell gate fails on the P90 (pooled 17.1 / 16.6); every multi-node llama3_70b f cell at 16K fails on P90 alone (cp8 / cp16 P90 12.15 / 11.04 at |bias| < 2.3)",
+      "geometry-signed bias larger than on GB200: qwen3_30b over-predicted (+4.77 % f, +5.75 % h; 2 / 15 f cells, 0 / 8 h cells pass), qwen3_5_397b under-predicted (-3.39 % f; 9 / 15 f, 6 / 8 h cells pass), llama3_70b +2.56 % f (3 / 15), +4.21 % h (0 / 8)",
+      "the d256 causal CP1 cells (qwen3_5_397b): the three causal units fail the CP1 fit gate as on GB200 (BG3.1; LOLO 6.51 / 10.7); sealed qwen3_5_397b 16K cp1 11.17 / 18.97 / -8.10 FAIL",
+      "the clock law is PRIOR-served (BG2.2): the GB200 B6.1 structural lambda 0.5757 +- 0.031 carried to GB300 because the GB300 reads are not independent (the sampled-clock ceiling 1845 MHz lies below every light-arm clock); the GB300 readings (card-clock lambda 0.356 / s 0.688, implied-clock 0.012 / 0.908) are recorded alternatives; the extrapolation from the lane clock to f0_bwd 1800 differs between them by +1.0 / +1.9 / +3.3 % at 1720 / 1650 / 1540 MHz",
+      "the H1 cell qwen3_30b p8192 cp4 (89.3 % of the exchange hidden): X stays x0 + kappa sum W0 (remainder.served false); the pre / prep alternatives move 2-8 cells (prep_excess_over_cp1 22 / 45 on f with a -4.1 % bias; pre_folded closer on 945 / 1176 h rows) - the first candidates for a GB300 round 2",
+      "the d128 bprop kernel reads Q-PARALLEL on GB300 (slope ratio 1.055; GB200 kv-parallel 1.115): by decision (1) ONE form on every hardware the served form stays F5b-1+jmax (LOLO 2.52) - F5b-Q+jmax (LOLO 3.07) is a frozen alternative",
+      "clock ceiling: attention-phase readings >= 1845 MHz (BG1 R6c) are a telemetry ceiling, flagged not corrected (none raised on the sealed rows); without a card the prediction is at f0 = 1800 MHz = the production backward default (= the DURING-window clock of the GB300 train-step probe, P1.2)",
+      "coverage: cp 32 and every non-power-of-two cp take the hardware's topology class without a measured W0 cell (flagged cuda_graph_cp_structure_extrapolated); R1 marginal (one record 0.27 ms) and R11 pack independence not met (informational, BG1)"
+    ],
+    "cp1": {
+      "form": "F5b-1+jmax", "f0_mhz": 1800, "static_us_per_slot": 0.155, "u_treatment": "none",
+      "structural": {
+        "R_bwd_rows": 128, "R_bwd_rows_by_head_dim": {"128": 128, "256": 256},
+        "P_bwd_by_head_dim": {"128": 152, "256": 76}
+      },
+      "static": {"form": "forward_slots", "thd_max": 64},
+      "helper_terms": {
+        "applied": true,
+        "by_head_dim": {
+          "128": {
+            "H_q": {
+              "form": "head_token",
+              "coef": {
+                "c_n_us_per_sequence": 0.2772470294, "c_us_per_head_token": 0.0003913561564,
+                "h0_us": 16.07327584
+              }
+            },
+            "H_kv": {
+              "form": "head_token",
+              "coef": {
+                "c_n_us_per_sequence": 0.267046463, "c_us_per_head_token": 0.0006502378227,
+                "h0_us": 16.68676522
+              }
+            }
+          },
+          "256": {
+            "H_q": {
+              "form": "head_token",
+              "coef": {
+                "c_n_us_per_sequence": 0.1359104971, "c_us_per_head_token": 0.0004200220031,
+                "h0_us": 5.892748868
+              }
+            },
+            "H_kv": {
+              "form": "head_token",
+              "coef": {
+                "c_n_us_per_sequence": 0.2065962475, "c_us_per_head_token": 0.002201049127,
+                "h0_us": 17.22248262
+              }
+            }
+          }
+        }
+      },
+      "geometries": {
+        "llama3_70b": {
+          "causal": {
+            "status": "fitted", "k0_ms": 0.01468161293, "b_S_ms_per_token": 0.00000538947091,
+            "tau_ms_per_tile": 0.002731519209, "rho_tiles": 1.5,
+            "tau_jmax_ms_per_tile": 0.0009797171055
+          },
+          "rectangle": {
+            "status": "fitted", "k0_ms": 0.01576034141, "b_S_ms_per_token": 0.000005565809465,
+            "tau_ms_per_tile": 0.002829545424, "rho_tiles": 1,
+            "tau_jmax_ms_per_tile": 0.0002778118605
+          }
+        },
+        "qwen3_30b": {
+          "causal": {
+            "status": "fitted", "k0_ms": 0.0143877829, "b_S_ms_per_token": 0.000002907317395,
+            "tau_ms_per_tile": 0.002742366597, "rho_tiles": 1.5,
+            "tau_jmax_ms_per_tile": 0.001009926482
+          },
+          "rectangle": {
+            "status": "fitted", "k0_ms": 0.01542865812, "b_S_ms_per_token": 0.000002933938832,
+            "tau_ms_per_tile": 0.00281945828, "rho_tiles": 1,
+            "tau_jmax_ms_per_tile": 0.0004594933248
+          }
+        },
+        "qwen3_5_397b": {
+          "causal": {
+            "status": "fitted", "k0_ms": 0.03207827337, "b_S_ms_per_token": 0.000004804575426,
+            "tau_ms_per_tile": 0.005776456865, "rho_tiles": 3,
+            "tau_jmax_ms_per_tile": 0.0004895047444
+          },
+          "rectangle": {
+            "status": "fitted", "k0_ms": 0.03264031631, "b_S_ms_per_token": 0.000005025612118,
+            "tau_ms_per_tile": 0.00514400364, "rho_tiles": 3,
+            "tau_jmax_ms_per_tile": 0.0003016153204
+          }
+        }
+      },
+      "geometry_params": {
+        "llama3_70b": {"q_heads": 64, "kv_heads": 8, "head_dim": 128},
+        "qwen3_30b": {"q_heads": 32, "kv_heads": 4, "head_dim": 128},
+        "qwen3_5_397b": {"q_heads": 32, "kv_heads": 2, "head_dim": 256}
+      }
+    },
+    "ring": {
+      "kernel_scale": 1,
+      "structure_of_cp": {
+        "2": "cp2_sequential_sendrecv", "4": "cp4_concurrent_intra_node", "8": "nvl72_domain",
+        "16": "nvl72_domain", "32": "nvl72_domain"
+      },
+      "f0_mhz": 1800,
+      "W0": {
+        "cp2_sequential_sendrecv": {"latency_us": 59.80678058, "us_per_byte": 0.000004345244794},
+        "cp4_concurrent_intra_node": {"latency_us": 31.06524344, "us_per_byte": 0.000002131320826},
+        "nvl72_domain": {"latency_us": 27.36987535, "us_per_byte": 0.000001576545231}
+      },
+      "X": {"kappa": 0.07011780736, "x0_us": 16.87743276},
+      "pre": {
+        "served": true, "p0_us": 18.98837433, "p_kv_us_per_MiB": 1.765740379,
+        "p_q_us_per_MiB": -0.1976928899
+      },
+      "glue": {
+        "form": "class_direct", "prep_mode": "class_direct", "scaled": false, "memset_us": 2.88,
+        "prep": {
+          "p0_us": 39.18612586, "p_kv_us_per_MiB_kv": 2.639446639,
+          "p_n_us_per_piece": 0.06979351862, "p_q_us_per_MiB_q": 0.3594504472
+        },
+        "accumulate": {"a0_us": 10.12232706, "a_us_per_MiB_kv": 0.6488085992},
+        "copy": {"c0_us": 1.341733828, "c_us_per_MiB_bytes": 0},
+        "helpers": {
+          "mode": "active_tokens",
+          "by_head_dim": {
+            "128": {
+              "H_q": {
+                "form": "head_token",
+                "coef": {
+                  "c_n_us_per_sequence": 0.2821284006, "c_us_per_head_token": 0.0003986992989,
+                  "h0_us": 15.22130574
+                }
+              },
+              "H_kv": {
+                "form": "head_token",
+                "coef": {
+                  "c_n_us_per_sequence": 0.1534846351, "c_us_per_head_token": 0.0007217035742,
+                  "h0_us": 18.4072559
+                }
+              }
+            },
+            "256": {
+              "H_q": {
+                "form": "head_token",
+                "coef": {
+                  "c_n_us_per_sequence": 0.1179646579, "c_us_per_head_token": 0.00042544598,
+                  "h0_us": 6.475298251
+                }
+              },
+              "H_kv": {
+                "form": "head_token",
+                "coef": {
+                  "c_n_us_per_sequence": 0.01892836445, "c_us_per_head_token": 0.002332091445,
+                  "h0_us": 24.16776154
+                }
+              }
+            }
+          }
+        }
+      },
+      "clock": {"helpers_clock_following": true, "law": {"kind": "structural", "lambda": 0.5757}}
+    },
+    "round": 1
+  }
+}
