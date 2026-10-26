@@ -16,12 +16,22 @@ import torch
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference import communication_utils
+from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.text_generation_server import tokenization
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     tokenization as dynamic_tokenization,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
-from tests.unit_tests.test_utilities import Utils, forbid_global_process_groups
+from megatron.core.utils import get_pg_size
+from tests.unit_tests.test_utilities import (
+    Utils,
+    build_test_pg_collection,
+    destroy_test_pg_collection,
+    forbid_global_process_groups,
+)
+
+# The sizes that build_inference_pg_collection takes, by collection field.
+_SIZE_FIELDS = ("tp", "cp", "pp", "ep", "expt_tp")
 
 
 @pytest.fixture(autouse=True)
@@ -241,3 +251,45 @@ class TestTokenizePrompts:
         self._check_tokens(module, tokens, lengths)
         # The broadcasts use the groups that tokenize_prompts resolved, and do not warn again.
         _check_fallback_warnings(record, ("tokenize_prompts", "pg_collection"))
+
+
+class TestBuildInferencePgCollection:
+    """Sizes left as None come from the training collection, else from the global grid."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_sizes_from_training_collection(self):
+        _require_even_world_size()
+        # The global grid has TP=1; the training collection has TP=2.
+        Utils.initialize_model_parallel()
+        training_pg_collection = build_test_pg_collection(tp=2)
+
+        with forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            pg_collection = build_inference_pg_collection(
+                Utils.world_size, pp_size=1, training_pg_collection=training_pg_collection
+            )
+
+        sizes = {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS}
+        assert sizes == {"tp": 2, "cp": 1, "pp": 1, "ep": 1, "expt_tp": 2}
+        destroy_test_pg_collection(training_pg_collection)
+
+    def test_fallback_uses_global_sizes(self):
+        _require_even_world_size()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        expected = {
+            "tp": parallel_state.get_tensor_model_parallel_world_size(),
+            "cp": parallel_state.get_context_parallel_world_size(),
+            "pp": parallel_state.get_pipeline_model_parallel_world_size(),
+            "ep": parallel_state.get_expert_model_parallel_world_size(),
+            "expt_tp": parallel_state.get_expert_tensor_parallel_world_size(),
+        }
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record, _reads_only_through_resolver():
+            pg_collection = build_inference_pg_collection(Utils.world_size)
+
+        assert {name: get_pg_size(vars(pg_collection)[name]) for name in _SIZE_FIELDS} == expected
+        _check_fallback_warnings(
+            record, ("build_inference_pg_collection", "training_pg_collection")
+        )
