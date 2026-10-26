@@ -1,0 +1,411 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Qwen3.8-Flash-Next training image for GB300 (aarch64, SM103a): the environment the
+# examples/qwen4exp recipes were run in, with the kernel dependencies this model needs on top of
+# NVIDIA PyTorch 26.07 (cuDNN Frontend QSA kernels, the MoK MoE megakernel, causal-conv1d for
+# the GDN pre-gated-delta-rule fusion, Emerging-Optimizers for Muon). Megatron-LM itself is not
+# installed: mount this repository and run from its root.
+#
+#   docker build -f examples/qwen4exp/Dockerfile.gb300 -t qwen4-gb300 examples/qwen4exp
+#
+# Build on an aarch64 host (MoK and causal-conv1d compile CUDA code; no GPU needed). Every
+# floating input is pinned:
+#
+#   base                 nvcr.io/nvidia/pytorch:26.07-py3
+#   cuDNN backend        apt libcudnn9-cuda-13, newest (9.27.0 at build time), the ONLY cuDNN install
+#   TransformerEngine    main @ 699ed6ec9e9c600c3d0acd3a488c4ca6f339e5d9
+#   flash-linear-attn    main @ a7a32d8b72965282dec45fae723c47cee20ee358
+#   causal-conv1d        Dao-AILab @ 4f6ae4e26ae5fe8af9372f8d312ab25cc4595223
+#                        (1.6.2.post1); its setup.py ignores
+#                        TORCH_CUDA_ARCH_LIST and emits its own list
+#                        (includes sm_100, sm_103); required by
+#                        --gdn-pre-gated-delta-rule-fusion
+#   Emerging-Optimizers  NVIDIA-NeMo v0.4.0 @ 925e1bfe32b37f5e3d52afdbeb24cfaf2df85c00
+#                        (Muon, --optimizer muon; pyproject pins v0.3.0, the
+#                        API Megatron imports is unchanged)
+#   DeepEP               hybrid-ep @ 10d4dd7377d5bce900fbb4b80cce863764892b95
+#   nvidia-cutlass-dsl   4.7.1 (cudnn-frontend PR #1765 QSA needs CuTeDSL >= 4.7)
+#   quack-kernels        0.6.5 (first release accepting cutlass-dsl >= 4.7)
+#   flash-attn-4         4.0.0b27
+#   cudnn-frontend       BestJuly/cudnn-frontend lit/qsa
+#                        @ faf7337dbf05a1bff2f8fa487f3db43c6e541879
+#                        = NVIDIA/cudnn-frontend PR #1765 head e1abc1aeb035
+#                        + cherry-pick of Tom-Zheng 0308fe9b9db9 (-> b46b9a9c)
+#                        + SM103 gate for the sparse_gqa backward (faf7337d)
+#                        (--qsa-attn-backend cudnn)
+#   mixture-of-kittens   BestJuly/mixture-of-kittens lit/qwen4
+#                        @ 2649f3bc7f25014457a7f11da80bb8442c446782
+#                        = QiZhangNV qizhang/mcore-integration d6ce58c
+#                        + PR #5 (128-aligned hidden)
+#                        + PR #7 squashed (6a4a99e, routed-row kernels)
+#                        + 128-aligned intermediate (2649f3b, the 640-wide
+#                          expert FFN of this model)
+#                        built ARCH=SM103; ThunderKittens patched by the
+#                        repo's own scripts/prepare_thunderkittens.sh
+#                        (--moe-megakernel-backend mok)
+#
+# Build-order rules (each cost a build before):
+#   * pip nvidia-cudnn-cu13 is removed before apt cuDNN is installed; two
+#     cuDNN installs => CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED.
+#   * TE needs nvidia-cudnn-frontend headers to build (1.28.0 wheel, --no-deps)
+#     and its install re-resolves the package, so the lit/qsa frontend is
+#     installed AFTER TE, replacing it, with --no-deps, and verified by commit.
+
+FROM nvcr.io/nvidia/pytorch:26.07-py3 AS runtime
+
+ENV SHELL=/bin/bash
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG YQ_VERSION="4.27.5"
+ARG CUDNN_FRONTEND_TE_BUILD_VERSION="1.28.0"
+ARG CUTLASS_DSL_VERSION="4.7.1"
+ARG QUACK_KERNELS_VERSION="0.6.5"
+ARG FLASH_ATTN_4_VERSION="4.0.0b27"
+ARG TE_COMMIT="699ed6ec9e9c600c3d0acd3a488c4ca6f339e5d9"
+ARG FLA_COMMIT="a7a32d8b72965282dec45fae723c47cee20ee358"
+ARG CAUSAL_CONV1D_COMMIT="4f6ae4e26ae5fe8af9372f8d312ab25cc4595223"
+ARG CAUSAL_CONV1D_ARCH="10.3a"
+ARG EMERGING_OPTIMIZERS_COMMIT="925e1bfe32b37f5e3d52afdbeb24cfaf2df85c00"
+ARG DEEPEP_COMMIT="10d4dd7377d5bce900fbb4b80cce863764892b95"
+ARG CUDNN_FRONTEND_COMMIT="faf7337dbf05a1bff2f8fa487f3db43c6e541879"
+ARG MOK_COMMIT="2649f3bc7f25014457a7f11da80bb8442c446782"
+ARG MOK_BUILD_ARCH="SM103"
+ARG NVTE_CUDA_ARCHS="100a;103a"
+ARG DEEPEP_CUDA_ARCHS="10.0;10.3"
+
+LABEL io.nvidia.pytorch.container="26.07-py3" \
+      io.nvidia.cudnn.backend="apt-libcudnn9-cuda-13-latest" \
+      io.nvidia.cudnn.frontend.branch="BestJuly/cudnn-frontend:lit/qsa" \
+      io.nvidia.cudnn.frontend.commit="${CUDNN_FRONTEND_COMMIT}" \
+      io.nvidia.cutlass-dsl="${CUTLASS_DSL_VERSION}" \
+      io.nvidia.flash-attention-4="${FLASH_ATTN_4_VERSION}" \
+      io.nvidia.transformer-engine.commit="${TE_COMMIT}" \
+      io.nvidia.flash-linear-attention.commit="${FLA_COMMIT}" \
+      io.nvidia.deepep.commit="${DEEPEP_COMMIT}" \
+      io.nvidia.mixture-of-kittens.branch="BestJuly/mixture-of-kittens:lit/qwen4" \
+      io.nvidia.mixture-of-kittens.commit="${MOK_COMMIT}" \
+      io.nvidia.mixture-of-kittens.arch="${MOK_BUILD_ARCH}"
+
+# Build and runtime utilities used by Megatron-LM and HybridEP. GB200/GB300 are
+# Arm SBSA systems, and the 26.07 PyTorch base is Ubuntu 24.04.
+RUN bash -euxo pipefail <<"EOF"
+    test "$(dpkg --print-architecture)" = "arm64"
+    . /etc/os-release
+    test "${ID}" = "ubuntu"
+    test "${VERSION_ID}" = "24.04"
+
+    rm -rf /opt/megatron-lm
+    apt-get -o Acquire::Retries=5 update
+    apt-get install -y --no-install-recommends \
+        ca-certificates sudo gdb bash-builtins git zsh autojump tmux curl wget \
+        gettext libfabric-dev
+
+    wget -q \
+        "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_arm64" \
+        -O /usr/bin/yq
+    chmod +x /usr/bin/yq
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+EOF
+
+# Remove the cuDNN that ships in the base image (pip nvidia-cudnn-cu13) BEFORE
+# installing the new one, so only one cuDNN ever exists in the image. Keeping
+# the two side by side -- they are different patch releases, in different
+# directories, both in ldconfig -- is what made a training process map both and
+# fail with CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED.
+RUN unset PIP_CONSTRAINT && python -m pip uninstall -y nvidia-cudnn-cu13
+
+# Install the newest cuDNN 9 (libcudnn9-cuda-13) from NVIDIA's CUDA apt repo.
+# cuda-keyring is arch-independent; repo path selects sbsa on aarch64 and x86_64 on amd64.
+# libcudnn9-dev-cuda-13 is also installed because TransformerEngine needs
+# cudnn.h to build, which the pip cuDNN removed above used to supply.
+RUN bash -ex <<"EOF"
+    ARCH=$(uname -m)
+    case "${ARCH}" in
+      "x86_64") REPO_ARCH=x86_64 ;;
+      "aarch64") REPO_ARCH=sbsa ;;
+      *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;;
+    esac
+    apt-get update
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${REPO_ARCH}/cuda-keyring_1.1-1_all.deb
+    dpkg -i cuda-keyring_1.1-1_all.deb
+    rm cuda-keyring_1.1-1_all.deb
+    apt-get update
+    apt-get install -y --no-install-recommends libcudnn9-cuda-13 libcudnn9-dev-cuda-13
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+EOF
+
+# Megatron-Core runtime, development, test, and observability dependencies.
+RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir \
+    debugpy dm-tree torch_tb_profiler einops wandb \
+    sentencepiece tokenizers transformers==4.57.1 torchvision ftfy modelcards datasets tqdm pydantic omegaconf \
+    py-spy yapf darker \
+    tiktoken flask-restful \
+    nltk wrapt pytest pytest_asyncio pytest-cov pytest_mock pytest-random-order \
+    black==24.4.2 isort==5.13.2 flake8==7.1.0 pylint==3.2.6 coverage mypy
+
+RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir --upgrade --no-deps \
+    "nvidia-resiliency-ext>=0.6.0"
+
+# TE's setup.py takes the cudnn-frontend C++ headers from the installed
+# nvidia-cudnn-frontend distribution, so a release wheel must exist while TE
+# builds (the same 1.28.0 the cudnn926 image built TE against). --no-deps keeps
+# pip nvidia-cudnn-cu13 out. The lit/qsa build replaces it after TE.
+RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir --no-deps \
+        "nvidia-cudnn-frontend==${CUDNN_FRONTEND_TE_BUILD_VERSION}"
+
+# Build the current Transformer Engine main revision for both Grace Blackwell
+# GPU targets. HybridEP owns expert-parallel communication in this image, so
+# TE's separate NCCL-EP backend is deliberately disabled. Must stay after the
+# cuDNN steps: TE links cuDNN at build time.
+RUN unset PIP_CONSTRAINT && \
+    python -m pip uninstall -y \
+        transformer-engine transformer-engine-torch transformer-engine-cu13 && \
+    NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" \
+    NVTE_BUILD_THREADS_PER_JOB=8 \
+    NVTE_FRAMEWORK=pytorch \
+    NVTE_WITH_NCCL_EP=0 \
+    python -m pip install --no-build-isolation --no-cache-dir \
+        "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_COMMIT}"
+
+# CUTLASS DSL is shared by FA4, quack-kernels, the cudnn-frontend OSS kernels
+# (QSA needs >= 4.7) and Megatron's in-tree CuTe DSL GDN/QSA kernels. Pinned
+# after TE so TE's resolver cannot move it.
+RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir --upgrade \
+        "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}" \
+        "quack-kernels==${QUACK_KERNELS_VERSION}" \
+        "flash-attn-4[cu13]==${FLASH_ATTN_4_VERSION}"
+
+# cudnn-frontend lit/qsa, built from source (nanobind extension against the
+# apt cuDNN). --no-deps: its metadata would otherwise reinstall the pip
+# nvidia-cudnn-cu13 removed above. Installed after TE (see header). The test
+# and benchmark trees are kept for in-container validation.
+RUN bash -euxo pipefail <<"EOF"
+    unset PIP_CONSTRAINT
+    git clone --branch lit/qsa https://github.com/BestJuly/cudnn-frontend.git /tmp/cudnn-frontend
+    cd /tmp/cudnn-frontend
+    git checkout "${CUDNN_FRONTEND_COMMIT}"
+    test "$(git rev-parse HEAD)" = "${CUDNN_FRONTEND_COMMIT}"
+    python -m pip uninstall -y nvidia-cudnn-frontend || true
+    CMAKE_BUILD_PARALLEL_LEVEL=32 python -m pip install --no-cache-dir --no-deps .
+    mkdir -p /opt/cudnn-frontend
+    echo "${CUDNN_FRONTEND_COMMIT}" > /opt/cudnn-frontend/COMMIT
+    cp -r test benchmark /opt/cudnn-frontend/
+    cd /
+    rm -rf /tmp/cudnn-frontend
+EOF
+
+# FLA main is intentionally installed from GitHub. The 26.07 image already
+# provides a matching pre-release PyTorch and Triton stack; --no-deps follows
+# FLA's guidance for nightly/pre-release torch and prevents replacing either.
+RUN unset PIP_CONSTRAINT && \
+    python -m pip uninstall -y fla-core flash-linear-attention && \
+    python -m pip install --no-build-isolation --no-cache-dir --no-deps \
+        "git+https://github.com/fla-org/flash-linear-attention.git@${FLA_COMMIT}"
+
+# causal-conv1d CUDA short convolution (the GDN pre-gated-delta-rule fusion
+# imports it), compiled from source for GB300 SM103a.
+RUN bash -euxo pipefail <<"EOF"
+    unset PIP_CONSTRAINT
+    git clone https://github.com/Dao-AILab/causal-conv1d.git /tmp/causal-conv1d
+    cd /tmp/causal-conv1d
+    git checkout "${CAUSAL_CONV1D_COMMIT}"
+    MAX_JOBS=32 TORCH_CUDA_ARCH_LIST="${CAUSAL_CONV1D_ARCH}" CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+        python -m pip install --no-build-isolation --no-cache-dir --no-deps .
+    cd /
+    rm -rf /tmp/causal-conv1d
+    python -c "import causal_conv1d_cuda"
+EOF
+
+# Emerging-Optimizers: the Muon implementation behind --optimizer muon
+# (megatron.core.optimizer imports it lazily). Pure Python.
+RUN bash -euxo pipefail <<"EOF"
+    unset PIP_CONSTRAINT
+    git clone https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git /tmp/emerging-optimizers
+    cd /tmp/emerging-optimizers
+    git checkout "${EMERGING_OPTIMIZERS_COMMIT}"
+    python -c "import absl" || python -m pip install --no-cache-dir absl-py
+    python -m pip install --no-build-isolation --no-cache-dir --no-deps .
+    cd /
+    rm -rf /tmp/emerging-optimizers
+    python -c "from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp"
+EOF
+
+# Multi-node HybridEP over the DOCA/NCCL path. Build the latest resolved
+# hybrid-ep revision for both GB200 and GB300 and retain CUDA/NVCC in the final
+# image because HybridEP JIT-compiles shape-specialized kernels at runtime.
+WORKDIR /workspace
+RUN bash -euxo pipefail <<"EOF"
+    git clone https://github.com/linux-rdma/rdma-core.git
+    cd rdma-core
+    git checkout tags/v60.0
+    sh build.sh
+
+    apt-get -o Acquire::Retries=5 update
+    apt-get install -y --no-install-recommends libnvidia-ml-dev
+
+    cd /workspace
+    git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+    cd DeepEP
+    git checkout "${DEEPEP_COMMIT}"
+    RDMA_CORE_HOME=/workspace/rdma-core/build \
+        HYBRID_EP_MULTINODE=1 USE_NIXL=0 \
+        TORCH_CUDA_ARCH_LIST="${DEEPEP_CUDA_ARCHS}" MAX_JOBS=8 \
+        python -m pip install --no-build-isolation .
+
+    apt-get purge -y libnvidia-ml-dev
+    apt-get autoremove -y
+    apt-get clean
+    rm -rf /root/.cache /tmp/* /var/lib/apt/lists/*
+EOF
+
+# Mixture-of-Kittens megakernel, lit/qwen4 (qizhang/mcore-integration + PR #5
+# + PR #7 + 128-aligned intermediate), built for GB300 only (ARCH=SM103).
+# ThunderKittens is pinned by the repo and patched with the repo's own
+# scripts/prepare_thunderkittens.sh. Built in place under MOK_HOME and put on
+# sys.path with a .pth.
+ENV MOK_HOME=/opt/mixture-of-kittens
+RUN bash -euxo pipefail <<"EOF"
+    git clone --branch lit/qwen4 \
+        https://github.com/BestJuly/mixture-of-kittens.git "${MOK_HOME}"
+    cd "${MOK_HOME}"
+    git checkout "${MOK_COMMIT}"
+    test "$(git rev-parse HEAD)" = "${MOK_COMMIT}"
+    git submodule update --init --recursive third_party/ThunderKittens
+    ./scripts/prepare_thunderkittens.sh
+
+    make -B "ARCH=${MOK_BUILD_ARCH}"
+
+    ls -la "${MOK_HOME}"/mok/_C*.so
+    cuobjdump --list-elf "${MOK_HOME}"/mok/_C*.so | tee /tmp/mok_elf.txt
+    grep -q "sm_103a" /tmp/mok_elf.txt
+
+    echo "${MOK_HOME}" > /usr/local/lib/python3.12/dist-packages/mok.pth
+    echo "MOK_HOME=${MOK_HOME}" >> /etc/environment
+    echo "${MOK_COMMIT}" > "${MOK_HOME}/COMMIT"
+
+    rm -rf "${MOK_HOME}/.git" /tmp/mok_elf.txt
+EOF
+
+# CUTLASS DSL 4.6.2 requires protobuf 6.x, while the base image's
+# grpcio-tools 1.83 requires protobuf 7.x. The 1.81 release supports protobuf
+# 6.x and remains compatible with the base image's newer grpcio runtime.
+RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir --upgrade \
+    "grpcio-tools==1.81.0"
+
+# Record and enforce the critical software contract at build time. GPU kernel
+# smoke tests run afterwards on GB300 nodes.
+RUN python - <<'PY'
+from importlib import metadata
+from importlib.util import find_spec
+from packaging.version import Version
+
+import causal_conv1d_cuda
+import cudnn
+import cudnn.ops as cudnn_ops
+import fla
+from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+import torch
+import transformer_engine
+import transformer_engine.pytorch
+from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+
+packages = (
+    "torch",
+    "triton",
+    "transformer-engine",
+    "flash-attn-4",
+    "flash-linear-attention",
+    "nvidia-cudnn-frontend",
+    "nvidia-cutlass-dsl",
+    "quack-kernels",
+    "nvidia-resiliency-ext",
+    "deep-ep",
+    "causal-conv1d",
+    "emerging-optimizers",
+)
+versions = {}
+for package in packages:
+    try:
+        versions[package] = metadata.version(package)
+    except metadata.PackageNotFoundError:
+        versions[package] = "NOT_INSTALLED"
+    print(f"{package}=={versions[package]}")
+
+backend_version = torch.backends.cudnn.version()
+frontend_backend_version = cudnn.backend_version()
+print(f"torch.backends.cudnn.version()={backend_version}")
+print(f"cudnn.backend_version()={frontend_backend_version}")
+
+# Exactly one cuDNN must be mapped.
+maps = open("/proc/self/maps").read()
+cudnn_libs = sorted({ln.split()[-1] for ln in maps.splitlines()
+                     if "libcudnn" in ln and ln.split()[-1].startswith("/")})
+cudnn_roots = {p.rsplit("/lib/", 1)[0] if "/lib/" in p else p.rsplit("/", 1)[0]
+               for p in cudnn_libs}
+print(f"mapped cuDNN objects: {cudnn_libs}")
+assert len(cudnn_roots) <= 1, f"more than one cuDNN install is mapped: {cudnn_roots}"
+# cuDNN is the newest apt release (9.27.0 when this image was built), at least 9.26.
+assert backend_version >= 92600, backend_version
+assert frontend_backend_version == backend_version, (frontend_backend_version, backend_version)
+
+# cudnn-frontend must be the lit/qsa build carrying the QSA training ops and
+# the SM103-enabled sparse_gqa backward.
+fe_commit = open("/opt/cudnn-frontend/COMMIT").read().strip()
+print(f"cudnn-frontend commit: {fe_commit} ({cudnn.__file__})")
+assert fe_commit == "faf7337dbf05a1bff2f8fa487f3db43c6e541879", fe_commit
+assert callable(cudnn_ops.qsa_forward) and callable(cudnn_ops.qsa_backward)
+from cudnn.sdpa.bwd import sparse_gqa_sm100
+assert (10, 3) in sparse_gqa_sm100._SUPPORTED_CAPABILITIES, sparse_gqa_sm100._SUPPORTED_CAPABILITIES
+
+assert torch.version.cuda.startswith("13.3"), torch.version.cuda
+assert versions["flash-attn-4"] == "4.0.0b27"
+assert versions["nvidia-cutlass-dsl"] == "4.7.1"
+assert versions["quack-kernels"] == "0.6.5"
+assert Version(versions["triton"]) >= Version("3.3")
+assert versions["transformer-engine"] != "NOT_INSTALLED"
+assert versions["flash-linear-attention"] == "0.6.0"
+assert versions["deep-ep"] != "NOT_INSTALLED"
+assert find_spec("deep_ep") is not None
+assert find_spec("deep_ep_cpp") is not None
+assert versions["causal-conv1d"] == "1.6.2.post1"
+assert versions["emerging-optimizers"] == "0.4.0"
+
+# mok._C links the CUDA driver, which is absent at build time; check files only.
+import glob
+assert glob.glob("/opt/mixture-of-kittens/mok/_C*.so"), "MoK extension missing"
+mok_commit = open("/opt/mixture-of-kittens/COMMIT").read().strip()
+assert mok_commit == "2649f3bc7f25014457a7f11da80bb8442c446782", mok_commit
+print(f"mok @ {mok_commit}")
+print(f"fla import: {fla.__file__}")
+print(f"transformer_engine import: {transformer_engine.__file__}")
+print(f"FA4 imports: {flash_attn_func}, {flash_attn_varlen_func}")
+PY
+
+RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir \
+    fastapi pydantic-settings slowapi "uvicorn[standard]"
+
+RUN python -m pip check
+
+# The OCI runtime provides driver libraries. A build-time NVML package left in
+# the image can shadow the host driver and cause an NVML version mismatch.
+RUN bash -euxo pipefail <<"EOF"
+    DRIVER_LIBS=$(find /usr/lib/aarch64-linux-gnu -maxdepth 1 \
+        \( -type f -o -type l \) -name 'libnvidia-ml.so*' -print)
+    if [[ -n "${DRIVER_LIBS}" ]]; then
+        echo "Unexpected NVIDIA driver libraries in the final image:" >&2
+        echo "${DRIVER_LIBS}" >&2
+        exit 1
+    fi
+    if dpkg -l 'libnvidia-compute-*' 2>/dev/null | \
+        awk '$1 == "ii" { found = 1 } END { exit !found }'; then
+        echo "Unexpected NVIDIA driver runtime packages in the final image:" >&2
+        dpkg -l 'libnvidia-compute-*' >&2
+        exit 1
+    fi
+    echo "NVIDIA driver runtime library check: PASS"
+EOF
+
+WORKDIR /workspace
