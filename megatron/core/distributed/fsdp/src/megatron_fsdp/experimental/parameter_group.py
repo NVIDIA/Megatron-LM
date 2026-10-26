@@ -423,10 +423,6 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
-    def _switch_to_unsharded_parameters(self) -> None:
-        for fsdp_parameter in self.fsdp_parameters:
-            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
-
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
         if isinstance(self.post_optimizer_model_weight, DBuffer):
@@ -455,10 +451,12 @@ class FsdpParameterGroup:
         return buffer.is_rowwise_allocated
 
     def unshard_parameters(self, phase: Phase | None = None) -> None:
-        """Gather missing weights and record their readiness on the current stream.
+        """Prepare this group's Parameters for the requested compute phase.
 
-        The caller selects the all-gather stream. Reuse existing events so compute
-        never waits for a later prefetch when its weights are already available.
+        On the caller-selected all-gather stream, refresh compute weights, gather
+        missing data if sharded, install the Parameters, and record readiness.
+        Reuse existing events so compute never waits for a later prefetch when its
+        weights are already available.
         """
         requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
         missing_phases = tuple(p for p in requested_phases if p not in self._unshard_events)
@@ -473,23 +471,21 @@ class FsdpParameterGroup:
 
         unsharded_model_weight = self._unsharded_model_weight
         if self._is_model_weight_unsharded():
-            # Reinstall so parameters see the latest optimizer update; MXFP8 padded
-            # scales are copies.
-            self._install_unsharded_parameters(self.model_weight)
+            unsharded_model_weight = self.model_weight
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(unsharded_model_weight, DBuffer):
-            self._materialize_unsharded_model_weight()
-            self._install_unsharded_parameters(unsharded_model_weight)
+            self._all_gather_model_weight()
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
-            rowwise = Phase.FORWARD in missing_phases
-            columnwise = Phase.BACKWARD in missing_phases
-            self._materialize_unsharded_model_weight(rowwise=rowwise, columnwise=columnwise)
-            self._install_unsharded_parameters(
-                unsharded_model_weight, rowwise=rowwise, columnwise=columnwise
+            self._all_gather_model_weight(
+                rowwise=Phase.FORWARD in missing_phases, columnwise=Phase.BACKWARD in missing_phases
             )
             ready_phases = missing_phases
-        self._switch_to_unsharded_parameters()
+        self._install_unsharded_parameters(
+            unsharded_model_weight,
+            rowwise=Phase.FORWARD in ready_phases,
+            columnwise=Phase.BACKWARD in ready_phases,
+        )
         event = torch.cuda.current_stream().record_event()
         for ready_phase in ready_phases:
             self._unshard_events[ready_phase] = event
@@ -508,10 +504,12 @@ class FsdpParameterGroup:
         rowwise: bool = True,
         columnwise: bool = True,
     ) -> None:
-        """Point unsharded parameters' data at ``unsharded_model_weight``.
+        """Update compute Parameters' data and install them on their owning modules.
 
         ``rowwise`` and ``columnwise`` select the newly gathered MXFP8 planes to
-        install. Regular compute weights ignore them.
+        install, preserving planes already installed for the other phase. Regular
+        compute weights ignore them. Replicated weights also need installation
+        after optimizer updates because their padded MXFP8 scales are copies.
         """
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor_view = unsharded_model_weight.get_tensor_view(index)
@@ -524,11 +522,10 @@ class FsdpParameterGroup:
                 update_mxfp8_tensor(
                     tensor_view, fsdp_parameter.unsharded, rowwise=rowwise, columnwise=columnwise
                 )
+            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
-    def _materialize_unsharded_model_weight(
-        self, *, rowwise: bool = True, columnwise: bool = True
-    ) -> None:
-        """All-gather full compute weights into their unsharded buffer.
+    def _all_gather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
+        """Allocate the gather buffer and fill it from sharded compute weights.
 
         ``rowwise`` and ``columnwise`` select the MXFP8 planes to gather. Regular
         compute weights ignore them and gather their whole buffer.
