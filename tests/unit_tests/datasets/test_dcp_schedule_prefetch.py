@@ -234,6 +234,22 @@ def test_planner_process_stays_cpu_only():
     )
 
 
+def test_worker_reports_initialization_error_after_process_exit():
+    config = SimpleNamespace(
+        max_seqlen_per_dp_cp_rank=1024,
+        min_dynamic_context_parallel_size=1,
+        dynamic_cp_runtime_model='calibrated_attention',
+        dynamic_cp_runtime_model_options='{"allow_provisional":true,"query_heads":7}',
+    )
+    worker = prefetch._CpuPlanner(prefetch.runtime_spec(config, 8))
+    try:
+        worker.process.wait(timeout=30)
+        with pytest.raises(RuntimeError, match='No forward coefficient set for geometry'):
+            worker.solve([1000], [1008], [[[0]] * 8])
+    finally:
+        worker.close()
+
+
 def test_runtime_respects_real_sequence_cap_after_dummy_tail():
     config = SimpleNamespace(
         max_seqlen_per_dp_cp_rank=1024,

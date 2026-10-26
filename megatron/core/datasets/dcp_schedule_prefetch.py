@@ -47,8 +47,12 @@ class _CpuPlanner:
 
     def solve(self, lengths: list[int], padded: list[int], baseline_rows: list) -> dict:
         # This method runs in an I/O-only thread; the separate process solves.
-        self.process.stdin.write(json.dumps([lengths, padded, baseline_rows]) + '\n')
-        self.process.stdin.flush()
+        try:
+            self.process.stdin.write(json.dumps([lengths, padded, baseline_rows]) + '\n')
+            self.process.stdin.flush()
+        except BrokenPipeError:
+            # Initialization failures already wrote an error response before exiting.
+            pass
         response = self.process.stdout.readline()
         if not response:
             raise RuntimeError(f'CPU DCP worker exited unexpectedly: {self.process.poll()}')
@@ -58,7 +62,10 @@ class _CpuPlanner:
         return payload
 
     def close(self) -> None:
-        self.process.stdin.close()
+        try:
+            self.process.stdin.close()
+        except BrokenPipeError:
+            pass
         self.process.wait()
         self.process.stdout.close()
 
@@ -313,12 +320,12 @@ def runtime_spec(
     allowed = tuple(
         cp for cp in range(minimum, world_size + 1) if cp & (cp - 1) == 0 and world_size % cp == 0
     )
-    if minimum not in allowed:
-        raise ValueError('Runtime DCP requires a power-of-two minimum CP dividing DPxCP')
     if factory == 'usp_calib_v1':
         if world_size not in (8, 16, 32) or minimum not in (8, 16, 32) or minimum > world_size:
             raise ValueError('usp_calib_v1 requires DPxCP and minimum CP in (8, 16, 32)')
         allowed = tuple(cp for cp in (8, 16, 32) if minimum <= cp <= world_size)
+    if minimum not in allowed:
+        raise ValueError('Runtime DCP requires a power-of-two minimum CP dividing DPxCP')
     return dict(
         geometry=dict(
             world_size=world_size,
