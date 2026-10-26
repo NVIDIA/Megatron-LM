@@ -32,11 +32,6 @@ shards **each parameter independently along dim 0**. Both systems
 can group parameters for communication; the difference is how they form
 the shards.
 
-Muon orthogonalizes the momentum-derived input for **each complete logical
-matrix** using Newton–Schulz. Applying it independently to row shards, or
-to the concatenated group buffer, would change the update. The challenge
-is to provide whole-matrix inputs while retaining module-level sharding.
-
 ### Example
 
 Five trainable FP32 parameters owned by one module are packed as follows.
@@ -61,6 +56,20 @@ rank. Gradient reduce-scatter reduces the full buffers and returns the
 corresponding segment to each rank. Afterward, `P0`, `P3`, and `P4` are
 already whole on one rank. Only `P1` and `P2` need reconstruction for local
 full-matrix Muon orthogonalization.
+
+## Challenge
+
+**RowAtomic and BlockAtomic.** Muon orthogonalizes the momentum-derived
+input for each complete logical matrix using Newton–Schulz. Applying it
+independently to row or block shards, or to the concatenated group buffer,
+would change the update. The challenge is to provide whole-matrix inputs
+while retaining module-level sharding.
+
+**TensorAtomic.** Whole-matrix inputs are already local. The challenge is
+to enforce the layout requested by Muon without substantially slowing
+forward/backward. Whole-matrix ownership can create uneven rank segments
+within each module; slower parameter materialization and gradient reduction
+could outweigh the savings from a communication-free optimizer step.
 
 ## Algorithm options
 
@@ -127,6 +136,6 @@ to the cost of uneven forward/backward communication.
 ## Next step
 
 Keep gather/scatter as the baseline and prototype the TensorAtomic fast
-path. Compare full-step time and peak memory with identical module
-boundaries, precision, and optimizer settings; verify updates against
-full-matrix Muon. Include single-node and multi-node runs.
+path. Compare forward/backward time, full-step time, and peak memory with
+identical module boundaries, precision, and optimizer settings; verify
+updates against full-matrix Muon. Include single-node and multi-node runs.
