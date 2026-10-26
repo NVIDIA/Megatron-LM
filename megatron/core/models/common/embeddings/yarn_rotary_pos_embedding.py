@@ -112,7 +112,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             offset (int, optional): RoPE offset. Defaults to 0.
 
         Returns:
-            Tensor: Embeddings after applying Yarn RoPE.
+            tuple[Tensor, float]: Rotary embeddings and the attention scaling factor.
         """
         assert (
             not self.rotary_interleaved
@@ -178,7 +178,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 Defaults to None.
 
         Returns:
-            Tensor: Embeddings after applying Yarn RoPE.
+            tuple[Tensor, float]: Rotary embeddings and the attention scaling factor.
         """
         return self._get_cached_emb(max_seq_len, offset, packed_seq, cp_group)
 

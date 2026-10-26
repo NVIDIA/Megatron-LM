@@ -27,6 +27,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
+from megatron.core.transformer.cuda_graphs import register_capture_constant
 from megatron.core.utils import deprecate_inference_params, internal_api
 
 logger = logging.getLogger(__name__)
@@ -67,7 +68,7 @@ class RotaryEmbedding(nn.Module):
             Defaults to None.
     """
 
-    # Maximum number of entries not retained by CUDA graphs.
+    # Maximum number of ordinary cached entries per instance.
     CACHE_CAPACITY = 32
     # The legacy forward.cache_clear() was shared across instances.
     _cache_instances: ClassVar[WeakSet[RotaryEmbedding]] = WeakSet()
@@ -106,7 +107,6 @@ class RotaryEmbedding(nn.Module):
             else parallel_state.get_context_parallel_group(check_initialized=False)
         )
         self._embedding_cache: OrderedDict[_RotaryCacheKey, tuple[Tensor, float]] = OrderedDict()
-        self._cuda_graph_cache_keys: set[_RotaryCacheKey] = set()
         self._cache_instances.add(self)
 
     @classmethod
@@ -115,20 +115,9 @@ class RotaryEmbedding(nn.Module):
         for module in tuple(cls._cache_instances):
             module.clear_cache()
 
-    def clear_cache(self, *, include_cuda_graphs: bool = False) -> None:
-        """Release cached embeddings, retaining constants used by captured CUDA graphs.
-
-        Args:
-            include_cuda_graphs: Also release captured constants. Callers must destroy all
-                graphs using this embedding before requesting this.
-        """
-        if include_cuda_graphs:
-            self._embedding_cache.clear()
-            self._cuda_graph_cache_keys.clear()
-        else:
-            for key in list(self._embedding_cache):
-                if key not in self._cuda_graph_cache_keys:
-                    del self._embedding_cache[key]
+    def clear_cache(self) -> None:
+        """Release ordinary embeddings; CUDA graph owners retain their own constants."""
+        self._embedding_cache.clear()
 
     def _get_emb_and_scale(self, max_seq_len: int, offset: int) -> tuple[Tensor, float]:
         """Compute an uncached embedding and its attention scaling factor."""
@@ -141,7 +130,7 @@ class RotaryEmbedding(nn.Module):
         packed_seq: bool,
         cp_group: torch.distributed.ProcessGroup | None,
     ) -> tuple[Tensor, float]:
-        """Share constants across calls without allowing graph references to be evicted."""
+        """Cache eager embeddings and transfer capture-time ownership to the graph manager."""
         if cp_group is None:
             cp_group = self.cp_group
         # CPU initialization defers frequency tensors' transfer until the first forward.
@@ -152,26 +141,25 @@ class RotaryEmbedding(nn.Module):
             max_seq_len, offset, packed_seq, cp_group, device, self.inv_freq.dtype
         )
         capturing = torch.cuda.is_current_stream_capturing()
-        if key not in self._embedding_cache:
+        if key in self._embedding_cache:
+            emb, scale = self._embedding_cache[key]
+            self._embedding_cache.move_to_end(key)
+        else:
             # These constants must also be usable by training backward after rollout.
             # An inference tensor cannot be saved for backward, even without gradients.
             with torch.inference_mode(False), torch.no_grad():
                 emb, scale = self._get_emb_and_scale(max_seq_len, offset)
                 if cp_group is not None and cp_group.size() > 1 and not packed_seq:
                     emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
-            self._embedding_cache[key] = (emb, scale)
-        self._embedding_cache.move_to_end(key)
-        if capturing:
-            # A cache hit during capture must retain the pre-existing warmup tensor too.
-            self._cuda_graph_cache_keys.add(key)
-        # Bound ordinary entries as before. Captured constants live until explicitly
-        # released with their graphs, or until this embedding instance is destroyed.
-        if len(self._embedding_cache) > self.CACHE_CAPACITY + len(self._cuda_graph_cache_keys):
-            for oldest_key in self._embedding_cache:
-                if oldest_key not in self._cuda_graph_cache_keys:
-                    del self._embedding_cache[oldest_key]
-                    break
-        return self._embedding_cache[key]
+            # Capture allocations belong to a graph's pool and must not escape into
+            # the ordinary cache, where they could outlive that graph or be reused by another.
+            if not capturing:
+                self._embedding_cache[key] = (emb, scale)
+                if len(self._embedding_cache) > self.CACHE_CAPACITY:
+                    self._embedding_cache.popitem(last=False)
+
+        register_capture_constant(emb)
+        return emb, scale
 
     def _apply_scaling(
         self,

@@ -17,7 +17,15 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    capture_constants,
+    create_cudagraphs,
+    delete_cuda_graphs,
+    release_capture_constants,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -114,13 +122,13 @@ def test_block_graph_rotary_survives_train_generation_switch(
 
         with torch.inference_mode():
             graphs = []
-            for seq_len in (64, 128):
+            for seq_len in (64, 128, 64):
                 context.max_sequence_length = seq_len
                 # Capture must retain the same constant used by warmup.
                 ref = weakref.ref(forward(context))
                 expected = forward(context) + 1
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                with capture_constants(graph), torch.cuda.graph(graph):
                     output = forward(context) + 1
                 graphs.append((seq_len, ref, graph, output, expected))
 
@@ -135,7 +143,7 @@ def test_block_graph_rotary_survives_train_generation_switch(
             assert ref() is not None, "block graph lost its cached positional embedding"
             hidden = torch.zeros((seq_len, 1, 32), device="cuda")
             embedding = forward()
-            assert embedding is ref()
+            torch.testing.assert_close(embedding, ref(), rtol=0, atol=0)
             assert not embedding.is_inference()
             activations = torch.randn_like(embedding, requires_grad=True)
             (activations * embedding).sum().backward()
@@ -155,12 +163,131 @@ def test_block_graph_rotary_survives_train_generation_switch(
         with torch.inference_mode():
             for seq_len, ref, graph, output, expected in graphs:
                 context.max_sequence_length = seq_len
-                assert forward(context) is ref()
+                torch.testing.assert_close(forward(context), ref(), rtol=0, atol=0)
                 graph.replay()
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+        # Two graphs share the warmup tensor. Deleting one must not invalidate the other.
+        clear_cache()
+        first_graph = graphs[0][2]
+        first_graph.reset()
+        release_capture_constants(first_graph)
+        assert graphs[0][1]() is not None
+        graphs[2][2].replay()
+        torch.testing.assert_close(graphs[2][3], graphs[2][4], rtol=0, atol=0)
+        for _, _, graph, _, _ in graphs:
+            graph.reset()
+            release_capture_constants(graph)
+        gc.collect()
+        assert all(ref() is None for _, ref, *_ in graphs)
+
     finally:
         InferenceMode.unset_active()
+        Utils.destroy_model_parallel()
+
+
+class _RotaryGraphModule(MegatronModule):
+    def __init__(self, config, embedding_type) -> None:
+        super().__init__(config)
+        self.rotary_pos_emb = embedding_type(32, 1.0)
+        self.embedding_ref = None
+
+    def project(self, x):
+        embedding = self.rotary_pos_emb(x.shape[0])
+        if isinstance(embedding, tuple):
+            embedding = embedding[0]
+        self.embedding_ref = weakref.ref(embedding)
+        return x * embedding
+
+
+@pytest.mark.parametrize("embedding_type", [RotaryEmbedding, YarnRotaryEmbedding])
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("cache_hit", [False, True])
+def test_rotary_constants_follow_managed_graph_lifetime(embedding_type, training, cache_hit):
+    """Exercise capture misses, replay, graph deletion and recapture through the real manager."""
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(
+        123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+    )
+    try:
+        config = TransformerConfig(
+            num_layers=1, hidden_size=32, num_attention_heads=1, cuda_graph_impl="local"
+        )
+        module = _RotaryGraphModule(config, embedding_type).cuda().train(training)
+        manager = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="project",
+            need_backward=training,
+            inline_capture=not training,
+            num_warmup_steps=0,
+        )
+        for _ in range(2):
+            x = torch.randn(16, 1, 1, 32, device="cuda", requires_grad=training)
+            expected = module.project(x, eager=True).detach().clone()
+            if training:
+                module.project(x).sum().backward()
+                x.grad = None
+            if not cache_hit:
+                module.rotary_pos_emb.clear_cache()
+
+            if training:
+                create_cudagraphs()
+            else:
+                with torch.inference_mode():
+                    module.project(x)
+            ref = module.embedding_ref
+            module.rotary_pos_emb.clear_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+            assert ref() is not None
+
+            with torch.set_grad_enabled(training):
+                output = module.project(x)
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                if training:
+                    # Backward must own its saved constants independently of the forward graph.
+                    torch.cuda.synchronize()
+                    graph = manager.cudagraph_runners[0].fwd_graph
+                    graph.reset()
+                    release_capture_constants(graph)
+                    assert ref() is not None
+                    output.sum().backward()
+                    torch.testing.assert_close(x.grad, ref(), rtol=0, atol=0)
+            del output
+
+            delete_cuda_graphs()
+            gc.collect()
+            assert all(
+                r.fwd_graph is None and r.bwd_graph is None for r in manager.cudagraph_runners
+            )
+            assert ref() is None, "destroyed graph retained a positional embedding"
+    finally:
+        delete_cuda_graphs()
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("embedding_type", [RotaryEmbedding, YarnRotaryEmbedding])
+def test_failed_capture_releases_rotary_constants(embedding_type):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        module = embedding_type(32, 1.0)
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="abort capture"):
+            with capture_constants(graph), torch.cuda.graph(graph):
+                embedding = module(16)
+                if isinstance(embedding, tuple):
+                    embedding = embedding[0]
+                ref = weakref.ref(embedding)
+                output = embedding + 1
+                del embedding
+                raise RuntimeError("abort capture")
+        graph.reset()
+        del output
+        gc.collect()
+        assert ref() is None
+    finally:
         Utils.destroy_model_parallel()
 
 
