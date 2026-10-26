@@ -18,7 +18,6 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
-    get_global_memory_buffer,
     get_gtp_weight_remat_rank,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -26,6 +25,7 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
     divide,
+    get_global_memory_buffer,
     get_pg_rank,
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
