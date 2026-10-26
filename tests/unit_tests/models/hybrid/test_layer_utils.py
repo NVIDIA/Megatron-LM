@@ -13,6 +13,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layer_config i
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import QSALayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
@@ -73,6 +74,7 @@ class TestSymbols:
             layer_utils.Symbols.MLA,
             layer_utils.Symbols.MLP,
             layer_utils.Symbols.MOE,
+            layer_utils.Symbols.QSA,
             layer_utils.Symbols.WINDOW,
         ]
 
@@ -82,6 +84,7 @@ class TestSymbols:
             DSALayerConfig,
             CSALayerConfig,
             MLALayerConfig,
+            QSALayerConfig,
         }
 
     def test_dsv4_symbols_map_to_fixed_compress_ratios(self):

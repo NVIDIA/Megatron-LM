@@ -33,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layer_config i
 from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
     CSALayerConfig,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa_layer_config import QSALayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -47,6 +48,7 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
     Symbols.HCA: CSALayerConfig,
     Symbols.MLA: MLALayerConfig,
     Symbols.WINDOW: CSALayerConfig,
+    Symbols.QSA: QSALayerConfig,
     Symbols.MLP: MLPLayerConfig,
     Symbols.MOE: MoELayerConfig,
 }
@@ -184,6 +186,20 @@ class TestValidateSegmentLayers:
         ]:
             result = validate_segment_layers(pattern, self.config)
             _assert_layer_config_types(result, pattern)
+
+    def test_qsa_symbol(self):
+        """'Q' (Qwen Sparse Attention) is GQA-based and NOT in the MLA family."""
+        assert Symbols.QSA == "Q"
+        assert layer_utils.is_valid_symbol(Symbols.QSA)
+        assert Symbols.QSA not in Symbols.MLA_ATTENTION
+        # Parses and is counted like any other layer.
+        _assert_layer_config_types(validate_segment_layers("GEGEGEQE", self.config), "GEGEGEQE")
+        assert get_hybrid_layer_counts("GEGEGEQE")["Q"] == 1
+        # Unlike the MLA family, 'Q' coexists with standard '*' attention...
+        validate_segment_layers("MQM*-", self.config)
+        # ...and does not trip the '*'-vs-MLA exclusivity check on its own.
+        with pytest.raises(ValueError):
+            validate_segment_layers("MQM*D", self.config)  # '*' + 'D' still forbidden
 
     def test_all_valid_pattern_characters(self):
         """Make sure all returned layers are valid."""
@@ -503,6 +519,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -519,6 +536,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 1,
             'E': 1,
+            'Q': 0,
             'W': 0,
         }
         assert get_hybrid_layer_counts("MGD-E") == {
@@ -532,6 +550,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 1,
             'E': 1,
+            'Q': 0,
             'W': 0,
         }
         assert get_hybrid_layer_counts("MG+-E") == {
@@ -545,6 +564,7 @@ class TestGetHybridLayerCounts:
             '+': 1,
             '-': 1,
             'E': 1,
+            'Q': 0,
             'W': 0,
         }
 
@@ -561,6 +581,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
         assert get_hybrid_layer_counts("M-M-|M-M*-") == {
@@ -574,6 +595,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 4,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -590,6 +612,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -607,6 +630,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 4,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -622,6 +646,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 2,
+            'Q': 0,
             'W': 0,
         }
 
@@ -638,6 +663,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -653,6 +679,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -669,6 +696,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -684,6 +712,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -699,6 +728,7 @@ class TestGetHybridLayerCounts:
             '+': 2,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 
@@ -714,6 +744,7 @@ class TestGetHybridLayerCounts:
             '+': 0,
             '-': 0,
             'E': 0,
+            'Q': 0,
             'W': 0,
         }
 

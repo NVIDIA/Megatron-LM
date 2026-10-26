@@ -1018,6 +1018,20 @@ def num_floating_point_operations(
             expanded += indexer_flops(
                 counts[Symbols.DS_ATTENTION], hybrid_layer_pattern=model_config.hybrid_layer_pattern
             )
+        if counts[Symbols.QSA]:
+            from megatron.core.transformer.experimental_attention_variant.qsa import (
+                QSAIndexer,
+                QSASelfAttention,
+            )
+
+            forward += counts[Symbols.QSA] * estimate(QSASelfAttention)
+            # Like the DSA indexer, the detached QSA indexer carries its own backward factor.
+            expanded += counts[Symbols.QSA] * QSAIndexer.estimate_flops(
+                transformer_cfg,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                include_backward=True,
+            )
         mtp_depths = transformer_cfg.mtp_num_layers or 0
         if any(counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP):
             mtp_depths = parse_hybrid_pattern(model_config.hybrid_layer_pattern).mtp_num_depths
@@ -3370,9 +3384,19 @@ def train_step(
 
 
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and active indexer modules (CSA or QSA) for loss logging."""
     transformer_cfg = model_config.transformer
     tracker_layers = transformer_cfg.num_layers + (transformer_cfg.mtp_num_layers or 0)
+
+    if (getattr(transformer_cfg, "qsa_indexer_loss_coeff", None) or 0) > 0:
+        # QSA carries exactly one indexer per 'Q' layer of the hybrid pattern. QSA is
+        # hybrid-only, so without a pattern there is nothing to count and the logger
+        # falls back to counting whatever reported a loss.
+        hybrid_layer_pattern = getattr(model_config, "hybrid_layer_pattern", None)
+        if hybrid_layer_pattern is None:
+            return tracker_layers, None
+        return tracker_layers, (hybrid_layer_pattern.count("Q") or None)
+
     if transformer_cfg.csa_compress_ratios is None:
         return tracker_layers, None
 
@@ -3666,7 +3690,13 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if cfg.model.transformer.dsa_indexer_loss_coeff is not None and cfg.model.transformer.dsa_indexer_loss_coeff > 0:
+    transformer_cfg = cfg.model.transformer
+    dsa_loss_on = (
+        transformer_cfg.dsa_indexer_loss_coeff is not None
+        and transformer_cfg.dsa_indexer_loss_coeff > 0
+    )
+    qsa_loss_on = (getattr(transformer_cfg, "qsa_indexer_loss_coeff", None) or 0) > 0
+    if dsa_loss_on or qsa_loss_on:
         indexer_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             assert pg_collection.has_language_model(), (

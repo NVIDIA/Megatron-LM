@@ -1188,6 +1188,57 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "flash-linear-attention's chunk_gated_delta_rule / chunk_kda Triton kernels, which "
         "are recorded as non-deterministic (see gated_delta_net).",
     ),
+    # ---------------------------------------------------------------- Qwen Sparse Attention
+    KernelEntry(
+        name="qsa_indexer_topk_and_sparse_metadata",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/ops/triton_qsa.py",
+            "megatron/core/transformer/experimental_attention_variant/ops/triton_qsa_select.py",
+        ),
+        tests=(K + "test_qsa_kernels.py",),
+        kind="triton",
+        notes="Indexer top-k: fp32 block scores under a pinned triton.autotune configuration, "
+        "then an exact radix select with a unique-key tie-break; replayed with exact score "
+        "ties and packed-document windows. Sparse-attention metadata: query-tile supersets "
+        "and the KV-tile query CSR; the bit masks are int32 sums of distinct powers of two "
+        "(tl.atomic_add in the Triton builder, scatter_add_ in the sort-based one), exact in "
+        "any order, and both builders are replayed and compared. The cuDNN top-k "
+        "implementation (impl='cudnn') is not replayed.",
+    ),
+    KernelEntry(
+        name="qsa_dkv_split_partial_sum",
+        sources=("megatron/core/transformer/experimental_attention_variant/ops/cute_qsa_attn.py",),
+        tests=(K + "test_qsa_kernels.py",),
+        kind="triton",
+        notes="_split_sum_cast: the fixed-order sum and cast of the fp32 split partials that "
+        "finishes the dk / dv gradients. The CuTe DSL kernels this module launches are "
+        "registered separately as qsa_cute_sparse_attention.",
+    ),
+    KernelEntry(
+        name="qsa_cute_sparse_attention",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/ops/cute_qsa_attn.py",
+            "megatron/core/transformer/experimental_attention_variant/ops/cute_qsa_attn_kernels.py",
+        ),
+        kind="external-lib",
+        exempt_reason="The forward, dq and dk/dv sparse GQA kernels are CuTe DSL kernels "
+        "(tcgen05 MMA) that need nvidia-cutlass-dsl and an SM100 (Blackwell) GPU, neither "
+        "available in the H100 determinism bucket. dk/dv are written as split partials and "
+        "summed in a fixed order, without atomics.",
+    ),
+    KernelEntry(
+        name="qsa_cute_indexer_loss",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/ops/cute_qsa_indexer_loss.py",
+        ),
+        kind="external-lib",
+        exempt_reason="The teacher and student kernels of the indexer distillation loss are "
+        "CuTe DSL kernels (tcgen05 MMA, TMEM) and the module imports cutlass at import time; "
+        "they need nvidia-cutlass-dsl, cuda.bindings and an SM100 (Blackwell) GPU, none "
+        "available in the H100 determinism bucket. The block-key gradient's scatter_add_ "
+        "writes each picked block once per row and exact zeros elsewhere, so it is "
+        "order-independent.",
+    ),
     # ==== end of the Qwen3.8-Flash-Next stack ====
 )
 
