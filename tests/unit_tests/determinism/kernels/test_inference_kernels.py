@@ -6,10 +6,10 @@ Inference kernels do not feed the training loss, but RL rollouts and batch-invar
 inference depend on them replaying bit-exactly. Covered here: KV-cache tensor ops and the
 fused KV append, the inference MoE activations and MXFP8 quantisation, the inference MoE
 permute/unpermute (batch-invariant path bit-exact; the atomic default path is the negative
-control), the vLLM-derived fused MoE GEMM and top-k sum, the batch-invariant GEMM /
-log-softmax / mean kernels, the CUDA-graph routing-map padding mask, and the zeroing of
-padding-token rows. Multi-rank NVLS symmetric-memory collectives are exempted in the
-manifest (they need NVLink peers).
+control), the FlashInfer per-token NVFP4 quantizer and MoE, the vLLM-derived fused MoE GEMM
+and top-k sum, the batch-invariant GEMM / log-softmax / mean kernels, the CUDA-graph
+routing-map padding mask, and the zeroing of padding-token rows. Multi-rank NVLS
+symmetric-memory collectives are exempted in the manifest (they need NVLink peers).
 """
 
 import pytest
@@ -867,3 +867,130 @@ def test_torch_mxfp8_moe_is_batch_invariant():
         "Torch MXFP8 MoE output changed with the batch; max abs diff: "
         f"{(output_alone - output_batched).abs().max().item()}"
     )
+
+
+# --- FlashInfer per-token NVFP4 MoE ----------------------------------------------------------
+
+
+def _require_flashinfer_nvfp4():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("per-token NVFP4 MoE requires Blackwell")
+    if not HAVE_FLASHINFER_ROUTED_NVFP4:
+        pytest.skip("FlashInfer >= 0.7.0 per-token NVFP4 MoE is unavailable")
+
+
+def _nvfp4_expert_weights(num_experts, hidden_size, intermediate_size, gated):
+    from megatron.core.inference.moe.flashinfer_nvfp4 import prepare_routed_nvfp4_weights
+
+    fc1_rows = 2 * intermediate_size if gated else intermediate_size
+    fc1 = torch.randn(num_experts, fc1_rows, hidden_size, device="cuda") * 0.05
+    fc2 = torch.randn(num_experts, hidden_size, intermediate_size, device="cuda") * 0.05
+    return prepare_routed_nvfp4_weights(fc1.bfloat16(), fc2.bfloat16())
+
+
+def test_per_token_nvfp4_quantize_replays():
+    from megatron.core.inference.moe.flashinfer_nvfp4 import quantize_routed_nvfp4_input
+
+    _require_flashinfer_nvfp4()
+    seeded()
+    x = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    x *= torch.logspace(-2, 2, x.shape[0], device="cuda", dtype=torch.bfloat16).unsqueeze(1)
+
+    def fn(x):
+        data, scale, per_token_scale = quantize_routed_nvfp4_input(x, x.shape[-1])
+        return data.view(torch.uint8), scale.view(torch.uint8), per_token_scale
+
+    assert_replays_bit_exact(fn, (x,), backward=False, what="per-token nvfp4_quantize")
+
+
+def _nvfp4_activation_type(gated):
+    from flashinfer import ActivationType
+
+    return (ActivationType.Swiglu if gated else ActivationType.Relu2).value
+
+
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+def test_flashinfer_nvfp4_moe_replays(gated):
+    """Batch-invariant mode selects an order-fixed top-k combine, so replays are exact."""
+    from megatron.core.inference.moe.flashinfer_nvfp4 import flashinfer_routed_nvfp4_moe
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    _require_flashinfer_nvfp4()
+    seeded()
+    num_experts, tokens, topk = 8, 384, 4
+    weights = _nvfp4_expert_weights(num_experts, 512, 512, gated)
+    x = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
+    routes = torch.stack(
+        [torch.randperm(num_experts, device="cuda")[:topk] for _ in range(tokens)]
+    ).to(torch.int32)
+    probs = torch.rand(tokens, topk, device="cuda")
+
+    def run(x):
+        return flashinfer_routed_nvfp4_moe(
+            x,
+            routes,
+            probs,
+            weights,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=_nvfp4_activation_type(gated),
+        )
+
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="FlashInfer NVFP4 MoE")
+
+
+@pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
+    """A routed token must be bitwise stable as the batch and its expert loads change.
+
+    Unlike a fixed-size buffer with inactive rows, the batch size itself changes here, so
+    kernel tactic and tile selection see a different M.
+    """
+    from megatron.core.inference.moe.flashinfer_nvfp4 import flashinfer_routed_nvfp4_moe
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    _require_flashinfer_nvfp4()
+    torch.manual_seed(1234)
+    num_experts, hidden_size, topk = 4, 512, 2
+    weights = _nvfp4_expert_weights(num_experts, hidden_size, hidden_size, gated)
+    target = torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16)
+    target_experts = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    target_probs = torch.tensor([0.625, 0.375], device="cuda", dtype=torch.float32)
+
+    def _run(num_tokens: int, target_row: int) -> torch.Tensor:
+        # 100x larger co-batch rows would dominate a tensor-wide activation scale.
+        hidden_states = (
+            torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16) * 100
+        )
+        routing_map = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+        routing_map.copy_(target_experts)
+        probs = torch.full((num_tokens, topk), 0.5, device="cuda", dtype=torch.float32)
+        hidden_states[target_row].copy_(target)
+        probs[target_row].copy_(target_probs)
+        return flashinfer_routed_nvfp4_moe(
+            hidden_states,
+            routing_map,
+            probs,
+            weights,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=_nvfp4_activation_type(gated),
+        )[target_row]
+
+    with torch.no_grad(), set_batch_invariant_mode(True):
+        output_alone = _run(1, 0)
+        output_batched = _run(193, 73)
+        output_large = _run(1024, 517)
+
+    for name, output in (("193", output_batched), ("1024", output_large)):
+        assert torch.equal(output_alone, output), (
+            f"FlashInfer NVFP4 MoE output changed at batch {name}; max abs diff: "
+            f"{(output_alone.float() - output.float()).abs().max().item()}"
+        )
