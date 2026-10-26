@@ -37,7 +37,7 @@ class ProcessGroupFallbackWarning(FutureWarning):
 
     It is a ``FutureWarning``, so filters and tests that match ``FutureWarning`` also match it.
     To turn every fallback into an error, for example in CI, call
-    ``warnings.simplefilter("error", ProcessGroupFallbackWarning)``, or run pytest with
+    ``enable_strict_process_group_fallbacks()``, or run pytest with
     ``-W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning``. The same option
     passed to ``python`` itself, or set in ``PYTHONWARNINGS``, has no effect: Python resolves it
     before site-packages, and so torch, can be imported, and ignores it with a note on stderr.
@@ -85,6 +85,33 @@ def warn_global_process_group_fallback(
         skip_file_prefixes=_FALLBACK_WARNING_SKIP_PREFIXES,
     )
     _warned_global_process_group_fallbacks.add(key)
+
+
+def enable_strict_process_group_fallbacks() -> None:
+    """Make every global process-group fallback in this process raise instead of warn.
+
+    This installs ``warnings.filterwarnings("error", category=ProcessGroupFallbackWarning)``
+    at the front of the filter list, ahead of every filter installed before it, such as the
+    ignore filters of ``megatron.rank_log_setup.suppress_duplicate_logs_off_rank0``. Each rank
+    that reaches a fallback then raises ``ProcessGroupFallbackWarning``; other warnings are not
+    affected. It also forgets which fallbacks already warned in this process, so those raise
+    too the next time they are reached.
+
+    Call it after the process's own warning setup: a filter installed later that also matches
+    this class, for example ``warnings.simplefilter("ignore")``, takes precedence again. A
+    ``warnings.catch_warnings()`` block restores the previous filters on exit, which scopes strict
+    mode to the block.
+
+    Unit tests opt in through pytest, which accepts a dotted class path:
+    ``pytest -W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning`` for a
+    run, or the same value in the ``filterwarnings`` ini option or marker. ``python -W`` and
+    ``PYTHONWARNINGS`` cannot name this class (see ``ProcessGroupFallbackWarning``). A fallback
+    that warned in an earlier test of the same process, for example under ``pytest.warns``,
+    stays silent under those filters; a test that must catch it calls this function inside
+    ``warnings.catch_warnings()``.
+    """
+    warnings.filterwarnings("error", category=ProcessGroupFallbackWarning)
+    _warned_global_process_group_fallbacks.clear()
 
 
 class ProcessGroupHelperMeta(type):
