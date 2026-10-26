@@ -101,6 +101,9 @@ navigation:
       - page: Megatron RL
         path: ../../user-guide/features/megatron_rl.mdx
         slug: megatron-rl
+      - page: Offline Logits Knowledge Distillation
+        path: ../../user-guide/features/offline_logits_distillation.mdx
+        slug: offline-logits-distillation
       - page: Tokenizers
         path: ../../user-guide/features/tokenizers.mdx
         slug: tokenizers
