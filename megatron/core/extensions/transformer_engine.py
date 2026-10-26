@@ -677,6 +677,7 @@ def split_te_layernorm_column_parallel_linear(
         is_expert=False,
         tp_comm_buffer_name=fused_layer.ub_name,
         tp_group=tp_group or fused_layer.tp_group,
+        pg_collection=fused_layer._pg_collection,
     )
 
     with torch.no_grad():
@@ -3485,6 +3486,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 config=config,
                 submodules=submodules,
                 tp_group=pg_collection.tp,
+                pg_collection=pg_collection,
                 is_expert=is_expert,
                 input_size=input_size,
                 ffn_hidden_size=ffn_hidden_size,
