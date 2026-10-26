@@ -1732,18 +1732,6 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
-        if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
-            raise ValueError(
-                "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
-            )
-        if (
-            self.sequence_packing_scheduler is not None
-            and self.context_parallel_size > 1
-            and self.linear_cp_layout != self.attention_cp_layout
-        ):
-            raise ValueError(
-                "The sequence-packing scheduler does not support CP layout conversion."
-            )
         if (
             self.context_parallel_size > 1
             and self.linear_cp_layout != self.attention_cp_layout
@@ -2042,7 +2030,7 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "DSv4 context parallelism requires attention_cp_layout='contiguous'."
                 )
-            if self.hybrid_context_parallel:
+            if self.dynamic_context_parallel:
                 raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             if self.dsa_kernel_backend == "tilelang":
@@ -3132,6 +3120,24 @@ class TransformerConfig(ModelParallelConfig):
                     f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
+            if not self.use_transformer_engine_op_fuser:
+                if not self.moe_use_grouped_tensor:
+                    raise ValueError(
+                        "moe_paged_stash without use_transformer_engine_op_fuser requires "
+                        "moe_use_grouped_tensor=True."
+                    )
+                if (
+                    not self.bias_activation_fusion
+                    or not self.gated_linear_unit
+                    or self.activation_func not in (F.silu, quick_gelu)
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "moe_paged_stash with the non-op-fuser GroupedTensor path requires "
+                        "fused SwiGLU or QuickGeGLU: set bias_activation_fusion=True, "
+                        "gated_linear_unit=True, activation_func to silu or quick_gelu, and "
+                        "moe_mlp_glu_interleave_size=None."
+                    )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -3719,6 +3725,20 @@ class TransformerConfig(ModelParallelConfig):
                     'use cuda_graph_impl=transformer_engine instead.'
                 )
                 self.cuda_graph_impl = "transformer_engine"
+
+        if self.dynamic_context_parallel:
+            # Captured graphs bake in static communicators, so they cannot follow the
+            # per-microbatch CP group that dynamic context parallelism selects at runtime.
+            assert (
+                self.cuda_graph_impl == "none"
+            ), "Dynamic context parallelism not supported with CUDA Graph"
+            assert (
+                self.calculate_per_token_loss
+            ), "Dynamic context parallelism must be used with calculate_per_token_loss"
+            # The router z-loss still scales by the static TP x CP group, not the runtime one.
+            assert (
+                self.moe_z_loss_coeff is None
+            ), "Dynamic context parallelism not supported with moe_z_loss_coeff"
 
         if self.cuda_graph_scope is not None:
             assert self.cuda_graph_modules in (
