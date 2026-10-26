@@ -20,6 +20,7 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     cuda_graph_captures_attention,
+    cuda_graph_uses_static_thd_inputs,
     get_deprecated_cuda_graph_modules_migration,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -4280,11 +4281,7 @@ class TransformerConfig(ModelParallelConfig):
         if (
             self.qsa_attn_backend == "cudnn"
             and self.qsa_cudnn_bwd_impl == "sparse_gqa"
-            and self.cuda_graph_impl != "none"
-            and (
-                self.sequence_packing_scheduler is not None
-                or self.thd_max_packed_sequences is not None
-            )
+            and cuda_graph_uses_static_thd_inputs(self)
             and cuda_graph_captures_attention(self)
         ):
             raise ValueError(
@@ -4307,6 +4304,15 @@ class TransformerConfig(ModelParallelConfig):
             assert self.thd_max_packed_sequences >= (
                 2 if pad_enabled and self.sequence_packing_scheduler is not None else 1
             ), "THD metadata capacity must leave room for the dummy padding document."
+            if self.sequence_packing_scheduler is None and self.cuda_graph_impl != "none":
+                # The SFT packed path opts into static THD graph inputs with
+                # thd_max_packed_sequences (see cuda_graph_uses_static_thd_inputs); its token
+                # dimension is a graph input too, so it must be padded to the static capacity.
+                assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank), (
+                    "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
+                    "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+                )
         # 'extend_last' THD tail padding with context parallelism requires the
         # global metadata to be extended before CP slicing, which only the
         # sequence-packing scheduler path performs. Restrict this combination.

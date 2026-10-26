@@ -29,6 +29,11 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.packed_seq_params import (
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
+)
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -58,7 +63,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import (
     get_run_config,
@@ -260,6 +265,78 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     )
 
 
+def _uses_static_thd_contract(config) -> bool:
+    """Whether packed SFT rows must be padded to the static THD capacity.
+
+    The sequence-packing scheduler path pads its packs inside the scheduler. The SFT packed
+    path has no scheduler, so it opts into the same fixed-capacity contract by setting both
+    ``--pad-packed-seq-alignment`` and ``--thd-max-packed-sequences``; THD CUDA graphs rely on
+    it because cu_seqlens and the token dimension are graph inputs with captured shapes.
+    """
+    return (
+        getattr(config, "sequence_packing_scheduler", None) is None
+        and getattr(config, "pad_packed_seq_alignment", None) is not None
+        and getattr(config, "thd_max_packed_sequences", None) is not None
+    )
+
+
+def _pad_packed_batch_to_static_thd(config, vp_stage, cp_batch: ContextParallelBatch):
+    """Pad an SFT packed microbatch to the static THD capacity.
+
+    Token-like tensors are padded to ``max_seqlen_per_dp_cp_rank`` (``max`` alignment) and all
+    four cu_seqlens tensors to ``thd_max_packed_sequences + 1`` entries, with the padding tail
+    represented by ``thd_tail_padding_policy`` (a dummy sequence by default). Returns a
+    ContextParallelBatch carrying the padded tensors, the rebuilt PackedSeqParams and the
+    padding mask (True at padded slots).
+    """
+    if not is_first_or_last_pipeline_stage(vp_stage):
+        # Middle stages carry neither token-like tensors nor a padding mask, and their
+        # hidden states already have the first stage's padded shape; padding only the
+        # boundaries there would need the first stage's padding decision.
+        raise NotImplementedError(
+            "The static THD contract (--pad-packed-seq-alignment with "
+            "--thd-max-packed-sequences) on the --sft path is not implemented for middle "
+            "pipeline stages."
+        )
+    if len(cp_batch.batches_by_layout) != 1 or cp_batch.thd_plan is not None:
+        # The padding is applied to the CP-local tensors of one layout; a second layout (for
+        # example GDN chunkwise CP's contiguous linear layout next to zigzag attention) would
+        # need the same tail in its own token order.
+        raise NotImplementedError(
+            "The static THD contract on the --sft path supports a single CP layout only; "
+            f"got layouts {sorted(cp_batch.batches_by_layout)}."
+        )
+    batch = dict(cp_batch.get_batch())
+    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+        config.pad_packed_seq_alignment,
+        config.max_seqlen_per_dp_cp_rank,
+        config.thd_max_packed_sequences,
+        config.cuda_graph_impl != "none",
+    )
+    (
+        batch["tokens"],
+        batch["labels"],
+        batch["loss_mask"],
+        batch["position_ids"],
+        packed_seq_params,
+        batch["padding_mask"],
+    ) = pad_sequence_for_thd(
+        batch.get("tokens"),
+        batch.get("labels"),
+        batch.get("loss_mask"),
+        batch.get("position_ids"),
+        cp_batch.get_packed_seq_params(),
+        alignment=alignment,
+        target_len=target_len,
+        max_num_seqs=max_num_seqs,
+        tail_padding_policy=resolve_thd_tail_padding_policy(config),
+        padding_mask=batch.get("padding_mask"),
+    )
+    return ContextParallelBatch.from_single_layout(
+        cp_batch.boundary_layout, batch, packed_seq_params
+    )
+
+
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
@@ -378,6 +455,9 @@ def forward_step(data_iterator, model: HybridModel):
         cp_batch = get_batch(
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
+        config = get_attr_wrapped_model(model, "config")
+        if cp_batch.get_packed_seq_params() is not None and _uses_static_thd_contract(config):
+            cp_batch = _pad_packed_batch_to_static_thd(config, vp_stage, cp_batch)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -480,6 +560,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         fast_cache_load=args.dataloader_fast_cache_load,
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
@@ -501,7 +582,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     is_packed_sequence = False
     if args.sft:
-        dataset_type = SFTDataset
+        # Mirror pretrain_gpt.py: --mock-data must select the mock packer, otherwise the
+        # packed path goes looking for a real SFT corpus on disk.
+        dataset_type = MockSFTDataset if args.mock_data else SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
     elif args.use_varlen_dataset:
         # Variable-length packed (THD) dataset, independent of --sft.

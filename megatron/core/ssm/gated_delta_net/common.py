@@ -833,7 +833,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         # fla/ops/common/chunk_delta_h.py), and with cu_seqlens None it never builds a
         # chunk_indices table for those offsets to desynchronize from. So there is nothing
         # to freeze, and SBHD capture must keep working without the environment variable.
-        is_thd = config.sequence_packing_scheduler is not None or config.dynamic_context_parallel
+        is_thd = (
+            config.sequence_packing_scheduler is not None
+            or config.dynamic_context_parallel
+            # The SFT packed path declares static THD graph inputs this way.
+            or getattr(config, "thd_max_packed_sequences", None) is not None
+        )
         if not is_thd:
             return
 

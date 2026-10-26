@@ -1144,3 +1144,61 @@ class TestStaticInputs:
         static_inputs = layer.get_layer_static_inputs(seq_length=256, micro_batch_size=2)
 
         assert static_inputs["input_ids"].shape == (1, 128)
+
+
+@pytest.mark.internal
+def test_static_thd_inputs_are_declared_by_scheduler_or_capacity():
+    """The --sft packed path opts into static THD graph inputs with thd_max_packed_sequences."""
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.cuda_graph_config import cuda_graph_uses_static_thd_inputs
+
+    def uses(**kwargs):
+        values = dict(
+            cuda_graph_impl="transformer_engine",
+            sequence_packing_scheduler=None,
+            thd_max_packed_sequences=None,
+        )
+        values.update(kwargs)
+        return cuda_graph_uses_static_thd_inputs(SimpleNamespace(**values))
+
+    assert not uses()
+    assert uses(sequence_packing_scheduler="dp_balanced")
+    assert uses(thd_max_packed_sequences=4)
+    assert not uses(cuda_graph_impl="none", thd_max_packed_sequences=4)
+
+
+class TestStaticThdReplayContract:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_packed_replay_into_sbhd_captured_attention_is_refused(self):
+        """Attention captured with SBHD inputs must not silently replay packed data."""
+        layer = _build_layer(256, 4, 4, 1024, 128, None)
+        layer.config.cuda_graph_impl = "transformer_engine"
+        assert not layer._is_thd_cuda_graph() and layer._attention_in_cuda_graph()
+        cu = torch.tensor([0, 128], dtype=torch.int32, device="cuda")
+        params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+        with pytest.raises(RuntimeError, match="thd-max-packed-sequences"):
+            layer._decompose_packed_seq_params_to_kwargs({"packed_seq_params": params})
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_missing_padded_boundaries_fall_back_to_unpadded(self):
+        layer = _build_layer(256, 4, 4, 1024, 128, 4)
+        layer.config.cuda_graph_impl = "transformer_engine"
+        assert layer._is_thd_cuda_graph()
+        cu = torch.tensor([0, 100, 128, 128, 128], dtype=torch.int32, device="cuda")
+        kwargs = {
+            "packed_seq_params": PackedSeqParams(
+                qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu
+            )
+        }
+        layer._decompose_packed_seq_params_to_kwargs(kwargs)
+        assert kwargs["cu_seqlens_q_padded"] is cu and kwargs["cu_seqlens_kv_padded"] is cu

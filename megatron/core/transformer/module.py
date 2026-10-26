@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.cuda_graph_config import cuda_graph_uses_static_thd_inputs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -288,10 +289,45 @@ class GraphableMegatronModule(MegatronModule):
 
     def _is_thd_cuda_graph(self):
         """Check if THD format with CUDA Graph is being used."""
-        return (
-            getattr(self.config, 'sequence_packing_scheduler', None) is not None
-            and self.config.cuda_graph_impl != "none"
-        )
+        return cuda_graph_uses_static_thd_inputs(self.config)
+
+    def _attention_in_cuda_graph(self) -> bool:
+        """Whether this layer's captured graph contains attention (consumes THD metadata)."""
+        return False
+
+    def _thd_graph_cu_seqlens_kwargs(self, packed_seq_params) -> dict:
+        """Return the THD sequence-boundary tensors a captured graph is replayed with.
+
+        A graph that contains attention must have been captured with static THD inputs to be
+        replayed on packed data. Otherwise its attention was captured in the SBHD layout, and
+        Transformer Engine silently drops replay kwargs it did not capture, so every pack
+        would be treated as a single sequence. That is refused here rather than at capture
+        time because only the replay sees the packed batch.
+
+        A missing ``*_padded`` boundary means the pack has no padding between sequences, so
+        the unpadded boundaries are substituted: the captured graph takes all four as inputs.
+        """
+        if not self._is_thd_cuda_graph() and self._attention_in_cuda_graph():
+            raise RuntimeError(
+                "Packed (THD) inputs reached a CUDA graph whose attention was captured with "
+                "SBHD static inputs, which would treat every pack as one sequence. Set "
+                "--thd-max-packed-sequences (with --pad-packed-seq-alignment max) so the "
+                "graph is captured with static THD inputs."
+            )
+        cu_seqlens_q = packed_seq_params.cu_seqlens_q
+        cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+        cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
+        cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
+        return {
+            'cu_seqlens_q': cu_seqlens_q,
+            'cu_seqlens_kv': cu_seqlens_kv,
+            'cu_seqlens_q_padded': (
+                cu_seqlens_q if cu_seqlens_q_padded is None else cu_seqlens_q_padded
+            ),
+            'cu_seqlens_kv_padded': (
+                cu_seqlens_kv if cu_seqlens_kv_padded is None else cu_seqlens_kv_padded
+            ),
+        }
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
