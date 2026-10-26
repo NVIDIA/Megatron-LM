@@ -11,7 +11,7 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training
 from megatron.training.checkpointing import save_grads
-from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.config import CheckpointConfig, TrainingConfig, ValidationConfig
 from megatron.training.global_vars import _set_train_state, destroy_global_vars, set_args
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.training import (
@@ -185,6 +185,57 @@ class TestTraining:
         args = create_test_args()
         set_args(args)
         _set_train_state()
+
+    @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
+    @pytest.mark.parametrize("verify_integrity", [False, True])
+    def test_checkpoint_conversion_preserves_supported_integrity_settings(
+        self, monkeypatch, run_config, ckpt_format, verify_integrity
+    ):
+        """Verify the source before clearing integrity checks for unsupported outputs."""
+        run_config.validation.skip_train = True
+        args = SimpleNamespace(
+            logits_save_dir=None,
+            logits_load_dir=None,
+            moe_use_upcycling=False,
+            load="source-checkpoints",
+            pretrained_checkpoint=None,
+            ckpt_format="torch_dist",
+            ckpt_convert_format=ckpt_format,
+            ckpt_convert_save="converted-checkpoints",
+            verify_integrity=verify_integrity,
+        )
+
+        def load_checkpoint(*unused_args, **unused_kwargs):
+            assert args.ckpt_format == "torch_dist"
+            assert args.verify_integrity is verify_integrity
+            return 123, 456
+
+        def save_checkpoint(*unused_args, **unused_kwargs):
+            assert args.ckpt_format == ckpt_format
+            assert args.save == str(Path("converted-checkpoints") / ckpt_format)
+            assert args.use_dist_ckpt is (ckpt_format != "torch")
+            checkpoint = CheckpointConfig(
+                ckpt_format=args.ckpt_format, verify_integrity=args.verify_integrity
+            )
+            assert checkpoint.verify_integrity is (verify_integrity and ckpt_format == "torch_dist")
+
+        load = Mock(side_effect=load_checkpoint)
+        save = Mock(side_effect=save_checkpoint)
+        monkeypatch.setattr(training, "get_args", lambda: args)
+        monkeypatch.setattr(training, "get_timers", Mock())
+        monkeypatch.setattr(training, "get_one_logger", lambda: None)
+        monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+        monkeypatch.setattr(training, "get_model", Mock(return_value=[torch.nn.Linear(1, 1)]))
+        monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
+        monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
+        monkeypatch.setattr(training, "update_num_microbatches", Mock())
+        monkeypatch.setattr(training, "load_checkpoint", load)
+        monkeypatch.setattr(training, "save_checkpoint", save)
+
+        with pytest.raises(SystemExit):
+            training.setup_model_and_optimizer(None, lambda: None, cfg_container=run_config)
+        load.assert_called_once()
+        save.assert_called_once()
 
     def test_build_train_valid_test_data_iterators(self, run_config):
         train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(

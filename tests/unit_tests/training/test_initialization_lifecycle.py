@@ -1134,7 +1134,7 @@ def test_gpt_embedding_groups_use_registered_model(monkeypatch, isolated_globals
 
 
 @pytest.mark.parametrize("module_name", ["pretrain_gpt", "pretrain_hybrid"])
-@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced", "default_dynamic_cp"])
 def test_dataset_helpers_use_registered_model(
     monkeypatch, isolated_globals, run_config, module_name, sequence_packing_scheduler
 ):
@@ -1154,13 +1154,15 @@ def test_dataset_helpers_use_registered_model(
         tensor_model_parallel_size=2,
         sequence_parallel=True,
         context_parallel_size=2,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=sequence_packing_scheduler == "default_dynamic_cp",
+        sequence_packing_scheduler=sequence_packing_scheduler,
+        max_seqlen_per_dp_cp_rank=32,
+        calculate_per_token_loss=True,
         pipeline_model_parallel_size=3,
         pipeline_dtype=torch.float32,
         pipeline_model_parallel_layout="Et*3|m|L",
         mtp_num_layers=1,
     )
-    transformer.sequence_packing_scheduler = sequence_packing_scheduler
     cfg = run_config
     cfg.model = GPTModelConfig(transformer=transformer, seq_length=64)
     # TP=2, PP=3, CP=2 gives DP=2 independently of the stale CLI topology.
@@ -1173,7 +1175,7 @@ def test_dataset_helpers_use_registered_model(
     dataset = entrypoint.core_gpt_dataset_config_from_args(args)
     assert dataset.context_parallel_size == 2
     assert dataset.sequence_parallel_size == 2
-    assert dataset.hybrid_context_parallel is True
+    assert dataset.dynamic_context_parallel is (sequence_packing_scheduler == "default_dynamic_cp")
     assert dataset.data_parallel_size == 2
     assert dataset.sequence_length == 32  # Actual data length, not position capacity.
 

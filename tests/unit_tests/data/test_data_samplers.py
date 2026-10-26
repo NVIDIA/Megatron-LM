@@ -59,7 +59,7 @@ class TestDataLoaderResume:
                 micro_batch_size=1,
                 global_batch_size=Utils.world_size,
                 num_workers=0,
-                hybrid_context_parallel=False,
+                dynamic_context_parallel=False,
                 sequence_packing_scheduler=None,
                 use_varlen_dataset=False,
                 varlen_sbhd_validation=False,
@@ -95,10 +95,11 @@ class TestDataLoaderResume:
         )
 
     @pytest.mark.parametrize(
-        "hybrid_cp,scheduler", [(False, None), (True, None), (True, "dp_balanced")]
+        "dynamic_cp,scheduler",
+        [(False, None), (False, "dp_balanced"), (True, "default_dynamic_cp")],
     )
     def test_sampler_and_collation_use_model_config(
-        self, monkeypatch, run_config, hybrid_cp, scheduler
+        self, monkeypatch, run_config, dynamic_cp, scheduler
     ):
         Utils.initialize_model_parallel(1, 1)
         run_config.train.micro_batch_size = 1
@@ -107,7 +108,7 @@ class TestDataLoaderResume:
             transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
             seq_length=16,
         )
-        run_config.model.transformer.hybrid_context_parallel = hybrid_cp
+        run_config.model.transformer.dynamic_context_parallel = dynamic_cp
         run_config.model.transformer.sequence_packing_scheduler = scheduler
         monkeypatch.setattr(
             data_samplers,
@@ -117,7 +118,7 @@ class TestDataLoaderResume:
                 micro_batch_size=1,
                 global_batch_size=2 * Utils.world_size,
                 num_workers=0,
-                hybrid_context_parallel=not hybrid_cp,
+                dynamic_context_parallel=not dynamic_cp,
                 sequence_packing_scheduler=None if scheduler else "dp_balanced",
                 use_varlen_dataset=False,
                 varlen_sbhd_validation=False,
@@ -126,14 +127,10 @@ class TestDataLoaderResume:
 
         loader = data_samplers.build_pretraining_data_loader(_Dataset(), consumed_samples=0)
 
-        hybrid_sampler = hybrid_cp and scheduler is None
-        assert (
-            isinstance(loader.batch_sampler, data_samplers.HybridCPMegatronPretrainingSampler)
-            is hybrid_sampler
-        )
+        assert isinstance(loader.batch_sampler, data_samplers.MegatronPretrainingSampler)
         batch = next(iter(loader))
-        if hybrid_cp or scheduler is not None:
+        if dynamic_cp or scheduler is not None:
             assert isinstance(batch, list)
-            assert len(batch) == (2 if hybrid_sampler else 1)
+            assert len(batch) == 1
         else:
             assert batch.shape == (1, 1)

@@ -28,12 +28,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
-)
+from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import (
@@ -62,12 +60,12 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from megatron.training.global_vars import (
     get_run_config,
     set_run_config,
 )
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
 
 try:
@@ -98,22 +96,19 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
     """Generate a batch."""
 
     args = get_args()
     cfg = get_run_config()
 
     if cfg.model.transformer.sequence_packing_scheduler is not None:
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            packed_seq_params,
-            padding_mask,
-        ) = get_batch_on_this_rank_for_sequence_packing(
+        if pg_collection is None:
+            # Compatibility for direct entrypoint callers; Core receives explicit groups.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+            )
+        return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
@@ -121,20 +116,14 @@ def get_batch(data_iterator, vp_stage=None):
                 mtp_num_layers=cfg.model.transformer.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
+                pp_group=pg_collection.pp,
+                vp_size=cfg.model.transformer.virtual_pipeline_model_parallel_size or 1,
             ),
             vp_stage=vp_stage,
-        )
-        return ContextParallelBatch.from_single_layout(
-            cfg.model.transformer.linear_cp_layout,
-            {
-                "tokens": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "padding_mask": padding_mask,
-            },
-            packed_seq_params,
+            dynamic_cp=cfg.model.transformer.dynamic_context_parallel,
+            pg_collection=pg_collection,
+            config=cfg.model.transformer,
+            return_context_parallel_batch=True,
         )
 
     cp_size = cfg.model.transformer.context_parallel_size
@@ -148,7 +137,8 @@ def get_batch(data_iterator, vp_stage=None):
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = cfg.model.transformer.hybrid_context_parallel
+    # Dynamic CP always uses the sequence-packing path above.
+    assert not cfg.model.transformer.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -176,7 +166,7 @@ def get_batch(data_iterator, vp_stage=None):
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=False,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
@@ -208,10 +198,9 @@ def get_batch(data_iterator, vp_stage=None):
     return get_batches_on_this_cp_rank(
         batch,
         boundary_layout=cfg.model.transformer.linear_cp_layout,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=False,
         cp_group=get_context_parallel_group(),
         additional_layouts=additional_layouts,
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
         sequence_parallel=cfg.model.transformer.sequence_parallel,
         tp_group=mpu.get_tensor_model_parallel_group(),
@@ -342,7 +331,9 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = get_batch(data_iterator, vp_stage)
+        cp_batch = get_batch(
+            data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
+        )
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -450,7 +441,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             cfg.model.transformer.tensor_model_parallel_size
             * cfg.model.transformer.sequence_parallel
         ),
-        hybrid_context_parallel=cfg.model.transformer.hybrid_context_parallel,
+        dynamic_context_parallel=cfg.model.transformer.dynamic_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
         varlen_sbhd_validation=args.varlen_sbhd_validation,
