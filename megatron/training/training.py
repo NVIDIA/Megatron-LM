@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -1024,7 +1024,22 @@ def num_floating_point_operations(
                                    mamba_num_groups, mamba_num_heads)
         )
         dsa_attention_flops = (
-            dsa_layer_flops(args, total_tokens, seqlen_squared_sum) if num_dsa_layers else 0
+            dsa_layer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attn_heads,
+                q_lora_rank=args.q_lora_rank,
+                kv_lora_rank=args.kv_lora_rank,
+                qk_head_dim=args.qk_head_dim,
+                qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                v_head_dim=args.v_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                dsa_indexer_kpool_always_select_tail=getattr(
+                    args, "dsa_indexer_kpool_always_select_tail", True
+                ),
+            ) if num_dsa_layers else 0
         )
         flops_fwd = (
                 num_dsa_layers * dsa_attention_flops +
@@ -1044,12 +1059,25 @@ def num_floating_point_operations(
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         # The indexer has its own loss-dependent backward cost.
-        return flops_fwd * 3 + dsa_indexer_flops(
-            args=args,
-            total_tokens=total_tokens,
-            seqlen_squared_sum=seqlen_squared_sum,
-            num_dsa_layers=num_dsa_layers,
+        indexer_flops = (
+            dsa_indexer_flops(
+                total_tokens=total_tokens,
+                seqlen_squared_sum=seqlen_squared_sum,
+                hidden_size=hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+                num_dsa_layers=num_dsa_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                hybrid_layer_pattern=args.hybrid_layer_pattern,
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+            ) if num_dsa_layers else 0
         )
+        return flops_fwd * 3 + indexer_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1364,14 +1392,41 @@ def num_floating_point_operations(
         if args.experimental_attention_variant == "dsa":
             total_floating_point_operations += (
                 num_layers
-                * dsa_layer_flops(args, total_real_tokens_in_batch, seqlen_squared_sum_in_batch)
+                * dsa_layer_flops(
+                    total_tokens=total_real_tokens_in_batch,
+                    seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                    hidden_size=args.hidden_size,
+                    num_attention_heads=args.num_attention_heads,
+                    q_lora_rank=args.q_lora_rank,
+                    kv_lora_rank=args.kv_lora_rank,
+                    qk_head_dim=args.qk_head_dim,
+                    qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+                    v_head_dim=args.v_head_dim,
+                    dsa_indexer_topk=args.dsa_indexer_topk,
+                    dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
+                    dsa_indexer_kpool_always_select_tail=getattr(
+                        args, "dsa_indexer_kpool_always_select_tail", True
+                    ),
+                )
                 * forward_backward_expansion_factor
             )
+            # Pass all DSA layers; the helper counts only layers that compute an index.
             total_floating_point_operations += dsa_indexer_flops(
-                args=args,
                 total_tokens=total_real_tokens_in_batch,
                 seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                hidden_size=args.hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
                 num_dsa_layers=num_layers,
+                dsa_indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
+                dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+                dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+                mtp_num_layers=mtp_num_layers,
+                mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
             )
         return total_floating_point_operations
 
@@ -1402,10 +1457,12 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
-        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
-                layer_counts
+        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
+            itemgetter(
+                Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
+                Symbols.DS_ATTENTION,
+            )(
+                get_hybrid_layer_counts(args.hybrid_layer_pattern)
             )
         )
 
@@ -1413,45 +1470,43 @@ def num_floating_point_operations(
         if mtp_num_layers is None:
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
-        return int(
-            hybrid_flops(
-                total_tokens=total_real_tokens_in_batch,
-                seqlen_squared_sum=seqlen_squared_sum_in_batch,
-                hidden_size=args.hidden_size,
-                num_attn_layers=num_attn_layers,
-                num_mamba_layers=num_mamba_layers,
-                num_mlp_layers=num_mlp_layers,
-                num_moe_layers=num_moe_layers,
-                num_dsa_layers=layer_counts[Symbols.DS_ATTENTION],
-                num_gdn_layers=num_gdn_layers,
-                mamba_state_dim=args.mamba_state_dim,
-                mamba_head_dim=args.mamba_head_dim,
-                mamba_num_groups=args.mamba_num_groups,
-                mamba_num_heads=args.mamba_num_heads,
-                gdp_num_householder=args.gdp_num_householder,
-                num_attn_heads=args.num_attention_heads,
-                gqa=args.group_query_attention,
-                gqa_groups=args.num_query_groups,
-                kv_channels=args.kv_channels,
-                mlp_expansion=args.ffn_hidden_size / args.hidden_size,
-                swiglu=args.swiglu,
-                use_gated_delta_product=_uses_gated_delta_product_spec(args),
-                moe_latent_size=args.moe_latent_size,
-                moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
-                                     else args.ffn_hidden_size),
-                shared_expert_ffn_hidden_size=(0 if args.moe_shared_expert_intermediate_size is None
-                                               else args.moe_shared_expert_intermediate_size),
-                num_experts_routed_to=args.moe_router_topk,
-                gdn_qk_head_dim=args.linear_key_head_dim or 128,
-                gdn_v_head_dim=args.linear_value_head_dim or 128,
-                gdn_num_qk_heads=args.linear_num_key_heads or 16,
-                gdn_num_v_heads=args.linear_num_value_heads or 32,
-                gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
-                gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
-                vocab_size=args.padded_vocab_size,
-                mtp_num_layers=mtp_num_layers,
-            )
-        )
+        return int(hybrid_flops(
+            total_tokens=total_real_tokens_in_batch,
+            seqlen_squared_sum=seqlen_squared_sum_in_batch,
+            hidden_size=args.hidden_size,
+            num_attn_layers=num_attn_layers,
+            num_mamba_layers=num_mamba_layers,
+            num_mlp_layers=num_mlp_layers,
+            num_moe_layers=num_moe_layers,
+            num_dsa_layers=num_dsa_layers,
+            num_gdn_layers=num_gdn_layers,
+            mamba_state_dim=args.mamba_state_dim,
+            mamba_head_dim=args.mamba_head_dim,
+            mamba_num_groups=args.mamba_num_groups,
+            mamba_num_heads=args.mamba_num_heads,
+            gdp_num_householder=args.gdp_num_householder,
+            num_attn_heads=args.num_attention_heads,
+            gqa=args.group_query_attention,
+            gqa_groups=args.num_query_groups,
+            kv_channels=args.kv_channels,
+            mlp_expansion=args.ffn_hidden_size / args.hidden_size,
+            swiglu=args.swiglu,
+            use_gated_delta_product=_uses_gated_delta_product_spec(args),
+            moe_latent_size=args.moe_latent_size,
+            moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
+                                 else args.ffn_hidden_size),
+            shared_expert_ffn_hidden_size=(0 if args.moe_shared_expert_intermediate_size is None
+                                           else args.moe_shared_expert_intermediate_size),
+            num_experts_routed_to=args.moe_router_topk,
+            gdn_qk_head_dim=args.linear_key_head_dim or 128,
+            gdn_v_head_dim=args.linear_value_head_dim or 128,
+            gdn_num_qk_heads=args.linear_num_key_heads or 16,
+            gdn_num_v_heads=args.linear_num_value_heads or 32,
+            gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
+            gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
+            vocab_size=args.padded_vocab_size,
+            mtp_num_layers=mtp_num_layers,
+        ))
     else:
         # Compute standard Transformer model FLOPs.
         return int(transformer_flops())
