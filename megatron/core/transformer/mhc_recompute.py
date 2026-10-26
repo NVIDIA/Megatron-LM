@@ -23,8 +23,7 @@ from torch import Tensor
 def uses_mhc_recompute_attn_cuda_graph_split(config) -> bool:
     """Whether attention-only TE graphs consume eager mHC recompute outputs.
 
-    Single definition for a predicate that gates both the layer-side split
-    (``TransformerLayer._uses_mhc_recompute_attn_cuda_graph_split``) and the
+    Single definition for a predicate that gates the GPT/Hybrid layer-side split and the
     capture-side arena validation (``TECudaGraphHelper._uses_mhc_direct_write_arena``).
     Two spellings drift, and the failure is asymmetric: one site would raise on a
     ``None`` field while the other silently returned False, disabling exactly the
@@ -34,15 +33,12 @@ def uses_mhc_recompute_attn_cuda_graph_split(config) -> bool:
     from megatron.core.transformer.enums import CudaGraphModule
 
     return (
-        config.mhc_recompute_attn_cuda_graph_split
-        # HybridStack has no split implementation; the config validator
-        # rejects the combination, and this keeps the capture-side arena
-        # validation from engaging on heterogeneous configs regardless.
-        and not getattr(config, "is_hybrid_model", False)
+        getattr(config, "mhc_recompute_attn_cuda_graph_split", False)
         and config.cuda_graph_impl == "transformer_engine"
         and list(config.cuda_graph_modules or []) == [CudaGraphModule.attn]
         and config.recompute_granularity == "selective"
-        and list(config.recompute_modules or []) == ["mhc"]
+        and "mhc" in (config.recompute_modules or [])
+        and set(config.recompute_modules) <= {"mhc", "mla_up_proj"}
     )
 
 

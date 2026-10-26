@@ -17,6 +17,7 @@ __all__ = [
     "build_dsattention_forward_mask",
     "build_fused_indexer_varlen_bounds",
     "build_valid_mask_from_starts_ends",
+    "can_prove_all_topk_rows_nonempty",
     "extract_query_valid_rows_from_packed_seq_params",
     "gather_sparse_topk_validity_and_bias",
     "generate_varlen_mask_params",
@@ -31,6 +32,46 @@ __all__ = [
     "scatter_topk_into_index_mask",
     "sort_topk_by_index",
 ]
+
+
+def can_prove_all_topk_rows_nonempty(
+    *,
+    computes_topk: bool,
+    indexer_topk: int,
+    kv_sequence_length: int,
+    attention_mask: Optional[torch.Tensor],
+    query_valid_rows: Optional[torch.Tensor],
+    varlen_is_plain_causal: bool,
+    use_local_indexer_varlen: bool,
+    varlen_starts: Optional[torch.Tensor],
+    varlen_ends: Optional[torch.Tensor],
+    key_positions: Optional[torch.Tensor],
+) -> bool:
+    """Return a host-side certificate that every query row has a selected key.
+
+    The packed-local branch is provenance-based: its bounds must come from DSA's internal
+    packed self-attention layout. Selected cumulative lengths (padded when available),
+    synthetic tail positions, and reordered KV cover every physical query row; checking
+    tensor values here would introduce a device sync. This proves geometric non-emptiness
+    only; real-token masking remains a separate concern.
+
+    Backend callers may pass their normalized plain-causal layout as
+    ``varlen_is_plain_causal=True`` after dropping the equivalent explicit bounds.
+    """
+    if (
+        not computes_topk
+        or indexer_topk <= 0
+        or kv_sequence_length <= 0
+        or attention_mask is not None
+        or query_valid_rows is not None
+    ):
+        return False
+    return varlen_is_plain_causal or (
+        use_local_indexer_varlen
+        and varlen_starts is not None
+        and varlen_ends is not None
+        and key_positions is None
+    )
 
 
 def build_causal_mask_from_positions(

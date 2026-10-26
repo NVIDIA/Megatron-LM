@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import gc
 import os
 import sys
@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_ma
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -26,19 +27,11 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import setup_model_and_optimizer
+from tests.unit_tests.a2a_overlap.utils import (
+    get_valid_flex_dispatcher_backend,
+    get_valid_token_dispatcher_types,
+)
 from tests.unit_tests.test_utilities import Utils
-
-
-def is_deep_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
-
-    return HAVE_DEEP_EP
-
-
-def is_hybrid_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
-
-    return HAVE_HYBRIDEP
 
 
 def save(fn, message):
@@ -172,7 +165,7 @@ class TestPartialCudaGraphedA2AOverlap:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -339,22 +332,12 @@ class TestPartialCudaGraphedA2AOverlap:
         not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
     )
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep"])
+    @pytest.mark.parametrize("moe_dispatcher_type", get_valid_token_dispatcher_types())
     def test_moe_partial_cudagraph_with_ep_overlap(self, moe_dispatcher_type):
         extra_kwargs = {"moe_layer_freq": 1}
-        if moe_dispatcher_type == "deepep":
-            if not is_deep_ep_available():
-                pytest.skip("Deep EP is not available")
-            extra_kwargs["moe_token_dispatcher_type"] = "flex"
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
-            extra_kwargs["moe_router_dtype"] = "fp32"
-        elif moe_dispatcher_type == "hybridep":
-            if not is_hybrid_ep_available():
-                pytest.skip("Hybrid EP is not available")
-            extra_kwargs["moe_token_dispatcher_type"] = "flex"
-            extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
-        else:
-            extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        if moe_dispatcher_type == "flex":
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
 
         loss_list_ref = self._run_test_helper(4, "none", None, 3, **extra_kwargs)
         for cuda_graph_modules in [
@@ -415,4 +398,31 @@ class TestPartialCudaGraphedA2AOverlap:
             assert torch.equal(loss_list[i].mean(), loss_list_ref[i].mean()), (
                 f"mHC recompute whole-attention overlap diverged from eager at i={i}: "
                 f"{loss_list[i]} vs {loss_list_ref[i]}"
+            )
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_scheduled_tensor_release_with_partial_cudagraph(self):
+        """A stable capture/replay smoke test for scheduled tensor release."""
+
+        extra_kwargs = {"moe_layer_freq": 1, "moe_token_dispatcher_type": "alltoall"}
+        warmup_steps = 2
+        loss_list_ref = self._run_test_helper(2, "none", None, warmup_steps, **extra_kwargs)
+        cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+        loss_list = self._run_test_helper(
+            2,
+            "transformer_engine",
+            cuda_graph_modules,
+            warmup_steps,
+            ep_overlap=True,
+            ep_overlap_use_scheduled_tensor_release=True,
+            **extra_kwargs,
+        )
+
+        assert len(loss_list) == len(loss_list_ref)
+        for i, (loss, loss_ref) in enumerate(zip(loss_list, loss_list_ref)):
+            assert torch.equal(loss.mean(), loss_ref.mean()), (
+                f"scope={cuda_graph_modules}, i={i}, " f"loss={loss}, loss_ref={loss_ref}"
             )

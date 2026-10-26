@@ -4,14 +4,16 @@
 
 The wrapped optimizer continues to own its normal param_groups and state mappings.
 Parameters selected for offload keep their master weights and tensor states in pinned CPU
-memory between updates. Immediately before an update, master weights are restored as one
-window and optimizer tensor states are restored one chunk at a time. The external optimizer
-therefore only ever observes regular CUDA tensors and does not need an offload-specific API.
+memory between updates. During an update, optimizer tensor states are restored one chunk at a
+time; a master the optimizer owns (``state['master_param']``) is one of them. MCore-owned
+masters are restored as one window before the first chunk. The external optimizer therefore
+only ever observes regular CUDA tensors and does not need an offload-specific API.
 """
 
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import logging
 import math
@@ -22,7 +24,7 @@ import torch
 from megatron.core.utils import log_single_rank
 
 _MASTER_PARAM_KEY = "master_param"
-_NON_OFFLOADABLE_STATE_KEYS = frozenset({_MASTER_PARAM_KEY, "step", "found_inf"})
+_NON_OFFLOADABLE_STATE_KEYS = frozenset({"step", "found_inf"})
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,13 @@ class OptimizerStateChunk:
     params: tuple[torch.Tensor, ...]
 
 
+_STAGING_ALIGNMENT_BYTES = 256
+
+
+def _align_staging_offset(offset: int) -> int:
+    return -(-offset // _STAGING_ALIGNMENT_BYTES) * _STAGING_ALIGNMENT_BYTES
+
+
 @dataclasses.dataclass
 class _StatePrefetch:
     """Prefetch token whose existence also records a scheduled no-copy chunk."""
@@ -47,11 +56,59 @@ class _StatePrefetch:
 
 @dataclasses.dataclass
 class _StateStagingSlot:
-    """Reusable GPU storage for one optimizer-state pipeline window."""
+    """Reusable GPU storage for one optimizer-state pipeline window.
 
-    buffers: Dict[tuple[torch.device, torch.dtype], torch.Tensor] = dataclasses.field(
-        default_factory=dict
-    )
+    One byte buffer per device backs every state dtype, so a chunk whose dtype mix differs
+    from the previous one reuses the same storage instead of leaving the old dtype's buffer
+    allocated next to the new one.
+    """
+
+    buffers: Dict[torch.device, torch.Tensor] = dataclasses.field(default_factory=dict)
+
+
+class _StagingSlotPool:
+    """The two staging windows of one manager, or of every manager in an optimizer chain.
+
+    Two windows let H2D(N+1), step(N), and D2H(N-1) overlap without host run-ahead
+    allocating one CUDA tensor set per chunk. A chain shares one pool and holds it while its
+    children step. A child's step then leaves the windows to the next child instead of freeing
+    them: freed storage still marked by ``record_stream()`` for an in-flight D2H is withheld
+    from the allocator, so the next child would allocate a fresh window and every child's
+    window could stay resident until the chain finished. Reuse needs no extra wait, because
+    every H2D already waits for the shared D2H stream.
+    """
+
+    def __init__(self) -> None:
+        self.slots = (_StateStagingSlot(), _StateStagingSlot())
+        self.next_slot = 0
+        self._holds = 0
+
+    @property
+    def in_use(self) -> bool:
+        """Return whether any window currently owns CUDA storage."""
+
+        return any(slot.buffers for slot in self.slots)
+
+    @contextlib.contextmanager
+    def hold(self):
+        """Keep the windows across every release requested inside the context."""
+
+        self._holds += 1
+        try:
+            yield
+        finally:
+            self._holds -= 1
+            if self._holds == 0:
+                self.release()
+
+    def release(self) -> None:
+        """Drop CUDA ownership unless a chain is still stepping through the pool."""
+
+        if self._holds:
+            return
+        for slot in self.slots:
+            slot.buffers.clear()
+        self.next_slot = 0
 
 
 class ChunkedOptimizerStateOffloader:
@@ -62,10 +119,13 @@ class ChunkedOptimizerStateOffloader:
     matrix optimizers such as Muon and also avoids fabricating optimizer parameters for slices
     of a DistributedOptimizer shard.
 
-    Master weights are always offloaded for selected mixed-precision parameters. They use a
-    full-window fallback: all selected masters are restored before the first state chunk and
-    copied back after the optimizer/model-parameter staging phase. This keeps the external
-    optimizer and FP8 parameter-gather paths unchanged while still removing masters from the
+    Master weights are always offloaded for selected mixed-precision parameters. A master the
+    optimizer owns (precision-aware FusedAdam's ``state['master_param']``) is read only by the
+    optimizer's own update, so it is ordinary chunk state: staged, updated and copied back with
+    its chunk's moments. MCore-owned masters use a full-window fallback: all selected masters
+    are restored before the first state chunk and copied back after the optimizer/model-parameter
+    staging phase, because MCore's main-to-model copies read them after the update. This keeps
+    the FP8 parameter-gather paths unchanged while still removing masters from the
     forward/backward residency set.
 
     Args:
@@ -81,7 +141,7 @@ class ChunkedOptimizerStateOffloader:
             authority for the actual state schema.
         optimizer_owned_master_dtypes: Dtype of each optimizer-owned ``master_param`` entry.
             Passing the exact parameters that materialize this entry avoids guessing and
-            accounts for compact int16 parameter remainders.
+            accounts for compact int16 parameter remainders in the chunk plan.
         d2h_stream: Optional transfer stream shared by related optimizer wrappers.
         h2d_stream: Optional transfer stream shared by related optimizer wrappers.
     """
@@ -158,20 +218,18 @@ class ChunkedOptimizerStateOffloader:
         )
         self._chunks = self._build_chunks(self._selected_params)
 
+        # CPU canonical tensor state, an optimizer-owned ``state['master_param']`` included.
         self._cpu_state: Dict[torch.Tensor, Dict[str, torch.Tensor]] = collections.defaultdict(dict)
-        # This map can be keyed by parameter alone because the constructor rejects combining
-        # MCore-owned ``param.data`` masters with optimizer-owned ``state['master_param']`` in
-        # one manager, and ``_validate_master_storage`` rechecks that invariant after lazy init.
+        # CPU canonical MCore-owned ``param.data`` masters. The constructor rejects combining them
+        # with optimizer-owned masters in one manager, and ``_validate_master_storage`` rechecks
+        # that invariant after lazy init.
         self._cpu_master: Dict[torch.Tensor, torch.Tensor] = {}
 
         self._d2h_stream = d2h_stream if d2h_stream is not None else torch.cuda.Stream()
         self._h2d_stream = h2d_stream if h2d_stream is not None else torch.cuda.Stream()
         self._master_h2d_event: torch.cuda.Event | None = None
         self._master_weights_resident = True
-        # Two reusable state windows allow H2D(N+1), step(N), and D2H(N-1) to overlap
-        # without letting host run-ahead allocate one CUDA tensor set per chunk.
-        self._state_staging_slots = (_StateStagingSlot(), _StateStagingSlot())
-        self._next_state_staging_slot = 0
+        self._staging_pool = _StagingSlotPool()
         self._first_prefetch: _StatePrefetch | None = None
 
     @staticmethod
@@ -187,14 +245,12 @@ class ChunkedOptimizerStateOffloader:
         return tuple(params)
 
     def _estimated_bundle_bytes(self, param: torch.Tensor) -> int:
-        state_bytes = self._estimated_state_bytes(param)
-        if id(param) in self._explicit_master_param_ids:
-            master_bytes = param.numel() * param.element_size()
-        elif id(param) in self._optimizer_owned_master_dtypes:
-            master_bytes = param.numel() * self._optimizer_owned_master_dtypes[id(param)].itemsize
-        else:
-            master_bytes = 0
-        return state_bytes + master_bytes
+        mcore_master_bytes = (
+            param.numel() * param.element_size()
+            if id(param) in self._explicit_master_param_ids
+            else 0
+        )
+        return self._estimated_state_bytes(param) + mcore_master_bytes
 
     def _param_has_master(self, param: torch.Tensor) -> bool:
         return (
@@ -226,7 +282,11 @@ class ChunkedOptimizerStateOffloader:
         return tuple(selected)
 
     def _estimated_state_bytes(self, param: torch.Tensor) -> int:
-        return param.numel() * self._state_bytes_per_param
+        """Bytes one state chunk stages for ``param``, an optimizer-owned master included."""
+
+        master_dtype = self._optimizer_owned_master_dtypes.get(id(param))
+        master_bytes = 0 if master_dtype is None else param.numel() * master_dtype.itemsize
+        return param.numel() * self._state_bytes_per_param + master_bytes
 
     def _build_chunks(self, params: Sequence[torch.Tensor]) -> tuple[OptimizerStateChunk, ...]:
         if not params:
@@ -292,6 +352,21 @@ class ChunkedOptimizerStateOffloader:
 
         return self._d2h_stream, self._h2d_stream
 
+    @property
+    def staging_pool(self) -> _StagingSlotPool:
+        """Return the staging windows used by this manager."""
+
+        return self._staging_pool
+
+    def use_staging_pool(self, pool: _StagingSlotPool) -> None:
+        """Adopt staging windows shared by sibling optimizers while none is in use."""
+
+        if pool is self._staging_pool:
+            return
+        if self._staging_pool.in_use or self._first_prefetch is not None:
+            raise RuntimeError("optimizer-state staging windows cannot change while in use")
+        self._staging_pool = pool
+
     def use_transfer_streams(
         self, d2h_stream: torch.cuda.Stream, h2d_stream: torch.cuda.Stream
     ) -> None:
@@ -335,9 +410,10 @@ class ChunkedOptimizerStateOffloader:
     def _is_offloadable_state(param: torch.Tensor, key: str, value: object) -> bool:
         """Return whether a tensor belongs to the supported chunked state schema."""
 
-        # Shape is sufficient only for the currently admitted fp32/bf16 Adam moments and the
-        # exact Muon momentum schema. FP8 moments carry one-element scale metadata that can match
-        # a one-element DistOpt shard; supporting them requires explicit state-key classification.
+        # Shape is sufficient only for the currently admitted fp32/bf16 Adam moments, the
+        # optimizer-owned fp32 master or its int16 remainder, and the exact Muon momentum schema.
+        # FP8 moments carry one-element scale metadata that can match a one-element DistOpt
+        # shard; supporting them requires explicit state-key classification.
         return (
             key not in _NON_OFFLOADABLE_STATE_KEYS
             and isinstance(value, torch.Tensor)
@@ -379,10 +455,10 @@ class ChunkedOptimizerStateOffloader:
         """Register CPU tensor states created or loaded outside the manager.
 
         Naturally CPU scalar state is left resident. Tensor state matching an optimizer
-        parameter shape is treated as offloaded state; this covers Adam moments and Muon
-        momentum while avoiding ordinary CPU step counters. Tracked buffers that are no longer
-        part of the optimizer's canonical state are released so checkpoint schema changes do
-        not retain stale pinned host memory.
+        parameter shape is treated as offloaded state; this covers Adam moments, an
+        optimizer-owned master and Muon momentum while avoiding ordinary CPU step counters.
+        Tracked buffers that are no longer part of the optimizer's canonical state are released
+        so checkpoint schema changes do not retain stale pinned host memory.
         """
 
         params = self._selected_params if params is None else params
@@ -455,8 +531,8 @@ class ChunkedOptimizerStateOffloader:
                 self._d2h_stream.synchronize()
                 self.adopt_cpu_optimizer_state(chunk.params)
 
-            # Precision-aware FusedAdam creates masters in optimizer.state during init.
-            # Scan and offload the full master window once, after all chunks exist.
+            # Precision-aware FusedAdam's masters went back with their chunks; this moves
+            # the MCore-owned master window.
             self._schedule_master_d2h()
             self._d2h_stream.synchronize()
             self.adopt_cpu_optimizer_state()
@@ -593,15 +669,16 @@ class ChunkedOptimizerStateOffloader:
                 )
 
     def _master_bindings_are_cuda(self) -> bool:
-        """Return whether every materialized selected master is CUDA-bound."""
+        """Return whether every selected MCore-owned master is CUDA-bound.
 
-        for param in self._selected_params:
-            if id(param) in self._explicit_master_param_ids and not param.data.is_cuda:
-                return False
-            state_master = self.optimizer.state.get(param, {}).get(_MASTER_PARAM_KEY)
-            if isinstance(state_master, torch.Tensor) and not state_master.is_cuda:
-                return False
-        return True
+        An optimizer-owned master is chunk state that only the optimizer's update reads.
+        """
+
+        return all(
+            param.data.is_cuda
+            for param in self._selected_params
+            if id(param) in self._explicit_master_param_ids
+        )
 
     def assert_master_weights_resident(self, operation: str) -> None:
         """Reject an external master reader while D2H/H2D changes its canonical binding."""
@@ -622,67 +699,53 @@ class ChunkedOptimizerStateOffloader:
         # Make the current stream depend on the H2D copy before the D2H stream follows it.
         self._wait_master_h2d()
 
-        transfers = []
-        for param in self._selected_params:
-            if id(param) in self._explicit_master_param_ids and param.data.is_cuda:
-                transfers.append((param, None, param.data))
-            state_master = self.optimizer.state.get(param, {}).get(_MASTER_PARAM_KEY)
-            if isinstance(state_master, torch.Tensor) and state_master.is_cuda:
-                transfers.append((param, _MASTER_PARAM_KEY, state_master))
+        transfers = [
+            param
+            for param in self._selected_params
+            if id(param) in self._explicit_master_param_ids and param.data.is_cuda
+        ]
         if not transfers:
             return
 
         self._master_weights_resident = False
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
-            for param, state_key, gpu_tensor in transfers:
+            for param in transfers:
+                gpu_tensor = param.data
                 cpu_tensor = self._cpu_buffer_for_master(param, gpu_tensor)
                 cpu_tensor.copy_(gpu_tensor, non_blocking=True)
                 gpu_tensor.record_stream(self._d2h_stream)
                 # CPU is the canonical binding as soon as the copy is enqueued. CUDA's
                 # allocator keeps the source alive through record_stream(), and any H2D
                 # consumer waits on the D2H stream before reading this buffer.
-                if state_key is None:
-                    param.data = cpu_tensor
-                else:
-                    self.optimizer.state[param][state_key] = cpu_tensor
+                param.data = cpu_tensor
 
     def _schedule_master_h2d(self) -> None:
         if not self._selected_params or self._master_h2d_event is not None:
             return
         self._validate_master_storage()
 
-        transfers = []
-        for param in self._selected_params:
-            if id(param) in self._explicit_master_param_ids and not param.data.is_cuda:
-                transfers.append((param, None, param.data))
-            state_master = self.optimizer.state.get(param, {}).get(_MASTER_PARAM_KEY)
-            if isinstance(state_master, torch.Tensor) and not state_master.is_cuda:
-                transfers.append((param, _MASTER_PARAM_KEY, state_master))
+        transfers = [
+            param
+            for param in self._selected_params
+            if id(param) in self._explicit_master_param_ids and not param.data.is_cuda
+        ]
         if not transfers:
             self._master_weights_resident = self._master_bindings_are_cuda()
             return
 
         self._master_weights_resident = False
         gpu_transfers = [
-            (
-                param,
-                state_key,
-                cpu_tensor,
-                torch.empty_like(cpu_tensor, device=self._param_devices[param]),
-            )
-            for param, state_key, cpu_tensor in transfers
+            (param, param.data, torch.empty_like(param.data, device=self._param_devices[param]))
+            for param in transfers
         ]
 
         self._order_h2d_after_source_streams()
         with torch.cuda.stream(self._h2d_stream):
-            for param, state_key, cpu_tensor, gpu_tensor in gpu_transfers:
+            for param, cpu_tensor, gpu_tensor in gpu_transfers:
                 gpu_tensor.copy_(cpu_tensor, non_blocking=cpu_tensor.is_pinned())
                 gpu_tensor.record_stream(self._h2d_stream)
-                if state_key is None:
-                    param.data = gpu_tensor
-                else:
-                    self.optimizer.state[param][state_key] = gpu_tensor
+                param.data = gpu_tensor
                 self._cpu_master[param] = cpu_tensor
 
             event = torch.cuda.Event()
@@ -715,52 +778,48 @@ class ChunkedOptimizerStateOffloader:
         """Return state views backed by the next reusable CUDA staging slot."""
 
         entries = []
-        required_numel = collections.defaultdict(int)
+        required_bytes = collections.defaultdict(int)
         for param in chunk.params:
             state = self.optimizer.state.get(param, {})
             for key, cpu_tensor in self._cpu_state.get(param, {}).items():
                 current = state.get(key)
                 if not isinstance(current, torch.Tensor) or current.is_cuda:
                     continue
-                pool_key = (self._param_devices[param], cpu_tensor.dtype)
-                entries.append((param, key, cpu_tensor, pool_key))
-                alignment_numel = max(1, 256 // cpu_tensor.element_size())
-                required_numel[pool_key] = (
-                    (required_numel[pool_key] + alignment_numel - 1) // alignment_numel
-                ) * alignment_numel
-                required_numel[pool_key] += cpu_tensor.numel()
+                device = self._param_devices[param]
+                offset = _align_staging_offset(required_bytes[device])
+                entries.append((param, key, cpu_tensor, device, offset))
+                required_bytes[device] = offset + cpu_tensor.numel() * cpu_tensor.element_size()
 
         if not entries:
             return []
 
-        slot = self._state_staging_slots[self._next_state_staging_slot]
-        self._next_state_staging_slot = (self._next_state_staging_slot + 1) % len(
-            self._state_staging_slots
-        )
-        for (device, dtype), numel in required_numel.items():
-            buffer = slot.buffers.get((device, dtype))
-            if buffer is None or buffer.numel() < numel:
-                slot.buffers[(device, dtype)] = torch.empty(numel, dtype=dtype, device=device)
+        pool = self._staging_pool
+        slot = pool.slots[pool.next_slot]
+        pool.next_slot = (pool.next_slot + 1) % len(pool.slots)
+        for device, nbytes in required_bytes.items():
+            buffer = slot.buffers.get(device)
+            if buffer is None or buffer.numel() < nbytes:
+                slot.buffers[device] = torch.empty(nbytes, dtype=torch.uint8, device=device)
 
-        offsets = collections.defaultdict(int)
         views = []
-        for param, key, cpu_tensor, pool_key in entries:
-            alignment_numel = max(1, 256 // cpu_tensor.element_size())
-            offset = (
-                (offsets[pool_key] + alignment_numel - 1) // alignment_numel
-            ) * alignment_numel
-            buffer = slot.buffers[pool_key]
-            gpu_tensor = buffer.narrow(0, offset, cpu_tensor.numel()).view(cpu_tensor.shape)
-            offsets[pool_key] = offset + cpu_tensor.numel()
+        for param, key, cpu_tensor, device, offset in entries:
+            nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+            gpu_tensor = (
+                slot.buffers[device]
+                .narrow(0, offset, nbytes)
+                .view(cpu_tensor.dtype)
+                .view(cpu_tensor.shape)
+            )
             views.append((param, key, cpu_tensor, gpu_tensor))
         return views
 
     def _release_state_staging_slots(self) -> None:
-        """Drop GPU pool ownership after all live views have been queued for D2H."""
+        """Drop GPU pool ownership after all live views have been queued for D2H.
 
-        for slot in self._state_staging_slots:
-            slot.buffers.clear()
-        self._next_state_staging_slot = 0
+        Inside a chain's hold the windows pass to the next child instead.
+        """
+
+        self._staging_pool.release()
 
     def _prefetch_state(self, chunk: OptimizerStateChunk) -> _StatePrefetch:
         staging_views = self._state_staging_views(chunk)
@@ -783,7 +842,8 @@ class ChunkedOptimizerStateOffloader:
             torch.cuda.current_stream().wait_event(prefetch.event)
 
     def prefetch_for_step(self) -> None:
-        """Asynchronously restore masters and the first state chunk for the next update."""
+        """Asynchronously restore MCore-owned masters and the first state chunk for the next
+        update."""
 
         if not self._selected_params:
             return
@@ -792,13 +852,13 @@ class ChunkedOptimizerStateOffloader:
             self._first_prefetch = self._prefetch_state(self._chunks[0])
 
     def prefetch_master_for_step(self) -> None:
-        """Asynchronously restore only masters, leaving tensor state CPU-resident."""
+        """Asynchronously restore only MCore-owned masters, leaving tensor state CPU-resident."""
 
         if self._selected_params:
             self._schedule_master_h2d()
 
     def ensure_master_for_param_sync(self) -> None:
-        """Ensure selected master weights are available for pre-forward FP8 staging."""
+        """Ensure selected MCore-owned masters are available for pre-forward FP8 staging."""
 
         if self._master_weights_resident and self._master_h2d_event is None:
             return
@@ -808,14 +868,16 @@ class ChunkedOptimizerStateOffloader:
     def offload_for_forward(self, offload_master: bool = True) -> None:
         """Start D2H for tensors still resident after an update or load.
 
-        Selected master bindings become CPU tensors as soon as their asynchronous D2H copy is
-        enqueued. CUDA consumers must restore them through this manager, and host consumers must
-        first call :meth:`synchronize_for_checkpoint`. The training loop deliberately calls this
-        only at the optimizer-to-forward lifecycle boundary, where no other master reader runs.
+        Selected MCore-owned master bindings become CPU tensors as soon as their asynchronous
+        D2H copy is enqueued. CUDA consumers must restore them through this manager, and host
+        consumers must first call :meth:`synchronize_for_checkpoint`. The training loop
+        deliberately calls this only at the optimizer-to-forward lifecycle boundary, where no
+        other master reader runs.
 
         Args:
-            offload_master: If false, stage only optimizer state. The training loop uses this
-                while an MXFP8 parameter buffer still needs to read updated masters.
+            offload_master: If false, stage only optimizer state, an optimizer-owned master
+                included. The training loop uses this while an MXFP8 parameter buffer still
+                needs to read updated MCore-owned masters.
         """
 
         if not self._selected_params:

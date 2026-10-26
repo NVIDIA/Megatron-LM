@@ -402,8 +402,9 @@ def run_sniff_tests(
 
 def _get_ffn_gemm_shapes():
     """Derive up-proj and down-proj GEMM shapes from current training args."""
-    from megatron.training.global_vars import get_args
+    from megatron.training.global_vars import get_args, get_run_config
 
+    cfg = get_run_config()
     args = get_args()
     h = args.hidden_size
     ffn_h = args.ffn_hidden_size
@@ -413,7 +414,7 @@ def _get_ffn_gemm_shapes():
     tp = args.tensor_model_parallel_size
     gated = getattr(args, 'gated_linear_unit', False) or getattr(args, 'swiglu', False)
 
-    tokens = args.micro_batch_size * args.seq_length
+    tokens = cfg.train.micro_batch_size * args.seq_length
     glu_mult = 2 if gated else 1
 
     # fc1 / up-proj: (tokens, ffn_hidden_size * glu_mult / TP) with K = hidden_size

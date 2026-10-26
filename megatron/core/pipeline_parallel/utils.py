@@ -17,7 +17,46 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+from .combined_1f1b_tensor_release import Combined1F1BTensorRelease
+
+try:
+    from transformer_engine.pytorch.ep import is_symm_backed
+except ImportError:
+    is_symm_backed = None
+
 logger = logging.getLogger(__name__)
+
+
+class StageDispatchBwdGrad(torch.autograd.Function):
+    """1F1B + NCCL-EP zero-copy only: redirect the dispatch-backward grad into the persistent
+    symm buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the 1F1B overlap schedule the dispatch output is consumed by the next node, which
+    detaches it into a leaf; autograd therefore hands ``dispatch_bwd`` a non-symm
+    ``AccumulateGrad`` clone. Applying this identity node to the dispatch output — while it is
+    still inside the dispatch node's own graph segment — makes it the sole consumer, moving that
+    accumulation to *our* output; the backward then does a single plain->symm copy into the
+    dispatcher's ``_zc_bwd_token_buf``. That buffer is free to stage into precisely because
+    ``get_expert_zero_copy_buffers`` withholds it from the op-fuser under overlap.
+    Forward is identity (no numeric effect).
+    """
+
+    @staticmethod
+    def forward(ctx, dispatched_tokens, token_dispatcher):  # type: ignore[override]
+        """Identity forward; stashes the dispatcher so backward can reach its symm buffer."""
+        ctx.token_dispatcher = token_dispatcher
+        return dispatched_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
+        buf = ctx.token_dispatcher._comm_manager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        buf.copy_(grad)
+        return buf, None
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -158,6 +197,8 @@ class ScheduleNode:
         name: str = "schedule_node",
         forward_nvtx_name: Optional[str] = None,
         backward_nvtx_name: Optional[str] = None,
+        tensor_release: Optional[Combined1F1BTensorRelease] = None,
+        ncclep_zero_copy: bool = False,
     ):
         """Initialize a schedule node.
 
@@ -177,6 +218,9 @@ class ScheduleNode:
             name (str): Name of the node for debugging purposes.
             forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
             backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
+            tensor_release (Combined1F1BTensorRelease, optional): Combined 1F1B
+                state for schedule-aware cross-stream tensor release. ``None``
+                preserves the allocator ``record_stream`` behavior.
         """
         self.name = name
         self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
@@ -186,6 +230,8 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.tensor_release = tensor_release
+        self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
         self.outputs = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
@@ -215,7 +261,8 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.forward_nvtx_name):
+        node_name = self.forward_nvtx_name
+        with self.stream_acquire_context(node_name):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
@@ -236,13 +283,26 @@ class ScheduleNode:
 
             self.output = data
 
-        # Immediately frees input tensors after they are used for nodes
-        # where inputs are no longer needed after computation.
-        if self.free_input:
+        if self.tensor_release is not None:
+            release_inputs = inputs[0] if len(inputs) == 1 else inputs
+            self.tensor_release.consume_inputs_and_publish_outputs(
+                release_inputs,
+                self.output,
+                stream=self.stream,
+                node=node_name,
+                release_consumed=self.free_input,
+            )
+        elif self.free_input:
             for input in inputs:
                 if input is not None:
                     input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+                    # Skip symmetric-memory (zero-copy EP) buffers
+                    if not (
+                        self.ncclep_zero_copy
+                        and is_symm_backed is not None
+                        and is_symm_backed(input)
+                    ):
+                        input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -260,7 +320,8 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(self.backward_nvtx_name):
+        node_name = self.backward_nvtx_name
+        with self.stream_acquire_context(node_name):
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)
@@ -268,15 +329,34 @@ class ScheduleNode:
                 f"{len(outputs)} of {type(outputs[0])} is not equal to "
                 f"{len(output_grad)} of {type(output_grad[0])}"
             )
-            output_grad = self.backward_func(outputs, output_grad)
+            consumed_grads = self.backward_func(outputs, output_grad)
 
-        # output_grad maybe from another stream
-        if output_grad:
-            for g in output_grad:
+        grads = self.get_grad()
+
+        if self.tensor_release is not None:
+            # These gradients come from detach bridges outside the scheduled
+            # producer/consumer chain, so retain the allocator fallback.
+            if isinstance(consumed_grads, tuple):
+                if len(consumed_grads) > len(output_grad):
+                    for grad in consumed_grads[len(output_grad) :]:
+                        if grad is not None:
+                            grad.record_stream(self.stream)
+            elif consumed_grads is not None:
+                consumed_grads.record_stream(self.stream)
+
+            # A recompute segment's final forward output is consumed by autograd
+            # rather than another forward node, so its owner metadata ends here.
+            self.tensor_release.consume_forward_outputs(self.output)
+            release_output_grads = output_grad[0] if len(output_grad) == 1 else output_grad
+            self.tensor_release.consume_output_grads_and_publish_input_grads(
+                release_output_grads, grads, stream=self.stream, node=node_name
+            )
+        elif consumed_grads:
+            # Gradients may have been produced on another stream.
+            for g in consumed_grads:
                 if g is not None:
                     g.record_stream(self.stream)
 
-        grads = self.get_grad()
         self._release_state()
 
         return grads
@@ -307,6 +387,10 @@ class ScheduleNode:
             nvtx_range_push(name)
         try:
             with torch.cuda.stream(self.stream):
+                # The wait above transfers every previously consumed tensor owned by
+                # this plan back to its creation stream before storage becomes reusable.
+                if self.tensor_release is not None:
+                    self.tensor_release.drain(self.stream)
                 yield
         finally:
             if name:

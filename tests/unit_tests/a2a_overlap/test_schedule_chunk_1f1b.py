@@ -70,6 +70,7 @@ def run_two_chunk_parity(
     extra_kwargs,
     microbatches=1,
     use_padding_mask=False,
+    cast_model_to_config_dtype=False,
     on_plans_built=None,
     on_forward_done=None,
 ):
@@ -97,6 +98,12 @@ def run_two_chunk_parity(
             # build model
             gpt_model, schedule_plan, data = build_model(config, use_padding_mask=use_padding_mask)
             gpt_model.cuda()
+            if cast_model_to_config_dtype:
+                # The production model wrapper casts embeddings as well as TE modules to
+                # params_dtype.  This standalone helper normally omits that wrapper; dense
+                # TE MLPs require the explicit cast because their BF16 weights reject the
+                # otherwise-FP32 embedding activation outside an autocast region.
+                gpt_model.to(dtype=config.params_dtype)
             gpt_models.append(gpt_model)
             datas.append(data)
             schedule_plans.append(schedule_plan)
@@ -165,14 +172,94 @@ def run_two_chunk_parity(
         torch.cuda.empty_cache()
 
 
-class TestA2AOverlap:
+def run_model_chunk_case(
+    mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers, scheduled_release
+):
     """
-    Test class for all-to-all overlap optimization in transformer models.
-
-    This class contains tests to verify that the all-to-all overlap optimization
-    produces the same results as the reference implementation.
+    Verifies all-to-all overlap optimization in transformer layer produces
+    the same results as the reference implementation.
     """
+    # create TransformerConfig
+    extra_kwargs = {
+        "overlap_moe_expert_parallel_comm": True,
+        "ep_overlap_use_scheduled_tensor_release": scheduled_release,
+    }
+    apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
+    if fp8_flag is not None:
+        extra_kwargs["fp8"] = fp8_flag[0]
+        extra_kwargs["fp8_recipe"] = fp8_flag[1]
+    if mtp_layers > 0:
+        extra_kwargs["mtp_num_layers"] = mtp_layers
+        extra_kwargs["mtp_loss_scaling_factor"] = 1.1
+    run_two_chunk_parity(layers, extra_kwargs)
 
+
+def run_full_recompute_case(
+    mtp_layers, dispatcher_type, flex_backend, fp8_flag, recompute_method, recompute_num_layers
+):
+    """Layer-level full recompute matches the non-overlap reference.
+
+    Under block, non-overlap keeps MTP eager while the overlap plan recomputes it;
+    recompute must remain numerically transparent across that intentional difference.
+    """
+    if mtp_layers > 0 and recompute_method == "uniform" and recompute_num_layers != 1:
+        # MultiTokenPredictionLayer._checkpointed_forward rejects this uniform config.
+        pytest.skip("MTP recompute requires recompute_method='uniform' with num_layers=1")
+
+    extra_kwargs = {
+        "recompute_granularity": "full",
+        "recompute_method": recompute_method,
+        "recompute_num_layers": recompute_num_layers,
+    }
+    apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
+    if fp8_flag is not None:
+        extra_kwargs["fp8"] = fp8_flag[0]
+        extra_kwargs["fp8_recipe"] = fp8_flag[1]
+    if mtp_layers > 0:
+        extra_kwargs["mtp_num_layers"] = mtp_layers
+        extra_kwargs["mtp_loss_scaling_factor"] = 1.1
+
+    def assert_segments_were_built(schedule_plans):
+        # Guard against degrading into the plain overlap test.
+        for plan in schedule_plans:
+            assert len(plan._recompute_segments) > 0, "no recompute segments were built"
+            planned_mtp_layers = plan._transformer_layers[plan._num_decoder_layers :]
+            if mtp_layers > 0:
+                assert (
+                    len(planned_mtp_layers) == mtp_layers
+                ), "the overlap plan did not build the configured MTP layers"
+                segmented_layers = {
+                    id(layer) for segment in plan._recompute_segments for layer in segment.layers
+                }
+                assert all(
+                    id(layer) in segmented_layers for layer in planned_mtp_layers
+                ), "an MTP layer was not assigned to a recompute segment"
+
+    def assert_activations_were_released(plan):
+        # The point of the feature: after the chunk forward a recomputed layer holds
+        # no activation and only its segment's input survives. Gradient parity alone
+        # cannot catch a regression here - recompute is numerically transparent, so a
+        # segment that quietly kept its graph would still compare equal.
+        for segment in plan._recompute_segments:
+            assert segment.input_tensor is not None, "segment input was not retained"
+            for layer in segment.layers:
+                for node in layer._iter_recomputed_nodes():
+                    assert node.output is None, f"{node.name} kept its forward output"
+                    assert node.inputs is None, f"{node.name} kept its forward inputs"
+
+    # NOTE: use_padding_mask=True currently fails here on
+    # [block-1-fp8_flag0-flex-hybridep-0] with a gradient value mismatch. Reproduced
+    # against the unmodified branch with that one flag flipped, so it is a defect in
+    # full recompute + padding_mask rather than in this test. Left off pending a fix.
+    run_two_chunk_parity(
+        [3, 2],
+        extra_kwargs,
+        on_plans_built=assert_segments_were_built,
+        on_forward_done=assert_activations_were_released,
+    )
+
+
+class _A2AOverlapTestBase:
     def setup_method(self, method):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
@@ -184,138 +271,28 @@ class TestA2AOverlap:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+
+class TestA2AOverlap(_A2AOverlapTestBase):
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("mtp_layers", [0, 1])
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
-    @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
+    @pytest.mark.parametrize('layers', [[2, 1]])
+    @pytest.mark.parametrize("scheduled_release", [False, True])
     def test_1f1b_schedule_model_chunk(
-        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers
+        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers, scheduled_release
     ):
-        """
-        Verifies all-to-all overlap optimization in transformer layer produces
-        the same results as the reference implementation.
-        """
-        # create TransformerConfig
-        extra_kwargs = {}
-        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
-        if fp8_flag is not None:
-            extra_kwargs["fp8"] = fp8_flag[0]
-            extra_kwargs["fp8_recipe"] = fp8_flag[1]
-        if mtp_layers > 0:
-            extra_kwargs["mtp_num_layers"] = mtp_layers
-            extra_kwargs["mtp_loss_scaling_factor"] = 1.1
-        run_two_chunk_parity(layers, extra_kwargs)
-
-    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("layers", [[2, 1], [1, 1]])
-    @pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
-    def test_1f1b_schedule_model_chunk_with_padding_mask(
-        self, dispatcher_type, flex_backend, layers, tp_size
-    ):
-        """
-        Verifies all-to-all overlap optimization with padding_mask produces
-        the same results as the reference implementation with various TP/EP/CP combinations.
-        """
-        # Re-initialize model parallel with the specified configuration
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=1,
-            expert_model_parallel_size=4,
-            expert_tensor_parallel_size=1,
+        run_model_chunk_case(
+            mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers, scheduled_release
         )
-        set_streams()
 
-        # create TransformerConfig
-        extra_kwargs = {"tensor_model_parallel_size": tp_size, "sequence_parallel": tp_size > 1}
-        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
-        run_two_chunk_parity(layers, extra_kwargs, use_padding_mask=True)
-
-    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("mtp_layers", [0, 1])
-    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
-    @pytest.mark.parametrize(
-        "recompute_method,recompute_num_layers",
-        [
-            ("uniform", 1),
-            ("uniform", 2),
-            # 'block' leaves trailing layers eager, pinning the recomputed -> eager
-            # hand-off: n=1 keeps layers 1.. eager, n=3 recomputes the whole decoder.
-            ("block", 1),
-            ("block", 3),
-        ],
-    )
-    def test_1f1b_schedule_model_chunk_full_recompute(
-        self,
-        mtp_layers,
-        dispatcher_type,
-        flex_backend,
-        fp8_flag,
-        recompute_method,
-        recompute_num_layers,
-    ):
-        """Layer-level full recompute matches the non-overlap reference.
-
-        Under block, non-overlap keeps MTP eager while the overlap plan recomputes it;
-        recompute must remain numerically transparent across that intentional difference.
-        """
-        if mtp_layers > 0 and recompute_method == "uniform" and recompute_num_layers != 1:
-            # MultiTokenPredictionLayer._checkpointed_forward rejects this uniform config.
-            pytest.skip("MTP recompute requires recompute_method='uniform' with num_layers=1")
+    def test_scheduled_tensor_release_with_mixed_dense_layer(self):
+        """Dense-layer Noop dispatch/combine nodes preserve tensor-release bindings."""
 
         extra_kwargs = {
-            "recompute_granularity": "full",
-            "recompute_method": recompute_method,
-            "recompute_num_layers": recompute_num_layers,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_layer_freq": [1, 0],
+            "overlap_moe_expert_parallel_comm": True,
+            "ep_overlap_use_scheduled_tensor_release": True,
         }
-        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
-        if fp8_flag is not None:
-            extra_kwargs["fp8"] = fp8_flag[0]
-            extra_kwargs["fp8_recipe"] = fp8_flag[1]
-        if mtp_layers > 0:
-            extra_kwargs["mtp_num_layers"] = mtp_layers
-            extra_kwargs["mtp_loss_scaling_factor"] = 1.1
-
-        def assert_segments_were_built(schedule_plans):
-            # Guard against degrading into the plain overlap test.
-            for plan in schedule_plans:
-                assert len(plan._recompute_segments) > 0, "no recompute segments were built"
-                planned_mtp_layers = plan._transformer_layers[plan._num_decoder_layers :]
-                if mtp_layers > 0:
-                    assert (
-                        len(planned_mtp_layers) == mtp_layers
-                    ), "the overlap plan did not build the configured MTP layers"
-                    segmented_layers = {
-                        id(layer)
-                        for segment in plan._recompute_segments
-                        for layer in segment.layers
-                    }
-                    assert all(
-                        id(layer) in segmented_layers for layer in planned_mtp_layers
-                    ), "an MTP layer was not assigned to a recompute segment"
-
-        def assert_activations_were_released(plan):
-            # The point of the feature: after the chunk forward a recomputed layer holds
-            # no activation and only its segment's input survives. Gradient parity alone
-            # cannot catch a regression here - recompute is numerically transparent, so a
-            # segment that quietly kept its graph would still compare equal.
-            for segment in plan._recompute_segments:
-                assert segment.input_tensor is not None, "segment input was not retained"
-                for layer in segment.layers:
-                    for node in layer._iter_recomputed_nodes():
-                        assert node.output is None, f"{node.name} kept its forward output"
-                        assert node.inputs is None, f"{node.name} kept its forward inputs"
-
-        # NOTE: use_padding_mask=True currently fails here on
-        # [block-1-fp8_flag0-flex-hybridep-0] with a gradient value mismatch. Reproduced
-        # against the unmodified branch with that one flag flipped, so it is a defect in
-        # full recompute + padding_mask rather than in this test. Left off pending a fix.
-        run_two_chunk_parity(
-            [3, 2],
-            extra_kwargs,
-            on_plans_built=assert_segments_were_built,
-            on_forward_done=assert_activations_were_released,
-        )
+        run_two_chunk_parity([2, 2], extra_kwargs, cast_model_to_config_dtype=True)

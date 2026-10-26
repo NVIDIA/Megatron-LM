@@ -16,21 +16,20 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-    fused_mla_rope_inplace,
-    fused_mla_rope_out_of_place,
-)
+from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, QKVLayout
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.csa import _build_csa_submodule
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -55,6 +54,10 @@ def _initialize_grouped_output_projection(
 ) -> None:
     """Initialize a grouped weight with the legacy 2D parameter layout."""
     init_method(weight.view(-1, weight.size(-1)))
+
+
+def _skip_initialization(weight: torch.Tensor) -> None:
+    """Leave the weight uninitialized when ``perform_initialization`` is disabled."""
 
 
 @dataclass
@@ -90,6 +93,19 @@ class DSv4HybridAttention(Attention):
         name: str | None = None,
     ) -> None:
 
+        if pg_collection is None:
+            raise ValueError("DSv4 hybrid attention requires an explicit ProcessGroupCollection.")
+        if config.experimental_attention_variant != "dsv4_hybrid":
+            raise ValueError(
+                "DSv4 attention requires experimental_attention_variant='dsv4_hybrid' "
+                "so the config validates and derives DSv4 projection dimensions."
+            )
+        assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
+        assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+        assert (
+            config.transformer_impl == "transformer_engine"
+        ), "DSv4 HybridModel currently supports only the transformer-engine implementation."
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -97,6 +113,7 @@ class DSv4HybridAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            cp_comm_type=cp_comm_type,
             pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
             name=name,
@@ -134,10 +151,21 @@ class DSv4HybridAttention(Attention):
         # per-(global)-layer csa_compress_ratios array (GPT-parity / array-driven path).
         _ratio_idx = self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
         if compress_ratio is None:
+            compress_ratio = getattr(self.config, "compress_ratio", None)
+        if compress_ratio is None:
+            if _ratio_idx >= len(self.config.csa_compress_ratios):
+                layer_kind = "MTP" if is_mtp_layer else "decoder"
+                raise ValueError(
+                    "csa_compress_ratios does not contain an entry for "
+                    f"{layer_kind} layer {layer_number}: index {_ratio_idx} requires at least "
+                    f"{_ratio_idx + 1} entries, got {len(self.config.csa_compress_ratios)}."
+                )
             compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
         # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
         # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
         use_compressed_yarn = compress_ratio > 1
+        self._dsv4_compress_ratio = compress_ratio
+        self._dsv4_uses_yarn_rope = use_compressed_yarn
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
@@ -170,7 +198,7 @@ class DSv4HybridAttention(Attention):
             "is_mtp_layer": is_mtp_layer,
             "name": (name + ".core_attention") if name is not None else None,
         }
-        self.core_attention = build_module(
+        self.core_attention = _build_csa_submodule(
             submodules.core_attention,
             config=self.config,
             layer_number=self.layer_number,
@@ -186,11 +214,16 @@ class DSv4HybridAttention(Attention):
 
         # Output.
         self.o_local_groups = self.config.o_groups
+        self.output_projection_local_groups = self.o_local_groups
         assert (
             self.query_projection_size % self.config.o_groups == 0
         ), "num_attention_heads * v_head_dim must be divisible by o_groups"
         group_proj_in_size = self.query_projection_size // self.config.o_groups
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = (
+            torch.device("cpu")
+            if self.config.use_cpu_initialization
+            else torch.device("cuda", torch.cuda.current_device())
+        )
         self._uses_te_batched_linear = submodules.linear_o_group_proj is not None
         if not self._uses_te_batched_linear:
             warnings.warn(
@@ -206,7 +239,8 @@ class DSv4HybridAttention(Attention):
                 device=device,
                 dtype=self.config.params_dtype,
             )
-            self.config.init_method(linear_o_group_proj)
+            if self.config.perform_initialization:
+                self.config.init_method(linear_o_group_proj)
             self.linear_o_group_proj = torch.nn.Parameter(linear_o_group_proj)
         else:
             self.linear_o_group_proj = build_module(
@@ -219,8 +253,12 @@ class DSv4HybridAttention(Attention):
                 dtype=self.config.params_dtype,
                 bias=False,
                 accumulate_into_main_grad=self.config.gradient_accumulation_fusion,
-                init_method=partial(
-                    _initialize_grouped_output_projection, init_method=self.config.init_method
+                init_method=(
+                    partial(
+                        _initialize_grouped_output_projection, init_method=self.config.init_method
+                    )
+                    if self.config.perform_initialization
+                    else _skip_initialization
                 ),
                 name=(name + ".linear_o_group_proj") if name is not None else None,
             )
@@ -241,6 +279,7 @@ class DSv4HybridAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
         )
 
         if (
@@ -411,10 +450,7 @@ class DSv4HybridAttention(Attention):
         # for recompute; the rest of this forward reads it from pg_collection.
         # Restore the static group before returning.
         _orig_cp_group = self.pg_collection.cp
-        cp_group = _orig_cp_group
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            cp_group = packed_seq_params.cp_group
+        cp_group = resolve_cp_group(_orig_cp_group, packed_seq_params)
 
         cp_size = cp_group.size()
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
@@ -496,121 +532,9 @@ class DSv4HybridAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
-        # inverse RoPE on last qk_pos_emb_head_dim of each head
-        seq_len = core_attn_out.size(0)
-        n_heads = self.num_attention_heads_per_partition
-        pos_dim = self.config.qk_pos_emb_head_dim
-        nope_dim = self.config.v_head_dim - pos_dim
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq:
-            cu_seqlens_kv = (
-                packed_seq_params.cu_seqlens_kv_padded
-                if packed_seq_params.cu_seqlens_kv_padded is not None
-                else packed_seq_params.cu_seqlens_kv
-            )
-            rope_seqlen = packed_seq_params.max_seqlen_kv
-            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
-        else:
-            cu_seqlens_kv = None
-            rope_seqlen = seq_len
-            rope_max_seqlen_kv = None
-        # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-        # concentration factor (mscale) is NOT part of the DSv4 model contract --
-        # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
-        mscale = 1.0
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        if self.config.apply_rope_fusion:
-            # ``mscale=1.0`` strips yarn's concentration factor from the
-            # cached cos/sin so the fused kernel matches the unfused
-            # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
-            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
-            )
-            rotary_pos_emb = None
-            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
-        elif self._dsv4_uses_yarn_rope:
-            rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        else:
-            rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        if self.config.apply_rope_fusion:
-            if use_thd_cp:
-                global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
-                core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
-                    core_attn_out,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    nope_dim,
-                    pos_dim,
-                    cu_seqlens_kv,
-                    global_start,
-                    inverse=True,
-                )
-            else:
-                if packed_seq:
-                    core_attn_out = core_attn_out.squeeze(1)
-                # Fused DSA backward retains the raw attention output O. Applying
-                # inverse RoPE to its view in-place corrupts the retained O used by
-                # the softmax backward, so this call needs private storage.
-                core_attn_out = fused_mla_rope_out_of_place(
-                    core_attn_out,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    nope_dim,
-                    pos_dim,
-                    cu_seqlens_kv,
-                    self.pg_collection.cp.rank(),
-                    self.pg_collection.cp.size(),
-                    inverse=True,
-                    remove_interleaving=True,
-                )
-                if packed_seq:
-                    core_attn_out = core_attn_out.unsqueeze(1)
-        elif use_thd_cp:
-            global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
-            core_attn_out = cp_utils.apply_thd_cp_local_rope_unfused(
-                core_attn_out,
-                rotary_pos_emb,
-                nope_dim,
-                pos_dim,
-                cu_seqlens_kv,
-                global_start,
-                self.config,
-                inverse=True,
-            )
-        else:
-            content_part, rot_part = torch.split(
-                core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
-            )
-            # ``_apply_rotary_pos_emb_thd`` documents 3-D ``(total, h, d)`` input
-            # and adds its own batch dim internally; drop the dummy ``b=1`` axis
-            # for THD before the rope and add it back after.
-            if packed_seq:
-                rot_part_in = rot_part.squeeze(1)
-            else:
-                rot_part_in = rot_part
-            rot_part_out = apply_rotary_pos_emb(
-                rot_part_in,
-                rotary_pos_emb,
-                self.config,
-                cu_seqlens=cu_seqlens_kv,
-                mscale=mscale,
-                cp_group=self.pg_collection.cp,
-                mla_rotary_interleaved=True,
-                inverse=True,
-                mla_output_remove_interleaving=True,
-                max_seqlen=rope_max_seqlen_kv,
-            )
-            if packed_seq:
-                rot_part = rot_part_out.unsqueeze(1)
-            else:
-                rot_part = rot_part_out
-            core_attn_out = torch.cat([content_part, rot_part], dim=-1)
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
+        # ``core_attention`` already applied the inverse RoPE to the last
+        # qk_pos_emb_head_dim of each head, fusing it into the sparse-attention
+        # Function where that path allows it.
 
         # Grouped output
         core_attn_out = core_attn_out.view(
@@ -652,7 +576,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         name: str | None = None,
     ):
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            raise ValueError("DSv4 hybrid attention requires an explicit ProcessGroupCollection.")
 
         super().__init__(
             config=config,
@@ -702,7 +626,15 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='q_up_proj',
             tp_group=pg_collection.tp,
+            pg_collection=pg_collection,
             name=(name + ".linear_q_up_proj") if name is not None else None,
+        )
+        # DSv4 hybrid packs each query head as [qk_head_dim | qk_pos_emb_head_dim]
+        # (qk_head_dim is derived as v_head_dim - qk_pos_emb_head_dim); linear_kv_proj
+        # is a single shared KV head, so it stays a whole matrix for Muon.
+        self.linear_q_up_proj.weight.qkv_layout = QKVLayout.from_splits(
+            self.config.num_attention_heads,
+            (self.config.qk_head_dim, self.config.qk_pos_emb_head_dim),
         )
 
         self.linear_kv_proj = build_module(
@@ -717,6 +649,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
+            pg_collection=pg_collection,
             name=(name + ".linear_kv_proj") if name is not None else None,
         )
         self.kv_layernorm = submodules.kv_layernorm(

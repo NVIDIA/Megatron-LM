@@ -51,6 +51,8 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -120,7 +122,7 @@ def run_inference(
         nonlocal num_requests_added
         _request = requests[num_requests_added]
         engine.add_request(num_requests_added, _request.prompt_text, _request.sampling_params)
-        _request.time_start = get_curr_time()
+        _request.time_start = get_curr_time(do_broadcast=False)
         _request.state = "started"
         num_requests_added += 1
         tbar.update(1)
@@ -129,7 +131,10 @@ def run_inference(
         """Process a single engine step result, updating bookkeeping state."""
         nonlocal total_output_tokens, num_requests_finished
 
-        is_decode_only = engine.is_decode_only
+        decode_only = engine.decode_only
+        is_decode_only = (
+            decode_only.launched if decode_only.launched is not None else decode_only.consumed
+        )
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
@@ -140,23 +145,22 @@ def run_inference(
 
         # Update requests.
         active_request_ids = result["active_request_ids"]
-        finished_request_records = result["finished_request_records"]
+        finished_requests = result["finished_requests"]
         step_time = result["step_time"]
-        if len(active_request_ids) > 0 or len(finished_request_records) > 0:
+        if len(active_request_ids) > 0 or len(finished_requests) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
                 step_times["prefill"].append(step_time)
 
             # Append output tokens.
-            output_start = get_curr_time()
-            for finished_request_record in finished_request_records:
-
-                finished_request = finished_request_record.merge()
+            output_start = get_curr_time(do_broadcast=False)
+            for finished_request in finished_requests:
+                finished_request.finalize_text(engine.controller.tokenizer)
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
-                request.time_end = get_curr_time()
+                request.time_end = get_curr_time(do_broadcast=False)
                 request.state = "finished"
                 request.request_id = finished_request.request_id
                 request.events = finished_request.events
@@ -186,16 +190,16 @@ def run_inference(
                 if not finished_request.sampling_params.skip_prompt_log_probs:
                     request.prompt_top_n_logprobs = finished_request.prompt_top_n_logprobs
                 num_requests_finished += 1
-            output_times.append(get_curr_time() - output_start)
+            output_times.append(get_curr_time(do_broadcast=False) - output_start)
 
     if batch_ranges is not None:
         # Batch-drain mode: add all requests in a batch, drain, then next batch.
         for batch_idx, (batch_start, batch_end) in enumerate(batch_ranges):
             # Add all requests in current batch.
-            add_start = get_curr_time()
+            add_start = get_curr_time(do_broadcast=False)
             while num_requests_added < batch_end:
                 _add_request()
-            add_times.append(get_curr_time() - add_start)
+            add_times.append(get_curr_time(do_broadcast=False) - add_start)
 
             # Step until all active requests finish (drain).
             while engine.has_unfinished_requests():
@@ -213,7 +217,7 @@ def run_inference(
         # Original mode: add requests per step based on arrival time or count.
         while True:
             # Add requests.
-            add_start = get_curr_time()
+            add_start = get_curr_time(do_broadcast=False)
             if args.incoming_requests_per_step is None:
                 # Add requests with 'earlier' arrival time.
                 while num_requests_added < num_requests_total:
@@ -226,10 +230,10 @@ def run_inference(
                     min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
                 ):
                     _add_request()
-            add_times.append(get_curr_time() - add_start)
+            add_times.append(get_curr_time(do_broadcast=False) - add_start)
 
             # Step inference engine (i.e., generate a token for each active request).
-            # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
+            # The engine reports the consumed and launched decode-only states after scheduling.
             try:
                 result = engine.step_modern()
             except EngineSuspendedError as e:
@@ -291,6 +295,7 @@ def main():
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
 
     # Start Nsight profiler.
@@ -476,7 +481,9 @@ def main():
             # Attach peak memory metrics; the functional test only validates these
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
-            json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
+            json_results["lifetime_prefill_token_count"] = (
+                engine.context.lifetime_prefill_token_count
+            )
             json_results["async_sched_step_count"] = engine.context.async_sched_step_count
             json_results["async_sched_compaction_step_count"] = (
                 engine.context.async_sched_compaction_step_count
@@ -502,7 +509,7 @@ def main():
         p_count = len(p_times)
         d_count = len(d_times)
 
-        p_mean = p_total / p_count
+        p_mean = p_total / p_count if p_count != 0 else 0.0
         d_mean = d_total / d_count if d_count != 0 else 0.0
 
         # Commented out for now as the step/add/output times are not calculated correctly.

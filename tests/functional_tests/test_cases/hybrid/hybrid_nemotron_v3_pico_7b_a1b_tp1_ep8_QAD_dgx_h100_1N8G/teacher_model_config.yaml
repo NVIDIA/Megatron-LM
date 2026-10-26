@@ -1,0 +1,6 @@
+# Teacher and student use the same Nemotron architecture for QAD.
+num_layers: 52
+hidden_size: 1216
+ffn_hidden_size: 896
+num_attention_heads: 32
+kv_channels: 128

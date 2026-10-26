@@ -1,0 +1,365 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Schedule-aware tensor release for the combined 1F1B pipeline schedule.
+
+When ``ep_overlap_use_scheduled_tensor_release`` is enabled, each model-chunk
+plan tracks the producer stream of concrete CUDA tensors passed between real
+``ScheduleNode`` objects.  A same-stream consumer can release storage
+immediately.  A cross-stream consumer instead holds a strong reference until a
+later node from the same plan acquires the producer stream.  That acquire already
+waits on the plan event, so storage can become reusable without adding another
+dependency or relying on the caching allocator's longer ``record_stream``
+lifetime.
+
+Tracking is deliberately plan-local.  Inputs and detached gradients that enter
+outside the managed node chain keep the conservative ``record_stream`` path.
+Phase finalization hands remaining deferred tensors back to their producer
+streams and exports outputs leaving the plan.  Distinct edge tensors sharing one
+storage are rejected because tensor-object ownership cannot safely represent
+aliases when an input's entire storage may be released.
+
+The manager keeps two kinds of strong references:
+
+* ``_owners[tensor_id]`` binds a published tensor to the stream and node that
+  produced it.
+* ``_pending[producer_stream]`` holds a consumed cross-stream tensor until that
+  producer stream has waited for the consumer's work.
+
+Each real schedule node participates in the following workflow.  ``consume``
+and ``publish`` below are the two halves of
+``consume_inputs_and_publish_outputs`` or
+``consume_output_grads_and_publish_input_grads``::
+
+    Node A produces tensor T on stream S_a
+      wait(event, S_a) -> drain(S_a) -> run A -> record(event, S_a)
+      consume(A inputs) + publish(T as owned by S_a)
+                         |
+             +-----------+---------------------------+
+             | stays in managed chain                | leaves managed chain
+             v                                       v
+    Node B consumes tensor T on stream S_b     export(T)
+      wait(event, S_b) -> drain(S_b)             remove owner; do not release
+      -> run B -> record(event, S_b)
+      consume(T) + publish(B outputs as owned by S_b)
+          |
+          +-- S_a == S_b: apply the release action immediately
+          |
+          +-- S_a != S_b: keep T in _pending[S_a]
+                                 |
+                                 v
+    A later node acquires S_a
+      wait(event, S_a) -> drain(S_a) -> apply T's release action -> run node
+
+    At the end of the forward or backward phase
+      finalize_phase(event, outputs)
+        -> wait + drain every stream remaining in _pending
+        -> export(outputs)
+        -> assert that _pending and _owners are empty
+
+The shared plan event is recorded before the consumer calls ``consume``.
+Consequently, the later ``wait(event, S_a)`` orders the producer stream after
+the consumer before ``drain(S_a)`` releases T.  The release action is
+``EMPTY_STORAGE`` for releasable forward inputs and ``DROP_REFERENCE`` for
+backward gradients.  The latter only ends the manager's strong reference; it
+does not resize gradient storage.
+
+A forward node calls ``consume_inputs_and_publish_outputs``: its inputs are
+consumed with ``EMPTY_STORAGE`` when ``free_input`` is true (otherwise with no
+release action), and its outputs are published.  A backward node first calls
+``consume_forward_outputs`` to end ownership of forward outputs retained by
+autograd without releasing them.  It then calls
+``consume_output_grads_and_publish_input_grads`` to consume output gradients
+with ``DROP_REFERENCE`` and publish the input gradients for the next backward
+node.
+
+The public operations have the following roles:
+
+* ``consume`` removes the input's owner binding after the consumer has finished.
+  It releases immediately on the owner stream, defers to ``_pending`` across
+  streams, or uses ``record_stream`` for values that entered from outside the
+  managed chain.  An action of ``None`` only removes ownership because autograd
+  or the caller still controls the tensor's lifetime.
+* ``publish`` creates an owner binding for each output using the current node's
+  stream.  It does not synchronize streams or release storage.
+* ``drain(stream)`` applies only the releases deferred to ``stream``.  Callers
+  invoke it after that stream waits on the shared plan event, either when a node
+  acquires the stream or during phase finalization.
+* ``export(value)`` removes owner bindings without releasing storage.  It is
+  used when a tensor leaves the managed node chain for pipeline communication,
+  post/pre-processing, or the caller.
+* ``finalize_phase(event, ...)`` is the terminal flush and consistency check.
+  It waits and drains every producer stream still in ``_pending``, exports the
+  phase outputs, and then requires both pending releases and owner bindings to
+  be empty.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Any, Iterable, Optional
+
+import torch
+
+
+class ReleaseAction(Enum):
+    """Action performed after a tensor is safe to release."""
+
+    EMPTY_STORAGE = auto()
+    DROP_REFERENCE = auto()
+
+
+@dataclass(slots=True)
+class TensorOwner:
+    """Strong, plan-local binding from one concrete tensor to its producer stream."""
+
+    tensor: torch.Tensor
+    stream: torch.cuda.Stream
+    producer_node: str
+
+
+@dataclass(slots=True)
+class DeferredRelease:
+    """Strong reference held until the owner stream has acquired the consumer."""
+
+    tensor: torch.Tensor
+    action: ReleaseAction
+
+
+def _iter_unique_cuda_tensors(value: Any) -> Iterable[torch.Tensor]:
+    """Yield each CUDA tensor object once from one flat schedule edge.
+
+    Schedule edges may be a tensor or a flat tuple containing tensors and
+    ``None``.  Repeated references to the same tensor represent one ownership
+    transition, so object identity is used to suppress duplicate work.
+    """
+
+    values = (value,) if isinstance(value, torch.Tensor) else value
+    if not values:
+        return
+    seen = set()
+    for tensor in values:
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        tensor_id = id(tensor)
+        if not tensor.is_cuda or tensor_id in seen:
+            continue
+        seen.add(tensor_id)
+        yield tensor
+
+
+class Combined1F1BTensorRelease:
+    """Release selected tensors within one combined 1F1B model-chunk plan.
+
+    Ownership follows concrete tensor objects rather than schedule-node input
+    slots.  Bindings are strong and single-consumer: a real node consumes each
+    input binding once, while ``NoopScheduleNode`` naturally carries the same
+    object and binding to the next real node.  Storage aliases among tensors
+    participating in one real-node transition are unsupported: combined EFVPA
+    nodes must return fresh storage so tensor-object ownership remains unambiguous.
+    """
+
+    def __init__(self):
+        self._owners: dict[int, TensorOwner] = {}
+        # A pending release is keyed by its producer stream.  When that stream
+        # next acquires the plan event, all of its entries become safe to release.
+        self._pending: defaultdict[torch.cuda.Stream, list[DeferredRelease]] = defaultdict(list)
+
+    def consume_inputs_and_publish_outputs(
+        self,
+        consumed: Any,
+        produced: Any,
+        *,
+        stream: torch.cuda.Stream,
+        node: str,
+        release_consumed: bool,
+    ) -> None:
+        """Consume input bindings and publish outputs from one forward node."""
+
+        action = ReleaseAction.EMPTY_STORAGE if release_consumed else None
+        self._consume_and_publish(consumed, produced, action, stream, node)
+
+    def consume_forward_outputs(self, forward_outputs: Any) -> None:
+        """End bindings for recomputed forward outputs consumed by autograd.
+
+        These tensors remain live through the autograd graph, so consuming the
+        binding must not resize their storage or register another stream.
+        """
+
+        self._consume(forward_outputs, None, None)
+
+    def consume_output_grads_and_publish_input_grads(
+        self, output_grads: Any, input_grads: Any, *, stream: torch.cuda.Stream, node: str
+    ) -> None:
+        """Release output grads and publish input grads produced by one backward node."""
+
+        self._consume_and_publish(
+            output_grads, input_grads, ReleaseAction.DROP_REFERENCE, stream, node
+        )
+
+    def export(self, value: Any) -> None:
+        """Move plan outputs outside scheduled release without changing storage."""
+
+        for tensor in _iter_unique_cuda_tensors(value):
+            self._export_tensor(tensor)
+
+    def drain(self, stream: torch.cuda.Stream) -> None:
+        """Release entries after ``stream`` has acquired the plan event.
+
+        The event wait orders the producer stream after every consumer that
+        deferred a release to it.  Removing the strong references or making
+        storage allocator-visible is therefore safe without another event.
+        """
+
+        for entry in self._pending.pop(stream, ()):
+            self._apply_action(entry.tensor, entry.action)
+
+    def finalize_phase(self, event: torch.cuda.Event, phase: str, outputs: Any = ()) -> None:
+        """Hand pending tensors back, export phase outputs, and audit bindings.
+
+        A phase may end before some producer stream is naturally acquired again.
+        Enqueueing the final plan-event wait on every such stream completes the
+        same hand-back that a later node acquire would have performed.
+        """
+
+        for stream in tuple(self._pending):
+            event.wait(stream)
+            with torch.cuda.stream(stream):
+                self.drain(stream)
+        if self._pending:
+            pending_count = sum(len(entries) for entries in self._pending.values())
+            raise RuntimeError(f"Phase {phase!r} finalized with {pending_count} deferred tensors")
+
+        self.export(outputs)
+        if self._owners:
+            producers = sorted({owner.producer_node for owner in self._owners.values()})
+            raise RuntimeError(
+                f"Phase {phase!r} finalized with {len(self._owners)} unconsumed tensor-owner "
+                f"bindings from producers {producers}"
+            )
+
+    def _consume_and_publish(
+        self,
+        consumed: Any,
+        produced: Any,
+        action: Optional[ReleaseAction],
+        stream: torch.cuda.Stream,
+        node: str,
+    ) -> None:
+        """Consume one edge and publish the next, rejecting storage aliases."""
+
+        consumed_tensors = tuple(_iter_unique_cuda_tensors(consumed))
+        produced_tensors = tuple(_iter_unique_cuda_tensors(produced))
+
+        # Object-id ownership cannot safely describe two tensors sharing an
+        # allocation, especially when EMPTY_STORAGE releases the whole storage.
+        # Validate the complete edge before mutating any binding or storage so a
+        # rejected transition leaves the release state and its tensors unchanged.
+        edge_tensors = consumed_tensors + produced_tensors
+        for tensor_index, tensor in enumerate(edge_tensors):
+            for prior_index in range(tensor_index):
+                if torch._C._is_alias_of(edge_tensors[prior_index], tensor):
+                    raise RuntimeError(
+                        f"Node {node!r} passed multiple tensor objects sharing one storage; "
+                        "combined 1F1B tensor release does not support storage aliases"
+                    )
+
+        for tensor in consumed_tensors:
+            self._consume_tensor(tensor, action, stream)
+
+        for tensor in produced_tensors:
+            self._publish_tensor(tensor, stream, node)
+
+    def _consume(
+        self,
+        value: Any,
+        action: Optional[ReleaseAction],
+        consumer_stream: Optional[torch.cuda.Stream],
+    ) -> None:
+        """Consume every CUDA tensor binding in one flat schedule edge."""
+
+        for tensor in _iter_unique_cuda_tensors(value):
+            self._consume_tensor(tensor, action, consumer_stream)
+
+    def _consume_tensor(
+        self,
+        tensor: torch.Tensor,
+        action: Optional[ReleaseAction],
+        consumer_stream: Optional[torch.cuda.Stream],
+    ) -> None:
+        """Consume one binding and release it according to its producer stream.
+
+        A missing owner means the tensor entered from outside the managed node
+        chain.  In that case the allocator's conservative ``record_stream`` path
+        remains responsible for preventing premature reuse.
+        """
+
+        owner = self._take_owner(tensor)
+        if owner is None:
+            if action is not None:
+                assert consumer_stream is not None
+                tensor.record_stream(consumer_stream)
+                self._apply_action(tensor, action)
+            return
+
+        # action=None removes the tensor from scheduled release without freeing
+        # storage; autograd or the caller still controls when it becomes dead.
+        if action is None:
+            return
+        assert consumer_stream is not None
+        self._release_tensor(tensor, action, owner, consumer_stream)
+
+    def _take_owner(self, tensor: torch.Tensor) -> Optional[TensorOwner]:
+        """Remove and return the binding only when it owns this exact object."""
+
+        tensor_id = id(tensor)
+        owner = self._owners.get(tensor_id)
+        if owner is None or owner.tensor is not tensor:
+            return None
+        self._owners.pop(tensor_id)
+        return owner
+
+    def _publish_tensor(self, tensor: torch.Tensor, stream: torch.cuda.Stream, node: str) -> None:
+        """Bind a newly produced tensor object to its CUDA producer stream."""
+
+        tensor_id = id(tensor)
+        existing = self._owners.get(tensor_id)
+        if existing is not None and existing.tensor is tensor:
+            raise RuntimeError(
+                f"Tensor already has an unconsumed owner binding from "
+                f"{existing.producer_node!r}; producer={node!r}, "
+                f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+            )
+        self._owners[tensor_id] = TensorOwner(tensor=tensor, stream=stream, producer_node=node)
+
+    def _export_tensor(self, tensor: torch.Tensor) -> None:
+        """Remove scheduled-release ownership without changing tensor storage."""
+
+        self._take_owner(tensor)
+
+    def _release_tensor(
+        self,
+        tensor: torch.Tensor,
+        action: ReleaseAction,
+        owner: TensorOwner,
+        consumer_stream: torch.cuda.Stream,
+    ) -> None:
+        """Release now on the owner stream or defer until it is acquired again."""
+
+        if owner.stream == consumer_stream:
+            self._apply_action(tensor, action)
+            return
+
+        # The consumer records the shared plan event after its work.  Keep a
+        # strong reference until the producer stream later waits on that event.
+        self._pending[owner.stream].append(DeferredRelease(tensor=tensor, action=action))
+
+    @staticmethod
+    def _apply_action(tensor: torch.Tensor, action: ReleaseAction) -> None:
+        """Make forward storage reusable or drop the held gradient reference."""
+
+        if action is ReleaseAction.EMPTY_STORAGE:
+            tensor.untyped_storage().resize_(0)
+        elif action is not ReleaseAction.DROP_REFERENCE:
+            raise AssertionError(f"Unknown scheduled tensor release action: {action}")

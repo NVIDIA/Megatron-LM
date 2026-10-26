@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,13 +19,26 @@ from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
+    import triton
+
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as fused_mla_rope_module
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        HAVE_TRITON,
+        _mla_rope_bwd_kernel,
+        _mla_rope_fwd_inplace_kernel,
+        fused_apply_mla_rope_for_q,
         fused_mla_rope_concat,
         fused_mla_rope_inplace,
         fused_mla_rope_kv_split,
         fused_mla_rope_out_of_place,
     )
-except Exception:
+except ImportError:
+    HAVE_TRITON = False
+    triton = None
+    fused_mla_rope_module = None
+    _mla_rope_bwd_kernel = None
+    _mla_rope_fwd_inplace_kernel = None
+    fused_apply_mla_rope_for_q = None
     fused_mla_rope_concat = None
     fused_mla_rope_inplace = None
     fused_mla_rope_kv_split = None
@@ -86,6 +100,133 @@ class FakeCPGroup:
         return self._rank
 
 
+class TestApplyRotaryPosEmbTHD:
+    @pytest.mark.parametrize(
+        ("unsupported_kwargs", "warning_text"),
+        [
+            ({"inverse": True}, "inverse RoPE is not supported"),
+            (
+                {"mla_rotary_interleaved": True, "mla_output_remove_interleaving": True},
+                "MLA-style interleaving",
+            ),
+            ({"mscale": 2.0}, "mscale=2.0 is not supported"),
+        ],
+    )
+    def test_unsupported_fusion_options_use_unfused(
+        self, unsupported_kwargs, warning_text, monkeypatch
+    ):
+        # dev's fused-RoPE fallback warnings are emitted once per key; reset the registry so
+        # this test does not depend on which tests ran earlier in the session.
+        monkeypatch.setattr(rope_utils_module, "_ROPE_FUSION_FALLBACK_WARNINGS", set())
+        cp_group = FakeCPGroup()
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(2, 1, 1, 8)
+        cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+        config = TransformerConfig(
+            num_attention_heads=2, num_layers=1, apply_rope_fusion=True, rotary_interleaved=False
+        )
+        expected = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=2, **unsupported_kwargs
+        )
+
+        fused_mock = MagicMock(return_value=t.clone())
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb_thd", fused_mock),
+            pytest.warns(UserWarning, match=warning_text),
+        ):
+            output = apply_rotary_pos_emb(
+                t,
+                freqs,
+                config,
+                cu_seqlens=cu_seqlens,
+                cp_group=cp_group,
+                max_seqlen=2,
+                **unsupported_kwargs,
+            )
+
+        fused_mock.assert_not_called()
+        torch.testing.assert_close(output, expected)
+
+    def test_packed_freqs_returns_offset_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=0)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(8, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
+
+        expected_freqs = torch.cat([freqs[0:1], freqs[3:4], freqs[4:5], freqs[7:8]], dim=0)
+        expected = rope_utils_module._apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1), expected_freqs
+        ).squeeze(1)
+
+        torch.testing.assert_close(out, expected)
+
+    def test_max_seqlen_freqs_returns_sequence_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=1)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
+
+        expected_freqs = torch.cat([freqs[1:2], freqs[2:3]], dim=0)
+        expected_slices = []
+        for x in torch.split(t, [2, 2]):
+            expected_slices.append(
+                rope_utils_module._apply_rotary_pos_emb_bshd(
+                    x.unsqueeze(1), expected_freqs
+                ).squeeze(1)
+            )
+        expected = torch.cat(expected_slices, dim=0)
+
+        torch.testing.assert_close(out, expected)
+
+    def test_missing_max_seqlen_preserves_legacy_packed_freq_mapping(self):
+        cp_group = FakeCPGroup(size=2, rank=0)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(8, 1, 1, 8)
+
+        legacy_out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group
+        )
+        explicit_out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
+
+        torch.testing.assert_close(legacy_out, explicit_out)
+
+    def test_shared_max_seqlen_maps_asymmetric_query_sequences_from_zero(self):
+        cp_group = FakeCPGroup(size=1, rank=0)
+        cu_seqlens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
+        t = torch.randn(6, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+
+        max_seqlen_q = 3
+        max_seqlen_kv = freqs.size(0)
+        assert max_seqlen_q < max_seqlen_kv < t.size(0)
+        combined_max_seqlen = max(max_seqlen_q, max_seqlen_kv)
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens_q, freqs, cp_group=cp_group, max_seqlen=combined_max_seqlen
+        )
+        compatibility_out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens_q, freqs, cp_group=cp_group
+        )
+
+        expected_freqs = freqs[torch.tensor([0, 1, 2, 0, 1, 2])]
+        expected = rope_utils_module._apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1), expected_freqs
+        ).squeeze(1)
+
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(out, compatibility_out)
+
+
 class _SaveOutputForBackward(torch.autograd.Function):
     """Minimal stand-in for a kernel whose backward consumes its output."""
 
@@ -102,10 +243,9 @@ class _SaveOutputForBackward(torch.autograd.Function):
 
 
 def _test_fused_mla_rope_inplace(
-    input_format, inverse=False, remove_interleaving=False, rope_first=False
+    input_format, inverse=False, remove_interleaving=False, rope_first=False, num_heads=32
 ):
     assert fused_mla_rope_inplace is not None
-    num_heads = 32
     q_dim = 128
     emb_dim = 64
     dtype = torch.bfloat16
@@ -214,12 +354,362 @@ def _test_fused_mla_rope_inplace(
     )
 
 
-def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
+def _packed_thd_positions(cu_seqlens, num_rows, cp_size, cp_rank):
+    """Reference position of every CP-local row of a packed THD batch.
+
+    The rows of each sequence follow those of the previous one. With context parallelism, a
+    sequence is split into ``2 * cp_size`` equal chunks and rank ``r`` holds chunks ``r`` and
+    ``2 * cp_size - 1 - r``, in that order. Rows past ``cu_seqlens[-1] // cp_size`` (CUDA-graph
+    padding) belong to no sequence and use position 0.
+    """
+    positions = torch.zeros(num_rows, dtype=torch.int64)
+    bounds = cu_seqlens.tolist()
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if cp_size == 1:
+            positions[start:end] = torch.arange(end - start)
+            continue
+        chunk = (end - start) // (2 * cp_size)
+        row = start // cp_size
+        for chunk_id in (cp_rank, 2 * cp_size - 1 - cp_rank):
+            positions[row : row + chunk] = chunk_id * chunk + torch.arange(chunk)
+            row += chunk
+    return positions.to(cu_seqlens.device)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("kernel", ["inplace", "concat", "kv_split"])
+def test_mla_rope_many_packed_thd_sequences_match_reference_positions(monkeypatch, kernel, cp_size):
+    """Every packed THD row must be rotated with the position it has in its own sequence.
+
+    The in-place, packing and key/value split kernels look up the sequence of each row in
+    ``cu_seqlens``. Use hundreds of short sequences, zero-length ones (first, last and a run in
+    the middle), CUDA-graph padding rows and every CP rank, forward and backward. Run the batch
+    also without its last, zero-length sequence, so that the last sequence has rows. The result
+    must equal, bit for bit, the same kernel on an SBHD view with batch size 1 (which reads the
+    cos/sin row of its own row index) with the tables gathered at the reference positions.
+    """
+    triton = pytest.importorskip("triton")
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as rope_kernels
+
+    # One BLOCK_H for both layouts: the key/value split backward sums the heads in tiles of
+    # BLOCK_H. A single-config autotuner runs that config without benchmarking.
+    autotuners = {
+        "inplace": (
+            "_autotuned_mla_rope_fwd_inplace_kernel",
+            "_autotuned_mla_rope_bwd_inplace_kernel",
+        ),
+        "concat": ("_mla_rope_concat_fwd_kernel", "_mla_rope_concat_bwd_kernel"),
+        "kv_split": ("_mla_rope_fwd_kv_split_kernel", "_mla_rope_bwd_kv_split_kernel"),
+    }[kernel]
+    for name in autotuners:
+        autotuner = getattr(rope_kernels, name)
+        monkeypatch.setattr(autotuner, "configs", [triton.Config({"BLOCK_H": 2})])
+        monkeypatch.setattr(autotuner, "cache", {})
+
+    emb_dim, num_heads, num_seqs, padding_rows = 64, 4, 300, 5
+    generator = torch.Generator().manual_seed(1234)
+    # Context parallelism needs every sequence length to be a multiple of 2 * cp_size.
+    multiple = 1 if cp_size == 1 else 2 * cp_size
+    lengths = torch.randint(1, 33, (num_seqs,), generator=generator) * multiple
+    lengths[::7] = 0
+    lengths[100:104] = 0
+    lengths[-1] = 0
+    cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    cu_seqlens = cu_seqlens.to(device="cuda", dtype=torch.int32)
+    num_rows = int(cu_seqlens[-1]) // cp_size + padding_rows
+    freqs = torch.randn(int(lengths.max()), emb_dim, generator=generator).cuda()
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+
+    if kernel == "inplace":
+        nope_dim = 64
+        shapes = [(num_heads, nope_dim + emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            # remove_interleaving=True stores every channel where it was loaded.
+            out = rope_kernels.fused_mla_rope_inplace(
+                inputs[0],
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q=cu_seqlens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                remove_interleaving=True,
+            )
+            return (out,)
+
+    elif kernel == "concat":
+        nope_dim = 128
+        shapes = [(num_heads, nope_dim), (num_heads, emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            nope, rope = inputs
+            out = rope_kernels.fused_mla_rope_concat(
+                nope, rope, cos, sin, cu_seqlens, cp_rank, cp_size
+            )
+            return (out,)
+
+    else:
+        k_dim = v_dim = 32
+        shapes = [(num_heads, k_dim + v_dim), (1, emb_dim)]
+
+        def run(inputs, cos, sin, cu_seqlens=None, cp_rank=0, cp_size=1):
+            kv, k_pos_emb = inputs
+            return rope_kernels.fused_mla_rope_kv_split(
+                kv,
+                k_pos_emb,
+                cos,
+                sin,
+                emb_dim,
+                k_dim,
+                v_dim,
+                cu_seqlens_kv=cu_seqlens,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+
+    # Without its last, zero-length sequence, the batch has the same rows and positions, but the
+    # last sequence of cu_seqlens is no longer empty.
+    batches = [(cu, rank) for cu in (cu_seqlens, cu_seqlens[:-1]) for rank in range(cp_size)]
+    for batch_cu_seqlens, cp_rank in batches:
+        positions = _packed_thd_positions(batch_cu_seqlens, num_rows, cp_size, cp_rank)
+        values = [
+            torch.randn(num_rows, *shape, dtype=torch.bfloat16, device="cuda") for shape in shapes
+        ]
+        thd_inputs = [v.clone().requires_grad_(True) for v in values]
+        sbhd_inputs = [v.unsqueeze(1).clone().requires_grad_(True) for v in values]
+        thd_outputs = run(thd_inputs, cos, sin, batch_cu_seqlens, cp_rank, cp_size)
+        sbhd_outputs = run(sbhd_inputs, cos[positions], sin[positions])
+        label = f"{len(batch_cu_seqlens) - 1} sequences, cp_rank {cp_rank}"
+        for thd, sbhd in zip(thd_outputs, sbhd_outputs):
+            torch.testing.assert_close(
+                thd, sbhd.squeeze(1), rtol=0, atol=0, msg=lambda msg: f"{label} fwd: {msg}"
+            )
+        grads = [torch.randn_like(out) for out in thd_outputs]
+        torch.autograd.backward(thd_outputs, [g.clone() for g in grads])
+        torch.autograd.backward(sbhd_outputs, [g.unsqueeze(1).clone() for g in grads])
+        for thd, sbhd in zip(thd_inputs, sbhd_inputs):
+            torch.testing.assert_close(
+                thd.grad,
+                sbhd.grad.squeeze(1),
+                rtol=0,
+                atol=0,
+                msg=lambda msg: f"{label} bwd: {msg}",
+            )
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize(
+    "sequence_lengths,global_start,local_rows",
+    [
+        pytest.param([8], -2, 12, id="single-sequence-boundary-and-tail-padding"),
+        pytest.param([0, 1, 0, 3, 0, 5], -2, 13, id="zero-length-sequences"),
+        pytest.param([1] * 257, -2, 261, id="many-short-sequences"),
+    ],
+)
+def test_mla_rope_contiguous_thd_global_start_matches_position_ids(
+    inverse, sequence_lengths, global_start, local_rows
+):
+    """Kernel-side THD row mapping must match explicit packed-sequence positions."""
+    assert fused_mla_rope_inplace is not None
+    torch.manual_seed(1234)
+
+    sequence_lengths = torch.tensor(sequence_lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.cat(
+        (torch.zeros(1, dtype=torch.int32, device="cuda"), sequence_lengths.cumsum(dim=0))
+    )
+    global_rows = torch.arange(
+        global_start, global_start + local_rows, dtype=torch.int32, device="cuda"
+    )
+    sequence_ids = torch.bucketize(
+        global_rows, cu_seqlens[1:], out_int32=True, right=True
+    ).clamp_max(cu_seqlens.numel() - 2)
+    sequence_starts = cu_seqlens[sequence_ids]
+    sequence_ends = cu_seqlens[sequence_ids + 1]
+    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
+    position_ids = torch.where(valid_rows, global_rows - sequence_starts, 0)
+
+    nope_dim = 4
+    emb_dim = 8
+    num_heads = 2
+    max_sequence_length = max(sequence_lengths.max().item(), 1)
+    freqs = torch.randn(max_sequence_length, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().contiguous()
+    sin = freqs.sin().contiguous()
+    values = torch.randn(
+        local_rows, num_heads, nope_dim + emb_dim, dtype=torch.float32, device="cuda"
+    )
+    position_input = values.clone().requires_grad_(True)
+    contiguous_input = values.clone().requires_grad_(True)
+
+    position_output = fused_mla_rope_inplace(
+        position_input,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=True,
+        position_ids=position_ids,
+    )
+    contiguous_output = fused_mla_rope_inplace(
+        contiguous_input,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=True,
+        thd_global_start=global_start,
+    )
+
+    torch.testing.assert_close(contiguous_output, position_output)
+    grad = torch.randn_like(position_output)
+    position_output.backward(grad.clone())
+    contiguous_output.backward(grad.clone())
+    torch.testing.assert_close(contiguous_input.grad, position_input.grad)
+
+
+def _channel_permuting_rope_reference(x, cos, sin, emb_dim, rope_first, backward):
+    """fp32 result of the in-place kernels with ``remove_interleaving=False``.
+
+    The forward rotates the interleaved pairs of the RoPE channels and stores them as two halves;
+    the backward applies the transposed rotation to the halves and stores interleaved pairs.
+    ``cos`` and ``sin`` hold one row per input row.
+    """
+    out = x.to(torch.float32, copy=True)
+    rope = out[..., :emb_dim] if rope_first else out[..., -emb_dim:]
+    half = emb_dim // 2
+    cos = cos.float()[:, None, :]
+    sin = sin.float()[:, None, :]
+    if backward:
+        left, right = rope[..., :half], rope[..., half:]
+        x1 = left * cos[..., :half] + right * sin[..., half:]
+        x2 = right * cos[..., half:] - left * sin[..., :half]
+        rotated = torch.stack((x1, x2), dim=-1).flatten(-2)
+    else:
+        x1, x2 = rope[..., 0::2], rope[..., 1::2]
+        left = x1 * cos[..., :half] - x2 * sin[..., :half]
+        right = x2 * cos[..., half:] + x1 * sin[..., half:]
+        rotated = torch.cat((left, right), dim=-1)
+    rope.copy_(rotated)
+    return out
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("block_h", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize(
+    ("num_heads", "head_dim", "rope_first"),
+    [pytest.param(16, 192, False, id="mla-query"), pytest.param(32, 128, True, id="dsa-indexer")],
+)
+def test_mla_rope_inplace_channel_permutation_is_race_free(
+    monkeypatch, num_heads, head_dim, rope_first, block_h
+):
+    """In-place RoPE with ``remove_interleaving=False`` must not depend on thread timing.
+
+    The MLA query RoPE (``fused_apply_mla_rope_for_q``) and the DSA indexer RoPE
+    (``rope_first=True``) use this mode: the forward kernel rotates their inputs in place, and in
+    training the backward kernel un-rotates the incoming gradient in place. The forward kernel
+    loads interleaved pairs and stores halves of the same channels, and the backward kernel does
+    the reverse, so the stores of one thread overwrite values that other threads of the same
+    program load. Without a barrier in between, the backward kernel at BLOCK_H=2 returned wrong
+    values whenever its warps drifted apart, which many short packed sequences make likely (every
+    row first walks ``cu_seqlens_q``). The backward kernel is run in place and with ``out=``
+    aliasing its input (which also copies the leading channels), so both need the barrier. The
+    forward barrier cannot be caught here: with Triton 3.6 the forward kernel keeps every head
+    within one warp at BLOCK_H <= 2 and converts its layout through shared memory, with a
+    barrier, from BLOCK_H=4 on.
+    """
+    triton = pytest.importorskip("triton")
+    from megatron.core.fusions import fused_mla_yarn_rope_apply as rope_kernels
+
+    # A single-config autotuner runs that config without benchmarking.
+    for autotuner in (
+        rope_kernels._autotuned_mla_rope_fwd_inplace_kernel,
+        rope_kernels._autotuned_mla_rope_bwd_inplace_kernel,
+    ):
+        monkeypatch.setattr(autotuner, "configs", [triton.Config({"BLOCK_H": block_h})])
+        monkeypatch.setattr(autotuner, "cache", {})
+
+    emb_dim = 64
+    nope_dim = head_dim - emb_dim
+    seq_len, num_seqs = 64, 64
+    rows = seq_len * num_seqs
+    torch.manual_seed(1234)
+    cu_seqlens = torch.arange(0, rows + 1, seq_len, dtype=torch.int32, device="cuda")
+    freqs = torch.randn(seq_len, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().to(torch.bfloat16)
+    sin = freqs.sin().to(torch.bfloat16)
+    positions = torch.arange(rows, device="cuda") % seq_len
+    x = torch.randn(rows, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+
+    def unapply_into_input(t, *args, **kwargs):
+        return rope_kernels.mla_rope_unapply_raw(t, *args, out=t, **kwargs)
+
+    variants = (
+        ("forward", rope_kernels.fused_mla_rope_inplace, False),
+        ("backward", rope_kernels.mla_rope_unapply_raw, True),
+        ("backward into out=input", unapply_into_input, True),
+    )
+    for name, apply_rope, backward in variants:
+        expected = _channel_permuting_rope_reference(
+            x, cos[positions], sin[positions], emb_dim, rope_first, backward
+        )
+        first = None
+        for run in range(8):
+            out = apply_rope(
+                x.clone(),
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q=cu_seqlens,
+                rope_first=rope_first,
+            )
+            label = f"{name} run {run}"
+            torch.testing.assert_close(
+                out.float(),
+                expected,
+                msg=lambda msg: f"Mismatch in {label}: {msg}",
+                **dtype_tols(torch.bfloat16),
+            )
+            if first is None:
+                first = out
+            torch.testing.assert_close(
+                out, first, rtol=0, atol=0, msg=lambda msg: f"{label} differs from run 0: {msg}"
+            )
+
+
+def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False, num_heads=32):
     assert fused_mla_rope_kv_split is not None
-    num_heads = 32
     k_dim = 128
     v_dim = 128
     emb_dim = 64
+    _check_fused_mla_rope_kv_split(
+        input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+    )
+
+
+def _check_fused_mla_rope_kv_split(
+    input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+):
+    """Compare the fused key/value split, forward and backward, with the unfused PyTorch path."""
+    assert fused_mla_rope_kv_split is not None
     dtype = torch.bfloat16
     transformer_config = TransformerConfig(
         num_attention_heads=num_heads,
@@ -440,20 +930,338 @@ def test_mla_rope_concat_matches_native(layout, num_heads, dtype):
     torch.testing.assert_close(native_rope.grad.float(), fused_rope.grad.float(), **tols)
 
 
+# -------------------------------------------------------------------------------------------------
+# Partial head block coverage.
+#
+# Every kernel here is launched over cdiv(head_num, BLOCK_H) head programs, so a head count that
+# BLOCK_H does not divide leaves the final program covering head rows that do not exist. BLOCK_H is
+# autotuned over {1, 2, ..., 128} and the tuner may pick a divisor, so an awkward head count is not
+# enough on its own -- a run can pass without the partial block ever being built. The tests below
+# pin BLOCK_H instead, and each one spells out the head count and the head-block size it needs.
+# -------------------------------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _pinned_block_h(block_h):
+    """Leave every autotuned kernel one BLOCK_H (the head-block size) to choose from."""
+    kernels = [
+        fused_mla_rope_module._autotuned_mla_rope_fwd_inplace_kernel,
+        fused_mla_rope_module._autotuned_mla_rope_bwd_inplace_kernel,
+        fused_mla_rope_module._mla_rope_fwd_kv_split_kernel,
+        fused_mla_rope_module._mla_rope_bwd_kv_split_kernel,
+    ]
+    saved = [(kernel, kernel.configs, kernel.cache) for kernel in kernels]
+    try:
+        for kernel in kernels:
+            kernel.configs = [triton.Config({"BLOCK_H": block_h})]
+            kernel.cache = {}
+        yield
+    finally:
+        for kernel, configs, cache in saved:
+            kernel.configs = configs
+            kernel.cache = cache
+
+
+def _thd_rope_tables(cu_seqlens_list, emb_dim, dtype):
+    """cos/sin for a THD batch, plus the cu_seqlens tensor the kernels want."""
+    max_seqlen = max(b - a for a, b in zip(cu_seqlens_list, cu_seqlens_list[1:]))
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+    freqs, mscale = yarn_rope(max_seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+    cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device="cuda")
+    return cos, sin, cu_seqlens
+
+
+def _run_kv_split_once(block_h, remove_interleaving, num_heads, seed=1234):
+    """One seeded forward and backward of the KV-split path at a pinned BLOCK_H.
+
+    Returns the four tensors whose values must not depend on the tiling: both forward outputs, the
+    kv gradient, and the k_pos_emb gradient. The last one is the ``dEMB`` reduction, the one site in
+    this file where an out-of-range lane survives into the result instead of being dropped by a
+    masked store.
+    """
+    k_dim = v_dim = 128
+    emb_dim = 64
+    dtype = torch.bfloat16
+    cu_seqlens_list = [0, 27, 54, 99, 128]
+    total_seqlen = cu_seqlens_list[-1]
+    cos, sin, cu_seqlens = _thd_rope_tables(cu_seqlens_list, emb_dim, dtype)
+
+    torch.manual_seed(seed)
+    kv = torch.randn((total_seqlen, num_heads, k_dim + v_dim), dtype=dtype, device="cuda")
+    emb = torch.randn((total_seqlen, 1, emb_dim), dtype=dtype, device="cuda")
+    dk = torch.randn((total_seqlen, num_heads, k_dim + emb_dim), dtype=dtype, device="cuda")
+    dv = torch.randn((total_seqlen, num_heads, v_dim), dtype=dtype, device="cuda")
+    kv.requires_grad_(True)
+    emb.requires_grad_(True)
+
+    with _pinned_block_h(block_h):
+        k_out, v_out = fused_mla_rope_kv_split(
+            kv,
+            emb,
+            cos,
+            sin,
+            emb_dim,
+            k_dim,
+            v_dim,
+            cu_seqlens_kv=cu_seqlens,
+            remove_interleaving=remove_interleaving,
+        )
+        torch.autograd.backward((k_out, v_out), (dk, dv))
+
+    return k_out.detach(), v_out.detach(), kv.grad.clone(), emb.grad.clone()
+
+
+def _q_inplace_test_data(input_format, emb_dim):
+    num_heads = 32
+    q_dim = 128
+    total_seqlen = 128
+    generator = torch.Generator(device="cuda").manual_seed(617)
+    source = torch.randn(
+        (total_seqlen, num_heads, q_dim + emb_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+
+    if input_format == "sbhd":
+        batch_size = 2
+        seq_num = None
+        cu_seqlens = None
+        max_seqlen = total_seqlen // batch_size
+        token_idx = torch.arange(max_seqlen, device="cuda").repeat_interleave(batch_size)
+    else:
+        batch_size = None
+        cu_seqlens = torch.tensor([0, 27, 54, 99, 128], dtype=torch.int32, device="cuda")
+        seq_num = len(cu_seqlens) - 1
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        max_seqlen = max(lengths)
+        token_idx = torch.cat([torch.arange(length, device="cuda") for length in lengths])
+
+    angles = torch.randn(
+        (max_seqlen, 1, 1, emb_dim // 2), dtype=torch.float32, device="cuda", generator=generator
+    )
+    cos_half = torch.cos(angles)
+    sin_half = torch.sin(angles)
+    cos = torch.cat((cos_half, cos_half), dim=-1).to(torch.bfloat16)
+    sin = torch.cat((sin_half, sin_half), dim=-1).to(torch.bfloat16)
+    return source, cos, sin, token_idx, q_dim, batch_size, seq_num, cu_seqlens
+
+
+def _q_inplace_torch_reference(source, cos, sin, token_idx, q_dim, direction):
+    expected = source.clone()
+    rotary = source[..., q_dim:].float()
+    emb_dim = rotary.shape[-1]
+    half = emb_dim // 2
+    token_cos = cos.view(-1, emb_dim)[token_idx].unsqueeze(1).float()
+    token_sin = sin.view(-1, emb_dim)[token_idx].unsqueeze(1).float()
+
+    if direction == "forward":
+        x_1, x_2 = rotary[..., 0::2], rotary[..., 1::2]
+        left = x_1 * token_cos[..., :half] - x_2 * token_sin[..., :half]
+        right = x_2 * token_cos[..., half:] + x_1 * token_sin[..., half:]
+        converted = torch.cat((left, right), dim=-1)
+    else:
+        left, right = rotary[..., :half], rotary[..., half:]
+        x_1 = left * token_cos[..., :half] + right * token_sin[..., half:]
+        x_2 = -left * token_sin[..., :half] + right * token_cos[..., half:]
+        converted = torch.empty_like(rotary)
+        converted[..., 0::2] = x_1
+        converted[..., 1::2] = x_2
+
+    expected[..., q_dim:] = converted.to(source.dtype)
+    return expected
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("remove_interleaving", [False, True])
+class TestFusedMLARopePartialHeadBlock:
+    @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_inplace_matches_unfused_reference(self, input_format, inverse, remove_interleaving):
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
+        with _pinned_block_h(block_heads_partial):
+            _test_fused_mla_rope_inplace(
+                input_format,
+                inverse=inverse,
+                remove_interleaving=remove_interleaving,
+                num_heads=num_heads,
+            )
+
+    @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+    def test_kv_split_matches_unfused_reference(self, input_format, remove_interleaving):
+        """Covers the forward outputs, the kv gradient and the k_pos_emb (``dEMB``) gradient."""
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
+        with _pinned_block_h(block_heads_partial):
+            _test_fused_mla_rope_kv_split(
+                input_format, remove_interleaving=remove_interleaving, num_heads=num_heads
+            )
+
+    def test_kv_split_result_does_not_depend_on_block_size(self, remove_interleaving):
+        """BLOCK_H is a tiling choice, so it must not change one bit of the result.
+
+        This needs no reference implementation, which is what makes it a sharper check than the
+        tolerance-based comparisons above: a lane that a mask should have excluded shows up as a
+        difference between two block sizes whatever value the hardware happened to give it.
+        """
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
+        block_heads_exact = 4  # 12 % 4 == 0: every program is full. Same arithmetic, no partial.
+        partial = _run_kv_split_once(block_heads_partial, remove_interleaving, num_heads)
+        exact = _run_kv_split_once(block_heads_exact, remove_interleaving, num_heads)
+        for name, from_partial, from_exact in zip(("k", "v", "d_kv", "d_emb"), partial, exact):
+            torch.testing.assert_close(
+                from_partial,
+                from_exact,
+                rtol=0,
+                atol=0,
+                msg=lambda msg, name=name: f"{name} depends on BLOCK_H: {msg}",
+            )
+
+    def test_inplace_does_not_write_past_the_tensor(self, remove_interleaving):
+        """The rotated tensor is a view of the head of a larger buffer whose tail is poisoned.
+
+        ``stride_x_seq == head_num * stride_x_nheads``, so the head rows the final program covers
+        but does not own are the next token's leading heads -- and, for the last token, memory past
+        the end of the tensor. The poisoned tail is where an unmasked store lands.
+        """
+        num_heads = 12  # Deliberately not a power of two.
+        block_heads_partial = 8  # 12 % 8 == 4: the second of two programs is partial.
+        nope_dim = 128
+        emb_dim = 64
+        dtype = torch.bfloat16
+        cu_seqlens_list = [0, 27, 54, 99, 128]
+        total_seqlen = cu_seqlens_list[-1]
+        cos, sin, cu_seqlens = _thd_rope_tables(cu_seqlens_list, emb_dim, dtype)
+
+        # One guard token row already exceeds the four head rows the partial block over-covers.
+        guard_rows = 2
+        buffer = torch.randn(
+            (total_seqlen + guard_rows, num_heads, nope_dim + emb_dim), dtype=dtype, device="cuda"
+        )
+        guard_before = buffer[total_seqlen:].clone()
+        rotated = buffer[:total_seqlen]
+        assert rotated.stride() == buffer.stride()
+
+        with _pinned_block_h(block_heads_partial), torch.no_grad():
+            fused_mla_rope_inplace(
+                rotated,
+                cos,
+                sin,
+                nope_dim,
+                emb_dim,
+                cu_seqlens_q=cu_seqlens,
+                remove_interleaving=remove_interleaving,
+            )
+
+        overflow = int((buffer[total_seqlen:] != guard_before).sum())
+        assert overflow == 0, (
+            f"{overflow} element(s) written past the end of the tensor: the partial final head "
+            f"block (head_num={num_heads}, BLOCK_H={block_heads_partial}) stored to head rows it "
+            f"does not own"
+        )
+
+
+@pytest.mark.skipif(not HAVE_TRITON, reason="Triton not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+@pytest.mark.parametrize(
+    "direction,emb_dim,block_h,num_warps,repeats",
+    [("forward", 128, 1, 8, 200), ("backward", 64, 2, 4, 100)],
+    ids=["forward-multi-warp", "backward-multi-warp"],
+)
+def test_rotary_q_inplace_conversion_loads_before_stores(
+    input_format, direction, emb_dim, block_h, num_warps, repeats
+) -> None:
+    """Validate a single-warp control, then require exact multi-warp reproducibility."""
+    source, cos, sin, token_idx, q_dim, batch_size, seq_num, cu_seqlens = _q_inplace_test_data(
+        input_format, emb_dim
+    )
+    expected = _q_inplace_torch_reference(source, cos, sin, token_idx, q_dim, direction)
+    kernel = _mla_rope_fwd_inplace_kernel if direction == "forward" else _mla_rope_bwd_kernel
+
+    def launch(launch_block_h, launch_num_warps):
+        actual = source.clone()
+        grid = (source.shape[0], triton.cdiv(source.shape[1], launch_block_h))
+        tensor_args = (actual,) if direction == "forward" else (actual, actual)
+        backward_kwargs = {} if direction == "forward" else {"COPY_NOPE": False, "BLOCK_NOPE": 1}
+        kernel[grid](
+            *tensor_args,
+            cos,
+            sin,
+            q_dim,
+            emb_dim,
+            source.shape[1],
+            batch_size,
+            seq_num,
+            cu_seqlens,
+            None,
+            0,
+            actual.stride(0),
+            actual.stride(1),
+            cos.stride(0),
+            sin.stride(0),
+            0,
+            1,
+            INVERSE=False,
+            REMOVE_INTERLEAVING=False,
+            ROPE_FIRST=False,
+            HAS_THD_GLOBAL_START=False,
+            BLOCK_H=launch_block_h,
+            num_warps=launch_num_warps,
+            num_stages=3,
+            **backward_kwargs,
+        )
+        return actual
+
+    control = launch(1, 1)
+    torch.testing.assert_close(control.float(), expected.float(), **dtype_tols(source.dtype))
+    for _ in range(repeats):
+        actual = launch(block_h, num_warps)
+        torch.testing.assert_close(actual, control, rtol=0, atol=0)
+
+
 @pytest.mark.experimental
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
-class TestFusedApplyMLARope:
+class TestFusedMLARope:
     @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize("rope_first", [False, True], ids=["nope-first", "rope-first"])
     def test_forward_backward_for_q(self, input_format, rope_first):
         _test_fused_mla_rope_inplace(input_format, rope_first=rope_first)
 
+    @pytest.mark.parametrize("inverse", [False, True])
     @pytest.mark.parametrize("remove_interleaving", [False, True])
-    def test_kv_split_forward_backward(self, input_format, remove_interleaving):
-        _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)
+    def test_inplace_forward_backward(self, input_format, inverse, remove_interleaving):
+        _test_fused_mla_rope_inplace(
+            input_format, inverse=inverse, remove_interleaving=remove_interleaving
+        )
+
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    @pytest.mark.parametrize(
+        ("num_heads", "k_dim", "v_dim", "emb_dim"),
+        [
+            # GLM-5 at TP 8: qk_head_dim 192, v_head_dim 256, qk_pos_emb_head_dim 64.
+            pytest.param(8, 192, 256, 64, id="glm5-tp8"),
+            # Key, value and rotary half (24 pairs) all padded.
+            pytest.param(4, 96, 160, 48, id="k96-v160-rope48"),
+        ],
+    )
+    def test_kv_split_non_power_of_two_head_dims(
+        self, input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+    ):
+        """The key/value split must handle head dims that are not powers of two."""
+        _check_fused_mla_rope_kv_split(
+            input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
+        )
 
 
 @pytest.mark.experimental
@@ -533,6 +1341,47 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)
     torch.testing.assert_close(source.grad, saved_reference, rtol=0, atol=0)
 
 
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+def test_legacy_query_api_remains_in_place(input_format):
+    """The legacy API keeps its original mutation behavior and allocation profile."""
+    assert fused_apply_mla_rope_for_q is not None
+    seqlen = 32
+    batch_size = 1
+    num_heads = 2
+    nope_dim = 16
+    emb_dim = 64
+    dtype = torch.bfloat16
+
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    freqs, mscale = yarn_rope(seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+
+    if input_format == "sbhd":
+        shape = (seqlen, batch_size, num_heads, nope_dim + emb_dim)
+        cu_seqlens = None
+    else:
+        shape = (2 * seqlen, num_heads, nope_dim + emb_dim)
+        cu_seqlens = torch.tensor([0, seqlen, 2 * seqlen], dtype=torch.int32, device="cuda")
+
+    query = torch.randn(shape, dtype=dtype, device="cuda")
+    reference = query.clone()
+    expected = fused_mla_rope_inplace(
+        reference.clone(), cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens
+    )
+    output = fused_apply_mla_rope_for_q(
+        query, cos, sin, qk_head_dim=nope_dim, emb_dim=emb_dim, cu_seqlens_q=cu_seqlens
+    )
+
+    assert output.data_ptr() == query.data_ptr()
+    assert not torch.equal(query, reference)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 class TestApplyRotaryPosEmbMlaFusionConflict:
     """Test apply_rotary_pos_emb: mla_rotary_interleaved vs apply_rope_fusion conflict."""
 
@@ -587,3 +1436,19 @@ class TestApplyRotaryPosEmbMlaFusionConflict:
             call_kw = unfused_spy.call_args[1]
             assert call_kw["mla_rotary_interleaved"] is True
         assert out.shape == t.shape
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("input_format", ["sbhd", "thd"])
+class TestFusedApplyMLARope:
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.parametrize("rope_first", [False, True], ids=["nope-first", "rope-first"])
+    def test_forward_backward_for_q(self, input_format, rope_first):
+        _test_fused_mla_rope_inplace(input_format, rope_first=rope_first)
+
+    @pytest.mark.parametrize("remove_interleaving", [False, True])
+    def test_kv_split_forward_backward(self, input_format, remove_interleaving):
+        _test_fused_mla_rope_kv_split(input_format, remove_interleaving=remove_interleaving)

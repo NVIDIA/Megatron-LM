@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
+    CheckpointWithoutOutputManager,
     MHCCheckpointManager,
     get_all_rng_states,
     get_cuda_rng_tracker,
@@ -76,7 +77,7 @@ class TestHyperConnectionCheckpoint:
         module = self._create_hyper_connection_module(hidden_size=4, num_residual_streams=2)
         hidden_states = torch.empty(0, 1, 8, device='cuda', requires_grad=True)
 
-        aggregated, h_res, h_post, residual = module(hidden_states)
+        aggregated, h_res, h_post, residual = module(hidden_states, return_residual=True)
 
         assert aggregated.shape == (0, 1, 4)
         assert h_res.shape == (0, 1, 2, 2)
@@ -223,7 +224,7 @@ class TestHyperConnectionCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         aggregated_ref, h_res_ref, h_post_ref, _ = module.forward(
-            hidden_states, mhc_recompute_manager=None
+            hidden_states, mhc_recompute_manager=None, return_residual=True
         )
         loss_ref = aggregated_ref.sum() + h_res_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
@@ -234,7 +235,7 @@ class TestHyperConnectionCheckpoint:
         torch.cuda.manual_seed(42)
         manager = MHCCheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
-            hidden_states_ckpt, mhc_recompute_manager=manager
+            hidden_states_ckpt, mhc_recompute_manager=manager, return_residual=True
         )
         loss_ckpt = aggregated_ckpt.sum() + h_res_ckpt.sum() + h_post_ckpt.sum()
 
@@ -301,7 +302,9 @@ class TestMHCBlockRecomputeIntegration:
         h = hidden_states_ref
         r = residual_ref
         for module in modules:
-            agg, h_res, h_post, _ = module.forward(h, mhc_recompute_manager=None)
+            agg, h_res, h_post, _ = module.forward(
+                h, mhc_recompute_manager=None, return_residual=True
+            )
             agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=None)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
@@ -321,7 +324,9 @@ class TestMHCBlockRecomputeIntegration:
         h = hidden_states_ckpt
         r = residual_ckpt
         for module in modules:
-            agg, h_res, h_post, _ = module.forward(h, mhc_recompute_manager=manager)
+            agg, h_res, h_post, _ = module.forward(
+                h, mhc_recompute_manager=manager, return_residual=True
+            )
             agg, _ = module.apply_h_post((0.1 * agg, None), h_post, manager=manager)
             mixed = module.apply_h_res(h_res, r)  # Apply h_res to get mixed [s, b, n*C]
             h = agg + mixed
@@ -380,7 +385,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         aggregated_ref, h_res_ref, h_post_ref, _ = module.forward(
-            hidden_states_ref, mhc_recompute_manager=None
+            hidden_states_ref, mhc_recompute_manager=None, return_residual=True
         )
         aggregated_ref, _ = module.apply_h_post(
             (0.1 * aggregated_ref, None), h_post_ref, manager=None
@@ -399,7 +404,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.cuda.manual_seed(42)
         manager = MHCCheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
-            hidden_states_ckpt, mhc_recompute_manager=manager
+            hidden_states_ckpt, mhc_recompute_manager=manager, return_residual=True
         )
 
         aggregated_ckpt, _ = module.apply_h_post(
@@ -444,6 +449,24 @@ class TestTransformerConfigRecomputeMhc:
         assert "mhc" in config.recompute_modules
         assert config.enable_hyper_connections is True
 
+    @pytest.mark.parametrize(
+        "extra_kwargs, error_type, match",
+        [
+            ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
+            ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
+        ],
+    )
+    def test_legacy_config_rejects_unsupported_combinations(self, extra_kwargs, error_type, match):
+        """Unsupported mHC combinations must fail at config time, not mid-forward."""
+        with pytest.raises(error_type, match=match):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_hyper_connections=True,
+                **extra_kwargs,
+            )
+
     def test_config_accepts_initial_attention_only_te_graph_split(self):
         config = TransformerConfig(
             num_layers=2,
@@ -457,6 +480,53 @@ class TestTransformerConfigRecomputeMhc:
             cuda_graph_modules=[CudaGraphModule.attn],
         )
         assert config.cuda_graph_modules == [CudaGraphModule.attn]
+
+    @pytest.mark.parametrize("packed", [False, True])
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    @pytest.mark.parametrize(
+        "recompute_modules", [["mhc"], ["mhc", "mla_up_proj"], ["mla_up_proj", "mhc"]]
+    )
+    def test_config_enables_mhc_split_with_optional_mla_recompute(
+        self, is_hybrid_model, recompute_modules, packed, monkeypatch
+    ):
+        packing_kwargs = {}
+        if packed:
+            import megatron.core.transformer.transformer_config as config_module
+
+            monkeypatch.setattr(config_module, "is_te_min_version", lambda _version: True)
+            packing_kwargs = dict(
+                sequence_packing_scheduler="dp_balanced",
+                max_seqlen_per_dp_cp_rank=32,
+                thd_max_packed_sequences=2,
+                pad_packed_seq_alignment="max",
+            )
+        config = TransformerConfig(
+            **self._mhc_recompute_config_kwargs(
+                is_hybrid_model=is_hybrid_model,
+                multi_latent_attention=True,
+                recompute_modules=recompute_modules,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.attn],
+                mhc_recompute_attn_cuda_graph_split=True,
+                **packing_kwargs,
+            )
+        )
+        assert uses_mhc_recompute_attn_cuda_graph_split(config)
+
+    @pytest.mark.parametrize("extra_module", ["core_attn", "layernorm"])
+    def test_config_split_rejects_other_recompute_modules(self, extra_module):
+        with pytest.raises(ValueError, match="recompute_modules"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    recompute_modules=["mhc", "mla_up_proj", extra_module],
+                    multi_latent_attention=True,
+                    cuda_graph_impl="transformer_engine",
+                    cuda_graph_modules=[CudaGraphModule.attn],
+                    mhc_recompute_attn_cuda_graph_split=True,
+                    hidden_dropout=0.0,
+                    attention_dropout=0.0,
+                )
+            )
 
     @pytest.mark.parametrize(
         ("cuda_graph_modules", "recompute_modules"),
@@ -738,6 +808,70 @@ class TestTransformerConfigRecomputeMhc:
         with pytest.warns(UserWarning, match="HybridStack"):
             HyperConnectionHybridLayer(config, types.SimpleNamespace(layer_number=1))
 
+    @pytest.mark.parametrize("vp_size", [None, 2])
+    def test_config_accepts_pipeline_parallel(self, vp_size):
+        """PP/VPP now carries the complete mHC residual stream width."""
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=vp_size,
+            pipeline_dtype=torch.bfloat16,
+        )
+        assert config.enable_mhc_connections
+
+    def test_config_rejects_fp32_residual_connection(self):
+        """The mHC residual is the n-stream tensor fed to the H_res bmm."""
+        with pytest.raises(NotImplementedError, match="fp32_residual_connection"):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_mhc_connections=True,
+                fp32_residual_connection=True,
+            )
+
+    def test_config_accepts_full_activation_recompute(self):
+        """Retained dev checkpointed_forward supports full mHC layer recomputation."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+        assert config.enable_mhc_connections
+        assert config.recompute_granularity == "full"
+        assert config.recompute_method == "uniform"
+        assert config.recompute_num_layers == 1
+
+    @pytest.mark.parametrize(
+        "extra_kwargs, error_type, match",
+        [
+            (
+                {"inference_fuse_tp_communication": True},
+                NotImplementedError,
+                "inference_fuse_tp_communication",
+            ),
+            ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
+            ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
+        ],
+    )
+    def test_config_rejects_unsupported_combinations(self, extra_kwargs, error_type, match):
+        """Unsupported mHC combinations must fail at config time, not mid-forward."""
+        with pytest.raises(error_type, match=match):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_mhc_connections=True,
+                **extra_kwargs,
+            )
+
 
 class TestCheckpointRngReplay:
     """Recompute must replay forward-time RNG (dropout masks) for every tracker kind.
@@ -848,7 +982,9 @@ class TestCheckpointRecomputeUnderFullGraphCapture:
 
         def run_step(x):
             manager = MHCCheckpointManager()
-            aggregated, _h_res, h_post, _residual = module.forward(x, mhc_recompute_manager=manager)
+            aggregated, _h_res, h_post, _residual = module.forward(
+                x, mhc_recompute_manager=manager, return_residual=True
+            )
             loss = aggregated.square().mean() + h_post.square().mean()
             manager.discard_all_outputs_and_register_unified_recompute(loss)
             loss.backward()
@@ -910,3 +1046,214 @@ class TestCheckpointRecomputeUnderFullGraphCapture:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestHyperConnectionModuleCheckpoint:
+    """Test HyperConnectionModule checkpoint functionality."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_hyper_connection_module(self, hidden_size=64, mhc_num_residual_streams=4):
+        """Create a HyperConnectionModule for testing."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=mhc_num_residual_streams,
+            mhc_sinkhorn_iterations=5,  # Fewer iterations for faster tests
+            mhc_init_gating_factor=0.01,
+        )
+        module = HyperConnectionModule(config=config, layer_number=1)
+        module.cuda()
+        return module
+
+    def test_apply_h_res_uses_h_res_transpose(self):
+        """apply_h_res should compute H_res.T @ residual."""
+        module = self._create_hyper_connection_module(hidden_size=4, mhc_num_residual_streams=2)
+        h_res = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], device='cuda')
+        residual = torch.tensor([[[10.0, 100.0, 3.0, 4.0, 1.0, 2.0, 5.0, 6.0]]], device='cuda')
+        expected = torch.tensor(
+            [[[13.0, 106.0, 18.0, 22.0, 24.0, 208.0, 26.0, 32.0]]], device='cuda'
+        )
+
+        mixed = module.apply_h_res(h_res, residual)
+
+        torch.testing.assert_close(mixed, expected, atol=0.0, rtol=0.0)
+
+    def test_forward_preserves_three_tuple_api_and_hybrid_can_request_residual(self):
+        module = self._create_hyper_connection_module(hidden_size=8, mhc_num_residual_streams=2)
+        hidden_states = torch.randn(4, 1, 16, device='cuda', requires_grad=True)
+
+        compatible_output = module(hidden_states)
+        hybrid_output = module(hidden_states, return_residual=True)
+
+        assert len(compatible_output) == 3
+        assert len(hybrid_output) == 4
+        for compatible, hybrid in zip(compatible_output, hybrid_output[:3]):
+            torch.testing.assert_close(compatible, hybrid)
+        assert hybrid_output[3].shape == hidden_states.shape
+
+    def test_forward_normal_vs_checkpoint_correctness(self):
+        """
+        Test that _forward_with_checkpoint produces the same outputs as _forward_normal.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        module = self._create_hyper_connection_module(hidden_size, num_streams)
+
+        # Create input tensors
+        hidden_states = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+        )
+        residual = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+        )
+
+        # Clone inputs for comparison
+        hidden_states_ckpt = hidden_states.detach().clone().requires_grad_(True)
+        residual_ckpt = residual.detach().clone().requires_grad_(True)
+
+        # Forward without checkpoint (reference)
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
+        mixed_ref = module.apply_h_res(h_res_ref, residual)
+        loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
+        loss_ref.backward()
+        grad_hidden_ref = hidden_states.grad.clone()
+        grad_residual_ref = residual.grad.clone()
+
+        # Forward with checkpoint
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        manager = CheckpointWithoutOutputManager()
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
+            module._forward_with_checkpoint(hidden_states_ckpt, manager)
+        )
+        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
+        # Calculate loss before discarding outputs
+        loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
+
+        # Register unified recompute hook
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+
+        # Backward pass
+        loss_ckpt.backward()
+        grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
+        grad_residual_ckpt = residual_ckpt.grad.clone()
+
+        # Verify gradients match
+        assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5), (
+            f"Hidden states gradients mismatch:\n"
+            f"Checkpoint: {grad_hidden_ckpt}\n"
+            f"Reference: {grad_hidden_ref}"
+        )
+        assert torch.allclose(grad_residual_ckpt, grad_residual_ref, atol=1e-5), (
+            f"Residual gradients mismatch:\n"
+            f"Checkpoint: {grad_residual_ckpt}\n"
+            f"Reference: {grad_residual_ref}"
+        )
+
+    def test_apply_h_post_with_checkpoint(self):
+        """
+        Test that apply_h_post with manager produces correct gradients.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        module = self._create_hyper_connection_module(hidden_size, num_streams)
+
+        # Create input tensors
+        x = torch.randn(seq_len, batch_size, hidden_size, device='cuda', requires_grad=True)
+        bias = torch.randn(hidden_size, device='cuda')
+        h_post = torch.randn(seq_len, batch_size, num_streams, device='cuda', requires_grad=True)
+
+        # Clone inputs
+        x_ckpt = x.detach().clone().requires_grad_(True)
+        h_post_ckpt = h_post.detach().clone().requires_grad_(True)
+
+        # Reference: without checkpoint (manager=None)
+        torch.manual_seed(42)
+        x_out_ref, bias_out_ref = module.apply_h_post((x, bias), h_post, manager=None)
+        loss_ref = x_out_ref.sum()
+        if bias_out_ref is not None:
+            loss_ref = loss_ref + bias_out_ref.sum()
+        loss_ref.backward()
+        grad_x_ref = x.grad.clone()
+        grad_h_post_ref = h_post.grad.clone()
+
+        # With checkpoint (manager provided)
+        torch.manual_seed(42)
+        manager = CheckpointWithoutOutputManager()
+        x_out_ckpt, bias_out_ckpt = module.apply_h_post(
+            (x_ckpt, bias), h_post_ckpt, manager=manager
+        )
+        loss_ckpt = x_out_ckpt.sum()
+        if bias_out_ckpt is not None:
+            loss_ckpt = loss_ckpt + bias_out_ckpt.sum()
+
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        loss_ckpt.backward()
+        grad_x_ckpt = x_ckpt.grad.clone()
+        grad_h_post_ckpt = h_post_ckpt.grad.clone()
+
+        # Verify gradients
+        assert torch.allclose(grad_x_ckpt, grad_x_ref, atol=1e-5)
+        assert torch.allclose(grad_h_post_ckpt, grad_h_post_ref, atol=1e-5)
+
+    def test_forward_with_manager_parameter(self):
+        """
+        Test forward() method with mhc_recompute_manager parameter.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        module = self._create_hyper_connection_module(hidden_size, num_streams)
+
+        # Create input tensors
+        hidden_states = torch.randn(
+            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+        )
+
+        # Clone inputs
+        hidden_states_ckpt = hidden_states.detach().clone().requires_grad_(True)
+
+        # Reference: forward without manager (uses _forward_normal)
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        aggregated_ref, h_res_ref, h_post_ref = module.forward(
+            hidden_states, mhc_recompute_manager=None
+        )
+        loss_ref = aggregated_ref.sum() + h_res_ref.sum() + h_post_ref.sum()
+        loss_ref.backward()
+        grad_hidden_ref = hidden_states.grad.clone()
+
+        # With manager (uses _forward_with_checkpoint)
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        manager = CheckpointWithoutOutputManager()
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
+            hidden_states_ckpt, mhc_recompute_manager=manager
+        )
+        loss_ckpt = aggregated_ckpt.sum() + h_res_ckpt.sum() + h_post_ckpt.sum()
+
+        manager.discard_all_outputs_and_register_unified_recompute(loss_ckpt)
+        loss_ckpt.backward()
+        grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
+
+        # Verify gradients match
+        assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)

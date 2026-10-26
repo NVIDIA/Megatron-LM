@@ -32,7 +32,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -40,6 +40,10 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_collective,
+)
+from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -190,6 +194,11 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         if self.ep_size == 1:
             if self._runs_metadata_sync:
                 InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
+                # local_tokens * ep_size, with ep_size == 1; see the matching
+                # comment in NVLSAllGatherVDispatcher.token_dispatch.
+                InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = hidden_states.shape[
+                    0
+                ]
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -313,6 +322,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _step_metadata: Optional[torch.Tensor] = None  # [3] int32
     _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
+    # [1] int32 view onto context.gpu_view.real_token_count. Fixed GPU address;
+    # written each step by the context's transfer_bookkeeping_to_gpu(). Holds the
+    # real (unpadded) local token count so the dispatcher can mask routing for
+    # CUDA-graph padding tokens. Wired once by the context after gpu_view init.
+    _real_token_count_tensor: Optional[torch.Tensor] = None
+
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
     # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32.
     _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
@@ -325,6 +340,31 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """Return the RSV symmetric buffer tensor so mcore_fused_moe can write
         unpermute output directly into it, avoiding a copy before RSV."""
         return cls._symm_rsv["tensor"] if cls._symm_rsv is not None else None
+
+    @classmethod
+    def set_real_token_count_tensor(cls, tensor: torch.Tensor) -> None:
+        """Bind the context's GPU real-token-count tensor on the dispatcher class.
+
+        Called once by DynamicInferenceContext after gpu_view is initialised.
+        The tensor is a fixed-address int32[1] view whose value is refreshed
+        each step by transfer_bookkeeping_to_gpu().
+        """
+        cls._real_token_count_tensor = tensor
+
+    @classmethod
+    def modify_real_token_count_for_mtp(cls, mtp_token_count: int) -> None:
+        """Override the routing-mask token count for an MTP forward.
+
+        Each step the context publishes batch_dimensions.token_count into the
+        bound tensor. MTP forwards are request-count shaped, so the controller
+        calls this before an MTP forward to point the mask at the MTP row count
+        instead.
+        """
+        assert cls._real_token_count_tensor is not None, (
+            "real-token-count tensor not wired; DynamicInferenceContext must "
+            "call set_real_token_count_tensor first"
+        )
+        cls._real_token_count_tensor.fill_(mtp_token_count)
 
     @classmethod
     def _rank_token_offset(cls) -> torch.Tensor:
@@ -343,6 +383,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._symm_agv_probs = None
         cls._symm_rsv = None
         cls._symm_metadata = None
+        cls._real_token_count_tensor = None
 
     @classmethod
     def allocate_buffers(
@@ -433,13 +474,14 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def update_metadata(self, local_tokens: int) -> None:
         """Per-step metadata update; invoked from the first instance's token_dispatch.
 
-        Fires the fused NVLS allgather+reduce to publish
-        [valid_tokens, rank_token_offset, ep_max_tokens] into _step_metadata, then
-        (for FlashInfer) pre-masks the routing buffer with -1 so rows beyond
-        valid_tokens are ignored by the GEMM; the AGV below overwrites
-        [0, valid_tokens) in-place.
+        For FlashInfer, first masks the routing buffer with -1 so rows beyond
+        valid_tokens are ignored by the GEMM. The fused NVLS metadata update then
+        provides the cross-rank fence which prevents a late local clear from erasing
+        an early peer AGV write. The AGV overwrites [0, valid_tokens) in-place.
         """
         cls = NVLSAllGatherVDispatcher
+        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
+            cls._symm_agv_routing["tensor"].fill_(-1)
         fused_metadata_update(
             local_tokens=local_tokens,
             local_buf=cls._symm_metadata["tensor"],
@@ -447,8 +489,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             step_metadata=cls._step_metadata,
         )
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
-        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
-            cls._symm_agv_routing["tensor"].fill_(-1)
 
     def __init__(
         self,
@@ -466,6 +506,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
+        # Rank inside pg_collection.tp — the *standard* TP group that SP shards
+        # the routing map along. Base class self.tp_rank is the expt_tp rank,
+        # which is not what we want for the SP padding offset.
+        self.sp_rank = get_pg_rank(pg_collection.tp)
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
         # When shared_expert_overlap is enabled, the shared expert forward is launched
@@ -516,9 +560,36 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             (hidden_states, probs) gathered to [global_max, *] shape.
             Also updates self.routing_map to [global_max, topk] int64.
         """
+        # Mask out CUDA-graph padding rows of the local routing map so padding
+        # tokens route to no expert. At ep_size > 1 this also makes the AGV
+        # propagate -1 into agv_r for those slots. _real_token_count_tensor is
+        # wired by the context and holds the *global* unpadded token count, so
+        # we pass self.sp_rank to shift local rows into the global frame for the
+        # comparison. When unset (standalone dispatcher use without a context)
+        # all rows are real, so skip the mask.
+        #
+        # Runs before the ep_size == 1 early-out: the padding rows are just as
+        # real at ep_size == 1, and leaving them unmasked sends every one of
+        # them through a full expert GEMM. That is correct -- the results are
+        # discarded downstream -- but it scales the MoE cost with the CUDA-graph
+        # bucket rather than the live batch, which is most of the bucket
+        # whenever the batch is draining.
+        if self.__class__._real_token_count_tensor is not None:
+            mask_routing_padding(
+                self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+            )
+
         if self.ep_size == 1:
             if self._runs_metadata_sync:
                 InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
+                # local_tokens * ep_size, with ep_size == 1. Set explicitly
+                # rather than left to vllm_fused_moe's `else max_tokens`
+                # fallback: that fallback sizes the launch config and grid from
+                # whatever buffer it was handed, which is the contract this hint
+                # exists to avoid relying on.
+                InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = hidden_states.shape[
+                    0
+                ]
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -568,9 +639,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
+        In batch-invariant mode, the symmetric RSV buffer is still used for data
+        visibility, but the rank reduction is an explicit fp32 rank-order loop
+        rather than a hardware multimem reduction.
+
         Args:
-            hidden_states: [global_max, hidden_size] expert outputs (fp32 when
-                written directly to the RSV buffer, bf16 otherwise).
+            hidden_states: [global_max, hidden_size] expert outputs (fp32
+                when written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
@@ -588,7 +663,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        multimem_reduce_scatter_v(
+        use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        # Under batch-invariant mode the "multimem" option keeps the native
+        # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
+        # bitwise-equal to an fp64 reference), deterministic and
+        # batch-invariant; "ordered" (default) uses the explicit fixed
+        # rank-order fp32 kernel, deterministic by construction anywhere.
+        reduce_scatter_v = (
+            batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
+        )
+        reduce_scatter_v(
             output,
             rsv["tensor"],
             rsv["handle"],

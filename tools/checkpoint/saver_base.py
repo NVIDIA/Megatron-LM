@@ -6,7 +6,7 @@ from importlib.metadata import version
 
 import torch
 from packaging.version import Version as PkgVersion
-from utils import _ConverterFakeProcessGroup, chunk_bias, chunk_weight
+from utils import chunk_bias, chunk_weight, initialize_checkpoint_converter_fake_process_groups
 
 
 class MegatronCheckpointSaverBase:
@@ -68,6 +68,10 @@ class MegatronCheckpointSaverBase:
                 'expert_model_parallel_size',
                 'world_size',
                 'params_dtype',
+                'tensor_parallel_num_weight_shards',
+                'gtp_weight_remat_size',
+                'expert_tensor_parallel_num_weight_shards',
+                'expert_gtp_weight_remat_size',
                 'num_layers_per_virtual_pipeline_stage',
                 'virtual_pipeline_model_parallel_size',
                 'masked_softmax_fusion',
@@ -164,22 +168,30 @@ class MegatronCheckpointSaverBase:
         """
         try:
             from megatron.core import mpu
-            from megatron.training.global_vars import get_args, set_global_variables
+            from megatron.training.argument_utils import inference_cfg_container_from_args
+            from megatron.training.global_vars import (
+                get_args,
+                get_train_state,
+                set_global_variables,
+            )
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
-        set_global_variables(self.margs, build_tokenizer=self.build_tokenizer)
+        cfg = inference_cfg_container_from_args(self.margs, build_model_config=False)
+        set_global_variables(self.margs, cfg, build_tokenizer=self.build_tokenizer)
 
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
 
+        train_state = get_train_state()
+        train_state.iteration = self.md.iteration
         if hasattr(self.md, 'consumed_train_samples'):
-            self.margs.consumed_train_samples = self.md.consumed_train_samples
-            self.margs.consumed_valid_samples = self.md.consumed_valid_samples
+            train_state.consumed_train_samples = self.md.consumed_train_samples
+            train_state.consumed_valid_samples = self.md.consumed_valid_samples
             print(
-                f"Setting consumed_train_samples to {self.margs.consumed_train_samples}"
-                f" and consumed_valid_samples to {self.margs.consumed_valid_samples}"
+                f"Setting consumed_train_samples to {train_state.consumed_train_samples}"
+                f" and consumed_valid_samples to {train_state.consumed_valid_samples}"
             )
         else:
             print("consumed_train_samples not provided.")
@@ -202,19 +214,12 @@ class MegatronCheckpointSaverBase:
         mpu.set_pipeline_model_parallel_rank(0)
         mpu.set_expert_model_parallel_rank(0)
 
-        # For backward compatibility during local parallel states refactoring
-        fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
-        fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
-        fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
-        fake_dp_group = _ConverterFakeProcessGroup(size=1)
-        fake_dp_ep_group = _ConverterFakeProcessGroup(size=1)
-        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
-        mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
-        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
-        mpu._DATA_PARALLEL_GROUP = fake_dp_group
-        mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
-        mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
-        mpu._EXPERT_DATA_PARALLEL_GROUP = fake_dp_ep_group
+        initialize_checkpoint_converter_fake_process_groups(
+            mpu,
+            self.args.target_tensor_parallel_size,
+            self.args.target_pipeline_parallel_size,
+            self.args.target_expert_parallel_size,
+        )
 
         try:
             import torch_llm_debug_tools
@@ -410,11 +415,13 @@ class MegatronCheckpointSaverBase:
         """
         try:
             from megatron.core import mpu
+            from megatron.training import get_train_state
             from megatron.training.checkpointing import save_checkpoint
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        train_state = get_train_state()
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
@@ -422,7 +429,7 @@ class MegatronCheckpointSaverBase:
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
                     save_checkpoint(
-                        self.md.iteration,
+                        train_state.iteration,
                         [self.get_local_model(pp_rank, ep_rank, tp_rank)],
                         None,
                         None,
@@ -602,10 +609,19 @@ class MegatronCheckpointSaverBase:
                             "mlp_norm_weight": post_norm_weight,
                         }
                         if self.margs.num_experts:
+                            num_local_experts = (
+                                self.margs.num_experts // self.args.target_expert_parallel_size
+                            )
                             params_dict.update(
                                 {
-                                    "mlp_fc1_weight": mlp_l0_weight[ep_rank][tp_rank],
-                                    "mlp_fc2_weight": mlp_l1_weight[ep_rank][tp_rank],
+                                    f"mlp_fc1_weight.{i}": mlp_l0_weight[ep_rank][tp_rank][i]
+                                    for i in range(num_local_experts)
+                                }
+                            )
+                            params_dict.update(
+                                {
+                                    f"mlp_fc2_weight.{i}": mlp_l1_weight[ep_rank][tp_rank][i]
+                                    for i in range(num_local_experts)
                                 }
                             )
                         else:

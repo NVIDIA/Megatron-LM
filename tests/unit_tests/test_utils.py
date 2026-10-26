@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import time
@@ -14,7 +14,7 @@ import torch
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
-from megatron.core._rank_utils import safe_get_world_size
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
@@ -50,6 +50,102 @@ def test_divide_properly():
 def test_divide_improperly():
     with pytest.raises(AssertionError):
         util.divide(4, 5)
+
+
+@pytest.mark.parametrize(
+    ("device", "expected_non_blocking"),
+    [(torch.device("cpu"), False), (torch.device("cuda"), True)],
+)
+@pytest.mark.parametrize("pin_memory", [None, False, True])
+def test_move_host_tensor_to_device(device, expected_non_blocking, pin_memory):
+    values = mock.Mock()
+    should_pin = expected_non_blocking and pin_memory is not False
+    source = values.pin_memory.return_value if should_pin else values
+    moved = object()
+    source.to.return_value = moved
+
+    kwargs = {} if pin_memory is None else {"pin_memory": pin_memory}
+    assert util.move_host_tensor_to_device(values, device, **kwargs) is moved
+    source.to.assert_called_once_with(device, non_blocking=expected_non_blocking)
+    if should_pin:
+        values.pin_memory.assert_called_once_with()
+        values.to.assert_not_called()
+    else:
+        values.pin_memory.assert_not_called()
+
+
+@pytest.fixture
+def clear_callable_kwarg_signature_cache():
+    util._CALLABLE_KWARG_SIGNATURE_CACHE.clear()
+    yield
+    util._CALLABLE_KWARG_SIGNATURE_CACHE.clear()
+
+
+def test_filter_kwargs_for_callable_inspects_signature_once(
+    monkeypatch, clear_callable_kwarg_signature_cache
+):
+    inspected = []
+    original_signature = util.inspect.signature
+
+    def target(*, supported=False):
+        return supported
+
+    def track_signature(func):
+        inspected.append(func)
+        return original_signature(func)
+
+    monkeypatch.setattr(util.inspect, "signature", track_signature)
+    candidates = {"supported": True, "unsupported": True}
+
+    assert util.filter_kwargs_for_callable(target, candidates) == {"supported": True}
+    assert util.filter_kwargs_for_callable(target, candidates) == {"supported": True}
+    assert inspected == [target]
+
+
+def test_filter_kwargs_for_callable_keeps_only_keyword_capable_parameters(
+    clear_callable_kwarg_signature_cache,
+):
+    def target(positional_only, /, positional_or_keyword=None, *, keyword_only=None):
+        return positional_only, positional_or_keyword, keyword_only
+
+    candidates = {
+        "positional_only": 1,
+        "positional_or_keyword": 2,
+        "keyword_only": 3,
+        "unsupported": 4,
+    }
+
+    assert util.filter_kwargs_for_callable(target, candidates) == {
+        "positional_or_keyword": 2,
+        "keyword_only": 3,
+    }
+
+
+def test_filter_kwargs_for_callable_keeps_all_for_var_keyword(clear_callable_kwarg_signature_cache):
+    def target(**kwargs):
+        return kwargs
+
+    candidates = {"first": 1, "second": 2}
+
+    assert util.filter_kwargs_for_callable(target, candidates) == candidates
+
+
+@pytest.mark.parametrize("exception_type", [TypeError, ValueError])
+def test_filter_kwargs_for_callable_uses_signature_unavailable_fallback(
+    monkeypatch, clear_callable_kwarg_signature_cache, exception_type
+):
+    def target(**kwargs):
+        return kwargs
+
+    def fail_signature(_func):
+        raise exception_type("signature unavailable")
+
+    monkeypatch.setattr(util.inspect, "signature", fail_signature)
+    candidates = {"legacy": 1, "new": 2}
+
+    assert util.filter_kwargs_for_callable(
+        target, candidates, signature_unavailable_fallback=(name for name in ("legacy",))
+    ) == {"legacy": 1}
 
 
 @pytest.mark.skipif(not util.HAVE_PACKAGING, reason="packaging is not installed")
@@ -164,6 +260,24 @@ def test_safely_set_viewless_tensor_data():
     assert torch.equal(tensor, new_data_tensor)
 
 
+def test_copy_parameter_metadata_copies_public_attributes_only():
+    source = torch.nn.Parameter(torch.ones(1))
+    destination = torch.nn.Parameter(torch.zeros(1))
+    process_group = object()
+
+    source.tensor_model_parallel = True
+    source.group = process_group
+    source.future_planner_metadata = "preserved without a name allowlist"
+    source._quantizer = "tensor-subclass implementation detail"
+
+    util.copy_parameter_metadata(destination, source)
+
+    assert destination.tensor_model_parallel is True
+    assert destination.group is process_group
+    assert destination.future_planner_metadata == "preserved without a name allowlist"
+    assert not hasattr(destination, "_quantizer")
+
+
 def test_assert_viewless_tensor():
     tensor = torch.rand((3, 4))
     assert torch.equal(util.assert_viewless_tensor(tensor), tensor)
@@ -215,6 +329,7 @@ def test_nvtx_range(msg, suffix):
     util.configure_nvtx_profiling(True)
     _call_nvtx_range()
     assert execution_tracker['ranges']
+    util.configure_nvtx_profiling(False)
 
 
 def test_nvtx_decorator():
@@ -577,6 +692,30 @@ class TestGetWorldSizeSafe:
             safe_get_world_size()
 
 
+class TestGetRankSafe:
+    """Test safe_get_rank function."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"RANK": "9"})
+    def test_uninitialized_torch_distributed_with_rank_env_var(self, mock_is_initialized):
+        """Test safe_get_rank when torch.distributed is not initialized but RANK env var exists."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_rank()
+
+        assert result == 9
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"RANK": "invalid"})
+    def test_invalid_rank_env_var_should_raise_value_error(self, mock_is_initialized):
+        """Test safe_get_rank with invalid RANK environment variable."""
+        mock_is_initialized.return_value = False
+
+        with pytest.raises(ValueError):
+            safe_get_rank()
+
+
 class TestGetLocalRankPreinit:
     """Test get_local_rank_preinit function."""
 
@@ -712,3 +851,24 @@ class TestTrainStepReductionThreading:
             torch.testing.assert_close(val.cpu(), expected)
         finally:
             grid.destroy()
+
+
+def test_with_current_cuda_device_sets_device_of_first_cuda_tensor(monkeypatch):
+    """The checkpoint-recompute wrapper makes the first CUDA argument's device current (the
+    autograd worker thread may have no CUDA context yet) and otherwise passes everything through."""
+    calls = []
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: calls.append(device))
+
+    def fn(*args, **kwargs):
+        return args, kwargs
+
+    wrapped = util.with_current_cuda_device(fn)
+    cpu = torch.zeros(1)
+    args, kwargs = wrapped(cpu, 3, flag=True)
+    assert args[0] is cpu and args[1] == 3 and kwargs == {"flag": True}
+    assert calls == []  # no CUDA tensor among the arguments: nothing to set
+    if torch.cuda.is_available():
+        gpu = torch.zeros(1, device=torch.device("cuda", torch.cuda.current_device()))
+        args, _ = wrapped(cpu, gpu, gpu)
+        assert args[1] is gpu
+        assert calls == [gpu.device]  # first CUDA tensor only, once

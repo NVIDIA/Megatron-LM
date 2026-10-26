@@ -54,29 +54,38 @@ VISION_KWARGS = {
 
 # Three distinct vision encoder architectures in the Qwen3.5 family.
 _VISION_SMALL = {
-    "num_layers": 12, "hidden_size": 768, "num_attention_heads": 12,
-    "kv_channels": 64, "ffn_hidden_size": 3072,
+    "num_layers": 12,
+    "hidden_size": 768,
+    "num_attention_heads": 12,
+    "kv_channels": 64,
+    "ffn_hidden_size": 3072,
 }
 _VISION_MEDIUM = {
-    "num_layers": 24, "hidden_size": 1024, "num_attention_heads": 16,
-    "kv_channels": 64, "ffn_hidden_size": 4096,
+    "num_layers": 24,
+    "hidden_size": 1024,
+    "num_attention_heads": 16,
+    "kv_channels": 64,
+    "ffn_hidden_size": 4096,
 }
 _VISION_LARGE = {
-    "num_layers": 27, "hidden_size": 1152, "num_attention_heads": 16,
-    "kv_channels": 72, "ffn_hidden_size": 4304,
+    "num_layers": 27,
+    "hidden_size": 1152,
+    "num_attention_heads": 16,
+    "kv_channels": 72,
+    "ffn_hidden_size": 4304,
 }
 
 # Per-variant vision config.  ``out_hidden_size`` equals the language model's
 # hidden_size and controls the merger projection output dimension.
 _VISION_VARIANT_CONFIGS = {
-    "0.8b":       {**_VISION_SMALL,  "out_hidden_size": 1024},
-    "2b":         {**_VISION_MEDIUM, "out_hidden_size": 2048},
-    "4b":         {**_VISION_MEDIUM, "out_hidden_size": 2560},
-    "9b":         {**_VISION_LARGE,  "out_hidden_size": 4096},
-    "27b":        {**_VISION_LARGE,  "out_hidden_size": 5120},
-    "35b_a3b":    {**_VISION_LARGE,  "out_hidden_size": 2048},
-    "122b_a10b":  {**_VISION_LARGE,  "out_hidden_size": 3072},
-    "397b_a17b":  {**_VISION_LARGE,  "out_hidden_size": 4096},
+    "0.8b": {**_VISION_SMALL, "out_hidden_size": 1024},
+    "2b": {**_VISION_MEDIUM, "out_hidden_size": 2048},
+    "4b": {**_VISION_MEDIUM, "out_hidden_size": 2560},
+    "9b": {**_VISION_LARGE, "out_hidden_size": 4096},
+    "27b": {**_VISION_LARGE, "out_hidden_size": 5120},
+    "35b_a3b": {**_VISION_LARGE, "out_hidden_size": 2048},
+    "122b_a10b": {**_VISION_LARGE, "out_hidden_size": 3072},
+    "397b_a17b": {**_VISION_LARGE, "out_hidden_size": 4096},
 }
 
 # Fallback for proxy/unknown variants (large ViT, generic out_hidden_size).
@@ -84,8 +93,7 @@ _VISION_DEFAULT = {**_VISION_LARGE, "out_hidden_size": 3584}
 
 
 def get_qwen35_vl_vision_config(
-    num_layers_override: Optional[int] = None,
-    variant: Optional[str] = None,
+    num_layers_override: Optional[int] = None, variant: Optional[str] = None
 ) -> TransformerConfig:
     """TransformerConfig for the Qwen3.5-VL vision encoder.
 
@@ -141,6 +149,11 @@ def get_qwen35_vl_vision_config(
 # Language config variants
 # ---------------------------------------------------------------------------
 
+# ``num_layers`` below counts *Qwen transformer blocks* (one attention + one
+# MLP each), which is what the HuggingFace releases report.  The decoder is a
+# ``HybridModel``, whose ``num_layers`` counts pattern symbols instead — one
+# per attention layer AND one per MLP layer — so the block count is doubled in
+# ``get_qwen35_vl_language_config`` below.  Keep this dict in block units.
 _VARIANT_CONFIGS = {
     "0.8b": {
         "num_layers": 24,
@@ -275,14 +288,17 @@ _VARIANT_CONFIGS = {
 }
 
 
-def get_qwen35_vl_language_config(
-    variant: str = "proxy",
-    **overrides,
-) -> TransformerConfig:
+def get_qwen35_vl_language_config(variant: str = "proxy", **overrides) -> TransformerConfig:
     """TransformerConfig for the Qwen3.5-VL language decoder.
 
+    The decoder is a ``HybridModel``, so ``num_layers`` on the returned config
+    is the hybrid *layer* count (two per Qwen transformer block: one attention
+    layer plus one MLP layer) and must match the length of the
+    ``--hybrid-layer-pattern`` used to build the model.
+
     The ``397b_a17b`` variant reproduces the MIMO
-    ``get_qwen35_language_model_config()`` output exactly.
+    ``get_qwen35_language_model_config()`` output exactly, except for this
+    doubled ``num_layers``.
 
     Args:
         variant: One of ``0.8b``, ``2b``, ``4b``, ``9b``, ``27b``,
@@ -295,15 +311,18 @@ def get_qwen35_vl_language_config(
     """
     if variant not in _VARIANT_CONFIGS:
         raise ValueError(
-            f"Unknown variant '{variant}'. "
-            f"Choose from {list(_VARIANT_CONFIGS.keys())}"
+            f"Unknown variant '{variant}'. " f"Choose from {list(_VARIANT_CONFIGS.keys())}"
         )
 
     v = _VARIANT_CONFIGS[variant]
 
     kwargs = dict(
-        # Architecture
-        num_layers=v["num_layers"],
+        # Architecture. HybridModel counts one layer per pattern symbol, so each
+        # Qwen block ('G'/'*' plus '-'/'E') contributes two layers. is_hybrid_model
+        # tells TransformerConfig to interpret num_layers that way — without it the
+        # output-layer init std would be scaled by the doubled count.
+        is_hybrid_model=True,
+        num_layers=2 * v["num_layers"],
         hidden_size=v["hidden_size"],
         ffn_hidden_size=v["ffn_hidden_size"],
         num_attention_heads=v["num_attention_heads"],
@@ -326,9 +345,10 @@ def get_qwen35_vl_language_config(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         add_bias_linear=False,
-        # Hybrid attention (GatedDeltaNet)
-        experimental_attention_variant="gated_delta_net",
-        linear_attention_freq=4,
+        # Hybrid attention (GatedDeltaNet). The GDN / full-attention layout comes
+        # from --hybrid-layer-pattern, not linear_attention_freq: HybridModel
+        # builds its stack from the pattern and never reads that field.
+        experimental_attention_variant=None,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=128,
         linear_value_head_dim=128,
@@ -350,9 +370,7 @@ def get_qwen35_vl_language_config(
             num_moe_experts=v["num_moe_experts"],
             moe_router_topk=v["moe_router_topk"],
             moe_ffn_hidden_size=v["moe_ffn_hidden_size"],
-            moe_shared_expert_intermediate_size=v[
-                "moe_shared_expert_intermediate_size"
-            ],
+            moe_shared_expert_intermediate_size=v["moe_shared_expert_intermediate_size"],
             moe_shared_expert_gate=True,
             moe_layer_freq=1,
             moe_router_pre_softmax=False,

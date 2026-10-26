@@ -14,6 +14,7 @@ can be more efficient for certain attention variants.
 
 import copy
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -21,6 +22,8 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import get_fp8_disabled_context
+from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -28,6 +31,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -35,11 +39,13 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, QKVLayout
+from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
@@ -118,6 +124,7 @@ class AbsorbedMLASelfAttentionSubmodules:
     linear_k_up_proj: Union[ModuleSpec, type] = None
     linear_v_up_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    linear_gate: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     kv_layernorm: Union[ModuleSpec, type] = None
@@ -136,6 +143,12 @@ class AbsorbedMLASelfAttention(Attention):
     The absorption is mathematically equivalent to standard MLA but enables MQA-style attention
     computation which can be more efficient for certain attention variants.
     """
+
+    def _mla_projection_context(self, *, is_init: bool = False):
+        """Use high precision for MLA projections only when explicitly requested."""
+        if not self.config.mla_proj_use_quantization:
+            return get_fp8_disabled_context(self.config, is_init=is_init)
+        return nullcontext()
 
     def __init__(
         self,
@@ -165,6 +178,8 @@ class AbsorbedMLASelfAttention(Attention):
             name=name,
         )
 
+        # Resolve which classes to use for Q and KV linear up projections and norms, based on
+        # QK-norm selection.
         layer_classes = QKNormConfigResolver(self.config, submodules).resolve()
 
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"
@@ -190,7 +205,11 @@ class AbsorbedMLASelfAttention(Attention):
         self.cache_mla_latents = self.config.cache_mla_latents
         assert not self.cache_mla_latents, "cache_mla_latents is not supported for AbsorbedMLA"
 
-        if self.config.rope_type == "rope":
+        # NoPE has no positional slice to embed or rotate.
+        self.use_rope = self.config.qk_pos_emb_head_dim > 0
+        if not self.use_rope:
+            self.rotary_pos_emb = None
+        elif self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
@@ -229,21 +248,55 @@ class AbsorbedMLASelfAttention(Attention):
             is_mtp_layer=is_mtp_layer,
         )
 
+        if self.config.attention_output_gate:
+            if submodules.linear_gate is None:
+                raise ValueError("MLA output gating requires a linear_gate module spec.")
+            gate_projection_size = (
+                self.config.num_attention_heads
+                if self.config.gated_attention_proj_granularity == 'headwise'
+                else self.query_projection_size
+            )
+            self.linear_gate = build_module(
+                submodules.linear_gate,
+                self.config.hidden_size,
+                gate_projection_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='mla_gate',
+                tp_group=self.pg_collection.tp,
+                name=(name + ".linear_gate") if name is not None else None,
+            )
+        else:
+            self.linear_gate = None
+
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
-            self.query_projection_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=False,
-            tp_comm_buffer_name='proj',
-            tp_group=self.pg_collection.tp,
-            name=(name + ".linear_proj") if name is not None else None,
-        )
+        linear_proj_config = self.config
+        linear_proj_buffer = "proj"
+        if not self.config.mla_proj_use_quantization:
+            # FP8 userbuffers are not registered for this BF16/FP32 projection.  Build the
+            # layer with overlap disabled rather than passing a stale ``proj`` buffer name.
+            linear_proj_config = copy.copy(self.config)
+            linear_proj_config.tp_comm_overlap = False
+            linear_proj_buffer = None
+        with self._mla_projection_context(is_init=True):
+            self.linear_proj = build_module(
+                submodules.linear_proj,
+                self.query_projection_size,
+                self.config.hidden_size,
+                config=linear_proj_config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=False,
+                tp_comm_buffer_name=linear_proj_buffer,
+                tp_group=self.pg_collection.tp,
+                name=(name + ".linear_proj") if name is not None else None,
+            )
 
         if (
             HAVE_TE
@@ -265,19 +318,20 @@ class AbsorbedMLASelfAttention(Attention):
 
         if self.config.q_lora_rank is None:
             # Not projecting query
-            self.linear_q_proj = build_module(
-                layer_classes["linear_q_proj"],
-                self.config.hidden_size,
-                self.config.num_attention_heads * self.q_head_dim,
-                config=self.config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='q_proj',
-                name=(name + ".linear_q_proj") if name is not None else None,
-            )
+            with self._mla_projection_context(is_init=True):
+                self.linear_q_proj = build_module(
+                    layer_classes["linear_q_proj"],
+                    self.config.hidden_size,
+                    self.config.num_attention_heads * self.q_head_dim,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='q_proj',
+                    name=(name + ".linear_q_proj") if name is not None else None,
+                )
         else:
             q_down_proj_kwargs = {}
             if submodules.linear_q_down_proj in [TELinear]:
@@ -291,40 +345,41 @@ class AbsorbedMLASelfAttention(Attention):
             else:
                 raise ValueError(f"Unsupported linear_q_down_proj: {submodules.linear_q_down_proj}")
 
-            self.linear_q_down_proj = build_module(
-                submodules.linear_q_down_proj,
-                self.config.hidden_size,
-                self.config.q_lora_rank,
-                config=self.config,
-                init_method=self.config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='q_down_proj',
-                skip_weight_param_allocation=False,
-                tp_group=(
-                    pg_collection.tp
-                    if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
-                    else None
-                ),
-                name=(name + ".linear_q_down_proj") if name is not None else None,
-                **q_down_proj_kwargs,
-            )
+            with self._mla_projection_context(is_init=True):
+                self.linear_q_down_proj = build_module(
+                    submodules.linear_q_down_proj,
+                    self.config.hidden_size,
+                    self.config.q_lora_rank,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='q_down_proj',
+                    skip_weight_param_allocation=False,
+                    tp_group=(
+                        pg_collection.tp
+                        if q_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                        else None
+                    ),
+                    name=(name + ".linear_q_down_proj") if name is not None else None,
+                    **q_down_proj_kwargs,
+                )
 
-            self.linear_q_up_proj = build_module(
-                layer_classes["linear_q_up_proj"],
-                self.config.q_lora_rank,
-                self.config.num_attention_heads * self.q_head_dim,
-                config=self.config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='q_up_proj',
-                tp_group=pg_collection.tp,
-                name=(name + ".linear_q_up_proj") if name is not None else None,
-            )
+                self.linear_q_up_proj = build_module(
+                    layer_classes["linear_q_up_proj"],
+                    self.config.q_lora_rank,
+                    self.config.num_attention_heads * self.q_head_dim,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='q_up_proj',
+                    tp_group=pg_collection.tp,
+                    name=(name + ".linear_q_up_proj") if name is not None else None,
+                )
 
         kv_down_proj_kwargs = {}
         if submodules.linear_kv_down_proj in [TELinear]:
@@ -338,25 +393,26 @@ class AbsorbedMLASelfAttention(Attention):
         else:
             raise ValueError(f"Unsupported linear_kv_down_proj: {submodules.linear_kv_down_proj}")
 
-        self.linear_kv_down_proj = build_module(
-            submodules.linear_kv_down_proj,
-            self.config.hidden_size,
-            self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name='kv_down_proj',
-            skip_weight_param_allocation=False,
-            tp_group=(
-                pg_collection.tp
-                if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
-                else None
-            ),
-            name=(name + ".linear_kv_down_proj") if name is not None else None,
-            **kv_down_proj_kwargs,
-        )
+        with self._mla_projection_context(is_init=True):
+            self.linear_kv_down_proj = build_module(
+                submodules.linear_kv_down_proj,
+                self.config.hidden_size,
+                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='kv_down_proj',
+                skip_weight_param_allocation=False,
+                tp_group=(
+                    pg_collection.tp
+                    if kv_down_proj_kwargs.get('parallel_mode') != 'duplicated'
+                    else None
+                ),
+                name=(name + ".linear_kv_down_proj") if name is not None else None,
+                **kv_down_proj_kwargs,
+            )
 
         kv_up_proj_config = copy.copy(self.config)
         kv_up_proj_config.delay_wgrad_compute = False
@@ -371,50 +427,61 @@ class AbsorbedMLASelfAttention(Attention):
         ):
             raise ValueError("Split AbsorbedMLA requires both K and V up projections")
 
+        with self._mla_projection_context(is_init=True):
+            if self._uses_combined_kv_up_projection:
+                self.linear_kv_up_proj = build_module(
+                    layer_classes["linear_kv_up_proj"],
+                    self.config.kv_lora_rank,
+                    self.config.num_attention_heads
+                    * (self.config.qk_head_dim + self.config.v_head_dim),
+                    config=kv_up_proj_config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='kv_up_proj',
+                    tp_group=pg_collection.tp,
+                    name=(name + ".linear_kv_up_proj") if name is not None else None,
+                )
+            else:
+                self.linear_k_up_proj = build_module(
+                    submodules.linear_k_up_proj,
+                    self.config.kv_lora_rank,
+                    self.config.num_attention_heads * self.config.qk_head_dim,
+                    config=kv_up_proj_config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='k_up_proj',
+                    tp_group=pg_collection.tp,
+                    name=(name + ".linear_k_up_proj") if name is not None else None,
+                )
+                self.linear_v_up_proj = build_module(
+                    submodules.linear_v_up_proj,
+                    self.config.kv_lora_rank,
+                    self.config.num_attention_heads * self.config.v_head_dim,
+                    config=kv_up_proj_config,
+                    init_method=self.config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='v_up_proj',
+                    tp_group=pg_collection.tp,
+                    name=(name + ".linear_v_up_proj") if name is not None else None,
+                )
+
+        q_up_proj = self.linear_q_proj if self.config.q_lora_rank is None else self.linear_q_up_proj
+        q_up_proj.weight.qkv_layout = QKVLayout.from_splits(
+            self.config.num_attention_heads,
+            (self.config.qk_head_dim, self.config.qk_pos_emb_head_dim),
+        )
         if self._uses_combined_kv_up_projection:
-            self.linear_kv_up_proj = build_module(
-                layer_classes["linear_kv_up_proj"],
-                self.config.kv_lora_rank,
-                self.config.num_attention_heads
-                * (self.config.qk_head_dim + self.config.v_head_dim),
-                config=kv_up_proj_config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='kv_up_proj',
-                tp_group=pg_collection.tp,
-                name=(name + ".linear_kv_up_proj") if name is not None else None,
-            )
-        else:
-            self.linear_k_up_proj = build_module(
-                submodules.linear_k_up_proj,
-                self.config.kv_lora_rank,
-                self.config.num_attention_heads * self.config.qk_head_dim,
-                config=kv_up_proj_config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='k_up_proj',
-                tp_group=pg_collection.tp,
-                name=(name + ".linear_k_up_proj") if name is not None else None,
-            )
-            self.linear_v_up_proj = build_module(
-                submodules.linear_v_up_proj,
-                self.config.kv_lora_rank,
-                self.config.num_attention_heads * self.config.v_head_dim,
-                config=kv_up_proj_config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='v_up_proj',
-                tp_group=pg_collection.tp,
-                name=(name + ".linear_v_up_proj") if name is not None else None,
+            self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_splits(
+                self.config.num_attention_heads, (self.config.qk_head_dim, self.config.v_head_dim)
             )
 
         if self.config.q_lora_rank is not None:
@@ -450,32 +517,40 @@ class AbsorbedMLASelfAttention(Attention):
         ), f"hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D"
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        # Retain this microbatch's group when the up-projection checkpoint replays
+        # after forward restores pg_collection.cp or another microbatch changes it.
+        effective_cp_group = self.pg_collection.cp
 
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
-        )
-
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        use_fused_rope = should_use_fused_mla_rope(self.config)
-        if use_fused_rope:
-            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
+        use_fused_rope = self.use_rope and should_use_fused_mla_rope(self.config)
+        if self.use_rope:
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, None, hidden_states, self.config, packed_seq_params
             )
-            rotary_pos_emb = None
-            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_concat is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
-        elif self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
+            if use_fused_rope:
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
+                )
+                rotary_pos_emb = None
+                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+                assert (
+                    fused_mla_rope_concat is not None
+                ), "Fused MLA RoPE apply is not imported successfully"
+            elif self.config.rope_type == "rope":
+                rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
+            else:
+                rotary_pos_emb, mscale = self.rotary_pos_emb(
+                    rotary_seq_len, packed_seq=thd_packed_seq
+                )
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
+            # NoPE: no rotary embedding; q_absorbed/kv_compressed carry no pos slice.
+            rotary_pos_emb = None
 
         if thd_packed_seq:
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -488,9 +563,14 @@ class AbsorbedMLASelfAttention(Attention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             rope_max_seqlen_q = packed_seq_params.max_seqlen_q
             rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+            rope_freqs_max_seqlen = (
+                max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                else None
+            )
         else:
             cu_seqlens_q = cu_seqlens_kv = None
-            rope_max_seqlen_q = rope_max_seqlen_kv = None
+            rope_freqs_max_seqlen = None
 
         # =========================================
         # Q down projection
@@ -500,7 +580,8 @@ class AbsorbedMLASelfAttention(Attention):
             #     q_compressed: [s, b, q_lora_rank / TP]
             # elif linear_q_down_proj is Linear:
             #     q_compressed: [s / TP, b, q_lora_rank]
-            q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            with self._mla_projection_context():
+                q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
             # When output is sharded (ColumnParallelLinear), two things are needed to be
             # identical to a normal Linear.
@@ -521,7 +602,8 @@ class AbsorbedMLASelfAttention(Attention):
         #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
         # elif linear_kv_down_proj is Linear:
         #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        with self._mla_projection_context():
+            kv_combined, _ = self.linear_kv_down_proj(hidden_states)
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
@@ -579,21 +661,33 @@ class AbsorbedMLASelfAttention(Attention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
+                with self._mla_projection_context():
+                    q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_proj(q_compressed)
+                with self._mla_projection_context():
+                    q, _ = self.linear_q_proj(q_compressed)
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             # [num_tokens, kv_lora_rank] -> [num_tokens, 1, kv_lora_rank]
             kv_compressed = torch.unsqueeze(kv_compressed, -2)
-            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             k_up_weight, _ = self._get_kv_up_weights()
+
+            if not self.use_rope:
+                q_absorbed = torch.einsum("...nd,ndk->...nk", q, k_up_weight)
+                q_absorbed = q_absorbed.contiguous()
+                assert q_absorbed.size(-1) == self.config.kv_lora_rank
+                assert q_absorbed.is_contiguous()
+                assert kv_compressed.is_contiguous()
+                # CheckpointWithoutOutput discards output storage; do not alias its saved input.
+                return q_absorbed, kv_compressed.clone()
+
+            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             if use_fused_rope:
                 # q_no_pe: [num_tokens, n, qk_head_dim]
@@ -609,8 +703,8 @@ class AbsorbedMLASelfAttention(Attention):
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
 
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = effective_cp_group.rank()
+                cp_size = effective_cp_group.size()
                 q_absorbed = fused_mla_rope_concat(
                     q_absorbed,
                     q_pos_emb,
@@ -636,7 +730,7 @@ class AbsorbedMLASelfAttention(Attention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif not thd_packed_seq or self.config.context_parallel_size == 1:
+                elif not thd_packed_seq or get_pg_size(effective_cp_group) == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -668,9 +762,9 @@ class AbsorbedMLASelfAttention(Attention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=effective_cp_group,
                     mla_rotary_interleaved=True,
-                    max_seqlen=rope_max_seqlen_q,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -679,9 +773,9 @@ class AbsorbedMLASelfAttention(Attention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=effective_cp_group,
                     mla_rotary_interleaved=True,
-                    max_seqlen=rope_max_seqlen_kv,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
 
                 # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
@@ -831,6 +925,8 @@ class AbsorbedMLASelfAttention(Attention):
     ):
         """Forward method with selective activation checkpointing."""
 
+        effective_cp_group = self.pg_collection.cp
+
         def custom_forward(*inputs):
             q_absorbed = inputs[0]
             k_compressed = inputs[1]
@@ -840,19 +936,23 @@ class AbsorbedMLASelfAttention(Attention):
             up_v_weight = inputs[5]
             attn_mask_type = inputs[6]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
-                q_absorbed,
-                k_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=up_v_weight,
-                position_ids=position_ids,
-                attn_mask_type=attn_mask_type,
-                packed_seq_params=packed_seq_params,
-            )
-            return output_
+            original_cp_group = self.pg_collection.cp
+            self.pg_collection.cp = effective_cp_group
+            try:
+                return self.core_attention(
+                    q_absorbed,
+                    k_compressed,
+                    value=None,
+                    attention_mask=attention_mask,
+                    x=hidden_states,
+                    qr=q_compressed,
+                    up_v_weight=up_v_weight,
+                    position_ids=position_ids,
+                    attn_mask_type=attn_mask_type,
+                    packed_seq_params=packed_seq_params,
+                )
+            finally:
+                self.pg_collection.cp = original_cp_group
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
@@ -906,9 +1006,7 @@ class AbsorbedMLASelfAttention(Attention):
         # attention use self.pg_collection.cp, which must point at this
         # microbatch's dynamic CP group. Restored before returning.
         _orig_cp_group = self.pg_collection.cp
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
+        self.pg_collection.cp = resolve_cp_group(_orig_cp_group, packed_seq_params)
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         if (
             thd_packed_seq
@@ -998,18 +1096,51 @@ class AbsorbedMLASelfAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
+        if self.linear_gate is not None:
+            core_attn_out = self._project_and_apply_mla_output_gate(core_attn_out, hidden_states)
+
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        with self._mla_projection_context():
+            output, bias = self.linear_proj(core_attn_out)
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
+
+    def _project_and_apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate_input: torch.Tensor
+    ) -> torch.Tensor:
+        """Project the gate after V expansion, then apply it to the MLA output."""
+        gate, _ = apply_module(self.linear_gate)(gate_input)
+        return self._apply_mla_output_gate(core_attn_out, gate)
+
+    def _apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Dispatch to the compiled headwise or eager elementwise gate."""
+        granularity = self.config.gated_attention_proj_granularity
+        if granularity == 'headwise':
+            return self._apply_mla_headwise_output_gate(core_attn_out, gate)
+        # Match ordinary MLA's FP32 sigmoid followed by native-dtype multiplication.
+        # Do not jit-fuse this elementwise path: preserve its eager cast/multiply
+        # rounding and VJP.
+        return apply_attention_output_gate(core_attn_out, gate, granularity, cast_mode='before')
+
+    @staticmethod
+    @jit_fuser
+    def _apply_mla_headwise_output_gate(
+        core_attn_out: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """Compile the shared gate arithmetic with MLA's headwise cast policy."""
+        return apply_attention_output_gate(core_attn_out, gate, 'headwise', cast_mode='before')
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation."""
         self._backward_kv_proj()
         self._backward_q_proj()
+        if self.linear_gate is not None:
+            self.linear_gate.backward_dw()
         core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
         if core_attention_backward_dw is not None:
             core_attention_backward_dw()
@@ -1038,6 +1169,8 @@ class AbsorbedMLASelfAttention(Attention):
         if self.config.q_lora_rank is not None:
             set_save_original_input(self.linear_q_down_proj)
         set_save_original_input(self.linear_kv_down_proj)
+        if self.linear_gate is not None:
+            set_save_original_input(self.linear_gate)
 
     def clip_qk(self):
         """

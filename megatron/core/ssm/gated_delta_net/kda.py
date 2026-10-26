@@ -26,6 +26,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     get_parameter_local_cp,
 )
+from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -189,7 +190,7 @@ class KimiDeltaAttention(_GDNBase):
         x = x.reshape(-1, self.value_head_dim)
         x = self.out_norm(x)
         gate = gate.reshape(-1, self.value_head_dim)
-        return (x * torch.sigmoid(gate.float())).to(x_dtype)
+        return apply_attention_output_gate(x, gate, 'elementwise', cast_mode='none').to(x_dtype)
 
     def forward(
         self,
@@ -291,6 +292,11 @@ class KimiDeltaAttention(_GDNBase):
             cu_seqlens_q = None
 
         if cp_size_chunkwise > 1:
+            if build_cp_context is None:
+                raise ImportError(
+                    "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "
+                    "Install an FLA build that provides the CP extension, or use CP=1/headwise CP."
+                )
             if cu_seqlens_q is None:
                 cache_key = (seq_len_global, batch)
                 cached = self._chunkwise_cp_context_cache.get(cache_key)
@@ -334,7 +340,21 @@ class KimiDeltaAttention(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+            if self.config.fp8 or self.config.fp4:
+                # Import here to avoid a circular dependency.
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                out, out_bias = te_checkpoint(
+                    _checkpointed_compute,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            else:
+                out, out_bias = tensor_parallel.checkpoint(
+                    _checkpointed_compute, False, hidden_states
+                )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
@@ -649,8 +669,12 @@ class KimiDeltaAttention(_GDNBase):
             raise ValueError(
                 "Packed KDA requires at least one sequence in both Q and KV boundaries."
             )
-        if cu_seqlens_q.shape != cu_seqlens_kv.shape or not torch.equal(
-            cu_seqlens_q, cu_seqlens_kv
+        # torch.equal synchronises with the device, which a CUDA graph capture forbids; the
+        # boundaries were validated during the eager warm-up steps and the captured graph's static
+        # cu_seqlens are identical by construction.
+        if cu_seqlens_q.shape != cu_seqlens_kv.shape or (
+            not torch.cuda.is_current_stream_capturing()
+            and not torch.equal(cu_seqlens_q, cu_seqlens_kv)
         ):
             raise ValueError(
                 "Packed KDA requires cu_seqlens_q to equal cu_seqlens_kv, "

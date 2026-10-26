@@ -402,7 +402,9 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1():
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode):
+def test_parallel_kda_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode, run_config
+):
     config = _make_config(linear_cp_mode=linear_cp_mode)
     _test_parallel_attention_correctness(
         transformer_config=config,
@@ -422,3 +424,25 @@ def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, 
         micro_batch_size=2,
         sequence_packing=sequence_packing,
     )
+
+
+def test_kda_packed_cu_seqlens_validation_skips_device_sync_during_capture():
+    """Packed KDA requires matching Q/KV boundaries; the value comparison is a device sync, so it is
+    skipped while a CUDA graph is being captured (the static cu_seqlens were validated eagerly)."""
+    from unittest.mock import patch
+
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+    KimiDeltaAttention._validate_packed_cu_seqlens(cu_seqlens, cu_seqlens.clone())
+    with pytest.raises(ValueError, match="at least one sequence"):
+        KimiDeltaAttention._validate_packed_cu_seqlens(
+            cu_seqlens, torch.tensor([0], dtype=torch.int32)
+        )
+    with pytest.raises(ValueError, match="to equal cu_seqlens_kv"):
+        KimiDeltaAttention._validate_packed_cu_seqlens(
+            cu_seqlens, torch.tensor([0, 4, 8, 12], dtype=torch.int32)
+        )
+    mismatched = torch.tensor([0, 4, 9], dtype=torch.int32)
+    with pytest.raises(ValueError, match="to equal cu_seqlens_kv"):
+        KimiDeltaAttention._validate_packed_cu_seqlens(cu_seqlens, mismatched)
+    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+        KimiDeltaAttention._validate_packed_cu_seqlens(cu_seqlens, mismatched)  # no sync, no raise

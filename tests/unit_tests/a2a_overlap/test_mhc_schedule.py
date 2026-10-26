@@ -102,7 +102,7 @@ class _RecordingLayer:
         # belongs to no RecomputeSegment and the segment hooks are skipped.
         self.recompute_segment = None
 
-    def get_fp8_context(self):
+    def get_low_precision_context(self):
         return nullcontext()
 
     def release_state(self):
@@ -116,8 +116,12 @@ class _RecordingChunk:
         self.pre_process = _RecordingNode(calls, "chunk.pre_process")
         self.post_process = None
         self.vp_stage = 0
+        # Match TransformerModelChunkSchedulePlan's optional release interface.
+        self.tensor_release = None
         # Read by run() only on the post_process path, which this chunk does not take.
         self.recompute_full = False
+        # Match TransformerModelChunkSchedulePlan's model state read by run().
+        self._model_chunk_state = SimpleNamespace(model=None)
 
     def record_current_stream(self):
         self.calls.append("chunk.record_current_stream")
@@ -226,7 +230,9 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
     captured_extra_args = []
 
     class _CapturedLayerPlan:
-        def __init__(self, layer, event, state, comp_stream, comm_stream, extra_args):
+        def __init__(
+            self, layer, event, state, comp_stream, comm_stream, extra_args, tensor_release=None
+        ):
             captured_extra_args.append(dict(extra_args))
 
     monkeypatch.setattr(
@@ -237,6 +243,7 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
     plan._event = object()
     plan._model_chunk_state = object()
     plan._transformer_layers = []
+    plan._tensor_release = None
     config = SimpleNamespace(
         enable_hyper_connections=True,
         recompute_granularity="selective",
@@ -410,11 +417,25 @@ def _assert_close_grads(overlap_gradients, reference_gradients, rtol=5e-3, atol=
             reference_gradients[name],
             rtol=rtol,
             atol=atol,
-            msg=f"Gradient mismatch for {name}",
+            msg=lambda detail, parameter_name=name: (
+                f"Gradient mismatch for {parameter_name}:\n{detail}"
+            ),
         )
 
 
 class TestMhcA2AOverlapNumerics:
+    @pytest.fixture(autouse=True)
+    def _isolated_compiler_cache(self):
+        # Previous graph/shape cases can exhaust Dynamo's specialization budget.
+        # A partially compiled BF16 reference then has different fusion/rounding
+        # from a fresh scheduled model. Isolate cases without disabling compilation
+        # or increasing its limit; both paths retain the original numeric checks.
+        torch.compiler.reset()
+        try:
+            yield
+        finally:
+            torch.compiler.reset()
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,

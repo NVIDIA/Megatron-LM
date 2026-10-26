@@ -65,6 +65,19 @@ def patch_hadamard_if_needed():
         yield
 
 
+@pytest.fixture
+def deterministic_csa_reference(monkeypatch):
+    """Isolate deferred wgrads from the reference gather's BF16 atomic backward."""
+    previous_mode = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous_mode, warn_only=previous_warn_only)
+
+
 # ---------------------------------------------------------------------------
 # Config / build helpers
 # ---------------------------------------------------------------------------
@@ -120,6 +133,9 @@ def _make_csa_config(delay_wgrad=True):
         # Indexer top-k is non-differentiable: the indexer linears ONLY receive
         # gradients through the indexer KL loss.  coeff=0 would make this test vacuous.
         dsa_indexer_loss_coeff=1.0,
+        # Exercise TE projection wgrads with the portable dense DSA reference;
+        # fused dense-loss DSA is unsupported on the H100 unit-test platform.
+        dsa_kernel_backend='none',
         # Deferred wgrads must land in param.grad, not main_grad.
         gradient_accumulation_fusion=False,
     )
@@ -204,6 +220,8 @@ def _assert_flushed_grads_match_eager(
     layer_number,
     hidden,
     pg_collection,
+    *,
+    delayed_output,
 ):
     """Delay-vs-eager gradient equality: the flush must not change the math.
 
@@ -228,6 +246,11 @@ def _assert_flushed_grads_match_eager(
 
     eager_hidden = hidden.detach().clone().requires_grad_(True)
     output, _ = eager_attn(hidden_states=eager_hidden, attention_mask=None)
+    torch.testing.assert_close(
+        output,
+        delayed_output,
+        msg=lambda detail: f"delayed and eager forwards differ before wgrad comparison:\n{detail}",
+    )
     output.sum().backward()
 
     for name, _ in delayed_named_linears:
@@ -236,7 +259,9 @@ def _assert_flushed_grads_match_eager(
         torch.testing.assert_close(
             delayed_grads[name],
             eager_linear.weight.grad,
-            msg=f"delayed-flushed wgrad differs from eager inline wgrad for {name}",
+            msg=lambda detail, linear_name=name: (
+                f"delayed-flushed wgrad differs from eager inline wgrad for {linear_name}:\n{detail}"
+            ),
         )
 
 
@@ -282,6 +307,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
         yield
         Utils.destroy_model_parallel()
 
+    @pytest.mark.usefixtures("deterministic_csa_reference")
     def test_csa_deferred_wgrads_flushed_through_core_attention(self):
         seq_len = 256
         batch_size = 2
@@ -328,6 +354,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
 
         output, bias = attn(hidden_states=hidden, attention_mask=None)
         assert output.shape == (seq_len, batch_size, config.hidden_size)
+        delayed_output = output.detach().clone()
         # The indexer KL loss is attached to `output` via DSAIndexerLossAutoScaler,
         # so backward through the output alone reaches the indexer subgraph.
         output.sum().backward()
@@ -355,6 +382,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
             2,
             hidden,
             pg,
+            delayed_output=delayed_output,
         )
 
 
@@ -427,6 +455,7 @@ class TestDSADelayedWgradFlush:
         # its own causal float mask, so attention_mask=None is valid here.
         output, bias = attn(hidden_states=hidden, attention_mask=None)
         assert output.shape == (seq_len, batch_size, config.hidden_size)
+        delayed_output = output.detach().clone()
         # The indexer KL loss is attached to `output` via DSAIndexerLossAutoScaler,
         # so backward through the output alone reaches the (detached-x) indexer.
         output.sum().backward()
@@ -467,4 +496,5 @@ class TestDSADelayedWgradFlush:
             1,
             hidden,
             pg,
+            delayed_output=delayed_output,
         )

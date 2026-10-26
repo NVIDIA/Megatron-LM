@@ -1,12 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Combined 1F1B schedules for fine-grained expert-parallel overlap.
+
+The schedule decomposes a model chunk into nodes and co-schedules forward and
+backward nodes from different microbatches on compute and communication streams.
+"""
+
 import contextlib
 from contextlib import nullcontext
 from typing import List, Union
 
 import torch
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+    any_sharding_strategy_in,
+    find_megatron_fsdp,
+)
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
@@ -381,12 +390,6 @@ def combined_forward_backward_step(
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
             )
-            from megatron.core.models.gpt.gpt_model import GPTModel
-
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
-            )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
             )
@@ -397,7 +400,9 @@ def combined_forward_backward_step(
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
         # schedule bypasses normal FSDP forward/backward hooks, so we release
         # each layer's all-gathered parameters explicitly after its compute.
-        # Only needed for optim_grads_params strategy (where params are sharded).
+        # Only needed for optim_grads_params strategy (where params are sharded), which
+        # may apply to expert parameters only. The release callbacks skip any parameter
+        # whose weights are not sharded.
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
         # Full recompute re-runs each layer segment's forward at backward time, which
         # needs the (sharded) parameters to be all-gathered again. That interaction
@@ -408,10 +413,8 @@ def combined_forward_backward_step(
             "overlap_moe_expert_parallel_comm full recompute (recompute_granularity=full) "
             "is not yet supported together with Megatron FSDP."
         )
-        if (
-            forward_fsdp_wrapper is not None
-            and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
-            == "optim_grads_params"
+        if forward_fsdp_wrapper is not None and any_sharding_strategy_in(
+            forward_fsdp_wrapper.ddp_config, ["optim_grads_params"]
         ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)
@@ -466,7 +469,7 @@ def combined_forward_backward_step(
 
     b_grad = b_output_tensor_grad[0] if b_model else None
     # combined forward and backward model chunk execution of two micro-batches
-    with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
+    with context_manager, outer_fp8_context:  # autocast context and delayed fp8 context
         # For GPT models, it calls common::TransformerModelChunkSchedulePlan.run(),
         output_tensor = type(f_schedule_plan or b_schedule_plan).run(
             f_schedule_plan,

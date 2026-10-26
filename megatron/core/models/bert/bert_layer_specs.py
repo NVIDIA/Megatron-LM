@@ -2,44 +2,15 @@
 import warnings
 from functools import partial
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.models.backends import get_backend, require
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.typed_torch import not_none
-
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import (
-        TEDotProductAttention,
-        TELayerNormColumnParallelLinear,
-        TERowParallelLinear,
-    )
-else:
-    (TEDotProductAttention, TELayerNormColumnParallelLinear, TERowParallelLinear) = (
-        None,
-        None,
-        None,
-    )
-
-try:
-    import apex  # pylint: disable=unused-import
-
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-
-    HAVE_APEX = True
-    LNImpl = FusedLayerNorm
-except ImportError:
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    LNImpl = WrappedTorchNorm
-    HAVE_APEX = False
 
 
 def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmodules:
@@ -49,19 +20,23 @@ def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmo
     Returns:
         TransformerLayerSubmodules: Submodules with TE modules.
     """
-    if not HAVE_TE:
-        raise ImportError(
-            "Transformer Engine is not installed. Please use local Bert layer spec instead."
-        )
+    # Base refused here rather than letting a spec be built that cannot be instantiated;
+    # the requirement is declared once, on the provider.
+    require(
+        TESpecProvider.REQUIRES,
+        "this spec",
+        "Use the local Bert layer spec instead (--spec local).",
+    )
+    backend = get_backend("transformer_engine")
 
     return TransformerLayerSubmodules(
         self_attention=ModuleSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.padding},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=not_none(TELayerNormColumnParallelLinear),
-                core_attention=not_none(TEDotProductAttention),
-                linear_proj=not_none(TERowParallelLinear),
+                linear_qkv=backend.column_parallel_layer_norm_linear(),
+                core_attention=backend.core_attention(),
+                linear_proj=backend.row_parallel_linear(),
                 # Leave q_layernorm/k_layernorm unset (None) rather than IdentityOp so that
                 # TransformerConfig.qk_layernorm can select the default TENorm through the
                 # shared SelfAttention fallback (`submodules.q_layernorm or TENorm`).
@@ -73,8 +48,8 @@ def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmo
         mlp=partial(
             MLP.as_mlp_submodule,
             submodules=MLPSubmodules(
-                linear_fc1=not_none(TELayerNormColumnParallelLinear),
-                linear_fc2=not_none(TERowParallelLinear),
+                linear_fc1=backend.column_parallel_layer_norm_linear(),
+                linear_fc2=backend.row_parallel_linear(),
             ),
         ),
         mlp_bda=get_bias_dropout_add,
@@ -94,36 +69,39 @@ def get_bert_layer_with_transformer_engine_spec():
 
 def __getattr__(name):
     if name == "bert_layer_with_transformer_engine_spec":
-        warnings.warn(
-            """Attribute bert_layer_specs.bert_layer_with_transformer_engine_spec is on a
+        warnings.warn("""Attribute bert_layer_specs.bert_layer_with_transformer_engine_spec is on a
             deprecation track and will be removed in future releases. Please migrate to
-            bert_layer_specs.get_bert_layer_with_transformer_engine_spec()."""
-        )
+            bert_layer_specs.get_bert_layer_with_transformer_engine_spec().""")
 
         return get_bert_layer_with_transformer_engine_spec()
 
+
+_local_backend = get_backend("local")
 
 # Use this spec for an implementation using only modules in megatron core
 bert_layer_local_spec = ModuleSpec(
     module=TransformerLayer,
     submodules=TransformerLayerSubmodules(
-        input_layernorm=LNImpl,
+        input_layernorm=_local_backend.layer_norm(),
         self_attention=ModuleSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.padding},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=ColumnParallelLinear,
-                core_attention=DotProductAttention,
-                linear_proj=RowParallelLinear,
+                linear_qkv=_local_backend.column_parallel_linear(),
+                core_attention=_local_backend.core_attention(),
+                linear_proj=_local_backend.row_parallel_linear(),
                 q_layernorm=IdentityOp,
                 k_layernorm=IdentityOp,
             ),
         ),
         self_attn_bda=get_bias_dropout_add,
-        pre_mlp_layernorm=LNImpl,
+        pre_mlp_layernorm=_local_backend.layer_norm(),
         mlp=partial(
             MLP.as_mlp_submodule,
-            submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
+            submodules=MLPSubmodules(
+                linear_fc1=_local_backend.column_parallel_linear(),
+                linear_fc2=_local_backend.row_parallel_linear(),
+            ),
         ),
         mlp_bda=get_bias_dropout_add,
         sharded_state_dict_keys_map={

@@ -1,14 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from contextlib import nullcontext
 from functools import partial
 from typing import Any, Callable, List, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core.enums import Fp8Recipe
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.pipeline_parallel.combined_1f1b_tensor_release import Combined1F1BTensorRelease
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -196,7 +196,25 @@ class TransformerLayerSchedulePlan:
     mhc_recompute = None
     mtp_post_process = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
+    @property
+    def pre_dispatch_computation(self):
+        """Incoming callable name for the preserved attention/router schedule node."""
+        return self.attn
+
+    @pre_dispatch_computation.setter
+    def pre_dispatch_computation(self, node):
+        self.attn = node
+
+    def __init__(
+        self,
+        layer,
+        event,
+        chunk_state,
+        comp_stream,
+        comm_stream,
+        extra_args={},
+        tensor_release=None,
+    ):
         """Initializes a transformer layer schedule plan.
 
         Args:
@@ -226,7 +244,9 @@ class TransformerLayerSchedulePlan:
         self.recompute_segment = None
 
         # get callable nodes for transformer/mtp layer
-        self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
+        self._build_callable_nodes(
+            event, comp_stream, comm_stream, extra_args, tensor_release=tensor_release
+        )
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
@@ -275,7 +295,9 @@ class TransformerLayerSchedulePlan:
                 self.layer._mhc_recompute_manager = None
             del self.layer
 
-    def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
+    def _build_callable_nodes(
+        self, event, comp_stream, comm_stream, extra_args, tensor_release=None
+    ):
         """
         Builds the callable nodes for the transformer/mtp layer:
             attn, mlp, moe_dispatch, moe_combine, and mtp_post_process.
@@ -314,6 +336,7 @@ class TransformerLayerSchedulePlan:
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
                 extra_args=extra_args,
+                tensor_release=tensor_release,
             )
 
         (
@@ -363,6 +386,7 @@ class TransformerLayerSchedulePlan:
                 event,
                 name="mhc_recompute",
                 forward_nvtx_name=f"mhc/recompute/{module_tag}/group_{group_index}/B",
+                tensor_release=tensor_release,
             )
         else:
             self.mhc_recompute = None
@@ -461,7 +485,7 @@ class TransformerLayerSchedulePlan:
         One fp8 context per node, matching run()'s forward half node for node.
         """
         for node in self._iter_layer_nodes():
-            with self.get_fp8_context():
+            with self.get_low_precision_context():
                 f_input = node.forward(f_input)
         return f_input
 
@@ -488,18 +512,13 @@ class TransformerLayerSchedulePlan:
         if dispatcher is not None:
             dispatcher.reset_transient_forward_state()
 
+    def get_low_precision_context(self):
+        """Get the low-precision context for the transformer layer."""
+        return self.layer.get_inner_quantization_context()
+
     def get_fp8_context(self):
-        """
-        Get the fp8 context for the transformer layer.
-        """
-        use_inner_fp8_context = (
-            self.layer.config.fp8 and self.layer.config.fp8_recipe != Fp8Recipe.delayed
-        )
-        return (
-            get_fp8_context(self.layer.config, self.layer.layer_number - 1)
-            if use_inner_fp8_context
-            else nullcontext()
-        )
+        """Compatibility alias for the layer's complete quantization context."""
+        return self.get_low_precision_context()
 
     @staticmethod
     def run(f_layer, b_layer, f_input=None, b_grad=None, is_last_layer_in_bwd=False):
@@ -546,14 +565,14 @@ class TransformerLayerSchedulePlan:
             # Full recompute: retain this segment's input for the backward-time replay.
             if f_layer.recompute_segment is not None:
                 f_layer.recompute_segment.capture(f_layer, f_input)
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.attn.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_dispatch.forward(f_input)
 
         if b_layer is not None:
@@ -564,22 +583,22 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.attn.backward(b_grad)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.mlp.forward(f_input)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.moe_combine.forward(f_input)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.mhc_post.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
 
         if f_layer is not None:
-            with f_layer.get_fp8_context():
+            with f_layer.get_low_precision_context():
                 f_input = f_layer.mtp_post_process.forward(f_input)
             segment = f_layer.recompute_segment
             if segment is not None and f_layer is segment.layers[-1]:
@@ -617,6 +636,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     └── post_process: PostProcessNode
     """
 
+    LAYER_SCHEDULE_PLAN_CLASS = None
+    PRE_PROCESS_NODE_CLASS = None
+    POST_PROCESS_NODE_CLASS = None
+
     def __init__(
         self,
         model,
@@ -631,7 +654,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         loss_mask: Optional[Tensor] = None,
         padding_mask=None,
         *,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        mtp_input_mask: Optional[Tensor] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
@@ -650,6 +674,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             extra_block_kwargs: Additional keyword arguments for blocks.
             runtime_gather_output: Whether to gather output at runtime.
             loss_mask (torch.Tensor): Used to mask out some portions of the loss
+            mtp_input_mask (Optional[torch.Tensor]): Tensor of shape ``[batch, sequence]``
+                whose values are converted to booleans. Nonzero/``True`` marks a valid MTP
+                conditioning token; zero/``False`` invalidates that token and any deeper MTP
+                prediction path that crosses it. ``None`` applies no additional conditioning
+                mask.
             output_processor (Callable): Custom postprocess hook to run instead of the
                 default logits/loss path.
             output_processor_context (Any): User-defined context object forwarded to
@@ -663,6 +692,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._event = torch.cuda.Event()
+        self._tensor_release = (
+            Combined1F1BTensorRelease()
+            if model.config.ep_overlap_use_scheduled_tensor_release
+            else None
+        )
         self.pre_process = None
         self.post_process = None
         self.vp_stage = model.vp_stage
@@ -685,6 +719,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # Holds the mHC bridge leaf across a segment replay; see RecomputeSegment.
         self._model_chunk_state.mhc_grad_carrier = None
         self._model_chunk_state.loss_mask = loss_mask
+        self._model_chunk_state.mtp_input_mask = mtp_input_mask  # type: ignore[attr-defined]
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.padding_mask = padding_mask
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
@@ -697,7 +732,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.attention_bias = None
 
         # build preprocess
-        self.pre_process = PreProcessNode(
+        pre_process_cls = self.PRE_PROCESS_NODE_CLASS or PreProcessNode
+        self.pre_process = pre_process_cls(
             model, self._model_chunk_state, self._event, get_comp_stream
         )
 
@@ -715,18 +751,54 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # build post process
         if model.post_process:
-            self.post_process = PostProcessNode(
+            post_process_cls = self.POST_PROCESS_NODE_CLASS or PostProcessNode
+            self.post_process = post_process_cls(
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
+
+        # setup FSDP hooks
+        has_fsdp_module = any(isinstance(submodule, FsdpModule) for submodule in model.modules())
+        if has_fsdp_module:
+            assert (
+                model.config.recompute_granularity != "full"
+            ), "EP-overlap full recompute is not yet supported with Megatron FSDP v2."
+            for layer_plan in self._transformer_layers:
+                # Forward resharding follows the schedule. Backward resharding and
+                # reduction are triggered by each FsdpModule's gradient countdown.
+                #
+                # One hook per layer plan pins the reshard boundary to "one transformer
+                # layer == one FSDP unit": the plan registers it on its own layer module
+                # (TransformerLayer / HybridStack / MTP layer) and fires it on that layer's
+                # last forward node, so the layer's all-gathered parameters are released at
+                # the layer boundary. That only holds while the FSDP unit is the layer
+                # itself -- the granularity `set_fsdp_reshard_hooks` asserts and the MFSDP
+                # v2 adapter forms for EP overlap (``fsdp_unit_modules``). A sub-layer unit
+                # would need a hook per unit; a coarser one would need this hoisted to the
+                # enclosing plan.
+                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)
 
         # Split into segments; pre_process and post_process keep their graphs.
         self._build_recompute_segments(model.config)
 
-    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream, module_tag):
+    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream, module_tag="decoder"):
         if module is None:
             return
 
         from megatron.core.tensor_parallel.random import MHCCheckpointManager
+
+        plan_cls = self.LAYER_SCHEDULE_PLAN_CLASS or TransformerLayerSchedulePlan
+        plan_kwargs = {}
+        if plan_cls is TransformerLayerSchedulePlan:
+            plan_kwargs["tensor_release"] = self._tensor_release
+        else:
+            # Existing main extension classes may use the original constructor contract.
+            import inspect
+
+            parameters = inspect.signature(plan_cls).parameters
+            if "tensor_release" in parameters or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+            ):
+                plan_kwargs["tensor_release"] = self._tensor_release
 
         num_layers = len(module.layers)
         config = module.config
@@ -748,27 +820,37 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 mhc_recompute_manager is not None
                 and (layer_idx == num_layers - 1 or (layer_idx + 1) % group_size == 0)
             )
-            extra_args = {
-                "is_first_layer": layer_idx == 0,
-                "is_last_layer": layer_idx == num_layers - 1,
-                "mhc_recompute_manager": mhc_recompute_manager,
-                "is_last_layer_in_mhc_recompute_group": is_group_end,
-                "mhc_recompute_group_index": group_index,
-                "mhc_recompute_module_tag": module_tag,
-            }
-            layer_plan = TransformerLayerSchedulePlan(
+            extra_args = self._extra_args_for_layer(module, layer_idx, num_layers)
+            extra_args.update(
+                {
+                    "mhc_recompute_manager": mhc_recompute_manager,
+                    "is_last_layer_in_mhc_recompute_group": is_group_end,
+                    "mhc_recompute_group_index": group_index,
+                    "mhc_recompute_module_tag": module_tag,
+                }
+            )
+            layer_plan = plan_cls(
                 module.layers[layer_idx],
                 self.event,
                 self.state,
                 comp_stream,
                 comm_stream,
                 extra_args,
+                **plan_kwargs,
             )
             self._transformer_layers.append(layer_plan)
 
             if is_group_end and layer_idx != num_layers - 1:
                 group_index += 1
                 mhc_recompute_manager = MHCCheckpointManager()
+
+    def _extra_args_for_layer(self, module, layer_idx, num_layers):
+        """Per-layer ``extra_args`` dict passed to the layer plan constructor.
+
+        Subclasses extend this hook to thread additional metadata (e.g. hybrid
+        layer-type symbols) without overriding ``_build_layer_schedule_plan``.
+        """
+        return {"is_first_layer": layer_idx == 0, "is_last_layer": layer_idx == num_layers - 1}
 
     def _build_recompute_segments(self, config):
         """Split this chunk's layers into full-recompute segments.
@@ -823,6 +905,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def event(self):
         """Gets the CUDA event for synchronization."""
         return self._event
+
+    @property
+    def tensor_release(self):
+        """Gets the optional combined 1F1B scheduled tensor-release state."""
+        return self._tensor_release
 
     def record_current_stream(self):
         """Records the current CUDA stream in the event."""
@@ -991,6 +1078,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+            if f_schedule_plan.tensor_release is not None:
+                # Post-processing is outside the managed layer-node chain.  Its input
+                # remains live, but no later managed node should consume this binding.
+                f_schedule_plan.tensor_release.export(f_input)
             if f_schedule_plan.recompute_full and f_input is not None and not f_input.requires_grad:
                 # The last layer ran under no_grad, so post_process needs a grad-tracking
                 # leaf to seed the replayed last segment's backward.
@@ -998,6 +1089,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:
+            if b_schedule_plan.tensor_release is not None:
+                # Pre-processing is the backward boundary of the managed layer-node chain.
+                b_schedule_plan.tensor_release.export(b_grad)
             b_schedule_plan.pre_process.backward(b_grad)
 
         # The forward output has been consumed (PP send / post_process), so the
@@ -1007,8 +1101,21 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()
+            if f_schedule_plan.tensor_release is not None:
+                f_schedule_plan.tensor_release.finalize_phase(
+                    f_schedule_plan.event, phase="forward", outputs=f_input
+                )
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
+            if b_schedule_plan.tensor_release is not None:
+                b_schedule_plan.tensor_release.finalize_phase(
+                    b_schedule_plan.event, phase="backward"
+                )
+            model = b_schedule_plan._model_chunk_state.model
+            if isinstance(model, FsdpModule):
+                # This schedule bypasses the root's autograd completion callback.
+                # Finish this microbatch's weight cleanup; gradient sync stays caller-managed.
+                model.context.post_backward()
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 
