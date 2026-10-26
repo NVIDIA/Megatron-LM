@@ -885,6 +885,11 @@ class HybridStack(MegatronModule):
         """
 
         sharded_offsets = sharded_offsets or ()
+        # Guard for cases metadata is not provided: replica ids span the stack's GTP-inclusive
+        # DP x CP group, the group the global default stands for.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
 
@@ -922,7 +927,6 @@ class HybridStack(MegatronModule):
         local_state_dict: dict = {}
         self._save_to_state_dict(local_state_dict, '', keep_vars=True)
         if local_state_dict:
-            metadata = ensure_metadata_has_dp_cp_group(metadata)
             sharded_state_dict.update(
                 make_sharded_tensors_for_checkpoint(
                     local_state_dict,
