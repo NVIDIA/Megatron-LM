@@ -18,7 +18,7 @@ from megatron.training import checkpointing
 from megatron.training.global_vars import get_args, get_train_state, set_args
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 from tests.unit_tests.transformer.moe import test_moe_single_grouped_weight_numerics as numerics
 
 # The GB200 CI selector scans this file's text before pytest resolves inherited marks.
@@ -312,6 +312,7 @@ def _save_canonical_checkpoint(case, directory, canonical, *, gated=True):
     optimizer.reload_model_params()
     force_param_sync(model, optimizer=optimizer)
     _assert_parameters(experts, canonical)
+    sync_checkpoint_config(get_args())
     checkpointing.save_checkpoint(1, model, optimizer, scheduler, 0)
     torch.distributed.barrier()
     _assert_checkpoint_parameters(directory, 1, canonical)
@@ -484,6 +485,7 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
             missing_conversion.setattr(
                 checkpointing, "prepare_glu_checkpoint_for_load", lambda state, args: state
             )
+            sync_checkpoint_config(get_args())
             checkpointing.load_checkpoint(model, optimizer, scheduler, strict=True)
         optimizer.quantize_and_sync_model_params_from_main_params()
         _assert_parameters(experts, canonical)
@@ -541,6 +543,7 @@ def test_non_glu_checkpoint_ignores_interleave_size(
         torch.testing.assert_close(actual_output, reference_output, rtol=0, atol=0)
         torch.testing.assert_close(actual_losses, reference_losses, rtol=0, atol=0)
 
+        sync_checkpoint_config(get_args())
         checkpointing.save_checkpoint(2, model, optimizer, scheduler, 0)
         torch.distributed.barrier()
         _assert_checkpoint_parameters(directory, 2, canonical)
@@ -609,6 +612,7 @@ def test_bf16_full_optimizer_resume_matches_uninterrupted_training(
             == "dp_reshardable"
         )
         force_param_sync(model, optimizer=optimizer)
+        sync_checkpoint_config(get_args())
         checkpointing.save_checkpoint(2, model, optimizer, scheduler, 0)
         torch.distributed.barrier()
         _assert_state_equal(

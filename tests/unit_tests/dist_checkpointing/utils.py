@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
 from typing import Any, Callable, Tuple, Union
@@ -18,6 +18,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
+from tests.unit_tests.test_utilities import sync_checkpoint_config
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -239,6 +240,9 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
+    # The registered run config owns these settings; tests that write to args afterwards call
+    # sync_checkpoint_config(args) again before saving or loading.
+    sync_checkpoint_config(args)
     # Clear the metadata cache to avoid contamination between tests
 
     if HAVE_NVRX:

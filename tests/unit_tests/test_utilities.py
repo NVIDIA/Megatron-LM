@@ -367,3 +367,18 @@ class Utils:
         ps.set_virtual_pipeline_model_parallel_rank(0)
 
         ps.set_pipeline_model_parallel_world_size(pipeline_model_parallel_size)
+
+
+def sync_checkpoint_config(args):
+    """Give the registered run config the checkpoint section these arguments describe.
+
+    Checkpoint settings are owned by the run config's ``CheckpointConfig``, not by the argument
+    namespace. Tests that still describe them on a namespace call this right before saving or
+    loading, after their last write to ``args``; the section is returned for further edits.
+    """
+    from megatron.training.argument_utils import checkpoint_config_from_args
+    from megatron.training.global_vars import get_run_config
+
+    run_config = get_run_config()
+    run_config.checkpoint = checkpoint_config_from_args(args)
+    return run_config.checkpoint

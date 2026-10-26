@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Tests for loading GPT checkpoints into HybridModel runs.
 
@@ -54,22 +54,26 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     save_checkpoint,
 )
+from megatron.training.config import CheckpointConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
     setup_model_and_optimizer,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
 class TestGPTCompatLayerMaps:
     def test_metadata_less_bridge_checkpoint_uses_regular_load_path(self):
         runtime_model = object.__new__(HybridModel)
 
-        assert _maybe_setup_gpt_to_hybrid_load(mock.Mock(), SimpleNamespace(), [runtime_model]) == (
-            None,
-            False,
-        )
+        assert _maybe_setup_gpt_to_hybrid_load(
+            mock.Mock(),
+            SimpleNamespace(),
+            [runtime_model],
+            checkpoint=CheckpointConfig(),
+            saved_save_optim=True,
+        ) == (None, False)
 
     def test_pairs_positions_in_pattern_order(self):
         maps = gpt_compatible_layer_maps('M*-M*-')
@@ -687,6 +691,7 @@ def _run_gpt_to_hybrid_optimizer_load(
             _seed_optimizer_moments(gpt_optimizer, seed=3)
             _configure_checkpoint_args(mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp)
             mock_args.num_layers = num_gpt_layers
+            sync_checkpoint_config(mock_args)
             save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
             Utils.destroy_model_parallel()
 
@@ -729,6 +734,7 @@ def _run_gpt_to_hybrid_optimizer_load(
                     data_parallel_size=data_parallel_size,
                 )
             try:
+                sync_checkpoint_config(mock_args)
                 iteration, _ = load_checkpoint(
                     hybrid_model, hybrid_optimizer, None, restore_training_state=True
                 )

@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from inspect import signature
@@ -44,7 +44,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -1552,6 +1552,7 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.no_save_rng = True
         mock_args.no_load_optim = True
         mock_args.no_load_rng = True
+        sync_checkpoint_config(mock_args)
         save_checkpoint(10, gpt_model, None, None, 0)
 
         # Calculate baseline output
@@ -1581,6 +1582,7 @@ def test_parallel_multi_latent_attention_correctness(
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
+            sync_checkpoint_config(mock_args)
             load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank

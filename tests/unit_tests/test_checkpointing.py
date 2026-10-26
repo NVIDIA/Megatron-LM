@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
 from dataclasses import fields
@@ -39,11 +39,11 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     set_checkpoint_version,
 )
-from megatron.training.config import ProfilingConfig
-from megatron.training.global_vars import set_args
+from megatron.training.config import CheckpointConfig, ProfilingConfig
+from megatron.training.global_vars import get_args, set_args
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -53,7 +53,9 @@ def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop(ckpt_args):
     """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
 
     args = SimpleNamespace(hybrid_layer_pattern="M*E")
-    assert _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, [object()]) == (None, False)
+    assert _maybe_setup_gpt_to_hybrid_load(
+        args, ckpt_args, [object()], checkpoint=CheckpointConfig(), saved_save_optim=True
+    ) == (None, False)
 
 
 @pytest.mark.parametrize("auto_detect", [False, True])
@@ -72,6 +74,7 @@ def test_inference_shards_reject_legacy_checkpoint(create_ckpt_load_args, monkey
         mock.Mock(return_value=({}, "unused", False, CheckpointType.LEGACY)),
     )
     with pytest.raises(ValueError, match="incompatible with legacy torch checkpoints"):
+        sync_checkpoint_config(args)
         load_checkpoint([], None, None)
 
 
@@ -719,6 +722,7 @@ def test_load_base_checkpoint(
         args = create_ckpt_load_args
         args.ckpt_format = ckpt_format
 
+        sync_checkpoint_config(args)
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir, args, rank0=True
         )
@@ -793,6 +797,7 @@ def test_save_checkpoint(
             "megatron.training.checkpointing.maybe_save_dataloader_state",
             wraps=maybe_save_dataloader_state,
         ) as save_dataloader_state:
+            sync_checkpoint_config(args)
             save_checkpoint(
                 iteration,
                 [model],
@@ -815,6 +820,7 @@ def test_save_checkpoint(
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+        sync_checkpoint_config(args)
         state, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
         # Legacy args remain unchanged; the run config records the effective policy.
         assert state["args"].profile is False and state["args"].profile_ranks == [99]
@@ -884,6 +890,7 @@ def test_load_checkpoint(
         torch.manual_seed(rng_config.seed + (torch.distributed.get_rank() if owned_rng else 0))
         expected_cpu_rng = torch.get_rng_state().clone()
         with mock.patch("torch.save", wraps=torch.save) as serialized:
+            sync_checkpoint_config(args)
             save_checkpoint(
                 iteration,
                 [model],
@@ -894,7 +901,9 @@ def test_load_checkpoint(
         # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
-            assert serialized.call_args.args[0]["args"] is args
+            # The persisted arguments are a copy whose checkpoint names follow the section;
+            # for a namespace that agrees with it, the copy is identical.
+            assert vars(serialized.call_args.args[0]["args"]) == vars(args)
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
@@ -906,6 +915,7 @@ def test_load_checkpoint(
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
         # Load checkpoint
+        sync_checkpoint_config(args)
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model], new_optimizer, new_opt_param_scheduler, strict=True, **load_kwargs
         )
@@ -939,6 +949,7 @@ def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_
     set_args(args)
 
     with pytest.raises(ValueError, match="inference-only"):
+        sync_checkpoint_config(args)
         load_checkpoint(
             [MockModel(TransformerConfig(num_layers=1, kv_channels=1))], MockState({}), None
         )
@@ -988,6 +999,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
         num_floating_point_operations_so_far = 456
 
+        sync_checkpoint_config(args)
         save_checkpoint(
             iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
@@ -1006,6 +1018,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         # Load checkpoint and verify runtime overrides are restored.
         train_state = TrainState()
         get_train_state.return_value = train_state
+        sync_checkpoint_config(args)
         loaded_iter, loaded_flops = load_checkpoint(
             [new_model],
             new_optimizer,
@@ -1023,6 +1036,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
         # Ensure loading without optimizer/scheduler remains safe.
+        sync_checkpoint_config(args)
         loaded_iter_none, loaded_flops_none = load_checkpoint(
             [new_model], None, None, strict=True, restore_training_state=True
         )
@@ -1059,6 +1073,7 @@ def test_strict_load_idle_rerun_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=saved_machine
         ):
+            sync_checkpoint_config(args)
             save_checkpoint(123, [model], None, None, 456)
 
         loaded_model = MockModel(config)
@@ -1068,6 +1083,7 @@ def test_strict_load_idle_rerun_checkpoint(
         with mock.patch(
             "megatron.training.checkpointing.get_rerun_state_machine", return_value=loaded_machine
         ):
+            sync_checkpoint_config(args)
             iteration, flops = load_checkpoint(
                 [loaded_model], None, None, strict=True, restore_training_state=True
             )
@@ -1133,6 +1149,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             'megatron.training.checkpointing._build_sharded_state_dict_metadata',
             return_value=first_job_mock_metadata,
         ):
+            sync_checkpoint_config(args)
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
         expected_loaded_metadata = {**first_job_mock_metadata, 'checkpoint_version': 3.1}
 
@@ -1146,12 +1163,14 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             return_value=second_job_mock_metadata,
         ):
             # Load checkpoint (into the same model, we don't check load correctness here)
+            sync_checkpoint_config(args)
             load_checkpoint(
                 [model], optimizer, opt_param_scheduler, strict=True, restore_training_state=True
             )
             assert optimizer._called_metadata[-1] == expected_loaded_metadata
 
             # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
+            sync_checkpoint_config(args)
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 
@@ -1222,6 +1241,7 @@ def test_checkpoint_load_without_microbatch_calculator(
 
         torch.manual_seed(123)
         model = build_model()
+        sync_checkpoint_config(args)
         save_checkpoint(123, [model], None, None, 456)
         saved_rng = torch.get_rng_state().clone()
         saved_cuda_rng = torch.cuda.get_rng_state().clone()
@@ -1259,11 +1279,13 @@ def test_checkpoint_load_without_microbatch_calculator(
                 side_effect=AssertionError("Inference must not restore training rerun state"),
             ):
                 load_kwargs = {} if load_mode == "default" else {"restore_training_state": False}
+                sync_checkpoint_config(args)
                 metadata = load_checkpoint([restored], None, None, **load_kwargs)
             assert not hasattr(args, "consumed_train_samples")
             assert not hasattr(args, "skipped_train_samples")
             assert not hasattr(args, "consumed_valid_samples")
         else:
+            sync_checkpoint_config(args)
             metadata = load_checkpoint([restored], None, None, restore_training_state=True)
             expected_iteration = 7 if load_mode == "override" else 123
             assert train_state.iteration == expected_iteration
@@ -1322,6 +1344,17 @@ def _make_metadata_args(
     return args
 
 
+def _metadata_checkpoint(args):
+    """The checkpoint section the metadata builder reads; the namespace keeps the rest."""
+    return CheckpointConfig(
+        ckpt_format=args.ckpt_format,
+        dist_ckpt_optim_fully_reshardable=args.dist_ckpt_optim_fully_reshardable,
+        distrib_optim_fully_reshardable_mem_efficient=(
+            args.distrib_optim_fully_reshardable_mem_efficient
+        ),
+    )
+
+
 class TestBuildShardedStateDictMetadata:
     """``_build_sharded_state_dict_metadata`` must set ``distrib_optim_sharding_type``
     whenever a real :class:`DistributedOptimizer` instance will be used at save
@@ -1335,20 +1368,26 @@ class TestBuildShardedStateDictMetadata:
 
     def test_distributed_optimizer_sets_dp_reshardable_default(self):
         args = _make_metadata_args(use_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_distributed_optimizer_fully_reshardable_flag(self):
         args = _make_metadata_args(
             use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
         assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
 
     def test_distributed_optimizer_fsdp_dtensor(self):
         args = _make_metadata_args(use_distributed_optimizer=True, ckpt_format='fsdp_dtensor')
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
     def test_layer_wise_only_still_sets_sharding_type(self):
@@ -1356,17 +1395,23 @@ class TestBuildShardedStateDictMetadata:
         # use, but the LayerWise + DistOpt split path still has a DistOpt
         # sub-optimizer for non-Muon params, so the metadata is required.
         args = _make_metadata_args(use_layer_wise_distributed_optimizer=True)
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
     def test_layer_wise_with_fully_reshardable(self):
         args = _make_metadata_args(
             use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
     def test_no_distributed_optimizer_no_sharding_type(self):
         args = _make_metadata_args()
-        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        metadata = _build_sharded_state_dict_metadata(
+            args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
+        )
         assert 'distrib_optim_sharding_type' not in metadata
