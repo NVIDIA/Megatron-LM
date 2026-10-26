@@ -21,7 +21,9 @@ determine how the buffers are partitioned:
 - `BlockAtomic(k)`: keeps blocks of `k` consecutive rows intact, with
   equal-sized rank segments. MXFP8 uses `k=32`.
 - `TensorAtomic`: assigns each complete parameter to one rank. Rank
-  segments may differ in size or be empty.
+  segments may differ in size or be empty. Keeping weights, gradients,
+  and momentum on the same owner makes Muon's optimizer step
+  communication-free.
 
 By contrast,
 [PyTorch FSDP2](https://docs.pytorch.org/docs/2.14/distributed.fsdp.fully_shard.html#communication-grouping-and-scheduling)
