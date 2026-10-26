@@ -82,12 +82,12 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
     # initialization instead uses the globally configured EP rank in its RNG seed.
     config = TransformerConfig(
-        num_layers=3 if shortcut else 2,
+        num_layers=3,
         hidden_size=64,
         num_attention_heads=4,
         num_moe_experts=4,
         expert_model_parallel_size=2,
-        moe_layer_freq=[0, 1, 0] if shortcut else [0, 1],
+        moe_layer_freq=[0, 1, 0],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_grouped_gemm=True,
@@ -117,7 +117,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         hybrid_stack_spec=(wide_residual_hybrid_stack_spec if shortcut else hybrid_stack_spec),
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E*" if shortcut else "*E",
+        hybrid_layer_pattern="*E*",
         pg_collection=reference_process_group_collection,
     ).cuda()
     model = HybridModel(
@@ -125,7 +125,7 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         hybrid_stack_spec=(wide_residual_hybrid_stack_spec if shortcut else hybrid_stack_spec),
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E*" if shortcut else "*E",
+        hybrid_layer_pattern="*E*",
         pg_collection=process_group_collection,
     ).cuda()
     model.load_state_dict(reference_model.state_dict(), strict=False)
@@ -169,10 +169,10 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         assert not isinstance(block.moe_layer, FsdpModule)
         assert not isinstance(block.moe_layer.mlp, FsdpModule)
         assert not isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule)
-        assert isinstance(model.module.decoder.layers[1], FsdpModule)
         experts = block.moe_layer.mlp.experts
     else:
         experts = model.module.decoder.layers[1].mlp.experts
+    assert isinstance(model.module.decoder.layers[-1], FsdpModule)
     assert isinstance(experts, FsdpModule)
     for parameter in experts.parameters():
         assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
