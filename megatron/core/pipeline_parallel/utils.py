@@ -89,10 +89,12 @@ class _UnwrapRealTensor(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, wrapper):
+        """Return the real tensor while connecting it to the wrapper leaf."""
         return wrapper._take_real_tensor()
 
     @staticmethod
     def backward(ctx, grad):
+        """Pass the real tensor's gradient back to the wrapper leaf."""
         return grad
 
 
