@@ -53,16 +53,33 @@ def get_packed_sequence_length(
     return seq_len + (-seq_len % alignment)
 
 
+def _pad_packed_graph_metadata(batch: Dict, max_num_seqs: Optional[int]) -> None:
+    """Fix metadata shapes without treating physical padding as real tokens."""
+    if max_num_seqs is None:
+        return
+    for key in ('cu_seqlens', 'cu_seqlens_padded'):
+        offsets = batch[key]
+        remaining = max_num_seqs + 1 - offsets.numel()
+        if remaining < 0:
+            raise ValueError("Packed documents exceed thd_max_packed_sequences.")
+        if remaining:
+            batch[key] = torch.cat((offsets, offsets[-1:].expand(remaining)))
+    # A stable upper bound is needed by TE capture even when document lengths vary.
+    batch['max_seqlen'] = batch['cu_seqlens_padded'][-1].to(torch.int32)
+
+
 def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size: int) -> None:
     """Pad global THD data and metadata before constructing any CP layout.
 
     Preserve compact logical boundaries and existing physical gaps. Align each
     physical sequence for zigzag CP, then append a masked dummy sequence to
-    reach the requested CP-local alignment. The dummy has equal logical and
-    physical lengths.
+    reach the requested CP-local alignment. For fixed graph metadata the dummy
+    has zero logical length; the ordinary main padding contract is unchanged.
     """
     alignment, enabled = get_packed_sequence_alignment(config, tp_size)
+    max_num_seqs = getattr(config, 'thd_max_packed_sequences', None)
     if not enabled:
+        _pad_packed_graph_metadata(batch, max_num_seqs)
         return
     logical = batch['cu_seqlens']
     physical = batch['cu_seqlens_padded']
@@ -102,11 +119,13 @@ def pad_packed_batch_before_cp_slice(batch: Dict, config, cp_size: int, tp_size:
         batch[key] = torch.cat((padded, tensor.new_full((tail,), fill))) if tail else padded
 
     if tail:
-        logical = torch.cat((logical, logical[-1:] + tail))
+        logical_tail = tail if max_num_seqs is None else 0
+        logical = torch.cat((logical, logical[-1:] + logical_tail))
         padded_boundaries = torch.cat((padded_boundaries, padded_boundaries[-1:] + tail))
     batch['cu_seqlens'] = logical
     batch['cu_seqlens_padded'] = padded_boundaries
     batch['max_seqlen'] = padded_boundaries.diff().max().to(torch.int32)
+    _pad_packed_graph_metadata(batch, max_num_seqs)
 
 
 def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:

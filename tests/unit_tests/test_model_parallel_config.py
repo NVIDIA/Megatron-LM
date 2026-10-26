@@ -128,3 +128,32 @@ def test_te_cross_entropy_loss_fusion_requires_te_2_19(monkeypatch):
 
     with pytest.raises(AssertionError, match="disabled due to stability issues"):
         validate_args(args)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize(
+    "alignment,capacity,valid",
+    [("max", 18, False), ("max", 24, True), (6, 24, True), (8, 24, True)],
+)
+def test_packed_padding_preserves_sequence_parallel_divisibility(
+    cp_size, alignment, capacity, valid
+):
+    kwargs = dict(
+        tensor_model_parallel_size=4,
+        context_parallel_size=cp_size,
+        sequence_packing_scheduler="dp_balanced",
+        pad_packed_seq_alignment=alignment,
+        max_seqlen_per_dp_cp_rank=capacity,
+    )
+    # Without sequence parallelism, TP does not constrain the padded token length.
+    ModelParallelConfig(**kwargs)
+    if valid:
+        config = ModelParallelConfig(sequence_parallel=True, **kwargs)
+        from megatron.core.datasets.data_schedule_utils import get_packed_sequence_alignment
+
+        effective_alignment, _ = get_packed_sequence_alignment(config, 4)
+        assert effective_alignment % 4 == 0
+        assert capacity % effective_alignment == 0
+    else:
+        with pytest.raises(AssertionError, match="sequence-parallel TP divisibility"):
+            ModelParallelConfig(sequence_parallel=True, **kwargs)
