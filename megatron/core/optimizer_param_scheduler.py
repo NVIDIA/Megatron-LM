@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -14,6 +15,37 @@ if TYPE_CHECKING:
     from megatron.core.optimizer import MegatronOptimizer
 
 logger = logging.getLogger(__name__)
+
+
+def parse_step_lr_rescale_schedule(schedule: str | None) -> tuple[tuple[int, float], ...]:
+    """Parse ``sample_threshold:multiplier`` entries for step-wise LR rescaling."""
+
+    if schedule is None:
+        return ()
+
+    entries = []
+    for entry in schedule.replace(',', ' ').split():
+        try:
+            threshold_raw, multiplier_raw = entry.split(':', 1)
+            threshold = int(threshold_raw)
+            multiplier = float(multiplier_raw)
+        except ValueError as error:
+            raise ValueError(
+                f"invalid step LR rescale entry {entry!r}; expected SAMPLES:MULTIPLIER"
+            ) from error
+
+        if threshold < 0:
+            raise ValueError("step LR rescale thresholds must be nonnegative")
+        if not math.isfinite(multiplier) or multiplier <= 0:
+            raise ValueError("step LR rescale multipliers must be finite and positive")
+        entries.append((threshold, multiplier))
+
+    if not entries or entries[0][0] != 0:
+        raise ValueError("step LR rescale schedule must begin at sample 0")
+    if any(current[0] >= following[0] for current, following in zip(entries, entries[1:])):
+        raise ValueError("step LR rescale thresholds must be strictly increasing")
+
+    return tuple(entries)
 
 
 class ParamGroupOverride(TypedDict, total=False):
@@ -119,6 +151,10 @@ class OptimizerParamScheduler:
         wsd_decay_steps (int, optional): number of weight decay decay steps
         lr_wsd_decay_style (str, optional): decay style for learning rate during weight decay decay
             steps
+        step_lr_rescale_schedule (str, optional): sample thresholds and LR multipliers for
+            step-wise LR rescaling
+        step_lr_rescale_warmup_samples (int, optional): number of samples used to linearly
+            transition between LR multipliers after the initial schedule entry
 
     """
 
@@ -139,6 +175,8 @@ class OptimizerParamScheduler:
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
+        step_lr_rescale_schedule: Optional[str] = None,
+        step_lr_rescale_warmup_samples: int = 0,
     ) -> None:
 
         # Class values.
@@ -156,6 +194,24 @@ class OptimizerParamScheduler:
         self.lr_decay_steps = lr_decay_steps
         self.wsd_decay_steps = wsd_decay_steps
         self.lr_wsd_decay_style = lr_wsd_decay_style
+        self.step_lr_rescale_schedule = parse_step_lr_rescale_schedule(step_lr_rescale_schedule)
+        self.step_lr_rescale_warmup_samples = step_lr_rescale_warmup_samples
+        if self.step_lr_rescale_warmup_samples < 0:
+            raise ValueError("step LR rescale warmup samples must be nonnegative")
+        if self.step_lr_rescale_warmup_samples > 0:
+            if len(self.step_lr_rescale_schedule) < 2:
+                raise ValueError(
+                    "step LR rescale warmup requires a schedule with at least two entries"
+                )
+            if any(
+                following[0] - current[0] < self.step_lr_rescale_warmup_samples
+                for current, following in zip(
+                    self.step_lr_rescale_schedule, self.step_lr_rescale_schedule[1:]
+                )
+            ):
+                raise ValueError(
+                    "step LR rescale warmup samples must not exceed the gap between transitions"
+                )
         assert self.lr_decay_steps > 0
         assert self.lr_warmup_steps < self.lr_decay_steps
 
@@ -228,24 +284,25 @@ class OptimizerParamScheduler:
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
-            return self.init_lr + (
+            lr = self.init_lr + (
                 (max_lr - self.init_lr) * float(self.num_steps) / float(self.lr_warmup_steps)
             )
+            return self._apply_lr_rescale(lr)
 
         # If the learning rate is constant, just return the initial value.
         if self.lr_decay_style == 'constant':
-            return max_lr
+            return self._apply_lr_rescale(max_lr)
 
         # For any steps larger than `self.lr_decay_steps`, use `min_lr`.
         if self.num_steps > self.lr_decay_steps:
-            return min_lr
+            return self._apply_lr_rescale(min_lr)
 
         # If we are done with the warmup period, use the decay style.
         if self.lr_decay_style == 'inverse-square-root':
             warmup_steps = max(self.lr_warmup_steps, 1)
             num_steps = max(self.num_steps, 1)
             lr = max_lr * warmup_steps**0.5 / (num_steps**0.5)
-            return max(min_lr, lr)
+            return self._apply_lr_rescale(max(min_lr, lr))
 
         num_steps_ = self.num_steps - self.lr_warmup_steps
         decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
@@ -279,7 +336,41 @@ class OptimizerParamScheduler:
             raise Exception(f'{self.lr_decay_style} decay style is not supported.')
         assert coeff is not None
 
-        return min_lr + coeff * delta_lr
+        return self._apply_lr_rescale(min_lr + coeff * delta_lr)
+
+    def _apply_lr_rescale(self, lr: float) -> float:
+        """Apply the active LR multiplier when step-wise rescaling is enabled."""
+
+        if not self.step_lr_rescale_schedule:
+            return lr
+        return lr * self.get_lr_rescale()
+
+    def get_lr_rescale(self) -> float:
+        """Return the active multiplier for the consumed-sample count."""
+
+        if not self.step_lr_rescale_schedule:
+            return 1.0
+
+        # Preserve the original hard-step path exactly when transition warmup is disabled.
+        if self.step_lr_rescale_warmup_samples == 0:
+            multiplier = 1.0
+            for threshold, value in self.step_lr_rescale_schedule:
+                if self.num_steps < threshold:
+                    break
+                multiplier = value
+            return multiplier
+
+        multiplier = self.step_lr_rescale_schedule[0][1]
+        for threshold, target_multiplier in self.step_lr_rescale_schedule[1:]:
+            if self.num_steps < threshold:
+                break
+
+            transition_samples = self.num_steps - threshold
+            if transition_samples < self.step_lr_rescale_warmup_samples:
+                progress = transition_samples / self.step_lr_rescale_warmup_samples
+                return multiplier + progress * (target_multiplier - multiplier)
+            multiplier = target_multiplier
+        return multiplier
 
     def step(self, increment: int) -> None:
         """Set lr for all parameters groups.
@@ -313,9 +404,13 @@ class OptimizerParamScheduler:
             'wd_incr_style': self.wd_incr_style,
             'wd_incr_steps': self.wd_incr_steps,
         }
+        if self.step_lr_rescale_schedule:
+            state_dict['step_lr_rescale_schedule'] = self.step_lr_rescale_schedule
+        if self.step_lr_rescale_warmup_samples > 0:
+            state_dict['step_lr_rescale_warmup_samples'] = self.step_lr_rescale_warmup_samples
         return state_dict
 
-    def _check_and_set(self, cls_value: float, sd_value: float, name: str) -> float:
+    def _check_and_set(self, cls_value: Any, sd_value: Any, name: str) -> Any:
         """Auxiliary function for checking the values in the checkpoint and
         setting them.
 
@@ -382,6 +477,22 @@ class OptimizerParamScheduler:
         self.lr_decay_style = self._check_and_set(
             self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
         )
+
+        if 'step_lr_rescale_schedule' in state_dict:
+            checkpoint_schedule = tuple(
+                (int(threshold), float(multiplier))
+                for threshold, multiplier in state_dict['step_lr_rescale_schedule']
+            )
+            self.step_lr_rescale_schedule = self._check_and_set(
+                self.step_lr_rescale_schedule, checkpoint_schedule, 'step LR rescale schedule'
+            )
+
+        if 'step_lr_rescale_warmup_samples' in state_dict:
+            self.step_lr_rescale_warmup_samples = self._check_and_set(
+                self.step_lr_rescale_warmup_samples,
+                int(state_dict['step_lr_rescale_warmup_samples']),
+                'step LR rescale warmup samples',
+            )
 
         if 'num_iters' in state_dict:
             num_steps = state_dict['num_iters']
