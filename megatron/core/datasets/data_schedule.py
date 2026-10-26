@@ -660,7 +660,7 @@ def wrap_data_iterator(
         scheduler_kwargs['allow_arbitrary_group_starts'] = getattr(
             config, 'use_native_cp_transport', False
         )
-        if config.sequence_parallel:
+        if getattr(config, 'sequence_parallel', False):
             scheduler_kwargs['sequence_parallel_size'] = config.tensor_model_parallel_size
         domain_size = getattr(config, 'dynamic_cp_nvlink_domain_size', None)
         if domain_size is not None:
