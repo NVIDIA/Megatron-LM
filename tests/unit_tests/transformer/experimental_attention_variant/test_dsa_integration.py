@@ -342,7 +342,7 @@ def test_checkpointed_absorbed_attention_keeps_metadata_out_of_tensor_args(monke
         attn_mask_type=AttnMaskType.causal,
         core_attention=CoreAttention(),
         pg_collection=SimpleNamespace(cp=None, tp=None),
-        # checkpoint_activations() picks the checkpoint backend from the config: BF16, no graphs.
+        # precision_aware_checkpoint() picks the backend from the config: BF16, no graphs.
         config=SimpleNamespace(fp8=None, fp4=None, cuda_graph_impl="none"),
     )
     monkeypatch.setattr(absorbed_mla_module.tensor_parallel, "checkpoint", fake_checkpoint)

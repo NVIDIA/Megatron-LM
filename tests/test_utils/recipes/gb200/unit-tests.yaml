@@ -73,7 +73,7 @@ spec:
         echo "No unit-test coverage data was produced; skipping coverage export."
     fi
 
-# GB200 selection is marker-driven. find_test_cases.py excludes the dedicated
+# GB200 selection is marker-driven. find_test_cases.py excludes dedicated
 # buckets from the catch-all bucket, so each marked test runs only once.
 # Keep M2N in a separate process: NCCL caches the test fixture's transport settings.
 products:

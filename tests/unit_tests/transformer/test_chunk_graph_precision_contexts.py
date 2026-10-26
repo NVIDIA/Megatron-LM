@@ -13,13 +13,13 @@ import torch
 from megatron.core import fp8_utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_recipe, get_layer_fp8_context
-from megatron.core.recompute import use_te_checkpoint
 from megatron.core.transformer.chunk_cuda_graph import (
     ChunkCudaGraphBlockMixin,
     ChunkCudaGraphPostProcessBlock,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import use_te_checkpoint
 
 
 def _config(**overrides):

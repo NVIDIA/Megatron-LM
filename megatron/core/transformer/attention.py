@@ -45,7 +45,11 @@ from megatron.core.transformer.attention_output_gate import apply_attention_outp
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
-from megatron.core.transformer.utils import cat_with_oom_fallback, is_layer_window_attention
+from megatron.core.transformer.utils import (
+    cat_with_oom_fallback,
+    is_layer_window_attention,
+    precision_aware_checkpoint,
+)
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -625,11 +629,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # tensor here and convert it back to AttnMaskType inside custom_forward.
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         checkpoint_inputs[5] = attn_mask_type
-        # import here to avoid circular import (recompute imports TransformerLayer)
-        from megatron.core.recompute import checkpoint_activations
-
-        hidden_states = checkpoint_activations(
-            self.config, custom_forward, False, self.pg_collection.tp, *checkpoint_inputs
+        hidden_states = precision_aware_checkpoint(
+            custom_forward, self.config, self.pg_collection.tp, *checkpoint_inputs
         )
 
         return hidden_states
@@ -896,6 +897,24 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         the corresponding gate tensor is appended as a trailing tuple element.
         """
 
+    def get_softmax_scale(
+        self, query_tensor: torch.Tensor, head_dim_index: int = -1
+    ) -> float | None:
+        """Return the softmax scaling value to use.
+
+        Tries, in order:
+        - `self.softmax_scale` (should only be assigned for MLA),
+        - `self.config.softmax_scale`, and if that is `None`, uses
+        - 1 / sqrt(Q head dim), as per `query_tensor` and `head_dim_index`.
+        """
+        if getattr(self, "softmax_scale", None) is not None:
+            softmax_scale = self.softmax_scale
+        elif getattr(self.config, "softmax_scale", None) is not None:
+            softmax_scale = self.config.softmax_scale
+        else:
+            softmax_scale = query_tensor.size(head_dim_index) ** -0.5
+        return softmax_scale
+
     def flash_decode(
         self,
         sequence_len_offset: Tensor,
@@ -942,6 +961,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             rotary_sin=rotary_sin,
             cache_seqlens=sequence_len_offset,
             rotary_interleaved=rotary_interleaved,
+            softmax_scale=self.get_softmax_scale(q),
         )
         # This path bypasses self.core_attention and calls flash-attention directly, so the
         # configured cap has to be passed here too. Only when set, so runs without softcapping
@@ -1237,10 +1257,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
-            if getattr(self, "softmax_scale", None) is not None:
-                softmax_scale = self.softmax_scale
-            else:
-                softmax_scale = q.shape[-1] ** -0.5
+            softmax_scale = self.get_softmax_scale(q)
             softcap = self.config.attn_logit_softcapping
             softcap_kwargs = {} if softcap is None else {"softcap": softcap}
             if use_fa4:
@@ -1353,6 +1370,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     "Set config.attn_logit_softcapping = None or use a non-MLA attention layer."
                 )
                 softmax_scale = self.softmax_scale
+                assert softmax_scale is not None
 
                 num_heads_k = 1  # Only a single head for MLA Flash
                 seq_len_q = tokens_per_request
@@ -1385,10 +1403,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     )
             else:
                 if use_fa4:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
+                    softmax_scale = self.get_softmax_scale(q)
                     # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
                     q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
                     decode_softcap = self.config.attn_logit_softcapping
@@ -1418,10 +1433,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         num_requests, tokens_per_request, *output_total.shape[1:]
                     )
                 else:
-                    if getattr(self, "softmax_scale", None) is not None:
-                        softmax_scale = self.softmax_scale
-                    else:
-                        softmax_scale = q.shape[-1] ** -0.5
+                    softmax_scale = self.get_softmax_scale(q)
                     flash_attn_args = {
                         "q": q,
                         "k_cache": k,

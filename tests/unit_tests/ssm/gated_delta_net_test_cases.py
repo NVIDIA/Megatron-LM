@@ -37,6 +37,7 @@ else:
 
 
 class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
+    """Shared module assertions collected only through variant-specific wrappers."""
 
     def test_gpu_forward(self):
         gdn = self.gdn
@@ -125,7 +126,10 @@ class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
             # match up to bf16 ULP-level differences for GDN2.
             atol, rtol = 1e-2, 1e-2
         else:
-            atol, rtol = 3e-4, 3e-4
+            # SBHD and padded THD use distinct FLA bf16 kernel paths, which can
+            # differ by one ULP. Match test_gated_delta_net_padding.py and #6851:
+            # https://github.com/NVIDIA/Megatron-LM/pull/6851#issuecomment-5455230207
+            atol, rtol = 5e-3, 5e-3
         sequence_length = 32
         micro_batch_size = 4
 

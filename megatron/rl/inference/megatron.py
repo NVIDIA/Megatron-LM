@@ -44,7 +44,12 @@ def resolve_generation_lag(
     dp_size: int,
     max_requests: int,
 ) -> float:
-    """Return the generation lag to run with. An unset `generation_lag` autotunes."""
+    """Return the generation lag to run with. An unset `generation_lag` autotunes.
+
+    This local DP/capacity estimate is inaccurate for disaggregated inference:
+    it does not aggregate the capacities of the built decode engines. See #8200
+    and #7138; an explicit lag avoids relying on this estimate for run-ahead.
+    """
     max_effective_groups = dp_size * max_requests // group_size
     max_effective_lag = max_effective_groups / prompts_per_step - 1
     if generation_lag is None:
@@ -157,6 +162,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         inference_engine.local_metadata_ledger_enabled = True
+        if inference_engine.context.config.disaggregation_shards is not None:
+            print_rank_0(
+                "WARNING: disaggregated RL generation-lag autotuning and HTTP concurrency "
+                "limits use local shard capacity, not aggregate decode capacity. "
+                "Set --rl-generation-lag explicitly when using partial rollouts; "
+                "capacity aggregation is tracked in Megatron-LM #8200 / #7138."
+            )
         generation_lag = cfg.rl.rl_generation_lag
         if cfg.rl.rl_partial_rollouts:
             generation_lag = resolve_generation_lag(
@@ -234,7 +246,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
                 stop_text_gen_server,
             )
-
             stop_text_gen_server()
 
     def set_generation_epoch(self, generation_epoch: int):

@@ -472,6 +472,39 @@ def test_inference_unpermute_batch_invariant_path_replays():
     )
 
 
+def test_inference_unpermute_batch_invariant_path_accumulates_in_fp64():
+    """The combine must equal an fp64 sum rounded once to fp32, as training's batch-invariant
+    unpermute does; an fp32 accumulator drops small contributions next to a large one."""
+    from megatron.core.inference.moe import batch_invariant
+
+    seeded()
+    num_tokens, hidden, num_local = 256, 1536, 8
+    valid_tokens = num_tokens - 13
+    routed = torch.rand(num_tokens, num_local, device="cuda") < 0.75
+    inverse_map = torch.full((num_tokens, num_local), -1, device="cuda", dtype=torch.int32)
+    inverse_map[routed] = torch.randperm(int(routed.sum()), device="cuda", dtype=torch.int32)
+    # Outlier tokens and channels: each row is scaled by its token's and channel's magnitude.
+    row_token = torch.empty(int(routed.sum()), device="cuda", dtype=torch.long)
+    row_token[inverse_map[routed].long()] = routed.nonzero()[:, 0]
+    token_scale = torch.randn(num_tokens, 1, device="cuda").exp()
+    channel_scale = (0.5 * torch.randn(1, hidden, device="cuda")).exp()
+    expert_output = torch.randn(row_token.numel(), hidden, device="cuda")
+    expert_output = (expert_output * token_scale[row_token] * channel_scale).to(torch.bfloat16)
+    # Token 0: one 2**24 contribution and seven 1.0s. fp32 accumulation gives 2**24; the
+    # fp64 sum 2**24 + 7 rounds to 2**24 + 8.
+    inverse_map[0] = torch.arange(num_local, device="cuda", dtype=torch.int32)
+    expert_output[:num_local] = 1.0
+    expert_output[0] = 2.0**24
+    valid = _dev_scalar(valid_tokens)
+
+    out = batch_invariant.unpermute_tokens_in_expert_order(expert_output, inverse_map, valid, None)
+
+    gathered = expert_output.double()[inverse_map.clamp(min=0).long()]
+    expected = (gathered * (inverse_map >= 0)[..., None]).sum(dim=1).float()
+    assert torch.equal(out[:valid_tokens], expected[:valid_tokens])
+    assert torch.all(out[0] == 2.0**24 + 8)
+
+
 @pytest.mark.xfail(
     strict=False,
     reason="Negative control: the default combine accumulates with fp32 tl.atomic_add, whose "
@@ -583,6 +616,57 @@ def test_batch_invariant_kernels_replay():
     assert_replays_bit_exact(
         lambda x: bik.mean_dim(x, 1), (x,), replays=4, backward=False, what="bik mean_dim"
     )
+
+
+@pytest.mark.parametrize("zero_centered_gamma", [False, True], ids=["gamma", "zero_centered_gamma"])
+def test_batch_invariant_rmsnorm_replays_and_matches_reference(zero_centered_gamma):
+    """Replay the batch-invariant RMSNorm autograd function and check it against fp32 torch.
+
+    The weight is random on purpose. At ``weight == 1`` the input gradient with the weight
+    factor applied twice equals the correct one, and under zero-centred gamma a forward that
+    forgets the ``+ 1`` returns exactly zero at ``weight == 0`` -- so either default init hides
+    one of the two defects this function has had. Only a non-unit, non-zero weight sees both.
+    """
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        BatchInvariantRMSNormFn,
+    )
+
+    seeded()
+    rows, hidden, eps = 4096, 2048, 1e-5
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+
+    def run(x, weight):
+        return BatchInvariantRMSNormFn.apply(x, weight, eps, zero_centered_gamma)
+
+    assert_replays_bit_exact(
+        run,
+        (x.clone().requires_grad_(True), weight.clone().requires_grad_(True)),
+        replays=3,
+        grad_outputs={"out": grad_output},
+        what=f"bik rmsnorm[zero_centered_gamma={zero_centered_gamma}]",
+    )
+
+    # fp32 reference, the same arithmetic TE's RMSNorm defines. Its gradients come from
+    # autograd, so the two defects (a dropped ``+ 1`` in forward, a duplicated weight factor in
+    # the input gradient) each show up as a mismatch here and nowhere in the replay above.
+    x_bik = x.clone().requires_grad_(True)
+    w_bik = weight.clone().requires_grad_(True)
+    out_bik = BatchInvariantRMSNormFn.apply(x_bik, w_bik, eps, zero_centered_gamma)
+    out_bik.backward(grad_output)
+
+    x_ref = x.float().requires_grad_(True)
+    w_ref = weight.float().requires_grad_(True)
+    w_eff = w_ref + 1.0 if zero_centered_gamma else w_ref
+    out_ref = x_ref * torch.rsqrt((x_ref * x_ref).mean(dim=-1, keepdim=True) + eps) * w_eff
+    out_ref.backward(grad_output.float())
+
+    # The function computes in fp32 and rounds once to the input dtype, so compare after the
+    # same rounding of the reference; the only remaining difference is reduction order.
+    torch.testing.assert_close(out_bik, out_ref.to(out_bik.dtype))
+    torch.testing.assert_close(x_bik.grad, x_ref.grad.to(x_bik.dtype))
+    torch.testing.assert_close(w_bik.grad, w_ref.grad.to(w_bik.dtype))
 
 
 def test_mask_routing_padding_replays():

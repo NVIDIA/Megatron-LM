@@ -169,7 +169,11 @@ class MegatronCheckpointSaverBase:
         try:
             from megatron.core import mpu
             from megatron.training.argument_utils import inference_cfg_container_from_args
-            from megatron.training.global_vars import get_args, set_global_variables
+            from megatron.training.global_vars import (
+                get_args,
+                get_train_state,
+                set_global_variables,
+            )
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -180,12 +184,14 @@ class MegatronCheckpointSaverBase:
         # Megatron args. (i.e., 'margs')
         self.margs = get_args()
 
+        train_state = get_train_state()
+        train_state.iteration = self.md.iteration
         if hasattr(self.md, 'consumed_train_samples'):
-            self.margs.consumed_train_samples = self.md.consumed_train_samples
-            self.margs.consumed_valid_samples = self.md.consumed_valid_samples
+            train_state.consumed_train_samples = self.md.consumed_train_samples
+            train_state.consumed_valid_samples = self.md.consumed_valid_samples
             print(
-                f"Setting consumed_train_samples to {self.margs.consumed_train_samples}"
-                f" and consumed_valid_samples to {self.margs.consumed_valid_samples}"
+                f"Setting consumed_train_samples to {train_state.consumed_train_samples}"
+                f" and consumed_valid_samples to {train_state.consumed_valid_samples}"
             )
         else:
             print("consumed_train_samples not provided.")
@@ -409,11 +415,13 @@ class MegatronCheckpointSaverBase:
         """
         try:
             from megatron.core import mpu
+            from megatron.training import get_train_state
             from megatron.training.checkpointing import save_checkpoint
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
 
+        train_state = get_train_state()
         for pp_rank in range(self.args.target_pipeline_parallel_size):
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             # initial the first module in pp stage to get the layer_num, pooler, lm_head. binary_head
@@ -421,7 +429,7 @@ class MegatronCheckpointSaverBase:
             for ep_rank in range(self.args.target_expert_parallel_size):
                 for tp_rank in range(self.args.target_tensor_parallel_size):
                     save_checkpoint(
-                        self.md.iteration,
+                        train_state.iteration,
                         [self.get_local_model(pp_rank, ep_rank, tp_rank)],
                         None,
                         None,

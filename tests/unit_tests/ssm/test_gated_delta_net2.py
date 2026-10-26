@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""GDN2 correctness in a separate CI bucket from GDN."""
+
 import pytest
 import torch.nn.functional as F
 from torch._inductor import config as inductor_config

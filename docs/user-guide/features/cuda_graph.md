@@ -191,7 +191,7 @@ backward graph, where the RNG state cannot be rewound. `--moe-router-force-load-
 rejected but its random router logits are drawn again in the captured recompute, so that combination
 is for throughput measurements only, not for numerical comparisons (the code warns). Re-entrant
 activation checkpoints — the
-`tensor_parallel.checkpoint` / `te_checkpoint` sites: full recompute, the MTP block, `mlp` / `moe` /
+`precision_aware_checkpoint` sites: full recompute, the MTP block, `mlp` / `moe` /
 `shared_experts`, `core_attn` and the GDN / KDA core (`gdn`) — always use Transformer Engine's checkpoint
 inside a chunk capture, because Megatron's `tensor_parallel.checkpoint` runs the function without a
 checkpoint node while a graph is warmed up or captured and would silently keep the activations resident.
@@ -215,21 +215,32 @@ Captures the entire training iteration (excluding optimizer) as a single CUDA gr
 wrapper is also used for training-loop validation/eval in forward-only mode. This provides the
 largest training/validation latency reduction.
 
+With an eager optimizer, full-iteration training captures model-to-optimizer gradient conversion
+in the forward/backward graph's memory pool. The distributed optimizer and the layer-wise
+mixed-precision optimizer can reuse completed forward/backward scratch for FP32 gradients.
+Replay order must remain forward/backward, gradient conversion, then optimizer update.
+The converted values are valid until the next forward/backward replay; gradient addresses must
+remain stable. Resetting the training graph also invalidates the conversion graph.
+
+This conversion graph is disabled with `--optimizer-cuda-graph`, which captures the optimizer
+step itself. CPU-offloaded and Megatron-FSDP optimizer paths are unchanged, as is the distributed
+precision-aware optimizer path that already aliases model gradients.
+
 This implementation does not create inference CUDA graphs. For inference, use
 `--cuda-graph-impl local --inference-cuda-graph-scope layer|block`.
 
 ### Requirements
 
-- `--no-check-for-nan-in-loss-and-grad` is required: NaN checks involve CPU-GPU synchronization
-  which cannot run inside a CUDA graph.
+- Loss and gradient checks remain enabled. Values passed to the rerun state machine during
+  capture are snapshotted at their validation sites. Host-side checks run after each replay,
+  before the training loop decides whether to rerun or update the optimizer.
 - `--cuda-graph-modules` must be omitted (or left empty): per-module selection has no meaning
   when the entire iteration is captured as a single graph.
 
 ### Example
 
 ```bash
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ---
@@ -250,8 +261,7 @@ All three implementations work for dense models:
 # equivalent: --cuda-graph-impl transformer_engine --cuda-graph-modules attn mlp
 
 # Full-iteration
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ### MoE Model Training
@@ -271,7 +281,6 @@ models as well:
 
 ```bash
 --cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad \
 --moe-flex-dispatcher-backend hybridep \
 --use-transformer-engine-op-fuser \
 --moe-expert-rank-capacity-factor <float> \

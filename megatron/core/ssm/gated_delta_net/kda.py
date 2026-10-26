@@ -31,6 +31,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -340,11 +341,8 @@ class KimiDeltaAttention(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            # import here to avoid circular import (recompute imports TransformerLayer)
-            from megatron.core.recompute import checkpoint_activations
-
-            out, out_bias = checkpoint_activations(
-                self.config, _checkpointed_compute, False, self.pg_collection.tp, hidden_states
+            out, out_bias = precision_aware_checkpoint(
+                _checkpointed_compute, self.config, self.pg_collection.tp, hidden_states
             )
         else:
             out, out_bias = self._forward_compute(

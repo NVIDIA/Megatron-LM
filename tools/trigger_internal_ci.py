@@ -167,11 +167,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--cluster-a100",
-        default=None,
-        help="CLUSTER_A100 pipeline variable (override the default cluster)",
-    )
-    parser.add_argument(
         "--cluster-h100",
         default=None,
         help="CLUSTER_H100 pipeline variable (override the default cluster)",
@@ -225,7 +220,6 @@ def main():
         pipeline_vars["FUNCTIONAL_TEST_TIME_LIMIT"] = str(time_limit)
 
     for var, val in [
-        ("CLUSTER_A100", args.cluster_a100),
         ("CLUSTER_H100", args.cluster_h100),
         ("CLUSTER_GB200", args.cluster_gb200),
         ("CLUSTER_GB300", args.cluster_gb300),

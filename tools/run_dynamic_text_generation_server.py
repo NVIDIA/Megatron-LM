@@ -64,7 +64,6 @@ from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args  # noqa: E402
 from megatron.training.global_vars import (
     get_run_config,
-    initialize_runtime_services,
     set_run_config,
 )
 from megatron.training.initialize import initialize_megatron  # noqa: E402
@@ -180,7 +179,6 @@ def parse_args_and_detect_vlm(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args)
     initialize_megatron()
     args = get_args()
 

@@ -278,6 +278,8 @@ def test_mrope_stored_cp_group_drives_unpacked_slicing():
 @pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 4), (1, 1, 8), (8, 1, 1)])
 def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_size):
     """Test HybridModel with custom process groups."""
+    if Utils.world_size != 8:
+        pytest.skip(f"requires 8 ranks, got {Utils.world_size}")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,

@@ -4,9 +4,7 @@ from typing import List, Optional, Set, Tuple, Union
 
 from torch import Tensor
 
-from megatron.core import tensor_parallel
 from megatron.core.context_parallel import ContextParallelLayoutState
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_layer_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -14,45 +12,7 @@ from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import te_checkpoint
-else:
-    te_checkpoint = None
-
-
-def use_te_checkpoint(config) -> bool:
-    """Whether activation checkpointing goes through Transformer Engine's ``checkpoint``.
-
-    TE's checkpoint is used under FP8/FP4 — ``tensor_parallel.checkpoint`` recomputes outside the
-    FP8 autocast, so a TE module in the region would recompute in BF16 (or dequantize FP8
-    parameters and lose their ``main_grad``), whereas TE's checkpoint re-enters the recorded FP8
-    state — and under chunk-wise Transformer Engine CUDA graphs for any precision: the
-    captured block contains the checkpointed forward and its recompute as one unit, whereas
-    ``tensor_parallel.checkpoint`` runs the forward without a checkpoint node during graph warm-up
-    and capture, which would keep every activation of the block alive inside the graph.
-    """
-    if config.fp8 or config.fp4:
-        return True
-    return te_checkpoint is not None and getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
-
-
-def checkpoint_activations(config, function, distribute_saved_activations, tp_group, *args):
-    """Activation checkpoint of ``function(*args)`` through the backend ``use_te_checkpoint``
-    selects — the same policy as the block-level recompute, for the sites that used
-    ``tensor_parallel.checkpoint`` unconditionally (``core_attn``, the absorbed-MLA core, the GDN /
-    KDA core). Like mcore's checkpoint, TE's saves tensor arguments only and restores the RNG
-    tracker state for the recompute.
-    """
-    if use_te_checkpoint(config):
-        return te_checkpoint(
-            function,
-            distribute_saved_activations,
-            tensor_parallel.random.get_cuda_rng_tracker,
-            tp_group,
-            *args,
-        )
-    return tensor_parallel.checkpoint(function, distribute_saved_activations, *args)
+from megatron.core.transformer.utils import precision_aware_checkpoint, use_te_checkpoint
 
 
 def checkpointed_forward(
@@ -236,20 +196,13 @@ def checkpointed_forward(
             input_ids,
         )
         if use_checkpoint:
-            # Precision-aware activation checkpoint: TE under FP8/FP4 and inside chunk CUDA
-            # graph captures, tensor_parallel under BF16/FP16/FP32 otherwise.
-            if use_te_checkpoint(self.config):
-                hidden_states, context = te_checkpoint(
-                    cf,
-                    self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
-                    *args,
-                )
-            else:
-                hidden_states, context = tensor_parallel.checkpoint(
-                    cf, self.config.distribute_saved_activations, *args
-                )
+            hidden_states, context = precision_aware_checkpoint(
+                cf,
+                self.config,
+                self.pg_collection.tp,
+                *args,
+                distribute_saved_activations=self.config.distribute_saved_activations,
+            )
         else:
             # Note: original block-branch no-checkpoint path omitted padding_mask
             # (relied on its default=None); restored here for consistency.
