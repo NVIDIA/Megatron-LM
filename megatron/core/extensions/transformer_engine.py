@@ -37,6 +37,7 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     amax_reduction_group,
+    require_process_groups,
     resolve_gtp_remat_group,
     warn_global_process_group_fallback,
 )
@@ -2350,14 +2351,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
-        else:
-            assert hasattr(
-                pg_collection, "tp"
-            ), "TEDotProductAttention pg_collection must have tp pg"
-            assert hasattr(
-                pg_collection, "cp"
-            ), "TEDotProductAttention pg_collection must have cp pg"
-        self._tp_group = pg_collection.tp
+        # An unset tp raises; a None tp reaches TE as "no group yet", to be set later through
+        # set_tensor_parallel_group(). cp is read only with context parallelism, which rejects
+        # an unset or None cp group below.
+        (self._tp_group,) = require_process_groups(
+            pg_collection, ("tp",), owner=type(self).__name__
+        )
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -3473,13 +3472,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             del is_mtp_layer
             if hash_moe_layer_threshold is not None and hash_moe_layer_threshold > 0:
                 raise ValueError("Dense MLP does not support hash MoE routing.")
-            assert hasattr(
-                pg_collection, 'tp'
-            ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+            (tp_group,) = require_process_groups(
+                pg_collection, ('tp',), owner=f"{cls.__name__}.as_mlp_submodule"
+            )
             return cls(
                 config=config,
                 submodules=submodules,
-                tp_group=pg_collection.tp,
+                tp_group=tp_group,
                 pg_collection=pg_collection,
                 is_expert=is_expert,
                 input_size=input_size,
