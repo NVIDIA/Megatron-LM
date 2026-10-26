@@ -183,6 +183,9 @@ class TestLifecycleGuards:
         llm._is_primary_rank = True
         llm._coord_runtime = MagicMock()
         llm._coord_runtime.coord_addr = "tcp://coord:5555"
+        llm._context.block_size_tokens = 256
+        llm._context.enable_prefix_caching = True
+        llm._context.config.prefix_caching_coordinator_policy = "longest_prefix"
 
         started = {}
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
@@ -208,6 +211,8 @@ class TestLifecycleGuards:
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True
+        assert started["block_size_tokens"] == 256
+        assert started["prefix_caching_coordinator_policy"] == "longest_prefix"
 
     @pytest.mark.asyncio
     async def test_async_serve_primary_rank_starts_frontend(self, monkeypatch):
@@ -222,6 +227,9 @@ class TestLifecycleGuards:
         llm._is_primary_rank = True
         llm._coord_runtime = MagicMock()
         llm._coord_runtime.coord_addr = "tcp://coord:5555"
+        llm._context.block_size_tokens = 256
+        llm._context.enable_prefix_caching = True
+        llm._context.config.prefix_caching_coordinator_policy = "longest_prefix"
 
         started = {}
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
@@ -247,6 +255,8 @@ class TestLifecycleGuards:
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
         assert started["eval_mode"] is True
+        assert started["block_size_tokens"] == 256
+        assert started["prefix_caching_coordinator_policy"] == "longest_prefix"
 
 
 class TestNormalizePrompts:
