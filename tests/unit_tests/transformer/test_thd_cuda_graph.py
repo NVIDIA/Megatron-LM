@@ -1333,7 +1333,7 @@ class TestDecomposeReconstruct:
         decoder next to packed_seq_params. Graph replay accepts tensors only; for a single layout
         the dict repeats packed_seq_params and the plan is None, so both are dropped. A real
         layout plan (per-layer CP layout conversion) cannot be captured and is refused."""
-        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        block = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8).decoder
         psp = _make_psp([64, 64])
         kw = {
             'hidden_states': torch.randn(128, 1, 256, device="cuda"),
@@ -1341,11 +1341,11 @@ class TestDecomposeReconstruct:
             'packed_seq_params_by_layout': {'contiguous': psp},
             'cp_layout_plan': None,
         }
-        layer._decompose_packed_seq_params_to_kwargs(kw)
+        block._decompose_packed_seq_params_to_kwargs(kw)
         assert 'packed_seq_params_by_layout' not in kw and 'cp_layout_plan' not in kw
         assert all(v is None or torch.is_tensor(v) for v in kw.values())
         with pytest.raises(AssertionError, match="layout plan"):
-            layer._decompose_packed_seq_params_to_kwargs({'cp_layout_plan': object()})
+            block._decompose_packed_seq_params_to_kwargs({'cp_layout_plan': object()})
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

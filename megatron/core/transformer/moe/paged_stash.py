@@ -544,24 +544,6 @@ class PagedStashManager:
         assert layer_no < 1000 and microbatch_no < 1000, "Schedule encoding overflow"
         return vp_stage * 1000000 + layer_no * 1000 + microbatch_no
 
-    def configure_runtime_schedule(self, enabled, config):
-        """Select recorded-order or runtime-keyed scheduling for this iteration.
-
-        Chunk-wise TE CUDA graphs capture whole decoder blocks, so a captured backward
-        holds each layer's reload (and, with full recompute, its recompute forward) itself. The
-        stash keys are then the live (vp, layer, microbatch) coordinates and no cross-layer
-        prefetch is derived from the recorded pipeline order.
-        """
-        self.runtime_schedule = bool(
-            enabled
-            and config is not None
-            and getattr(config, 'cuda_graph_impl', 'none') == 'chunk_wise'
-            and getattr(config, 'moe_paged_stash', False)
-        )
-        self.runtime_schedule_stash_activations = bool(
-            self.runtime_schedule and getattr(config, 'pipeline_model_parallel_size', 1) > 1
-        )
-
     def add_paged_tensor_to_stash(self, paged_tensor):
         """Add a paged tensor to the stash list."""
         if self.status == 'captured':
@@ -1267,6 +1249,27 @@ def paged_stash_wait_for_stash_to_complete():
         stash_manager.wait_for_stash_to_complete()
 
 
+def configure_runtime_schedule(stash_manager, enabled, config):
+    """Select recorded-order or runtime-keyed scheduling for this iteration.
+
+    Chunk-wise TE CUDA graphs capture whole decoder blocks, so a captured backward holds each
+    layer's reload (and, with full recompute, its recompute forward) itself. The stash keys are
+    then the live (vp, layer, microbatch) coordinates and no cross-layer prefetch is derived from
+    the recorded pipeline order. Sets ``runtime_schedule`` and
+    ``runtime_schedule_stash_activations`` on ``stash_manager``.
+    """
+    runtime_schedule = bool(
+        enabled
+        and config is not None
+        and getattr(config, 'cuda_graph_impl', 'none') == 'chunk_wise'
+        and getattr(config, 'moe_paged_stash', False)
+    )
+    stash_manager.runtime_schedule = runtime_schedule
+    stash_manager.runtime_schedule_stash_activations = bool(
+        runtime_schedule and getattr(config, 'pipeline_model_parallel_size', 1) > 1
+    )
+
+
 def paged_stash_prepare_for_cuda_graph_capture(config):
     """Make sure the page buffers exist before a chunk CUDA graph records their addresses.
 
@@ -1280,7 +1283,7 @@ def paged_stash_prepare_for_cuda_graph_capture(config):
         "Paged stash must finish schedule and capacity discovery before chunk CUDA graph "
         "capture (cuda_graph_warmup_steps >= 2)."
     )
-    stash_manager.configure_runtime_schedule(True, config)
+    configure_runtime_schedule(stash_manager, True, config)
     if stash_manager.stash_buffers is None:
         stash_manager.prepare_stash_buffers(config)
     assert stash_manager.stash_buffers is not None
@@ -1296,7 +1299,7 @@ def paged_stash_reset(enabled=True, config=None):
     """
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
-    stash_manager.configure_runtime_schedule(enabled, config)
+    configure_runtime_schedule(stash_manager, enabled, config)
     stash_manager.iteration += 1
     if config is not None:
         stash_manager.page_size = config.moe_paged_stash_page_size
