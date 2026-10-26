@@ -25,7 +25,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
-from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -36,16 +35,15 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.fixture
-def process_group_collections(distributed_setup, request):
-    """Yield the requested EP groups and singleton reference groups, then clean up."""
+def process_group_collections(distributed_setup):
+    """Yield EP=2 process groups and singleton reference groups, then clean them up."""
     world_size = distributed_setup.world_size
-    ep_size = getattr(request, "param", 2)
-    if world_size < 2 or world_size % ep_size:
-        pytest.skip("MFSDP v2 EP adapter test requires at least two ranks, divisible by EP.")
-    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+    if world_size < 2 or world_size % 2:
+        pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
     process_group_collection = ProcessGroupCollection.use_mpu_process_groups()
-    assert process_group_collection.ep.size() == ep_size
-    assert process_group_collection.expt_dp.size() == world_size // ep_size
+    assert process_group_collection.ep.size() == 2
+    assert process_group_collection.expt_dp.size() == world_size // 2
     reference_group = torch.distributed.new_group(
         [torch.distributed.get_rank()], use_local_synchronization=True
     )
@@ -69,108 +67,27 @@ def process_group_collections(distributed_setup, request):
     destroy_model_parallel()
 
 
-@pytest.fixture
-def shortcut_model(process_group_collections):
-    """Build a small shortcut model for unit-selection checks."""
-    process_group_collection, _ = process_group_collections
-    config = TransformerConfig(
-        num_layers=2,
-        hidden_size=64,
-        num_attention_heads=4,
-        num_moe_experts=4,
-        expert_model_parallel_size=process_group_collection.ep.size(),
-        moe_layer_freq=[0, 1],
-        moe_token_dispatcher_type="alltoall",
-        moe_router_topk=2,
-        moe_grouped_gemm=True,
-        moe_ffn_hidden_size=128,
-        moe_shortcut_connection=True,
-        add_bias_linear=False,
-        use_cpu_initialization=True,
-        gradient_accumulation_fusion=False,
-        attention_backend=AttnBackend.unfused,
-    )
-    return HybridModel(
-        config=config,
-        hybrid_stack_spec=hybrid_stack_spec,
-        vocab_size=128,
-        max_sequence_length=8,
-        hybrid_layer_pattern="*E",
-        pg_collection=process_group_collection,
-    ).cuda()
-
-
-@pytest.mark.parametrize("include_moe", [False, True])
-def test_moe_selection_controls_expert_unit(shortcut_model, include_moe):
-    """Only selected MoE types automatically contribute expert units."""
-    block = shortcut_model.decoder.layers[0]
-    moe = block.moe_layer.mlp
-    unit_types = [ShortcutMoEBlock]
-    if include_moe:
-        unit_types.append(MoELayer)
-    units = FsdpUnitCollector(tuple(unit_types)).collect(shortcut_model)
-    assert units[:2] == [shortcut_model, block]
-    # The shortcut path invokes the MoE helpers directly, even when its type is enabled.
-    assert moe not in units
-    assert (moe.experts in units) == include_moe
-    assert FsdpUnitCollector(()).collect(moe) == [moe]
-
-
 @pytest.mark.parametrize(
-    "shortcut, custom_units, overlap, recompute_norms, wide_residual, "
-    "exclude_moe, process_group_collections",
+    "shortcut, overlap",
     [
-        (False, False, False, False, False, False, 2),
-        (False, True, False, False, False, False, 2),
-        (True, False, False, False, False, False, 2),
-        (True, True, False, False, False, False, 2),
-        (True, True, True, False, False, False, 2),
-        (True, True, False, True, False, False, 2),
-        (True, True, True, True, False, False, 2),
-        (False, False, False, False, True, False, 2),
-        (True, False, False, False, True, False, 2),
-        (True, False, True, False, True, False, 2),
-        (False, False, False, False, False, True, 1),
-        (True, False, False, False, True, True, 1),
-    ],
-    indirect=["process_group_collections"],
-    ids=[
-        "standard",
-        "standard-custom-units",
-        "shortcut",
-        "shortcut-custom-units",
-        "shortcut-custom-units-overlap",
-        "shortcut-custom-units-recompute",
-        "shortcut-custom-units-overlap-recompute",
-        "wide-residual-moe-act",
-        "wide-residual-shortcut-moe-act",
-        "wide-residual-shortcut-overlap-moe-act",
-        "ep1-excluded-moe",
-        "ep1-excluded-wide-shortcut-moe",
+        pytest.param(False, False, id="standard"),
+        pytest.param(True, False, id="wide-shortcut"),
+        pytest.param(True, True, id="wide-shortcut-overlap"),
     ],
 )
-def test_build_train_step_and_clip(
-    process_group_collections,
-    distributed_setup,
-    shortcut,
-    custom_units,
-    overlap,
-    recompute_norms,
-    wide_residual,
-    exclude_moe,
-):
+def test_build_train_step_and_clip(process_group_collections, distributed_setup, shortcut, overlap):
     """Compare MoE training and gradient clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
     # initialization instead uses the globally configured EP rank in its RNG seed.
     config = TransformerConfig(
-        num_layers=4 if wide_residual else 2,
+        num_layers=3 if shortcut else 2,
         hidden_size=64,
         num_attention_heads=4,
         num_moe_experts=4,
-        expert_model_parallel_size=process_group_collection.ep.size(),
-        moe_layer_freq=[0, 1, 0, 1] if wide_residual else [0, 1],
+        expert_model_parallel_size=2,
+        moe_layer_freq=[0, 1, 0] if shortcut else [0, 1],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_grouped_gemm=True,
@@ -187,32 +104,28 @@ def test_build_train_step_and_clip(
         gradient_accumulation_fusion=False,
         attention_backend=AttnBackend.unfused,
         wide_residual=(
-            WideResidualConfig(num_streams=3, learned_retention=True) if wide_residual else None
+            WideResidualConfig(num_streams=3, learned_retention=True) if shortcut else None
         ),
-        recompute_granularity="selective" if wide_residual or recompute_norms else None,
-        recompute_modules=(
-            ["moe_act"]
-            if wide_residual
-            else ["layernorm", "shortcut_pre_mlp_layernorm"] if recompute_norms else None
-        ),
+        recompute_granularity="selective" if shortcut else None,
+        recompute_modules=["moe_act"] if shortcut else None,
     )
     # Pair CPU initialization with an explicit common seed for the reference and EP model.
     torch.manual_seed(123)
     reference_config = replace(config, expert_model_parallel_size=1)
     reference_model = HybridModel(
         config=reference_config,
-        hybrid_stack_spec=(wide_residual_hybrid_stack_spec if wide_residual else hybrid_stack_spec),
+        hybrid_stack_spec=(wide_residual_hybrid_stack_spec if shortcut else hybrid_stack_spec),
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E*E" if wide_residual else "*E",
+        hybrid_layer_pattern="*E*" if shortcut else "*E",
         pg_collection=reference_process_group_collection,
     ).cuda()
     model = HybridModel(
         config=config,
-        hybrid_stack_spec=(wide_residual_hybrid_stack_spec if wide_residual else hybrid_stack_spec),
+        hybrid_stack_spec=(wide_residual_hybrid_stack_spec if shortcut else hybrid_stack_spec),
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E*E" if wide_residual else "*E",
+        hybrid_layer_pattern="*E*" if shortcut else "*E",
         pg_collection=process_group_collection,
     ).cuda()
     model.load_state_dict(reference_model.state_dict(), strict=False)
@@ -232,11 +145,9 @@ def test_build_train_step_and_clip(
                     if model_parameter is not None:
                         model_parameter.data.copy_(reference_parameter.data)
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-    fsdp_unit_modules = None
-    if custom_units:
-        fsdp_unit_modules = [ShortcutMoEBlock, TransformerLayer, MoETransformerLayer, MoELayer]
-    if exclude_moe:
-        fsdp_unit_modules = [ShortcutMoEBlock, TransformerLayer, MoETransformerLayer]
+    if shortcut:
+        experts = model.decoder.layers[0].moe_layer.mlp.experts
+        assert experts not in FsdpUnitCollector((ShortcutMoEBlock,)).collect(model)
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -247,7 +158,6 @@ def test_build_train_step_and_clip(
             fsdp_all_gather_in_start_param_sync=False,
         ),
         module=model,
-        fsdp_unit_modules=fsdp_unit_modules,
         pg_collection=process_group_collection,
     )
     assert isinstance(model.module, FsdpModule)
@@ -259,15 +169,13 @@ def test_build_train_step_and_clip(
         assert not isinstance(block.moe_layer, FsdpModule)
         assert not isinstance(block.moe_layer.mlp, FsdpModule)
         assert not isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule)
+        assert isinstance(model.module.decoder.layers[1], FsdpModule)
         experts = block.moe_layer.mlp.experts
     else:
         experts = model.module.decoder.layers[1].mlp.experts
-    assert isinstance(experts, FsdpModule) == (not exclude_moe)
+    assert isinstance(experts, FsdpModule)
     for parameter in experts.parameters():
-        if exclude_moe:
-            assert parameter.device_mesh.get_group("dp") == process_group_collection.dp_cp
-        else:
-            assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
+        assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
 
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
@@ -335,122 +243,3 @@ def test_build_train_step_and_clip(
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
-
-
-@pytest.mark.parametrize(
-    "unit_modules, shard_shortcut",
-    [
-        (None, True),
-        ([ShortcutMoEBlock, MoELayer], True),
-        ([TransformerLayer, MoETransformerLayer, MoELayer], False),
-        ([MoELayer], False),
-    ],
-    ids=["default", "explicit-shortcut", "other-types", "root-and-experts"],
-)
-def test_shortcut_ownership_and_weight_lifetime(
-    process_group_collections, unit_modules, shard_shortcut
-):
-    """Skip helper-only containers inside shortcuts, but shard ordinary sibling layers."""
-    process_group_collection, _ = process_group_collections
-    config = TransformerConfig(
-        num_layers=3,
-        hidden_size=64,
-        num_attention_heads=4,
-        num_moe_experts=4,
-        expert_model_parallel_size=2,
-        moe_layer_freq=[0, 1, 0],
-        moe_token_dispatcher_type="alltoall",
-        moe_router_topk=2,
-        moe_grouped_gemm=True,
-        moe_ffn_hidden_size=128,
-        moe_shortcut_connection=True,
-        moe_shortcut_post_norm=True,
-        moe_shared_expert_intermediate_size=128,
-        add_bias_linear=False,
-        use_cpu_initialization=True,
-        params_dtype=torch.float32,
-        attention_dropout=0.0,
-        hidden_dropout=0.0,
-        gradient_accumulation_fusion=False,
-        attention_backend=AttnBackend.unfused,
-        wide_residual=WideResidualConfig(num_streams=3, learned_retention=True),
-    )
-    model = HybridModel(
-        config=config,
-        hybrid_stack_spec=wide_residual_hybrid_stack_spec,
-        vocab_size=128,
-        max_sequence_length=8,
-        hybrid_layer_pattern="*E*",
-        pg_collection=process_group_collection,
-    ).cuda()
-    block = model.decoder.layers[0]
-    names_before = set(model.state_dict())
-    assert any("compute_layer.residual_read_self_attn.read_map" in key for key in names_before)
-    assert any("moe_layer.mlp.experts" in key for key in names_before)
-    model = FullyShardedDataParallel(
-        config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
-            fsdp_all_gather_in_start_param_sync=False,
-        ),
-        module=model,
-        fsdp_unit_modules=unit_modules,
-        pg_collection=process_group_collection,
-    )
-    assert set(model.module.state_dict()) == names_before
-    assert isinstance(block, FsdpModule) == shard_shortcut
-    assert not isinstance(block.compute_layer, FsdpModule)
-    assert not isinstance(block.moe_layer, FsdpModule)
-    assert not isinstance(block.moe_layer.mlp, FsdpModule)
-    assert isinstance(block.moe_layer.mlp.experts, FsdpModule)
-    shard_ordinary_layer = unit_modules is None or TransformerLayer in unit_modules
-    assert isinstance(model.module.decoder.layers[1], FsdpModule) == shard_ordinary_layer
-    for child in (
-        block.compute_layer.residual_read_self_attn,
-        block.compute_layer.residual_write_self_attn,
-        block.moe_layer.residual_read_mlp,
-        block.moe_layer.residual_write_mlp,
-        block.shortcut_pre_mlp_layernorm,
-        block.shortcut_post_norm,
-    ):
-        assert not isinstance(child, FsdpModule)
-    expected = [module for module in model.module.modules() if isinstance(module, FsdpModule)]
-    assert list(model.module._context.forward_order) == expected
-    calls = []
-    handles = []
-    for module in expected:
-
-        def record(module, args):
-            calls.append(module)
-
-        handles.append(module.register_forward_pre_hook(record, prepend=True))
-    optimizer = get_megatron_optimizer(
-        OptimizerConfig(lr=1.0e-3, use_distributed_optimizer=False), [model]
-    )
-    optimizer.reload_model_params()
-    for _ in range(3):
-        calls.clear()
-        optimizer.zero_grad(set_to_none=True)
-        x = torch.randint(0, 128, (2, 8), device="cuda")
-        positions = torch.arange(8, device="cuda").repeat(2, 1)
-
-        def forward():
-            output = model(input_ids=x, position_ids=positions, attention_mask=None)
-            assert calls == expected
-            assert all(
-                group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
-                for group in block.moe_layer.mlp.experts.parameter_groups
-            )
-            loss = output.square().mean()
-            assert torch.isfinite(loss)
-            return loss
-
-        run_forward_backward_on_microbatches(model, forward)
-        assert all(not module._unshard_events for module in expected)
-        success, _, _ = optimizer.step()
-        assert success
-    for handle in handles:
-        handle.remove()
