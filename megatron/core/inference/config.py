@@ -7,7 +7,11 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Sequence, Tuple, Unio
 
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    require_process_groups,
+    resolve_process_groups,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, unwrap_model
 
@@ -489,9 +493,41 @@ class MultimodalPromptConfig:
 
 
 # The process groups that inference reads from `InferenceConfig.pg_collection`: the model wrapper
-# (tp, pp), the text generation controller (pp, dp), the dynamic context (tp, pp, ep) and the
-# dynamic engine (tp, pp, dp, mp, ep).
-_INFERENCE_PROCESS_GROUPS = ("tp", "pp", "dp", "mp", "ep")
+# (tp, pp), the text generation controller (pp, dp), the dynamic context (tp, pp, ep), the dynamic
+# engine (tp, pp, dp, mp, ep), the disaggregated coordinator setup (tp, pp, dp, ep, cp, expt_tp)
+# and the Dynamo engine service (dp, expt_dp).
+_INFERENCE_PROCESS_GROUPS = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp")
+
+# The groups that inference passes to torch.distributed collectives, or whose ranks decide which
+# rank coordinates its peers, for example the dynamic engine's barrier on `mp`. torch.distributed
+# treats a None group as the default (world) group, and get_pg_rank and get_pg_size return 0 and 1
+# for it, so these must be process groups even when their axis has size 1. For the other groups
+# that inference reads, None means that the axis is off.
+_INFERENCE_COMMUNICATION_GROUPS = ("tp", "pp", "dp", "mp")
+
+
+def _check_inference_process_groups(pg_collection: ProcessGroupCollection, owner: str) -> None:
+    """Raise if `pg_collection` cannot run inference.
+
+    Args:
+        pg_collection: The collection that inference would run on.
+        owner: Name of the class that resolves it, used in error messages.
+
+    Raises:
+        ValueError: A group in `_INFERENCE_PROCESS_GROUPS` is absent, or a group in
+            `_INFERENCE_COMMUNICATION_GROUPS` is None.
+        TypeError: `pg_collection` is a `MultiModuleProcessGroupCollection`.
+    """
+    require_process_groups(pg_collection, _INFERENCE_PROCESS_GROUPS, owner=owner)
+    groups = vars(pg_collection)
+    unset = [name for name in _INFERENCE_COMMUNICATION_GROUPS if groups[name] is None]
+    if unset:
+        raise ValueError(
+            f"{owner} requires pg_collection to set {', '.join(unset)} to a process group, not "
+            "None. Inference runs collectives on these groups and picks coordinating ranks from "
+            "them, and torch.distributed treats a None group as the world group. Use a "
+            "single-rank group for an axis of size 1."
+        )
 
 
 @dataclass
@@ -642,7 +678,8 @@ class InferenceConfig:
     """Max possible sequence length (prompt + output) that will occur."""
 
     pg_collection: Optional[ProcessGroupCollection] = None
-    """A `ProcessGroupCollection` for distributed execution."""
+    """A `ProcessGroupCollection` for distributed execution. It must set every group that
+    inference reads; see `resolve_pg_collection`."""
 
     image_preprocessing_config: Optional[ImageProcessingConfig] = None
     """Configuration for preprocessing raw image payloads."""
@@ -867,8 +904,12 @@ class InferenceConfig:
         config construction.
 
         If `pg_collection` is unset, the collection that `model` was built with is used when it
-        sets every group that inference reads (tp, pp, dp, mp and ep). Otherwise the groups come
-        from `megatron.core.parallel_state`; that fallback is deprecated and warns.
+        sets every group that inference reads (tp, pp, dp, mp, ep, cp, expt_tp and expt_dp).
+        Otherwise the groups come from `megatron.core.parallel_state`; that fallback is deprecated
+        and warns.
+
+        The collection, configured or not, must set every one of these groups, and tp, pp, dp and
+        mp must be process groups rather than None, because inference runs collectives on them.
 
         See ``docs/developer/parallel-state-deprecation.md``.
 
@@ -877,8 +918,14 @@ class InferenceConfig:
 
         Returns:
             The collection, which is also stored in `pg_collection`.
+
+        Raises:
+            ValueError: The collection lacks a group that inference reads, or sets tp, pp, dp or
+                mp to None.
+            TypeError: The collection is a `MultiModuleProcessGroupCollection`.
         """
-        if self.pg_collection is None:
+        pg_collection = self.pg_collection
+        if pg_collection is None:
             model_pg_collection = None
             if model is not None:
                 model_pg_collection = getattr(unwrap_model(model), "pg_collection", None)
@@ -887,16 +934,18 @@ class InferenceConfig:
             if model_pg_collection is not None and all(
                 name in vars(model_pg_collection) for name in _INFERENCE_PROCESS_GROUPS
             ):
-                self.pg_collection = model_pg_collection
+                pg_collection = model_pg_collection
             else:
-                self.pg_collection = resolve_process_groups(
+                pg_collection = resolve_process_groups(
                     None,
                     owner=type(self).__name__,
                     required=_INFERENCE_PROCESS_GROUPS,
                     deprecated_in="0.21",
                     removed_in="0.23",
                 )
-        return self.pg_collection
+        _check_inference_process_groups(pg_collection, type(self).__name__)
+        self.pg_collection = pg_collection
+        return pg_collection
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
