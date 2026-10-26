@@ -4,7 +4,7 @@
 
 # Muon with MFSDP v2
 
-## Challenge
+## Background
 
 MFSDP shards one **module** at a time. By default, parameters owned by that
 module with the same dtype and `requires_grad` form one parameter group.
@@ -97,7 +97,7 @@ The next step is a direct Muon path that skips gather/scatter staging and
 local copies. Both approaches need a companion optimizer for excluded
 parameters, such as biases and embeddings.
 
-## Tradeoffs and next step
+## Tradeoffs
 
 | | Gather/scatter | TensorAtomic |
 | --- | --- | --- |
@@ -107,9 +107,12 @@ parameters, such as biases and embeddings.
 | Memory | Sharded state plus temporary full matrices | Whole-matrix state and workspace must fit on each owner |
 | Load balance | Compute owners restricted to existing fragment holders | Balance persistent memory and compute across modules |
 
+The benefit depends on how much boundary-matrix traffic is removed relative
+to the cost of uneven forward/backward communication.
+
+## Next step
+
 Keep gather/scatter as the baseline and prototype the TensorAtomic fast
 path. Compare full-step time and peak memory with identical module
 boundaries, precision, and optimizer settings; verify updates against
-full-matrix Muon. Include single-node and multi-node runs. The benefit
-depends on how much boundary-matrix traffic is removed relative to the
-cost of uneven forward/backward communication.
+full-matrix Muon. Include single-node and multi-node runs.
