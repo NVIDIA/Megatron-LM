@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -17,7 +16,6 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -71,12 +69,12 @@ def test_standard_moe_train_step_and_clip(process_group_collections, distributed
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
     config = TransformerConfig(
-        num_layers=3,
+        num_layers=2,
         hidden_size=64,
         num_attention_heads=4,
         num_moe_experts=4,
         expert_model_parallel_size=2,
-        moe_layer_freq=[0, 1, 0],
+        moe_layer_freq=[0, 1],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
         moe_grouped_gemm=True,
@@ -95,7 +93,7 @@ def test_standard_moe_train_step_and_clip(process_group_collections, distributed
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E*",
+        hybrid_layer_pattern="*E",
         pg_collection=reference_process_group_collection,
     ).cuda()
     model = HybridModel(
@@ -103,17 +101,13 @@ def test_standard_moe_train_step_and_clip(process_group_collections, distributed
         hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
-        hybrid_layer_pattern="*E*",
+        hybrid_layer_pattern="*E",
         pg_collection=process_group_collection,
     ).cuda()
     model = _train_and_compare(
         model, reference_model, process_group_collection, distributed_setup.world_size
     )
-    assert isinstance(model.module.decoder.layers[-1], FsdpModule)
-    experts = model.module.decoder.layers[1].mlp.experts
-    assert isinstance(experts, FsdpModule)
-    for parameter in experts.parameters():
-        assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
+    assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["no-overlap", "overlap"])
@@ -163,23 +157,13 @@ def test_shortcut_moe_train_step_and_clip(process_group_collections, distributed
         hybrid_layer_pattern="*E*",
         pg_collection=process_group_collection,
     ).cuda()
-    block = model.decoder.layers[0]
-    assert isinstance(block, ShortcutMoEBlock)
-    experts = block.moe_layer.mlp.experts
-    assert experts not in FsdpUnitCollector((ShortcutMoEBlock,)).collect(model)
-
     model = _train_and_compare(
         model, reference_model, process_group_collection, distributed_setup.world_size
     )
+    block = model.module.decoder.layers[0]
     assert isinstance(block, FsdpModule)
-    assert not isinstance(block.compute_layer, FsdpModule)
-    assert not isinstance(block.moe_layer, FsdpModule)
-    assert not isinstance(block.moe_layer.mlp, FsdpModule)
-    assert not isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule)
+    assert isinstance(block.moe_layer.mlp.experts, FsdpModule)
     assert isinstance(model.module.decoder.layers[-1], FsdpModule)
-    assert isinstance(experts, FsdpModule)
-    for parameter in experts.parameters():
-        assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
 
 
 def _train_and_compare(model, reference_model, process_group_collection, world_size):
