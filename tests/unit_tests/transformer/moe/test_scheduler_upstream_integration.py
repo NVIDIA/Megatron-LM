@@ -162,3 +162,20 @@ def test_scheduler_moon_router_compact_scores_match_dense_gradients(monkeypatch,
         torch.testing.assert_close(logits.grad, reference.grad, rtol=2e-4, atol=1e-6)
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_compact_dispatch_metadata_expansion_preserves_scores_and_gradients(tp_size):
+    from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
+
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.tp_size, dispatcher.ep_size, dispatcher.num_local_experts = tp_size, 2, 4
+    ids = torch.tensor([[0, 5], [7, 2]], dtype=torch.int16)
+    scores = torch.tensor([[0.2, 0.8], [0.3, 0.7]], requires_grad=True)
+    routes, expanded = dispatcher._initialize_metadata(ids, scores)
+    assert routes.shape == (2, 2 * tp_size)
+    assert expanded.shape == (2, 2 * tp_size, 4)
+    flat = expanded.reshape(2, -1)
+    torch.testing.assert_close(flat.gather(1, routes.long()), scores.repeat_interleave(tp_size, 1))
+    expanded.sum().backward()
+    torch.testing.assert_close(scores.grad, torch.full_like(scores, tp_size))

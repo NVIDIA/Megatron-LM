@@ -38,6 +38,12 @@ Zero-replica EPLB keeps native compute, and home exchange/checkpoint boundaries
 remain independent of replica transfer. Latest-dev TrainState is reset when
 initializing home ownership from an ordinary logical checkpoint.
 
+The unquantized native expert fallback trims unused rows from MoonEP's static
+receive budget before TE splits expert segments, then zero-pads the output back
+to the combine budget. This path already needs host counts; quantized grouped
+kernels continue to consume device offsets without this host read. This also
+handles BF16 overrides inside an otherwise MXFP8 MTP model.
+
 ## Design Goals
 
 - Decouple load planning from expert-weight movement so planners and expert
@@ -78,7 +84,8 @@ optional `HomeExpertPlacement(source_slots, version)` with a `[EP, H]` source
 permutation. `replica_expert_placement` is an optional `[EP, S]` integer table,
 with `-1` for inactive replicas. Both tables are destination-major and encode
 **physical** sources as `rank * H + local_home_slot`. `placement_result` is
-opaque reroute state. `reroute()` returns dense physical route/probability tensors.
+opaque reroute state. `reroute()` returns either dense physical route/probability
+tensors or compact physical IDs with matching top-k probabilities.
 
 `MoEScheduler` calls `HomeExpertDispatch` and `ReplicaExpertDispatch` directly.
 Home dispatch stages metadata until `scheduler.step()`; replica dispatch starts
@@ -124,7 +131,7 @@ classDiagram
 | --- | --- | --- | --- |
 | Planner | `echo` | `EchoLoadPlanner` | CUDA/Triton assignment and token reroute aligned with Echo PR #2368. |
 | Planner | `eplb` | `EPLBLoadPlanner` | Greedy replication, optional periodic home LPT permutations, and global round-robin rerouting. |
-| Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #7450 padding-aware placement with symmetric-memory histogram exchange and separate rerouting. |
+| Planner | `moon_ep` | `MoonEPLoadPlanner` | Upstream cooperative placement/rerouting kernel with symmetric-memory histogram exchange. |
 | Expert dispatch | `replica_peer_tma` | `ReplicaExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
 | Expert dispatch | `replica_hybridep` | Same dispatcher, `HybridEPWeightTransport` | Reserved; rejected during configuration validation. |
 | Expert dispatch | `replica_nccl` | Same dispatcher, `NcclP2PTransport` | Packed NCCL P2P; BF16/MXFP8 weights, BF16/FP32 gradients, host planning. |
@@ -389,9 +396,11 @@ and does not impose this replica dtype restriction. Megatron-FSDP v2 is rejected
 at initialization because its parameter/gradient ownership and home-state bindings
 are not integrated yet.
 
-The upstream-dev integration retains Boolean logical routing for scheduler
-planners even when fused routing supports compact top-k indices. Token dispatch
-can convert the resulting physical routes to its supported backend format.
+ECHO and EPLB retain Boolean logical routing. Both MoonEP entry points use
+compact int64 IDs and top-k probabilities when index routing is enabled. Fused
+TE routing returns full-width probabilities, which the router gathers in top-k
+order without detaching gradients. Dense mock routes are adapted by the planner.
+Token dispatch receives the representation supported by its backend.
 `moe_megakernel_backend` must remain unset: that execution path bypasses the
 scheduler lifecycle and has no integrated replica computation contract.
 
@@ -754,13 +763,14 @@ parameter bindings, and configuration capacity checks. These focused tests do
 not establish full FSDP/MXFP8 training parity.
 
 
-## PR #7450 alignment (no scheduler-interface or GTP migration)
+## Historical split-planner reference
 
-The MoonEP kernels track PR #7450 at `242c8dbc63c17ec804f1e31974d3dec86e5ed56c`.
-The scheduler still calls `update_placement`, replica dispatch, then `reroute`.
-Placement and reroute remain separate launches and retain the dense routing IR.
-Consequently this branch does not claim the PR's fused planner/side-stream
-scheduling overhead or end-to-end training performance.
+The test-only split planner tracks PR #7450 at `242c8dbc63c17ec804f1e31974d3dec86e5ed56c`.
+The following describes the former implementation preserved under
+`tests/unit_tests/transformer/moe/moonep_reference*.py`. Its placement and reroute
+are separate launches with dense routing. Production MoonEP instead uses the
+cooperative kernel described above; reference benchmarks do not measure the new
+scheduler adapter or establish its end-to-end performance.
 
 Placement rounds each global logical expert count once into GEMM-aligned blocks
 (256 for the supported fused grouped MLP), balances these blocks, and assigns
@@ -793,8 +803,11 @@ fused ops. Detaching a runtime owned by another layer remains an error.
 
 The existing TE weighted squared-ReLU expert path is allowed by scheduler
 configuration, with `ScaledSReLU` checked during environment initialization.
-Quantile routing and upstream grouped-tensor/GTP API migration are outside this
-change. All comparisons use a common supported recipe, not the PR's GTP recipe.
+The historical alignment tests use a common supported recipe rather than GTP.
+The retained upstream `test_virtual_experts.py` separately exercises quantile
+routing, grouped-tensor/GTP, repeated MTP, recompute and offload through the
+legacy entry point. These tests do not imply arbitrary planner/backend support
+for every upstream GTP configuration.
 
 `test_moonep_pr7450_alignment.py` checks the pinned PR's independent CPU oracle,
 local EP33/64 layouts, real EP communication and graph replay.

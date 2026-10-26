@@ -2411,11 +2411,22 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Bool routing maps are expanded from [num_local_tokens, num_experts] to
         [num_local_tokens, world_size, num_local_experts]. Dense top-k indices are expanded
         from [num_local_tokens, topk] to [num_local_tokens, topk * expert_tp_size]. probs are
-        always the router's full [num_local_tokens, num_experts] weights and are expanded like a
-        bool map; the backend managers select the per-route weights from them.
+        converted from compact scheduler scores to full [num_local_tokens, num_experts]
+        weights when needed and then expanded like a bool map; backend managers select
+        the per-route weights from them.
         """
         num_local_tokens = routing_map.shape[0]
         world_size = self.tp_size * self.ep_size
+        num_experts = self.ep_size * self.num_local_experts
+        if routing_map.dtype != torch.bool and probs.shape[1] != num_experts:
+            if probs.shape != routing_map.shape:
+                raise ValueError("Compact route IDs and probabilities must have matching shapes.")
+            # MoonEP retains compact scores through planning. HybridEP currently
+            # consumes full-width probabilities, so expand only at this boundary,
+            # before expert-TP replication, while preserving the probability graph.
+            probs = probs.new_zeros((num_local_tokens, num_experts)).scatter(
+                1, routing_map.long(), probs
+            )
         if routing_map.dtype == torch.bool:
             routing_map = (
                 routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
