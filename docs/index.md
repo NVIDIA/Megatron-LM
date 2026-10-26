@@ -108,6 +108,7 @@ user-guide/observability/extending
 developer/contribute
 developer/parallel-state-deprecation
 developer/process-group-collection
+developer/process-group-failure-patterns
 developer/submit
 developer/oncall
 developer/generate_docs

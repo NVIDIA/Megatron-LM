@@ -13,6 +13,9 @@ collectives or rank-dependent RNG offsets can then produce incorrect results or 
 
 The caller knows which model owns an operation and should supply its groups explicitly.
 
+[Process-group failure patterns](process-group-failure-patterns.md) shows the ways this goes wrong
+in practice, and how to write each case instead.
+
 ## What is deprecated
 
 | Tier | What | Replacement | Status |
