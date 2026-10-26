@@ -135,6 +135,20 @@ def _token_major_activations(num_rows: int, contiguous: bool = True) -> torch.Te
 CONTIGUITY = pytest.mark.parametrize("contiguous", [True, False], ids=["kernel", "fallback"])
 
 
+def test_dynamic_context_rejects_context_parallelism_before_allocating_cache():
+    model_config = TransformerConfig(
+        params_dtype=torch.bfloat16,
+        num_layers=1,
+        hidden_size=32,
+        kv_channels=8,
+        num_attention_heads=4,
+        context_parallel_size=2,
+    )
+
+    with pytest.raises(ValueError, match="does not support context parallelism"):
+        DynamicInferenceContext(model_config, InferenceConfig(buffer_size_gb=0.01))
+
+
 def test_zero_padding_rows_module_supports_missing_triton(monkeypatch):
     """The torch fallback remains importable and functional without Triton installed."""
     module_name = f"{zero_padding_rows_kernel.__name__}_without_triton"

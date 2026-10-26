@@ -380,6 +380,23 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
+        # Dynamic inference owns a replicated paged KV cache and feeds complete
+        # request sequences directly to FlashAttention. It does not partition or
+        # gather those sequences across a context-parallel group. Reject CP here,
+        # including the direct engine path that bypasses inference-shard parsing,
+        # rather than silently returning results from an unsupported layout.
+        pg_collection = inference_config.pg_collection
+        configured_cp_size = (
+            get_pg_size(pg_collection.cp)
+            if pg_collection is not None
+            else model_config.context_parallel_size
+        )
+        if model_config.context_parallel_size != 1 or configured_cp_size != 1:
+            raise ValueError(
+                "Dynamic inference does not support context parallelism; "
+                "context_parallel_size and the CP process group must both have size 1."
+            )
+
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
@@ -428,7 +445,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads
-        pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             tp_size = get_pg_size(pg_collection.tp)
             pp_size = get_pg_size(pg_collection.pp)
