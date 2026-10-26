@@ -40,8 +40,8 @@ initializing home ownership from an ordinary logical checkpoint.
 
 The unquantized native expert fallback trims unused rows from MoonEP's static
 receive budget before TE splits expert segments, then zero-pads the output back
-to the combine budget. This path already needs host counts; quantized grouped
-kernels continue to consume device offsets without this host read. This also
+to the combine budget. This path already needs host counts; native grouped-tensor
+and quantized kernels continue to consume device offsets without this host read. This also
 handles BF16 overrides inside an otherwise MXFP8 MTP model.
 
 ## Design Goals

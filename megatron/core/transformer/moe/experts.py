@@ -1243,10 +1243,11 @@ class TEGroupedMLP(MegatronModule):
         # TE's unquantized fallback splits the input using host counts, so it must
         # see only those segments, even when moe_use_grouped_tensor was requested.
         # Keep the static shape at the dispatch/combine boundary and zero its tail.
-        # Quantized grouped kernels consume offsets directly and need no host read.
+        # Native grouped-tensor kernels consume offsets directly and need no host read.
         receive_capacity = None
         if (
             self.config.moe_virtual_expert_load_balance
+            and not getattr(self.linear_fc1, "use_grouped_tensor", False)
             and not self.linear_fc1.will_execute_quantized(
                 is_context_quantized=bool(self.config.fp8 or self.config.fp4)
             )
