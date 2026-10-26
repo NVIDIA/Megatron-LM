@@ -25,11 +25,8 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 class FsdpUnitCollector:
     """Collect dense and expert modules in pre-order, including the root."""
 
-    def __init__(
-        self, fsdp_unit_modules: tuple[type[nn.Module], ...], include_experts: bool
-    ) -> None:
+    def __init__(self, fsdp_unit_modules: tuple[type[nn.Module], ...]) -> None:
         self._fsdp_unit_modules = fsdp_unit_modules
-        self._include_experts = include_experts
         self._units_to_shard: list[nn.Module] = []
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
@@ -48,7 +45,7 @@ class FsdpUnitCollector:
             and module not in self._units_to_shard
         ):
             self._units_to_shard.append(module)
-        if self._include_experts and isinstance(module, MoELayer):
+        if isinstance(module, MoELayer):
             if module.experts not in self._units_to_shard:
                 self._units_to_shard.append(module.experts)
 

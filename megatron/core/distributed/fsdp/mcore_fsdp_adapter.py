@@ -727,9 +727,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = nullcontext(active_context)
         with construction_context:
             # Pre-order: collect only the modules to shard.
-            collector = FsdpUnitCollector(
-                tuple(fsdp_unit_modules), include_experts=expert_dp_mesh is not None
-            )
+            collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
             units_to_shard = collector.collect(module)
 
             # Reverse pre-order: children claim their parameters before their parents.
