@@ -474,7 +474,7 @@ try:
             choices.append(choice_data)
             request_idx += 1
 
-        prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        prompt_token_count = sum(prompt_tokens_counts)
         response = {
             "id": response_uid,
             "object": "text_completion",  # as per the openAI spec

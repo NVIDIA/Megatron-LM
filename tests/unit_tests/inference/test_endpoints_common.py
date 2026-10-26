@@ -866,7 +866,12 @@ async def test_streaming_requires_a_fast_tokenizer(path):
 @pytest.mark.parametrize("include_usage", [False, True])
 async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usage, monkeypatch):
     offload_params = {"store": "x"}
-    client = ReplyingClient()
+    client = ReplyingClient(
+        [
+            completed_reply(f"req-{index}", [10, 11], [12, 13], num_cached_tokens=index)
+            for index in range(1, 4)
+        ]
+    )
     app = build_streaming_app(path, client, monkeypatch)
     body = {
         **FAN_OUT_BODIES[path],
@@ -889,13 +894,14 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
     assert sorted(choice["index"] for choice in finals) == [0, 1, 2]
     assert all(choice["generated_text"] == "<12><13>" for choice in finals)
     usage = [p["usage"] for p in payloads if "usage" in p]
+    prompt_tokens = 2 if path == CHAT_PATH else 6
     assert usage == (
         [
             {
-                "prompt_tokens": 2,
+                "prompt_tokens": prompt_tokens,
                 "completion_tokens": 6,
-                "total_tokens": 8,
-                "prompt_tokens_details": {"cached_tokens": 0},
+                "total_tokens": prompt_tokens + 6,
+                "prompt_tokens_details": {"cached_tokens": 3 if path == CHAT_PATH else 6},
             }
         ]
         if include_usage

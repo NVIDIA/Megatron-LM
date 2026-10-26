@@ -401,7 +401,7 @@ async def test_completions_response_format(
     assert payload["object"] == "text_completion"
     assert payload["model"] == "EMPTY"
     assert isinstance(payload["created"], int)
-    assert payload["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    assert payload["usage"] == {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
     choice_0, choice_1 = payload["choices"]
     assert (choice_0["index"], choice_1["index"]) == (0, 1)
     assert (choice_0["text"], choice_1["text"]) == (
