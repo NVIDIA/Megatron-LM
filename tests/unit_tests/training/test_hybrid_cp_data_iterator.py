@@ -21,9 +21,10 @@ def test_wrap_dynamic_cp_data_iterator_returns_rerun_iterator(monkeypatch):
         def __init__(self, *args, **kwargs):
             assert kwargs['min_cp_size'] == 1
 
-        def run(self, iterator, num_microbatches, *args):
+        def run(self, iterator, num_microbatches, *args, validate_cuda_graph_limits=True):
             assert iterator is original
             assert num_microbatches == 2
+            assert validate_cuda_graph_limits
             return expected, 3, 256, 16384
 
     monkeypatch.setitem(data_schedule.scheduler_map, 'default_dynamic_cp', Scheduler)

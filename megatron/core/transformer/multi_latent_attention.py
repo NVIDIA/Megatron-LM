@@ -173,9 +173,10 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
     def forward(ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim):
         """Split kv, apply RoPE to k_pos_emb and quantize key and value"""
         key, value = fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, v_dim)
-        ctx.save_for_backward(cos, sin)
+        # The key/value split RoPE backward reads cu_seqlens_kv (None: BSHD) from saved_tensors.
+        ctx.save_for_backward(cos, sin, None)
         ctx.emb_dim, ctx.k_dim, ctx.v_dim = emb_dim, k_dim, v_dim
-        ctx.cu_seqlens_kv, ctx.cp_rank, ctx.cp_size = None, 0, 1
+        ctx.cp_rank, ctx.cp_size = 0, 1
         ctx.remove_interleaving = False
         return key, value
 
@@ -263,6 +264,18 @@ class MultiLatentAttention(Attention):
     This layer only contains common modules required for the "self attn" and
     "cross attn" specializations.
     """
+
+    def _retain_cuda_graph_rope_tensors(self, *rope_tensors: Optional[torch.Tensor]) -> None:
+        """Retain MLA-internal RoPE allocations used by TE CUDA graphs."""
+        if getattr(self.config, 'cuda_graph_impl', 'none') != 'transformer_engine':
+            return
+
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if not is_graph_capturing():
+            return
+        refs = self.__dict__.setdefault('_cuda_graph_static_tensor_refs', {})
+        refs.update((id(tensor), tensor) for tensor in rope_tensors if tensor is not None)
 
     def __init__(
         self,
@@ -996,6 +1009,8 @@ class MLASelfAttention(MultiLatentAttention):
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
             rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
+
+        self._retain_cuda_graph_rope_tensors(rotary_pos_emb, rotary_pos_cos, rotary_pos_sin)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
