@@ -5478,10 +5478,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     global_work_from_last_consensus, _ = self._last_ep_consensus
                     if (
-                        global_work_from_last_consensus == 0
+                        self.ep_world_size == 1
+                        or global_work_from_last_consensus == 0
                         or self._ep_consensus_loop_counter % self.ep_consensus_interval == 0
                     ):
                         # selectively enter ep_establish_consensus if
+                        # 0. there are no EP peers -> consensus is local and free. A cached value
+                        #    goes stale once local work drains and would trigger a dummy forward
+                        #    with no collective to join. Such a dummy forward would also need a
+                        #    request-owned recurrent-state slot (the dedicated dummy slot is only
+                        #    reserved for EP > 1), which pending handoffs may all be holding.
                         # 1. there is no global work -> engine is idle. At any step in the future
                         #    one of the ranks can receive work. So we should be eagerly checking for that
                         # 2. it has been 20 steps since we last established consensus, and that consensus

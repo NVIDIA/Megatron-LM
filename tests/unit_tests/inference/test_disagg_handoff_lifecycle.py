@@ -34,7 +34,11 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingSSMImport,
 )
 from megatron.core.inference.disaggregation.transfer_backends.base import TransferStartError
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    EngineState,
+    RequestEntry,
+)
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -1944,3 +1948,96 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         is not requests[1].disaggregated_params["kv_meta"]
     )
     assert all("ssm" not in meta for meta in engine._kv_peer_metas)
+
+
+class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
+    """Prefill engine shell that drives the real coordinator loop on scripted work."""
+
+    def __init__(self, *, ep_world_size, peer_work, iterations, dummy_forward):
+        self._initialize_disaggregation_state()
+        self._kv_transfer_role = "prefill"
+        self.state = EngineState.RUNNING
+        self.rank = 0
+        self.ep_world_size = ep_world_size
+        self.ep_consensus_interval = 20
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus = (0, False)
+        self.use_synchronous_zmq_collectives = False
+        self.waiting_request_ids = deque([7])
+        self.context = SimpleNamespace(
+            step_count=0, prefix_cache_lru_clock=0, get_active_request_count=lambda: 0
+        )
+        self.controller = SimpleNamespace(dummy_forward=dummy_forward)
+        self.step_start_event = mock.Mock()
+        self.step_end_event = mock.Mock()
+        self.step_calls = 0
+        self.all_reduce_inputs = []
+        self._peer_work = peer_work
+        self._iterations_left = iterations
+        if ep_world_size > 1:
+            self.expert_parallel_zmq_communicator = SimpleNamespace(
+                all_reduce_max=self._all_reduce_max
+            )
+
+    async def _all_reduce_max(self, local_work, consensus, async_op):
+        self.all_reduce_inputs.append(local_work)
+        return max(local_work, self._peer_work), consensus
+
+    def schedule_requests(self):
+        self._iterations_left -= 1
+        if self._iterations_left < 0:
+            self.state = EngineState.STOPPING
+        return 0
+
+    async def async_step(self, *, verbose=False):
+        # The prompt finishes prefill in one step and leaves the batch; its detached
+        # recurrent-state slot stays pinned until decode releases the handoff.
+        self.step_calls += 1
+        self.waiting_request_ids.clear()
+        await asyncio.sleep(0)
+
+    async def shutdown(self):
+        return None
+
+
+def _run_coordinator_loop(engine, loop):
+    run = DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__
+    loop.run_until_complete(asyncio.wait_for(run(engine, loop=loop), timeout=30))
+
+
+def test_idle_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loop):
+    """A drained EP=1 engine must not act on a cached EP consensus.
+
+    Pending handoffs may hold every request-owned recurrent-state slot, and EP=1 reserves no
+    dummy slot, so a dummy forward here fails to allocate a slot and kills the engine.
+    """
+    dummy_forward = mock.Mock(
+        side_effect=AssertionError(
+            "No free recurrent-state slots for 1 expert-parallel dummy request(s)"
+        )
+    )
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=1, peer_work=0, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.step_calls == 1
+    dummy_forward.assert_not_called()
+    assert engine.context.step_count == 0
+    assert engine._last_ep_consensus == (0, False)
+
+
+def test_idle_expert_parallel_rank_keeps_amortized_consensus_dummy_forward(handoff_loop):
+    """EP>1 ranks still reuse consensus within the interval and join busy peers."""
+    dummy_forward = mock.Mock()
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=2, peer_work=1, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.all_reduce_inputs == [1]
+    assert engine.step_calls == 1
+    assert dummy_forward.call_count == 3
+    assert engine.context.step_count == 3
