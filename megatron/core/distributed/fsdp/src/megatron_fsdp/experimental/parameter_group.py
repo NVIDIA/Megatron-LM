@@ -118,6 +118,8 @@ class FsdpParameterGroup:
     # dtype of the reduce-scatter input (partial_grad): MixedPrecisionPolicy.grad_comm_dtype,
     # or main_grad's dtype when unset.
     grad_comm_dtype: torch.dtype
+    # Full compute storage: persistent model_weight when replicated, otherwise a
+    # temporary buffer populated by all-gather.
     _unsharded_model_weight: DBuffer | QuantizedDBuffer
     # BF16 shares one event across phases; sharded MXFP8 has independent rowwise
     # (forward) and columnwise (backward) events. Releasing storage clears its event.
@@ -185,9 +187,9 @@ class FsdpParameterGroup:
         )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
 
-        # _build_fsdp_parameters() creates views into this storage, which requires a valid
-        # storage size. Release it only after construction; a later unshard reallocates it.
-        self._unsharded_model_weight.release_storage()
+        # Building Parameter views requires live storage. Release temporary gather
+        # storage afterward; replicated weights keep their persistent buffer.
+        self.release_unsharded_storage()
         self._switch_to_sharded_parameters()
 
     @staticmethod
@@ -333,19 +335,23 @@ class FsdpParameterGroup:
                     )
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
         self.sync_model_weight_from_main_weight()
-        with self._symmetric_memory_context():
-            if isinstance(self.model_weight, DBuffer):
-                self._unsharded_model_weight = DBuffer(
-                    mesh=self.mesh,
-                    placements=[Replicate()] * self.mesh.ndim,
-                    layout=layout,
-                    dtype=self.dtype,
-                    device=self.main_weight.device,
-                )
-            else:
-                self._unsharded_model_weight = QuantizedDBuffer(
-                    self.mesh, [Replicate()] * self.mesh.ndim, layout, self.main_weight.device
-                )
+        unsharded_placements = (Replicate(),) * self.mesh.ndim
+        if self.model_weight.placements == unsharded_placements:
+            self._unsharded_model_weight = self.model_weight
+        else:
+            with self._symmetric_memory_context():
+                if isinstance(self.model_weight, DBuffer):
+                    self._unsharded_model_weight = DBuffer(
+                        mesh=self.mesh,
+                        placements=unsharded_placements,
+                        layout=layout,
+                        dtype=self.dtype,
+                        device=self.main_weight.device,
+                    )
+                else:
+                    self._unsharded_model_weight = QuantizedDBuffer(
+                        self.mesh, unsharded_placements, layout, self.main_weight.device
+                    )
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
@@ -441,14 +447,14 @@ class FsdpParameterGroup:
         )
 
     def _is_model_weight_unsharded(self) -> bool:
-        """Whether compute weights are already unsharded."""
-        return self.model_weight.placements == self._unsharded_model_weight.placements
+        """Whether full compute storage is the persistent model-weight buffer."""
+        return self._unsharded_model_weight is self.model_weight
 
     @property
     def is_rowwise_unsharded(self) -> bool:
-        """Whether this group's gather buffer holds MXFP8 rowwise planes."""
-        # Replicated compute weights use persistent model_weight storage and never
-        # allocate this gather buffer after construction.
+        """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
+        if self._is_model_weight_unsharded():
+            return False
         buffer = self._unsharded_model_weight
         # QuantizedDBuffer aliases DBuffer when TE is unavailable.
         if isinstance(buffer, DBuffer):
@@ -475,11 +481,9 @@ class FsdpParameterGroup:
             )
             self._model_weight_is_stale = False
 
-        unsharded_model_weight = self._unsharded_model_weight
         if self._is_model_weight_unsharded():
-            unsharded_model_weight = self.model_weight
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
-        elif isinstance(unsharded_model_weight, DBuffer):
+        elif isinstance(self._unsharded_model_weight, DBuffer):
             self._allgather_model_weight()
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
@@ -488,9 +492,7 @@ class FsdpParameterGroup:
             )
             ready_phases = missing_phases
         self._install_unsharded_parameters(
-            unsharded_model_weight,
-            rowwise=Phase.FORWARD in ready_phases,
-            columnwise=Phase.BACKWARD in ready_phases,
+            rowwise=Phase.FORWARD in ready_phases, columnwise=Phase.BACKWARD in ready_phases
         )
         self._switch_to_unsharded_parameters()
         event = torch.cuda.current_stream().record_event()
@@ -505,11 +507,7 @@ class FsdpParameterGroup:
             torch.cuda.current_stream().wait_event(event)
 
     def _install_unsharded_parameters(
-        self,
-        unsharded_model_weight: DBuffer | QuantizedDBuffer,
-        *,
-        rowwise: bool = True,
-        columnwise: bool = True,
+        self, *, rowwise: bool = True, columnwise: bool = True
     ) -> None:
         """Update each FsdpParameter's unsharded data and scales from the weight buffer.
 
@@ -518,6 +516,7 @@ class FsdpParameterGroup:
         compute weights ignore them. Replicated weights also need installation
         after optimizer updates because their padded MXFP8 scales are copies.
         """
+        unsharded_model_weight = self._unsharded_model_weight
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor_view = unsharded_model_weight.get_tensor_view(index)
             # TE saves an MXFP8 Parameter itself for backward and reads its planes when
@@ -584,14 +583,15 @@ class FsdpParameterGroup:
         else:
             self._unshard_events.clear()
 
+        # Clear readiness so the next unshard refreshes Parameter data/scales,
+        # but never free persistent compute weights or their padded scale copies.
+        if self._is_model_weight_unsharded():
+            return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
             unsharded_model_weight.release_storage()
             return
         unsharded_model_weight.release_storage(rowwise_only=rowwise_only)
-        # Replicated compute parameters reference persistent model_weight storage.
-        if self._is_model_weight_unsharded():
-            return
         for parameter in self.fsdp_parameters:
             weight = parameter.unsharded
             # TE #3518 requires padded scale copies on the Parameter, separate
