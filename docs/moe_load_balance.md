@@ -11,7 +11,7 @@ token preprocessing, dispatch, expert computation, combine, and backward flow.
 
 ## Integration with upstream MoonEP
 
-The implementation is based on dev `dd8f93b57` (including PR #7450). The existing
+The implementation is based on dev `ff20ed546` (including PR #7450). The existing
 `moe_virtual_expert_load_balance` flag keeps the accepted compact-route,
 GTP/TE, stream, and backward lifecycle. `MoELayer` exposes it through the same
 `MoEScheduler` ownership interface as the configurable backends; the two enable

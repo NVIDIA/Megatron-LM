@@ -1959,3 +1959,48 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
     assert max_seqlen.numel() == 1
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+@pytest.mark.parametrize("sequence_packing_scheduler", [None, "dp_balanced"])
+@pytest.mark.parametrize("vp_size", [None, 2])
+def test_packed_sequence_dataset_built_on_rank(script, sequence_packing_scheduler, vp_size):
+    """Check which ranks build a packed-sequence dataset.
+
+    Without the sequence-packing scheduler, middle PP stages read the packing metadata from their
+    own data iterator. The scheduler sends that metadata to them instead and rejects a data
+    iterator on any rank other than TP rank 0 of the first or last PP stage.
+    """
+    tp_size, pp_size = 2, 4
+    if tp_size * pp_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because tp_size * pp_size > torch.cuda.device_count() "
+            f"({tp_size * pp_size} > {torch.cuda.device_count()})"
+        )
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        virtual_pipeline_model_parallel_size=vp_size,
+    )
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+
+    args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
+    config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+    vp_stages = [None] if vp_size is None else range(vp_size)
+    with (
+        patch.object(script, "get_args", return_value=args),
+        patch.object(script, "core_transformer_config_from_args", return_value=config),
+    ):
+        for vp_stage in vp_stages:
+            built = script.is_dataset_built_on_rank(vp_stage=vp_stage, is_packed_sequence=True)
+
+            if sequence_packing_scheduler is None:
+                expected = tp_rank == 0
+            else:
+                on_first_stage = pp_rank == 0 and vp_stage == vp_stages[0]
+                on_last_stage = pp_rank == pp_size - 1 and vp_stage == vp_stages[-1]
+                expected = tp_rank == 0 and (on_first_stage or on_last_stage)
+            assert built == expected, f"{tp_rank=} {pp_rank=} {vp_stage=}"
+
+    Utils.destroy_model_parallel()
