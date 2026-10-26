@@ -38,6 +38,7 @@ except ImportError:
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
@@ -606,9 +607,25 @@ def is_gtp_remat_active(args):
     )
 
 
-def is_first_or_last_pipeline_stage(vp_stage):
+def is_first_or_last_pipeline_stage(vp_stage, pp_group=None, vp_size=None):
     """Return True if on first or last pipeline stage, taking into account virtual
-    pipeline parallelism."""
+    pipeline parallelism.
+
+    Args:
+        vp_stage: Virtual pipeline stage of the model chunk. None checks only the
+            pipeline stage of the rank.
+        pp_group: Pipeline-parallel group of the model. None reads the stage from the
+            global parallel state.
+        vp_size: Virtual pipeline size of the model, used with ``pp_group``. None means
+            the model has no virtual pipeline stages.
+    """
+    if pp_group is not None:
+        is_first_stage = is_pp_first_stage(pp_group)
+        is_last_stage = is_pp_last_stage(pp_group)
+        if vp_stage is not None and vp_size is not None:
+            is_first_stage = is_first_stage and vp_stage == 0
+            is_last_stage = is_last_stage and vp_stage == vp_size - 1
+        return is_first_stage or is_last_stage
     ignore_virtual = True
     if vp_stage is not None:
         ignore_virtual = False
