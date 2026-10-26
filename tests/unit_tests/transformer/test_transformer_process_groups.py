@@ -19,6 +19,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
@@ -28,6 +29,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
     get_mtp_num_layers_to_build,
+    mtp_on_this_rank,
     process_mtp_loss,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -405,6 +407,48 @@ class TestMultiTokenPrediction:
         with pytest.warns(ProcessGroupFallbackWarning) as record:
             assert get_mtp_layer_offset(config) == get_mtp_layer_offset(config, pp_rank=pp_rank)
         _fallback_warning(record, "get_mtp_layer_offset", "pp_rank")
+
+    @requires_two_ranks
+    def test_placement_without_vp_size_warns_and_uses_the_global_size(self):
+        Utils.initialize_model_parallel(
+            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
+        )
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        last_stage = parallel_state.get_pipeline_model_parallel_rank() == 1
+        placement = dict(mtp_num_layers=1, ignore_virtual=False, pp_group=pp_group)
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            for vp_stage in range(2):
+                on_this_rank = mtp_on_this_rank(vp_stage=vp_stage, **placement)
+                assert on_this_rank == mtp_on_this_rank(vp_stage=vp_stage, vp_size=2, **placement)
+                # Without a layout, MTP sits on the last virtual stage of the last pipeline stage.
+                assert on_this_rank == (last_stage and vp_stage == 1)
+        _fallback_warning(record, "mtp_on_this_rank", "vp_size")
+
+    def test_gpt_model_places_mtp_by_the_virtual_pipeline_size_of_its_config(self, monkeypatch):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+        config = _config(num_layers=2, mtp_num_layers=1)
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config, _layer_spec(), use_transformer_engine=HAVE_TE, pp_rank=0
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        def forbid(*args, **kwargs):
+            raise AssertionError("read the global virtual pipeline size")
+
+        monkeypatch.setattr(
+            parallel_state, "get_virtual_pipeline_model_parallel_world_size", forbid
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=_layer_spec(),
+            vocab_size=128,
+            max_sequence_length=16,
+            mtp_block_spec=mtp_block_spec,
+            pg_collection=pg_collection,
+        )
+        # Without pipeline or virtual pipeline parallelism, the only stage holds MTP.
+        assert model.mtp_process
 
     @pytest.mark.parametrize("metric_avg_group", ["omitted", "given"])
     def test_loss_metrics_without_a_group_warn_and_use_the_global_group(
