@@ -53,6 +53,14 @@ except ImportError:
 
     HAVE_FLA = False
 
+# fla.ops.cp is only needed for chunkwise context parallelism and is missing from
+# some FLA builds. Import it separately so its absence does not disable GDN
+# entirely; the CP paths check for None and raise with an actionable message.
+try:
+    from fla.ops.cp import build_cp_context
+except ImportError:
+    build_cp_context = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -200,6 +208,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
+        # Chunkwise CP keeps every TP-local head on each CP rank and shards the sequence
+        # contiguously; headwise CP all-to-alls heads across the CP group instead. Only
+        # variants that implement chunkwise CP may run with it (see _setup_variant_attrs).
+        self.chunkwise_context_parallel = config.linear_cp_mode == "chunkwise" and self.cp_size > 1
+        self.cp_size_headwise = 1 if self.chunkwise_context_parallel else self.cp_size
+        self.cp_group_headwise = None if self.chunkwise_context_parallel else self.pg_collection.cp
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
@@ -305,6 +319,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+
+        # FLA chunkwise CP contexts for unpacked (SBHD) inputs, keyed by (global seq_len,
+        # batch). Packed-sequence cu_seqlens vary per batch, so those contexts are not cached.
+        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -424,7 +442,11 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
         return a2a_hp_to_cp(
-            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
+            norm_out_hp,
+            self.cp_size_headwise,
+            self.cp_group_headwise,
+            packed_seq_params,
+            thd_cp_a2a_inv,
         )
 
     @jit_fuser
@@ -465,7 +487,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [
+                2 * self.qk_dim_local_tp // self.cp_size_headwise,
+                self.v_dim_local_tp // self.cp_size_headwise,
+            ],
             dim=-1,
         )
 
@@ -479,7 +504,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             query_key = normalize(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size_headwise
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
@@ -714,7 +739,7 @@ def _build_head_perm_for_split_sections(
 def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
@@ -722,7 +747,8 @@ def get_parameter_local_cp(
     Args:
         param (torch.Tensor): The entire parameter to get the local parameter for.
         dim (int): The dimension to split the parameter along. Usually the dimension of head.
-        cp_group (torch.distributed.ProcessGroup): The context parallel group.
+        cp_group (torch.distributed.ProcessGroup | None): The context parallel group, or None
+            when the parameter is not split over CP (e.g. chunkwise CP).
         split_sections (Optional[list[int]]): If not None,
             first split the parameter along the dimension dim into sections,
             then get the local hidden parallel weights separately,
@@ -732,12 +758,13 @@ def get_parameter_local_cp(
         torch.Tensor: The local parameter for the current context parallel rank.
     """
 
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to split if CP size is 1.
     if cp_size == 1:
         return param
+
+    cp_rank = cp_group.rank()
 
     # Split first if needed.
     if split_sections is not None:
@@ -760,7 +787,7 @@ def tensor_a2a_cp2hp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
     undo_attention_load_balancing: bool = True,
 ):
@@ -771,7 +798,8 @@ def tensor_a2a_cp2hp(
             Currently only support (seq_len, batch, head_dim) shaped tensor.
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
-        cp_group (torch.distributed.ProcessGroup): The context parallel group.
+        cp_group (torch.distributed.ProcessGroup | None): The context parallel group, or None
+            for no CP all-to-all.
         split_sections (Optional[list[int]]): If not None, split the tensor along the dimension
             head_dim into sections first, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
@@ -781,7 +809,7 @@ def tensor_a2a_cp2hp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
@@ -823,7 +851,7 @@ def tensor_a2a_hp2cp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
     redo_attention_load_balancing: bool = True,
 ):
@@ -834,7 +862,8 @@ def tensor_a2a_hp2cp(
             Currently only support (seq_len, batch, head_dim) shaped tensor.
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
-        cp_group (torch.distributed.ProcessGroup): The context parallel group.
+        cp_group (torch.distributed.ProcessGroup | None): The context parallel group, or None
+            for no CP all-to-all.
         split_sections (Optional[list[int]]): If not None, first split the tensor along the
             dimension head_dim into sections, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
@@ -844,7 +873,7 @@ def tensor_a2a_hp2cp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
@@ -887,7 +916,7 @@ def a2a_cp_to_hp(
     qkvzba: torch.Tensor,
     in_proj_split_sections: tuple[int, ...],
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     cu_seqlens_q: torch.Tensor | None,
     seq_len: int,
     packed_seq_params: PackedSeqParams | None,
@@ -898,8 +927,8 @@ def a2a_cp_to_hp(
         qkvzba: in_proj output in sbhd format, sharded along the sequence dim over CP.
         in_proj_split_sections: per-section sizes of the in_proj output, local to this
             TP rank, used to build the pre-a2a head permutation.
-        cp_size: context-parallel world size.
-        cp_group: context-parallel process group.
+        cp_size: headwise context-parallel size (1 under chunkwise CP).
+        cp_group: headwise context-parallel group (None under chunkwise CP).
         cu_seqlens_q: cumulative sequence lengths, required for the ``thd`` path.
         seq_len: global (unsharded) sequence length.
         packed_seq_params: packed-sequence params; the ``thd`` path is taken when its
@@ -936,7 +965,7 @@ def a2a_cp_to_hp(
 def a2a_hp_to_cp(
     norm_out: torch.Tensor,
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     packed_seq_params: PackedSeqParams | None,
     thd_cp_a2a_inv: torch.Tensor | None,
 ) -> torch.Tensor:
@@ -944,8 +973,8 @@ def a2a_hp_to_cp(
 
     Args:
         norm_out: gated-norm output in sbhd format, sharded along the head dim over CP.
-        cp_size: context-parallel world size.
-        cp_group: context-parallel process group.
+        cp_size: headwise context-parallel size (1 under chunkwise CP).
+        cp_group: headwise context-parallel group (None under chunkwise CP).
         packed_seq_params: packed-sequence params; the ``thd`` path is taken when its
             ``qkv_format`` is ``'thd'``.
         thd_cp_a2a_inv: sequence-dim inverse permutation returned by

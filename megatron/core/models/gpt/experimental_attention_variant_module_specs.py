@@ -308,6 +308,18 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         wrapper with TE fallback for unsupported operations.
     """
 
+    if (
+        is_gated_delta_net_variant(config.experimental_attention_variant)
+        and config.linear_cp_mode == "chunkwise"
+        and config.context_parallel_size > 1
+    ):
+        # Chunkwise CP needs the GDN layers in the contiguous CP layout while softmax
+        # attention stays zigzag. Only HybridStack converts between the two per layer.
+        raise ValueError(
+            "Gated DeltaNet with linear_cp_mode='chunkwise' is supported only in HybridModel, "
+            "which converts layers between attention_cp_layout and linear_cp_layout."
+        )
+
     backend = _get_backend_spec_provider(config=config)
 
     layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(

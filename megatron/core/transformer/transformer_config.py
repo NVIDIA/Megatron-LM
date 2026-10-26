@@ -1276,7 +1276,13 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
-    """Context-parallel algorithm for recurrent and linear-attention layers."""
+    """Context-parallel algorithm for recurrent and linear-attention layers.
+    "headwise": scatter heads across the CP group with all-to-all (Ulysses-style); each rank
+    runs the kernel on the full sequence for a shard of heads.
+    "chunkwise": keep contiguous sequence shards on each CP rank and exchange the recurrent
+    state across ranks (Gated DeltaProduct and Gated DeltaNet; GDN uses FLA CP kernels and
+    runs in HybridModel, whose stack converts layers to ``linear_cp_layout='contiguous'``).
+    GDN2 supports only headwise CP."""
 
     linear_cp_layout: CPLayout = "zigzag"
     """CP layout for linear-attention layers."""
@@ -1985,15 +1991,25 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
 
-            # Check tensor parallelism compatibility
-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-            assert self.linear_num_key_heads % tp_cp_size == 0, (
+            chunkwise_cp = self.linear_cp_mode == "chunkwise" and self.context_parallel_size > 1
+            if chunkwise_cp and self.experimental_attention_variant == "gdn2":
+                raise ValueError(
+                    "experimental_attention_variant='gdn2' supports only headwise context "
+                    "parallelism; linear_cp_mode='chunkwise' is not supported."
+                )
+
+            # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank.
+            linear_head_parallel_size = self.tensor_model_parallel_size
+            if not chunkwise_cp:
+                linear_head_parallel_size *= self.context_parallel_size
+            assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
-            assert self.linear_num_value_heads % tp_cp_size == 0, (
+            assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
