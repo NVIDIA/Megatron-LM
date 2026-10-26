@@ -139,10 +139,10 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
     return optimizer, entry.init_state_fn
 
 
-def _create_fsdp_muon_optimizer(
+def _create_fsdp_emerging_optimizer(
     config: OptimizerConfig, param_groups: list[dict[str, Any]]
 ) -> tuple[torch.optim.Optimizer, Callable]:
-    """Build owner-compute Muon and initialize checkpoint state without taking a step."""
+    """Build an MFSDP emerging optimizer (currently Muon) and its state initializer."""
     from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
