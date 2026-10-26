@@ -4,6 +4,7 @@ import copy
 import logging
 import math
 import warnings
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -33,8 +34,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _compute_indexer_teacher_probabilities,
+    _normalize_indexer_teacher_target,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
+    bwd_fused_indexer_loss_naive,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
     is_dsa_skip_topk_layer,
@@ -56,8 +60,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     build_causal_mask_from_positions,
     build_dsattention_forward_mask,
     build_fused_indexer_varlen_bounds,
+    can_prove_all_topk_rows_nonempty,
+    extract_query_valid_rows_from_packed_seq_params,
     generate_varlen_mask_params_for_positions,
     masked_log_softmax,
+    masked_softmax,
     scatter_topk_into_index_mask,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -392,6 +399,7 @@ def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
             rope_type="rope",
             context_parallel_size=cp_size,
             dynamic_context_parallel=dynamic,
+            max_seqlen_per_dp_cp_rank=sum(sequence_lengths) if dynamic else None,
             cp_comm_type="all_gather",
             apply_rope_fusion=False,
             use_cpu_initialization=True,
@@ -407,7 +415,9 @@ def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
         config=make_config(configured_cp_size, configured_cp_size != effective_cp_size),
         pg_collection=SimpleNamespace(cp=effective_group),
         tp_group=_FakeCPGroup(1),
+        use_rope=True,
         rotary_pos_emb=rotary,
+        _mla_projection_context=lambda **_: nullcontext(),
         linear_q_down_proj=TupleLinear(16, 8, bias=False).cuda(),
         linear_kv_down_proj=TupleLinear(16, 12, bias=False).cuda(),
         linear_q_up_proj=TupleLinear(8, 16, bias=False).cuda(),
@@ -498,6 +508,13 @@ def test_dsa_kernel_backend_selects_optional_kernel_module():
         == "megatron.core.transformer.experimental_attention_variant.dsa_cudnn_kernels"
     )
 
+    # The DSA-over-GQA backends load no module, so they behave like "none" here.
+    for backend in ("reference", "min-memory-torch", "min-memory-triton"):
+        config.dsa_kernel_backend = backend
+        assert dsa_kernels._get_backend_module_name(config) is None
+        assert not dsa_kernels.use_fused_dsa_kernels(config)
+
+    config.dsa_kernel_backend = "cudnn"
     config.attention_backend = "unfused"
     assert not dsa_kernels.use_fused_dsa_kernels(config)
 
@@ -542,6 +559,128 @@ def test_dsa_kernel_backend_loader_cache_and_import_errors(monkeypatch):
     monkeypatch.setattr(dsa_kernels, "import_module", fail_import_module)
     with pytest.raises(RuntimeError, match="Failed to import DSA kernel backend"):
         dsa_kernels._load_backend(Config)
+
+
+def test_dsa_all_topk_rows_nonempty_certificate():
+    common = {
+        "computes_topk": True,
+        "indexer_topk": 2,
+        "kv_sequence_length": 4,
+        "attention_mask": None,
+        "query_valid_rows": None,
+        "varlen_is_plain_causal": True,
+        "use_local_indexer_varlen": False,
+        "varlen_starts": None,
+        "varlen_ends": None,
+        "key_positions": None,
+    }
+    assert can_prove_all_topk_rows_nonempty(**common)
+
+    packed_local = {
+        **common,
+        "varlen_is_plain_causal": False,
+        "use_local_indexer_varlen": True,
+        "varlen_starts": torch.tensor([0, 0]),
+        "varlen_ends": torch.tensor([1, 2]),
+    }
+    assert can_prove_all_topk_rows_nonempty(**packed_local)
+
+    unsupported = [
+        {"computes_topk": False},
+        {"indexer_topk": 0},
+        {"kv_sequence_length": 0},
+        {"attention_mask": torch.zeros((1, 1, 2, 4), dtype=torch.bool)},
+        {"query_valid_rows": torch.ones((1, 2), dtype=torch.bool)},
+        {"varlen_is_plain_causal": False},
+        {**packed_local, "key_positions": torch.arange(4)},
+        {**packed_local, "varlen_ends": None},
+    ]
+    for override in unsupported:
+        assert not can_prove_all_topk_rows_nonempty(**{**common, **override})
+
+
+def test_dsa_packed_cp_padding_preserves_nonempty_local_varlen_rows():
+    """Padded THD rows still have causal KV coverage without a real-token mask."""
+    device = torch.device("cpu")
+    cp_size = 2
+    global_rows = 12
+    local_rows = global_rows // cp_size
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32, device=device)
+    cu_seqlens_padded = torch.tensor([0, 4, 12], dtype=torch.int32, device=device)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=8,
+        max_seqlen_kv=8,
+        pad_between_seqs=True,
+    )
+    query_valid_rows = extract_query_valid_rows_from_packed_seq_params(
+        packed_seq_params, b=1, sq=local_rows, device=device
+    )
+    assert query_valid_rows is None
+
+    padding_positions = torch.tensor([3, 8, 9, 10, 11], device=device)
+    all_query_positions = []
+    for cp_rank in range(cp_size):
+        query_positions = build_packed_allgather_cp_local_positions(
+            cu_seqlens_padded,
+            cp_size,
+            cp_rank,
+            device,
+            output_size=local_rows,
+            cu_seqlens_cover_output=True,
+        )
+        all_query_positions.append(query_positions)
+        float_mask, varlen_params, varlen_is_plain_causal = build_dsattention_forward_mask(
+            sq=local_rows,
+            skv=global_rows,
+            b=1,
+            device=device,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            cp_comm_type="allgather",
+            cp_group=None,
+            attn_mask_type=AttnMaskType.causal,
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=packed_seq_params,
+            packed_query_positions=query_positions,
+        )
+        assert float_mask is None
+        assert not varlen_is_plain_causal
+        assert varlen_params is not None
+        starts, ends, key_positions = varlen_params
+        assert key_positions is None
+
+        physical_key_positions = torch.arange(global_rows, device=device)
+        row_has_key = (
+            (physical_key_positions.unsqueeze(0) >= starts.unsqueeze(1))
+            & (physical_key_positions.unsqueeze(0) < ends.unsqueeze(1))
+        ).any(dim=1)
+        assert torch.all(row_has_key)
+        assert torch.any((query_positions.unsqueeze(1) == padding_positions).any(dim=1))
+        assert can_prove_all_topk_rows_nonempty(
+            computes_topk=True,
+            indexer_topk=2,
+            kv_sequence_length=global_rows,
+            attention_mask=None,
+            query_valid_rows=query_valid_rows,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            use_local_indexer_varlen=True,
+            varlen_starts=starts,
+            varlen_ends=ends,
+            key_positions=key_positions,
+        )
+
+    torch.testing.assert_close(
+        torch.cat(all_query_positions).sort().values,
+        torch.arange(global_rows, device=device),
+        rtol=0,
+        atol=0,
+    )
 
 
 def test_dsa_kernel_hooks_return_none_without_backend_function(monkeypatch):
@@ -630,7 +769,9 @@ def test_dsa_kernel_hooks_log_declined_backend(monkeypatch, caplog):
         is None
     )
     assert (
-        dsa_kernels.run_fused_absorbed_sparse_attention(Config, q, q, starts.view(1, 1, 1), 1.0, 1)
+        dsa_kernels.run_fused_absorbed_sparse_attention(
+            Config, q, q, starts.view(1, 1, 1), 1.0, 1, all_topk_rows_nonempty=True
+        )
         is None
     )
     assert (
@@ -694,8 +835,9 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
         seen["loss_kwargs"] = kwargs
         return expected_topk_loss
 
-    def run_fused_absorbed_sparse_attention(*args):
+    def run_fused_absorbed_sparse_attention(*args, all_topk_rows_nonempty=False):
         seen["sparse_args"] = args
+        seen["all_topk_rows_nonempty"] = all_topk_rows_nonempty
         return expected_sparse
 
     def run_fused_dsa_attention(**kwargs):
@@ -766,11 +908,12 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     topk_length = torch.ones((1, 1), dtype=torch.int32)
     assert (
         dsa_kernels.run_fused_absorbed_sparse_attention(
-            Config, q, k, topk_indices, 1.0, 1, topk_length
+            Config, q, k, topk_indices, 1.0, 1, topk_length, all_topk_rows_nonempty=True
         )
         is expected_sparse
     )
     assert seen["sparse_args"][-1] is topk_length
+    assert seen["all_topk_rows_nonempty"] is True
 
     assert (
         dsa_kernels.run_fused_dsa_attention(
@@ -1819,6 +1962,140 @@ class TestRotateActivation:
             rotate_activation(x)
 
 
+def test_indexer_teacher_probability_matches_full_softmax_oracle():
+    """External mass changes the denominator but not the compressed-key support."""
+    attention_scores = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    valid_mask = torch.ones((1, 2, 2), dtype=torch.bool)
+    non_compressed_lse = torch.tensor([[[0.5, 1.5]]])
+
+    actual = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    expected_denominator = torch.logaddexp(
+        torch.logsumexp(attention_scores, dim=-1), non_compressed_lse
+    )
+    expected = torch.exp(attention_scores - expected_denominator.unsqueeze(-1))
+    torch.testing.assert_close(actual, expected)
+
+    normalized = _normalize_indexer_teacher_target(actual.sum(dim=1), non_compressed_lse)
+    torch.testing.assert_close(normalized.sum(dim=-1), torch.ones((1, 2)))
+
+
+def test_indexer_teacher_probability_rescales_underflowed_external_mass():
+    """A huge external LSE preserves the relative compressed-key teacher target."""
+    attention_scores = torch.tensor([[[[0.0, -1.0]], [[-2.0, 1.0]]]], dtype=torch.float32)
+    valid_mask = torch.ones((1, 1, 2), dtype=torch.bool)
+    non_compressed_lse = torch.tensor([[[1000.0], [1002.0]]], dtype=torch.float32)
+
+    probabilities = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    normalized = _normalize_indexer_teacher_target(probabilities.sum(dim=1), non_compressed_lse)
+
+    scores64 = attention_scores.double()
+    compressed_lse64 = torch.logsumexp(scores64, dim=-1)
+    full_lse64 = torch.logaddexp(non_compressed_lse.double(), compressed_lse64)
+    log_probabilities64 = scores64 - full_lse64.unsqueeze(-1)
+    expected = torch.softmax(torch.logsumexp(log_probabilities64, dim=1), dim=-1).float()
+
+    assert torch.isfinite(probabilities).all()
+    torch.testing.assert_close(normalized.sum(dim=-1), torch.ones((1, 1)))
+    torch.testing.assert_close(normalized, expected)
+
+
+def test_indexer_teacher_probability_keeps_fully_masked_rows_zero():
+    """A fully masked compressed row remains finite and exactly zero."""
+    attention_scores = torch.tensor([[[[1.0, 2.0]]]], requires_grad=True)
+    valid_mask = torch.zeros((1, 1, 2), dtype=torch.bool)
+    non_compressed_lse = torch.full((1, 1, 1), float("-inf"))
+
+    target = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    assert torch.isfinite(target).all()
+    torch.testing.assert_close(target, torch.zeros_like(target))
+
+    normalized = _normalize_indexer_teacher_target(target.sum(dim=1), non_compressed_lse)
+    assert torch.isfinite(normalized).all()
+    torch.testing.assert_close(normalized, torch.zeros_like(normalized))
+    target.sum().backward()
+    assert torch.isfinite(attention_scores.grad).all()
+    torch.testing.assert_close(attention_scores.grad, torch.zeros_like(attention_scores))
+
+
+def test_indexer_teacher_probability_preserves_legacy_path():
+    """Without external mass, probability and target normalization stay unchanged."""
+    attention_scores = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    valid_mask = torch.tensor([[[True, False], [False, False]]])
+    expanded_valid_mask = valid_mask.unsqueeze(1)
+
+    actual = _compute_indexer_teacher_probabilities(attention_scores, valid_mask)
+    expected = masked_softmax(attention_scores.float(), expanded_valid_mask, dim=-1)
+    torch.testing.assert_close(actual, expected)
+
+    actual_normalized = _normalize_indexer_teacher_target(actual.sum(dim=1), None)
+    expected_normalized = dsa_indexer_loss.normalize_indexer_target(expected.sum(dim=1))
+    torch.testing.assert_close(actual_normalized, expected_normalized)
+
+
+def test_indexer_teacher_valid_zero_mass_has_zero_manual_gradient():
+    """A valid row with zero teacher mass has zero manual KL gradient."""
+    q = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+    weights = torch.ones((1, 1, 1), dtype=torch.float32)
+    k = torch.ones((1, 1, 1), dtype=torch.float32)
+    query = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+    key = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+
+    grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        q=q,
+        weights=weights,
+        k=k,
+        query=query,
+        key=key,
+        topk_indices=torch.zeros((1, 1, 1), dtype=torch.long),
+        softmax_scale=1.0,
+        loss_coeff=1.0,
+        sparse_loss=False,
+        mask=torch.zeros((1, 1), dtype=torch.float32),
+        grad_loss=torch.tensor(1.0),
+        pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 1)),
+        non_compressed_lse=torch.full((1, 1, 1), float("inf"), dtype=torch.float32),
+    )
+
+    torch.testing.assert_close(grad_q, torch.zeros_like(grad_q))
+    torch.testing.assert_close(grad_weights, torch.zeros_like(grad_weights))
+    torch.testing.assert_close(grad_k, torch.zeros_like(grad_k))
+
+
+def test_indexer_loss_empty_query_returns_zero_key_gradient():
+    """An empty query batch must not return an empty-shaped key gradient."""
+    q = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    weights = torch.empty((0, 1, 1), dtype=torch.float32)
+    k = torch.ones((3, 1, 2), dtype=torch.float32)
+    query = torch.empty((0, 1, 1, 2), dtype=torch.float32)
+    key = torch.ones((3, 1, 1, 2), dtype=torch.float32)
+
+    grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        q=q,
+        weights=weights,
+        k=k,
+        query=query,
+        key=key,
+        topk_indices=torch.empty((1, 0, 1), dtype=torch.long),
+        softmax_scale=1.0,
+        loss_coeff=1.0,
+        sparse_loss=False,
+        mask=torch.empty((0, 3), dtype=torch.float32),
+        grad_loss=torch.tensor(1.0),
+        pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 1)),
+    )
+
+    assert grad_q.shape == q.shape
+    assert grad_weights.shape == weights.shape
+    assert grad_k.shape == k.shape
+    torch.testing.assert_close(grad_k, torch.zeros_like(k))
+
+
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])
 class TestComputeDSAIndexerLoss:
     """Test compute_dsa_indexer_loss function."""
@@ -2020,6 +2297,11 @@ class TestDSAIndexerLossAutoScaler:
         )
         yield
         Utils.destroy_model_parallel()
+
+    @pytest.fixture(autouse=True)
+    def reset_loss_scale(self):
+        yield
+        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward_pass(self):
@@ -2452,6 +2734,71 @@ class TestDSAIndexer:
         assert self.indexer.index_head_dim == 64
         assert self.indexer.index_topk == 32
         assert self.indexer.k_norm.eps == pytest.approx(1e-6)
+        assert all(not param.requires_grad for param in self.indexer.parameters())
+
+    def test_kpool_projection_precision_and_backward(self, seqlen):
+        self.indexer.cuda()
+        x = torch.randn(seqlen, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        qr = torch.randn(seqlen, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        gate = torch.nn.Parameter(torch.randn(64, 256, device="cuda", dtype=torch.bfloat16))
+        with (
+            patch.object(self.indexer, "index_kpool", 4),
+            patch.object(self.indexer, "index_kpool_compress_gate", gate),
+            patch.object(self.config, "dsa_indexer_rotate_activation", False),
+        ):
+            q, k, weights = self.indexer.forward_before_topk(x, qr)
+            gate_score = self.indexer._kpool_gate_score
+            assert q.dtype == k.dtype == gate_score.dtype == torch.bfloat16
+            torch.testing.assert_close(gate_score, torch.nn.functional.linear(x, gate))
+            (
+                q.float().sum() + k.float().sum() + weights.sum() + gate_score.float().sum()
+            ).backward()
+            assert torch.isfinite(x.grad).all()
+            assert torch.isfinite(qr.grad).all()
+            assert torch.isfinite(gate.grad).all()
+
+    @pytest.mark.parametrize("zero_centered", [False, True])
+    def test_k_norm_fp32_honors_zero_centered_gamma(self, seqlen, zero_centered):
+        """The explicit FP32 LayerNorm path must match TE's zero-centered gamma contract."""
+        del seqlen
+        self.indexer.cuda()
+        x = torch.randn(4, 1, 256, device="cuda", dtype=torch.bfloat16)
+        qr = torch.randn(4, 1, 64, device="cuda", dtype=torch.bfloat16)
+        original_weight = self.indexer.k_norm.weight.detach().clone()
+        original_bias = self.indexer.k_norm.bias.detach().clone()
+        original_fp32 = self.config.dsa_indexer_k_norm_fp32
+        original_zero_centered = self.config.layernorm_zero_centered_gamma
+        original_rotate = self.config.dsa_indexer_rotate_activation
+        try:
+            self.config.dsa_indexer_k_norm_fp32 = True
+            self.config.layernorm_zero_centered_gamma = zero_centered
+            self.config.dsa_indexer_rotate_activation = False
+            with torch.no_grad():
+                # TE stores gamma - 1 when zero-centered gamma is enabled.
+                self.indexer.k_norm.weight.fill_(0.0 if zero_centered else 1.0)
+                self.indexer.k_norm.bias.zero_()
+            with self.indexer._projection_quantization_context():
+                k_linear, _ = self.indexer.linear_wk(x)
+            with patch.object(
+                self.indexer, "_apply_rope", side_effect=lambda value, *args, **kwargs: value
+            ):
+                _, k, _ = self.indexer.forward_before_topk(x, qr)
+            expected = torch.nn.functional.layer_norm(
+                k_linear.float(),
+                (self.indexer.index_head_dim,),
+                torch.ones(self.indexer.index_head_dim, device="cuda"),
+                torch.zeros(self.indexer.index_head_dim, device="cuda"),
+                self.indexer.k_norm.eps,
+            ).to(dtype=k.dtype)
+            torch.testing.assert_close(k, expected)
+            assert torch.count_nonzero(k).item() > 0
+        finally:
+            with torch.no_grad():
+                self.indexer.k_norm.weight.copy_(original_weight)
+                self.indexer.k_norm.bias.copy_(original_bias)
+            self.config.dsa_indexer_k_norm_fp32 = original_fp32
+            self.config.layernorm_zero_centered_gamma = original_zero_centered
+            self.config.dsa_indexer_rotate_activation = original_rotate
 
     @pytest.mark.parametrize("interleaved", [False, True])
     def test_dsa_indexer_rope_interleave_follows_config(self, seqlen, interleaved):
@@ -2539,6 +2886,8 @@ class TestDSAIndexer:
             config.dsa_indexer_rope_interleaved = True
             config.dsa_indexer_k_norm_fp32 = True
             config.dsa_indexer_rotate_activation = False
+            # Keep the indexer projections trainable so parameter gradients are compared.
+            config.dsa_indexer_loss_coeff = 1.0
             submodules = DSAIndexerSubmodules(
                 linear_wq_b=ModuleSpec(module=TELinear),
                 linear_wk=ModuleSpec(module=TELinear),
@@ -2627,6 +2976,44 @@ class TestDSAIndexer:
                 atol=5e-2 * math.sqrt(seqlen),
                 msg=lambda msg: f"gradient mismatch for {name}: {msg}",
             )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_kpool_gate_score_released_after_selection(self, seqlen):
+        """KPool selection must not retain its token-aligned gate activation."""
+        self.indexer.cuda()
+        x = torch.randn(seqlen, 1, self.config.hidden_size, dtype=torch.bfloat16, device="cuda")
+        qr = torch.randn(seqlen, 1, self.config.q_lora_rank, dtype=torch.bfloat16, device="cuda")
+        gate = torch.nn.Parameter(
+            torch.randn(
+                self.indexer.index_head_dim,
+                self.config.hidden_size,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+        )
+        seen_gate = []
+
+        def fake_kpool(*args, **kwargs):
+            del kwargs
+            seen_gate.append(args[5])
+            return (
+                torch.zeros(1, seqlen, seqlen, device="cuda", dtype=torch.float32),
+                torch.zeros(1, seqlen, 8, device="cuda", dtype=torch.long),
+            )
+
+        with (
+            patch.object(self.indexer, "index_kpool", 4),
+            patch.object(self.indexer, "index_topk", 8),
+            patch.object(self.indexer, "index_kpool_compress_gate", gate),
+            patch(
+                "megatron.core.transformer.experimental_attention_variant.dsa.fused_qk_topk_kpool",
+                side_effect=fake_kpool,
+            ),
+        ):
+            self.indexer.forward_with_scores(x, qr)
+
+        assert seen_gate and seen_gate[0] is not None
+        assert self.indexer._kpool_gate_score is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_forward_with_scores(self, seqlen):
@@ -2888,6 +3275,79 @@ class TestDSAttention:
 
         assert output is expected_output
         assert seen["loss_coeff"] == 0.0
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize(
+        ("attn_mask_type", "with_attention_mask"),
+        [(AttnMaskType.causal, False), (AttnMaskType.causal, True), (None, True)],
+        ids=["causal-no-tensor", "causal-with-tensor", "explicit-empty-row"],
+    )
+    def test_split_attention_certifies_normalized_mask(
+        self, monkeypatch, attn_mask_type, with_attention_mask
+    ):
+        """Split attention certifies effective causal masks and preserves explicit empty rows."""
+        seq_len = 4
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        latent_dim = self.config.kv_lora_rank
+        head_dim = latent_dim + self.config.qk_pos_emb_head_dim
+        attention_mask = None
+        if with_attention_mask:
+            attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool).triu(1)
+            if attn_mask_type is None:
+                attention_mask[:, :, 0, :] = True
+        seen = {}
+
+        def fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            return (
+                torch.ones(seq_len, batch_size, 2, 4),
+                torch.ones(seq_len, batch_size, 4),
+                torch.ones(seq_len, batch_size, 2),
+            )
+
+        def decline_full_attention(**_kwargs):
+            seen["full_attention_declined"] = True
+            return None
+
+        def fake_sparse_attention(_config, query, _key, topk_indices, _scale, v_channels, **kwargs):
+            seen["certificate"] = kwargs["all_topk_rows_nonempty"]
+            seen["first_row_topk"] = topk_indices[:, 0, :]
+            return query.new_zeros((seq_len, batch_size, num_heads, v_channels))
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", fake_forward_before_topk
+        )
+        monkeypatch.setattr(dsa_kernels, "run_fused_dsa_attention", decline_full_attention)
+        monkeypatch.setattr(dsa_kernels, "run_fused_qk_topk", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            dsa_kernels, "run_fused_absorbed_sparse_attention", fake_sparse_attention
+        )
+
+        was_training = self.sparse_attention.training
+        self.sparse_attention.eval()
+        try:
+            output = self.sparse_attention(
+                query=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                key=torch.randn(seq_len, batch_size, 1, head_dim),
+                value=None,
+                up_v_weight=torch.randn(num_heads, self.config.v_head_dim, latent_dim),
+                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                attention_mask=attention_mask,
+                attn_mask_type=attn_mask_type,
+            )
+        finally:
+            self.sparse_attention.train(was_training)
+
+        assert output.shape == (seq_len, batch_size, num_heads * self.config.v_head_dim)
+        assert seen["full_attention_declined"]
+        assert seen["certificate"] is (attn_mask_type == AttnMaskType.causal)
+        if attn_mask_type is None:
+            assert torch.all(seen["first_row_topk"] == -1)
+        else:
+            assert torch.any(seen["first_row_topk"] == 0)
 
     def test_packed_dense_indexer_loss_uses_local_varlen_on_fused_path(self, monkeypatch):
         """Packed dense indexer loss should keep local varlen and be owned by the backend."""
@@ -3542,6 +4002,7 @@ class TestIndexerTensorParallel:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            dsa_indexer_loss_coeff=1.0,
         )
 
     def _create_indexer(self, config, pg_collection):

@@ -94,6 +94,11 @@ def get_elastic_buffer(
     """Get or create a DeepEP v2 elastic buffer for all-to-all communication."""
     global _elastic_buffer
 
+    if _elastic_buffer is None or _elastic_buffer.group != group:
+        # Initialize the NCCL communicator before DeepEP reads _comm_ptr() in
+        # get_buffer_size_hint(); a fresh group's pointer may still be null.
+        torch.distributed.all_reduce(torch.zeros(1, device="cuda"), group=group)
+
     num_bytes = ElasticBuffer.get_buffer_size_hint(
         group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
     )
@@ -110,6 +115,7 @@ def get_elastic_buffer(
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             hidden=hidden,
             num_topk=num_topk,
+            deterministic=True,
         )
     return _elastic_buffer
 
@@ -365,14 +371,17 @@ class DeepepV2Dispatch(torch.autograd.Function):
         ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
     ):
         """Backward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # Queue input conversions before recording the event that DeepEP waits on.
+        grad_output = grad_output.contiguous()
+        grad_token_probs = grad_token_probs.float()
         # The backward pass of dispatch is a combine over the dispatch handle.
         previous_event = (
             ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
         )
         grad_x, grad_token_probs, event = ctx.buffer.combine(
-            grad_output.contiguous(),
+            grad_output,
             handle=ctx.handle,
-            topk_weights=grad_token_probs.float(),
+            topk_weights=grad_token_probs,
             num_sms=ctx.num_sms,
             previous_event=previous_event,
             async_with_compute_stream=ctx.async_finish,
@@ -411,11 +420,13 @@ class DeepepV2Combine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, grad_combined_token_probs):
         """Backward pass of DeepEP v2 elastic combine."""
+        # The communication stream must wait for the contiguous copy as well.
+        grad_output = grad_output.contiguous()
         previous_event = (
             ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
         )
         grad_x, _, _, _, event = ctx.buffer.dispatch(
-            grad_output.contiguous(),
+            grad_output,
             handle=ctx.handle,
             num_sms=ctx.num_sms,
             previous_event=previous_event,
@@ -584,6 +595,10 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     if num_sms_preprocessing_api is not None:
         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
+    # HybridEP's custom allgather gives up after ~20 s if a rank is late and continues with that
+    # rank's routing rows from the previous dispatch, silently corrupting it. Use NCCL instead.
+    if 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters:
+        kwargs['enable_custom_allgather'] = False
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -908,10 +923,13 @@ def ensure_nccl_ep_bootstrapped(
         num_experts (int): Total experts across ``ep_group`` (global, not per-rank).
         max_tokens_per_rank (int): Upper bound on local input tokens per forward. Must be
             even (NCCL EP requires ``num_tokens_per_rank * inner_dim % 4 == 0``).
-        recv_capacity_per_rank (int): Per-rank receive-buffer capacity in tokens. Must be
-            ``>= max_tokens_per_rank``; runtime overflow hard-traps (no soft drop).
+        recv_capacity_per_rank (int, optional): Per-rank receive-buffer capacity in tokens. Must
+            be ``>= max_tokens_per_rank``. ``None`` selects eager mode, where TE sizes the
+            receive buffer per step from the actual received-token count.
         hidden_dim (int): Token hidden size.
         num_topk (int): Per-token top-k over ``ep_group``; sizes NCCL EP's internal buffers.
+            This is the same TP-scaled top-k used for the receive-capacity budget, not the
+            raw ``moe_router_topk``.
         num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
     """
     if not HAVE_TE_EP:
@@ -919,7 +937,7 @@ def ensure_nccl_ep_bootstrapped(
             "transformer_engine.pytorch.ep is unavailable. The 'ncclep' flex dispatcher backend "
             "requires a TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
         )
-    if te_ep._BOOTSTRAPPED:  # reuse TE's own one-time guard; no parallel state to drift
+    if is_nccl_ep_bootstrapped():  # reuse TE's own one-time guard; no parallel state to drift
         return
     te_ep.ep_bootstrap(
         ep_group,
@@ -930,7 +948,17 @@ def ensure_nccl_ep_bootstrapped(
         num_topk=num_topk,
         max_num_sms=num_sms,
         zero_copy=zero_copy,
+        drop_on_overflow=recv_capacity_per_rank is not None,
     )
+
+
+def is_nccl_ep_bootstrapped() -> bool:
+    """Whether TE's process-wide NCCL EP context is live. is_ep_bootstrapped is TE 3321."""
+    if not HAVE_TE_EP:
+        return False
+    if hasattr(te_ep, "is_ep_bootstrapped"):
+        return te_ep.is_ep_bootstrapped()
+    return te_ep._BOOTSTRAPPED
 
 
 def nccl_ep_finalize():
@@ -945,6 +973,17 @@ def nccl_ep_finalize():
 
 if HAVE_TE_EP:
 
+    def alloc_ep_symm_buffer(shape, dtype, ep_group):
+        """Allocate one persistent NCCL symm-mem buffer (per-buffer collective rendezvous). mcore's
+        zero-copy buffers are all persistent and non-pool; the symm mem-pool is used only by TE for
+        the per-call recv buffers it recycles."""
+        return te_ep.symm_mem_alloc(shape, dtype, ep_group)
+
+    # Whether this TE build supports quantized EP dispatch/combine payloads.
+    _TE_EP_BUFFER_HAS_QUANT_RECIPE = (
+        "dispatch_fwd_quant_recipe" in inspect.signature(te_ep.EpBuffer).parameters
+    )
+
     def new_nccl_ep_buffer(
         top_k,
         max_tokens_per_rank,
@@ -952,12 +991,31 @@ if HAVE_TE_EP:
         hidden_dim,
         num_local_experts,
         alignment=0,
+        dispatch_fwd_quant_recipe=None,
+        combine_bwd_quant_recipe=None,
     ):
         """Build a fresh TE EpBuffer for one dispatch/combine pair.
 
-        The buffer owns handle_mem (the routing table dispatch writes and combine reads) and
-        the receive buffers; a new one is built per dispatch and dropped after combine.
+        The buffer owns handle_mem (the routing table dispatch writes and combine reads); a new one
+        is built per dispatch and dropped after combine. Payload symm buffers are not owned here —
+        they are caller-supplied to dispatch/combine or allocated on the fly by TE.
+
+        dispatch_fwd_quant_recipe / combine_bwd_quant_recipe (TE Recipe, optional): quantize the
+        dispatch forward payload / combine backward gradient over the wire,
+        the corresponding output is returned as a per-expert GroupedTensor.
         """
+        quant_kwargs = {}
+        if dispatch_fwd_quant_recipe is not None or combine_bwd_quant_recipe is not None:
+            if not _TE_EP_BUFFER_HAS_QUANT_RECIPE:
+                raise RuntimeError(
+                    "Quantized NCCL EP dispatch/combine payloads require a TransformerEngine "
+                    "build with EpBuffer quant-recipe support "
+                    "(dispatch_fwd_quant_recipe / combine_bwd_quant_recipe)."
+                )
+            quant_kwargs = dict(
+                dispatch_fwd_quant_recipe=dispatch_fwd_quant_recipe,
+                combine_bwd_quant_recipe=combine_bwd_quant_recipe,
+            )
         return te_ep.EpBuffer(
             top_k=top_k,
             max_tokens_per_rank=max_tokens_per_rank,
@@ -965,9 +1023,12 @@ if HAVE_TE_EP:
             hidden_dim=hidden_dim,
             num_local_experts=num_local_experts,
             alignment=alignment,
+            **quant_kwargs,
         )
 
-    def nccl_ep_dispatch(buffer, tokens, topk_idx, topk_weights):
+    def nccl_ep_dispatch(
+        buffer, tokens, topk_idx, topk_weights, recv_tokens=None, recv_topk_weights=None
+    ):
         """Autograd-aware prepare + dispatch via TransformerEngine NCCL EP.
 
         Args:
@@ -977,41 +1038,56 @@ if HAVE_TE_EP:
             topk_idx (torch.Tensor): ``int64`` ``[num_local_tokens, top_k]`` global expert
                 ids per token.
             topk_weights (torch.Tensor): ``float32`` ``[num_local_tokens, top_k]`` weights.
+            recv_tokens, recv_topk_weights (torch.Tensor, optional): caller-owned symm dispatch
+                recv buffers (fp8 zero-copy). Left None, TE allocates them (bf16 zero-copy: symm
+                mem-pool; normal: plain).
 
         Returns:
             tuple: ``(recv_tokens, tokens_per_expert, dispatched_probs)``:
-              * ``recv_tokens``: packed received tokens ``[recv_capacity_per_rank, hidden]``,
-                grouped by local expert (no separate compaction step).
-              * ``tokens_per_expert``: ``int32`` ``[num_local_experts]`` device tensor of
+              * ``recv_tokens``: packed received tokens ``[recv_rows, hidden]``, grouped by local
+                expert (no separate compaction step). ``recv_rows`` is
+                ``recv_capacity_per_rank``, or this step's received-token count in eager mode.
+              * ``tokens_per_expert``: ``int64`` ``[num_local_experts]`` device tensor of
                 received counts per local expert (feeds grouped GEMM as group sizes;
                 alignment-padded, == actual when ``alignment=0``).
-              * ``dispatched_probs``: ``float32`` ``[recv_capacity_per_rank]`` per-slot
+              * ``dispatched_probs``: ``float32`` ``[recv_rows]`` per-slot
                 weights; apply them in the expert MLP (combine is called unweighted).
 
             ``tokens_per_expert`` is non-differentiable.
         """
         recv_tokens, dispatched_probs, tokens_per_expert = te_ep.ep_dispatch(
-            buffer, tokens, topk_idx, topk_weights
+            buffer,
+            tokens,
+            topk_idx,
+            topk_weights,
+            recv_tokens=recv_tokens,
+            recv_topk_weights=recv_topk_weights,
         )
         return recv_tokens, tokens_per_expert, dispatched_probs
 
-    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None):
+    def nccl_ep_combine(buffer, expert_out, num_local_tokens=None, grad_out=None):
         """Autograd-aware combine via TransformerEngine NCCL EP (no scatter step).
 
         Args:
             buffer (te_ep.EpBuffer): The TE EP buffer for this combine.
-            expert_out (torch.Tensor): Expert outputs ``[recv_capacity_per_rank, hidden]``,
-                already weighted.
+            expert_out (torch.Tensor): Expert outputs ``[recv_rows, hidden]`` (the row count
+                ``nccl_ep_dispatch`` returned), already weighted.
             num_local_tokens (int): Rows of the result (local token count for this
                 forward). When None, TE uses ``buffer.max_tokens_per_rank``.
+            grad_out (torch.Tensor, optional): caller-owned symm buffer the backward scatters the
+                expert_out grad into (zero-copy). Left None, TE allocates it (bf16: symm mem-pool;
+                normal: plain).
 
         Returns:
             torch.Tensor: ``[num_local_tokens, hidden]`` combined output, in local token
             order.
         """
-        return te_ep.ep_combine(buffer, expert_out, num_local_tokens=num_local_tokens)
+        return te_ep.ep_combine(
+            buffer, expert_out, num_local_tokens=num_local_tokens, grad_out=grad_out
+        )
 
 else:
+    alloc_ep_symm_buffer = None
     new_nccl_ep_buffer = None
     nccl_ep_dispatch = None
     nccl_ep_combine = None

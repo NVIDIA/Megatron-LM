@@ -22,6 +22,7 @@ except ImportError:
     _SymmetricMemory = MagicMock()
 
 from .barrier import symm_mem_sync
+from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_128, st_128
 from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
 
@@ -58,7 +59,7 @@ def _ag_phase(
             + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
-        (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+        x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
         st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
@@ -75,8 +76,24 @@ def _multimem_all_gather_kernel(
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    BARRIER_BEFORE: tl.constexpr,
 ):
     """Single-tensor multicast all-gather kernel."""
+    if BARRIER_BEFORE:
+        # Ensure every rank has finished reading the previous contents before
+        # this all-gather reuses the symmetric buffer. The usual RS -> AG
+        # sequence gets this ordering from the reduce-scatter; consecutive AGs
+        # must request it explicitly.
+        symm_mem_sync(
+            signal_pad_ptrs,
+            None,
+            RANK,
+            WORLD_SIZE,
+            hasPreviousMemAccess=True,
+            hasSubsequentMemAccess=True,
+        )
+        sync_threads()
+
     _ag_phase(
         local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
     )
@@ -198,7 +215,7 @@ def _multimem_reduce_scatter_kernel(
             multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
-        (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
+        x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
         st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
@@ -206,7 +223,14 @@ def _multimem_reduce_scatter_kernel(
 
 # ── Python wrappers ─────────────────────────────────────────────────────────
 
-_DEFAULT_KERNEL_CONFIG = {"max_num_blocks": 128, "num_warps": 32, "BLOCK_SIZE": 1024}
+# Do not autotune BLOCK_SIZE or the number of blocks with Triton. The grid is derived from
+# BLOCK_SIZE, and every rank must launch the same grid of at most max_num_blocks blocks, or
+# the barrier overflows the signal pad or hangs. See kernel_config.py.
+_DEFAULT_KERNEL_CONFIG = {
+    "max_num_blocks": SYMM_MEM_KERNEL_CONFIG.max_num_blocks,
+    "num_warps": SYMM_MEM_KERNEL_CONFIG.max_block_size // SYMM_MEM_KERNEL_CONFIG.warp_size,
+    "BLOCK_SIZE": SYMM_MEM_KERNEL_CONFIG.max_block_size,
+}
 
 
 def _kernel_launch_config(element_size: int, max_numel: int, world_size: int, **kwargs):
@@ -224,6 +248,7 @@ def _kernel_launch_config(element_size: int, max_numel: int, world_size: int, **
     numel_per_thread = 128 // (element_size * 8)
     num_threads = triton.cdiv(max_numel // numel_per_thread, world_size)
     num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
     return numel_per_thread, num_blocks, config
 
 
@@ -232,12 +257,19 @@ def multimem_all_gather(
     input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
     byte_offset: int = 0,
+    barrier_before: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     """
     Multicast all-gather for a single tensor.
     Output tensor must be a symmetric memory buffer.
     Input tensor can be a regular torch tensor.
+
+    ``barrier_before`` inserts a pre-all-gather barrier so every rank has finished
+    reading the buffer's previous contents before this all-gather overwrites them.
+    It must be set by the caller whenever this all-gather directly follows another
+    all-gather on the same symmetric buffer with no reduce-scatter in between (a
+    reduce-scatter already establishes that ordering inside its own kernel).
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
     assert are_tensors_nvls_eligible(
@@ -261,6 +293,7 @@ def multimem_all_gather(
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
+        BARRIER_BEFORE=barrier_before,
         num_warps=config["num_warps"],
     )
 

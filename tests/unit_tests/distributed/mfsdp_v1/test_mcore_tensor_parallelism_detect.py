@@ -1,9 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
+import pytest
 import torch
 from torch import nn
 
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
@@ -87,6 +88,14 @@ def test_safe_get_rank_should_fall_back_to_rank_env_if_distributed_is_not_initia
     assert safe_get_rank() == 7
 
 
+def test_safe_get_rank_should_raise_value_error_if_rank_env_is_invalid(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setenv("RANK", "not-an-int")
+
+    with pytest.raises(ValueError):
+        safe_get_rank()
+
+
 class DummyConfig:
     # Just enough attributes for __init__ to run if needed in future tests.
     gradient_accumulation_fusion = False
@@ -114,10 +123,10 @@ def _make_fsdp_for_unit_tests():
     and only setting the attributes that _detect_parallelism_type
     and _annotate_tensor_parallelism actually use.
     """
-    fsdp = FullyShardedDataParallel.__new__(FullyShardedDataParallel)
+    fsdp = FullyShardedDataParallelV1.__new__(FullyShardedDataParallelV1)
 
     # Copy the registry from the real class.
-    fsdp._MODULE_TYPE_REGISTRY = FullyShardedDataParallel._MODULE_TYPE_REGISTRY
+    fsdp._MODULE_TYPE_REGISTRY = FullyShardedDataParallelV1._MODULE_TYPE_REGISTRY
 
     return fsdp
 

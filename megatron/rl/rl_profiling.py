@@ -53,7 +53,8 @@ RL_LOGGABLE_TIMER_NAMES = [
     # Rollout collection breakdown
     "rl/inference-setup",
     "rl/collect-rollouts",
-    "rl/sync-rollouts",
+    "rl/sync-rollout-state",
+    "rl/sync-request-ledger",
     "rl/suspend-engine",
     # Optimizer offload/restore
     "rl/offload-optimizer-before-inference",
@@ -116,7 +117,7 @@ TIMER_HIERARCHY = {
     "rl/rollout-collection": [
         "rl/inference-setup",
         "rl/collect-rollouts",
-        "rl/sync-rollouts",
+        "rl/sync-rollout-state",
         "rl/suspend-engine",
         "rl/offload-optimizer-before-inference",
         "rl/restore-optimizer-after-inference",
@@ -535,7 +536,7 @@ class RLProfiler:
         phases["training"] = get_max("forward-backward")
 
         # Wait/sync time (proxy for load imbalance)
-        phases["sync_wait"] = get_max("rl/suspend-engine") + get_max("rl/sync-rollouts")
+        phases["sync_wait"] = get_max("rl/suspend-engine") + get_max("rl/sync-rollout-state")
 
         return phases
 
@@ -677,6 +678,32 @@ def initialize_rl_profiler(
     global _RL_PROFILER
     _RL_PROFILER = RLProfiler(output_dir=output_dir, run_id=run_id, enabled=enabled, **kwargs)
     return _RL_PROFILER
+
+
+def maybe_initialize_rl_profiler(
+    rl_config, save_dir: Optional[str], *, log_to_wandb: bool, log_to_tensorboard: bool
+) -> Optional[str]:
+    """Start the profiler when ``--rl-profile`` is set; returns its output directory, else None.
+
+    Profiles go under ``--rl-profile-dir``, else ``<save_dir>/profiles``, else ``./profiles``; the
+    run id is the SLURM job id or a timestamp.
+    """
+    if not rl_config.rl_profile:
+        return None
+    profile_dir = rl_config.rl_profile_dir
+    if profile_dir is None:
+        profile_dir = os.path.join(save_dir, 'profiles') if save_dir else './profiles'
+    run_id = os.getenv("SLURM_JOB_ID", None)
+    if run_id is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    initialize_rl_profiler(
+        output_dir=profile_dir,
+        run_id=run_id,
+        enabled=True,
+        log_to_wandb=log_to_wandb,
+        log_to_tensorboard=log_to_tensorboard,
+    )
+    return profile_dir
 
 
 def log_iteration_profile(
@@ -843,7 +870,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         ],
         "Logprobs Computation": ["rl/compute-old-logprobs", "rl/compute-ref-logprobs"],
         "Training": ["forward-backward"],
-        "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollouts"],
+        "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollout-state"],
     }
 
     for phase_name, timer_list in phases.items():

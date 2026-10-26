@@ -21,13 +21,15 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    initialize_runtime_services,
     set_args,
-    set_global_variables,
+    set_run_config,
 )
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
@@ -63,6 +65,7 @@ except (ImportError, AttributeError):
 
 pytestmark = [
     pytest.mark.internal,
+    pytest.mark.launch_on_gb200,
     pytest.mark.skipif(
         not is_te_min_version("2.14.0"),
         reason="moe_single_grouped_weight requires Transformer Engine >= 2.14.0",
@@ -197,6 +200,7 @@ class TestMoESingleGroupedWeightNumerics:
         args.overlap_grad_reduce = overlap_grad_reduce
         args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         args.ddp_bucket_size = 40960
+        args.save_tokenizer_assets = False
 
         args.num_experts = 2
         args.moe_layer_freq = 1
@@ -224,7 +228,13 @@ class TestMoESingleGroupedWeightNumerics:
             raise ValueError(f"Unknown precision test case: {precision}")
 
         validate_args(args)
-        set_global_variables(args, False)
+        set_args(args)
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use config; remaining settings still use legacy args.
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.finalize()
+        set_run_config(cfg)
+        initialize_runtime_services(args, build_tokenizer=False, training=True)
         return args
 
     def get_batch(self):
@@ -520,7 +530,9 @@ class TestMoESingleGroupedWeightNumerics:
         args, model, optimizer, opt_param_scheduler, batch = self.setup_mxfp8_overlap_case(
             single_weight=load_single_weight, checkpoint_dir=checkpoint_dir
         )
-        loaded_iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+        loaded_iteration, _ = load_checkpoint(
+            model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
+        )
         assert loaded_iteration == 2
         return self.run_one_mxfp8_overlap_train_step(args, model, optimizer, batch)
 
@@ -720,7 +732,22 @@ class TestMoESingleGroupedWeightNumerics:
             use_transformer_engine_op_fuser=True,
         )
 
-    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
+    @pytest.mark.parametrize(
+        "precision",
+        [
+            "bf16",
+            "mxfp8",
+            pytest.param(
+                "nvfp4",
+                marks=pytest.mark.skip(
+                    reason=(
+                        "NVFP4 single grouped weights without FP4 parameter gather use a "
+                        "TransformerEngine split-quantize fallback that is being deprecated; "
+                    )
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
     def test_single_grouped_weight_parity_without_primary_param_gather(
         self, precision, gradient_accumulation_fusion

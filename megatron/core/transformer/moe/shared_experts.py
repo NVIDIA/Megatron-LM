@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import warnings
 from copy import deepcopy
 from enum import Enum
@@ -9,9 +10,12 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from megatron.core.activations import situlu
+from megatron.core.activations import situ_glu, situlu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -126,8 +130,13 @@ class SharedExpertMLP(MLP):
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
-        # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            tp_group=pg_collection.tp,
+            name=name,
+            pg_collection=pg_collection,
+        )
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -300,27 +309,44 @@ class SharedExpertMLP(MLP):
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
                         clamp_value=self.config.activation_func_clamp_value,
+                        gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                        linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
             else:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
+                tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
                 if self.config.gated_linear_unit:
-
-                    def glu(x):
-                        if self.config.activation_func is situlu:
-                            return situlu(x, self.config.situ_glu_beta1, self.config.situ_glu_beta2)
-                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
-                        if (val := self.config.activation_func_clamp_value) is not None:
-                            x_glu = x_glu.clamp(min=None, max=val)
-                            x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (
-                            x_linear + self.config.glu_linear_offset
+                    if tanh_clamp_scale is not None:
+                        intermediate_parallel = situ_glu(
+                            intermediate_parallel,
+                            tanh_clamp_scale,
+                            self.config.activation_func_tanh_clamp_scale_linear,
+                            self.config.glu_linear_offset,
                         )
+                    else:
 
-                    intermediate_parallel = glu(intermediate_parallel)
+                        def glu(x):
+                            if self.config.activation_func is situlu:
+                                return situlu(
+                                    x, self.config.situ_glu_beta1, self.config.situ_glu_beta2
+                                )
+                            x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                            if (val := self.config.activation_func_clamp_value) is not None:
+                                x_glu = x_glu.clamp(min=None, max=val)
+                                x_linear = x_linear.clamp(min=-val, max=val)
+                            return self.config.activation_func(x_glu) * (
+                                x_linear + self.config.glu_linear_offset
+                            )
+
+                        intermediate_parallel = glu(intermediate_parallel)
                 else:
+                    if tanh_clamp_scale is not None:
+                        intermediate_parallel = tanh_soft_clamp(
+                            intermediate_parallel, tanh_clamp_scale
+                        )
                     intermediate_parallel = self.activation_func(intermediate_parallel)
 
             self.cached_fc2_input = intermediate_parallel
@@ -408,7 +434,14 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         )
         self._fused_grouped_swiglu_ops = None
         self._fused_grouped_swiglu_recipe = None
+        self._fused_grouped_swiglu_unit_scale = None
+        self._fused_grouped_swiglu_tokens_per_expert = {}
         self._validate_fused_grouped_swiglu()
+        # Older TE versions use the legacy environment variable to enable fusion.
+        # Cache API support here to keep signature inspection out of forward.
+        self._grouped_linear_kwargs = {}
+        if "split_alignment" in inspect.signature(te.pytorch.ops.GroupedLinear).parameters:
+            self._grouped_linear_kwargs["split_alignment"] = TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
 
     def _validate_fused_grouped_swiglu(self) -> None:
         """Validate the requested GroupedLinear(num_groups=1) SwiGLU path."""
@@ -438,6 +471,15 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             raise RuntimeError(
                 f"{self.__class__.__name__} requires Transformer Engine with "
                 "pytorch.ops.ScaledSiTUGLU for SiTU-GLU."
+            )
+        if self.config.activation_func_clamp_value is not None and (
+            not is_te_min_version("2.17.0.dev0")
+            or not hasattr(te.pytorch.ops, "ScaledClampedQGeGLU")
+        ):
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine >= 2.17.0.dev0 "
+                "with pytorch.ops.ScaledClampedQGeGLU when "
+                "activation_func_clamp_value is set."
             )
         if self.config.moe_shared_expert_glu_interleave_size is None:
             raise ValueError(
@@ -475,7 +517,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         return self._fused_grouped_swiglu_recipe
 
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
-        """Construct GroupedLinear(num_groups=1) -> ScaledSwiGLU -> GroupedLinear."""
+        """Construct the grouped-linear shared-expert MLP operations."""
         ops = te.pytorch.ops.Sequential()
         tp_world_size = get_pg_size(self.tp_group)
         rng_state_tracker_function = None
@@ -493,21 +535,33 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             bias=False,
             rng_state_tracker_function=rng_state_tracker_function,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+            **self._grouped_linear_kwargs,
         )
         op.weight0 = fc1_weight
         op._glu_interleave_size = glu_interleave_size
         ops.append(op)
 
+        clamp_value = self.config.activation_func_clamp_value
         if self.config.activation_func is situlu:
-            ops.append(
-                te.pytorch.ops.ScaledSiTUGLU(
-                    glu_interleave_size=glu_interleave_size,
-                    beta1=self.config.situ_glu_beta1,
-                    beta2=self.config.situ_glu_beta2,
-                )
+            activation_op = te.pytorch.ops.ScaledSiTUGLU(
+                glu_interleave_size=glu_interleave_size,
+                beta1=self.config.situ_glu_beta1,
+                beta2=self.config.situ_glu_beta2,
             )
+        elif clamp_value is None:
+            activation_op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
         else:
-            ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
+            activation_op = te.pytorch.ops.ScaledClampedQGeGLU(
+                glu_interleave_size=glu_interleave_size,
+                alpha=1.0,
+                limit=clamp_value,
+                glu_linear_offset=0.0,
+            )
+        # Shared experts are not router-gated. Mark this fused-op instance so
+        # TE can omit the optional forward cuDNN probability tensor without
+        # changing the semantics of routed single-group MLPs.
+        activation_op._grouped_mlp_unit_activation_scale = True
+        ops.append(activation_op)
 
         fc2_weight = self.linear_fc2.weight
         op = te.pytorch.ops.GroupedLinear(
@@ -519,6 +573,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             bias=False,
             rng_state_tracker_function=rng_state_tracker_function,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+            **self._grouped_linear_kwargs,
         )
         op.weight0 = fc2_weight
         ops.append(op)
@@ -545,10 +600,28 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         hidden_size = hidden_states.size(-1)
         hidden_states_2d = hidden_states.view(-1, hidden_size)
         total_tokens = hidden_states_2d.size(0)
-        tokens_per_expert = torch.full(
-            (1,), total_tokens, dtype=torch.long, device=hidden_states.device
-        )
-        scales = torch.ones(total_tokens, device=hidden_states.device, dtype=hidden_states.dtype)
+        if total_tokens % TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT != 0:
+            raise ValueError(
+                f"{self.__class__.__name__} requires the token count after tensor-parallel "
+                f"communication to be divisible by {TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}, "
+                f"but got {total_tokens}. "
+                f"split_alignment={TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT} does not pad the input."
+            )
+        tokens_key = (hidden_states.device, total_tokens)
+        tokens_per_expert = self._fused_grouped_swiglu_tokens_per_expert.get(tokens_key)
+        if tokens_per_expert is None:
+            tokens_per_expert = torch.tensor(
+                [total_tokens], dtype=torch.long, device=hidden_states.device
+            )
+            self._fused_grouped_swiglu_tokens_per_expert[tokens_key] = tokens_per_expert
+        scales = self._fused_grouped_swiglu_unit_scale
+        if (
+            scales is None
+            or scales.device != hidden_states.device
+            or scales.dtype != hidden_states.dtype
+        ):
+            scales = torch.ones(1, device=hidden_states.device, dtype=hidden_states.dtype)
+            self._fused_grouped_swiglu_unit_scale = scales
 
         recipe = self._get_fused_grouped_swiglu_recipe()
         if self._fused_grouped_swiglu_ops is None:

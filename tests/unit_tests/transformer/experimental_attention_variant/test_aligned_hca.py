@@ -53,7 +53,8 @@ def test_optional_api_import_and_cache(missing_api):
 
 
 @pytest.mark.parametrize("cp_rank,cp_size", [(None, 16), (0, 4), (7, 8), (15, 16)])
-def test_backward_dispatch_and_strides(cp_rank, cp_size):
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_backward_dispatch_and_strides(cp_rank, cp_size, deterministic):
     """Autograd routes gradients and passes contiguous inputs to aligned HCA."""
     q = torch.randn(3, 2, 8, device="cpu")[..., ::2].requires_grad_()
     kv = torch.randn(5, 8, device="cpu")[:, ::2].requires_grad_()
@@ -70,11 +71,26 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size):
     stock.sparse_attention_backward_wrapper.return_value = grads
     with (
         patch.object(sparse, "_csa_fwd_flash_mla", return_value=(out, lse, None)),
+        patch.object(sparse, "get_flash_mla_topk_alignment", return_value=64),
         patch.object(sparse, "_DSA", stock),
+        patch.object(
+            sparse,
+            "_deterministic_sparse_bwd_kwargs",
+            return_value={"deterministic": deterministic},
+        ) as deterministic_kwargs,
         patch.object(hca, "_get_aligned_hca_backward", return_value=(Mock(), aligned)) as loader,
     ):
         result = sparse.csa_sparse_attn(
-            q, kv, sink, topk, 0.125, is_thd=True, hca_cp_rank=cp_rank, hca_cp_size=cp_size
+            q,
+            kv,
+            sink,
+            topk,
+            0.125,
+            is_thd=True,
+            deterministic=deterministic,
+            cuda_graph=deterministic,
+            hca_cp_rank=cp_rank,
+            hca_cp_size=cp_size,
         )
         torch.testing.assert_close(result, out.reshape(3, -1))
         result.backward(dout.reshape_as(result))
@@ -84,7 +100,15 @@ def test_backward_dispatch_and_strides(cp_rank, cp_size):
         loader.assert_not_called()
         aligned.assert_not_called()
         stock.sparse_attention_backward_wrapper.assert_called_once()
+        assert (
+            stock.sparse_attention_backward_wrapper.call_args.kwargs["deterministic"]
+            is deterministic
+        )
+        assert deterministic_kwargs.call_args.kwargs == dict(
+            requested=deterministic, cuda_graph=deterministic
+        )
     else:
+        deterministic_kwargs.assert_not_called()
         stock.sparse_attention_backward_wrapper.assert_not_called()
         aligned.assert_called_once()
         assert aligned.call_args.kwargs == dict(
@@ -124,6 +148,80 @@ def _select(q, kv, params, group, **kwargs):
     options = dict(window_size=128, compress_ratio=128, boundary_rows=128)
     options.update(kwargs)
     return hca.aligned_hca_cp_rank(q, kv, params, group, **options)
+
+
+@pytest.mark.parametrize(
+    "boundaries,expected",
+    [([0, 65536, 65536], True), ([0, 32768, 65536], False), ([0, 0, 65536], False)],
+)
+def test_prepared_packing_avoids_repeated_readback(boundaries, expected):
+    """Batch preparation supplies the same verdict to every eager layer."""
+    cu = torch.tensor(boundaries, device="cpu", dtype=torch.int32)
+    params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, max_seqlen_q=65536)
+    hca.prepare_aligned_hca_metadata(params)
+    with patch.object(torch.Tensor, "item", side_effect=AssertionError("repeated readback")):
+        for _ in range(15):
+            assert hca._is_single_sequence(params, cu, 65536) is expected
+
+
+def test_prepared_packing_invalidates_on_changes():
+    """Tensor writes, replacements and different lengths cannot reuse a stale verdict."""
+    cu = torch.tensor([0, 65536, 65536], device="cpu", dtype=torch.int32)
+    params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, max_seqlen_q=65536)
+    hca.prepare_aligned_hca_metadata(params)
+    assert not hca._is_single_sequence(params, cu, 32768)
+    replacement = torch.tensor([0, 32768, 65536], device="cpu", dtype=torch.int32)
+    assert not hca._is_single_sequence(params, replacement, 65536)
+    cu[1] = 32768
+    assert not hca._is_single_sequence(params, cu, 65536)
+    hca.prepare_aligned_hca_metadata(params)
+    cu[1] = 65536
+    assert hca._is_single_sequence(params, cu, 65536)
+
+
+def test_prepared_packing_without_version_counter():
+    """Inference tensors retain live validation when mutation tracking is unavailable."""
+    with torch.inference_mode():
+        cu = torch.tensor([0, 65536, 65536], device="cpu", dtype=torch.int32)
+        params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, max_seqlen_q=65536)
+        hca.prepare_aligned_hca_metadata(params)
+        assert hca._is_single_sequence(params, cu, 65536)
+        cu[1] = 32768
+        assert not hca._is_single_sequence(params, cu, 65536)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_capture_unsupported_backend_does_not_assert():
+    """A backend that declines HCA must not record an HCA-only graph assertion."""
+    q, kv, params, group = _metadata()
+    params.cu_seqlens_q_padded[1] = 32768
+    api = Mock()
+    api.supports_configuration.return_value = False
+    with (
+        patch.object(hca, "_get_aligned_hca_backward", return_value=(api, Mock())),
+        patch.object(torch, "_assert_async") as guard,
+    ):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            assert _select(q, kv, params, group) is None
+        graph.replay()
+        guard.assert_not_called()
+        api.supports_configuration.assert_called_once()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prepared_dispatch_does_not_synchronize():
+    """Prepared metadata removes the per-layer device-to-host synchronization."""
+    q, kv, params, group = _metadata()
+    hca.prepare_aligned_hca_metadata(params)
+    previous = torch.cuda.get_sync_debug_mode()
+    try:
+        with patch.object(hca, "_get_aligned_hca_backward", return_value=(Mock(), Mock())):
+            torch.cuda.set_sync_debug_mode("error")
+            for _ in range(15):
+                assert _select(q, kv, params, group) == 0
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -177,9 +275,12 @@ def test_unsupported_layout_falls_back(change):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_capture_guards_current_boundaries():
+@pytest.mark.parametrize("prepared", [False, True])
+def test_capture_guards_current_boundaries(prepared):
     """Capture emits a tensor guard instead of reusing an eager shape verdict."""
     q, kv, params, group = _metadata()
+    if prepared:
+        hca.prepare_aligned_hca_metadata(params)
     with (
         patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
         patch.object(hca, "_get_aligned_hca_backward", return_value=(Mock(), Mock())),

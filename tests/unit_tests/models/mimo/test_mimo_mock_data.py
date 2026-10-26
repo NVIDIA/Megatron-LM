@@ -25,8 +25,9 @@ def _args():
         seed=123,
         dataset_provider="mock",
         micro_batch_size=2,
-        llm_dp=2,
-        encoder_dp=1,
+        mimo_llm_dp=2,
+        gtp_weight_remat_size=1,
+        mimo_encoder_dp=1,
         seq_length=8,
         image_seq_length=4,
         vocab_size=64,
@@ -43,21 +44,35 @@ def _args():
     )
 
 
-def _topology(*, language_rank, encoder_rank=None):
+def _topology(*, language_rank, encoder_rank=None, cp_rank=0, cp_size=1, gtp_rank=0, gtp_size=1):
     encoder = RADIO_ENCODER_MODULE_NAME
     grids = {"language": _grid(language_rank)}
-    pgs = {"language": SimpleNamespace(pp=_group(size=3), dp=_group(rank=0, size=2))}
+    pgs = {
+        "language": SimpleNamespace(
+            pp=_group(size=3),
+            cp=_group(rank=cp_rank, size=cp_size),
+            dp=_group(rank=0, size=2),
+            gtp_remat=_group(rank=gtp_rank, size=gtp_size),
+            dp_gtp_remat=_group(rank=gtp_rank, size=2 * gtp_size),
+            dp_cp_gtp_remat=None,
+        )
+    }
     if encoder_rank is not None:
         grids[encoder] = _grid(encoder_rank)
-        pgs[encoder] = SimpleNamespace(pp=_group(), dp=_group(rank=1, size=2))
+        pgs[encoder] = SimpleNamespace(
+            pp=_group(),
+            dp=_group(rank=1, size=2),
+            dp_gtp_remat=_group(rank=1, size=2),
+            dp_cp_gtp_remat=None,
+        )
     return SimpleNamespace(grids=grids, module_pgs=pgs)
 
 
 @pytest.fixture
-def adapter(monkeypatch):
+def adapter(monkeypatch, run_config):
     from examples.mimo.training import data
 
-    monkeypatch.setattr(data, "get_pg_rank", lambda pg: pg.rank())
+    run_config.rng.seed = 123
     monkeypatch.setattr(data, "is_pp_first_stage", lambda pg: pg.rank() == 0)
     monkeypatch.setattr(data, "is_pp_last_stage", lambda pg: pg.rank() == pg.size() - 1)
     return data
@@ -66,7 +81,7 @@ def adapter(monkeypatch):
 def test_dynamic_radio_loader_emits_patchified_cpu_metadata(adapter):
     args = _args()
     args.micro_batch_size = 2
-    args.llm_dp = 1
+    args.mimo_llm_dp = 1
     args.seq_length = 24
     args.image_seq_length = 12
     args.params_dtype = torch.bfloat16
@@ -105,6 +120,7 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         _args(), _topology(language_rank=True)
     )
     assert all(loader.batch_size == 2 for loader in language_loaders)
+    assert all(loader.pin_memory for loader in language_loaders)
     assert len({id(loader.dataset) for loader in language_loaders}) == 3
     assert len({loader.dataset.seed for loader in language_loaders}) == 3
     language_batch = next(iter(language_loaders[0]))
@@ -115,9 +131,70 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         _args(), _topology(encoder_rank=True, language_rank=False)
     )
     assert all(loader.batch_size == 4 for loader in encoder_loaders)
+    assert all(loader.pin_memory for loader in encoder_loaders)
     encoder_batch = next(iter(encoder_loaders[0]))
     assert encoder_batch["input_ids"].shape == (4, 8)
     encoder_inputs = encoder_batch["modality_inputs"][RADIO_ENCODER_MODULE_NAME][
         RADIO_ENCODER_MODULE_NAME
     ]
     assert encoder_inputs["x"].shape == (4, 3, 4, 4)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("gtp_size", [1, 2])
+def test_cp_replicas_share_batches_without_merging_data_lanes(adapter, cp_size, gtp_size):
+    args = _args()
+    args.gtp_weight_remat_size = gtp_size
+    lane_seeds = []
+    for lane in range(args.mimo_llm_dp * gtp_size):
+        replicas = []
+        for cp_rank in range(cp_size):
+            topology = _topology(language_rank=True)
+            pg = topology.module_pgs["language"]
+            pg.cp = _group(rank=cp_rank, size=cp_size)
+            pg.dp_gtp_remat = _group(rank=lane, size=args.mimo_llm_dp * gtp_size)
+            pg.dp_cp_gtp_remat = _group(
+                rank=lane * cp_size + cp_rank, size=args.mimo_llm_dp * gtp_size * cp_size
+            )
+            loaders = adapter.build_train_valid_test_data_loaders(args, topology)
+            assert all(loader.batch_size == args.micro_batch_size for loader in loaders)
+            replicas.append(loaders)
+        lane_seeds.append(replicas[0][0].dataset.seed)
+        for split in range(3):
+            reference = next(iter(replicas[0][split]))
+            for replica in replicas[1:]:
+                batch = next(iter(replica[split]))
+                for key in ("input_ids", "labels", "loss_mask", "position_ids"):
+                    assert torch.equal(batch[key], reference[key]), key
+    assert len(set(lane_seeds)) == args.mimo_llm_dp * gtp_size
+
+
+@pytest.mark.parametrize(
+    "cp_size,weight_size,sequence_shards,sample_size",
+    [(4, 1, 1, 2), (1, 8, 4, 4), (2, 8, 4, 4), (1, 4, 1, 8)],
+)
+def test_sequence_sharding_mock_data_uses_sample_rank_and_encoder_batch_size(
+    adapter, cp_size, weight_size, sequence_shards, sample_size
+):
+    args = _args()
+    args.mimo_llm_cp = cp_size
+    args.gtp_weight_remat_size = weight_size
+    args.tensor_parallel_num_sequence_shards = sequence_shards
+    cp_size *= sequence_shards
+    seeds = []
+    for lane in range(sample_size):
+        cp_seeds = []
+        for cp_rank in range(cp_size):
+            topology = _topology(language_rank=True, cp_rank=cp_rank, cp_size=cp_size)
+            topology.module_pgs["language"].dp_gtp_remat = _group(rank=lane, size=sample_size)
+            loaders = adapter.build_train_valid_test_data_loaders(args, topology)
+            cp_seeds.append([loader.dataset.seed for loader in loaders])
+        assert all(seed == cp_seeds[0] for seed in cp_seeds)
+        seeds.append(cp_seeds[0][0])
+    assert len(set(seeds)) == sample_size
+    encoder_loaders = adapter.build_train_valid_test_data_loaders(
+        args, _topology(encoder_rank=True, language_rank=False)
+    )
+    assert all(
+        loader.batch_size == args.micro_batch_size * sample_size for loader in encoder_loaders
+    )

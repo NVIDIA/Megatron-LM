@@ -3,9 +3,9 @@
 """OpenAI-compatible inference server using the Megatron high-level API.
 
 Mirrors tools/run_dynamic_text_generation_server.py but drives the
-``DynamicInferenceEngine`` through ``MegatronAsyncLLM.serve(...)`` instead
+`DynamicInferenceEngine` through `MegatronAsyncLLM.serve(...)` instead
 of building the coordinator/engine pipeline manually. Coordinator mode is
-required (HTTP serving uses the coordinator path); ``use_coordinator=True``
+required (HTTP serving uses the coordinator path); `use_coordinator=True`
 is hardcoded in the script.
 """
 
@@ -15,12 +15,15 @@ import sys
 from argparse import ArgumentParser
 
 import torch
+import torch.distributed as dist
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
 from megatron.core.inference.apis import MegatronAsyncLLM, ServeConfig
+from megatron.core.inference.shards import build_inference_pg_collections_for_shards
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
@@ -29,7 +32,12 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, initialize_megatron
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
 
 
 def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
@@ -49,7 +57,56 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
         default=4,
         help="Number of HTTP frontend processes spawned on the primary rank.",
     )
+    group.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Server-level temperature default when a request omits temperature. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
+    )
+    group.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Server-level top-p default when a request omits top_p. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 1.0 if neither is set.",
+    )
+    group.add_argument(
+        "--default-top-k",
+        type=int,
+        default=None,
+        help="Server-level top-k default when a request omits top_k. "
+        "Takes precedence over the model's generation_config.json; unset leaves "
+        "that free to apply, falling back to 0 if neither is set.",
+    )
+    group.add_argument(
+        "--eval-mode",
+        action="store_true",
+        help="Avoid returning prompt token IDs by default for pure serving.",
+    )
     return parser
+
+
+def _build_model_and_inference_config(args):
+    """Build the model on either global or role-tagged inference process groups."""
+
+    if spec_declares_disaggregation(args.inference_shards):
+        world_size = dist.get_world_size()
+        shards = build_inference_pg_collections_for_shards(world_size, args.inference_shards)
+        local_shard = next(shard for shard in shards if shard.pg_collection is not None)
+        model = get_model_for_inference(
+            pg_collection=local_shard.pg_collection,
+            checkpoint_group=local_shard.process_group,
+        )
+        inference_config = get_inference_config_from_model_and_args(model, args)
+        inference_config.pg_collection = local_shard.pg_collection
+        return model, inference_config
+
+    model = get_model_for_inference()
+    inference_config = get_inference_config_from_model_and_args(model, args)
+    return model, inference_config
 
 
 async def _serve(args, model, tokenizer, inference_config):
@@ -67,26 +124,37 @@ async def _serve(args, model, tokenizer, inference_config):
             parsers=args.parsers,
             verbose=args.verbose,
             frontend_replicas=args.frontend_replicas,
+            default_temperature=args.default_temperature,
+            default_top_p=args.default_top_p,
+            default_top_k=args.default_top_k,
+            eval_mode=args.eval_mode,
         )
         await llm.serve(serve_config, blocking=True)
 
 
 def main():
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_serve_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
 
     args = get_args()
 
     # Match the legacy tool's NVTX gating.
-    if args.profile and args.nvtx_ranges:
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
+    if (
+        cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler
+    ) and cfg.profiling.nvtx_ranges:
         configure_nvtx_profiling(True)
 
     tokenizer = build_tokenizer(args)
-    model = get_model_for_inference()
-    inference_config = get_inference_config_from_model_and_args(model, args)
+    model, inference_config = _build_model_and_inference_config(args)
 
     try:
         asyncio.run(_serve(args, model, tokenizer, inference_config))

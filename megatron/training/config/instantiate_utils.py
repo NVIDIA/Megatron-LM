@@ -15,6 +15,51 @@ try:
 except ImportError:
     HAVE_OMEGACONF = False
 
+_TARGET_ALLOWLIST_MUTATORS: tuple[str, ...] = (
+    "add_prefix",
+    "remove_prefix",
+    "add_exact",
+    "remove_exact",
+    "disable",
+    "enable",
+)
+_DISALLOWED_CANONICAL_TARGETS: set[str] = {"numpy.load", "torch.serialization.load"}
+_DISALLOWED_TARGETS: set[str] = {
+    "numpy.ctypeslib.load_library",
+    "numpy.load",
+    "torch.classes.load_library",
+    "torch.ctypes.CDLL",
+    "torch.ctypes.OleDLL",
+    "torch.ctypes.PyDLL",
+    "torch.ctypes.WinDLL",
+    "torch.ctypes.cdll.LoadLibrary",
+    "torch.ctypes.oledll.LoadLibrary",
+    "torch.ctypes.pydll.LoadLibrary",
+    "torch.ctypes.windll.LoadLibrary",
+    "torch.hub.load",
+    "torch.load",
+    "torch.ops.load_library",
+    "torch.utils.cpp_extension.load",
+    "torch.utils.cpp_extension.load_inline",
+    "transformers.pipeline",
+    *{
+        f"megatron.training.config.instantiate_utils.target_allowlist.{method}"
+        for method in _TARGET_ALLOWLIST_MUTATORS
+    },
+}
+_DISALLOWED_TRANSFORMERS_PREFIXES: tuple[str, ...] = (
+    "transformers.dynamic_module_utils.",
+    "transformers.utils.import_utils.",
+    "transformers.pipelines.",
+)
+_DISALLOWED_TRANSFORMERS_METHODS: frozenset[str] = frozenset({"from_pretrained", "from_config"})
+_DISALLOWED_CALLABLE_FIELD_NAMES: set[str] = {
+    "collate_impl",
+    "hf_filter_lambda",
+    "preprocess_fn",
+    "process_example_fn",
+}
+
 
 class InstantiationException(Exception):
     """Custom exception type for instantiation errors."""
@@ -213,14 +258,10 @@ def instantiate(
 
         return instantiate_node(config, *args, partial=_partial_, mode=mode)
     else:
-        raise InstantiationException(
-            dedent(
-                f"""\
+        raise InstantiationException(dedent(f"""\
                 Cannot instantiate config of type {type(config).__name__}.
                 Top level config must be an OmegaConf DictConfig/ListConfig object,
-                a plain dict/list, or a Structured Config class or instance."""
-            )
-        )
+                a plain dict/list, or a Structured Config class or instance."""))
 
 
 def instantiate_node(
@@ -558,3 +599,25 @@ def _convert_node(node: Any) -> Any:
         node = OmegaConf.to_container(node, resolve=True)
 
     return node
+
+
+def _reject_unsafe_target_name(*, target: str, full_key: str | int) -> None:
+    """Reject known unsafe target names without importing their modules."""
+    field_name = full_key.rsplit(".", 1)[-1] if isinstance(full_key, str) else ""
+    if field_name in _DISALLOWED_CALLABLE_FIELD_NAMES:
+        raise InstantiationException(
+            f"Instantiation of '{target}' is not allowed for callable config field '{full_key}'. "
+            "Use a registered symbolic option or pass a Python callable from trusted application code."
+        )
+    if (
+        target in _DISALLOWED_TARGETS
+        or target.startswith(_DISALLOWED_TRANSFORMERS_PREFIXES)
+        or (
+            target.startswith("transformers.")
+            and target.rsplit(".", 1)[-1] in _DISALLOWED_TRANSFORMERS_METHODS
+        )
+    ):
+        raise InstantiationException(
+            f"Instantiation of '{target}' is not allowed because it can bypass target validation."
+            + (f"\nfull_key: {full_key}" if full_key else "")
+        )

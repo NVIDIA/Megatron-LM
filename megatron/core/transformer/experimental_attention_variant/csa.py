@@ -3,7 +3,7 @@
 import copy
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Tuple, Union
+from typing import Optional, Protocol, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_out_of_place,
 )
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (
     async_gather_from_sequence_parallel_region,
@@ -63,10 +63,28 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     use_fused_dsa_kernels,
 )
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    get_compact_indexer_workspace_registry,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+
+
+def _build_csa_submodule(spec, *args, **kwargs):
+    """Accept both dev ModuleSpecs and main's callable factories at the construction boundary."""
+    if isinstance(spec, (ModuleSpec, type)):
+        return build_module(spec, *args, **kwargs)
+    return spec(*args, **kwargs)
+
+
+def _pool_compressor_values(kv, score, output_dtype):
+    """Pool compressor groups using FP32 accumulation before casting the result."""
+    weights = torch.softmax(score, dim=1, dtype=torch.float32)
+    return (kv.float() * weights).sum(dim=1).to(output_dtype)
+
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -117,6 +135,22 @@ def get_compress_topk_idxs(
     """All-compressed-position indices [batch, seqlen, seqlen // ratio]."""
     matrix = _get_compress_topk_idxs_cached(ratio, seqlen, offset, str(device))
     return matrix.unsqueeze(0).expand(batch_size, -1, -1)
+
+
+@lru_cache(maxsize=8)
+def _get_compress_causal_mask_cached(
+    ratio: int, seqlen: int, n_compressed: int, device_str: str
+) -> torch.Tensor:
+    """Return the additive causal mask for compressed positions (cached)."""
+    compressed_positions = torch.arange(n_compressed, device=device_str).unsqueeze(0)
+    valid_counts = _get_compress_valid_counts_cached(ratio, seqlen, device_str)
+    return torch.where(compressed_positions >= valid_counts, float("-inf"), 0.0)
+
+
+@lru_cache(maxsize=8)
+def _get_compress_valid_counts_cached(ratio: int, seqlen: int, device_str: str) -> torch.Tensor:
+    """Return the number of causally valid compressed positions per query (cached)."""
+    return torch.arange(1, seqlen + 1, device=device_str).unsqueeze(1) // ratio
 
 
 def _get_csa_compressed_capacity(
@@ -698,12 +732,15 @@ def unfused_compressed_sparse_attn(
 
     # ----------- Shared core: gather, MQA softmax with sink, sum ---------
     rows, np_, hn = q_flat.shape
+    if attn_sink.ndim != 1 or attn_sink.numel() != np_:
+        raise ValueError(
+            f"attn_sink must contain one value per query head ({np_}), "
+            f"got shape {tuple(attn_sink.shape)}."
+        )
 
     safe_indices = global_indices.clamp(min=0).long()
-    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, hn)
-    kv_gathered = torch.gather(
-        kv_flat.unsqueeze(0).expand(rows, -1, -1), dim=1, index=safe_indices_exp
-    )  # (rows, topk, hn)
+    # Index the flat KV storage directly, avoiding a rows-by-KV backward allocation.
+    kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).view(rows, -1, hn)
 
     q_f = q_flat.float()
     kv_g = kv_gathered.float()
@@ -1113,7 +1150,7 @@ class Compressor(MegatronModule):
         proj_out_dim = self.coff * head_dim
 
         with get_fp8_disabled_context(config, is_init=True):
-            self.linear_wkv = build_module(
+            self.linear_wkv = _build_csa_submodule(
                 submodules.linear_wkv,
                 config.hidden_size,
                 proj_out_dim,
@@ -1126,7 +1163,7 @@ class Compressor(MegatronModule):
                 name=(name + ".linear_wkv") if name is not None else None,
             )
 
-            self.linear_wgate = build_module(
+            self.linear_wgate = _build_csa_submodule(
                 submodules.linear_wgate,
                 config.hidden_size,
                 proj_out_dim,
@@ -1148,7 +1185,7 @@ class Compressor(MegatronModule):
 
         norm_config = copy.copy(config)
         norm_config.normalization = "RMSNorm"
-        self.norm = build_module(
+        self.norm = _build_csa_submodule(
             submodules.norm, config=norm_config, hidden_size=head_dim, eps=config.layernorm_epsilon
         )
 
@@ -1225,8 +1262,7 @@ class Compressor(MegatronModule):
         if self.overlap:
             kv = self._overlap_transform(kv, fill_value=0)
             score = self._overlap_transform(score, fill_value=float("-inf"))
-        weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
-        kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
+        kv = _pool_compressor_values(kv, score, x.dtype)
         kv = self.norm(kv.to(x.dtype))
         kv = _apply_rope(
             kv,
@@ -1500,8 +1536,9 @@ class Compressor(MegatronModule):
 
             # Batched softmax + weighted sum — single kernel for all entries.
             # (total_comp, [2*]ratio, 1, [coff*]d)  →  (total_comp, 1, head_dim)
-            weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
-            compressed_thd = (kv_grouped * weights).sum(dim=1)
+            # Match SBHD and CP pooling: premature BF16 weight/product rounding can
+            # change the indexer's Top-K set when only the input layout changes.
+            compressed_thd = _pool_compressor_values(kv_grouped, score_grouped, dtype)
 
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
@@ -1600,6 +1637,69 @@ class Compressor(MegatronModule):
         nvtx_range_pop("compressor")
         return result
 
+    def _project(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project compressor values and gates outside any enclosing FP8 context."""
+        with get_fp8_disabled_context(self.config):
+            kv, _ = self.linear_wkv(x)
+            score, _ = self.linear_wgate(x)
+        return kv, score
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        *,
+        max_seqlen_q: int,
+        compressed_group_ids: torch.Tensor,
+        compressed_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool fixed-capacity complete groups and their overlapping predecessors.
+
+        Input layout comes from prepare_cp_compressor_input. Metadata describes
+        physical local groups, while position IDs remain document relative.
+        Canonical ownership is assigned separately by the global compressed-row map.
+        """
+        total_comp = compressed_group_ids.shape[0]
+        ratio = self.compress_ratio
+        kv, score = self._project(x)
+        kv = kv.reshape(total_comp, ratio, 1, -1)
+        score = score.reshape(total_comp, ratio, 1, -1) + self.ape.view(1, ratio, 1, -1)
+        if self.overlap:
+            is_first = compressed_group_ids == 0
+            kv = self._overlap_transform_thd(kv, is_first, fill_value=0)
+            score = self._overlap_transform_thd(score, is_first, fill_value=float("-inf"))
+        compressed = _pool_compressor_values(kv, score, x.dtype)
+        compressed = apply_module(self.norm)(compressed)
+        if self.config.apply_rope_fusion:
+            cos, sin = self.rotary_pos_emb.get_cached_cos_sin(
+                max_seqlen_q, dtype=compressed.dtype, packed_seq=True, mscale=1.0
+            )
+            compressed = fused_mla_rope_inplace(
+                compressed,
+                cos,
+                sin,
+                self.head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                cu_seqlens_q=cu_seqlens,
+                remove_interleaving=True,
+                position_ids=compressed_position_ids,
+            )
+        else:
+            rope = self.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+            freqs = rope[0] if isinstance(rope, tuple) else rope
+            compressed = _apply_unfused_rope(
+                compressed,
+                freqs.index_select(0, compressed_position_ids.long()),
+                self.head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                self.config,
+                # Frequencies are already selected for each physical compressed row;
+                # do not index them again through the packed-sequence helper.
+                cu_seqlens=None,
+                cp_group=self.pg_collection.cp,
+            )
+        return rotate_activation(compressed) if self.rotate else compressed
+
 
 # ---------------------------------------------------------------------------
 # CSAIndexer
@@ -1659,7 +1759,7 @@ class CSAIndexer(MegatronModule):
 
         # Q projection (FP8 in the reference DeepSeek V4 checkpoint, so it is built
         # inside the enclosing fp8_model_init context like the other FP8 weights)
-        self.linear_wq_b = build_module(
+        self.linear_wq_b = _build_csa_submodule(
             submodules.linear_wq_b,
             self.q_lora_rank,
             self.index_n_heads * self.index_head_dim,
@@ -1676,7 +1776,7 @@ class CSAIndexer(MegatronModule):
         # DeepSeek V4 checkpoint keeps it in BF16), so build it outside any
         # enclosing fp8_model_init context.
         with get_fp8_disabled_context(config, is_init=True):
-            self.linear_weights_proj = build_module(
+            self.linear_weights_proj = _build_csa_submodule(
                 submodules.linear_weights_proj,
                 self.hidden_size,
                 self.index_n_heads,
@@ -1690,7 +1790,7 @@ class CSAIndexer(MegatronModule):
             )
 
         # Own compressor (smaller head_dim, with Hadamard rotation)
-        self.compressor = build_module(
+        self.compressor = _build_csa_submodule(
             submodules.compressor,
             config=config,
             compress_ratio=compress_ratio,
@@ -1869,6 +1969,19 @@ class CSAIndexer(MegatronModule):
         nvtx_range_pop("indexer")
         return index_scores, topk_indices
 
+    def _project_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Project indexer weights outside any enclosing FP8 context."""
+        with get_fp8_disabled_context(self.config):
+            weights, _ = self.linear_weights_proj(x)
+        return weights
+
+    def project_packed_queries(self, x: torch.Tensor, qr: torch.Tensor):
+        """Project local packed Q and head weights, retaining FP8/BF16 ownership."""
+        q, _ = self.linear_wq_b(qr)
+        q = q.reshape(x.shape[0], self.index_n_heads, self.index_head_dim)
+        weights = self._project_weights(x).squeeze(1) * (self.index_n_heads**-0.5)
+        return q, weights
+
 
 # ---------------------------------------------------------------------------
 # CompressedSparseAttention (core attention)
@@ -2012,6 +2125,44 @@ class CompressedSparseAttentionSubmodules:
     indexer: Union[ModuleSpec, type] = None
 
 
+class _CompactIndexerWorkspaceStore:
+    """Warmed-up compact-indexer workspaces (BSHD, THD, balanced THD per slot) and the active one
+    of each kind (the immediately preceding warm-up, which capture reuses).
+
+    One store per CSA module reproduces the historical per-layer ownership. With
+    ``TransformerConfig.dsa_compact_indexer_workspace_sharing`` all CSA modules built from the same
+    config on the same device share one store: layers execute serially on one stream and nothing in
+    a workspace outlives the indexer dispatch that fills it (the quantized q/k, packed scales and
+    candidate offsets are consumed by the compact top-k kernel, whose outputs are copied into
+    per-dispatch buffers; the attention and indexer-loss backward read bf16 saved tensors, never
+    the workspace), so a later layer overwriting the buffers is the same reuse eager gets from
+    its transient allocations.
+    """
+
+    def __init__(self) -> None:
+        self.bshd: list[BSHDCompactIndexerWorkspace] = []
+        self.bshd_active: BSHDCompactIndexerWorkspace | None = None
+        self.thd: list[THDCompactIndexerWorkspace] = []
+        self.thd_active: THDCompactIndexerWorkspace | None = None
+        self.balanced_thd: dict[str, list[THDCompactIndexerWorkspace]] = {}
+        self.balanced_thd_active: dict[str, THDCompactIndexerWorkspace] = {}
+
+    def __deepcopy__(self, memo):
+        # Runtime GPU state shared by graphs; a copied config must not duplicate it.
+        return self
+
+
+def _shared_compact_indexer_workspace_store(config, device: torch.device):
+    """Return the store shared by all CSA layers built from ``config`` on ``device``."""
+    stores = get_compact_indexer_workspace_registry(config)
+    key = (device.type, device.index)
+    store = stores.get(key)
+    if store is None:
+        store = _CompactIndexerWorkspaceStore()
+        stores[key] = store
+    return store
+
+
 class CompressedSparseAttention(MegatronModule):
     """Sparse core attention for CompressedSparseAttention.
 
@@ -2055,6 +2206,8 @@ class CompressedSparseAttention(MegatronModule):
         self.pg_collection = pg_collection
 
         self.layer_number = layer_number
+        if self.pg_collection.tp.size() != 1:
+            raise ValueError("CompressedSparseAttention supports only tensor-parallel size 1.")
         if is_mtp_layer:
             self.layer_number = self.layer_number + self.config.num_layers
         self.compress_ratio = compress_ratio
@@ -2082,7 +2235,7 @@ class CompressedSparseAttention(MegatronModule):
 
         # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
         if self.compress_ratio > 1 and submodules.compressor is not None:
-            self.compressor = build_module(
+            self.compressor = _build_csa_submodule(
                 submodules.compressor,
                 config=config,
                 compress_ratio=self.compress_ratio,
@@ -2101,7 +2254,7 @@ class CompressedSparseAttention(MegatronModule):
             and not config.csa_dense_mode
             and submodules.indexer is not None
         ):
-            self.indexer = build_module(
+            self.indexer = _build_csa_submodule(
                 submodules.indexer,
                 config=config,
                 compress_ratio=self.compress_ratio,
@@ -2123,22 +2276,15 @@ class CompressedSparseAttention(MegatronModule):
             )
 
         # Compact CUDA graphs reference caller-owned THD offsets and MXFP8
-        # buffers by address. Retain every warmed-up static geometry for the
-        # lifetime of this module so later graph captures cannot invalidate an
-        # earlier graph's storage. Candidate scratch and compact outputs are
-        # allocated inside the forward, so the CUDA-graph pool can reuse them
-        # after each serialized graph.
-        # ``_active_*`` identifies the immediately preceding warmup.
-        self._bshd_compact_indexer_workspaces: list[BSHDCompactIndexerWorkspace] = []
-        self._active_bshd_compact_indexer_workspace: BSHDCompactIndexerWorkspace | None = None
-        self._thd_compact_indexer_workspaces: list[THDCompactIndexerWorkspace] = []
-        self._active_thd_compact_indexer_workspace: THDCompactIndexerWorkspace | None = None
-        self._balanced_thd_compact_indexer_workspaces: dict[
-            str, list[THDCompactIndexerWorkspace]
-        ] = {}
-        self._active_balanced_thd_compact_indexer_workspaces: dict[
-            str, THDCompactIndexerWorkspace
-        ] = {}
+        # buffers by address. Every warmed-up static geometry is retained in a
+        # ``_CompactIndexerWorkspaceStore`` for the lifetime of the graphs so
+        # later captures cannot invalidate an earlier graph's storage. Candidate
+        # scratch and compact outputs are allocated inside the forward, so the
+        # CUDA-graph pool can reuse them after each serialized graph. The store
+        # is bound lazily (the device is only known at the first dispatch) and,
+        # with ``config.dsa_compact_indexer_workspace_sharing``, is shared by all
+        # CSA layers built from this config on that device.
+        self._compact_indexer_store: _CompactIndexerWorkspaceStore | None = None
 
     def backward_dw(self):
         """Compute the deferred weight gradients of the optional compressor/indexer submodules.
@@ -2154,6 +2300,64 @@ class CompressedSparseAttention(MegatronModule):
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
+
+    def _compact_indexer_workspace_store(
+        self, device: torch.device | None = None
+    ) -> _CompactIndexerWorkspaceStore:
+        """Bind (once) and return this layer's compact-indexer workspace store."""
+        store = self._compact_indexer_store
+        if store is None:
+            if device is None:
+                param = next(self.parameters(), None)
+                device = (
+                    param.device
+                    if param is not None
+                    else torch.device("cuda", torch.cuda.current_device())
+                )
+            if getattr(self.config, "dsa_compact_indexer_workspace_sharing", True):
+                store = _shared_compact_indexer_workspace_store(self.config, device)
+            else:
+                store = _CompactIndexerWorkspaceStore()
+            self._compact_indexer_store = store
+        return store
+
+    # The historical per-module attribute names stay valid (tests and probes read them); they now
+    # resolve into the bound store, shared or private.
+    @property
+    def _bshd_compact_indexer_workspaces(self) -> list[BSHDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().bshd
+
+    @property
+    def _active_bshd_compact_indexer_workspace(self) -> BSHDCompactIndexerWorkspace | None:
+        return self._compact_indexer_workspace_store().bshd_active
+
+    @_active_bshd_compact_indexer_workspace.setter
+    def _active_bshd_compact_indexer_workspace(self, value) -> None:
+        self._compact_indexer_workspace_store().bshd_active = value
+
+    @property
+    def _thd_compact_indexer_workspaces(self) -> list[THDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().thd
+
+    @property
+    def _active_thd_compact_indexer_workspace(self) -> THDCompactIndexerWorkspace | None:
+        return self._compact_indexer_workspace_store().thd_active
+
+    @_active_thd_compact_indexer_workspace.setter
+    def _active_thd_compact_indexer_workspace(self, value) -> None:
+        self._compact_indexer_workspace_store().thd_active = value
+
+    @property
+    def _balanced_thd_compact_indexer_workspaces(
+        self,
+    ) -> dict[str, list[THDCompactIndexerWorkspace]]:
+        return self._compact_indexer_workspace_store().balanced_thd
+
+    @property
+    def _active_balanced_thd_compact_indexer_workspaces(
+        self,
+    ) -> dict[str, THDCompactIndexerWorkspace]:
+        return self._compact_indexer_workspace_store().balanced_thd_active
 
     def _get_bshd_compact_indexer_workspace(
         self,
@@ -2171,6 +2375,7 @@ class CompressedSparseAttention(MegatronModule):
         wrapper, avoiding an extra permutation during graph capture.
         """
         precision = self.config.dsa_indexer_precision
+        self._compact_indexer_workspace_store(q.device)
         if self.config.cuda_graph_impl == "none" or not bshd_compact_indexer_available(
             q, k, precision
         ):
@@ -2192,8 +2397,16 @@ class CompressedSparseAttention(MegatronModule):
         capturing = torch.cuda.is_current_stream_capturing()
         workspace = self._active_bshd_compact_indexer_workspace
         if capturing:
-            if workspace is not None and workspace.matches_shape(**match_kwargs):
-                return workspace
+            # As on the THD path: under full recompute the no-grad forward and the recompute
+            # can alternate return_softmax, so the active workspace is not necessarily the one
+            # this capture needs; any warmed-up workspace of the geometry serves.
+            candidates = [workspace] if workspace is not None else []
+            candidates += [w for w in self._bshd_compact_indexer_workspaces if w is not workspace]
+            for candidate in candidates:
+                if candidate.matches_shape(**match_kwargs):
+                    if candidate is not workspace:
+                        self._active_bshd_compact_indexer_workspace = candidate
+                    return candidate
             raise ValueError(
                 "BSHD compact CUDA graph capture requires an eagerly prepared compact "
                 "workspace for the active static geometry. Run eager warmup before capture."
@@ -2237,11 +2450,14 @@ class CompressedSparseAttention(MegatronModule):
         """Return persistent compact storage for a warmed-up THD graph geometry.
 
         Workspace sizing synchronizes with the host, so it is performed only
-        during eager CUDA-graph warmup. Capture reuses the active workspace;
-        when warmup was skipped or static shapes changed, capture must fail
-        clearly. Unsupported devices/frontends retain the non-compact path.
+        during eager CUDA-graph warmup. Capture reuses a warmed-up workspace of
+        the slot (the active one first, then the other geometries warm-up
+        prepared); when none matches, because warmup was skipped or static
+        shapes changed, capture must fail clearly. Unsupported devices/frontends
+        retain the non-compact path.
         """
         precision = self.config.dsa_indexer_precision
+        self._compact_indexer_workspace_store(q.device)
         if self.config.cuda_graph_impl == "none" or not thd_compact_indexer_available(
             q, k, precision
         ):
@@ -2249,39 +2465,54 @@ class CompressedSparseAttention(MegatronModule):
 
         capturing = torch.cuda.is_current_stream_capturing()
         # Head and tail have different causal offsets and may have different
-        # geometry. Keep their quantization/candidate metadata separate, just as
-        # each attention module owns storage independently of the other layers.
+        # geometry. Keep their quantization/candidate metadata in separate slots;
+        # within a slot the layers built from one config share the workspaces
+        # (dsa_compact_indexer_workspace_sharing), so the slot is what keeps the
+        # head and tail of the balanced indexer apart.
         balanced = workspace_slot != "default"
         workspace = (
             self._active_balanced_thd_compact_indexer_workspaces.get(workspace_slot)
             if balanced
             else self._active_thd_compact_indexer_workspace
         )
-        if capturing:
-            if workspace is not None and workspace.matches(
-                q=q,
-                k=k,
-                topk=topk,
-                ratio=ratio,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                q_causal_offsets=q_causal_offsets,
-                return_softmax=return_softmax,
-                precision=precision,
-            ):
-                return workspace
-            raise ValueError(
-                "THD compact CUDA graph capture requires an eagerly prepared compact "
-                "workspace for the active packed geometry. Run eager warmup before capture."
-            )
-
         workspaces = (
             self._balanced_thd_compact_indexer_workspaces.setdefault(workspace_slot, [])
             if balanced
             else self._thd_compact_indexer_workspaces
         )
+        if capturing:
+            # Under full activation recompute the checkpoint forward (no_grad) and its recompute
+            # alternate between two geometries (return_softmax differs), so the last prepared
+            # workspace is not necessarily the one this capture needs. Any warmed-up workspace of
+            # this slot may be reused: matching is shape-only (no host synchronization).
+            candidates = [workspace] if workspace is not None else []
+            candidates += [w for w in workspaces if w is not workspace]
+            for candidate in candidates:
+                if candidate.matches(
+                    q=q,
+                    k=k,
+                    topk=topk,
+                    ratio=ratio,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    q_causal_offsets=q_causal_offsets,
+                    return_softmax=return_softmax,
+                    precision=precision,
+                ):
+                    if balanced:
+                        self._active_balanced_thd_compact_indexer_workspaces[workspace_slot] = (
+                            candidate
+                        )
+                    else:
+                        self._active_thd_compact_indexer_workspace = candidate
+                    return candidate
+            raise ValueError(
+                "THD compact CUDA graph capture requires an eagerly prepared compact "
+                "workspace for the active packed geometry. Run eager warmup before capture."
+            )
+
         for workspace in workspaces:
             if workspace.matches(
                 q=q,
@@ -2374,11 +2605,9 @@ class CompressedSparseAttention(MegatronModule):
                 qr_det = qr.detach()
 
                 causal_mask = (
-                    torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
-                )
-                positions = torch.arange(1, sq + 1, device=x.device).unsqueeze(1)
-                causal_mask = (
-                    torch.where(causal_mask >= positions // self.compress_ratio, float("-inf"), 0.0)
+                    _get_compress_causal_mask_cached(
+                        self.compress_ratio, sq, n_compressed, str(x.device)
+                    )
                     .unsqueeze(0)
                     .expand(b, -1, -1)
                 )  # [b, sq, n_compressed]
@@ -2424,7 +2653,9 @@ class CompressedSparseAttention(MegatronModule):
                         x_det, qr_det, mask=causal_mask, packed_seq_params=packed_seq_params
                     )
 
-                n_valid_per_pos = positions // self.compress_ratio  # [sq, 1]
+                n_valid_per_pos = _get_compress_valid_counts_cached(
+                    self.compress_ratio, sq, str(x.device)
+                )
                 valid = (topk_indices_compressed >= 0) & (topk_indices_compressed < n_valid_per_pos)
                 compress_topk_idxs = torch.where(
                     valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
@@ -2472,7 +2703,14 @@ class CompressedSparseAttention(MegatronModule):
 
         nvtx_range_push("sparse_attn_kernel")
         output = csa_sparse_attn(
-            query, kv_full, self.attn_sink.float(), flat_idxs, self.softmax_scale, out_rope=out_rope
+            query,
+            kv_full,
+            self.attn_sink.float(),
+            flat_idxs,
+            self.softmax_scale,
+            out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2532,6 +2770,8 @@ class CompressedSparseAttention(MegatronModule):
             self.softmax_scale,
             topk_length=flat_tlen,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output
@@ -2593,6 +2833,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             out_rope=out_rope,
         )
         nvtx_range_pop("sparse_attn_kernel")
@@ -2637,12 +2878,23 @@ class CompressedSparseAttention(MegatronModule):
             output: [sq, b, np * v_head_dim], with DSv4's inverse RoPE already
                 applied to the trailing ``qk_pos_emb_head_dim`` of each head.
         """
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if not is_thd and attention_mask is not None:
+            raise ValueError("CompressedSparseAttention supports only an implicit causal mask.")
+        expected_ndim = 3 if is_thd else 4
+        if query.ndim != expected_ndim:
+            raise ValueError(
+                f"CompressedSparseAttention query must have {expected_ndim} dimensions."
+            )
+        if query.size(-2) != self.n_local_heads:
+            raise ValueError(
+                "CompressedSparseAttention query head count must match the unsharded "
+                f"attention sink ({self.n_local_heads}), got {query.size(-2)}."
+            )
         nvtx_range_push("compressed_sparse_attn")
 
         _orig_cp_group = self.pg_collection.cp
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
-            self.pg_collection.cp = packed_seq_params.cp_group
+        self.pg_collection.cp = resolve_cp_group(_orig_cp_group, packed_seq_params)
 
         cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
@@ -2939,6 +3191,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3048,6 +3302,8 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=flat_tlen,
             is_thd=True,
             out_rope=out_rope,
+            deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
         )
         return output.unsqueeze(1)
 
@@ -3156,6 +3412,7 @@ class CompressedSparseAttention(MegatronModule):
             compact_workspace=compact_workspace,
             indexer_precision=self.config.dsa_indexer_precision,
             deterministic=self.config.deterministic_mode,
+            cuda_graph=self.config.cuda_graph_impl != "none",
             thd_window_size=self.window_size,
             thd_compressed_is_sequence_major=True,
             out_rope=out_rope,
@@ -3710,6 +3967,8 @@ class CompressedSparseAttention(MegatronModule):
                     self.window_size,
                     kv_reconstruction_parts,
                     fused_out_rope,
+                    self.config.deterministic_mode,
+                    self.config.cuda_graph_impl != "none",
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
@@ -3751,6 +4010,8 @@ class CompressedSparseAttention(MegatronModule):
                 is_thd=True,
                 kv_reconstruction_parts=kv_reconstruction_parts,
                 out_rope=fused_out_rope,
+                deterministic=self.config.deterministic_mode,
+                cuda_graph=self.config.cuda_graph_impl != "none",
                 hca_cp_rank=hca_cp_rank,
                 hca_cp_size=cp_size,
             )
@@ -3938,3 +4199,150 @@ class CompressedSparseAttention(MegatronModule):
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
         return output
+
+
+class CompressorInterface(Protocol):
+    """Runtime interface exposed by a CSA compressor."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Compress an input sequence."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute deferred weight gradients."""
+        ...
+
+    def forward_packed(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        *,
+        max_seqlen_q: int,
+        compressed_group_ids: torch.Tensor,
+        compressed_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compress explicitly grouped packed tokens."""
+        ...
+
+
+class CompressorBuilder(Protocol):
+    """Builder protocol for CSA compressors."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        compress_ratio: int,
+        head_dim: int,
+        rotate: bool = False,
+        rotary_pos_emb: nn.Module | None = None,
+        pg_collection: ProcessGroupCollection,
+        name: str | None = None,
+    ) -> CompressorInterface:
+        """Build a CSA compressor."""
+        ...
+
+
+class CSAIndexerInterface(Protocol):
+    """Runtime interface exposed by a CSA indexer."""
+
+    index_topk: int
+    index_n_heads: int
+    index_head_dim: int
+    qk_pos_emb_head_dim: int
+    rotary_pos_emb: nn.Module
+    compressor: CompressorInterface
+    softmax_scale: float
+    pg_collection: ProcessGroupCollection
+
+    def forward_before_topk(
+        self, x: torch.Tensor, qr: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute indexer projections before top-k selection."""
+        ...
+
+    def forward(
+        self, x: torch.Tensor, qr: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute index scores and selected indices."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute deferred weight gradients."""
+        ...
+
+    def project_packed_queries(self, x: torch.Tensor, qr: torch.Tensor):
+        """Project local packed indexer queries and weights."""
+        ...
+
+
+class CSAIndexerBuilder(Protocol):
+    """Builder protocol for CSA indexers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        compress_ratio: int,
+        rotary_pos_emb: nn.Module | None = None,
+        pg_collection: ProcessGroupCollection,
+        name: str | None = None,
+    ) -> CSAIndexerInterface:
+        """Build a CSA indexer."""
+        ...
+
+
+class CompressedSparseAttentionInterface(Protocol):
+    """Runtime interface exposed by compressed sparse attention."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        x: torch.Tensor | None = None,
+        qr: torch.Tensor | None = None,
+        attn_mask_type: AttnMaskType | None = None,
+        attention_bias: torch.Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        boundary_hidden: torch.Tensor | None = None,
+        boundary_kv: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply compressed sparse attention."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Compute deferred weight gradients."""
+        ...
+
+
+class CompressedSparseAttentionBuilder(Protocol):
+    """Builder protocol for compressed sparse attention."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        softmax_scale: float | None,
+        k_channels: int | None,
+        v_channels: int | None,
+        cp_comm_type: str | None,
+        pg_collection: ProcessGroupCollection,
+        rotary_pos_emb: nn.Module | None,
+        compress_ratio: int,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ) -> CompressedSparseAttentionInterface:
+        """Build compressed sparse attention."""
+        ...
+
+
+CSA_OPERATION_DETERMINISM = {
+    "unfused_sparse_attention": "unknown",
+    "non_compressed_lse": "unknown",
+    "compressor_pooling": "unknown",
+}

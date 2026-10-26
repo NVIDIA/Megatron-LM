@@ -4,6 +4,7 @@
 
 from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -26,10 +27,17 @@ def prepare_packed_seq_params(
         The supplied metadata with its CP group and per-microbatch routes prepared.
     """
     packed_seq_params = finalize_packed_seq_params(packed_seq_params)
-    if packed_seq_params is None or not getattr(config, "dsa_cp_balance_indexer", False):
+    if packed_seq_params is None:
+        return packed_seq_params
+    if getattr(config, "hca_aligned_backward", False) and not cuda_graph_captures_attention(config):
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.aligned_hca import (
+            prepare_aligned_hca_metadata,
+        )
+
+        prepare_aligned_hca_metadata(packed_seq_params)
+    if not getattr(config, "dsa_cp_balance_indexer", False):
         return packed_seq_params
 
-    from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
     from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
         prebuild_balanced_layouts,
     )
@@ -39,7 +47,7 @@ def prepare_packed_seq_params(
         capacity = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
     prebuild_balanced_layouts(
         packed_seq_params,
-        cp_group=packed_seq_params.cp_group,
+        cp_group=(packed_seq_params.cp_singleton_group or packed_seq_params.cp_group),
         pad_alignment=config.pad_packed_seq_alignment,
         capacity=capacity,
         graphs_enabled=cuda_graph_captures_attention(config),

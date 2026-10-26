@@ -1038,23 +1038,34 @@ def _run_compiled_launch(
 ) -> None:
     """Compile/cache a CuTe launch function and invoke it on the current stream."""
     static_arg_set = set(static_arg_indices)
+    # Layouts are dynamic and sizes are runtime scalars. Packed-batch shapes
+    # must not create a new compile key for every microbatch.
+    for tensor in tensor_args:
+        if tensor.ndim != 0 and tensor.stride(-1) != 1:
+            raise RuntimeError(
+                f"CSA THD CuTe kernel {launch_fn.__name__} requires last-dim-contiguous "
+                f"tensors, got shape {tuple(tensor.shape)} stride {tuple(tensor.stride())}."
+            )
     key = (
         launch_fn.__name__,
+        # CuTe retains broadcast (zero) strides as static even in a dynamic
+        # layout. Expanded and non-broadcast tensors need separate launches.
         tuple(
-            (tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())) for tensor in tensor_args
+            (tensor.dtype, tensor.ndim, tuple(stride == 0 for stride in tensor.stride()))
+            for tensor in tensor_args
         ),
         tuple((i, scalar_args[i]) for i in static_arg_indices),
     )
     compiled = _COMPILED_LAUNCH_CACHE.get(key)
     if compiled is None:
         cap = torch.cuda.get_device_capability()
-        arch = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}.get(
+        arch = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_100f"}.get(
             cap
         )
         if arch is None:
             raise RuntimeError(
                 f"Unsupported GPU compute capability {cap} for CSA CP CuTe kernels; "
-                "supported architectures: sm_90a, sm_100a, sm_103a, sm_107a."
+                "supported architectures: sm_90a, sm_100a, sm_103a, sm_100f."
             )
         cute_tensor_args = []
         for tensor in tensor_args:

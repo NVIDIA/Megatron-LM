@@ -902,8 +902,8 @@ def test_tilelang_dsa_fused_hook_guard_paths(monkeypatch):
         tilelang_dsa.fused_sparse_mla_absorbed(query, key, topk_indices[..., :63], 1.0, 512) is None
     )
 
-    query_supported = torch.empty(2, 1, 3, 576)
-    key_supported = torch.empty(2, 1, 1, 576)
+    query_supported = torch.empty(2, 1, 3, 576, dtype=torch.bfloat16)
+    key_supported = torch.empty(2, 1, 1, 576, dtype=torch.bfloat16)
     topk_supported = torch.zeros(1, 2, 64, dtype=torch.int32)
     assert (
         tilelang_dsa.fused_sparse_mla_absorbed(
@@ -911,11 +911,22 @@ def test_tilelang_dsa_fused_hook_guard_paths(monkeypatch):
         )
         is None
     )
+
+    # Non-aligned widths are padded with -1 so the TileLang path stays usable.
+    class PaddedSparseMLA:
+        @staticmethod
+        def apply(_q, _kv, idx, _scale):
+            assert idx.shape[-1] == 64
+            assert torch.equal(idx[..., :63], topk_supported[..., :63].unsqueeze(2))
+            assert torch.all(idx[..., 63:] == -1)
+            return torch.empty(1, 2, 16, 512), torch.empty(1, 2, 16)
+
+    monkeypatch.setattr(tilelang_dsa, "SparseMLA", PaddedSparseMLA)
     assert (
         tilelang_dsa.fused_sparse_mla_absorbed(
             query_supported, key_supported, topk_supported[..., :63], 1.0, 512
         )
-        is None
+        is not None
     )
 
     class FailSparseMLA:
@@ -996,6 +1007,23 @@ def test_fused_sparse_mla_absorbed_batches_mocked_tilelang_outputs(monkeypatch):
     assert output.shape == (2, 2, 16, 512)
     assert torch.equal(output[:, 0], torch.zeros_like(output[:, 0]))
     assert torch.equal(output[:, 1], torch.full_like(output[:, 1], 18432.0))
+
+
+def test_fused_sparse_mla_absorbed_pads_kpool_tail_width(monkeypatch):
+    class FakeSparseMLA:
+        @staticmethod
+        def apply(q, _kv, idx, _scale):
+            assert idx.shape == (1, 2, 1, 2112)
+            assert torch.all(idx[..., :2051] == 0)
+            assert torch.all(idx[..., 2051:] == -1)
+            return torch.zeros(1, 2, 16, 512, dtype=q.dtype), torch.zeros(1, 2, 16)
+
+    monkeypatch.setattr(tilelang_dsa, "SparseMLA", FakeSparseMLA)
+    query = torch.zeros(2, 1, 16, 576, dtype=torch.bfloat16)
+    key = torch.zeros(2, 1, 1, 576, dtype=torch.bfloat16)
+    topk_indices = torch.zeros(1, 2, 2051, dtype=torch.int32)
+    output = tilelang_dsa.fused_sparse_mla_absorbed(query, key, topk_indices, 1.0, 512)
+    assert output.shape == (2, 1, 16, 512)
 
 
 def test_fused_sparse_mla_absorbed_pads_small_head_count_without_gradient_leak(monkeypatch):
@@ -1285,3 +1313,33 @@ def test_fused_sparse_mla_absorbed_accepts_thd_sentinels(num_heads):
     assert torch.isfinite(query.grad).all()
     assert torch.isfinite(key.grad).all()
     assert query.grad[0].abs().max() == 0
+
+
+def test_lighting_indexer_indices_preserves_single_head_weight_axis(monkeypatch):
+    seen = {}
+
+    def fake_indexer_fwd_interface(
+        index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits, use_relu
+    ):
+        del index_q, index_k, cu_seqlen_ks, cu_seqlen_ke
+        seen["weights_shape"] = weights.shape
+        seen["clean_logits"] = clean_logits
+        seen["use_relu"] = use_relu
+        return torch.arange(6, dtype=torch.float32).view(2, 3)
+
+    monkeypatch.setattr(indexer, "indexer_fwd_interface", fake_indexer_fwd_interface)
+
+    topk_indices = indexer.lighting_indexer_indices(
+        index_q=torch.empty(2, 1, 4),
+        index_k=torch.empty(3, 4),
+        weights=torch.ones(2, 1),
+        cu_seqlen_ks=torch.zeros(2, dtype=torch.int32),
+        cu_seqlen_ke=torch.full((2,), 3, dtype=torch.int32),
+        topk=2,
+        use_relu=False,
+    )
+
+    assert seen["weights_shape"] == (2, 1)
+    assert seen["clean_logits"] is True
+    assert seen["use_relu"] is False
+    torch.testing.assert_close(topk_indices, torch.tensor([[2, 1], [2, 1]], dtype=torch.int32))

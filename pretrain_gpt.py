@@ -9,14 +9,12 @@ _PROGRAM_START_TIME = time.time()
 
 import json
 
-# Suppress warnings on all ranks but rank 0.
-import os
-import warnings
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 
-rank = int(os.environ.get('RANK', 0))
-if rank != 0:
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
+# Quiet the duplicate warnings before the heavy imports below: torch raises its
+# own deprecations while it is being imported, so a filter installed any later
+# cannot reach them.
+suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
@@ -52,11 +50,19 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
+from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -262,7 +268,7 @@ SPIKY_LOSS_FACTOR = 10
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+    logprobs_dir, decode_threads, msc_prefetch_depth, kd_loss_alpha, ignore_errors, ignore_hash
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -274,10 +280,10 @@ def _build_cached_logits_loss_func(
     return LossFuncCallable(
         logprobs_dir=logprobs_dir,
         decode_threads=decode_threads,
-        prefetch_factor=prefetch_factor,
         msc_prefetch_depth=msc_prefetch_depth,
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
+        ignore_hash=ignore_hash,
     )
 
 
@@ -304,10 +310,10 @@ def loss_func(
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
             decode_threads=args.logits_load_decode_threads,
-            prefetch_factor=args.logits_load_prefetch_factor,
             msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
+            ignore_hash=args.logits_load_ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
@@ -373,6 +379,26 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             get_batch(data_iterator, vp_stage)
         )
+
+        # Offline logits KD: record this microbatch's global (un-CP-sharded)
+        # document boundaries so the saver can persist them alongside the
+        # logits _forward_hook is about to capture -- required for
+        # document-aware CP reassembly of packed (--sft) sequences. get_batch
+        # carries them in packed_seq_params (cu_seqlens_q_padded, falling back
+        # to cu_seqlens_q); the sequence-packing scheduler path records None.
+        from megatron.training.distillation.logits_saver import get_logits_saver
+
+        saver = get_logits_saver()
+        if saver is not None:
+            cu_seqlens_for_saver = None
+            if args.sequence_packing_scheduler is None and packed_seq_params is not None:
+                cu_seqlens_for_saver = (
+                    packed_seq_params.cu_seqlens_q_padded
+                    if packed_seq_params.cu_seqlens_q_padded is not None
+                    else packed_seq_params.cu_seqlens_q
+                )
+            saver.set_current_cu_seqlens(cu_seqlens_for_saver)
+
     timers('batch-generator').stop()
 
     with stimer:
@@ -410,6 +436,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
+    elif getattr(args, 'sequence_packing_scheduler', None) is not None:
+        # The scheduler sends packing metadata to middle PP stages itself and requires that
+        # only the first and last stages hold a data iterator.
+        return is_first_or_last_pipeline_stage(vp_stage)
     elif is_packed_sequence or (
         getattr(args, 'use_varlen_dataset', False)
         and getattr(args, 'varlen_sbhd_validation', False)
@@ -423,6 +453,8 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 
 
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
+    """Build the GPT (or FIM) dataset config from parsed CLI args."""
+    cfg = get_run_config()
     tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
@@ -436,13 +468,13 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             sequences_per_dataset = json.load(f)
 
     data_args = {
-        "random_seed": args.seed,
+        "random_seed": cfg.rng.seed,
         "sequence_length": args.seq_length,
         "blend": blend,
         "blend_per_split": blend_per_split,
         "split": args.split,
-        "multiple_validation_sets": args.multiple_validation_sets,
-        "full_validation": args.full_validation,
+        "multiple_validation_sets": cfg.validation.multiple_validation_sets,
+        "full_validation": cfg.validation.full_validation,
         "num_dataset_builder_threads": args.num_dataset_builder_threads,
         "path_to_cache": args.data_cache_path,
         "mmap_bin_files": args.mmap_bin_files,
@@ -451,6 +483,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "reset_attention_mask": args.reset_attention_mask,
         "eod_mask_loss": args.eod_mask_loss,
         "create_attention_mask": args.create_attention_mask_in_dataloader,
+        "inter_document_masking": args.dataloader_inter_document_masking,
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
@@ -509,7 +542,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         is_packed_sequence = True  # SFT always uses packed sequence
     elif args.use_varlen_dataset:
         # Variable-length packed (THD) dataset, independent of --sft.
-        # Reuses SFTDataset's THD/dynamic-cp packing internally but is gated
+        # Reuses SFTDataset's THD packing internally but is gated
         # by its own top-level flag.
         if args.mock_data:
             dataset_type = MockVarlenDataset
@@ -575,10 +608,13 @@ if __name__ == "__main__":
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = gpt_config_from_args(args, model_config_cls=ModelOptModelConfig)
+        model_cfg = gpt_config_from_args(
+            args, model_config_cls=ModelOptModelConfig, vocab_size_from_tokenizer=True
+        )
     else:
-        model_cfg = gpt_config_from_args(args)
+        model_cfg = gpt_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(full_config)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

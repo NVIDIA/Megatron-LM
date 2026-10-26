@@ -45,6 +45,17 @@ def _record_tracker_pp_group(tracker, prefix: str, pp_group) -> None:
         tracker[f"{prefix}_pp_ranks"] = ranks
 
 
+def _check_fixed_raw_storage(tracker, size: int) -> None:
+    """Validate optional raw-loss storage against a fixed tracker capacity."""
+    raw_values = tracker.get("raw_values")
+    if raw_values is None:
+        return
+    if size == 0:
+        raise RuntimeError("Zero-capacity DSA metric tracker unexpectedly owns raw-loss storage.")
+    if raw_values.shape[0] != size:
+        raise RuntimeError("DSA metric tracker raw-loss storage does not match fixed capacity.")
+
+
 class DSAIndexerLossLoggingHelper:
     """Helper class for logging sparse attention indexer losses."""
 
@@ -72,6 +83,7 @@ class DSAIndexerLossLoggingHelper:
                 raise RuntimeError("DSA metric tracker storage does not match its fixed capacity.")
             if agreed_size == 0 and values is not None:
                 raise RuntimeError("Zero-capacity DSA metric tracker unexpectedly owns storage.")
+            _check_fixed_raw_storage(tracker, agreed_size)
             return
         if "values" not in tracker:
             tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
@@ -81,6 +93,11 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
+        raw_values = tracker.get("raw_values")
+        if raw_values is not None and raw_values.shape[0] < tracker["values"].shape[0]:
+            grown = torch.zeros_like(tracker["values"])
+            grown[: raw_values.shape[0]] = raw_values
+            tracker["raw_values"] = grown
 
     @staticmethod
     def save_loss_to_tracker(
@@ -89,6 +106,7 @@ class DSAIndexerLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        raw_loss: Optional[torch.Tensor] = None,
     ):
         """Save the indexer loss for logging.
 
@@ -98,6 +116,9 @@ class DSAIndexerLossLoggingHelper:
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
+            raw_loss: The unscaled loss, before the indexer loss coefficient is applied.
+                Optional so call sites that do not track it (for example fused kernels or
+                CSA) keep working; it is appended last to preserve the positional order above.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
@@ -112,6 +133,16 @@ class DSAIndexerLossLoggingHelper:
         needed = max(num_layers, layer_number)
         DSAIndexerLossLoggingHelper.ensure_tracker_size(needed)
         tracker["values"][layer_number - 1] += loss.detach()
+        if raw_loss is not None:
+            raw_values = tracker.get("raw_values")
+            if raw_values is None and tracker.get("agreed_size") is None:
+                # Lazy trackers allocate raw-loss storage on first use. Fixed-capacity trackers
+                # own it from initialize_dsa_metric_tracker(), so capture never reallocates.
+                raw_values = torch.zeros_like(tracker["values"])
+                tracker["raw_values"] = raw_values
+            if raw_values is not None:
+                raw_values[layer_number - 1] += raw_loss.detach()
+                tracker["raw_loss_recorded"] = True
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -123,6 +154,8 @@ class DSAIndexerLossLoggingHelper:
         avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
+        if "raw_values" in tracker:
+            tracker["raw_values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -133,6 +166,7 @@ class DSAIndexerLossLoggingHelper:
         configured_cp_size: Optional[int] = None,
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """Collect and reduce the indexer losses across ranks.
 
@@ -156,6 +190,10 @@ class DSAIndexerLossLoggingHelper:
                 logging and to validate the Dynamic-CP parent domain; defaults to the legacy
                 global process-group registry when omitted.
         """
+        if pg_collection is not None:
+            pp_group = pg_collection.pp if pp_group is None else pp_group
+            dp_group = pg_collection.dp if dp_group is None else dp_group
+
         tracker = DSAIndexerLossLoggingHelper.tracker
         if pp_group is None:
             # Legacy callers may omit the collection. Training passes the owning language-model
@@ -215,29 +253,74 @@ class DSAIndexerLossLoggingHelper:
             values = tracker.get("values")
             if values is None or values.shape[0] != size:
                 raise RuntimeError("DSA metric tracker storage does not match its fixed capacity.")
-        values = tracker["values"]
+            _check_fixed_raw_storage(tracker, size)
+        metric_tensors = [tracker["values"]]
+        if DSAIndexerLossLoggingHelper._agree_raw_loss_logging(
+            tracker, size, pp_group, lazy=agreed_size is None
+        ):
+            # Raw losses follow exactly the same reduction path as the scaled losses.
+            metric_tensors.append(tracker["raw_values"])
 
-        if dynamic_cp_parent_group is not None:
-            torch.distributed.all_reduce(values, group=pp_group)
-            values.mul_(configured_cp_size)
-            torch.distributed.all_reduce(
-                values, group=dynamic_cp_parent_group, op=torch.distributed.ReduceOp.AVG
-            )
-        else:
-            # Apply static-CP normalization on the PP stage that owns each indexer before
-            # broadcasting its layer slots across PP. Empty PP stages have no local group
-            # metadata and can safely skip CP because their values are still zero here.
-            if tracker.get('reduce_group') is not None:
-                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-            if tracker.get('avg_group') is not None:
+        for values in metric_tensors:
+            if dynamic_cp_parent_group is not None:
+                torch.distributed.all_reduce(values, group=pp_group)
+                values.mul_(configured_cp_size)
                 torch.distributed.all_reduce(
-                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                    values, group=dynamic_cp_parent_group, op=torch.distributed.ReduceOp.AVG
                 )
-            torch.distributed.all_reduce(values, group=pp_group)
-            if dp_group is None:
-                # Legacy fallback; explicit process-group collections are preferred.
-                dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
-            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
+            else:
+                # Apply static-CP normalization on the PP stage that owns each indexer before
+                # broadcasting its layer slots across PP. Empty PP stages have no local group
+                # metadata and can safely skip CP because their values are still zero here.
+                if tracker.get('reduce_group') is not None:
+                    torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+                if tracker.get('avg_group') is not None:
+                    torch.distributed.all_reduce(
+                        values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                    )
+                torch.distributed.all_reduce(values, group=pp_group)
+                if dp_group is None:
+                    # Legacy fallback; explicit process-group collections are preferred.
+                    dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
+                torch.distributed.all_reduce(
+                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
+                )
+
+    @staticmethod
+    def _agree_raw_loss_logging(tracker, size: int, pp_group, lazy: bool) -> bool:
+        """Return whether raw indexer losses are reduced and logged for this tracker.
+
+        Raw-loss writers are optional and may be absent from some PP stages, so the decision
+        is agreed once across PP and cached, keeping every rank's collectives matched.
+        Fixed-capacity raw storage is allocated on every PP rank by
+        initialize_dsa_metric_tracker(), so its absence is already a uniform "disabled".
+        Runs that never record a raw loss reduce and log nothing new.
+        """
+        enabled = tracker.get("raw_values_enabled")
+        if enabled is None:
+            if not lazy and "raw_values" not in tracker:
+                enabled = False
+            else:
+                enabled = bool(tracker.get("raw_loss_recorded", False))
+                if torch.distributed.is_initialized():
+                    flag = torch.tensor(
+                        [int(enabled)], device=torch.cuda.current_device(), dtype=torch.long
+                    )
+                    torch.distributed.all_reduce(
+                        flag, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                    )
+                    enabled = bool(flag.item())
+            tracker["raw_values_enabled"] = enabled
+        if not enabled:
+            return False
+        raw_values = tracker.get("raw_values")
+        if raw_values is None or raw_values.shape[0] < size:
+            # Only lazy trackers reach this: PP stages without a raw-loss writer join with zeros.
+            grown = torch.zeros_like(tracker["values"])
+            if raw_values is not None:
+                grown[: raw_values.shape[0]] = raw_values
+            tracker["raw_values"] = grown
+        return True
 
     @staticmethod
     def track_indexer_metrics(
@@ -254,6 +337,7 @@ class DSAIndexerLossLoggingHelper:
         configured_cp_size: Optional[int] = None,
         pp_group: Optional[torch.distributed.ProcessGroup] = None,
         dp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -276,6 +360,10 @@ class DSAIndexerLossLoggingHelper:
             pp_group: Pipeline-parallel group that owns the language model.
             dp_group: Data-parallel group that owns the language model.
         """
+        if pg_collection is not None:
+            pp_group = pg_collection.pp if pp_group is None else pp_group
+            dp_group = pg_collection.dp if dp_group is None else dp_group
+
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             num_layers=num_layers,
             dynamic_cp_parent_group=dynamic_cp_parent_group,
@@ -307,6 +395,20 @@ class DSAIndexerLossLoggingHelper:
 
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
+
+        raw_values = tracker.get("raw_values")
+        if tracker.get("raw_values_enabled", False) and raw_values is not None:
+            # Unscaled indexer loss (before the indexer loss coefficient), averaged as above.
+            avg_raw_indexer_loss = (raw_values * loss_scale).sum() / max(num_indexer_layers, 1)
+            if total_loss_dict is not None:
+                if "indexer raw loss" in total_loss_dict:
+                    total_loss_dict["indexer raw loss"] += avg_raw_indexer_loss
+                else:
+                    total_loss_dict["indexer raw loss"] = avg_raw_indexer_loss
+            if writer is not None:
+                writer.add_scalar("indexer raw loss", avg_raw_indexer_loss, iteration)
+            if wandb_writer is not None:
+                wandb_writer.log({"indexer raw loss": avg_raw_indexer_loss}, iteration)
 
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
@@ -422,6 +524,7 @@ def initialize_dsa_metric_tracker(
             raise RuntimeError("DSA metric tracker storage does not match its fixed capacity.")
         if agreed_size == 0 and values is not None:
             raise RuntimeError("Zero-capacity DSA metric tracker unexpectedly owns storage.")
+        _check_fixed_raw_storage(tracker, agreed_size)
         return agreed_size
 
     if torch.distributed.is_initialized():
@@ -432,10 +535,13 @@ def initialize_dsa_metric_tracker(
         local_required_size = int(size_tensor.item())
 
     size = local_required_size
-    if "values" in tracker:
+    if "values" in tracker or "raw_values" in tracker:
         raise RuntimeError("DSA metric tracker must be initialized before its first metric write.")
     if size > 0:
         tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        # Optional raw-loss storage shares the fixed capacity, so CUDA Graph captures of
+        # raw-loss writers also keep a stable address.
+        tracker["raw_values"] = torch.zeros(size, device=torch.cuda.current_device())
 
     tracker["agreed_size"] = size
     _record_tracker_pp_group(tracker, "agreed_size", pp_group)

@@ -16,8 +16,10 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
+from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 
 _EXPERT_VIEW = "expert"
+_WEIGHT_VIEW = "weights"
 
 
 @dataclass
@@ -33,23 +35,24 @@ class ModuleGridSpec:
     cp: int = 1
     pp: int = 1
     ep: int = 1
+    gtp_remat: int = 1
     rank_offset: int = 0
     # Experts default to TP=1 (set explicitly for MoE); intentionally not Megatron's etp=tp default.
     expt_tp: int = 1
+    expt_gtp_remat: int = 1
+    gtp_remat_num_sequence_shards: int = 1
+    """Sequence partitions within GTP_remat, excluding TP/SP; ``cp`` adds partitions."""
+
     dp: int = field(init=False)
     expt_dp: int = field(init=False)
 
     def __post_init__(self) -> None:
-        dense = self.tp * self.cp * self.pp
-        if self.num_ranks % dense != 0:
-            raise ValueError(
-                f"num_ranks ({self.num_ranks}) must be divisible by tp*cp*pp ({dense})"
-            )
-        self.dp = self.num_ranks // dense
-        expert = self.expt_tp * self.ep * self.pp
+        self.dp = self.gtp_layout.dp
+        expert = self.expt_tp * self.ep * self.expt_gtp_remat * self.pp
         if self.num_ranks % expert != 0:
             raise ValueError(
-                f"num_ranks ({self.num_ranks}) must be divisible by expt_tp*ep*pp ({expert})"
+                f"num_ranks ({self.num_ranks}) must be divisible by "
+                f"expt_tp*ep*expt_gtp_remat*pp ({expert})"
             )
         self.expt_dp = self.num_ranks // expert
 
@@ -57,6 +60,19 @@ class ModuleGridSpec:
     def size(self) -> int:
         """Total ranks spanned by this module's grid."""
         return self.num_ranks
+
+    @property
+    def gtp_layout(self) -> GTPParallelLayout:
+        """Weight and token ownership with GTP sequence sharding."""
+        return GTPParallelLayout(
+            self.num_ranks,
+            self.tp,
+            self.pp,
+            self.cp,
+            self.gtp_remat,
+            num_sequence_shards=self.gtp_remat_num_sequence_shards,
+            rank_offset=self.rank_offset,
+        )
 
 
 @dataclass
@@ -80,7 +96,9 @@ class HeteroTopology:
             grid.destroy()
 
 
-def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
+def create_topology(
+    specs: list[ModuleGridSpec], high_priority_stream_groups: Optional[list[str]] = None
+) -> HeteroTopology:
     """Build every module's grid, PGC, and embedding groups.
 
     Exactly one spec must be named ``MIMO_LANGUAGE_MODULE_KEY`` (the language module); specs must
@@ -100,11 +118,15 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
     module_pgs: dict[str, ProcessGroupCollection] = {}
     try:
         for spec in specs:
-            grids[spec.name] = _build_grid(spec)
+            grids[spec.name] = _build_grid(spec, high_priority_stream_groups)
         _validate_grid_layout(grids)
 
         for name, grid in grids.items():
-            module_pgs[name] = pg_collection_from_grid(grid, is_language=(name == language_name))
+            module_pgs[name] = pg_collection_from_grid(
+                grid,
+                is_language=(name == language_name),
+                high_priority_stream_groups=high_priority_stream_groups,
+            )
 
         schedule_pg_collection = build_schedule_pg_collection(grids, module_pgs, language_name)
         return HeteroTopology(
@@ -115,35 +137,107 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
         raise
 
 
-def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
+def _build_grid(
+    spec: ModuleGridSpec, high_priority_stream_groups: Optional[list[str]] = None
+) -> HyperCommGrid:
     """Create a dense grid plus its expert view and the process groups MIMO needs."""
+    layout = spec.gtp_layout if spec.gtp_remat_num_sequence_shards > 1 else None
     grid = HyperCommGrid(
-        shape=[spec.tp, spec.cp, spec.dp, spec.pp],
-        dim_names=["tp", "cp", "dp", "pp"],
+        shape=(
+            [
+                spec.tp,
+                spec.gtp_remat_num_sequence_shards,
+                spec.gtp_remat // spec.gtp_remat_num_sequence_shards,
+                spec.cp,
+                spec.dp,
+                spec.pp,
+            ]
+            if layout is not None
+            else [spec.tp, spec.cp, spec.gtp_remat, spec.dp, spec.pp]
+        ),
+        dim_names=(
+            ["tp", "gtp_remat_sequence_shards", "gtp_remat", "cp", "dp", "pp"]
+            if layout is not None
+            else ["tp", "cp", "gtp_remat", "dp", "pp"]
+        ),
         rank_offset=spec.rank_offset,
         backend="nccl",
     )
+    if layout is not None:
+        # CP and GTP sequence shards share a sample; the remaining GTP extent
+        # assigns independent samples. The weight view keeps all GTP weight shards together.
+        grid.register_view(
+            _WEIGHT_VIEW,
+            shape=[spec.tp, spec.gtp_remat, layout.num_weight_replicas, spec.pp],
+            dim_names=["tp", "gtp_remat", "dp", "pp"],
+            shared_dims=["tp", "pp"],
+        )
     # Expert factorization over the same rank span; pp is shared with the base view.
     grid.register_view(
         _EXPERT_VIEW,
-        shape=[spec.expt_tp, spec.ep, spec.expt_dp, spec.pp],
-        dim_names=["expt_tp", "ep", "expt_dp", "pp"],
+        shape=[spec.expt_tp, spec.ep, spec.expt_gtp_remat, spec.expt_dp, spec.pp],
+        dim_names=["expt_tp", "ep", "expt_gtp_remat", "expt_dp", "pp"],
         shared_dims=["pp"],
     )
 
+    def create_pg(dims: list[str], pg_name: str, *, view: Optional[str] = None) -> None:
+        grid.create_pg(
+            dims, view=view, pg_options=_get_pg_options(pg_name, high_priority_stream_groups)
+        )
+
     try:
-        for dims in (
-            ["tp"], ["cp"], ["pp"], ["dp"],
-            ["dp", "cp"], ["tp", "cp"], ["tp", "pp"],
-            ["tp", "dp"], ["tp", "dp", "cp"], ["tp", "cp", "dp", "pp"],
-        ):
-            grid.create_pg(dims)
-        for dims in (["ep"], ["expt_tp"], ["expt_dp"], ["expt_tp", "ep"], ["expt_tp", "ep", "pp"]):
-            grid.create_pg(dims, view=_EXPERT_VIEW)
+        pg_names = {
+            "dp_gtp_remat": "gtp_remat_dp",
+            "dp_cp_gtp_remat": "gtp_remat_dp_cp",
+            "intra_dist_opt": "intra_dist_opt_instance",
+        }
+        for field_name, (dims, view) in _dense_group_dims(layout is not None).items():
+            create_pg(dims, pg_names.get(field_name, field_name), view=view)
+
+        create_pg(["ep"], "ep", view=_EXPERT_VIEW)
+        create_pg(["expt_tp"], "ep_tp", view=_EXPERT_VIEW)
+        create_pg(["expt_gtp_remat"], "expt_gtp_remat", view=_EXPERT_VIEW)
+        create_pg(["expt_dp"], "ep_dp", view=_EXPERT_VIEW)
+        create_pg(["expt_tp", "ep"], "tp_ep_mp", view=_EXPERT_VIEW)
+        create_pg(["expt_tp", "ep", "pp"], "tp_ep_pp", view=_EXPERT_VIEW)
+        create_pg(
+            ["expt_tp", "ep", "expt_gtp_remat", "pp"], "tp_ep_gtp_remat_pp", view=_EXPERT_VIEW
+        )
+        create_pg(["expt_gtp_remat", "expt_dp"], "ep_gtp_remat_dp", view=_EXPERT_VIEW)
     except Exception:
         grid.destroy()
         raise
     return grid
+
+
+def _dense_group_dims(sequence_sharding: bool) -> dict[str, tuple[list[str], str | None]]:
+    """Map PGC fields to token or weight dimensions in the module grid."""
+    cp = ["cp", "gtp_remat_sequence_shards"] if sequence_sharding else ["cp"]
+    weights = _WEIGHT_VIEW if sequence_sharding else None
+    return {
+        "tp": (["tp"], None),
+        "gtp_remat": (["gtp_remat"], weights),
+        "cp": (cp, None),
+        "pp": (["pp"], None),
+        "dp": (["dp"], None),
+        "dp_cp": (["dp"] if sequence_sharding else ["dp", "cp"], weights),
+        "dp_gtp_remat": (["gtp_remat", "dp"], None),
+        "dp_cp_gtp_remat": (cp + ["gtp_remat", "dp"], None),
+        "tp_cp": (["tp"] + cp, None),
+        "mp": (["tp", "gtp_remat", "pp"], weights),
+        "tp_dp": (["tp", "gtp_remat", "dp"], None),
+        "tp_dp_cp": (["tp"] + cp + ["gtp_remat", "dp"], None),
+        "intra_dist_opt": (["tp"] + cp + ["gtp_remat", "dp", "pp"], None),
+    }
+
+
+def _get_pg_options(
+    group_name: str, high_priority_stream_groups: Optional[list[str]]
+) -> Optional[dist.ProcessGroupNCCL.Options]:
+    """Return high-priority NCCL options for a stock parallel-state group name."""
+    if group_name not in (high_priority_stream_groups or ()):
+        return None
+    return dist.ProcessGroupNCCL.Options(is_high_priority_stream=True)
 
 
 def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
@@ -181,46 +275,56 @@ def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
 
 
 def pg_collection_from_grid(
-    grid: HyperCommGrid, is_language: bool = False
+    grid: HyperCommGrid,
+    is_language: bool = False,
+    high_priority_stream_groups: Optional[list[str]] = None,
 ) -> ProcessGroupCollection:
     """Adapt a populated ``HyperCommGrid`` into a ``ProcessGroupCollection``.
 
     Only the language module gets embedding groups; others leave ``embd``/``pos_embd`` as ``None``.
     """
     pgc = ProcessGroupCollection()
-    pgc.tp = grid.get_pg("tp")
-    pgc.cp = grid.get_pg("cp")
-    pgc.pp = grid.get_pg("pp")
-    pgc.dp = grid.get_pg("dp")
-    pgc.dp_cp = grid.get_pg(["dp", "cp"])
+    group_dims = _dense_group_dims("gtp_remat_sequence_shards" in grid.dim_names)
+    for field_name, (dims, view) in group_dims.items():
+        setattr(pgc, field_name, grid.get_pg(dims, view=view))
     pgc.intra_dp_cp = pgc.dp_cp
-    pgc.tp_cp = grid.get_pg(["tp", "cp"])
-    pgc.tp_dp = grid.get_pg(["tp", "dp"])
-    pgc.tp_dp_cp = grid.get_pg(["tp", "dp", "cp"])
-    pgc.mp = grid.get_pg(["tp", "pp"])
-    pgc.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     pgc.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
     pgc.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
+    pgc.expt_gtp_remat = grid.get_pg("expt_gtp_remat", view=_EXPERT_VIEW)
     pgc.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
+    pgc.expt_dp_gtp_remat = grid.get_pg(["expt_gtp_remat", "expt_dp"], view=_EXPERT_VIEW)
     pgc.intra_expt_dp = pgc.expt_dp
     pgc.tp_ep = grid.get_pg(["expt_tp", "ep"], view=_EXPERT_VIEW)
     pgc.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
+    pgc.tp_ep_pp_with_egtp_remat = grid.get_pg(
+        ["expt_tp", "ep", "expt_gtp_remat", "pp"], view=_EXPERT_VIEW
+    )
     pgc.embd = None
     pgc.pos_embd = None
     if is_language:
-        _build_language_embedding_groups(grid, pgc)
+        _build_language_embedding_groups(grid, pgc, high_priority_stream_groups)
     return pgc
 
 
-def _build_language_embedding_groups(grid: HyperCommGrid, pgc: ProcessGroupCollection) -> None:
+def _build_language_embedding_groups(
+    grid: HyperCommGrid,
+    pgc: ProcessGroupCollection,
+    high_priority_stream_groups: Optional[list[str]] = None,
+) -> None:
     """Set this rank's word/position embedding groups, mirroring parallel_state.
 
     Creation is collective: every grid rank calls ``new_group`` for each PP tuple.
     """
     own_pp_ranks = tuple(dist.get_process_group_ranks(pgc.pp)) if pgc.pp is not None else ()
     for pp_ranks in grid.get_rank_enum("pp"):
-        emb_group = dist.new_group(ranks=default_embedding_ranks(list(pp_ranks)))
-        pos_group = dist.new_group(ranks=default_position_embedding_ranks(list(pp_ranks)))
+        emb_group = dist.new_group(
+            ranks=default_embedding_ranks(list(pp_ranks)),
+            pg_options=_get_pg_options("embd", high_priority_stream_groups),
+        )
+        pos_group = dist.new_group(
+            ranks=default_position_embedding_ranks(list(pp_ranks)),
+            pg_options=_get_pg_options("pos_embd", high_priority_stream_groups),
+        )
         if tuple(pp_ranks) == own_pp_ranks:
             if _is_process_group_member(emb_group):
                 pgc.embd = emb_group

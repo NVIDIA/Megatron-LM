@@ -24,6 +24,43 @@ def _get_aligned_hca_backward():
     return AlignedHCABackward, aligned_hca_backward_wrapper
 
 
+def prepare_aligned_hca_metadata(packed_seq_params: PackedSeqParams) -> None:
+    """Refresh the eager packing verdict once per microbatch, before model execution."""
+    packed_seq_params._aligned_hca_sequence = None
+    cu = packed_seq_params.cu_seqlens_q_padded
+    if cu is None:
+        cu = packed_seq_params.cu_seqlens_q
+    sequence_length = packed_seq_params.max_seqlen_q
+    if (
+        packed_seq_params.qkv_format != "thd"
+        or cu is None
+        or cu.ndim != 1
+        or cu.numel() < 2
+        or not isinstance(sequence_length, int)
+        or cu.is_inference()
+        or (cu.is_cuda and torch.cuda.is_current_stream_capturing())
+    ):
+        return
+    single_sequence = ((cu[0] == 0) & (cu[1:] == sequence_length).all()).item()
+    packed_seq_params._aligned_hca_sequence = (cu, cu._version, sequence_length, single_sequence)
+
+
+def _is_single_sequence(
+    packed_seq_params: PackedSeqParams, cu: Tensor, sequence_length: int
+) -> bool:
+    """Reuse prepared metadata only while its tensor and contents are unchanged."""
+    prepared = getattr(packed_seq_params, "_aligned_hca_sequence", None)
+    if (
+        prepared is not None
+        and prepared[0] is cu
+        and not cu.is_inference()
+        and prepared[1] == cu._version
+        and prepared[2] == sequence_length
+    ):
+        return prepared[3]
+    return ((cu[0] == 0) & (cu[1:] == sequence_length).all()).item()
+
+
 def aligned_hca_cp_rank(
     query: Tensor,
     kv: Tensor,
@@ -63,19 +100,19 @@ def aligned_hca_cp_rank(
         cu = packed_seq_params.cu_seqlens_q
     if cu is None or cu.ndim != 1 or cu.numel() < 2 or cu.device != query.device:
         return None
-    single_sequence = (cu[0] == 0) & (cu[1:] == sequence_length).all()
-    if torch.cuda.is_current_stream_capturing():
-        # Recheck device metadata on every replay, including reused input buffers.
-        torch._assert_async(
-            single_sequence,
-            "hca_aligned_backward CUDA graphs require one aligned padded sequence; "
-            "disable the flag for changing pack boundaries.",
-        )
-    elif not single_sequence.item():
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing and not _is_single_sequence(packed_seq_params, cu, sequence_length):
         return None
     api, _ = _get_aligned_hca_backward()
     if not api.supports_configuration(local_tokens, cp_size, query.device):
         return None
+    if capturing:
+        # Recheck device metadata on every replay, including reused input buffers.
+        torch._assert_async(
+            (cu[0] == 0) & (cu[1:] == sequence_length).all(),
+            "hca_aligned_backward CUDA graphs require one aligned padded sequence; "
+            "disable the flag for changing pack boundaries.",
+        )
     return cp_group.rank()
 
 
