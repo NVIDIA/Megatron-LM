@@ -1618,7 +1618,7 @@ def validate_args(args, defaults={}):
                 f'must be >= single sequence max length ({args.seq_length})'
             )
 
-    if args.sequence_packing_scheduler is not None and args.cuda_graph_impl == 'transformer_engine':
+    if args.sequence_packing_scheduler == 'dp_balanced' and args.cuda_graph_impl == 'transformer_engine':
         assert args.use_varlen_dataset and args.micro_batch_size == 1, (
             'Scheduler CUDA graphs require one variable-length sample per dataset item '
             'and --micro-batch-size 1.'
