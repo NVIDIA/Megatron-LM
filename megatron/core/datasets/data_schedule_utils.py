@@ -712,7 +712,9 @@ def build_packed_microbatches(
     return new_samples
 
 
-def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
+def get_batch_and_global_seqlens(
+    data_iterator, num_microbatches, dp_group, include_original_seqlens=False
+):
     """
     Get the batch and global sequence lengths.
     Each DP rank loads the same number of sequences, so we need to gather the sequence
