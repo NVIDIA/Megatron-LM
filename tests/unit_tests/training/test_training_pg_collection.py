@@ -8,13 +8,19 @@ collection distinct communicators over the same ranks, or a layout that differs 
 grid, so that a global read changes which group is used.
 """
 
+import importlib.util
+import pathlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.enums import ModelType
+from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel.schedules import (
     forward_backward_no_pipelining,
     forward_backward_pipelining_with_interleaving,
@@ -32,6 +38,13 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.skipif(
     Utils.world_size < 4 or Utils.world_size % 2 != 0, reason="Requires an even world of 4+ ranks"
 )
+
+_CHECKER_SPEC = importlib.util.spec_from_file_location(
+    "check_process_group_usage",
+    pathlib.Path(__file__).resolve().parents[3] / "tools" / "check_process_group_usage.py",
+)
+_checker = importlib.util.module_from_spec(_CHECKER_SPEC)
+_CHECKER_SPEC.loader.exec_module(_checker)
 
 
 class _TinyModel(MegatronModule):
@@ -51,6 +64,34 @@ def _same_ranks(group):
 
 def _ranks(group):
     return torch.distributed.get_process_group_ranks(group)
+
+
+def _forbid_global_grid(monkeypatch):
+    """Make the parallel_state accessors the usage checker counts, and the collection shim built
+    on them, raise when called."""
+
+    def read_global_grid(*args, **kwargs):
+        raise AssertionError("read a process group of the global parallel grid")
+
+    for name, value in list(vars(parallel_state).items()):
+        if callable(value) and _checker._is_deprecated_accessor(name):
+            monkeypatch.setattr(parallel_state, name, read_global_grid)
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", read_global_grid)
+
+
+class _DenseAndExpertLinear(torch.nn.Module):
+    """One dense and one expert-parallel weight, so the optimizer builds both of its groups."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.dense = torch.nn.Linear(16, 16, bias=False, device="cuda")
+        self.experts = torch.nn.Linear(16, 16, bias=False, device="cuda")
+        self.experts.weight.allreduce = False
+
+
+class _OptimizerBuilt(Exception):
+    """Stops setup_model_and_optimizer once it has built the optimizer."""
 
 
 class TestTrainingPgCollection:
@@ -95,6 +136,110 @@ class TestTrainingPgCollection:
 
         with pytest.raises(ValueError, match="all-gather groups whose ranks differ"):
             training._build_pg_collection_from_parallel_state(args)
+
+    @pytest.mark.usefixtures("run_config")
+    @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
+    def test_collection_carries_the_grid_gloo_groups(self, use_gloo_process_groups):
+        Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
+        args = SimpleNamespace(create_all_gather_group=False, expert_model_parallel_size=1)
+
+        pg_collection = training._build_pg_collection_from_parallel_state(args)
+
+        if not use_gloo_process_groups:
+            assert pg_collection.intra_dp_cp_gloo is None
+            assert pg_collection.intra_expt_dp_gloo is None
+            return
+        # The Gloo mirrors of the groups the distributed optimizer shards over.
+        assert pg_collection.intra_dp_cp_gloo is not None
+        assert pg_collection.intra_dp_cp_gloo is parallel_state.get_data_parallel_group_gloo(
+            with_context_parallel=True, partial_data_parallel=True
+        )
+        assert pg_collection.intra_expt_dp_gloo is not None
+        assert pg_collection.intra_expt_dp_gloo is (
+            parallel_state.get_expert_data_parallel_group_gloo(partial_expert_data_parallel=True)
+        )
+
+    @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
+    def test_setup_builds_the_optimizer_on_the_collection(
+        self, monkeypatch, run_config, use_gloo_process_groups
+    ):
+        Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
+        run_config.dist.use_gloo_process_groups = use_gloo_process_groups
+        # The collection pretrain() builds and hands to setup_model_and_optimizer().
+        pg_collection = training._build_pg_collection_from_parallel_state(
+            SimpleNamespace(create_all_gather_group=False, expert_model_parallel_size=1)
+        )
+        if use_gloo_process_groups:
+            # Distinct Gloo communicators over the data-parallel ranks (every rank on this grid),
+            # so the optimizer holds them only if it takes its Gloo groups from the collection.
+            pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(
+                ranks=_ranks(pg_collection.dp_cp), backend="gloo"
+            )
+            pg_collection.intra_expt_dp_gloo = torch.distributed.new_group(
+                ranks=_ranks(pg_collection.expt_dp), backend="gloo"
+            )
+        config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
+        model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(use_distributed_optimizer=True),
+            _DenseAndExpertLinear(config),
+            pg_collection=pg_collection,
+        )
+        get_model = Mock(return_value=[model])
+        build_optimizer = training.get_megatron_optimizer
+        optimizer_calls = []
+        optimizers = []
+
+        def get_megatron_optimizer(*args, **kwargs):
+            optimizer_calls.append(kwargs)
+            with pytest.MonkeyPatch.context() as patch:
+                _forbid_global_grid(patch)
+                optimizers.append(build_optimizer(*args, **kwargs))
+            return optimizers[-1]
+
+        monkeypatch.setattr(
+            training,
+            "get_args",
+            lambda: SimpleNamespace(
+                logits_save_dir=None, logits_load_dir=None, dump_param_to_param_group_map=None
+            ),
+        )
+        monkeypatch.setattr(training, "get_timers", Mock())
+        monkeypatch.setattr(training, "get_one_logger", lambda: None)
+        monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+        monkeypatch.setattr(training, "is_gtp_remat_active", lambda args: False)
+        monkeypatch.setattr(training, "get_model", get_model)
+        monkeypatch.setattr(
+            training,
+            "get_megatron_optimizer_config",
+            lambda args: (
+                OptimizerConfig(optimizer="adam", lr=1e-3, use_distributed_optimizer=True),
+                None,
+            ),
+        )
+        monkeypatch.setattr(training, "get_megatron_optimizer", get_megatron_optimizer)
+        monkeypatch.setattr(
+            training, "get_optimizer_param_scheduler", Mock(side_effect=_OptimizerBuilt)
+        )
+
+        with pytest.raises(_OptimizerBuilt):
+            training.setup_model_and_optimizer(
+                ModelType.encoder_or_decoder,
+                Mock(),
+                cfg_container=run_config,
+                pg_collection=pg_collection,
+            )
+
+        # The model and its optimizer are built on the one collection, Gloo groups included.
+        assert get_model.call_args.kwargs["pg_collection"] is pg_collection
+        (optimizer_kwargs,) = optimizer_calls
+        assert optimizer_kwargs["pg_collection"] is pg_collection
+        assert optimizer_kwargs["use_gloo_process_groups"] is use_gloo_process_groups
+        dense_optimizer, expert_optimizer = optimizers[0].chained_optimizers
+        assert isinstance(dense_optimizer, DistributedOptimizer)
+        assert isinstance(expert_optimizer, DistributedOptimizer)
+        assert dense_optimizer.data_parallel_group_gloo is pg_collection.intra_dp_cp_gloo
+        assert expert_optimizer.data_parallel_group_gloo is pg_collection.intra_expt_dp_gloo
 
     @pytest.mark.usefixtures("run_config")
     def test_get_model_wraps_ddp_with_the_given_collection(self, monkeypatch):
