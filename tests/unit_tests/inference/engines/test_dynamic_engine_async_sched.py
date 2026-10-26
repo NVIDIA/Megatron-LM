@@ -2059,7 +2059,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
 
         def step():
             context = env.engine.context
-            recapture_was_pending = env.engine._cuda_graph_recapture_dimensions is not None
             runtime["max_active"] = max(
                 runtime["max_active"], context.total_request_count - context.paused_request_count
             )
@@ -2067,9 +2066,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             result = env.engine.step_modern()
             runtime["steps"] += 1
             runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
-            runtime["cuda-graph-deferred-eager-steps"] += int(
-                recapture_was_pending and not context.using_cuda_graph_this_step()
-            )
             runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
             for request in result["finished_requests"]:
                 env.requests[request.request_id] = request
