@@ -64,6 +64,7 @@ from .kv_block_allocator import MAX_CACHED_PROMPT_TOP_N_LOGPROBS, KVBlockAllocat
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .mtp_context_mixin import MTPContextMixin
 from .routing_metadata import RoutingMetadata
+from .zero_padding_rows_kernel import zero_padding_rows
 
 # These callbacks are currently consumed only by the Dynamo frontend.
 KVEventListener = Callable[[str, dict[str, Any]], None]
@@ -1855,6 +1856,28 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
+
+    def zero_padding_tokens(self, tensor: Tensor, sequence_parallel_rank: int = 0) -> None:
+        """Zero, in place, the rows of a token-major activation that belong to padding tokens.
+
+        Rows at or past this step's real token count are padding. Their values still reach
+        the amax of FP8/FP4 GEMMs, so callers zero them before quantized layers. The count is
+        read on device from ``gpu_view.real_token_count`` rather than taken from
+        ``padding_slice``: a Python slice is frozen when a CUDA graph is captured, and capture
+        fills the graph with dummy tokens, so slice-based zeroing would be empty on every
+        replay.
+
+        Args:
+            tensor: Activation whose first dimension is the padded token dimension.
+            sequence_parallel_rank: If ``tensor`` is this rank's sequence-parallel shard, the
+                rank's index in the tensor-parallel group, so that local row ``i`` is treated
+                as token ``i + sequence_parallel_rank * tensor.shape[0]``.
+        """
+        zero_padding_rows(
+            tensor,
+            self.gpu_view.real_token_count,
+            first_token_idx=sequence_parallel_rank * tensor.shape[0],
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""

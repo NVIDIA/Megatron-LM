@@ -1006,6 +1006,28 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+class _MTPHeadGradInjector(torch.autograd.Function):
+    """Route a gradient that was already computed for an MTP head input into the main graph.
+
+    Used by ``mtp_loss_early_backward``: the head's projection + loss + backward have already
+    run, producing ``head_grad`` for the (detached) head input. This node is a no-op in forward
+    and, in backward, hands ``head_grad`` to ``head_hidden`` so it flows into the MTP layers and
+    the main model exactly as the deferred path would have delivered it.
+    """
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, head_hidden: torch.Tensor, head_grad: torch.Tensor):
+        """Pass ``output`` through; stash the precomputed gradient for ``head_hidden``."""
+        ctx.save_for_backward(head_grad)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Return the pass-through gradient and the precomputed head-input gradient."""
+        (head_grad,) = ctx.saved_tensors
+        return grad_output, head_grad, None
+
+
 def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
     """Whether the loss callable takes ``return_argmax`` (LanguageModule's loss does)."""
     try:
@@ -1125,12 +1147,16 @@ def process_mtp_loss(
         )
         mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
 
-    for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=False,
-        )
+    def _mtp_head_loss(
+        mtp_layer_number: int, head_hidden: Tensor, head_labels: Tensor, layer_loss_mask: Tensor
+    ):
+        """Project one MTP depth to the vocabulary and compute its masked per-token loss.
+
+        Returns ``(masked_loss, correct, total)``. ``correct``/``total`` are the acceptance
+        counts (``None`` when not training). Everything that allocates [s, b, v] tensors for
+        one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
+        """
+        mtp_logits, _ = output_layer(head_hidden, weight=output_weight, runtime_gather_output=False)
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         if is_observing_tensor("mtp_logits"):
@@ -1143,6 +1169,30 @@ def process_mtp_loss(
                 sequence_dim=0,
                 batch_dim=1,
             )
+        mtp_preds = None
+        if loss_returns_argmax:
+            head_loss, mtp_preds = compute_language_model_loss(
+                head_labels, mtp_logits, return_argmax=True
+            )
+        else:
+            head_loss = compute_language_model_loss(head_labels, mtp_logits)
+        correct = total = None
+        if is_training:
+            correct, total = _compute_mtp_acceptance_counts(
+                mtp_logits, head_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
+            )
+        head_loss = layer_loss_mask * head_loss
+        return head_loss, correct, total
+
+    # Early backward: fwd(head) -> bwd(head) per depth so at most one head's logits/softmax is
+    # resident at a time. Needs a live graph and cannot run inside CUDA-graph capture/warmup.
+    early_backward = False
+    if getattr(config, "mtp_loss_early_backward", False) and torch.is_grad_enabled():
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        early_backward = not (is_graph_capturing() or is_graph_warmup())
+
+    for mtp_layer_number in range(config.mtp_num_layers):
         if config.attention_cp_layout == "contiguous":
             mtp_labels, loss_mask, mtp_input_mask = roll_contiguous_fields(
                 (mtp_labels, loss_mask, mtp_input_mask), cp_group, packed_seq_params
@@ -1200,23 +1250,19 @@ def process_mtp_loss(
                 # no-mask fast path for all non-multimodal MTP callers.
                 num_tokens = rolled_num_tokens
 
-        mtp_preds = None
-        if loss_returns_argmax:
-            mtp_loss, mtp_preds = compute_language_model_loss(
-                mtp_labels, mtp_logits, return_argmax=True
-            )
-        else:
-            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-
-        mtp_loss = layer_loss_mask * mtp_loss
+        head_hidden = hidden_states_list[mtp_layer_number + 1]
+        # In early-backward mode the head runs on a detached leaf so its backward stops at the
+        # head input; the resulting gradient is re-injected into the main graph below.
+        head_input = head_hidden.detach().requires_grad_(True) if early_backward else head_hidden
+        mtp_loss, correct, total = _mtp_head_loss(
+            mtp_layer_number, head_input, mtp_labels, layer_loss_mask
+        )
 
         if is_training:
+            # Logging only: detach so nothing here keeps this head's graph alive.
             mtp_loss_for_log = (
-                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+                torch.sum(mtp_loss.detach()) * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
-            correct, total = _compute_mtp_acceptance_counts(
-                mtp_logits, mtp_labels, layer_loss_mask, tp_group=tp_group, preds=mtp_preds
-            )
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1245,12 +1291,24 @@ def process_mtp_loss(
             mtp_loss_normalized = (
                 mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
             )
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+
+        if early_backward:
+            # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
+            # frees this head's logits/softmax and accumulates the output-layer weight gradient
+            # before the next head (or the main head) allocates its own logits.
+            torch.autograd.backward(
+                mtp_loss_normalized,
+                torch.ones_like(mtp_loss_normalized) * MTPLossAutoScaler.main_loss_backward_scale,
             )
+            head_grad = head_input.grad
+            head_input.grad = None
+            del mtp_loss, mtp_loss_normalized, head_input
+            hidden_states = _MTPHeadGradInjector.apply(hidden_states, head_hidden, head_grad)
+        else:
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
 
     return hidden_states
 

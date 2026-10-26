@@ -44,6 +44,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
+    get_pg_rank,
     is_using_quantization_scales,
     log_single_rank,
 )
@@ -505,13 +506,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
+            # quantization scales to avoid corrupting amax calculations. Under sequence
+            # parallelism, decoder_input holds this rank's shard of the tokens.
             if (
-                inference_context is not None
+                decoder_input is not None
+                and inference_context is not None
                 and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
-                decoder_input[inference_context.padding_slice] = 0.0
+                inference_context.zero_padding_tokens(
+                    decoder_input,
+                    sequence_parallel_rank=(
+                        get_pg_rank(self.pg_collection.tp) if self.config.sequence_parallel else 0
+                    ),
+                )
 
             # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
             # reference held by this caller function, enabling early garbage collection for
