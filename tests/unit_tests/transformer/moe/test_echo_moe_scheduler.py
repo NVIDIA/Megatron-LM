@@ -564,6 +564,7 @@ def test_moe_layer_scheduler_helper_uses_unified_scheduler_output():
     physical_routing_map[:, 1] = routing_map[:, 1]
 
     class _RecordingScheduler:
+        expert_dispatch = SimpleNamespace(owns_token_preprocessing=False)
         max_dispatch_routes_per_rank = 4
         max_dispatch_padded_tokens_per_rank = 256
 

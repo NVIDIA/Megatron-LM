@@ -1227,7 +1227,13 @@ class TopKRouter(Router):
                 topk_indices=topk_indices,
                 dense_output=dense_output and not fused,
             )
-            if self.config.moe_virtual_expert_load_balance and fused:
+            if (
+                dense_output
+                and fused
+                and (
+                    self.config.moe_virtual_expert_load_balance or self.config.moe_enable_scheduler
+                )
+            ):
                 # TE returns compact IDs but full-width probabilities; normalize the pair.
                 probs = probs.gather(1, routing_map)
 
