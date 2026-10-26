@@ -75,6 +75,9 @@ saved in the optimizer step.
 
 ## Algorithm options
 
+Both options need a separate optimizer for excluded parameters, such as
+biases and embeddings.
+
 ### Gather and scatter
 
 **Implemented in [`FsdpMuon`](../megatron_fsdp/experimental/muon.py).** Keep
@@ -109,18 +112,10 @@ other ranks hold empty shards for that matrix.
 2. Reduce each matrix's gradient to its owner.
 3. Update momentum, orthogonalize, and update weights locally on the owner.
 
-This removes optimizer-step matrix communication. Forward/backward still
-communicate at the module-group level, but owner segments can differ in
-size or be empty. Balancing ownership across the model does not ensure
-balance within every module. Communication must handle these uneven
-segments without padding every rank to the largest contribution, as
-explained in the [authors' discussion](https://github.com/NVIDIA/Megatron-LM/issues/6161#issuecomment-5229334204).
-
-MFSDP already supports [`TensorAtomic`](../megatron_fsdp/experimental/placement.py)
-layouts and [uneven DBuffer collectives](../megatron_fsdp/experimental/dbuffer.py).
-The next step is a direct Muon path that skips gather/scatter staging and
-local copies. Both approaches need a companion optimizer for excluded
-parameters, such as biases and embeddings.
+This removes optimizer-step matrix communication. Forward/backward should
+[communicate uneven owner segments without padding](https://github.com/NVIDIA/Megatron-LM/issues/6161#issuecomment-5229334204).
+MFSDP already provides the [layouts](../megatron_fsdp/experimental/placement.py)
+and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 
 ## Tradeoffs
 
@@ -137,7 +132,8 @@ to the cost of uneven forward/backward communication.
 
 ## Next step
 
-Keep gather/scatter as the baseline and prototype the TensorAtomic fast
-path. Compare forward/backward time, full-step time, and peak memory with
-identical module boundaries, precision, and optimizer settings; verify
-updates against full-matrix Muon. Include single-node and multi-node runs.
+Keep gather/scatter as the baseline and prototype TensorAtomic support in
+Muon that skips gather/scatter staging and local copies. Compare
+forward/backward time, full-step time, and peak memory with identical
+module boundaries, precision, and optimizer settings; verify updates
+against full-matrix Muon. Include single-node and multi-node runs.
