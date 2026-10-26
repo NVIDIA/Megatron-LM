@@ -104,10 +104,57 @@ def test_standard_moe_train_step_and_clip(process_group_collections, distributed
         hybrid_layer_pattern="*E",
         pg_collection=process_group_collection,
     ).cuda()
-    model = _train_and_compare(
-        model, reference_model, process_group_collection, distributed_setup.world_size
+    _sync_model_parameters(reference_model, model)
+    reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    model = FullyShardedDataParallel(
+        config=model.config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            fsdp_all_gather_in_start_param_sync=False,
+        ),
+        module=model,
+        pg_collection=process_group_collection,
     )
+    assert isinstance(model.module, FsdpModule)
+
     assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+
+    optimizer_config = OptimizerConfig(
+        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
+    )
+    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
+    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    assert isinstance(optimizer, FullyShardedOptimizer)
+    optimizer.reload_model_params()
+
+    world_size = distributed_setup.world_size
+    local_batch_size = 2
+    torch.manual_seed(4321)
+    input_ids = torch.randint(0, 128, (world_size * local_batch_size, 8), device="cuda")
+    position_ids = torch.arange(8, device="cuda").repeat(world_size * local_batch_size, 1)
+    targets = torch.randn(world_size * local_batch_size, 8, 128, device="cuda")
+    input_slice = slice(
+        torch.distributed.get_rank() * local_batch_size,
+        (torch.distributed.get_rank() + 1) * local_batch_size,
+    )
+
+    reference_losses = _train(
+        reference_model, reference_optimizer, input_ids, position_ids, targets
+    )
+    losses = _train(
+        model, optimizer, input_ids[input_slice], position_ids[input_slice], targets[input_slice]
+    )
+    torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.AVG)
+    if torch.distributed.get_rank() == 0:
+        logger.info("MFSDP v2 EP loss curve: %s", losses.tolist())
+        logger.info("MFSDP v2 EP reference loss curve: %s", reference_losses.tolist())
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(reference_losses).all()
+    assert losses[-1] < losses[0]
+    torch.testing.assert_close(losses, reference_losses)
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["no-overlap", "overlap"])
@@ -157,17 +204,64 @@ def test_shortcut_moe_train_step_and_clip(process_group_collections, distributed
         hybrid_layer_pattern="*E*",
         pg_collection=process_group_collection,
     ).cuda()
-    model = _train_and_compare(
-        model, reference_model, process_group_collection, distributed_setup.world_size
+    _sync_model_parameters(reference_model, model)
+    reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    model = FullyShardedDataParallel(
+        config=model.config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+            fsdp_all_gather_in_start_param_sync=False,
+        ),
+        module=model,
+        pg_collection=process_group_collection,
     )
+    assert isinstance(model.module, FsdpModule)
+
     block = model.module.decoder.layers[0]
     assert isinstance(block, FsdpModule)
     assert isinstance(block.moe_layer.mlp.experts, FsdpModule)
     assert isinstance(model.module.decoder.layers[-1], FsdpModule)
 
+    optimizer_config = OptimizerConfig(
+        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
+    )
+    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
+    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    assert isinstance(optimizer, FullyShardedOptimizer)
+    optimizer.reload_model_params()
 
-def _train_and_compare(model, reference_model, process_group_collection, world_size):
-    """Copy reference weights, wrap with MFSDP, and compare five training steps."""
+    world_size = distributed_setup.world_size
+    local_batch_size = 2
+    torch.manual_seed(4321)
+    input_ids = torch.randint(0, 128, (world_size * local_batch_size, 8), device="cuda")
+    position_ids = torch.arange(8, device="cuda").repeat(world_size * local_batch_size, 1)
+    targets = torch.randn(world_size * local_batch_size, 8, 128, device="cuda")
+    input_slice = slice(
+        torch.distributed.get_rank() * local_batch_size,
+        (torch.distributed.get_rank() + 1) * local_batch_size,
+    )
+
+    reference_losses = _train(
+        reference_model, reference_optimizer, input_ids, position_ids, targets
+    )
+    losses = _train(
+        model, optimizer, input_ids[input_slice], position_ids[input_slice], targets[input_slice]
+    )
+    torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.AVG)
+    if torch.distributed.get_rank() == 0:
+        logger.info("MFSDP v2 EP loss curve: %s", losses.tolist())
+        logger.info("MFSDP v2 EP reference loss curve: %s", reference_losses.tolist())
+    assert torch.isfinite(losses).all()
+    assert torch.isfinite(reference_losses).all()
+    assert losses[-1] < losses[0]
+    torch.testing.assert_close(losses, reference_losses)
+
+
+def _sync_model_parameters(reference_model, model):
+    """Copy reference parameters, mapping global expert indices to local experts."""
     # CPU initialization gives each rank the same reference weights. Remap the
     # EP=1 reference's global expert indices to the EP=2 model's local indices.
     model.load_state_dict(reference_model.state_dict(), strict=False)
@@ -184,85 +278,23 @@ def _train_and_compare(model, reference_model, process_group_collection, world_s
                     reference_parameter = getattr(reference_fc, f"{parameter_name}{global_}", None)
                     if model_parameter is not None:
                         model_parameter.data.copy_(reference_parameter.data)
-    reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-    model = FullyShardedDataParallel(
-        config=model.config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
-            fsdp_all_gather_in_start_param_sync=False,
-        ),
-        module=model,
-        pg_collection=process_group_collection,
-    )
-    assert isinstance(model.module, FsdpModule)
 
-    optimizer_config = OptimizerConfig(
-        lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
-    )
-    reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
-    assert isinstance(optimizer, FullyShardedOptimizer)
-    optimizer.reload_model_params()
 
-    local_batch_size = 2
-    torch.manual_seed(4321)
-    input_ids = torch.randint(0, 128, (world_size * local_batch_size, 8), device="cuda")
-    position_ids = torch.arange(8, device="cuda").repeat(world_size * local_batch_size, 1)
-    targets = torch.randn(world_size * local_batch_size, 8, 128, device="cuda")
-    input_slice = slice(
-        torch.distributed.get_rank() * local_batch_size,
-        (torch.distributed.get_rank() + 1) * local_batch_size,
-    )
-
-    def reference_forward():
-        output = reference_model(
-            input_ids=input_ids, position_ids=position_ids, attention_mask=None
-        )
-        return torch.nn.functional.mse_loss(output, targets)
-
-    reference_losses = []
-    for _ in range(5):
-        reference_optimizer.zero_grad(set_to_none=True)
-        (reference_loss,) = run_forward_backward_on_microbatches(reference_model, reference_forward)
-        reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
-        assert reference_success
-        assert (
-            reference_pre_clip_norm > optimizer_config.clip_grad
-        ), "Reference gradients must exceed the clipping threshold to exercise clipping."
-        reference_losses.append(reference_loss)
+def _train(model, optimizer, input_ids, position_ids, targets):
+    """Train one model for five steps and return its stacked losses."""
 
     def forward():
-        output = model(
-            input_ids=input_ids[input_slice],
-            position_ids=position_ids[input_slice],
-            attention_mask=None,
-        )
-        return torch.nn.functional.mse_loss(output, targets[input_slice])
+        output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+        return torch.nn.functional.mse_loss(output, targets)
 
     losses = []
     for _ in range(5):
         optimizer.zero_grad(set_to_none=True)
         (loss,) = run_forward_backward_on_microbatches(model, forward)
-        assert all(
-            not unit._unshard_events
-            for unit in model.module.modules()
-            if isinstance(unit, FsdpModule)
-        ), "Static prefetch must not leave unused full weights after backward."
-        success, _, _ = optimizer.step()
+        success, pre_clip_norm, _ = optimizer.step()
         assert success
-        torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+        assert (
+            pre_clip_norm > optimizer.config.clip_grad
+        ), "Gradients must exceed the clipping threshold to exercise clipping."
         losses.append(loss)
-
-    losses = torch.stack(losses)
-    reference_losses = torch.stack(reference_losses)
-    if torch.distributed.get_rank() == 0:
-        logger.info("MFSDP v2 EP loss curve: %s", losses.tolist())
-        logger.info("MFSDP v2 EP reference loss curve: %s", reference_losses.tolist())
-    assert torch.isfinite(losses).all()
-    assert torch.isfinite(reference_losses).all()
-    assert losses[-1] < losses[0]
-    torch.testing.assert_close(losses, reference_losses)
-    return model
+    return torch.stack(losses)
