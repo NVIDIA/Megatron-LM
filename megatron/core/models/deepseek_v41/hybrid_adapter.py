@@ -12,6 +12,7 @@ from megatron.core.extensions.transformer_engine import te_checkpoint
 from megatron.core.fp8_utils import get_fp8_context, get_fp8_recipe, is_first_last_bf16_layer
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_layer_spec,
@@ -72,8 +73,36 @@ class _LayerRegion(nn.Module):
         return hidden, self.codec.snapshot(csa, mhc, values, boundary + 1, loss=self.loss)
 
 
+class _LayerGroupRegion(nn.Module):
+    """Replay a local layer group with fresh shared state and explicit auxiliary losses."""
+
+    def __init__(self, layers, codec, kwargs, loss_layers):
+        super().__init__()
+        self.regions = nn.ModuleList(
+            _LayerRegion(layer, codec, kwargs, layer.layer_number - 1 in loss_layers)
+            for layer in layers
+        )
+        self.training = layers[0].training
+
+    def forward(self, hidden, values):
+        """Keep intermediate producers live inside the group, exporting only its boundary."""
+        hashes = values.get('hashes')
+        objectives = {}
+        for region in self.regions:
+            if getattr(region.layer, 'engram', None) is not None:
+                values = {**values, 'hashes': hashes}
+            accumulator = hidden
+            hidden, values = region(hidden, values)
+            observe_layer_residuals(region.layer, accumulator, hidden)
+            if region.loss:
+                objectives[f'indexer_loss_{region.layer.layer_number - 1}'] = values.pop(
+                    'indexer_loss'
+                )
+        return hidden, {**values, **objectives}
+
+
 class DeepSeekV41Adapter:
-    """Model-owned layer execution; the generic stack retains its sole layer loop."""
+    """Model-owned eager, graph and checkpoint execution of explicit V4.1 state."""
 
     def __init__(
         self,
@@ -135,25 +164,104 @@ class DeepSeekV41Adapter:
             values,
         )
 
-    def run_layer(self, layer, hidden_states, context, **kwargs):
+    def _has_indexer_loss(self, layer):
+        return (
+            layer.layer_number - 1 in self.config.csa2_index_source_layers
+            and layer.training
+            and torch.is_grad_enabled()
+            and (self.config.dsa_indexer_loss_coeff or 0) > 0
+        )
+
+    def _prepare_hashes(self, context):
+        if context.hashes is not None:
+            return
+        layout = context.cross_layer_state.thd_layout
+        context.hashes = context.hasher(
+            context.values['tokens'],
+            None if layout is None else layout.valid_tokens.unsqueeze(0),
+            None if layout is None else layout.sequence_ids.unsqueeze(0),
+            cp_group=self.pg_collection.cp,
+        )
+
+    def checkpointed_forward(self, layers, hidden_states, context, **kwargs):
+        """Honor uniform group sizes or a block count within this PP/VPP stage."""
+        c, codec = self.config, context.codec
+        if context.capture is not None or self.graphs:
+            raise ValueError('Full recompute and layer capture are separate execution profiles')
+        uniform = c.recompute_method == 'uniform'
+        group_size = c.recompute_num_layers if uniform else 1
+        kwargs = dict(kwargs)
+        kwargs.pop('packed_seq_params', None)
+        for start in range(0, len(layers), group_size):
+            group = layers[start : start + group_size]
+            if not uniform and start >= c.recompute_num_layers:
+                layer = group[0]
+                accumulator = hidden_states
+                with get_fp8_context(layer.config, layer.layer_number - 1):
+                    hidden_states = self.run_layer(
+                        layer,
+                        hidden_states,
+                        context,
+                        recompute=False,
+                        packed_seq_params=codec.packed(context.values),
+                        **kwargs,
+                    )
+                observe_layer_residuals(layer, accumulator, hidden_states)
+                continue
+            first, end = group[0].layer_number - 1, group[-1].layer_number
+            values = codec.snapshot(
+                context.cross_layer_state, context.mhc_state, context.values, first
+            )
+            inputs = codec.schema(first).fields
+            if any(getattr(layer, 'engram', None) is not None for layer in group):
+                self._prepare_hashes(context)
+                values['hashes'] = context.hashes
+                inputs = (
+                    *inputs,
+                    TensorField('hashes', tuple(context.hashes.shape), torch.int64, 'contiguous'),
+                )
+            loss_layers = tuple(
+                layer.layer_number - 1 for layer in group if self._has_indexer_loss(layer)
+            )
+            loss_fields = tuple(
+                TensorField(f'indexer_loss_{i}', (), torch.float32, 'contiguous', True)
+                for i in loss_layers
+            )
+            region = StatefulModule(
+                _LayerGroupRegion(group, codec, kwargs, loss_layers),
+                inputs,
+                (*codec.schema(end).fields, *loss_fields),
+            )
+            if c.fp8:
+                result = te_checkpoint(
+                    region,
+                    c.distribute_saved_activations,
+                    get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    *region.inputs.pack(values),
+                    use_reentrant=False,
+                )
+                hidden_states, values = region.restore_result(result, values)
+            else:
+                hidden_states, values = region.run(hidden_states, values, recompute=True)
+            objectives = [(i, values.pop(f'indexer_loss_{i}')) for i in loss_layers]
+            csa, mhc, _ = codec.restore(values, end)
+            context.cross_layer_state, context.mhc_state, context.values = csa, mhc, values
+            for layer_id, objective in objectives:
+                hidden_states = self._attach_loss(hidden_states, context, objective, layer_id)
+            self._retire_state(context)
+        return hidden_states
+
+    def run_layer(self, layer, hidden_states, context, *, recompute=None, **kwargs):
         """Run eagerly, with explicit checkpointing, or in a prepared graph slot."""
         c, codec, csa = self.config, context.codec, context.cross_layer_state
         layer_id = layer.layer_number - 1
-        loss = (
-            layer_id in c.csa2_index_source_layers
-            and layer.training
-            and torch.is_grad_enabled()
-            and (c.dsa_indexer_loss_coeff or 0) > 0
-        )
-        if getattr(layer, 'engram', None) is not None and context.hashes is None:
-            layout = csa.thd_layout
-            context.hashes = context.hasher(
-                context.values['tokens'],
-                None if layout is None else layout.valid_tokens.unsqueeze(0),
-                None if layout is None else layout.sequence_ids.unsqueeze(0),
-                cp_group=self.pg_collection.cp,
-            )
-        recompute = layer.training and c.recompute_granularity == 'full'
+        loss = self._has_indexer_loss(layer)
+        if getattr(layer, 'engram', None) is not None:
+            self._prepare_hashes(context)
+        if recompute is None:
+            recompute = layer.training and c.recompute_granularity == 'full'
         graph_key = (layer_id, codec.shape, loss, layer.training)
         capture = context.capture is not None and layer_id in context.capture['layers']
         if capture and layer_id % 2:
@@ -231,6 +339,12 @@ class DeepSeekV41Adapter:
             )
             objective = csa.indexer_loss
             context.values = codec.snapshot(csa, context.mhc_state, context.values, layer_id + 1)
+        hidden_states = self._attach_loss(hidden_states, context, objective, layer_id)
+        self._retire_state(context)
+        return hidden_states
+
+    def _attach_loss(self, hidden_states, context, objective, layer_id):
+        c, codec = self.config, context.codec
         if objective is not None:
             logged = objective.detach()
             if c.calculate_per_token_loss:
@@ -247,6 +361,10 @@ class DeepSeekV41Adapter:
                 reduce_group=self.pg_collection.cp if codec.shape.cp_size > 1 else None,
             )
             hidden_states = DSAIndexerLossAutoScaler.apply(hidden_states, objective)
+        return hidden_states
+
+    @staticmethod
+    def _retire_state(context):
         # Do not retain retired producers or layer objectives through subsequent forwards.
         csa = context.cross_layer_state
         csa.indexer_loss = None
@@ -256,7 +374,6 @@ class DeepSeekV41Adapter:
             csa.indexer_k = csa.indexer_k_flat = None
         if 'tokens' not in context.values:
             context.hashes = None
-        return hidden_states
 
     def finalize_forward(self, output, context):
         """Keep the ordinary stack contract; the model owns pipeline publication."""

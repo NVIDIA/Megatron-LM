@@ -731,6 +731,23 @@ class HybridStack(MegatronModule):
             if (
                 self.config.recompute_granularity == 'full'
                 and self.training
+                and self.forward_adapter is not None
+            ):
+                hidden_states = self.forward_adapter.checkpointed_forward(
+                    self.layers,
+                    hidden_states,
+                    forward_context,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    sequence_len_offset=sequence_len_offset,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                )
+                mhc_state = forward_context.mhc_state
+            elif (
+                self.config.recompute_granularity == 'full'
+                and self.training
                 and self.forward_adapter is None
             ):
                 hidden_states = checkpointed_forward(
