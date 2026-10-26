@@ -132,8 +132,11 @@ to the cost of uneven forward/backward communication.
 
 ## Next step
 
-Keep gather/scatter as the baseline and prototype TensorAtomic support in
-Muon that skips gather/scatter staging and local copies. Compare
-forward/backward time, full-step time, and peak memory with identical
-module boundaries, precision, and optimizer settings; verify updates
-against full-matrix Muon. Include single-node and multi-node runs.
+1. **Integrate `FsdpMuon` with `MegatronOptimizer`**, including chaining
+   with an optimizer for excluded parameters.
+2. **Optimize performance.** Overlap communication with Muon computation
+   and make parameter placement aware of hardware topology to keep traffic
+   on fast links, as discussed in [#6368](https://github.com/NVIDIA/Megatron-LM/issues/6368).
+3. **Evaluate TensorAtomic at larger scale.** Compare it with gather/scatter
+   on larger models across multiple nodes, measuring forward/backward time,
+   full-step time, and peak memory.
