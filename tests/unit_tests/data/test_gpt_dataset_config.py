@@ -74,8 +74,10 @@ def test_construction_needs_no_tokenizer_and_derives_the_sources():
 def test_validate_needs_the_tokenizer_and_asserts_only(tokenizer):
     """What __post_init__ asserted before: run once the config is complete. Assertions only and
     idempotent; token_dtype_code follows the tokenizer and mock / split_matrix follow the sources,
-    so a config completed after construction needs no refresh."""
+    so a config completed after construction needs no refresh. validate_without_tokenizer() is the
+    part that runs before the tokenizer exists; validate() runs it first."""
     cfg = _config()
+    cfg.validate_without_tokenizer()  # the checks that need no tokenizer pass before it is bound
     with pytest.raises(AssertionError):
         cfg.validate()  # no tokenizer
     cfg.tokenizer = tokenizer
@@ -89,9 +91,15 @@ def test_validate_needs_the_tokenizer_and_asserts_only(tokenizer):
     for missing in ("reset_position_ids", "reset_attention_mask", "eod_mask_loss"):
         with pytest.raises(AssertionError):
             _config(tokenizer=tokenizer, **{missing: None}).validate()
+        with pytest.raises(AssertionError):  # needs no tokenizer: validate_without_tokenizer()'s
+            _config(**{missing: None}).validate_without_tokenizer()
     sbhd = _config(tokenizer=tokenizer, varlen_sbhd_validation=True, hybrid_context_parallel=True)
     with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
         sbhd.validate()
+    with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
+        _config(
+            varlen_sbhd_validation=True, hybrid_context_parallel=True
+        ).validate_without_tokenizer()
     counts = _config(blend=BLEND, split="9,1,0", sequences_per_dataset={"prefix-a": [10, 2]})
     counts.tokenizer = SimpleNamespace(vocab_size=None)
     with pytest.raises(AssertionError, match="vocab size"):
@@ -132,6 +140,10 @@ def test_fim_config_validates_its_own_fields(tokenizer):
     cfg.validate()
     assert cfg.token_dtype_code == 8
     fim(fim_rate=0.0, fim_spm_rate=0.0).validate()  # 0.0 is a rate, not a missing value
+    unbound = fim(tokenizer=None)
+    unbound.validate_without_tokenizer()  # the FIM checks need no tokenizer
+    with pytest.raises(AssertionError):
+        unbound.validate()  # the complete check still needs it
     for bad, message in (
         (dict(fim_rate=None), "fim_rate"),
         (dict(fim_spm_rate=None), "fim_spm_rate"),
@@ -140,3 +152,5 @@ def test_fim_config_validates_its_own_fields(tokenizer):
     ):
         with pytest.raises(AssertionError, match=message):
             fim(**bad).validate()
+        with pytest.raises(AssertionError, match=message):  # and before the tokenizer exists
+            fim(tokenizer=None, **bad).validate_without_tokenizer()

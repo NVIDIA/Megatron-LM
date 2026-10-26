@@ -108,7 +108,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     parity in CI."""
 
     def validate(self) -> None:
-        """Validate the config; needs the tokenizer. Assertions only.
+        """Check a complete config: ``validate_without_tokenizer()``, then the tokenizer and what
+        follows from it. Assertions only, idempotent.
 
         What ``__post_init__`` asserted before: a config can be constructed before its tokenizer
         exists and completed later, so run this once it is complete
@@ -117,23 +118,31 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         """
         super().validate()
 
-        assert self.tokenizer is not None
-
-        assert self.reset_position_ids is not None
-        assert self.reset_attention_mask is not None
-        assert self.eod_mask_loss is not None
-
-        if self.varlen_sbhd_validation:
-            assert not self.hybrid_context_parallel, (
-                "--varlen-sbhd-validation is incompatible with "
-                "--hybrid-context-parallel (SBHD mode is not packed)."
-            )
+        assert (
+            self.tokenizer is not None
+        ), "tokenizer must be bound before the config is validated or the datasets are built."
 
         if self.sequences_per_dataset is not None:
             assert (
                 self.token_dtype_code is not None
             ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
             fix the tokenizer."
+
+    def validate_without_tokenizer(self) -> None:
+        """The checks that need no tokenizer: the base class's, the three masking / loss booleans
+        and the SBHD / hybrid-CP exclusion. ``validate()`` runs them first; a caller that checks a
+        config before its tokenizer exists runs this alone."""
+        super().validate_without_tokenizer()
+
+        assert self.reset_position_ids is not None, "reset_position_ids must be defined."
+        assert self.reset_attention_mask is not None, "reset_attention_mask must be defined."
+        assert self.eod_mask_loss is not None, "eod_mask_loss must be defined."
+
+        if self.varlen_sbhd_validation:
+            assert not self.hybrid_context_parallel, (
+                "--varlen-sbhd-validation is incompatible with "
+                "--hybrid-context-parallel (SBHD mode is not packed)."
+            )
 
     @property
     def token_dtype_code(self) -> Optional[int]:

@@ -82,12 +82,21 @@ class BlendedMegatronDatasetConfig:
     """
 
     def validate(self) -> None:
-        """Check the blend and split: assertions only, idempotent.
+        """Check a complete config: assertions only, idempotent.
 
-        Nothing runs at construction. A config can be constructed before its tokenizer exists and
-        completed later: run this once it is complete. ``BlendedMegatronDatasetBuilder`` runs it
-        before building, so a config handed complete to the builder needs no explicit call.
-        Subclasses add the checks that need the tokenizer.
+        ``validate_without_tokenizer()`` and then the checks that need the tokenizer (none in this
+        class; subclasses add theirs here). Nothing runs at construction: a config can be
+        constructed before its tokenizer exists and completed later, and this runs once it is
+        complete. ``BlendedMegatronDatasetBuilder`` runs it before building, so a config handed
+        complete to the builder needs no explicit call.
+        """
+        self.validate_without_tokenizer()
+
+    def validate_without_tokenizer(self) -> None:
+        """The checks that need no tokenizer: the fast-cache prerequisites and the blend / split
+        rules. Assertions only, idempotent. A config constructed before its tokenizer exists can
+        run this at once; subclasses add their tokenizer-free checks here and the rest in
+        ``validate()``.
         """
         if self.fast_cache_load:
             assert (

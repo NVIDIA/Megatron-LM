@@ -4,9 +4,10 @@ settings and the dataset class.
 
 ``DataConfig.dataset`` is ``megatron.core.datasets.gpt_dataset.GPTDatasetConfig`` itself (or its FIM
 subclass), the object ``BlendedMegatronDatasetBuilder`` consumes, constructed from the arguments or
-a YAML file before the tokenizer exists: Core checks the blend and split at construction and keeps
-the checks that need a tokenizer in ``validate()``, which ``DataConfig.bind_tokenizer`` runs once the
-runtime services bind the run's tokenizer (the builder runs it again before building).
+a YAML file before the tokenizer exists: nothing runs at construction, Core's checks that need no
+tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the complete
+``validate()``, which needs the tokenizer, runs in ``DataConfig.bind_tokenizer`` once the runtime
+services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
 saved with the section. Six Core fields are owned by other container sections (the parallel layout,
 the validation flags): the container writes them at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``)
@@ -23,7 +24,6 @@ nothing here runs for them.
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
 
@@ -222,13 +222,14 @@ class DataConfig:
     def validate(self) -> None:
         """Check the loader settings and the class / config agreement; no mutation.
 
-        Megatron Core's tokenizer-free checks (the blend and split rules) run here too, so a YAML
-        or Python section fails at ``cfg.validate()``; the checks that need the tokenizer run in
-        ``bind_tokenizer()`` and in the builder.
+        Megatron Core's checks that need no tokenizer (``validate_without_tokenizer()``: the blend /
+        split rules, the GPT booleans, the FIM rates and tokens) run here too, so a YAML or Python
+        section fails at ``cfg.validate()``, before runtime initialization; the checks that need the
+        tokenizer run in ``bind_tokenizer()`` and in the builder.
         """
         self.dataloader.validate()
         if self.dataset is not None:
-            BlendedMegatronDatasetConfig.validate(self.dataset)
+            self.dataset.validate_without_tokenizer()
         resolve_dataset_class(self.dataset, self.dataset_type)
 
     def finalize(self) -> None:

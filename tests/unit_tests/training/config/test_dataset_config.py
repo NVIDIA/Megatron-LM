@@ -113,14 +113,21 @@ def test_the_section_holds_megatron_cores_config(tokenizer):
 
 
 def test_bind_tokenizer_runs_megatron_cores_checks(tokenizer):
-    """Core's validate() is where a GPT config that needs the tokenizer fails: the asserts its
-    __post_init__ had, once the tokenizer is bound (the blend / split rules fail at construction,
-    as they did)."""
+    """Core's checks that need no tokenizer (validate_without_tokenizer(): the blend / split rules,
+    the GPT booleans, the FIM rates and tokens) fail at the section's validate(), before runtime
+    initialization; the complete validate() runs when the section binds the tokenizer."""
+    with pytest.raises(AssertionError):
+        DataConfig(dataset=_dataset(reset_position_ids=None)).validate()
     with pytest.raises(AssertionError):
         DataConfig(dataset=_dataset(reset_position_ids=None)).bind_tokenizer(tokenizer)
     sbhd = DataConfig(dataset=_dataset(varlen_sbhd_validation=True, hybrid_context_parallel=True))
     with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
+        sbhd.validate()
+    with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
         sbhd.bind_tokenizer(tokenizer)
+    with pytest.raises(AssertionError, match="fim_rate should be specified"):
+        DataConfig(dataset=_fim(fim_rate=None, fim_spm_rate=0.5)).validate()
+    DataConfig(dataset=_fim(fim_rate=0.0, fim_spm_rate=0.0)).validate()  # 0.0 is a value
     counts = DataConfig(
         dataset=_dataset(blend=BLEND, split="9,1,0", sequences_per_dataset={"prefix-a": [10, 2]})
     )

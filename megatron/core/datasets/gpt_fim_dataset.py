@@ -37,10 +37,12 @@ class GPTFIMDatasetConfig(GPTDatasetConfig):
     fim_no_prefix: Optional[str] = None
     """Do not apply FIM to fragments that start with this prefix"""
 
-    def validate(self) -> None:
-        """The GPT checks, then the FIM ones: both rates and the five extra tokens must be given
-        (a rate of 0.0 is a value; ``validate_args`` checks the same for ``--fim-data``)."""
-        super().validate()
+    def validate_without_tokenizer(self) -> None:
+        """The GPT checks that need no tokenizer, then the FIM ones, which need none either: both
+        rates and the five extra tokens must be given (a rate of 0.0 is a value; ``validate_args``
+        checks the same for ``--fim-data``). ``validate()`` runs this before the tokenizer checks.
+        """
+        super().validate_without_tokenizer()
         assert self.fim_rate is not None, "fim_rate should be specified."
         assert self.fim_spm_rate is not None, "fim_spm_rate should be specified."
         assert self.fim_extra_tokens is not None and all(
