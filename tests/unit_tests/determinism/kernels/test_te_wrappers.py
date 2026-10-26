@@ -903,8 +903,12 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
             t = torch.randn(s, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
             cu_seqlens = torch.tensor([0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda")
 
+        cp_group = parallel_state.get_context_parallel_group()
+
         def fn(t):
-            return rope_utils.apply_rotary_pos_emb(t, freqs, config, cu_seqlens=cu_seqlens)
+            return rope_utils.apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens, cp_group=cp_group
+            )
 
         assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
     finally:
