@@ -265,6 +265,7 @@ class AbsorbedMLASelfAttention(Attention):
                 is_expert=False,
                 tp_comm_buffer_name=linear_proj_buffer,
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
                 name=(name + ".linear_proj") if name is not None else None,
             )
 
@@ -301,6 +302,7 @@ class AbsorbedMLASelfAttention(Attention):
                     is_expert=False,
                     tp_comm_buffer_name='q_proj',
                     tp_group=pg_collection.tp,
+                    pg_collection=pg_collection,
                     name=(name + ".linear_q_proj") if name is not None else None,
                 )
         else:
@@ -329,6 +331,7 @@ class AbsorbedMLASelfAttention(Attention):
                     tp_comm_buffer_name='q_down_proj',
                     skip_weight_param_allocation=False,
                     tp_group=pg_collection.tp,
+                    pg_collection=pg_collection,
                     name=(name + ".linear_q_down_proj") if name is not None else None,
                     **q_down_proj_kwargs,
                 )
@@ -345,6 +348,7 @@ class AbsorbedMLASelfAttention(Attention):
                     is_expert=False,
                     tp_comm_buffer_name='q_up_proj',
                     tp_group=pg_collection.tp,
+                    pg_collection=pg_collection,
                     name=(name + ".linear_q_up_proj") if name is not None else None,
                 )
 
@@ -373,6 +377,7 @@ class AbsorbedMLASelfAttention(Attention):
                 tp_comm_buffer_name='kv_down_proj',
                 skip_weight_param_allocation=False,
                 tp_group=pg_collection.tp,
+                pg_collection=pg_collection,
                 name=(name + ".linear_kv_down_proj") if name is not None else None,
                 **kv_down_proj_kwargs,
             )
@@ -391,6 +396,7 @@ class AbsorbedMLASelfAttention(Attention):
                 is_expert=False,
                 tp_comm_buffer_name='kv_up_proj',
                 tp_group=pg_collection.tp,
+                pg_collection=pg_collection,
                 name=(name + ".linear_kv_up_proj") if name is not None else None,
             )
 

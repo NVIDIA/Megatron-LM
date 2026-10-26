@@ -403,6 +403,7 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
             self.linear_k = build_module(
                 submodules.linear_k,
@@ -415,6 +416,7 @@ class SimplifiedDSGQAIndexer(MegatronModule):
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
                 tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
         if self.pg_collection.tp.size() > 1:
             for param in self.parameters():
