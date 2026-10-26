@@ -486,7 +486,7 @@ def test_build_train_and_step(process_group_collection):
             batches = iter(microbatches)
 
             def forward():
-                output = model(next(batches), attention_mask=None)
+                output = model(hidden_states=next(batches), attention_mask=None)
                 return torch.nn.functional.mse_loss(
                     output.float(), torch.zeros_like(output, dtype=torch.float32)
                 )
@@ -550,7 +550,7 @@ def test_fused_sgd_casts_mismatched_grads(process_group_collection):
     hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
     def forward():
-        output = model(hidden, attention_mask=None)
+        output = model(hidden_states=hidden, attention_mask=None)
         return torch.nn.functional.mse_loss(
             output.float(), torch.zeros_like(output, dtype=torch.float32)
         )
@@ -625,7 +625,7 @@ def test_gradient_clipping_reaches_global_norm(
     ).expand(8, 2, -1) * (torch.distributed.get_rank() + 1)
 
     def forward():
-        output = model(hidden, attention_mask=None)
+        output = model(hidden_states=hidden, attention_mask=None)
         return torch.nn.functional.mse_loss(
             output.float(), torch.zeros_like(output, dtype=torch.float32), reduction="sum"
         )

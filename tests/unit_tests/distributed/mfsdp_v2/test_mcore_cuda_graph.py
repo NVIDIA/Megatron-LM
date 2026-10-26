@@ -122,7 +122,7 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
 
         def forward():
             hidden = next(data_iterator[0])["hidden_states"]
-            output = model[0](hidden, attention_mask=None)
+            output = model[0](hidden_states=hidden, attention_mask=None)
             return torch.nn.functional.mse_loss(
                 output.float(), torch.zeros_like(output, dtype=torch.float32)
             )

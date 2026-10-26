@@ -677,7 +677,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         )
         with backbone_context:
             hidden_states = self.decoder(
-                decoder_input,
+                hidden_states=decoder_input,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,

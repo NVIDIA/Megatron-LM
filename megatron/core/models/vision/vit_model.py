@@ -338,7 +338,7 @@ class ViTModel(MegatronModule):
         # 5. TransformerBlock: expects (S, B, hidden)
         x = x.transpose(0, 1).contiguous()
         x = self.decoder(
-            x,
+            hidden_states=x,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
@@ -716,7 +716,7 @@ class QwenVLViTModel(MegatronModule):
         # 5. TransformerBlock: (S, B, hidden)
         x = x.transpose(0, 1).contiguous()
         x = self.decoder(
-            x,
+            hidden_states=x,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
@@ -976,7 +976,7 @@ class KimiViTModel(MegatronModule):
         # 4. TransformerBlock: (S, B, hidden)
         x = x.transpose(0, 1).contiguous()
         x = self.decoder(
-            x,
+            hidden_states=x,
             attention_mask=attention_mask,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,

@@ -2100,7 +2100,8 @@ class CudaGraphManager(torch.nn.Module):
         if cache_key is None and is_inference_mode:
             inference_context = kwargs['inference_context']
             if inference_context.is_static_batching():
-                batch_size = kwargs['hidden_states'].shape[0]
+                hidden_states = args[0] if args else kwargs['hidden_states']
+                batch_size = hidden_states.shape[0]
                 cache_key = (batch_size, inference_context.is_decode_only())
             else:
                 cache_key = inference_context.padded_batch_dimensions
@@ -2143,13 +2144,17 @@ class CudaGraphManager(torch.nn.Module):
                                     getattr(r[0].base_module, 'layer_number', None)
                                     == runner.base_module.layer_number - 1
                                     and r[0].fwd_graph is not None
-                                    and ArgMetadata(r[3]['hidden_states'])
-                                    == ArgMetadata(kwargs['hidden_states'])
+                                    and ArgMetadata(r[2][0] if r[2] else r[3]['hidden_states'])
+                                    == ArgMetadata(args[0] if args else kwargs['hidden_states'])
                                 )
                             )
                             # Replace the hidden states from previous layer's output buffer
-                            local_kwargs = dict(kwargs)
-                            local_kwargs['hidden_states'] = previous_runner[0].fwd_graph_outputs[0]
+                            previous_output = previous_runner[0].fwd_graph_outputs[0]
+                            if args:
+                                local_args = (previous_output, *args[1:])
+                            else:
+                                local_kwargs = dict(kwargs)
+                                local_kwargs['hidden_states'] = previous_output
                         except StopIteration:
                             # No match found for previous layer, continue with no buffer reuse
                             pass

@@ -186,7 +186,9 @@ class TestInterleaveTransformerBlock:
         hidden_states = hidden_states.cuda()
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
-        hidden_states = parallel_transformer_block(hidden_states, attention_mask=attention_mask)
+        hidden_states = parallel_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size

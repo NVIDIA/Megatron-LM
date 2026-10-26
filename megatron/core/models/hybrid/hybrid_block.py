@@ -752,7 +752,6 @@ class HybridStack(MegatronModule):
                         with inner_quant_context:
                             if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
-                                    hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     rotary_pos_emb=rotary_pos_emb,
@@ -782,10 +781,9 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = input_ids
-                                hidden_states, _ = layer(**layer_kwargs)
+                                hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
-                                    hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
@@ -796,7 +794,7 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["residual_stream_recompute_context"] = (
                                         residual_stream_recompute_context
                                     )
-                                hidden_states = layer(**layer_kwargs)
+                                hidden_states = layer(hidden_states, **layer_kwargs)
                             else:  # Expert or MLP
                                 if residual_stream_recompute_context is not None:
                                     raise TypeError(

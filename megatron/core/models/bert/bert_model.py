@@ -355,7 +355,7 @@ class BertModel(LanguageModule):
 
         # Run encoder.
         hidden_states = self.encoder(
-            encoder_input,
+            hidden_states=encoder_input,
             attention_mask=extended_attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,

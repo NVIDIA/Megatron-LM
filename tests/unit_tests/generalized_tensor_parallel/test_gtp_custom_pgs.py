@@ -153,7 +153,7 @@ def _full_grads(block, gtp_group):
 
 def _fwd_bwd(block, x):
     """Run one forward/backward; return (output, input gradient) on cpu in fp32."""
-    out = block(x, attention_mask=None)
+    out = block(hidden_states=x, attention_mask=None)
     out.sum().backward()
     return out.detach().float().cpu(), x.grad.detach().float().cpu()
 
