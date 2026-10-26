@@ -2,7 +2,7 @@
 
 """CSA2 candidate blocks, with bounded scoring workspace and compact shared state.
 
-Reuse main's cuDNN BF16 scorer and radix Top-K. Only block reduction,
+Reuse DSv4's cuDNN BF16/MXFP8 scorer and radix Top-K. Only block reduction,
 newest-block retention and deterministic compaction require new kernels.
 Selection is discrete; indexer supervision keeps the original projection graph.
 """
@@ -15,6 +15,14 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+from megatron.core.ops.attention.csa.indexer_quantization import (
+    create_indexer_mxfp8_quantization_buffers,
+    indexer_mxfp8_thd_scale_capacity,
+    indexer_mxfp8_thd_scale_shape,
+    make_indexer_mxfp8_scale_cu_seqlens,
+    quantize_indexer_mxfp8,
+)
 
 from . import fused_sparse_attention
 from .thd_utils import CSA2THDCompressionLayout, CSA2THDLayout
@@ -36,8 +44,6 @@ except ImportError:
 # Score tiles are transient, including on the candidate-source layer. The
 # unavoidable output is [queries, topk_blocks], never [queries, global keys].
 _SCORE_CHUNK_MAX_BYTES = 32 * 1024 * 1024
-# Enough query rows to amortize scorer/selection launches; the byte cap still
-# bounds each tile for long contexts, including the ordinary no-candidate path.
 _QUERY_CHUNK_SIZE = 2048
 
 
@@ -99,7 +105,7 @@ def candidate_blocks_from_scores(
     scores: Tensor, visible: Tensor, topk_blocks: int, block_size: int
 ) -> CSA2CandidateBlocks:
     """Native block selection over already-masked, sequence-local score columns."""
-    if topk_blocks <= 0 or block_size <= 0:
+    if topk_blocks < 0 or block_size <= 0:
         raise ValueError("CSA2 candidate block count and size must be positive")
     width = scores.shape[-1]
     padded = F.pad(scores, (0, -width % block_size), value=-torch.inf)
@@ -284,7 +290,8 @@ def fused_candidate_blocks(
     Consume the same prepared Q/K/W as this layer's indexer loss. SBHD batches
     are viewed as packed segments so workspace does not grow with batch size.
     Each chunk preserves the original sequence's causal offset.
-    The original BF16 K is reused by every query chunk.
+    K is quantized once in MXFP8 mode; each Q chunk is quantized independently
+    with the same channel-block rounding. No round trip to dense FP32 Q/K is used.
     When ``token_topk`` is supplied, select this layer's token Top-K from the
     same score tiles before releasing them. Candidates never restrict that Top-K.
     """
@@ -292,8 +299,8 @@ def fused_candidate_blocks(
     ratio, thd_layout = inputs.ratio, inputs.thd_layout
     if ratio not in (1, 2) or topk_blocks < 0 or block_size <= 0:
         raise ValueError("CSA2 candidates require ratio 1/2 and positive block count/size")
-    if precision != "bf16":
-        raise ValueError("CSA2 currently uses the main BF16 scorer")
+    if precision not in ("bf16", "mxfp8"):
+        raise ValueError("CSA2 candidate precision must be bf16 or mxfp8")
     if not HAVE_TRITON:
         raise RuntimeError("Fused CSA2 candidates require Triton")
     if not q.is_cuda or any(
@@ -337,12 +344,60 @@ def fused_candidate_blocks(
     row_bytes = ((score_max_k + 3) // 4 * 4) * 4
     chunk_size = min(_QUERY_CHUNK_SIZE, max(1, _SCORE_CHUNK_MAX_BYTES // row_bytes))
     kernel_k = k
+    precision_kwargs = dict(precision=precision)
+    if precision == "mxfp8":
+        # Reuse DSv4's static scale bounds: reading a device prefix to size
+        # these buffers would synchronize once for K and once per Q chunk.
+        num_sequences = cu_q.numel() - 1
+        chunk_rows = min(chunk_size, q.shape[0])
+        q_scale_capacity = indexer_mxfp8_thd_scale_capacity(chunk_rows, num_sequences, 64)
+        k_scale_capacity = indexer_mxfp8_thd_scale_capacity(k.shape[0], num_sequences, 1)
+        q_scale = torch.empty(
+            indexer_mxfp8_thd_scale_shape(q_scale_capacity, 64, q.shape[-1]),
+            dtype=torch.float8_e8m0fnu,
+            device=q.device,
+        )
+        k_scale = torch.empty(
+            indexer_mxfp8_thd_scale_shape(k_scale_capacity, 1, k.shape[-1]),
+            dtype=torch.float8_e8m0fnu,
+            device=k.device,
+        )
+        k_scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(cu_k, 1)
+        kernel_k, k_scale = quantize_indexer_mxfp8(
+            k, cu_seqlens=cu_k, cu_seqlens_scale_padded=k_scale_prefix, out_scale=k_scale
+        )
+        precision_kwargs.update(k_scale=k_scale, cu_seqlens_k_scale_padded=k_scale_prefix)
+        q_buffers = None
+        if num_heads == 32:
+            padded_q = q.new_zeros((chunk_rows, 64, q.shape[-1]))
+            padded_w = weights.new_zeros((chunk_rows, 64))
+
     for start in range(0, q.shape[0], chunk_size):
         end = min(start + chunk_size, q.shape[0])
         chunk_cu_q = (cu_q.clamp(min=start, max=end) - start).contiguous()
         offsets = (causal_offsets + (start - cu_q[:-1]).clamp_min(0)).contiguous()
         kernel_q = q[start:end]
         kernel_w = scaled_weights[start:end]
+        if precision == "mxfp8":
+            # The existing MXFP8 scorer needs H64. Pad only this chunk; keep
+            # real H32 scaling and avoid doubling the full projected Q storage.
+            if num_heads == 32:
+                padded_q[: end - start, :num_heads].copy_(kernel_q)
+                padded_w[: end - start, :num_heads].copy_(kernel_w)
+                kernel_q, kernel_w = padded_q[: end - start], padded_w[: end - start]
+            # Only a shorter final chunk needs a different TE destination.
+            # Scale storage also covers its changing packed-sequence boundaries.
+            if q_buffers is None or not q_buffers.matches(kernel_q):
+                q_buffers = create_indexer_mxfp8_quantization_buffers(kernel_q)
+            q_scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(chunk_cu_q, kernel_q.shape[-2])
+            kernel_q, q_scale = quantize_indexer_mxfp8(
+                kernel_q,
+                cu_seqlens=chunk_cu_q,
+                cu_seqlens_scale_padded=q_scale_prefix,
+                buffers=q_buffers,
+                out_scale=q_scale,
+            )
+            precision_kwargs.update(q_scale=q_scale, cu_seqlens_q_scale_padded=q_scale_prefix)
         scores = fused_sparse_attention._DSA.indexer_forward_wrapper(
             kernel_q,
             kernel_k.unsqueeze(1),
@@ -353,6 +408,7 @@ def fused_candidate_blocks(
             max_seqlen_q=min(end - start, max_q),
             max_seqlen_k=score_max_k,
             q_causal_offsets=offsets,
+            **precision_kwargs,
         )["scores"]
         if token_width:
             # cuDNN's scorer aligns to four floats; radix needs eight. Only
@@ -373,6 +429,6 @@ def fused_candidate_blocks(
             indices[start:end].copy_(selected.indices)
             lengths[start:end].copy_(selected.lengths)
             del selected
+        # Release before the next scorer allocates its chunk.
         del scores
-
     return result()

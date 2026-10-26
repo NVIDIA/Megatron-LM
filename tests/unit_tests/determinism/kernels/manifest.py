@@ -856,6 +856,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="csa2_shared_attention",
         sources=(
+            "megatron/core/ops/attention/csa/indexer_quantization.py",
             "megatron/core/transformer/experimental_attention_variant/csa2.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_candidates.py",
             "megatron/core/transformer/experimental_attention_variant/csa_utils/csa2_indexer.py",

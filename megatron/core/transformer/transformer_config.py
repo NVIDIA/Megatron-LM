@@ -369,6 +369,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
+    """CSA2 index selection precision, independent of the model's linear FP8 recipe.
+    MXFP8 requires SM100 and cuDNN. Indexer supervision uses the original projections.
+    """
+
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] | None = None
     """Optional fused DSA kernel backend.
     When unset, DSv4 hybrid uses ``cudnn`` and other attention variants use ``none``.
