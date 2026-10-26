@@ -1,0 +1,1146 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""
+Unit tests for THD format with CUDA Graph support: the post-pack THD padding helpers
+(pad_sequence_for_thd and friends) and the TransformerLayer static-input /
+PackedSeqParams decompose-reconstruct contract of THD CUDA graphs.
+
+    torchrun --nproc_per_node 2 -m pytest -xvs tests/unit_tests/transformer/test_thd_cuda_graph.py
+
+Tests marked as requiring two ranks are skipped under a single process.
+"""
+
+import os
+
+import pytest
+import torch
+
+from megatron.core.datasets.data_schedule import _build_thd_padding_mask
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    _resolve_thd_padding_lengths,
+    _same_tensor_view,
+    extend_thd_padding_before_cp_slice,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
+)
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from tests.unit_tests.test_utilities import Utils
+
+_REQUIRES_TWO_RANKS = pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) < 2 or torch.cuda.device_count() < 2,
+    reason="requires torchrun with at least 2 GPUs",
+)
+
+
+# =============================================================================
+# Helpers (shared by the lightweight unit tests)
+# =============================================================================
+
+
+def _make_cu(seqlens, device="cuda"):
+    cu = torch.zeros(len(seqlens) + 1, dtype=torch.int32, device=device)
+    for i, s in enumerate(seqlens):
+        cu[i + 1] = cu[i] + s
+    return cu
+
+
+def _make_psp(seqlens):
+    cu = _make_cu(seqlens)
+    return PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu.clone(),
+        cu_seqlens_q_padded=cu.clone(),
+        cu_seqlens_kv_padded=cu.clone(),
+        max_seqlen_q=max(seqlens),
+        max_seqlen_kv=max(seqlens),
+    )
+
+
+def _make_same_view_cu_pair(boundaries):
+    storage = torch.tensor([-1, *boundaries, -1], dtype=torch.int32)
+    q = storage[1:-1]
+    kv = storage[1:-1]
+    assert q is not kv
+    assert q.data_ptr() == kv.data_ptr()
+    return q, kv
+
+
+def _make_same_view_psp(valid_boundaries, padded_boundaries):
+    cu_q, cu_kv = _make_same_view_cu_pair(valid_boundaries)
+    cu_q_padded, cu_kv_padded = _make_same_view_cu_pair(padded_boundaries)
+    max_seqlen = max(
+        right - left
+        for boundaries in (valid_boundaries, padded_boundaries)
+        for left, right in zip(boundaries, boundaries[1:])
+    )
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        cu_seqlens_q_padded=cu_q_padded,
+        cu_seqlens_kv_padded=cu_kv_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        pad_between_seqs=valid_boundaries != padded_boundaries,
+    )
+
+
+def _assert_qkv_views_are_shared(packed_seq_params):
+    for q, kv in (
+        (packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv),
+        (packed_seq_params.cu_seqlens_q_padded, packed_seq_params.cu_seqlens_kv_padded),
+    ):
+        assert q is kv
+        assert q.data_ptr() == kv.data_ptr()
+        assert q.storage_offset() == kv.storage_offset()
+        assert q.shape == kv.shape
+        assert q.stride() == kv.stride()
+
+
+def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=H,
+        num_attention_heads=nh,
+        num_query_groups=nkv,
+        ffn_hidden_size=ffn,
+        max_seqlen_per_dp_cp_rank=max_seqlen,
+        thd_max_packed_sequences=max_num_seqs,
+        tensor_model_parallel_size=tp,
+        sequence_parallel=sp,
+        bf16=True,
+    )
+    model_parallel_cuda_manual_seed(42)
+    return (
+        TransformerLayer(
+            config, get_gpt_layer_with_transformer_engine_spec().submodules, layer_number=1
+        )
+        .cuda()
+        .bfloat16()
+    )
+
+
+# =============================================================================
+# 1. pad_sequence_for_thd correctness
+# =============================================================================
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("cuda_graph_static,expected_max_num_seqs", [(False, 32), (True, 32)])
+def test_pad_to_max_resolves_padding_kwargs(cuda_graph_static, expected_max_num_seqs):
+    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+        pad_packed_seq_alignment="max",
+        max_seqlen_per_dp_cp_rank=8192,
+        thd_max_packed_sequences=32,
+        cuda_graph_static=cuda_graph_static,
+    )
+
+    assert alignment is None
+    assert target_len == 8192
+    assert max_num_seqs == expected_max_num_seqs
+
+
+@pytest.mark.internal
+def test_resolve_thd_tail_padding_policy():
+    from types import SimpleNamespace
+
+    # Default (unset): append an ordinary dummy sequence.
+    assert resolve_thd_tail_padding_policy(SimpleNamespace()) == "append_dummy_seq"
+    assert (
+        resolve_thd_tail_padding_policy(SimpleNamespace(thd_tail_padding_policy=None))
+        == "append_dummy_seq"
+    )
+    # Explicit policies are returned as-is.
+    assert (
+        resolve_thd_tail_padding_policy(SimpleNamespace(thd_tail_padding_policy="extend_last"))
+        == "extend_last"
+    )
+    with pytest.raises(AssertionError, match="Unsupported thd_tail_padding_policy"):
+        resolve_thd_tail_padding_policy(SimpleNamespace(thd_tail_padding_policy="bogus"))
+
+
+class TestResolveThdPaddingLengths:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "source,target_len,alignment,expected",
+        [
+            ("tokens", None, 64, (80, 80, 128, 128)),
+            ("labels", 256, None, (80, 80, 256, 256)),
+            ("metadata", None, 64, (80, 80, 128, 128)),
+        ],
+    )
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_non_cp_length_resolution_contract(self, source, target_len, alignment, expected):
+        """Resolve lengths from local tensors when present, otherwise from THD metadata."""
+        tokens, labels = None, None
+        psp = _make_psp([50, 30])
+
+        if source == "tokens":
+            tokens = torch.ones(1, 80, device="cuda")
+            psp = PackedSeqParams(qkv_format="thd")
+            expected_device = tokens.device
+        elif source == "labels":
+            labels = torch.ones(1, 80, device="cuda")
+            expected_device = labels.device
+        else:
+            expected_device = psp.cu_seqlens_q.device
+
+        local_actual, global_actual, local_target, global_target, mask_device = (
+            _resolve_thd_padding_lengths(
+                tokens, labels, None, None, psp, target_len=target_len, alignment=alignment
+            )
+        )
+
+        assert (local_actual, global_actual, local_target, global_target) == expected
+        assert mask_device == expected_device
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_no_tensor_requires_cu_seqlens(self):
+        """All-None tensor inputs need cu_seqlens to build a padding mask."""
+        psp = PackedSeqParams(qkv_format="thd")
+
+        with pytest.raises(AssertionError, match="cu_seqlens_q must be available"):
+            _resolve_thd_padding_lengths(
+                None, None, None, None, psp, target_len=128, alignment=None
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_metadata_only_uses_physical_padded_endpoint(self):
+        """Physical storage, not compact valid-token count, determines padding length."""
+        cu_valid = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+        cu_padded = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        psp = PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=cu_valid, cu_seqlens_q_padded=cu_padded
+        )
+
+        resolved = _resolve_thd_padding_lengths(
+            None, None, None, None, psp, target_len=None, alignment=6
+        )
+
+        assert resolved[:4] == (8, 8, 12, 12)
+        assert resolved[4] == cu_padded.device
+
+    @pytest.mark.internal
+    @_REQUIRES_TWO_RANKS
+    def test_cp_tensor_alignment_uses_local_target_and_global_tail(self):
+        """CP-local padding tail determines the global padded endpoint."""
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        tokens = torch.ones(1, 1600, device="cuda")
+        psp = _make_psp([1600, 1600])
+
+        local_actual, global_actual, local_target, global_target, mask_device = (
+            _resolve_thd_padding_lengths(
+                tokens, None, None, None, psp, target_len=None, alignment=128
+            )
+        )
+
+        assert (local_actual, global_actual, local_target, global_target) == (
+            1600,
+            3200,
+            1664,
+            3328,
+        )
+        assert mask_device == tokens.device
+
+    @pytest.mark.internal
+    @_REQUIRES_TWO_RANKS
+    def test_cp_tensor_target_len_scales_global_target(self):
+        """Fixed target_len is CP-local and scales to a global endpoint."""
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        tokens = torch.ones(1, 80, device="cuda")
+        psp = _make_psp([140])
+
+        local_actual, global_actual, local_target, global_target, mask_device = (
+            _resolve_thd_padding_lengths(
+                tokens, None, None, None, psp, target_len=128, alignment=None
+            )
+        )
+
+        assert (local_actual, global_actual, local_target, global_target) == (80, 140, 128, 256)
+        assert mask_device == tokens.device
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "alignment,target_len,expected_global_target", [(128, None, 256), (None, 128, 256)]
+    )
+    @_REQUIRES_TWO_RANKS
+    def test_cp_no_tensor_partitions_actual_and_target_lengths(
+        self, alignment, target_len, expected_global_target
+    ):
+        """Without local tensors, CP-local lengths come from THD partition indices."""
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        from megatron.core import parallel_state
+        from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
+
+        psp = _make_psp([140])
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        expected_local_actual = get_thd_partitioned_indices(
+            psp.cu_seqlens_q, 140, cp_size, cp_rank
+        ).numel()
+        expected_local_target = get_thd_partitioned_indices(
+            psp.cu_seqlens_q, expected_global_target, cp_size, cp_rank
+        ).numel()
+
+        local_actual, global_actual, local_target, global_target, mask_device = (
+            _resolve_thd_padding_lengths(
+                None, None, None, None, psp, target_len=target_len, alignment=alignment
+            )
+        )
+
+        assert (local_actual, global_actual, local_target, global_target) == (
+            expected_local_actual,
+            140,
+            expected_local_target,
+            expected_global_target,
+        )
+        assert mask_device == psp.cu_seqlens_q.device
+
+
+class TestPadSequenceForThdAliasPreservation:
+
+    @pytest.mark.internal
+    def test_same_tensor_view_edge_cases_fail_closed(self):
+        base = torch.arange(6)
+        same_view = base[:4]
+        same_view_alias = base[:4]
+        assert _same_tensor_view(same_view, same_view)
+        assert _same_tensor_view(same_view, same_view_alias)
+        assert not _same_tensor_view(None, None)
+        assert not _same_tensor_view(same_view, None)
+
+        empty = torch.empty(0)
+        assert not _same_tensor_view(empty, empty)
+        assert not _same_tensor_view(empty, empty.view_as(empty))
+
+        meta = torch.empty(4, device="meta")
+        assert not _same_tensor_view(meta, meta)
+        assert not _same_tensor_view(meta, meta.view_as(meta))
+
+        assert not _same_tensor_view(same_view, base[1:5])
+        assert not _same_tensor_view(same_view, base[:3])
+
+    @pytest.mark.internal
+    def test_same_tensor_view_fake_tensor_fails_closed(self):
+        try:
+            from torch._subclasses.fake_tensor import FakeTensorMode
+        except ImportError:
+            pytest.skip("FakeTensorMode is not available in this PyTorch version.")
+
+        with FakeTensorMode():
+            fake = torch.empty(4, device="cuda")
+            fake_alias = fake.view_as(fake)
+
+        assert not _same_tensor_view(fake, fake)
+        assert not _same_tensor_view(fake, fake_alias)
+
+    @pytest.mark.internal
+    def test_append_dummy_sequence_preserves_qkv_views(self):
+        psp = _make_same_view_psp([0, 3, 5], [0, 3, 5])
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5), None, None, None, psp, target_len=8, cp_size=1, cp_rank=0
+        )
+
+        expected = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
+        assert torch.equal(padded.cu_seqlens_q, expected)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected)
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_extend_last_sequence_preserves_qkv_views(self):
+        psp = _make_same_view_psp([0, 3, 5], [0, 4, 7])
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 7),
+            None,
+            None,
+            None,
+            psp,
+            target_len=10,
+            tail_padding_policy="extend_last",
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        assert torch.equal(padded.cu_seqlens_q, torch.tensor([0, 3, 5], dtype=torch.int32))
+        assert torch.equal(padded.cu_seqlens_q_padded, torch.tensor([0, 4, 10], dtype=torch.int32))
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_extend_last_missing_padded_metadata_inherits_valid_qkv_view(self):
+        cu_q, cu_kv = _make_same_view_cu_pair([0, 3, 5])
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+            pad_between_seqs=False,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            tail_padding_policy="extend_last",
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        assert torch.equal(padded.cu_seqlens_q, torch.tensor([0, 3, 5], dtype=torch.int32))
+        assert torch.equal(padded.cu_seqlens_q_padded, torch.tensor([0, 3, 8], dtype=torch.int32))
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_extend_last_missing_padded_metadata_keeps_distinct_valid_qkv_views(self):
+        cu_q = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_kv = cu_q.clone()
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+            pad_between_seqs=False,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            tail_padding_policy="extend_last",
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        expected = torch.tensor([0, 3, 8], dtype=torch.int32)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected)
+        assert torch.equal(padded.cu_seqlens_kv_padded, expected)
+        assert padded.cu_seqlens_q_padded is not padded.cu_seqlens_kv_padded
+        assert padded.cu_seqlens_q_padded.data_ptr() != padded.cu_seqlens_kv_padded.data_ptr()
+
+    def test_fixed_capacity_only_padding_preserves_qkv_views(self):
+        psp = _make_same_view_psp([0, 3, 8], [0, 4, 8])
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 8),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            max_num_seqs=5,
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        assert torch.equal(padded.cu_seqlens_q, torch.tensor([0, 3, 8, 8, 8, 8], dtype=torch.int32))
+        assert torch.equal(
+            padded.cu_seqlens_q_padded, torch.tensor([0, 4, 8, 8, 8, 8], dtype=torch.int32)
+        )
+        _assert_qkv_views_are_shared(padded)
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_q_padded.data_ptr()
+
+    @pytest.mark.internal
+    def test_distinct_equal_qkv_views_remain_distinct(self):
+        cu_q = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_kv = cu_q.clone()
+        cu_q_padded = cu_q.clone()
+        cu_kv_padded = cu_q.clone()
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_q_padded=cu_q_padded,
+            cu_seqlens_kv_padded=cu_kv_padded,
+            max_seqlen_q=3,
+            max_seqlen_kv=3,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 5),
+            None,
+            None,
+            None,
+            psp,
+            target_len=8,
+            max_num_seqs=5,
+            cp_size=1,
+            cp_rank=0,
+        )
+
+        expected = torch.tensor([0, 3, 5, 8, 8, 8], dtype=torch.int32)
+        assert torch.equal(padded.cu_seqlens_q, expected)
+        assert torch.equal(padded.cu_seqlens_kv, expected)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected)
+        assert torch.equal(padded.cu_seqlens_kv_padded, expected)
+        assert padded.cu_seqlens_q is not padded.cu_seqlens_kv
+        assert padded.cu_seqlens_q.data_ptr() != padded.cu_seqlens_kv.data_ptr()
+        assert padded.cu_seqlens_q_padded is not padded.cu_seqlens_kv_padded
+        assert padded.cu_seqlens_q_padded.data_ptr() != padded.cu_seqlens_kv_padded.data_ptr()
+
+
+class TestPadSequenceForThd:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_generic_alignment_appends_dummy_padding_sequence(self):
+        """Default THD padding covers tail slots with an ordinary dummy sequence."""
+        seqlens, total_T = [50, 30], 80
+        psp = _make_psp(seqlens)
+        orig = psp.cu_seqlens_q.clone()
+        p_tok, _, _, _, p, mask = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"), None, None, None, psp, alignment=64
+        )
+        assert p_tok.shape == (1, 128)
+        expected = torch.cat((orig, torch.tensor([128], dtype=orig.dtype, device=orig.device)))
+        assert torch.equal(p.cu_seqlens_q, expected)
+        assert torch.equal(p.cu_seqlens_q_padded, expected)
+        assert p.pad_between_seqs is False
+        assert mask.shape == (1, 128)
+        assert not mask[0, :total_T].any() and mask[0, total_T:].all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_default_dummy_preserves_existing_valid_and_physical_gaps(self):
+        """The legacy ordinary dummy adds only the tail length to compact metadata."""
+        cu_valid = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+        cu_padded = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_valid,
+            cu_seqlens_kv=cu_valid.clone(),
+            cu_seqlens_q_padded=cu_padded,
+            cu_seqlens_kv_padded=cu_padded.clone(),
+            max_seqlen_q=4,
+            max_seqlen_kv=4,
+        )
+        initial_padding_mask = torch.tensor(
+            [[False, False, False, True, False, False, True, True]], dtype=torch.bool, device="cuda"
+        )
+
+        p_tok, _, _, _, padded, mask = pad_sequence_for_thd(
+            torch.ones(1, 8, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            target_len=12,
+            padding_mask=initial_padding_mask,
+        )
+
+        expected_valid = torch.tensor([0, 3, 5, 9], dtype=torch.int32, device="cuda")
+        expected_padded = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device="cuda")
+        assert p_tok.shape == (1, 12)
+        assert torch.equal(padded.cu_seqlens_q, expected_valid)
+        assert torch.equal(padded.cu_seqlens_kv, expected_valid)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected_padded)
+        assert torch.equal(padded.cu_seqlens_kv_padded, expected_padded)
+        assert padded.pad_between_seqs is True
+        assert padded.max_seqlen_q == 4
+        assert padded.max_seqlen_kv == 4
+        assert torch.equal(
+            mask,
+            torch.tensor(
+                [[False, False, False, True, False, False, True, True, True, True, True, True]],
+                dtype=torch.bool,
+                device="cuda",
+            ),
+        )
+
+    @pytest.mark.internal
+    @_REQUIRES_TWO_RANKS
+    def test_cp_alignment_uses_global_cu_seqlens_length(self):
+        """CP-local token length must not cap global packed-sequence padding."""
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        psp = _make_psp([140])
+        local_T = 80
+        p_tok, _, _, _, p, mask = pad_sequence_for_thd(
+            torch.ones(1, local_T, device="cuda"), None, None, None, psp, alignment=128
+        )
+
+        assert p_tok.shape[-1] >= local_T
+        assert p.cu_seqlens_q[-1].item() == 256
+        assert p.cu_seqlens_q_padded[-1].item() == 256
+        assert p.max_seqlen_q == 140
+        assert p.max_seqlen_kv == 140
+        assert mask.shape[-1] == p_tok.shape[-1]
+        assert not mask[0, :local_T].any()
+
+    @pytest.mark.internal
+    @_REQUIRES_TWO_RANKS
+    def test_cp_alignment_covers_local_padding_tail(self):
+        """CP-local padding can create a global tail even when global length is aligned."""
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        psp = _make_psp([1600, 1600])
+        local_T = 1600
+        p_tok, _, _, _, p, mask = pad_sequence_for_thd(
+            torch.ones(1, local_T, device="cuda"), None, None, None, psp, alignment=128
+        )
+
+        assert p_tok.shape[-1] == 1664
+        assert p.cu_seqlens_q[-1].item() == 3328
+        assert p.cu_seqlens_q_padded[-1].item() == 3328
+        assert p.max_seqlen_q == 1600
+        assert p.max_seqlen_kv == 1600
+        assert mask.shape[-1] == p_tok.shape[-1]
+        assert not mask[0, :local_T].any()
+        assert mask[0, local_T:].all()
+
+    @pytest.mark.internal
+    @_REQUIRES_TWO_RANKS
+    def test_cp_dummy_rejects_tail_that_cannot_be_partitioned(self):
+        """An ordinary dummy sequence must satisfy TE's 2*CP divisibility rule."""
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        with pytest.raises(AssertionError, match="must be divisible"):
+            pad_sequence_for_thd(
+                torch.ones(1, 2, device="cuda"), None, None, None, _make_psp([4]), target_len=3
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_non_dummy_padding_rejects_slice_first_call(self):
+        """Non-dummy metadata must be extended before CP partitions the tensors."""
+        with pytest.raises(AssertionError, match="before CP slicing"):
+            pad_sequence_for_thd(
+                torch.ones(1, 2, device="cuda"),
+                None,
+                None,
+                None,
+                _make_psp([4]),
+                target_len=3,
+                tail_padding_policy="extend_last",
+                cp_size=2,
+                cp_rank=0,
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_without_dummy_extends_last_padded_sequence(self):
+        """Non-dummy tail padding belongs to the final real sequence."""
+        cu_valid = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+        cu_padded = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_valid,
+            cu_seqlens_kv=cu_valid.clone(),
+            cu_seqlens_q_padded=cu_padded,
+            cu_seqlens_kv_padded=cu_padded.clone(),
+            max_seqlen_q=4,
+            max_seqlen_kv=4,
+            pad_between_seqs=True,
+        )
+        original = {
+            "cu_seqlens_q": psp.cu_seqlens_q.clone(),
+            "cu_seqlens_kv": psp.cu_seqlens_kv.clone(),
+            "cu_seqlens_q_padded": psp.cu_seqlens_q_padded.clone(),
+            "cu_seqlens_kv_padded": psp.cu_seqlens_kv_padded.clone(),
+        }
+        initial_padding_mask = torch.tensor(
+            [[False, False, False, True, False, False, True, True]], dtype=torch.bool, device="cuda"
+        )
+        p_tok, _, _, _, p, mask = pad_sequence_for_thd(
+            torch.ones(1, 8, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            target_len=10,
+            tail_padding_policy="extend_last",
+            padding_mask=initial_padding_mask,
+        )
+        expected_padded = torch.tensor([0, 4, 10], dtype=torch.int32, device="cuda")
+        assert p_tok.shape == (1, 10)
+        assert torch.equal(p.cu_seqlens_q, cu_valid)
+        assert torch.equal(p.cu_seqlens_kv, cu_valid)
+        assert torch.equal(p.cu_seqlens_q_padded, expected_padded)
+        assert torch.equal(p.cu_seqlens_kv_padded, expected_padded)
+        assert p.max_seqlen_q == 6
+        assert p.max_seqlen_kv == 6
+        assert p.pad_between_seqs is True
+        assert torch.equal(
+            p.seq_idx,
+            torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1, 1, 1]], dtype=torch.int32, device="cuda"),
+        )
+        for name, value in original.items():
+            assert torch.equal(getattr(psp, name), value)
+        assert torch.equal(
+            mask,
+            torch.tensor(
+                [[False, False, False, True, False, False, True, True, True, True]],
+                dtype=torch.bool,
+                device="cuda",
+            ),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_non_dummy_padding_extends_globally_before_slice(self):
+        """The supported slice-then-pad recipe for the non-scheduler SFT path.
+
+        With CP > 1 the caller extends the global physical endpoint and pads
+        tensors before CP slicing; the post-slice pad_sequence_for_thd call is
+        then a metadata no-op instead of tripping the slice-first assertion.
+        """
+        cp_size = 2
+        cu_valid = torch.tensor([0, 4, 12], dtype=torch.int32, device="cuda")
+        cu_padded = cu_valid.clone()
+        max_seqlen = torch.tensor([8], dtype=torch.int32, device="cuda")
+
+        cu_padded, max_seqlen, global_target_len = extend_thd_padding_before_cp_slice(
+            cu_padded, max_seqlen, alignment=4, target_len=None, cp_size=cp_size, cp_layout="zigzag"
+        )
+        assert global_target_len == 16
+        assert torch.equal(cu_padded, torch.tensor([0, 4, 16], dtype=torch.int32, device="cuda"))
+        assert int(max_seqlen.item()) == 12
+
+        padding_mask = _build_thd_padding_mask(cu_valid, cu_padded)
+        assert padding_mask.tolist() == [False] * 12 + [True] * 4
+
+        tokens = torch.arange(1, global_target_len + 1, device="cuda").unsqueeze(0)
+        tokens[0, 12:] = 0
+        expected_local_rows = {
+            0: [0, 3, 4, 5, 6, 13, 14, 15],  # zigzag chunks 0 and 3 of each sequence
+            1: [1, 2, 7, 8, 9, 10, 11, 12],  # zigzag chunks 1 and 2 of each sequence
+        }
+        for cp_rank, rows in expected_local_rows.items():
+            index = torch.tensor(rows, dtype=torch.int64, device="cuda")
+            local_tokens = tokens.index_select(1, index)
+            local_mask = padding_mask.unsqueeze(0).index_select(1, index)
+            psp = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_valid,
+                cu_seqlens_kv=cu_valid.clone(),
+                cu_seqlens_q_padded=cu_padded,
+                cu_seqlens_kv_padded=cu_padded.clone(),
+                max_seqlen_q=int(max_seqlen.item()),
+                max_seqlen_kv=int(max_seqlen.item()),
+            )
+            p_tok, _, _, _, p, mask = pad_sequence_for_thd(
+                local_tokens,
+                None,
+                None,
+                None,
+                psp,
+                alignment=4,
+                tail_padding_policy="extend_last",
+                padding_mask=local_mask,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+            )
+            assert torch.equal(p_tok, local_tokens)
+            assert torch.equal(p.cu_seqlens_q, cu_valid)
+            assert torch.equal(p.cu_seqlens_q_padded, cu_padded)
+            assert p.max_seqlen_q == 12
+            assert torch.equal(mask, local_mask)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_without_dummy_creates_padded_metadata(self):
+        """Equal input boundaries diverge when the last sequence absorbs the tail."""
+        psp = _make_psp([5, 3])
+
+        _, _, _, _, padded, mask = pad_sequence_for_thd(
+            torch.ones(1, 8, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            target_len=12,
+            tail_padding_policy="extend_last",
+        )
+
+        expected_valid = torch.tensor([0, 5, 8], dtype=torch.int32, device="cuda")
+        expected_padded = torch.tensor([0, 5, 12], dtype=torch.int32, device="cuda")
+        assert torch.equal(padded.cu_seqlens_q, expected_valid)
+        assert torch.equal(padded.cu_seqlens_kv, expected_valid)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected_padded)
+        assert torch.equal(padded.cu_seqlens_kv_padded, expected_padded)
+        assert padded.max_seqlen_q == 7
+        assert padded.max_seqlen_kv == 7
+        assert padded.pad_between_seqs is True
+        assert not mask[0, :8].any()
+        assert mask[0, 8:].all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_shapes_and_data_preservation(self):
+        """Shapes are static; original data intact; padding zero-filled."""
+        seqlens, max_seqlen, max_num_seqs = [100, 50, 30], 256, 8
+        total_T = sum(seqlens)
+        tokens = torch.arange(total_T, device="cuda").unsqueeze(0).float()
+        p_tok, p_lab, p_loss, p_pos, p_params, p_mask = pad_sequence_for_thd(
+            tokens,
+            tokens.clone(),
+            torch.ones(1, total_T, device="cuda"),
+            torch.arange(total_T, device="cuda").unsqueeze(0),
+            _make_psp(seqlens),
+            target_len=max_seqlen,
+            max_num_seqs=max_num_seqs,
+        )
+        for t in (p_tok, p_lab, p_loss, p_pos):
+            assert t.shape == (1, max_seqlen)
+        for cu in (
+            p_params.cu_seqlens_q,
+            p_params.cu_seqlens_kv,
+            p_params.cu_seqlens_q_padded,
+            p_params.cu_seqlens_kv_padded,
+        ):
+            assert cu.shape[0] == max_num_seqs + 1
+        expected_cu = torch.tensor(
+            [0, 100, 150, 180, 256, 256, 256, 256, 256], dtype=torch.int32, device="cuda"
+        )
+        assert torch.equal(p_params.cu_seqlens_q, expected_cu)
+        assert torch.equal(p_params.cu_seqlens_kv, expected_cu)
+        assert torch.equal(p_params.cu_seqlens_q_padded, expected_cu)
+        assert torch.equal(p_params.cu_seqlens_kv_padded, expected_cu)
+        assert p_params.max_seqlen_q == max_seqlen
+        assert p_params.max_seqlen_kv == max_seqlen
+        assert p_params.pad_between_seqs is True
+        assert p_mask.shape == (1, max_seqlen) and p_mask.dtype == torch.bool
+        assert torch.equal(p_tok[0, :total_T], tokens[0])
+        assert (p_tok[0, total_T:] == 0).all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_eager_pad_to_max_appends_dummy_padding_sequence(self):
+        """Default eager pad-to-max covers the tail with a dummy sequence."""
+        seqlens, total_T, target_len = [50, 30], 80, 8192
+        psp = _make_psp(seqlens)
+        orig_cu = psp.cu_seqlens_q.clone()
+        alignment, pad_target_len, max_num_seqs = get_thd_padding_kwargs(
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=target_len,
+            thd_max_packed_sequences=None,
+            cuda_graph_static=False,
+        )
+
+        p_tok, _, _, _, p_params, p_mask = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            alignment=alignment,
+            target_len=pad_target_len,
+            max_num_seqs=max_num_seqs,
+        )
+
+        assert p_tok.shape == (1, target_len)
+        expected = torch.cat(
+            (orig_cu, torch.tensor([target_len], dtype=orig_cu.dtype, device=orig_cu.device))
+        )
+        assert torch.equal(p_params.cu_seqlens_q, expected)
+        assert torch.equal(p_params.cu_seqlens_q_padded, expected)
+        assert p_params.cu_seqlens_q.shape[0] == orig_cu.shape[0] + 1
+        assert p_params.max_seqlen_q == target_len - total_T
+        assert p_params.max_seqlen_kv == target_len - total_T
+        assert p_params.total_tokens == target_len
+        assert p_params.pad_between_seqs is False
+        assert p_mask.shape == (1, target_len)
+        assert not p_mask[0, :total_T].any()
+        assert p_mask[0, total_T:].all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_mask_boundary(self):
+        """False at real positions, True at padding (MoE aux-loss contract)."""
+        seqlens, total_T, max_seqlen = [60, 40], 100, 128
+        _, _, _, _, _, m = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"),
+            None,
+            None,
+            None,
+            _make_psp(seqlens),
+            target_len=max_seqlen,
+            max_num_seqs=4,
+        )
+        assert not m[0, :total_T].any() and m[0, total_T:].all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_mask_preserves_existing_padding(self):
+        """Existing THD padding and appended tail padding are merged in one helper."""
+        seqlens, total_T, max_seqlen = [4, 4], 8, 10
+        padding_mask = torch.tensor(
+            [[False, False, False, True, False, False, True, True]], dtype=torch.bool, device="cuda"
+        )
+
+        _, _, _, _, _, m = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"),
+            None,
+            None,
+            None,
+            _make_psp(seqlens),
+            target_len=max_seqlen,
+            max_num_seqs=4,
+            padding_mask=padding_mask,
+        )
+
+        assert torch.equal(
+            m,
+            torch.tensor(
+                [[False, False, False, True, False, False, True, True, True, True]],
+                dtype=torch.bool,
+                device="cuda",
+            ),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cp_metadata_only_uses_local_padding_mask(self, monkeypatch):
+        """A middle PP stage must not repartition already CP-sliced physical rows."""
+        packed_seq_params = _make_psp([15])
+        cu_seqlens_padded = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+        packed_seq_params.cu_seqlens_q_padded = cu_seqlens_padded
+        packed_seq_params.cu_seqlens_kv_padded = cu_seqlens_padded.clone()
+        padding_mask = torch.tensor([[False, False, False, True]], dtype=torch.bool, device="cuda")
+
+        def fail_if_called(*_args, **_kwargs):
+            pytest.fail("already sliced padding_mask must avoid TE repartitioning")
+
+        monkeypatch.setattr(
+            "megatron.core.extensions.transformer_engine.get_thd_partitioned_indices",
+            fail_if_called,
+        )
+
+        _, _, _, _, padded_params, padded_mask = pad_sequence_for_thd(
+            None,
+            None,
+            None,
+            None,
+            packed_seq_params,
+            target_len=4,
+            padding_mask=padding_mask,
+            cp_size=4,
+            cp_rank=3,
+        )
+
+        assert torch.equal(padded_mask, padding_mask)
+        assert padded_params.cu_seqlens_q.tolist() == [0, 15]
+        assert padded_params.cu_seqlens_q_padded.tolist() == [0, 16]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cu_seqlens_fill_value(self):
+        """Static cu padding repeats the dummy endpoint."""
+        seqlens, total_T = [50, 30], 80
+        _, _, _, _, p, _ = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"),
+            None,
+            None,
+            None,
+            _make_psp(seqlens),
+            target_len=128,
+            max_num_seqs=32,
+        )
+        assert p.cu_seqlens_q[0] == 0 and p.cu_seqlens_q[2] == 80
+        assert (p.cu_seqlens_q[3:] == 128).all()
+        assert p.cu_seqlens_q_padded[0] == 0 and p.cu_seqlens_q_padded[2] == 80
+        assert (p.cu_seqlens_q_padded[3:] == 128).all()
+        assert p.pad_between_seqs is True
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_non_dummy_tail_padding_extends_static_padded_endpoint(self):
+        """Static entry padding repeats the extended final padded endpoint."""
+        cu_valid = torch.tensor([0, 18, 44, 52, 96, 118], dtype=torch.int32, device="cuda")
+        cu_padded = torch.tensor([0, 24, 56, 64, 112, 144], dtype=torch.int32, device="cuda")
+        psp = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_valid,
+            cu_seqlens_kv=cu_valid.clone(),
+            cu_seqlens_q_padded=cu_padded,
+            cu_seqlens_kv_padded=cu_padded.clone(),
+            max_seqlen_q=48,
+            max_seqlen_kv=48,
+            pad_between_seqs=True,
+        )
+
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 144, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            target_len=160,
+            max_num_seqs=8,
+            tail_padding_policy="extend_last",
+        )
+
+        expected_valid = torch.tensor(
+            [0, 18, 44, 52, 96, 118, 118, 118, 118], dtype=torch.int32, device="cuda"
+        )
+        expected_padded = torch.tensor(
+            [0, 24, 56, 64, 112, 160, 160, 160, 160], dtype=torch.int32, device="cuda"
+        )
+        assert torch.equal(padded.cu_seqlens_q, expected_valid)
+        assert torch.equal(padded.cu_seqlens_kv, expected_valid)
+        assert torch.equal(padded.cu_seqlens_q_padded, expected_padded)
+        assert torch.equal(padded.cu_seqlens_kv_padded, expected_padded)
+        assert padded.max_seqlen_q == 160
+        assert padded.max_seqlen_kv == 160
+        assert padded.pad_between_seqs is True
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_none_inputs(self):
+        """Non-pre_process PP: mask from cu_seqlens when all tensors None."""
+        seqlens, total_T, max_seqlen = [50, 30], 80, 128
+        _, _, _, _, _, mask = pad_sequence_for_thd(
+            None, None, None, None, _make_psp(seqlens), target_len=max_seqlen, max_num_seqs=4
+        )
+        assert mask.shape == (1, max_seqlen)
+        assert not mask[0, :total_T].any() and mask[0, total_T:].all()
+
+
+# =============================================================================
+# 2. PackedSeqParams decompose / reconstruct
+# =============================================================================
+
+
+class TestDecomposeReconstruct:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_reconstruct_preserves_cu_tensors_and_uses_conservative_padding_flag(self):
+        """Reconstruction preserves cu tensors and uses a graph-static padding flag."""
+        psp = _make_psp([100, 50, 30])
+        orig = {
+            k: getattr(psp, k).clone()
+            for k in (
+                'cu_seqlens_q',
+                'cu_seqlens_kv',
+                'cu_seqlens_q_padded',
+                'cu_seqlens_kv_padded',
+            )
+        }
+        # Capacity matches the 3-sequence pack; replay decomposition rejects other shapes.
+        layer = _build_layer(256, 4, 4, 1024, 128, 3)
+        layer.config.cuda_graph_impl = "transformer_engine"
+        kw = {'packed_seq_params': psp, 'other': 'kept'}
+        layer._decompose_packed_seq_params_to_kwargs(kw)
+        assert 'packed_seq_params' not in kw and 'cu_seqlens_q' in kw
+        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        r = kw['packed_seq_params']
+        assert r.qkv_format == 'thd' and r.max_seqlen_q == 128
+        assert r.pad_between_seqs is True
+        for k, v in orig.items():
+            assert torch.equal(getattr(r, k), v)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_reconstruct_preserves_inter_sequence_padding_semantics(self):
+        """CUDA graph reconstruction conservatively enables valid/physical gaps."""
+        cu_valid = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
+        cu_padded = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
+        psp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_valid,
+            cu_seqlens_kv=cu_valid.clone(),
+            cu_seqlens_q_padded=cu_padded,
+            cu_seqlens_kv_padded=cu_padded.clone(),
+            max_seqlen_q=4,
+            max_seqlen_kv=4,
+            pad_between_seqs=True,
+        )
+        layer = _build_layer(256, 4, 4, 1024, 128, 2)
+        layer.config.cuda_graph_impl = "transformer_engine"
+        kw = {'packed_seq_params': psp}
+
+        layer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+
+        reconstructed = kw['packed_seq_params']
+        assert reconstructed.pad_between_seqs is True
+        assert not torch.equal(reconstructed.cu_seqlens_q, reconstructed.cu_seqlens_q_padded)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_noop_without_packed_seq_params(self):
+        """No-ops on non-THD kwargs (SBHD path)."""
+        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        kw = {'hidden_states': torch.randn(10, 1, 256, device="cuda")}
+        keys = set(kw.keys())
+        layer._decompose_packed_seq_params_to_kwargs(kw)
+        assert set(kw.keys()) == keys
+        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        assert set(kw.keys()) == keys
+
+
+class TestStaticInputs:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_hash_router_input_ids_use_per_rank_capacity(self):
+        """Hash routing input IDs must use the fixed [1, local_tokens] THD shape."""
+        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        layer.config.context_parallel_size = 2
+        layer.config.sequence_packing_scheduler = "dp_balanced"
+        layer.config.cuda_graph_impl = "transformer_engine"
+        layer.is_moe_layer = True
+        layer.mlp.router = torch.nn.Identity()
+        layer.mlp.router.is_hash_layer = True
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=256, micro_batch_size=2)
+
+        assert static_inputs["input_ids"].shape == (1, 128)

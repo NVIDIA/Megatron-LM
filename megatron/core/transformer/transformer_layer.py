@@ -1737,30 +1737,42 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Get the static inputs for the transformer layer. Besides the hidden_states that is
         generated in GraphableMegatronModule, we also add the attention_mask.
 
+        For THD + CUDA Graph: generates static cu_seqlens tensors instead of attention_mask.
+
         Returns:
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
-        if getattr(self.config, "sequence_packing_scheduler", None) is not None:
-            capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
-            offsets = torch.zeros(
-                self.config.thd_max_packed_sequences + 1,
-                dtype=torch.int32,
-                device=static_inputs["hidden_states"].device,
-            )
-            offsets[1:] = capacity
-            for name in (
-                'cu_seqlens_q',
-                'cu_seqlens_kv',
-                'cu_seqlens_q_padded',
-                'cu_seqlens_kv_padded',
-            ):
-                static_inputs[name] = offsets.clone()
-        elif not isinstance(self.self_attention, IdentityOp) and (
+        # Captured forward needs attention-side static input only when this
+        # layer's attention is inside the captured scope.
+        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
-        ):
+        )
+
+        if self._is_thd_cuda_graph():
+            if attn_in_graph:
+                # Static cu_seqlens shaped [thd_max_packed_sequences + 1]. We seed it as
+                # one full-length sequence (covers the worst case at capture):
+                #   cu_seqlens = [0, max_T, max_T, ..., max_T]
+                # which represents a single packed sequence followed by zero-length
+                # entries. cu_seqlens_q / kv / *_padded all share this layout.
+                max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+                cu_seqlens = torch.zeros(
+                    self.config.thd_max_packed_sequences + 1,
+                    dtype=torch.int32,
+                    device=static_inputs["hidden_states"].device,
+                )
+                cu_seqlens[1:] = max_T
+                for name in (
+                    'cu_seqlens_q',
+                    'cu_seqlens_kv',
+                    'cu_seqlens_q_padded',
+                    'cu_seqlens_kv_padded',
+                ):
+                    static_inputs[name] = cu_seqlens.clone()
+        elif attn_in_graph:
             slen_per_cp = seq_length // self.config.context_parallel_size
             static_inputs["attention_mask"] = (
                 ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
@@ -1769,8 +1781,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 .tile(micro_batch_size, 1, 1, 1)
             )
         if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
+            # [batch, seq] of the static hidden states; THD graphs use a single packed row.
             static_inputs["input_ids"] = torch.zeros(
-                (micro_batch_size, static_inputs["hidden_states"].shape[0]),
+                (static_inputs["hidden_states"].shape[1], static_inputs["hidden_states"].shape[0]),
                 dtype=torch.long,
                 device=torch.cuda.current_device(),
             )
@@ -1850,21 +1863,52 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 submodules += [self.mlp.shared_experts]
         return submodules
 
-    def _reconstruct_packed_graph_inputs(self, kwargs):
-        """Rebuild THD metadata inside capture using graph-static scalar capacities."""
+    def _decompose_packed_seq_params_to_kwargs(self, kwargs):
+        """Decompose PackedSeqParams into individual tensor kwargs for CUDA graph.
+
+        CUDA graph requires all inputs to be tensors. This extracts the cu_seqlens
+        tensor fields from PackedSeqParams into individual kwargs. max_seqlen_q/kv
+        are omitted because they are static and reading them from a CUDA tensor is
+        forbidden during graph capture. They are restored from config in
+        _reconstruct_packed_seq_params_from_kwargs.
+        """
+        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        if packed_seq_params is None:
+            return
+        for name in ('cu_seqlens_q', 'cu_seqlens_kv', 'cu_seqlens_q_padded', 'cu_seqlens_kv_padded'):
+            offsets = getattr(packed_seq_params, name)
+            if offsets is None or offsets.numel() != self.config.thd_max_packed_sequences + 1:
+                raise ValueError(
+                    "Packed CUDA graph inputs must use the configured metadata capacity."
+                )
+            kwargs[name] = offsets
+
+    def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
+        """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
+
+        During CUDA graph capture/replay, PackedSeqParams fields are decomposed into
+        individual cu_seqlens tensor kwargs. This method reassembles them into a
+        PackedSeqParams. max_seqlen_q/kv are taken from config since they are always
+        the padded static value and cannot be read from CUDA tensors during graph capture.
+        pad_between_seqs is conservatively enabled because its Python value is not a
+        graph input and inferring it from CUDA tensors would synchronize during capture.
+        """
         if 'cu_seqlens_q' not in kwargs:
             return
-        capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
         kwargs['packed_seq_params'] = PackedSeqParams(
             qkv_format='thd',
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
             cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
-            max_seqlen_q=capacity,
-            max_seqlen_kv=capacity,
-            # Runtime packs can contain valid/physical gaps. A fixed True value
-            # avoids a CUDA-to-host tensor comparison during attention capture.
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            # CUDA graph inputs do not carry this Python bool. Sequence-packing
+            # metadata may contain valid/physical gaps, so use the conservative
+            # graph-static value instead of asking TE to infer it with a CUDA
+            # tensor comparison during capture. This restricts TE backend
+            # selection for THD to cuDNN fused attention.
             pad_between_seqs=True,
         )
 
@@ -1876,7 +1920,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
-        self._reconstruct_packed_graph_inputs(kwargs)
+        self._reconstruct_packed_seq_params_from_kwargs(kwargs)
 
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
@@ -1955,21 +1999,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 kwargs["input_ids"] = input_ids
 
         packed = kwargs.get('packed_seq_params')
-        if packed is not None and self.config.sequence_packing_scheduler is not None:
+        if packed is not None and self._is_thd_cuda_graph():
             kwargs = dict(kwargs)
-            kwargs.pop('packed_seq_params')
-            for name in (
-                'cu_seqlens_q',
-                'cu_seqlens_kv',
-                'cu_seqlens_q_padded',
-                'cu_seqlens_kv_padded',
-            ):
-                offsets = getattr(packed, name)
-                if offsets is None or offsets.numel() != self.config.thd_max_packed_sequences + 1:
-                    raise ValueError(
-                        "Packed CUDA graph inputs must use the configured metadata capacity."
-                    )
-                kwargs[name] = offsets
+            self._decompose_packed_seq_params_to_kwargs(kwargs)
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
@@ -2165,7 +2197,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 # The attention_mask can be None when there is no padding to the input sequence.
                 # However, an attention_mask Tensor must be passed into cudagraph for replay, so
                 # we create an equivalent zero Tensor as the attention_mask.
-                if self.config.sequence_packing_scheduler is not None:
+                if self._is_thd_cuda_graph():
                     cudagraph_kwargs.pop("attention_mask")
                 else:
                     cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(

@@ -3921,14 +3921,33 @@ class TransformerConfig(ModelParallelConfig):
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
         if self.thd_max_packed_sequences is not None:
-            assert self.sequence_packing_scheduler == "dp_balanced"
+            # Either the dp_balanced scheduler bounds packing with this capacity, or the caller
+            # pads already-packed THD batches to it with pad_sequence_for_thd.
+            assert self.sequence_packing_scheduler in (None, "dp_balanced")
             assert not self.dynamic_context_parallel
             pad_enabled = self.pad_packed_seq_alignment is not None or (
                 self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
             )
+            # The scheduler always reserves the dummy slot when padding is enabled. Post-pack
+            # padding appends a dummy only when the pack falls short of the padding target,
+            # so a capacity of one fits packs that already fill it.
             assert self.thd_max_packed_sequences >= (
-                2 if pad_enabled else 1
+                2 if pad_enabled and self.sequence_packing_scheduler is not None else 1
             ), "THD metadata capacity must leave room for the dummy padding document."
+        # 'extend_last' THD tail padding with context parallelism requires the
+        # global metadata to be extended before CP slicing, which only the
+        # sequence-packing scheduler path performs. Restrict this combination.
+        if (
+            self.sequence_packing_scheduler is None
+            and self.pad_packed_seq_alignment is not None
+            and (self.thd_tail_padding_policy or 'append_dummy_seq') == 'extend_last'
+            and (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+        ):
+            raise ValueError(
+                "thd_tail_padding_policy='extend_last' with context parallelism is only "
+                "supported together with a sequence_packing_scheduler. Either enable a "
+                "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
+            )
         if self.cuda_graph_dynamic_microbatches:
             assert self.cuda_graph_impl == "transformer_engine"
             assert self.sequence_packing_scheduler == "dp_balanced"
