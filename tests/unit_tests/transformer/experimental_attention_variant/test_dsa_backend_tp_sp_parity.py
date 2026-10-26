@@ -766,7 +766,9 @@ def test_indexer_metrics_reduce_across_pipeline_rank_without_indexer():
             loss_scale=0.5,
             iteration=1,
             writer=None,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['pp', 'dp']),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['pp', 'dp', 'dp_cp']
+            ),
             total_loss_dict=total_loss_dict,
             num_layers=num_layers,
             num_indexer_layers=1,
