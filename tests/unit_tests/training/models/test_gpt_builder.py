@@ -128,6 +128,25 @@ class TestDefaultLayerSpecDispatch:
         # cp_world_size=4 → use_arbitrary_attention_mask=False
         assert mock_get_spec.call_args.kwargs["use_arbitrary_attention_mask"] is False
 
+    @pytest.mark.parametrize("cp_size", [1, 4])
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_spec")
+    @patch("megatron.core.parallel_state")
+    def test_modelopt_arbitrary_attention_mask_derived_from_collection_cp_size(
+        self, mock_ps, mock_get_spec, cp_size
+    ):
+        # The builder's collection decides, not the global parallel state.
+        mock_ps.get_context_parallel_world_size.side_effect = AssertionError("global read")
+        mock_get_spec.return_value = Mock(spec=ModuleSpec)
+        config = _make_dispatch_config()
+        config.restore_modelopt_state = True
+        config.use_arbitrary_attention_mask = None
+        pg_collection = Mock()
+        pg_collection.cp.size.return_value = cp_size
+
+        default_layer_spec(config, vp_stage=None, pg_collection=pg_collection)
+
+        assert mock_get_spec.call_args.kwargs["use_arbitrary_attention_mask"] is (cp_size == 1)
+
     @patch(
         "megatron.training.models.gpt.get_transformer_block_with_experimental_attention_variant_spec"
     )
@@ -513,7 +532,7 @@ class TestGPTModelBuilderBuildModel:
 
         self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=3)
 
-        mock_default.assert_called_once_with(self.config, 3)
+        mock_default.assert_called_once_with(self.config, 3, pg_collection=self.pg)
         assert mock_model.call_args.kwargs["transformer_layer_spec"] is default_spec
 
     @patch("megatron.training.models.gpt.mtp_block_spec", return_value=None)
