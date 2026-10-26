@@ -357,7 +357,7 @@ class T5Model(LanguageModule):
             # Run encoder.
             if self.add_encoder:
                 encoder_hidden_states = self.encoder(
-                    encoder_input,
+                    hidden_states=encoder_input,
                     attention_mask=encoder_attn_mask,
                     inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
@@ -413,7 +413,7 @@ class T5Model(LanguageModule):
 
         # Run decoder.
         decoder_hidden_states = self.decoder(
-            decoder_input,
+            hidden_states=decoder_input,
             attention_mask=decoder_attn_mask,
             context=encoder_hidden_states,
             context_mask=encoder_decoder_attn_mask,

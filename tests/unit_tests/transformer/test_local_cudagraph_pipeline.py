@@ -103,7 +103,7 @@ class TestLocalCudagraphPipelineOutput:
             (1, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
         )
 
-        record_out = block(hidden_states, attention_mask=attention_mask)
+        record_out = block(hidden_states=hidden_states, attention_mask=attention_mask)
         expected_shape = record_out.shape
         assert torch.isfinite(record_out).all()
         assert record_out._base is None
@@ -116,7 +116,7 @@ class TestLocalCudagraphPipelineOutput:
         hidden_states.grad = None
         create_cudagraphs()
 
-        replay_out = block(hidden_states, attention_mask=attention_mask)
+        replay_out = block(hidden_states=hidden_states, attention_mask=attention_mask)
         assert replay_out.shape == expected_shape
         assert torch.isfinite(replay_out).all()
         assert replay_out._base is None

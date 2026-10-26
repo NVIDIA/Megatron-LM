@@ -567,12 +567,16 @@ class TestMultiModulePipelineCommunicator:
         # ========== Run actual distributed pipeline blocks (per process, depending on role) ==========
         if mllm_comm.is_current_rank_in_grid(image_encoder_grid):
             # Image encoder rank: run forward and send output
-            image_encoder_output = image_encoder_block(hidden_states, attention_mask=None)
+            image_encoder_output = image_encoder_block(
+                hidden_states=hidden_states, attention_mask=None
+            )
             output_dict = {'image_encoder': image_encoder_output}
             mllm_comm.send_forward(output_dict)
         if mllm_comm.is_current_rank_in_grid(audio_encoder_grid):
             # Audio encoder rank: run forward and send output
-            audio_encoder_output = audio_encoder_block(hidden_states, attention_mask=None)
+            audio_encoder_output = audio_encoder_block(
+                hidden_states=hidden_states, attention_mask=None
+            )
             output_dict = {'audio_encoder': audio_encoder_output}
             mllm_comm.send_forward(output_dict)
         if mllm_comm.is_current_rank_in_grid(llm_grid):
@@ -580,7 +584,7 @@ class TestMultiModulePipelineCommunicator:
                 # LLM stage 0 (receives both image and audio, concatenates along seq_dim)
                 input_dict = mllm_comm.recv_forward()
                 llm_output = llm_block(
-                    torch.cat(
+                    hidden_states=torch.cat(
                         [input_dict['image_encoder'], input_dict['audio_encoder']], dim=seq_dim
                     ),
                     attention_mask=None,
@@ -592,14 +596,14 @@ class TestMultiModulePipelineCommunicator:
                 input_dict = mllm_comm.recv_forward(
                     tensor_shape=(sequence_length * 2, micro_batch_size, hidden_size)
                 )
-                llm_output = llm_block(input_dict['llm'], attention_mask=None)
+                llm_output = llm_block(hidden_states=input_dict['llm'], attention_mask=None)
                 output_dict = {'llm': llm_output}
                 mllm_comm.send_forward(output_dict)
 
         if mllm_comm.is_current_rank_in_grid(generator_grid):
             # Generator block: only receives from llm and runs forward
             input_dict = mllm_comm.recv_forward()
-            generator_output = generator_block(input_dict['llm'], attention_mask=None)
+            generator_output = generator_block(hidden_states=input_dict['llm'], attention_mask=None)
 
         # ========== Build a reference (serial/global) pipeline for correctness checking ==========
         global_image_encoder_block, _ = get_transformer_block_and_grid(
@@ -639,8 +643,12 @@ class TestMultiModulePipelineCommunicator:
         )
 
         # Run each stage sequentially as a global pipeline (for truth)
-        global_image_encoder_output = global_image_encoder_block(hidden_states, attention_mask=None)
-        global_audio_encoder_output = global_audio_encoder_block(hidden_states, attention_mask=None)
+        global_image_encoder_output = global_image_encoder_block(
+            hidden_states=hidden_states, attention_mask=None
+        )
+        global_audio_encoder_output = global_audio_encoder_block(
+            hidden_states=hidden_states, attention_mask=None
+        )
         # Compare output between global and distributed blocks for image/audio stage
         if current_rank == 0:
             torch.testing.assert_close(
@@ -656,14 +664,14 @@ class TestMultiModulePipelineCommunicator:
             [global_image_encoder_output, global_audio_encoder_output], dim=seq_dim
         )
         global_llm_pp_rank_0_output = global_llm_block_pp_rank_0(
-            global_llm_input, attention_mask=None
+            hidden_states=global_llm_input, attention_mask=None
         )
         if current_rank == 2 or current_rank == 3:
             torch.testing.assert_close(
                 global_llm_pp_rank_0_output, llm_output, rtol=1e-3, atol=1e-3
             )
         global_llm_pp_rank_1_output = global_llm_block_pp_rank_1(
-            global_llm_pp_rank_0_output, attention_mask=None
+            hidden_states=global_llm_pp_rank_0_output, attention_mask=None
         )
         if current_rank == 4 or current_rank == 5:
             torch.testing.assert_close(
@@ -672,7 +680,7 @@ class TestMultiModulePipelineCommunicator:
 
         # Generator output and comparison to distributed output (for each DP chunk)
         global_generator_block_output = global_generator_block(
-            global_llm_pp_rank_1_output, attention_mask=None
+            hidden_states=global_llm_pp_rank_1_output, attention_mask=None
         )
         global_generator_block_chunks = torch.split(
             global_generator_block_output, global_generator_block_output.shape[1] // 2, dim=1
@@ -772,14 +780,14 @@ class TestMultiModulePipelineCommunicator:
         if grid_1 is not None and mllm_comm.is_current_rank_in_grid(grid_1):
             rank_module_info = mllm_comm.rank_module_map['image_encoder']
             if rank_module_info.pp_rank == 0:
-                hidden_states = block_grid_1(hidden_states, attention_mask=None)
+                hidden_states = block_grid_1(hidden_states=hidden_states, attention_mask=None)
                 mllm_comm.send_forward({'image_encoder': hidden_states})
             else:
                 input_dict = mllm_comm.recv_forward(
                     tensor_shape=(sequence_length, micro_batch_size, hidden_size)
                 )
                 hidden_states = input_dict['image_encoder']
-                hidden_states = block_grid_1(hidden_states, attention_mask=None)
+                hidden_states = block_grid_1(hidden_states=hidden_states, attention_mask=None)
                 mllm_comm.send_forward({'image_encoder': hidden_states})
 
         # If current rank is in second grid, receive and run the second block
@@ -788,7 +796,7 @@ class TestMultiModulePipelineCommunicator:
             if rank_module_info.pp_rank == 0:
                 input_dict = mllm_comm.recv_forward()
                 hidden_states = input_dict['image_encoder']
-                hidden_states = block_grid_2(hidden_states, attention_mask=None)
+                hidden_states = block_grid_2(hidden_states=hidden_states, attention_mask=None)
                 if rank_module_info.pp_rank == rank_module_info.pp_size - 1:
                     output_grid_2 = hidden_states
                 else:
@@ -802,7 +810,7 @@ class TestMultiModulePipelineCommunicator:
                     )
                 )
                 hidden_states = input_dict['llm']
-                hidden_states = block_grid_2(hidden_states, attention_mask=None)
+                hidden_states = block_grid_2(hidden_states=hidden_states, attention_mask=None)
                 mllm_comm.send_forward({'llm': hidden_states})
             else:
                 input_dict = mllm_comm.recv_forward(
@@ -813,7 +821,7 @@ class TestMultiModulePipelineCommunicator:
                     )
                 )
                 hidden_states = input_dict['llm']
-                output_grid_2 = block_grid_2(hidden_states, attention_mask=None)
+                output_grid_2 = block_grid_2(hidden_states=hidden_states, attention_mask=None)
 
                 # Compute expected output shape based on change in DP size (chunk/expand batch dimension appropriately)
                 factor = max(grid1_dp, grid2_dp) // min(grid1_dp, grid2_dp)
@@ -847,10 +855,10 @@ class TestMultiModulePipelineCommunicator:
         )
 
         for i in range(grid1_pp):
-            hidden_states_ref = global_block_1(hidden_states_ref, attention_mask=None)
+            hidden_states_ref = global_block_1(hidden_states=hidden_states_ref, attention_mask=None)
 
         for i in range(grid2_pp):
-            hidden_states_ref = global_block_2(hidden_states_ref, attention_mask=None)
+            hidden_states_ref = global_block_2(hidden_states=hidden_states_ref, attention_mask=None)
 
         # Output comparison under different DP compositions between grids
         if (
