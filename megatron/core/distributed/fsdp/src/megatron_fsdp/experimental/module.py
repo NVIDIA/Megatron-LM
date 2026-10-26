@@ -368,10 +368,10 @@ class FsdpModule:
         """Return parameters to their sharded resting state after forward compute."""
         is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
-            groups = tuple(
+            groups_to_release = tuple(
                 group for group in self._parameter_groups if group.has_forward_only_planes
             )
-            self._release_unsharded_storage(groups, rowwise_only=True)
+            self._release_unsharded_storage(groups_to_release, rowwise_only=True)
         else:
             self.reshard()
         if self.phase is Phase.FORWARD:
