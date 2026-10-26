@@ -1239,6 +1239,27 @@ class TEGroupedMLP(MegatronModule):
             output_buffer is None and grad_input_buffer is None
         ), "output_buffer/grad_input_buffer require the TE op-fuser (fused) path"
 
+        # A MoonEP receive budget can exceed the sum of its padded expert segments.
+        # TE's unquantized fallback splits the input using host counts, so it must
+        # see only those segments, even when moe_use_grouped_tensor was requested.
+        # Keep the static shape at the dispatch/combine boundary and zero its tail.
+        # Quantized grouped kernels consume offsets directly and need no host read.
+        receive_capacity = None
+        if (
+            self.config.moe_virtual_expert_load_balance
+            and not self.linear_fc1.will_execute_quantized(
+                is_context_quantized=bool(self.config.fp8 or self.config.fp4)
+            )
+        ):
+            receive_capacity = permuted_local_hidden_states.shape[0]
+            if isinstance(tokens_per_expert, torch.Tensor):
+                tokens_per_expert = tokens_per_expert.tolist()
+            valid_rows = sum(tokens_per_expert)
+            if valid_rows > receive_capacity:
+                raise ValueError("Expert segments exceed the MoonEP receive capacity.")
+            permuted_local_hidden_states = permuted_local_hidden_states[:valid_rows]
+            permuted_probs = permuted_probs[:valid_rows]
+
         # Apply padding if needed
         unpadded_tokens_per_expert = None
         permuted_probs = permuted_probs.unsqueeze(-1)
@@ -1445,6 +1466,9 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
+
+        if receive_capacity is not None:
+            output = F.pad(output, (0, 0, 0, receive_capacity - output.shape[0]))
 
         output_bias = None
 

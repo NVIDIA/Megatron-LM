@@ -145,12 +145,21 @@ def run_leg(
 
         def capture_routes(module, args, output):
             probabilities, routes = output
-            # Router probabilities retain the logical [tokens, experts] shape
-            # even when the fused routing map is emitted as dense top-k IDs.
+            # Compare semantic expert scores across dense and compact router APIs.
             logical = probabilities.detach()
+            if routes.dtype != torch.bool and logical.shape == routes.shape:
+                logical = logical.new_zeros((routes.shape[0], config.num_moe_experts)).scatter(
+                    1, routes.long(), logical
+                )
             assert logical.shape == (routes.shape[0], config.num_moe_experts)
+            if routes.dtype == torch.bool:
+                logical_routes = routes
+            else:
+                logical_routes = torch.zeros_like(logical, dtype=torch.bool).scatter(
+                    1, routes.long(), True
+                )
             route_capture["routing_probs"] = snapshot(logical)
-            route_capture["routing_map"] = snapshot(logical != 0)
+            route_capture["routing_map"] = snapshot(logical_routes)
 
         layer.router.register_forward_hook(capture_routes)
     try:
