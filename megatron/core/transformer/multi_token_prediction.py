@@ -2712,7 +2712,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     shifts=-1,
                     dims=0,
                     sp_group=self.tp_group if self.sequence_parallel else None,
-                    cp_group=self.cp_group,
+                    cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
                 )
@@ -2724,7 +2724,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                         shifts=-1,
                         dims=0,
                         sp_group=self.tp_group if self.sequence_parallel else None,
-                        cp_group=self.cp_group,
+                        cp_group=cp_group,
                         packed_seq_params=packed_seq_params,
                         return_sum=False,
                     )
