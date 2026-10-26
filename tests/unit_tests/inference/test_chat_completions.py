@@ -1602,8 +1602,8 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
         pytest.param(
             {"messages": "hi"}, {}, 400, "'messages' must be a list", id="messages-not-a-list"
         ),
-        # A sampling field of the wrong type is a client error when the conversion raises
-        # ValueError; a TypeError (a list where a number is expected) escapes as a 500.
+        # Sampling conversion failures are client errors, regardless of whether
+        # Python reports a bad value or an incompatible type.
         pytest.param(
             {**CHAT_BODY, "temperature": "hot"},
             {},
@@ -1611,7 +1611,14 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
             NOT_A_NUMBER_ERROR,
             id="temperature-not-a-number",
         ),
-        pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 500, None, id="top-k-list"),
+        pytest.param(
+            {**CHAT_BODY, "top_k": [1]},
+            {},
+            400,
+            "Invalid sampling parameter: int() argument must be a string, a bytes-like object or a real number, not 'list'",
+            id="top-k-list",
+        ),
+        pytest.param({**CHAT_BODY, "n": 0}, {}, 400, "'n' must be at least 1", id="zero-choices"),
         pytest.param(
             {"messages": [{"role": "user", "content": [_FTP_IMAGE]}]},
             {},

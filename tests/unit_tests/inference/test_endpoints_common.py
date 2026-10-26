@@ -440,6 +440,13 @@ _COMPLETIONS_DEFAULTS = {
             _CHAT_DEFAULTS,
             id="chat-non-dict-stream-options-ignored",
         ),
+        pytest.param(
+            COMPLETIONS_PATH,
+            {"stream_options": ["include_usage"]},
+            {},
+            _COMPLETIONS_DEFAULTS,
+            id="completions-non-dict-stream-options-ignored",
+        ),
     ],
 )
 async def test_sampling_params_are_parsed_from_the_request(path, body, app_config, expected_fields):
@@ -902,3 +909,17 @@ async def test_streaming_fans_out_and_reports_usage_on_request(path, include_usa
         else []
     )
     assert client.aborted == []
+
+
+@pytest.mark.asyncio
+@PATHS
+async def test_malformed_stream_options_is_rejected_before_submission(path, monkeypatch):
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(
+        path, json={**BODIES[path], "stream": True, "stream_options": ["include_usage"]}
+    )
+
+    assert response.status_code == 400
+    assert client.prompt_tokens == []
