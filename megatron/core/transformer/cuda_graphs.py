@@ -25,7 +25,7 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
-from megatron.core.process_groups_config import ProcessGroupCollection, amax_reduction_group
+from megatron.core.process_groups_config import amax_reduction_group, resolve_process_groups
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     cudagraph_needs_generator_registration,
@@ -2056,15 +2056,23 @@ class CudaGraphManager(torch.nn.Module):
         will always execute in the same order, so cudagraphs can both be reused and share a
         single mempool. The pipeline group comes from `pg_collection` if it was given, else from
         the collection of the graphed module, where a `pp` set to None means no pipeline
-        parallelism. The global parallel state is used only when neither collection sets `pp`.
+        parallelism. When neither collection sets `pp`, the global parallel state is used; this
+        fallback is deprecated and emits a `ProcessGroupFallbackWarning`.
         """
         if self.reuse_cudagraphs is None:
             pg_collection = self.pg_collection
             if pg_collection is None:
                 pg_collection = getattr(megatron_module, "pg_collection", None)
             if pg_collection is None or "pp" not in vars(pg_collection):
-                # Compatibility fallback for graphed modules without a pipeline group.
-                pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['pp'])
+                # Deprecated fallback for graphed modules without a pipeline group.
+                pg_collection = resolve_process_groups(
+                    None,
+                    owner="CudaGraphManager",
+                    required=("pp",),
+                    argument="pg_collection.pp",
+                    deprecated_in="0.21",
+                    removed_in="0.23",
+                )
             self.reuse_cudagraphs = get_pg_size(pg_collection.pp) == 1
         return self.reuse_cudagraphs
 
@@ -2336,7 +2344,15 @@ class TECudaGraphHelper:
         self.optimizers = optimizers
         self.pg_collection = pg_collection
         if self.pg_collection is None:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            # Deprecated fallback for callers that do not pass the model's process groups: the
+            # groups this helper reads (logging, pipeline schedule and amax reduction).
+            self.pg_collection = resolve_process_groups(
+                None,
+                owner=type(self).__name__,
+                required=("tp", "dp_cp", "pp", "tp_cp", "tp_dp_cp"),
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
         self.tp_group = self.pg_collection.tp
         self.dp_cp_group = self.pg_collection.dp_cp
         self.pp_group = self.pg_collection.pp
