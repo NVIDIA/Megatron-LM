@@ -303,13 +303,15 @@ class OptimizerConfig:
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
-    muon_tp_mode='layer_sharded'. MoE assigns hundreds of identically shaped expert weights
-    to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
-    transient stack of this many matrices for far fewer launches. The value is an upper
-    bound per same-shape bucket, so oversizing it is harmless. Batches of more than one use
-    baddbmm instead of addmm and differ from the per-matrix path by kernel-level rounding,
-    so bitwise parity with duplicated mode is lost; the default of 1 keeps the bit-exact
-    path. Values > 1 require emerging-optimizers >= 0.3.0."""
+    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
+    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
+    the per-matrix loop is kernel-launch bound; batching trades transient memory for
+    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
+    value is an upper bound per same-shape bucket, so a value above the matrix count
+    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
+    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
+    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
+    emerging-optimizers >= 0.3.0."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)

@@ -1,0 +1,11 @@
+# .github/autobot/review-config.yml
+auto-review:
+  enabled: true
+  mode: comment
+  on: status_change
+  when: ready_for_review
+
+approval:
+  enabled: true
+  eligible_teams:
+    - automation
