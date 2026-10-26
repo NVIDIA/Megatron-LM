@@ -251,7 +251,7 @@ materialization ran.
 | `megatron/core/transformer/moe/echo_moe_scheduler.py` | Echo planner and Triton reroute path. |
 | `megatron/core/transformer/moe/eplb_moe_scheduler.py` | EPLB greedy replication, fixed-home LPT placement, and round-robin reroute. |
 | `megatron/core/transformer/moe/moonep_moe_scheduler.py` | MoonEP/PR #7450 planner adapter and common-IR conversion. |
-| `megatron/core/transformer/moe/moonep_replica_triton.py` | #7450 histogram/placement and route-mapping Triton kernels. |
+| `megatron/core/transformer/moe/ops/virtual_expert_triton.py` | Shared upstream MoonEP planning and Peer-TMA kernels. |
 | `megatron/core/transformer/moe/replica_expert_dispatch.py` | Common placement adapter and replica forward/backward lifecycle. |
 | `megatron/core/transformer/moe/replica_expert_runtime.py` | TE/GTP runtime weights, gradient handoff, and transport coordination. |
 | `megatron/core/transformer/moe/replica_weight_transport.py` | Backend-neutral replica weight/gradient transport contract and factory. |

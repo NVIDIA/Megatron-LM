@@ -62,8 +62,13 @@ def test_runtime_release_before_binding_preserves_native_compute():
 
 @pytest.mark.parametrize("capacity", [None, 1.5])
 @pytest.mark.parametrize("padding", [[False] * 12, [True, False, False] * 4, [True] * 12])
-def test_learned_padding_preserves_topk_and_zero_gradients(capacity, padding):
-    router = _router("moon_ep", moe_expert_rank_capacity_factor=capacity)
+@pytest.mark.parametrize("route_mode", ["bool", "indices"])
+def test_learned_padding_preserves_topk_and_zero_gradients(capacity, padding, route_mode):
+    router = _router(
+        "moon_ep",
+        moe_expert_rank_capacity_factor=capacity,
+        moe_hybridep_routing_map_mode=route_mode,
+    )
     router.mock_route_cache = None
     router.config.moe_router_mock_maxvio = None
     router.routing_type = "none"
@@ -72,17 +77,26 @@ def test_learned_padding_preserves_topk_and_zero_gradients(capacity, padding):
     mask = torch.tensor(padding, device="cuda")
     reference_probs, reference_routes = router.routing(logits)
     probs, routes = router.routing(logits, padding_mask=mask)
-    assert (routes.sum(1) == router.topk).all()
+    if route_mode == "bool":
+        assert routes.dtype == torch.bool and (routes.sum(1) == router.topk).all()
+    else:
+        assert routes.dtype == torch.int64 and routes.shape == (12, router.topk)
+        assert (routes.sort(1).values.diff(dim=1) > 0).all()
     torch.testing.assert_close(routes, reference_routes)
     torch.testing.assert_close(probs[~mask], reference_probs[~mask])
     assert not probs[mask].any()
-    _, ids = extract_semantic_routes(routes, probs, router.topk)
+    if route_mode == "bool":
+        _, ids = extract_semantic_routes(routes, probs, router.topk)
+        dy = torch.arange(8, device="cuda")
+    else:
+        ids, dy = routes, routes.to(probs.dtype)
     assert ((ids >= 0) & (ids < 8)).all()
-    (probs * torch.arange(8, device="cuda")).sum().backward()
+    (probs * dy).sum().backward()
     assert not logits.grad[mask].any()
 
 
-def test_learned_padding_runs_distributed_moonep(distributed_world):
+@pytest.mark.parametrize("route_mode", ["bool", "indices"])
+def test_learned_padding_runs_distributed_moonep(distributed_world, route_mode):
     group = distributed_world
     rank, size = dist.get_rank(group), dist.get_world_size(group)
     experts = 2 * size
@@ -91,6 +105,7 @@ def test_learned_padding_runs_distributed_moonep(distributed_world):
         num_moe_experts=experts,
         expert_model_parallel_size=size,
         moe_router_mock_maxvio=1.0,
+        moe_hybridep_routing_map_mode=route_mode,
     )
     router.mock_route_cache = None
     router.config.moe_router_mock_maxvio = None
@@ -115,7 +130,12 @@ def test_learned_padding_runs_distributed_moonep(distributed_world):
     planner = MoonEPLoadPlanner(2)
     _, _, placement = planner.update_placement(probs, routes, context)
     output_routes, output_probs = planner.reroute(probs, routes, placement, context)
-    assert (output_routes.sum(1) == 2).all()
+    if route_mode == "bool":
+        assert (output_routes.sum(1) == 2).all()
+    else:
+        assert output_routes.shape == (32, 2)
+        assert ((output_routes >= 0) & (output_routes < 2 * experts)).all()
+        assert (output_routes.sort(1).values.diff(dim=1) > 0).all()
     torch.testing.assert_close(output_probs.sum(1), probs.sum(1))
     assert not output_probs[mask].any()
     output_probs.sum().backward()
