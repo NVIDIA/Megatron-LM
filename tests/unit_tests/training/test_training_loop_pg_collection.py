@@ -18,6 +18,7 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import gpu_sniff_test, training
 from megatron.training.config import ValidationConfig
+from megatron.training.logging import packed_sequence_stats
 from megatron.training.state import TrainState
 from tests.unit_tests.test_utilities import Utils
 
@@ -341,3 +342,22 @@ class TestTrainingLoopPgCollection:
         )
 
         assert sniffed == [pg_collection, pg_collection]
+
+    @_needs_4_ranks
+    def test_packed_sequence_stats_count_the_collection_last_stage(self, monkeypatch):
+        pg_collection = ProcessGroupCollection(
+            pp=_subgroup(_strided_pairs()), tp=_subgroup(_singletons()), cp=_subgroup(_singletons())
+        )
+        packed_sequence_stats._reset_packed_sequence_stats_in_iteration()
+        _forbid_global_reads(monkeypatch, packed_sequence_stats)
+
+        packed_sequence_stats.update_packed_sequence_stats(
+            torch.tensor([[100, 150, 0]]),
+            torch.tensor([[1.0, 1.0, 0.0]]),
+            pg_collection=pg_collection,
+        )
+        stats = packed_sequence_stats.consume_packed_sequence_stats_in_iteration()
+
+        # Only the last pipeline stage of the collection, half of the ranks, contributes.
+        assert stats["packed_sequence/original_samples"] == 2.0 * Utils.world_size / 2
+        assert stats["packed_sequence/total_tokens"] == 250.0 * Utils.world_size / 2
