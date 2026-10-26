@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.process_groups_config import resolve_process_groups
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_collective,
 )
@@ -64,7 +64,8 @@ def unpermute(
     shapes and adds contributions by EP rank then top-k slot, matching the
     inference NVLS rank-ordered combine. `ep_size` is the expert-parallel size
     of the caller's token dispatcher, which splits the experts into `ep_size`
-    contiguous per-rank shards; None uses the global expert-parallel size.
+    contiguous per-rank shards. Omitting it is deprecated: the size of the global
+    expert-parallel group is used, with a `ProcessGroupFallbackWarning`.
     """
     input_dtype = permuted_tokens.dtype
     # Mirror the inference engine's summation tree exactly:
@@ -82,8 +83,22 @@ def unpermute(
     acc_dtype = torch.float64 if cross_rank_fp64 else torch.float32
     output_tokens = torch.zeros(restore_shape, dtype=acc_dtype, device=permuted_tokens.device)
     if ep_size is None:
-        # Migration fallback for callers that do not pass their dispatcher's EP size.
-        ep_size = parallel_state.get_expert_model_parallel_world_size() or 1
+        # Deprecated fallback for callers that do not pass their dispatcher's EP size.
+        ep_group = resolve_process_groups(
+            None,
+            owner="unpermute",
+            required=("ep",),
+            argument="ep_size",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        ).ep
+        if ep_group is None and torch.distributed.is_initialized():
+            raise ValueError(
+                "unpermute needs ep_size, and parallel_state has no expert-parallel group. "
+                "Pass the expert-parallel size of the token dispatcher."
+            )
+        # A single process without torch.distributed has one EP rank.
+        ep_size = 1 if ep_group is None else ep_group.size()
     assert num_experts % ep_size == 0, "batch-invariant MoE expects contiguous EP shards"
     experts_per_rank = num_experts // ep_size
     inverse_rows = inverse_map[0]

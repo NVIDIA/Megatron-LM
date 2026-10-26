@@ -561,8 +561,9 @@ def unpermute(
             `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
             global expert id. Used by batch-invariant CUDA graph paths.
         ep_size (int, optional): Expert-parallel size of the calling token dispatcher. The
-            batch-invariant path combines the experts of each EP rank in rank order. Defaults
-            to the global expert-parallel size.
+            batch-invariant path combines the experts of each EP rank in rank order. Omitting
+            it there is deprecated: the size of the global expert-parallel group is used, with
+            a ``ProcessGroupFallbackWarning``.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
