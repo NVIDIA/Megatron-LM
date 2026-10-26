@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -69,6 +70,15 @@ from megatron.core.transformer.wide_residual_layer import (
 )
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
+
+def _without_shortcut_moe(config: TransformerConfig) -> TransformerConfig:
+    """Return a shallow copy of a config with every shortcut MoE option disabled."""
+    config = copy.copy(config)
+    config.moe_shortcut_connection = False
+    config.moe_shortcut_parallel = False
+    config.moe_shortcut_post_norm = False
+    return config
 
 
 @dataclass
@@ -171,6 +181,12 @@ class HybridStack(MegatronModule):
                 has_mtp=is_mtp_layer,
             )
 
+        if is_mtp_layer and config.moe_shortcut_disable_mtp:
+            # MTP shares the decoder config; specialize copies before constructing child layers.
+            config = _without_shortcut_moe(config)
+            layer_config_list = [
+                _without_shortcut_moe(layer_config) for layer_config in layer_config_list
+            ]
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm

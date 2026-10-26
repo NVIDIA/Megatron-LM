@@ -267,6 +267,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shortcut_connection": False,
+    "moe_shortcut_disable_mtp": False,
     "moe_shortcut_parallel": False,
     "moe_shortcut_post_norm": False,
     "moe_shared_expert_gate": False,
