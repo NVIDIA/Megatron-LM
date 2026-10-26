@@ -1,6 +1,7 @@
 # Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import copy
 import gc
 import logging
 import math
@@ -65,6 +66,9 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+    VLMInferenceWrapper,
+)
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -73,17 +77,22 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
     hybrid_mixer_kwargs,
@@ -904,9 +913,12 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: int = 1
     # EP process groups can also exercise dense models; build MoE layers only
     # when a test explicitly owns that model behavior.
     use_moe_layer_spec: bool = False
+    num_moe_experts: Optional[int] = None
+    moe_grouped_gemm: bool = False
     sequence_parallel: bool = False
 
     use_fixed_output_lengths: bool = False
@@ -919,9 +931,15 @@ class DynamicEngineTestConfig:
     cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
+    cuda_graph_warmup_steps: int = 3
     fp8: bool = False
+    fp8_recipe: str = "tensorwise"
+    fp8_output_proj: bool = False
+    zero_model_parameters: bool = False
     hidden_size: Optional[int] = None
     model_provider: str = "gpt"
+    multi_latent_attention: bool = False
+    cache_mla_latents: bool = False
     flash_attention_version: Optional[int] = 2
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -947,9 +965,12 @@ class DynamicEngineTestConfig:
     inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
     cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
+    defer_cuda_graph_creation: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
     moe_enable_routing_replay: bool = False
+    moe_router_topk: int = 2
+    moe_router_pre_softmax: bool = False
     # If False, do not build cuda graphs in the tests, even if
     # num_cuda_graphs is set.
     # For tests concerning cuda-graph warmups, we set this to False
@@ -959,6 +980,8 @@ class DynamicEngineTestConfig:
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
+    unified_memory_level: int = 0
+    allow_stale_multimodal_embeddings: bool = False
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
@@ -985,6 +1008,7 @@ class DynamicEngineTestConfig:
     top_p: float = 0.0
     offset_sampling_seed_by_dp_rank: bool = True
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
+    engine_cls: type = DynamicInferenceEngine
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -1151,8 +1175,8 @@ class DynamicInferenceEngineTestBase:
                 prefix_caching_mamba_gb=test_config.prefix_caching_mamba_gb,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
-                # this is for compatibility with the LTS environment
-                unified_memory_level=0,  # unit tests currently broken with UVM
+                unified_memory_level=test_config.unified_memory_level,
+                allow_stale_multimodal_embeddings=(test_config.allow_stale_multimodal_embeddings),
                 track_generated_token_events=test_config.track_generated_token_events,
                 track_paused_request_events=test_config.track_paused_request_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
@@ -1190,10 +1214,75 @@ class DynamicInferenceEngineTestBase:
                 if test_config.num_cuda_graphs is not None and test_config.force_build_cuda_graphs
                 else "none"
             )
+        num_moe_experts = test_config.num_moe_experts
+        if num_moe_experts is None and test_config.expert_model_parallel_size > 1:
+            num_moe_experts = test_config.expert_model_parallel_size
 
-        if test_config.model_provider == "gpt":
+        if test_config.model_provider in ("gpt", "vlm"):
             # Transformer config.
-            transformer_config = TransformerConfig(
+            config_cls = (
+                MLATransformerConfig if test_config.multi_latent_attention else TransformerConfig
+            )
+            quant_recipe = None
+            if (
+                test_config.fp8
+                and test_config.fp8_recipe == "mxfp8"
+                and test_config.transformer_impl == "inference_optimized"
+                and num_moe_experts is not None
+            ):
+                from megatron.core.quantization.quant_config import RecipeConfig
+
+                quant_recipe = RecipeConfig.from_config_dict(
+                    {
+                        "configs": {
+                            "bf16": {
+                                "transformer_engine_config_type": "TEQuantizationParams",
+                                "training_recipe": {"override_quantized_autocast": True},
+                            },
+                            "mxfp8": {
+                                "transformer_engine_config_type": "TEQuantizationParams",
+                                "training_recipe": {
+                                    "fp8_quantization_recipe": "mxfp8",
+                                    "override_quantized_autocast": True,
+                                },
+                            },
+                        },
+                        "matchers": {
+                            "routed_experts": {
+                                "type": "glob",
+                                "pattern": "*mlp.experts.linear_fc*",
+                                "config": "mxfp8",
+                                "enabled": True,
+                            },
+                            "dense_layers": {
+                                "type": "glob",
+                                "pattern": "*",
+                                "config": "bf16",
+                                "enabled": True,
+                            },
+                        },
+                    }
+                )
+            mla_kwargs = (
+                {
+                    "q_lora_rank": 64,
+                    # FlashMLA's dense-decode kernel supports a 576-wide latent
+                    # cache (512 content + 64 RoPE). FA3 supports the resulting
+                    # unequal Q/K=192 and V=128 widths. Retain unequal channels
+                    # so the E2E owns the K/V split instead of merely building it.
+                    "kv_lora_rank": 512,
+                    "qk_head_dim": 128,
+                    "qk_pos_emb_head_dim": 64,
+                    "v_head_dim": 128,
+                    "rope_type": "rope",
+                    "cache_mla_latents": test_config.cache_mla_latents,
+                    "output_projection_groups": 1,
+                    "output_projection_lora_rank": 64,
+                }
+                if test_config.multi_latent_attention
+                else {}
+            )
+            transformer_config = config_cls(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
                 num_layers=4,
@@ -1212,7 +1301,7 @@ class DynamicInferenceEngineTestBase:
                     else (
                         "fp32"
                         if test_config.transformer_impl == "inference_optimized"
-                        and test_config.expert_model_parallel_size > 1
+                        and num_moe_experts is not None
                         else None
                     )
                 ),
@@ -1228,18 +1317,22 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
-                num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
-                ),
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
+                num_moe_experts=num_moe_experts,
+                moe_grouped_gemm=test_config.moe_grouped_gemm,
+                moe_router_topk=test_config.moe_router_topk,
+                moe_router_pre_softmax=test_config.moe_router_pre_softmax,
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
-                fp8_recipe="tensorwise" if test_config.fp8 else None,
+                fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
+                fp8_output_proj=test_config.fp8_output_proj,
+                fp8_param=test_config.fp8 and test_config.fp8_recipe == "mxfp8",
+                quant_recipe=quant_recipe,
                 inference_sampling_seed=test_config.random_seed,
+                cuda_graph_warmup_steps=test_config.cuda_graph_warmup_steps,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
                     test_config.inference_cuda_graph_scope
@@ -1251,7 +1344,7 @@ class DynamicInferenceEngineTestBase:
                 activation_func=(
                     squared_relu
                     if test_config.transformer_impl == "inference_optimized"
-                    and test_config.expert_model_parallel_size > 1
+                    and num_moe_experts is not None
                     else torch.nn.functional.gelu
                 ),
                 inference_moe_token_dispatcher_type=(
@@ -1267,18 +1360,31 @@ class DynamicInferenceEngineTestBase:
                 # inference optimized currently only supports RMS Norm
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
+                **mla_kwargs,
             )
             # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
             # explicitly for MoE test cases so they build MoE layers instead of a dense MLP.
             num_experts = (
                 transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
             )
-            if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
+            if test_config.transformer_impl == "inference_optimized":
+                layer_spec = get_gpt_layer_with_inference_spec(
+                    num_experts=num_experts,
+                    moe_grouped_gemm=test_config.moe_grouped_gemm,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                )
+            elif test_config.fp8 or test_config.transformer_impl == "transformer_engine":
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=num_experts,
+                    moe_grouped_gemm=test_config.moe_grouped_gemm,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
-            elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=num_experts,
+                    moe_grouped_gemm=test_config.moe_grouped_gemm,
+                    multi_latent_attention=test_config.multi_latent_attention,
+                )
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
@@ -1288,18 +1394,57 @@ class DynamicInferenceEngineTestBase:
                     config=transformer_config, spec=layer_spec, use_transformer_engine=use_te
                 )
 
-            # GPT model.
-            model = GPTModel(
-                config=transformer_config,
-                transformer_layer_spec=layer_spec,
-                vocab_size=test_config.vocab_size,
-                max_sequence_length=test_config.max_sequence_length,
-                parallel_output=True,
-                pre_process=parallel_state.is_pipeline_first_stage(),
-                post_process=parallel_state.is_pipeline_last_stage(),
-                mtp_block_spec=mtp_block_spec,
-                position_embedding_type=test_config.position_embedding_type,
-            ).cuda()
+            if test_config.model_provider == "gpt":
+                model = GPTModel(
+                    config=transformer_config,
+                    transformer_layer_spec=layer_spec,
+                    vocab_size=test_config.vocab_size,
+                    max_sequence_length=test_config.max_sequence_length,
+                    parallel_output=True,
+                    pre_process=parallel_state.is_pipeline_first_stage(),
+                    post_process=parallel_state.is_pipeline_last_stage(),
+                    mtp_block_spec=mtp_block_spec,
+                    position_embedding_type=(
+                        "rope"
+                        if test_config.multi_latent_attention
+                        else test_config.position_embedding_type
+                    ),
+                ).cuda()
+            else:
+                transformer_config.language_model_type = "dummy"
+                language_submodules = get_gpt_layer_local_submodules()
+                language_spec = ModuleSpec(module=TransformerLayer, submodules=language_submodules)
+                projection_spec = copy.deepcopy(get_submodules(language_submodules.mlp))
+                assert isinstance(projection_spec, MLPSubmodules)
+                vision_config = TransformerConfig(
+                    num_layers=1,
+                    hidden_size=16,
+                    num_attention_heads=2,
+                    use_cpu_initialization=True,
+                    params_dtype=torch.bfloat16,
+                )
+                vision_config.vision_model_type = "clip"
+                projection_config = TransformerConfig(
+                    num_layers=1,
+                    hidden_size=transformer_config.hidden_size,
+                    ffn_hidden_size=32,
+                    num_attention_heads=1,
+                    use_cpu_initialization=True,
+                    params_dtype=torch.bfloat16,
+                )
+                model = LLaVAModel(
+                    language_transformer_config=transformer_config,
+                    language_transformer_layer_spec=language_spec,
+                    language_vocab_size=test_config.vocab_size,
+                    language_max_sequence_length=test_config.max_sequence_length,
+                    vision_transformer_config=vision_config,
+                    vision_transformer_layer_spec=language_spec,
+                    drop_vision_class_token=False,
+                    vision_projection_config=projection_config,
+                    vision_projection_layer_spec=projection_spec,
+                    add_encoder=False,
+                    image_token_index=-200,
+                ).cuda()
         elif test_config.model_provider == "hybrid":
             is_gdn = test_config.ssm_mixer == "gdn"
             pp_size = test_config.pipeline_model_parallel_size
@@ -1330,18 +1475,18 @@ class DynamicInferenceEngineTestBase:
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=pp_size,
                 expert_model_parallel_size=test_config.expert_model_parallel_size,
-                num_moe_experts=(
-                    None
-                    if test_config.expert_model_parallel_size == 1
-                    else test_config.expert_model_parallel_size
-                ),
+                expert_tensor_parallel_size=test_config.expert_tensor_parallel_size,
+                num_moe_experts=num_moe_experts,
+                moe_grouped_gemm=test_config.moe_grouped_gemm,
                 sequence_parallel=test_config.sequence_parallel,
                 pipeline_dtype=torch.bfloat16,
                 add_bias_linear=test_config.expert_model_parallel_size == 1
                 and not (test_config.transformer_impl == "inference_optimized"),
                 fp8="hybrid" if test_config.fp8 else None,
-                fp8_recipe="tensorwise" if test_config.fp8 else None,
+                fp8_recipe=test_config.fp8_recipe if test_config.fp8 else None,
+                fp8_param=test_config.fp8 and test_config.fp8_recipe == "mxfp8",
                 inference_sampling_seed=test_config.random_seed,
+                cuda_graph_warmup_steps=test_config.cuda_graph_warmup_steps,
                 cuda_graph_modules=test_config.cuda_graph_modules,
                 inference_cuda_graph_scope=(
                     test_config.inference_cuda_graph_scope
@@ -1386,8 +1531,30 @@ class DynamicInferenceEngineTestBase:
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
 
+        is_mxfp8_scenario = test_config.fp8 and test_config.fp8_recipe == "mxfp8"
+        if is_mxfp8_scenario:
+            from megatron.core.inference.quantization.utils import _has_mxfp8_storage
+
         for param in model.parameters():
-            param.data = param.data.to(transformer_config.params_dtype)
+            if not (is_mxfp8_scenario and _has_mxfp8_storage(param)):
+                param.data = param.data.to(transformer_config.params_dtype)
+            if test_config.zero_model_parameters:
+                param.data.zero_()
+
+        if (
+            test_config.transformer_impl == "inference_optimized"
+            and test_config.fp8
+            and test_config.fp8_recipe == "mxfp8"
+        ):
+            from megatron.core.inference.quantization.utils import (
+                quantize_model_to_mxfp8,
+                resolve_mxfp8_backend,
+            )
+
+            quantize_model_to_mxfp8(
+                model,
+                backend=resolve_mxfp8_backend(transformer_config.inference_grouped_gemm_backend),
+            )
 
         model.eval()
 
@@ -1402,7 +1569,11 @@ class DynamicInferenceEngineTestBase:
         )
 
         # Inference model wrapper.
-        inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
+        inference_wrapped_model = (
+            VLMInferenceWrapper(model, inference_context)
+            if test_config.model_provider == "vlm"
+            else GPTInferenceWrapper(model, inference_context)
+        )
 
         # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -1419,8 +1590,13 @@ class DynamicInferenceEngineTestBase:
 
         delete_cuda_graphs()
 
-        # Inference engine.
-        engine = DynamicInferenceEngine(text_generation_controller, inference_context)
+        if test_config.defer_cuda_graph_creation:
+            with mock.patch.object(
+                test_config.engine_cls, "create_cuda_graphs", autospec=True, return_value=None
+            ):
+                engine = test_config.engine_cls(text_generation_controller, inference_context)
+        else:
+            engine = test_config.engine_cls(text_generation_controller, inference_context)
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)

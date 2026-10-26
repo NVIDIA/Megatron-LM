@@ -14,6 +14,8 @@ without CUDA graphs) and compared:
 
 import random
 import types
+from contextlib import nullcontext
+from unittest import mock
 
 import pytest
 import torch
@@ -35,7 +37,11 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    _CudaGraphRunner,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -225,15 +231,48 @@ class TestPrefixCachingCudaGraphs:
             enable_prefix_caching=True,
         )
 
-    def _run_scenario(self, engine, batch_structure, prompts):
+    def _run_scenario(self, engine, batch_structure, prompts, trace_replays=False):
         """Run the prefix-sharing scenario with the given batch structure.
 
-        Returns (outputs, step_log) where step_log is a list of
-        (prefill_req_count, decode_req_count, using_cuda_graph) per step.
+        Returns outputs, a per-step dimension log, and actual runner replay evidence.
         """
         ctx = engine.context
         finished = {}
         step_log = []
+        replay_evidence = []
+        replay_calls_by_step = {}
+
+        original_replay = _CudaGraphRunner.replay_graph_capture
+
+        def traced_replay(runner, is_first_microbatch, args, kwargs):
+            step = len(step_log)
+            replay_calls_by_step[step] = replay_calls_by_step.get(step, 0) + 1
+            if not replay_evidence or replay_evidence[-1]["step"] != step:
+                real = ctx.batch_dimensions
+                padded = ctx.padded_batch_dimensions
+                active_slice = slice(ctx.paused_request_count, ctx.total_request_count)
+                replay_evidence.append(
+                    {
+                        "step": step,
+                        "real": (real.token_count, real.prefill_req_count, real.decode_req_count),
+                        "padded": (
+                            padded.token_count,
+                            padded.prefill_req_count,
+                            padded.decode_req_count,
+                        ),
+                        "request_ids": tuple(ctx.request_ids[active_slice].tolist()),
+                        "input_ids": tuple(
+                            ctx.token_to_input_ids[: ctx.active_token_count].tolist()
+                        ),
+                    }
+                )
+            return original_replay(runner, is_first_microbatch, args, kwargs)
+
+        replay_context = (
+            mock.patch.object(_CudaGraphRunner, "replay_graph_capture", new=traced_replay)
+            if trace_replays
+            else nullcontext()
+        )
 
         def _step_and_log():
             result = engine.step_modern()
@@ -247,28 +286,27 @@ class TestPrefixCachingCudaGraphs:
             for request in result["finished_requests"]:
                 finished[request.request_id] = list(request.generated_tokens)
 
-        if batch_structure in ("prefill", "decode"):
-            # Add all 4 requests before first step.
-            for i, prompt in enumerate(prompts):
-                engine._add_request(self._make_request(i, prompt))
-            while engine.has_unfinished_requests():
-                _step_and_log()
+        with replay_context:
+            if batch_structure in ("prefill", "decode"):
+                for i, prompt in enumerate(prompts):
+                    engine._add_request(self._make_request(i, prompt))
+                while engine.has_unfinished_requests():
+                    _step_and_log()
 
-        elif batch_structure == "mixed":
-            # Add req 0+1 first, step until both are decoding, then add 2+3.
-            for i in [0, 1]:
-                engine._add_request(self._make_request(i, prompts[i]))
-            reqs_added = False
-            while engine.has_unfinished_requests():
-                _step_and_log()
-                if not reqs_added:
-                    last_p, last_d, _ = step_log[-1]
-                    if last_p == 0 and last_d > 0:
-                        for i in [2, 3]:
-                            engine._add_request(self._make_request(i, prompts[i]))
-                        reqs_added = True
+            elif batch_structure == "mixed":
+                for i in [0, 1]:
+                    engine._add_request(self._make_request(i, prompts[i]))
+                reqs_added = False
+                while engine.has_unfinished_requests():
+                    _step_and_log()
+                    if not reqs_added:
+                        last_p, last_d, _ = step_log[-1]
+                        if last_p == 0 and last_d > 0:
+                            for i in [2, 3]:
+                                engine._add_request(self._make_request(i, prompts[i]))
+                            reqs_added = True
 
-        return finished, step_log
+        return finished, step_log, replay_evidence, replay_calls_by_step
 
     @pytest.mark.flaky_in_dev  # Issue #6130
     @pytest.mark.parametrize(
@@ -291,17 +329,33 @@ class TestPrefixCachingCudaGraphs:
 
         # Baseline: no CUDA graphs.
         baseline_engine = self._build_engine(model, mamba_config, num_cuda_graphs=None)
-        baseline_outputs, _ = self._run_scenario(baseline_engine, batch_structure, prompts)
+        baseline_outputs, _, _, _ = self._run_scenario(baseline_engine, batch_structure, prompts)
 
         # CG enabled.
         cg_engine = self._build_engine(model, mamba_config, num_cuda_graphs=2)
-        cg_outputs, step_log = self._run_scenario(cg_engine, batch_structure, prompts)
+        cg_outputs, step_log, replay_evidence, replay_calls_by_step = self._run_scenario(
+            cg_engine, batch_structure, prompts, trace_replays=True
+        )
 
         # 1. Correctness: generated tokens must match.
         for req_id in range(4):
             assert baseline_outputs[req_id] == cg_outputs[req_id], (
                 f"req {req_id}: baseline {baseline_outputs[req_id]} != " f"cg {cg_outputs[req_id]}"
             )
+
+        # Selection is not sufficient evidence: every selected step must invoke an
+        # actual production runner, and an eager step must not invoke one.
+        assert replay_evidence
+        for step, (_, _, using_graph) in enumerate(step_log):
+            assert bool(replay_calls_by_step.get(step, 0)) is using_graph
+
+        # A stable graph shape must consume changing live tokens. Exact eager parity
+        # above makes this a stale-input correctness oracle, not just a repeatability check.
+        replay_inputs = {}
+        for event in replay_evidence:
+            key = (event["padded"], event["request_ids"])
+            replay_inputs.setdefault(key, set()).add(event["input_ids"])
+        assert any(len(inputs) > 1 for inputs in replay_inputs.values())
 
         # 2. CUDA graph usage at expected batch types.
         if batch_structure == "prefill":
@@ -320,6 +374,10 @@ class TestPrefixCachingCudaGraphs:
             assert any(
                 p > 0 and d > 0 and cg for p, d, cg in step_log
             ), f"no mixed CG step found in {step_log}"
+            # The stressed wave reuses captured runners at multiple sizes and changes
+            # request identity as the short first wave finishes.
+            assert len({event["padded"] for event in replay_evidence}) >= 2
+            assert len({event["request_ids"] for event in replay_evidence}) >= 2
 
 
 @pytest.mark.internal

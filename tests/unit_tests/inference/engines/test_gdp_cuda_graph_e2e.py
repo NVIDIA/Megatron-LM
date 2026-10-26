@@ -24,6 +24,8 @@ kernel-level half only; GDP has no batch-invariant mixer path, so
 
 import random
 import types
+from contextlib import nullcontext
+from unittest import mock
 
 import pytest
 import torch
@@ -46,7 +48,11 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4, Attention
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    _CudaGraphRunner,
+)
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -243,7 +249,7 @@ class TestGDPCudaGraphE2E:
             for n in (70, 129, 33, 200)
         ]
 
-    def _run(self, engine, prompts, stagger):
+    def _run(self, engine, prompts, stagger, trace_replays=False):
         """Drive the engine to completion, returning tokens and a per-step log.
 
         With `stagger`, two requests are held back and added once the first
@@ -254,24 +260,47 @@ class TestGDPCudaGraphE2E:
             engine._add_request(self._make_request(i, prompt))
 
         ctx = engine.context
-        finished, step_log = {}, []
+        finished, step_log, replay_log = {}, [], []
         pending = list(enumerate(prompts))[2:] if stagger else []
 
-        while engine.has_unfinished_requests() or pending:
-            if pending and step_log and step_log[-1][0] == 0 and step_log[-1][1] > 0:
-                for i, prompt in pending:
-                    engine._add_request(self._make_request(i, prompt))
-                pending = []
+        original_replay = _CudaGraphRunner.replay_graph_capture
 
-            result = engine.step_modern()
-            dims = ctx.batch_dimensions
-            step_log.append(
-                (dims.prefill_req_count, dims.decode_req_count, ctx.using_cuda_graph_this_step())
+        def traced_replay(runner, *args, **kwargs):
+            padded = ctx.padded_batch_dimensions
+            replay_log.append(
+                (
+                    ctx.step_count,
+                    (padded.token_count, padded.prefill_req_count, padded.decode_req_count),
+                    tuple(type(module).__name__ for module in runner.base_module.modules()),
+                )
             )
-            for request in result["finished_requests"]:
-                finished[request.request_id] = list(request.generated_tokens)
+            return original_replay(runner, *args, **kwargs)
 
-        return finished, step_log
+        replay_context = (
+            mock.patch.object(_CudaGraphRunner, "replay_graph_capture", new=traced_replay)
+            if trace_replays
+            else nullcontext()
+        )
+        with replay_context:
+            while engine.has_unfinished_requests() or pending:
+                if pending and step_log and step_log[-1][0] == 0 and step_log[-1][1] > 0:
+                    for i, prompt in pending:
+                        engine._add_request(self._make_request(i, prompt))
+                    pending = []
+
+                result = engine.step_modern()
+                dims = ctx.batch_dimensions
+                step_log.append(
+                    (
+                        dims.prefill_req_count,
+                        dims.decode_req_count,
+                        ctx.using_cuda_graph_this_step(),
+                    )
+                )
+                for request in result["finished_requests"]:
+                    finished[request.request_id] = list(request.generated_tokens)
+
+        return finished, step_log, replay_log
 
     @pytest.mark.parametrize("stagger", [False, True], ids=["uniform", "mixed_steps"])
     @torch.inference_mode()
@@ -285,10 +314,12 @@ class TestGDPCudaGraphE2E:
             prompts = self._create_prompts()
 
             eager_engine = self._build_engine(model, num_cuda_graphs=None)
-            eager_outputs, eager_log = self._run(eager_engine, prompts, stagger)
+            eager_outputs, eager_log, eager_replays = self._run(eager_engine, prompts, stagger)
 
             cg_engine = self._build_engine(model, num_cuda_graphs=NUM_CUDA_GRAPHS)
-            cg_outputs, cg_log = self._run(cg_engine, prompts, stagger)
+            cg_outputs, cg_log, cg_replays = self._run(
+                cg_engine, prompts, stagger, trace_replays=True
+            )
 
         assert set(eager_outputs) == set(range(len(prompts))), "not every request finished"
         for req_id in sorted(eager_outputs):
@@ -302,6 +333,14 @@ class TestGDPCudaGraphE2E:
         # and never in the eager engine.
         assert any(cg for _, _, cg in cg_log), f"no CUDA graph step was taken: {cg_log}"
         assert not any(cg for _, _, cg in eager_log), f"eager engine used graphs: {eager_log}"
+        assert not eager_replays
+        assert cg_replays
+        replayed_modules = {name for _, _, names in cg_replays for name in names}
+        assert "GatedDeltaProductMixer" in replayed_modules
+        model_modules = {type(module).__name__ for module in model.modules()}
+        for companion in ("ShortcutMoEBlock", "WideResidualTransformerLayer"):
+            if companion in model_modules:
+                assert companion in replayed_modules
         assert (
             _CudagraphGlobalRecord.cudagraph_inference_record
         ), "no CUDA graph was captured for any layer"

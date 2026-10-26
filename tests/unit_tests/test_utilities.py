@@ -101,11 +101,19 @@ def _restore_torch_settings(settings):
     mode, warn_only = settings["deterministic"]
     torch.use_deterministic_algorithms(mode, warn_only=warn_only)
     torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
-    (
+    current_cudnn = (
         torch.backends.cudnn.deterministic,
         torch.backends.cudnn.benchmark,
         torch.backends.cudnn.allow_tf32,
-    ) = settings["cudnn"]
+    )
+    # Newer PyTorch disables direct cuDNN flag mutation after a backend first uses
+    # bracketed flags. Avoid a forbidden assignment when there is nothing to restore.
+    if current_cudnn != settings["cudnn"]:
+        (
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.allow_tf32,
+        ) = settings["cudnn"]
     (
         torch.backends.cuda.matmul.allow_tf32,
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
@@ -149,9 +157,7 @@ def restore_process_state(state):
 def reset_transient_process_state():
     """Drop the lazily built caches no later test may inherit."""
     reset_cuda_graph_global_state()
-    # Sized at the first num_layers seen; TestMTPLossLoggingHelper reads it back.
     multi_token_prediction.MTPLossLoggingHelper.tracker.clear()
-    # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False
 
