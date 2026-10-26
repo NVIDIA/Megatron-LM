@@ -16,6 +16,7 @@ from megatron.core.transformer.module import (
     convert_module_to_dtype_except_fp32_marked,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 class HyperConnectionHybridLayer(MegatronModule):
@@ -191,13 +192,16 @@ class HyperConnectionHybridLayer(MegatronModule):
         # TransformerLayer.forward -- the fast path calls the sublayer helpers directly,
         # and the fallback path passes skip_engram=True.
         if getattr(self.inner_layer, "engram", None) is not None:
+            nvtx_range_push("HC::engram")
             hidden_states = self.inner_layer._maybe_apply_engram(
                 hidden_states, input_ids, packed_seq_params
             )
+            nvtx_range_pop("HC::engram")
 
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
         )
+        nvtx_range_push("HC::inner")
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,
             attention_mask,
@@ -229,6 +233,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             bias_dropout_fusion = False
         else:
             layer_output_with_bias, context, dropout_prob, bias_dropout_fusion = fast_path_result
+        nvtx_range_pop("HC::inner")
 
         layer_output = layer_output_with_bias[0]
         if layer_output.shape != aggregated.shape:

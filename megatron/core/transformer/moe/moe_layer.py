@@ -45,7 +45,7 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualEx
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import internal_api, nvtx_decorator, nvtx_range_pop, nvtx_range_push
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -544,6 +544,7 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
+    @nvtx_decorator(message="MoE::route")
     def route(
         self,
         hidden_states: torch.Tensor,
@@ -632,6 +633,7 @@ class MoELayer(BaseMoELayer):
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
+    @nvtx_decorator(message="MoE::shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
 
@@ -651,6 +653,7 @@ class MoELayer(BaseMoELayer):
         return shared_expert_output
 
     @internal_api
+    @nvtx_decorator(message="MoE::routed_experts_compute")
     def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
 

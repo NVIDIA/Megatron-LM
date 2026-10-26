@@ -143,6 +143,8 @@ from megatron.core.utils import (
     get_model_config,
     get_pg_rank,
     get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
     unwrap_model,
 )
 from megatron.training.callbacks import (
@@ -3918,7 +3920,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
     )
     with _opt_cm as _opt_span:
+        nvtx_range_push("train.optimizer_step")
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        nvtx_range_pop("train.optimizer_step")
         if engram_training_state is not None:
             _verify_engram_table_training_state(engram_training_state, model, iteration + 1)
         if _opt_span is not None:

@@ -28,6 +28,7 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     main_grad_buffer as _main_grad_buffer,
 )
+from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -379,6 +380,7 @@ class MoKMegakernel(MegakernelBackend):
         routing_map = routing_map.reshape(num_tokens, -1)
         return routing_map_to_mok_inputs(probs, routing_map, self.topk)
 
+    @nvtx_decorator(message="MoE::megakernel")
     def forward(
         self,
         hidden_states: torch.Tensor,

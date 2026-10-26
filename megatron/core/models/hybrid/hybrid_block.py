@@ -73,7 +73,13 @@ from megatron.core.transformer.wide_residual_layer import (
     expand_wide_residual_stream,
 )
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 @dataclass
@@ -748,6 +754,7 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
+                layer_types = self.layer_type_list
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -808,6 +815,13 @@ class HybridStack(MegatronModule):
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
                         )
+                        # One range per layer at the call site: it stays on the host when the
+                        # layer's submodules are CUDA-graphed, so graph replays project onto it.
+                        layer_range = (
+                            f"hybrid.layer{layer.layer_number:02d}."
+                            f"{layer_types[physical_layer_idx]}"
+                        )
+                        nvtx_range_push(layer_range)
                         with inner_quant_context:
                             if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -873,6 +887,7 @@ class HybridStack(MegatronModule):
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
                                 )
+                        nvtx_range_pop(layer_range)
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]

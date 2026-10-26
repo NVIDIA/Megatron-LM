@@ -28,6 +28,7 @@ from megatron.core.utils import (
     get_pg_rank,
     get_tensor_model_parallel_group_if_none,
     make_tp_sharded_tensor_for_checkpoint,
+    nvtx_decorator,
 )
 
 
@@ -113,6 +114,7 @@ class LanguageModule(MegatronModule):
         return False
 
     # pylint: disable=line-too-long
+    @nvtx_decorator(message="LM::loss")
     def compute_language_model_loss(
         self, labels: Tensor, logits: Tensor, return_argmax: bool = False
     ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
