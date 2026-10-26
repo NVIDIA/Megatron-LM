@@ -185,31 +185,31 @@ class TestTraining:
     ):
         """Verify the source before clearing integrity checks for unsupported outputs."""
         run_config.validation.skip_train = True
-        args = SimpleNamespace(
-            logits_save_dir=None,
-            logits_load_dir=None,
-            moe_use_upcycling=False,
+        run_config.checkpoint = CheckpointConfig(
             load="source-checkpoints",
-            pretrained_checkpoint=None,
             ckpt_format="torch_dist",
             ckpt_convert_format=ckpt_format,
             ckpt_convert_save="converted-checkpoints",
             verify_integrity=verify_integrity,
         )
+        # The namespace carries no checkpoint settings: the section owns them.
+        args = SimpleNamespace(logits_save_dir=None, logits_load_dir=None, moe_use_upcycling=False)
 
-        def load_checkpoint(*unused_args, **unused_kwargs):
-            assert args.ckpt_format == "torch_dist"
-            assert args.verify_integrity is verify_integrity
+        def load_checkpoint(*unused_args, **kwargs):
+            # The source checkpoint is loaded under the run's own policy.
+            assert "checkpoint" not in kwargs
             return 123, 456
 
-        def save_checkpoint(*unused_args, **unused_kwargs):
-            assert args.ckpt_format == ckpt_format
-            assert args.save == str(Path("converted-checkpoints") / ckpt_format)
-            assert args.use_dist_ckpt is (ckpt_format != "torch")
-            checkpoint = CheckpointConfig(
-                ckpt_format=args.ckpt_format, verify_integrity=args.verify_integrity
-            )
-            assert checkpoint.verify_integrity is (verify_integrity and ckpt_format == "torch_dist")
+        def save_checkpoint(*unused_args, **kwargs):
+            converted = kwargs["checkpoint"]
+            assert converted.ckpt_format == ckpt_format
+            assert converted.save == str(Path("converted-checkpoints") / ckpt_format)
+            assert converted.use_dist_ckpt is (ckpt_format != "torch")
+            assert converted.verify_integrity is (verify_integrity and ckpt_format == "torch_dist")
+            # Neither the registered section nor the namespace is written.
+            assert run_config.checkpoint.ckpt_format == "torch_dist"
+            assert run_config.checkpoint.verify_integrity is verify_integrity
+            assert not hasattr(args, "ckpt_format") and not hasattr(args, "save")
 
         load = Mock(side_effect=load_checkpoint)
         save = Mock(side_effect=save_checkpoint)

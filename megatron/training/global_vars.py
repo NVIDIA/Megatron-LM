@@ -360,7 +360,7 @@ def _set_wandb_writer(args):
             save_dir = cfg.logger.wandb_save_dir
         else:
             # Defaults to the save dir.
-            save_dir = os.path.join(args.save, 'wandb')
+            save_dir = os.path.join(cfg.checkpoint.save, 'wandb')
         # Private attributes are runtime state rather than configuration and can be large; keep
         # them out of the wandb config. Copy so the kitchen contents added below stay off args.
         wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron initialization."""
 import logging
@@ -47,7 +47,11 @@ from megatron.training.argument_utils import (
     core_transformer_config_from_args,
 )
 from megatron.training.async_utils import init_persistent_async_worker
-from megatron.training.global_vars import get_run_config, get_train_state, initialize_runtime_services
+from megatron.training.global_vars import (
+    get_run_config,
+    get_train_state,
+    initialize_runtime_services,
+)
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -113,7 +117,7 @@ def initialize_megatron(
     # set logging level
     setup_logging()
 
-    if training and args.async_save and args.use_persistent_ckpt_worker:
+    if training and cfg.checkpoint.async_save and cfg.checkpoint.use_persistent_ckpt_worker:
         init_persistent_async_worker(args.rank, 'forkserver')
 
     # init rerun state

@@ -306,12 +306,14 @@ def pretrain_until_warmup(monkeypatch):
             raise WarmupReached
 
         monkeypatch.setattr(kernel_warmup, "_warmup_training_kernels", observe)
-        # Only what pretrain() touches before the warmup call; validate() is a no-op here.
+        # Only what pretrain() touches before the warmup call; validate() and finalize() are
+        # no-ops here.
         cfg = Namespace(
             model=model_config,
             train=Namespace(micro_batch_size=9),
             logger=Namespace(log_progress=False),
             validate=lambda: None,
+            finalize=lambda: None,
         )
         with pytest.raises(WarmupReached):
             training.pretrain(cfg, None, None, None, pg_collection=Namespace(tp=tp_group))

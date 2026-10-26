@@ -2505,12 +2505,9 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         return args
 
     # Parse time: no run config is registered yet, the load policy comes from the arguments.
+    checkpoint = checkpoint_config_from_args(args)
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir,
-        args,
-        rank0=True,
-        checkpointing_context=checkpointing_context,
-        checkpoint=checkpoint_config_from_args(args),
+        load_dir, args, rank0=True, checkpointing_context=checkpointing_context, checkpoint=checkpoint
     )
 
     # Args.
@@ -2654,7 +2651,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_use_norm_before_up_proj', force=True)
 
     # Tokenizer args.
-    if args.use_tokenizer_model_from_checkpoint_args:
+    if checkpoint.use_tokenizer_model_from_checkpoint_args:
         # Using checkpoint version might not always be safe (e.g., if running on different cluster).
         _set_arg('tokenizer_model', force=True)
         _set_arg('tokenizer_type', force=True)
@@ -2665,7 +2662,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('ckpt_format')
 
     # Model parallelism args.
-    if args.use_mp_args_from_checkpoint_args:
+    if checkpoint.use_mp_args_from_checkpoint_args:
         if checkpoint_version < 3.0:
             _set_arg('tensor_model_parallel_size', 'model_parallel_size')
         else:

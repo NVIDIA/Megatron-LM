@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
 import json
@@ -456,7 +456,7 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
     # Add barrier to ensure consistnecy.
     torch.distributed.barrier()
     if autoresume.termination_requested():
-        if args.save:
+        if get_run_config().checkpoint.save:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
         print_rank_0(">>> autoresume termination request found!")
         if torch.distributed.get_rank() == 0:
