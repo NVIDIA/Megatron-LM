@@ -6,7 +6,7 @@ import itertools
 import math
 import tempfile
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -211,6 +212,47 @@ class DummyMoELayer:
     def transition_cudagraph_scope(self, mode):
         self.transition_calls.append(mode)
         self.use_partial_cudagraphs = mode == "partial"
+
+
+# parallel_state accessors that are not reads of the global grid.
+_NOT_GLOBAL_GRID_READS = {
+    "get_nccl_options",
+    "get_all_ranks",
+    "get_global_memory_buffer",
+    "get_virtual_pipeline_model_parallel_rank",
+    "get_virtual_pipeline_model_parallel_world_size",
+}
+
+
+@contextmanager
+def forbid_global_grid():
+    """Make every parallel_state accessor of the global grid raise inside the block.
+
+    Covers the group, rank and size accessors and the pipeline-stage predicates, so the
+    ProcessGroupCollection.use_mpu_process_groups() shim raises too.
+    """
+
+    def forbidden(name):
+        def read_global_grid(*args, **kwargs):
+            raise AssertionError(f"parallel_state.{name}() reads the global parallel grid")
+
+        return read_global_grid
+
+    suffixes = ("_group", "_groups", "_gloo", "_rank", "_ranks", "_world_size", "_src_rank")
+    names = [
+        name
+        for name, value in vars(parallel_state).items()
+        if callable(value)
+        and (
+            (name.startswith("get_") and name.endswith(suffixes))
+            or name in ("is_pipeline_first_stage", "is_pipeline_last_stage")
+        )
+        and name not in _NOT_GLOBAL_GRID_READS
+    ]
+    with pytest.MonkeyPatch.context() as patcher:
+        for name in names:
+            patcher.setattr(parallel_state, name, forbidden(name))
+        yield
 
 
 @pytest.fixture
@@ -1131,7 +1173,10 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "get_timers", MagicMock)
         monkeypatch.setattr(train_rl, "get_rerun_state_machine", MagicMock)
         monkeypatch.setattr(train_rl, "get_rl_runtime_state", rl_utils.RLRuntimeState)
-        monkeypatch.setattr(train_rl, "is_pipeline_last_stage", lambda: True)
+        stage_groups = []
+        monkeypatch.setattr(
+            train_rl, "is_pp_last_stage", lambda pp_group: stage_groups.append(pp_group) or True
+        )
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
         monkeypatch.setattr(
@@ -1159,9 +1204,12 @@ class TestRLUtils:
             mask = torch.zeros(3, SEQ + 1, device="cuda")  # forward_step drops its first column
             batch, expected = (tokens, values, values, mask, tokens, values, values), 3
 
-        _, loss_fn = train_rl.forward_step(iter([batch]), MagicMock())
+        model = MagicMock()
+        _, loss_fn = train_rl.forward_step(iter([batch]), model)
         report = loss_fn(values)[2]
 
+        # The last-stage check uses the pipeline group of the model being trained.
+        assert stage_groups == [model.pg_collection.pp]
         assert report["_samples_seen"].item() == expected
         assert _pop_samples_seen([report, dict(report)]).item() == 2 * expected
 
@@ -1384,6 +1432,129 @@ class TestRLUtils:
             request_ledger=request_ledger,
         )
         assert get_num_microbatches() == expected_microbatches
+
+    @pytest.mark.skipif(
+        Utils.world_size < 4 or Utils.world_size % 4 != 0, reason="needs a multiple of 4 ranks"
+    )
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_prepare_data_for_update_uses_training_model_groups(self, initialize_model_parallel):
+        """The rollouts are split over the data-parallel group of the model being trained, which
+        need not be the global one, and the logprobs pass selects and runs its schedule on the
+        model's process groups: no global grid accessor is read."""
+        world_size, _, _, _ = initialize_model_parallel
+        tokenizer = MockTokenizer()
+        self.create_test_args(
+            micro_batch_size=1,
+            seq_length=4,
+            curr_iteration=1,
+            global_batch_size=world_size,
+            grpo_prompts_per_step=world_size // 2,
+            grpo_group_size=2,
+        )
+        model = MockModel()
+        # The global data-parallel group spans every rank; the model's groups are rank pairs.
+        model_dp_group, _ = dist.new_subgroups_by_enumeration(
+            [[rank, rank + 1] for rank in range(0, world_size, 2)]
+        )
+        model.pg_collection.dp_gtp_remat = model_dp_group
+
+        def rollout(row):
+            # The second token identifies the row.
+            return make_token_rollout(
+                [[1, 100 + row, 200 + row, tokenizer.eod]],
+                [[-0.1, -0.2, -0.3]],
+                [[False, True, True, True]],
+                reward=float(row % 2),
+                problem_id=str(row // 2),
+            )
+
+        rollouts = [[rollout(row), rollout(row + 1)] for row in range(0, world_size, 2)]
+        request_ledger = _ledger_for(*(r for g in rollouts for r in g))
+        rows_per_rank = world_size // 2
+        with forbid_global_grid():
+            data_iter, _, _ = rl_utils.prepare_data_for_update(
+                [model],
+                {},
+                rollouts,
+                tokenizer,
+                sequence_packing=False,
+                is_correction=False,
+                request_ledger=request_ledger,
+            )
+            # world_size rows over the 2 ranks of the pair, one row per microbatch.
+            assert get_num_microbatches() == rows_per_rank
+            rows = [int(next(data_iter)[0][0, 1]) - 100 for _ in range(rows_per_rank)]
+
+        first_row = model_dp_group.rank() * rows_per_rank
+        assert rows == list(range(first_row, first_row + rows_per_rank))
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_eager_train_comm_warmup_uses_given_groups(
+        self, initialize_model_parallel, monkeypatch
+    ):
+        """The communicator warmup all-reduces once over each group of the collection it is
+        given, in order, skips the groups the collection does not hold, and reads no global
+        grid accessor."""
+        world_size, _, _, _ = initialize_model_parallel
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # A distinct communicator over the ranks of the global data-parallel group.
+        pg_collection.dp_gtp_remat = dist.new_group(ranks=list(range(world_size)))
+        pg_collection.expt_tp = None
+        reduced_groups = []
+        all_reduce = dist.all_reduce
+
+        def recording_all_reduce(tensor, group=None, **kwargs):
+            reduced_groups.append(group)
+            return all_reduce(tensor, group=group, **kwargs)
+
+        monkeypatch.setattr(rl_utils.dist, "all_reduce", recording_all_reduce)
+        with forbid_global_grid():
+            rl_utils._eager_train_comm_warmup(pg_collection)
+
+        names = (
+            "dp_gtp_remat",
+            "dp_cp_gtp_remat",
+            "cp",
+            "mp",
+            "tp_dp_cp",
+            "expt_dp_gtp_remat",
+            "ep",
+        )
+        assert reduced_groups == [getattr(pg_collection, name) for name in names]
+
+    def test_get_inference_interface_warms_up_training_model_groups(self, monkeypatch):
+        """The first call warms up the communicators of the model being trained, not those of
+        the separate inference model it launches the interface for; later calls reuse it."""
+        training_model = [SimpleNamespace(pg_collection=object())]
+        inference_model = [SimpleNamespace(pg_collection=object())]
+        interface = object()
+        warmed, launched = [], []
+        monkeypatch.setattr(rl_utils, "_INFERENCE_INTERFACE", None)
+        monkeypatch.setattr(rl_utils, "_eager_train_comm_warmup", warmed.append)
+        monkeypatch.setattr(
+            rl_utils,
+            "MegatronLocal",
+            SimpleNamespace(launch=lambda model, **kwargs: launched.append(model)),
+        )
+        loop = SimpleNamespace(run_until_complete=lambda _: interface)
+        args = SimpleNamespace(inference_text_gen_server_logging=False)
+
+        for _ in range(2):
+            assert (
+                rl_utils.get_inference_interface(args, loop, inference_model, training_model)
+                is interface
+            )
+
+        assert warmed == [training_model[0].pg_collection]
+        assert launched == [inference_model[0]]
 
     def test_prepare_trajectories(self):
         """Every row kind becomes one padded training row in a single batch: a single-turn
