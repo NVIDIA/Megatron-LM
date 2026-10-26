@@ -1239,6 +1239,26 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "writes each picked block once per row and exact zeros elsewhere, so it is "
         "order-independent.",
     ),
+    # ---------------------------------------------------------------- Engram
+    KernelEntry(
+        name="engram_fused_dense",
+        sources=("megatron/core/models/engram/fused_dense.py",),
+        tests=(K + "test_engram_kernels.py",),
+        kind="triton",
+        notes="Gate, conv-norm, causal depthwise convolution, SiLU and residual with fixed "
+        "tile shapes; gamma and convolution-weight gradients are per-program partials "
+        "reduced with torch.sum. Replays the output and all seven gradients.",
+    ),
+    KernelEntry(
+        name="engram_table_lookup",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=(K + "test_engram_kernels.py",),
+        kind="torch-op",
+        notes="Hashed n-gram table lookup with heavily repeated rows on one EP rank: "
+        "F.embedding and the sorted, segmented backward that deterministic_mode selects. The "
+        "EP > 1 request routing counts requests with scatter_add_ / bincount on integers "
+        "(exact in any order); the all-to-all exchange is not replayed here.",
+    ),
     # ==== end of the Qwen3.8-Flash-Next stack ====
 )
 

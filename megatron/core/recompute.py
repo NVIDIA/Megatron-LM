@@ -46,8 +46,8 @@ def checkpointed_forward(
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
-        input_ids (Tensor, optional): Boundary-layout token IDs for hash-routed MoE
-            and custom layers.
+        input_ids (Tensor, optional): Boundary-layout token IDs for hash-routed MoE,
+            Engram and custom layers.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -149,8 +149,12 @@ def checkpointed_forward(
                 layer_input_ids = input_ids
                 if is_custom_layer and cp_layout_state is not None:
                     layer_input_ids = cp_layout_state.get_layer_input_ids(index, input_ids)
+                # Engram layers hash the token IDs too (before attention), so they need them
+                # whether or not their MLP is hash-routed.
                 if input_ids is not None and (
-                    is_custom_layer or getattr(router, "is_hash_layer", False)
+                    is_custom_layer
+                    or getattr(router, "is_hash_layer", False)
+                    or getattr(inner_layer, "engram", None) is not None
                 ):
                     layer_kwargs["input_ids"] = layer_input_ids
                 with inner_quantization_context:
