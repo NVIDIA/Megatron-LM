@@ -444,8 +444,8 @@ class FsdpParameterGroup:
         return self.model_weight.placements == self._unsharded_model_weight.placements
 
     @property
-    def has_forward_only_planes(self) -> bool:
-        """Whether gathered MXFP8 rowwise planes can be released independently."""
+    def is_rowwise_unsharded(self) -> bool:
+        """Whether this group's gather buffer holds MXFP8 rowwise planes."""
         # Replicated compute weights use persistent model_weight storage and never
         # allocate this gather buffer after construction.
         buffer = self._unsharded_model_weight

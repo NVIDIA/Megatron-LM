@@ -369,7 +369,7 @@ class FsdpModule:
         is_recomputing = self.phase is Phase.BACKWARD or _is_in_backward()
         if is_recomputing:
             groups_to_release = tuple(
-                group for group in self._parameter_groups if group.has_forward_only_planes
+                group for group in self._parameter_groups if group.is_rowwise_unsharded
             )
             self._release_unsharded_storage(groups_to_release, rowwise_only=True)
         else:
