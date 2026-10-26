@@ -31,6 +31,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     require_process_groups,
     resolve_process_groups,
+    warn_global_process_group_fallback,
 )
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
@@ -113,13 +114,24 @@ def _get_offloading_interface():
 def get_transformer_layer_offset(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ):
-    """Get the index offset of current pipeline stage, given the level of pipelining."""
-    if pp_rank is None:
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    """Get the index offset of current pipeline stage, given the level of pipelining.
 
-    is_first_pp_stage = pp_rank == 0
-
+    Args:
+        config: Configuration of the model.
+        vp_stage: Virtual pipeline stage; required with a virtual pipeline.
+        pp_rank: Rank of this stage in the model's pipeline-parallel group. Without pipeline
+            parallelism the offset is 0 and the rank is not needed. With pipeline parallelism,
+            omitting it is deprecated: the global pipeline rank in ``parallel_state`` is used
+            instead, with a ``ProcessGroupFallbackWarning``.
+    """
     if config.pipeline_model_parallel_size > 1:
+        if pp_rank is None:
+            warn_global_process_group_fallback(
+                "get_transformer_layer_offset", "pp_rank", deprecated_in="0.21", removed_in="0.23"
+            )
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        is_first_pp_stage = pp_rank == 0
 
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(

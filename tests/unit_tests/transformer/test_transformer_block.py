@@ -854,9 +854,10 @@ class TestPipelineParallelLayoutTransformerBlock:
             )
             total_build_layers = 0
             for i in range(pp_size):
-                parallel_state.set_pipeline_model_parallel_rank(i)
                 for j in range(vpp_size):
-                    total_build_layers += get_num_layers_to_build(transformer_config, vp_stage=j)
+                    total_build_layers += get_num_layers_to_build(
+                        transformer_config, vp_stage=j, pp_rank=i
+                    )
         if not should_assert_error:
             assert (
                 total_build_layers == num_layers
