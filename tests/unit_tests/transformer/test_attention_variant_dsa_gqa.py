@@ -1,19 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import process_groups_config
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
     hybrid_stack_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+    DSGQAAttentionSubmodules,
     DSGQACoreAttention,
     DSGroupedSelfAttention,
     SimplifiedDSGQAIndexer,
@@ -36,6 +40,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
     dsa_dense_indexer_loss,
     dsa_min_memory_gqa,
 )
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -486,6 +491,123 @@ def test_simplified_indexer_rope_matches_model_rotary_config(monkeypatch):
     assert indexer.rotary_pos_emb.rotary_interleaved
     assert indexer.rotary_pos_emb.seq_len_interpolation_factor == 2.0
     assert indexer.rotary_pos_emb.inv_freq.device.type == "cpu"
+
+
+@pytest.fixture
+def fresh_fallback_warnings(monkeypatch):
+    """Each test observes the first fallback warning of every owner."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
+def _forbid_global_collection(monkeypatch):
+    def forbid(*args, **kwargs):
+        raise AssertionError("read the global process groups")
+
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbid)
+
+
+def _simplified_dsa_config():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        experimental_attention_variant="dsa",
+        add_bias_linear=False,
+        dsa_indexer_mode="simplified",
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="min-memory-torch",
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_use_sparse_loss=True,
+    )
+    # The indexer reads its RoPE settings as dynamic attributes; without RoPE it builds no
+    # rotary embedding.
+    config.rotary_percent = 0.0
+    return config
+
+
+def _simplified_indexer_submodules():
+    return SimplifiedDSGQAIndexerSubmodules(linear_q=torch.nn.Linear, linear_k=torch.nn.Linear)
+
+
+def _build_with_plain_linears(spec, *args, **kwargs):
+    """Build the indexer projections as plain linears, and every other spec as usual."""
+    if spec is torch.nn.Linear:
+        input_size, output_size = args
+        return torch.nn.Linear(input_size, output_size, bias=False)
+    return build_module(spec, *args, **kwargs)
+
+
+def test_simplified_indexer_without_collection_warns_and_uses_global_tp_cp(
+    monkeypatch, fresh_fallback_warnings
+):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    global_groups = ProcessGroupCollection(tp=_DummyTPGroup(), cp=None)
+    requested = []
+
+    def use_mpu_process_groups(required_pgs=None):
+        requested.append(required_pgs)
+        return global_groups
+
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", use_mpu_process_groups)
+    monkeypatch.setattr(dsa_gqa, "build_module", _build_with_plain_linears)
+    config = _simplified_dsa_config()
+
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        indexer = SimplifiedDSGQAIndexer(config, _simplified_indexer_submodules())
+
+    (warning,) = [
+        w
+        for w in record
+        if "SimplifiedDSGQAIndexer was called without `pg_collection`" in str(w.message)
+    ]
+    # The warning points at the code that omitted the collection.
+    assert warning.filename == __file__
+    assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in str(warning.message)
+    assert requested == [["tp", "cp"]]
+    assert indexer.pg_collection is global_groups
+
+
+def test_simplified_indexer_requires_cp_in_its_collection(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    _forbid_global_collection(monkeypatch)
+    monkeypatch.setattr(dsa_gqa, "build_module", _build_with_plain_linears)
+
+    with pytest.raises(ValueError, match="SimplifiedDSGQAIndexer requires pg_collection to set cp"):
+        SimplifiedDSGQAIndexer(
+            _simplified_dsa_config(),
+            _simplified_indexer_submodules(),
+            pg_collection=ProcessGroupCollection(tp=_DummyTPGroup()),
+        )
+
+
+def test_dsgqa_core_attention_passes_its_collection_to_the_indexer(monkeypatch):
+    import megatron.core.transformer.experimental_attention_variant.dsa_gqa as dsa_gqa
+
+    _forbid_global_collection(monkeypatch)
+    monkeypatch.setattr(dsa_gqa, "build_module", _build_with_plain_linears)
+    pg_collection = ProcessGroupCollection(tp=_DummyTPGroup(), cp=None)
+    submodules = DSGQAAttentionSubmodules(
+        indexer=ModuleSpec(
+            module=SimplifiedDSGQAIndexer, submodules=_simplified_indexer_submodules()
+        )
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        core_attention = DSGQACoreAttention(
+            _simplified_dsa_config(),
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=pg_collection,
+        )
+
+    assert core_attention.indexer.pg_collection is pg_collection
 
 
 @pytest.mark.parametrize(
