@@ -15,7 +15,12 @@ import torch
 import pretrain_gpt
 import pretrain_hybrid
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.datasets.utils import Split
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.training import training
+from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.datasets import data_samplers
+from megatron.training.state import TrainState
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from tests.unit_tests.test_utilities import Utils
 
@@ -369,3 +374,128 @@ def test_vlm_forward_step_passes_the_model_groups(monkeypatch):
     assert output_tensor is output
     assert fetch.call_args.args == (data_iterator,)
     assert fetch.call_args.kwargs["pg_collection"] is pgs
+
+
+class _Dataset(torch.utils.data.Dataset):
+    def __init__(self, num_samples, split=None):
+        self.num_samples = num_samples
+        if split is not None:
+            self.split = split
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        return idx
+
+
+def _loader_args(dataloader_type):
+    return SimpleNamespace(
+        dataloader_type=dataloader_type,
+        num_workers=0,
+        data_sharding=True,
+        dynamic_context_parallel=False,
+        sequence_packing_scheduler=None,
+        use_varlen_dataset=False,
+        varlen_sbhd_validation=False,
+    )
+
+
+@pytest.mark.parametrize("field", ["dp_gtp_remat", "dp"])
+def test_pretraining_sampler_shards_over_the_supplied_data_parallel_group(
+    monkeypatch, run_config, field
+):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(data_samplers, "get_args", lambda: _loader_args("single"))
+    pgs = ProcessGroupCollection(**{field: _FakeGroup(1, [4, 6])})
+
+    loader = data_samplers.build_pretraining_data_loader(
+        _Dataset(8), consumed_samples=2, pg_collection=pgs
+    )
+
+    assert list(loader.batch_sampler) == [[3], [5], [7]]
+
+
+def test_random_sampler_shards_over_the_supplied_data_parallel_group(monkeypatch, run_config):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(data_samplers, "get_args", lambda: _loader_args("cyclic"))
+    # The GTP-inclusive group decides the sharding when the collection carries both.
+    pgs = ProcessGroupCollection(dp_gtp_remat=_FakeGroup(2, [4, 5, 6]), dp=_FakeGroup(0, [4]))
+
+    loader = data_samplers.build_pretraining_data_loader(
+        _Dataset(9), consumed_samples=0, pg_collection=pgs
+    )
+
+    assert loader.batch_sampler.data_parallel_rank == 2
+    assert loader.batch_sampler.data_parallel_size == 3
+
+
+def test_full_validation_sampler_shards_over_the_supplied_data_parallel_group(
+    monkeypatch, run_config
+):
+    _forbid_global_process_groups(monkeypatch)
+    _use_fake_groups(monkeypatch)
+    run_config.validation.full_validation = True
+    monkeypatch.setattr(data_samplers, "get_args", lambda: _loader_args("single"))
+    pgs = ProcessGroupCollection(dp_gtp_remat=_FakeGroup(1, [4, 6]))
+
+    loader = data_samplers.build_pretraining_data_loader(
+        _Dataset(5, split=Split.valid), consumed_samples=0, pg_collection=pgs
+    )
+
+    assert list(loader.batch_sampler) == [[1], [3]]
+
+
+def test_pretraining_sampler_rejects_a_collection_without_a_data_parallel_group(
+    monkeypatch, run_config
+):
+    _forbid_global_process_groups(monkeypatch)
+    run_config.train.micro_batch_size = 1
+    monkeypatch.setattr(data_samplers, "get_args", lambda: _loader_args("single"))
+
+    with pytest.raises(ValueError, match="dp_gtp_remat"):
+        data_samplers.build_pretraining_data_loader(
+            _Dataset(8), consumed_samples=0, pg_collection=ProcessGroupCollection(tp=None)
+        )
+
+
+def test_data_iterators_use_the_run_groups(monkeypatch, run_config):
+    world_size = Utils.world_size
+    if world_size < 4 or world_size % 2:
+        pytest.skip("needs an even world size of at least 4")
+    Utils.initialize_model_parallel()
+    try:
+        rank = torch.distributed.get_rank()
+        # Pairs of adjacent ranks; the global data-parallel group spans every rank here.
+        pair_group, _ = torch.distributed.new_subgroups(group_size=2)
+        pgs = ProcessGroupCollection(tp=_FakeGroup(0, [rank]), dp_cp_gtp_remat=pair_group)
+        run_config.train = TrainingConfig(train_samples=1, train_iters=1, global_batch_size=1)
+        run_config.validation = ValidationConfig(
+            eval_interval=1, eval_iters=1, eval_global_batch_size=1, full_validation=True
+        )
+        args = SimpleNamespace(dataloader_type="single", phase_transition_iterations=None)
+        loader_groups = []
+
+        def build_loader(dataset, consumed_samples, pg_collection=None):
+            loader_groups.append(pg_collection)
+            return dataset
+
+        def datasets_provider(train_valid_test_num_samples):
+            return range(1), range(rank + 1), range(1)
+
+        with monkeypatch.context() as patch:
+            _forbid_global_process_groups(patch)
+            patch.setattr(training, "get_args", lambda: args)
+            patch.setattr(training, "get_train_state", lambda: TrainState())
+            patch.setattr(training, "build_pretraining_data_loader", build_loader)
+            training.build_train_valid_test_data_iterators(datasets_provider, pg_collection=pgs)
+
+        assert loader_groups == [pgs, pgs, pgs]
+        # Full validation runs as many iterations as the longest loader of the pair.
+        assert run_config.validation.eval_iters == rank // 2 * 2 + 2
+    finally:
+        Utils.destroy_model_parallel()

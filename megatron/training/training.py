@@ -2037,6 +2037,11 @@ def pretrain(
     # tracing systems are independent.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+    # A MIMO collection holds one collection per module, and MIMO data providers build their
+    # own loaders, so the data pipeline keeps its global defaults there.
+    data_pg_collection = (
+        pg_collection if isinstance(pg_collection, ProcessGroupCollection) else None
+    )
     with _otel_managed_span('data_loading', 'megatron.startup.dataloader', is_goodput_span=True):
         if args.virtual_pipeline_model_parallel_size is not None:
             train_data_iterator = []
@@ -2051,14 +2056,16 @@ def pretrain(
                 if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
                     vp_stage_train_valid_test_dataset_provider.is_distributed = True
                 iterators = build_train_valid_test_data_iterators(
-                    vp_stage_train_valid_test_dataset_provider
+                    vp_stage_train_valid_test_dataset_provider, pg_collection=data_pg_collection
                 )
                 train_data_iterator.append(iterators[0])
                 valid_data_iterator.append(iterators[1])
                 test_data_iterator.append(iterators[2])
         else:
             train_data_iterator, valid_data_iterator, test_data_iterator = (
-                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+                build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider, pg_collection=data_pg_collection
+                )
             )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
@@ -5978,8 +5985,19 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
-    """Build pretraining data loaders."""
+def build_train_valid_test_data_loaders(
+    build_train_valid_test_datasets_provider, pg_collection=None
+):
+    """Build pretraining data loaders.
+
+    Args:
+        build_train_valid_test_datasets_provider: Function that builds the train, validation
+            and test datasets.
+        pg_collection: Process groups of the run. Unless the provider is distributed-aware,
+            the first rank of its tensor-parallel group builds the data pipeline, and the
+            loaders shard samples over its data-parallel group. None uses the global
+            parallel state.
+    """
 
     args = get_args()
     train_state = get_train_state()
@@ -6019,7 +6037,13 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
     # Construct the data pipeline
-    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
+    if is_distributed:
+        build_data_pipeline = True
+    elif pg_collection is None:
+        build_data_pipeline = mpu.get_tensor_model_parallel_rank() == 0
+    else:
+        build_data_pipeline = get_pg_rank(pg_collection.tp) == 0
+    if build_data_pipeline:
 
         # Build datasets and dataloders.
         if cfg.rl.perform_rl_step:
@@ -6038,20 +6062,28 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if cfg.validation.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+                train_dataloader = build_pretraining_data_loader(
+                    train_ds, consumed_train_samples_in_current_phase, pg_collection=pg_collection
+                )
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if cfg.validation.skip_train or cfg.validation.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                    valid_dataloaders.append(
+                        build_pretraining_data_loader(valid_d, 0, pg_collection=pg_collection)
+                    )
                 else:
                     if cfg.validation.multiple_validation_sets:
                         # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
                         # correct and needs to be calculated/set per validation set
                         raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, train_state.consumed_valid_samples))
+                    valid_dataloaders.append(
+                        build_pretraining_data_loader(
+                            valid_d, train_state.consumed_valid_samples, pg_collection=pg_collection
+                        )
+                    )
             if not cfg.validation.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            test_dataloader = build_pretraining_data_loader(test_ds, 0, pg_collection=pg_collection)
             do_train = train_dataloader is not None and (cfg.validation.skip_train or cfg.train.train_iters > 0)
             do_valid = valid_dataloaders is not None and (cfg.validation.full_validation or cfg.validation.eval_iters > 0)
             do_test = test_dataloader is not None and (cfg.validation.full_validation or cfg.validation.eval_iters > 0)
@@ -6071,15 +6103,40 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
-    """Build pretraining data iterators."""
+def _data_parallel_group_with_cp(pg_collection):
+    """Return the data-parallel group with context-parallel ranks of ``pg_collection``.
+
+    The group includes the GTP weight-remat axis, like the global
+    ``get_data_parallel_group(with_context_parallel=True)``. Collections that predate the GTP
+    weight-remat fields carry only the replicate group. None reads the global parallel state.
+    """
+    if pg_collection is None:
+        return mpu.get_data_parallel_group(with_context_parallel=True)
+    group = pg_collection.dp_cp_gtp_remat or pg_collection.dp_cp
+    if group is None:
+        raise ValueError("pg_collection requires dp_cp_gtp_remat or dp_cp")
+    return group
+
+
+def build_train_valid_test_data_iterators(
+    build_train_valid_test_datasets_provider, pg_collection=None
+):
+    """Build pretraining data iterators.
+
+    Args:
+        build_train_valid_test_datasets_provider: Function that builds the train, validation
+            and test datasets.
+        pg_collection: Process groups of the run, used to build the data loaders and to agree
+            on the number of full-validation iterations across its data-parallel ranks. None
+            uses the global parallel state.
+    """
 
     cfg = get_run_config()
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider, pg_collection=pg_collection
     )
 
     # Build iterators.
@@ -6119,7 +6176,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True),
+                        group=_data_parallel_group_with_cp(pg_collection),
                     )
                     cfg.validation.eval_iters = eval_iters_tensor.tolist()
             else:
@@ -6128,7 +6185,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                 torch.distributed.all_reduce(
                     eval_iters_tensor,
                     op=torch.distributed.ReduceOp.MAX,
-                    group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    group=_data_parallel_group_with_cp(pg_collection),
                 )
                 cfg.validation.eval_iters = eval_iters_tensor.item()
 
