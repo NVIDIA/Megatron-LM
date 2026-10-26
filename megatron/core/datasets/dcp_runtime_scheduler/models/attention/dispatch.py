@@ -14,6 +14,7 @@ _BACKEND = ContextVar("attention_dispatch_backend", default="python")
 
 @contextmanager
 def dispatch_backend(name):
+    """Select a dispatch evaluator within this context and restore the previous choice."""
     if name not in ("python", "numba"):
         raise ValueError("dispatch backend must be python or numba")
     token = _BACKEND.set(name)
@@ -72,6 +73,7 @@ def compiled_chain(units, slots, rho):
 
 
 def accelerated_chain(units, slots, rho):
+    """Evaluate the optional compiled dispatch chain, or defer to the Python caller."""
     if _BACKEND.get() == "python":
         return None
     return compiled_chain(units, slots, rho)

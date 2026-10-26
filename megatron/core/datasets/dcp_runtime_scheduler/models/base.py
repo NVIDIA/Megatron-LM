@@ -67,6 +67,7 @@ class QuadraticCostModel:
         self.source_hashes = {"quadratic": f"cp_step_ms={self.cp_step_ms}"}
 
     def forward(self, lengths, cp, *, ranks=None) -> float:
+        """Predict per-layer forward time for the quadratic smoke model."""
         cp = int(cp)
         if not 1 <= cp <= self.geometry.world_size:
             raise ValueError("cp outside the world")
@@ -77,13 +78,17 @@ class QuadraticCostModel:
         return total / 1e6 + self.cp_step_ms * (cp - 1)
 
     def backward(self, lengths, cp, *, ranks=None) -> float:
+        """Predict per-layer backward time for the quadratic smoke model."""
         return 2.0 * self.forward(lengths, cp, ranks=ranks)
 
     def timing(self) -> None:
+        """Use the shared scalar timeline for this smoke model."""
         return None
 
     def clear(self) -> None:
+        """Accept the cache-reset hook for this stateless smoke model."""
         return None
 
     def check_domain(self, geometry, config) -> None:
+        """Accept any geometry supported by the shared smoke-test planner."""
         return None

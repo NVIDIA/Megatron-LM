@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class TimelineModel:
+    """Simulate CP/EP synchronization dependencies across a complete training step."""
+
     world_size: int
     ep_size: int
     layer_count: int
@@ -24,18 +26,22 @@ class TimelineModel:
 
     @property
     def blocks(self):
+        """Return the number of expert-parallel blocks in the parent domain."""
         return self.world_size // self.ep_size
 
     @property
     def scalar(self):
+        """Indicate whether timing uses scalar forward/backward costs."""
         return self.program is None
 
     # ------------------------------------------------------------------ state
     def initial_state(self):
+        """Initialize completion times for each modeled block or rank."""
         n = self.blocks if self.scalar else self.world_size
         return [0.0] * n
 
     def makespan(self, state):
+        """Return step completion time including the configured iteration tail."""
         return max(state) + self.iteration_tail_ms
 
     def advance(self, state, groups: Sequence[tuple], first: bool):
@@ -53,6 +59,7 @@ class TimelineModel:
         return self._program_phase(state, groups, self.program[1])
 
     def evaluate(self, rounds: Sequence[Sequence[tuple]]):
+        """Score all microbatches with the shared forward/backward timeline."""
         state = self.initial_state()
         for index, groups in enumerate(rounds):
             state = self.advance(state, groups, index == 0)

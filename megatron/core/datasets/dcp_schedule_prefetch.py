@@ -47,6 +47,7 @@ class _CpuPlanner:
 
     def solve(self, lengths: list[int], padded: list[int], baseline_rows: list) -> dict:
         # This method runs in an I/O-only thread; the separate process solves.
+        """Send one global batch to the isolated worker and return its result or error."""
         try:
             self.process.stdin.write(json.dumps([lengths, padded, baseline_rows]) + '\n')
             self.process.stdin.flush()
@@ -62,6 +63,7 @@ class _CpuPlanner:
         return payload
 
     def close(self) -> None:
+        """Close the request stream and reap the CPU worker process."""
         try:
             self.process.stdin.close()
         except BrokenPipeError:
@@ -82,6 +84,7 @@ class _BufferedIterator:
         return self.items.popleft() if self.items else next(self.source)
 
     def peek(self, count):
+        """Buffer upcoming items without advancing the owning rerun iterator."""
         while len(self.items) < count:
             self.items.append(next(self.source))
         return list(self.items)[:count]

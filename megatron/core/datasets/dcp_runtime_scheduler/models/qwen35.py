@@ -268,6 +268,7 @@ class Qwen35CoreCostModel:
         return costs
 
     def program_costs(self, lengths, cp, *, ranks=None):
+        """Price the frozen FA, GDN and remainder operations for one pack."""
         values = tuple(lengths)
         if not values or len(values) > 64 or any((type(n) is not int or n <= 0 for n in values)):
             raise ValueError('one to 64 positive integer logical lengths required')
@@ -286,21 +287,26 @@ class Qwen35CoreCostModel:
         return dict(self._program(values, cp))
 
     def forward(self, lengths, cp, *, ranks=None):
+        """Return mean forward time per layer for the frozen three-GDN/two-FA stack."""
         p = self.program_costs(lengths, cp, ranks=ranks)
         return (3 * p['gdn_f'] + 2 * p['fa_f']) / 5
 
     def backward(self, lengths, cp, *, ranks=None):
+        """Return mean backward time per layer for the frozen three-GDN/two-FA stack."""
         p = self.program_costs(lengths, cp, ranks=ranks)
         return (3 * p['gdn_b'] + 2 * p['fa_b']) / 5
 
     def timing(self):
+        """Describe the frozen mixed-layer program and synchronization costs."""
         return execution_timing(self.non_attention['cost_ms'], False)
 
     def clear(self):
+        """Clear the exact and proposal-guide pack caches for a new global batch."""
         self._program.cache_clear()
         self._guide_program.cache_clear()
 
     def check_domain(self, geometry, config=None):
+        """Require the frozen W32/EP4/local16K/dataset64 proxy geometry."""
         if (
             geometry.world_size,
             geometry.ep_size,
@@ -310,6 +316,7 @@ class Qwen35CoreCostModel:
             raise ValueError('the composed proxy requires W32/EP4/local16K/dataset64')
 
     def metadata(self):
+        """Expose the frozen proxy recipe, source hashes and transfer limitations."""
         return dict(
             name=self.name,
             source_hashes=self.source_hashes,

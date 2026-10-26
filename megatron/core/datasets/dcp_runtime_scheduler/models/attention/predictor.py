@@ -144,6 +144,7 @@ def round_pieces(lengths, padded, cp_size):
 
 
 def ceil_div(a, b):
+    """Round an integer quotient upward."""
     return -(-int(a) // int(b))
 
 
@@ -240,6 +241,7 @@ class AttentionModel:
         self._profile_by_shape = {shape: name for name, shape in self.geometries.items()}
 
     def geometry_profile(self, query_heads, kv_heads, head_dim):
+        """Resolve a coefficient profile for the supplied attention head geometry."""
         key = int(query_heads), int(kv_heads), int(head_dim)
         if key not in self._profile_by_shape:
             raise ValueError(f'No {self.phase} coefficient set for geometry {key}')

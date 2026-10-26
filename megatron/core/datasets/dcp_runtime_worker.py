@@ -31,18 +31,23 @@ class _AttentionWorkModel:
         self.geometry = geometry
 
     def forward(self, lengths, cp, *, ranks=None):
+        """Estimate per-layer forward milliseconds from padded quadratic attention work."""
         return sum(self.geometry.stored_length(length, cp) ** 2 for length in lengths) / cp / 1e6
 
     def backward(self, lengths, cp, *, ranks=None):
+        """Estimate per-layer backward milliseconds for the quadratic work proxy."""
         return 2 * self.forward(lengths, cp, ranks=ranks)
 
     def timing(self):
+        """Use the shared scalar timeline for the quadratic work proxy."""
         return None
 
     def clear(self):
+        """Accept the cache-reset hook for this stateless work proxy."""
         return None
 
     def check_domain(self, geometry, config):
+        """Accept the validated planner geometry for this geometry-only proxy."""
         return None
 
 
@@ -138,6 +143,7 @@ def _solve(planner, spec, lengths, padded, baseline_rows):
 
 def main() -> None:
     # Keep third-party diagnostics out of the JSON protocol, which uses stdout.
+    """Serve newline-delimited CPU planner requests over standard input/output."""
     output = sys.stdout
     sys.stdout = sys.stderr
     try:
