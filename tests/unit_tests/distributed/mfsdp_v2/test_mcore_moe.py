@@ -65,7 +65,7 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
-def test_standard_moe_train_step_and_clip(process_group_collections, distributed_setup):
+def test_standard_moe_training_and_clipping(process_group_collections, distributed_setup):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
     config = TransformerConfig(
@@ -158,7 +158,7 @@ def test_standard_moe_train_step_and_clip(process_group_collections, distributed
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["no-overlap", "overlap"])
-def test_shortcut_moe_train_step_and_clip(process_group_collections, distributed_setup, overlap):
+def test_shortcut_moe_training_and_clipping(process_group_collections, distributed_setup, overlap):
     """Keep shortcut parameters together while matching reference training with wide residuals."""
     process_group_collection, reference_process_group_collection = process_group_collections
     config = TransformerConfig(
