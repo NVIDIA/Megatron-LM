@@ -4,8 +4,7 @@
 from __future__ import annotations
 
 import logging
-import math
-from functools import cache, partial
+from functools import cache
 from typing import Optional
 
 import torch
@@ -15,12 +14,16 @@ from megatron.core.inference.contexts import BaseInferenceContext
 
 try:
     import deep_select
+
     HAVE_DEEP_SELECT = True
 except ImportError:
     deep_select = None
     HAVE_DEEP_SELECT = False
 
+SCORE_BUFFER_BYTES = 1 << 30
+
 logger = logging.getLogger(__name__)
+
 
 @cache
 def _log_decode_topk_backend(use_deep_select: bool) -> None:
@@ -244,6 +247,8 @@ def dynamic_sparse_attention(
             "DSA inference decodes one token per request; MTP speculative decoding is not "
             "supported."
         )
+    if backend not in ("triton", "triton_gluon", "flashinfer"):
+        raise ValueError(f"Unsupported dynamic DSA-GQA backend: {backend}")
     if query.dim() == 3:
         query = query.unsqueeze(1)
     num_tokens, _, num_query_heads, _ = query.shape
@@ -257,6 +262,20 @@ def dynamic_sparse_attention(
     max_context_length = inference_context.active_attn_metadata["mha_metadata"].state_data[
         "max_seqlen_k"
     ]
+    if backend == "triton_gluon":
+        return _native_sparse_attention(
+            query=query[:, 0],
+            key_cache=key_cache,
+            value_cache=value_cache,
+            index_query=index_query.reshape(num_tokens, -1),
+            index_key_cache=index_key_cache,
+            block_table=block_table,
+            inference_context=inference_context,
+            row_metadata=row_metadata,
+            max_context_length=max_context_length,
+            index_topk=index_topk,
+            softmax_scale=softmax_scale,
+        ).view(num_tokens, 1, num_query_heads * value_cache.size(-1))
     if backend == "flashinfer":
         from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
 
@@ -297,3 +316,86 @@ def dynamic_sparse_attention(
     )
     return output.view(num_tokens, 1, num_query_heads * value_cache.size(-1))
 
+
+@torch.no_grad()
+def _native_sparse_attention(
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    index_query: torch.Tensor,
+    index_key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    inference_context: BaseInferenceContext,
+    row_metadata: tuple,
+    max_context_length: int,
+    index_topk: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    from .dsa_gqa_triton_decode import TritonDSADecodeWorkspace
+
+    rows = min(query.shape[0], inference_context.padded_active_request_count)
+    max_context = inference_context.max_sequence_length
+    cache_key = (
+        index_key_cache.data_ptr(),
+        rows,
+        query.shape[1:],
+        max_context,
+        index_topk,
+        key_cache.shape[1],
+    )
+    cache = inference_context._dsa_decode_workspaces
+    if cache_key not in cache:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm the native DSA workspace before CUDA graph capture")
+        workspace = TritonDSADecodeWorkspace(
+            batch_size=rows,
+            num_query_heads=query.shape[1],
+            head_dim=query.shape[2],
+            index_topk=index_topk,
+            max_context=max_context,
+            page_size=key_cache.shape[1],
+            device=query.device,
+        )
+        stable_query = torch.empty(
+            rows, index_query.shape[1], dtype=index_query.dtype, device=query.device
+        )
+        cache[cache_key] = workspace, stable_query
+    workspace, stable_query = cache[cache_key]
+    stable_query.copy_(index_query[:rows])
+    lengths = inference_context.dsa_decode_lengths[:rows]
+    native = workspace(
+        query=query[:rows],
+        index_query=stable_query,
+        index_key_cache=index_key_cache,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_table=block_table,
+        context_lengths=lengths,
+        request_indices=row_metadata[0][:rows],
+        softmax_scale=softmax_scale,
+    )
+    if inference_context.is_decode_only():
+        return native
+
+    # Mixed steps retain the prefill implementation; decode rows are computed only
+    # by the native workspace, with zero lengths in the prefill score/attention path.
+    prefill_lengths = row_metadata[1].clone()
+    prefill_lengths[:rows] = torch.where(lengths > 0, 0, prefill_lengths[:rows])
+    prefill_metadata = (row_metadata[0], prefill_lengths, *row_metadata[2:])
+    output = _sparse_attention_rows(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        index_query=index_query,
+        index_key_cache=index_key_cache,
+        block_table=block_table,
+        row_metadata=prefill_metadata,
+        max_context_length=max_context_length,
+        index_topk=index_topk,
+        softmax_scale=softmax_scale,
+        filter_blocks=inference_context.dsa_filter_blocks(),
+        decode_only=False,
+    )
+    output[:rows] = torch.where((lengths > 0)[:, None, None], native, output[:rows])
+    return output

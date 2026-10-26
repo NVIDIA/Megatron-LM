@@ -838,6 +838,34 @@ class DSGQACoreAttention(MegatronModule):
         total_tokens, batch_size, num_query_heads, _ = query.shape
         assert batch_size == 1, "Dynamic DSA-GQA expects packed tokens with batch=1."
         output = value_cache.new_zeros((total_tokens, 1, num_query_heads * value_cache.size(-1)))
+        indexer_hidden_states = hidden_states.detach()
+        if _simplified_indexer_uses_main_input_norm(self.config):
+            indexer_hidden_states = _normalized_indexer_input(
+                indexer_hidden_states, indexer_input_norm
+            )
+
+        index_q, current_index_key = self.indexer.forward_qk_dynamic(
+            indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
+        )
+        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
+        index_key_cache, index_block_table = inference_context.dsa_key_cache(provider_layer_number)
+
+        if self.config.dsa_inference_backend != "cute":
+            from .dsa_gqa_inference import dynamic_sparse_attention
+
+            return dynamic_sparse_attention(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                index_query=index_q,
+                index_key_cache=index_key_cache,
+                block_table=block_table,
+                inference_context=inference_context,
+                index_topk=self.indexer.index_topk,
+                softmax_scale=self.softmax_scale,
+                backend=self.config.dsa_inference_backend,
+            )
+
         request_count = inference_context.get_active_request_count()
         if request_count == 0:
             return output
@@ -859,18 +887,6 @@ class DSGQACoreAttention(MegatronModule):
                 f"Dynamic DSA-GQA received {packed_seq_params.total_tokens} packed tokens, "
                 f"but the inference context has {active_tokens}."
             )
-
-        indexer_hidden_states = hidden_states.detach()
-        if _simplified_indexer_uses_main_input_norm(self.config):
-            indexer_hidden_states = _normalized_indexer_input(
-                indexer_hidden_states, indexer_input_norm
-            )
-
-        index_q, current_index_key = self.indexer.forward_qk_dynamic(
-            indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
-        )
-        inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
-        index_key_cache, index_block_table = inference_context.dsa_key_cache(provider_layer_number)
 
         num_decode_requests = inference_context.num_decode_requests
         if num_decode_requests:
@@ -1191,8 +1207,11 @@ class DSGroupedSelfAttention(SelfAttention):
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         """Dispatch dynamic batching to the mixed prefill/decode DSA path."""
-        if inference_context.using_cuda_graph_this_step():
-            raise NotImplementedError("Dynamic DSA-GQA does not yet support CUDA graphs.")
+        if (
+            self.config.dsa_inference_backend == "cute"
+            and inference_context.using_cuda_graph_this_step()
+        ):
+            raise NotImplementedError("The CuTe DSA-GQA backend does not support CUDA graphs.")
 
         provider_layer_number = self.layer_number - self._get_pp_layer_offset_for_inference()
         return self.core_attention.forward_dynamic(

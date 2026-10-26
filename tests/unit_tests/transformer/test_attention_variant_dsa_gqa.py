@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import subprocess
 import sys
 import textwrap
@@ -1582,14 +1583,26 @@ class TestDSGQADynamicInference:
                 decode_output[request_idx], expected[-1], rtol=2e-2, atol=2e-2
             )
 
-    @pytest.mark.parametrize("backend", ["reference", "min-memory-triton"])
-    @pytest.mark.parametrize("topk", [8, 512])
     @pytest.mark.parametrize(
-        "head_dim,index_head_dim,rotary_base,rotary_percent",
-        [(128, 128, 10000, 1.0), (192, 128, 500000, 0.5), (256, 64, 1000000, 0.5)],
+        "backend,topk,head_dim,index_head_dim,rotary_base,rotary_percent,inference_backend",
+        [
+            (backend, topk, *shape, "cute")
+            for backend in ("reference", "min-memory-triton")
+            for topk in (8, 512)
+            for shape in ((128, 128, 10000, 1.0), (192, 128, 500000, 0.5), (256, 64, 1000000, 0.5))
+        ]
+        + [("min-memory-triton", 512, 128, 128, 10000, 1.0, "triton_gluon")],
     )
     def test_decode_logprobs_match_training(
-        self, monkeypatch, backend, topk, head_dim, index_head_dim, rotary_base, rotary_percent
+        self,
+        monkeypatch,
+        backend,
+        topk,
+        head_dim,
+        index_head_dim,
+        rotary_base,
+        rotary_percent,
+        inference_backend,
     ):
         """The same weights and token histories give close full-vocabulary logprobs."""
         torch.manual_seed(53)
@@ -1612,6 +1625,7 @@ class TestDSGQADynamicInference:
             experimental_attention_variant="dsa",
             dsa_indexer_mode="simplified",
             dsa_kernel_backend=backend,
+            dsa_inference_backend=inference_backend,
             dsa_indexer_n_heads=1,
             dsa_indexer_head_dim=index_head_dim,
             dsa_indexer_topk=topk,
@@ -1661,7 +1675,7 @@ class TestDSGQADynamicInference:
                 max_sequence_length=640,
                 max_requests=3,
                 max_tokens=1024,
-                block_size_tokens=64,
+                block_size_tokens=256 if inference_backend == "triton_gluon" else 64,
                 buffer_size_gb=0.05,
                 unified_memory_level=0,
                 num_cuda_graphs=None,
@@ -1679,13 +1693,21 @@ class TestDSGQADynamicInference:
             )
 
         decode_calls = []
-        original_decode = decode_kernels.dsa_gqa_decode_attention
+        if inference_backend == "triton_gluon":
+            from megatron.core.transformer.experimental_attention_variant.dsa_gqa_triton_decode import (
+                TritonDSADecodeWorkspace,
+            )
+
+            decode_target, decode_name = TritonDSADecodeWorkspace, "__call__"
+        else:
+            decode_target, decode_name = decode_kernels, "dsa_gqa_decode_attention"
+        original_decode = getattr(decode_target, decode_name)
 
         def capture_decode(*args, **kwargs):
             decode_calls.append(1)
             return original_decode(*args, **kwargs)
 
-        monkeypatch.setattr(decode_kernels, "dsa_gqa_decode_attention", capture_decode)
+        monkeypatch.setattr(decode_target, decode_name, capture_decode)
         model.eval()
         errors = []
         with torch.inference_mode(), InferenceMode.active():
@@ -1724,13 +1746,15 @@ class TestDSGQADynamicInference:
                         for request_id in request_ids
                     ]
                 )
-                # Check every request and vocabulary token at every step. An absolute
-                # tolerance of 0.01 nats allows about 1% probability error per element.
+                # The fused native backend has a different BF16 softmax rounding
+                # order. Its uniform 0.02-nat budget permits about 2% probability
+                # error; retain a separate aggregate mean-error budget.
+                logprob_atol = 2e-2 if inference_backend == "triton_gluon" else 1e-2
                 torch.testing.assert_close(
                     actual,
                     expected,
                     rtol=0,
-                    atol=1e-2,
+                    atol=logprob_atol,
                     msg=lambda message: f"Step {step}, request IDs {request_ids}:\n{message}",
                 )
                 delta = (actual - expected).abs()
@@ -1748,7 +1772,17 @@ class TestDSGQADynamicInference:
                         new_tokens=targets.cpu(),
                     )
 
-        assert len(decode_calls) == 2 * decode_steps
+        # The native graph path also launches empty decode rows during prefill.
+        expected_calls = 2 * (decode_steps + (inference_backend == "triton_gluon"))
+        assert len(decode_calls) == expected_calls
         # Keep the aggregate error budget in addition to the elementwise checks above.
-        mean_abs_error = torch.stack(errors).mean().item()
-        assert mean_abs_error <= 2e-3, f"Mean logprob error: {mean_abs_error} nats"
+        all_errors = torch.stack(errors)
+        mean_abs_error = all_errors.mean().item()
+        logging.getLogger(__name__).info(
+            "Model logprob parity: inference_backend=%s max_abs=%s mean_abs=%s",
+            inference_backend,
+            all_errors.max().item(),
+            mean_abs_error,
+        )
+        mean_error_limit = 2.5e-3 if inference_backend == "triton_gluon" else 2e-3
+        assert mean_abs_error <= mean_error_limit, f"Mean logprob error: {mean_abs_error} nats"
