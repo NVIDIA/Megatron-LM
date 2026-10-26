@@ -491,6 +491,18 @@ def validate_args(args, defaults={}):
         assert args.ckpt_convert_save is not None
         assert args.load is not None
         args.exit_on_missing_checkpoint = True
+    if getattr(args, "moe_scheduler_export_logical_checkpoint", False):
+        export_format = "fsdp_dtensor" if args.use_megatron_fsdp else "torch_dist"
+        if args.ckpt_convert_format != export_format or not args.load:
+            raise ValueError(
+                f"Logical expert export requires --load and --ckpt-convert-format {export_format}."
+            )
+        if not args.moe_enable_scheduler or not args.moe_scheduler_home_update_interval:
+            raise ValueError(
+                "Load with the original home-migration scheduler configuration for logical export."
+            )
+        if args.finetune or args.no_load_optim or args.no_save_optim:
+            raise ValueError("Logical expert export must load and save optimizer masters/state.")
 
     # Temporary
     assert args.non_persistent_ckpt_type in [
@@ -2462,6 +2474,18 @@ def validate_args(args, defaults={}):
             args.num_experts is not None
         ), "MoE latent projections are applicable only for MoE models."
 
+    # Validate the final optimizer options after defaults and argument normalization.
+    if getattr(args, "moe_scheduler_home_update_interval", 0):
+        from megatron.core.transformer.moe.home_expert_state import (
+            validate_home_expert_optimizer_config,
+        )
+
+        validate_home_expert_optimizer_config(args)
+        if args.skip_train and not (args.perform_rl_step and not args.no_load_optim):
+            raise ValueError(
+                "Home migration requires optimizer initialization; remove --skip-train."
+            )
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -3113,6 +3137,8 @@ def _add_network_size_args(parser):
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
         "sequence_packing_scheduler",
+        # already defined by the mixed-precision argument group
+        "grad_reduce_in_bf16",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")

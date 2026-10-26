@@ -3532,6 +3532,24 @@ class ParamAndGradBuffer:
         self.dist_main_weight = dist_main_weight
         self.dist_main_grad = {}
 
+    def get_main_weight_shard_location(
+        self, parameter: torch.Tensor
+    ) -> Tuple[int, Optional[torch.distributed.ProcessGroup]] | None:
+        """Return the authoritative shard's element offset and reconstruction group.
+
+        The main-weight buffer can have a different slice from the quantized
+        compute-weight buffer. Return None for parameters owned by another chunk.
+        """
+        if parameter not in self.param_to_param_group:
+            return None
+        group = self.parameter_groups[self.param_to_param_group[parameter]]
+        weight = group.main_weight_buffer or group.model_weight_buffer
+        sharded = self.bucketing_policy.data_parallel_sharding_strategy != "no_shard"
+        if not sharded:
+            return 0, None
+        start, _ = weight._get_item_slice_in_shard(weight.param_idx[parameter])
+        return start, self.dist_index.get_dp_group(is_expert_parallel=group.is_expert_param)
+
     def _init_optimizer_named_parameters(self) -> List[Tuple[str, torch.nn.Parameter]]:
         named_parameters = []
         for pg in self.parameter_groups:

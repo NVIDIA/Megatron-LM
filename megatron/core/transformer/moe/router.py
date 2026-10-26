@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -17,6 +17,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
+from megatron.core.transformer.moe.mock_router import MockRouteCache, mock_route_scores
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -227,6 +228,16 @@ class TopKRouter(Router):
         self.frozen_expert_bias = False
         self.is_hash_layer = False
         self.register_buffer('tid2eid', None)
+        self.mock_route_cache = (
+            MockRouteCache(
+                self.config.num_moe_experts,
+                self.topk,
+                self.config.expert_model_parallel_size,
+                self.config.moe_router_mock_maxvio,
+            )
+            if self.config.moe_router_mock_maxvio is not None
+            else None
+        )
 
         self.use_micro_batch_quantile_balancing = (
             self.routing_type == "quantile_balancing"
@@ -560,6 +571,8 @@ class TopKRouter(Router):
 
     def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
         """Return the route-index dtype for Flex backends that consume dense top-k indices."""
+        if self.config.moe_enable_scheduler and self.config.moe_scheduler_planner_type != "moon_ep":
+            return None
         config = self.config
         fused_dense_routing = (
             config.moe_token_dispatcher_type == "flex"
@@ -1070,6 +1083,36 @@ class TopKRouter(Router):
         routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top_indices, True)
         return routing_probs, routing_map
 
+    def _mock_routing(self, logits, padding_mask):
+        """Route valid tokens through a cached prefix, without host reads of padding."""
+        if padding_mask is not None and (
+            padding_mask.numel() != logits.shape[0]
+            or padding_mask.dtype != torch.bool
+            or padding_mask.device != logits.device
+        ):
+            raise ValueError(
+                "Mock routing needs one boolean padding entry per token on the logits device."
+            )
+        indices = self.mock_route_cache.get(logits.shape[0], logits.device)
+        if padding_mask is not None and logits.shape[0] > 0:
+            # Selecting by valid-token ordinal supports changing THD padding in
+            # graph replay. Never key the cache on a mask pointer or call .item().
+            ordinal = (~padding_mask).long().cumsum(0).sub(1).clamp_min(0)
+            indices = indices.index_select(0, ordinal)
+        else:
+            # Dispatchers must not be able to modify the cached semantic IDs.
+            indices = indices.clone()
+        probs = mock_route_scores(
+            logits,
+            indices,
+            self.score_function,
+            self.config.moe_router_pre_softmax,
+            self.config.moe_router_topk_scaling_factor,
+            self.is_hash_layer,
+        )
+        routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, indices, True)
+        return torch.zeros_like(logits).scatter(1, indices, probs), routing_map
+
     def routing(
         self,
         logits: torch.Tensor,
@@ -1127,7 +1170,9 @@ class TopKRouter(Router):
                 "Hash routing requires a layer number. Construct the router through MoELayer "
                 "or call set_layer_number() before routing."
             )
-        if self.is_hash_layer:
+        if self.mock_route_cache is not None:
+            probs, routing_map = self._mock_routing(logits, padding_mask)
+        elif self.is_hash_layer:
             assert input_ids is not None, (
                 "input_ids is required for hash-based routing. Pass token IDs through "
                 "the model, transformer block, and transformer layer."
@@ -1186,6 +1231,17 @@ class TopKRouter(Router):
                 # TE returns compact IDs but full-width probabilities; normalize the pair.
                 probs = probs.gather(1, routing_map)
 
+        # Planner inputs retain K dummy routes for padding, with zero probabilities.
+        # Ordinary routing leaves padding removal to the dispatcher, which also
+        # supports upstream compact top-k index maps.
+        if padding_mask is not None and (
+            self.mock_route_cache is not None or self.config.moe_enable_scheduler
+        ):
+            valid_tokens = (~padding_mask).unsqueeze(-1)
+            probs = probs * valid_tokens
+            if not self.config.moe_enable_scheduler:
+                routing_map = routing_map & valid_tokens
+
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -1199,7 +1255,9 @@ class TopKRouter(Router):
 
         # Reuse the unbiased aux-loss routing calculation for due router diagnostics.
         # Hash assignments come from tid2eid, so learned-routing aux losses do not apply.
-        aux_loss_enabled = not self.is_hash_layer and self.is_aux_loss_enabled()
+        aux_loss_enabled = (
+            self.mock_route_cache is None and not self.is_hash_layer and self.is_aux_loss_enabled()
+        )
         apply_aux_loss = torch.is_grad_enabled() and aux_loss_enabled
         compute_aux_inputs = self.training and (observe_router_diagnostics or apply_aux_loss)
         if compute_aux_inputs:

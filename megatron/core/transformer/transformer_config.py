@@ -38,6 +38,8 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
     LayerType,
 )
+from megatron.core.transformer.moe.mock_router import validate_mock_route_parameters
+from megatron.core.transformer.moe.replica_weight_transport import REPLICA_EXPERT_DISPATCHER_TYPES
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.utils import experimental_api
@@ -1129,6 +1131,14 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_router_mock_maxvio: Optional[float] = None
+    """Benchmark-only cached logical expert choices with a target max/mean EP rank load.
+
+    Uses the initial contiguous home layout, before scheduler rerouting. Gate scores
+    remain differentiable; learned selection and balancing auxiliary losses are skipped.
+    None preserves normal routing. The target must be in
+    [1, EP * min(topk, num_moe_experts / EP) / topk]."""
+
     moe_router_force_biased: Optional[float] = None
     """Apply random expert bias in normal distribution with specified std
     to router logits. Shared seed across all ranks ensures identical bias.
@@ -1213,6 +1223,50 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    moe_enable_scheduler: bool = False
+    """[Experimental] Enable MoEScheduler before token dispatch.
+
+    MoEScheduler rewrites router output into a physical expert layout and materializes any
+    expert replicas before the existing token dispatcher runs. The MoE forward/backward flow
+    remains the same after scheduler preprocessing."""
+
+    moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep'] = "echo"
+    """Planner backend used by MoEScheduler. Supports 'echo', 'eplb', and 'moon_ep'."""
+
+    moe_scheduler_expert_dispatcher_type: Literal['replica_peer_tma', 'replica_nccl'] = (
+        "replica_peer_tma"
+    )
+    """Expert-dispatch backend used by MoEScheduler.
+
+    The single replica expert dispatcher uses this value to select its weight transport.
+    ``replica_peer_tma`` selects the existing symmetric-memory peer-TMA transport.
+    ``replica_nccl`` selects packed NCCL P2P for BF16/MXFP8 weights with host planning.
+    ``replica_hybridep`` is a reserved, unimplemented transport.
+    Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
+    """
+
+    moe_scheduler_replica_storage: Literal['shared', 'layerwise'] = "shared"
+    """Share replica weights/gradients across layers or allocate per runtime."""
+
+    moe_scheduler_replica_mxfp8_storage: Literal['reuse', 'separate'] = "reuse"
+    """Alias MXFP8 directional storage or keep independent row/column bytes."""
+
+    moe_scheduler_num_idle_experts: Optional[int] = None
+    """Number of transient physical expert slots added across the EP group.
+
+    The ``moon_ep`` planner follows the PR #7450 replica planner and requires
+    this to equal ``num_moe_experts``.
+    """
+
+    moe_scheduler_home_update_interval: int = 0
+    """Successful optimizer steps between EPLB home proposals; zero keeps homes fixed."""
+
+    moe_scheduler_home_exchange_buffer_mb: int = 256
+    """Combined send/receive MiB budget shared across serialized home migrations."""
+
+    moe_scheduler_replica_exchange_buffer_mb: int = 256
+    """Combined NCCL replica send/receive/FP32 scratch MiB, shared across layers."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
@@ -1224,6 +1278,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_virtual_expert_load_balance: bool = False
     """Balance MoE routes by materializing virtual experts over HybridEP."""
+
+    grad_reduce_in_bf16: bool = False
+    """Use BF16 gradient storage and communication instead of the default FP32."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -3009,6 +3066,41 @@ class TransformerConfig(ModelParallelConfig):
                     "Please set num_moe_experts or remove moe_ffn_hidden_size."
                 )
 
+        if self.moe_router_mock_maxvio is not None:
+            validate_mock_route_parameters(
+                self.num_moe_experts,
+                self.moe_router_topk,
+                self.expert_model_parallel_size,
+                self.moe_router_mock_maxvio,
+            )
+            conflicts = {
+                'moe_router_force_load_balancing': self.moe_router_force_load_balancing,
+                'moe_router_force_biased': self.moe_router_force_biased is not None,
+                'moe_enable_routing_replay': self.moe_enable_routing_replay,
+                'moe_router_enable_expert_bias': self.moe_router_enable_expert_bias,
+                'group-limited routing': self.moe_router_num_groups is not None
+                or self.moe_router_group_topk is not None,
+                'token dropping': self.moe_expert_capacity_factor is not None
+                or self.moe_pad_expert_input_to_capacity
+                or self.moe_token_dropping,
+                'expert tensor parallelism': self.expert_tensor_parallel_size != 1,
+            }
+            routing_types = self.moe_router_load_balancing_type
+            if isinstance(routing_types, str):
+                routing_types = [routing_types]
+            conflicts['sinkhorn/quantile balancing'] = any(
+                t in ('sinkhorn', 'quantile_balancing') for t in routing_types
+            )
+            enabled = [name for name, active in conflicts.items() if active]
+            if enabled:
+                raise ValueError(
+                    f"moe_router_mock_maxvio is incompatible with {', '.join(enabled)}."
+                )
+            warnings.warn(
+                "Mock routing is for performance benchmarks only: learned/Hash-MoE choices "
+                "are replaced and router auxiliary balancing losses are disabled."
+            )
+
         if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
             if not self.moe_grouped_gemm:
                 raise ValueError(
@@ -3111,6 +3203,190 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
+
+        if self.moe_enable_scheduler and self.moe_virtual_expert_load_balance:
+            raise ValueError(
+                "Choose either moe_enable_scheduler or moe_virtual_expert_load_balance; "
+                "a layer must have exactly one expert execution runtime."
+            )
+        if self.moe_enable_scheduler:
+            if self.expert_model_parallel_size <= 1:
+                raise ValueError("MoEScheduler requires expert_model_parallel_size > 1.")
+            if self.recompute_granularity == "full":
+                raise ValueError("MoEScheduler does not support full activation recomputation.")
+            if self.moe_scheduler_expert_dispatcher_type == "replica_hybridep":
+                raise ValueError(
+                    "replica_hybridep is not implemented; select replica_peer_tma or replica_nccl."
+                )
+            if (
+                self.moe_scheduler_planner_type == "moon_ep"
+                or self.moe_scheduler_expert_dispatcher_type == "replica_peer_tma"
+            ) and self.expert_model_parallel_size > 64:
+                raise ValueError("MoonEP and peer-TMA support at most 64 EP ranks.")
+            if self.moe_scheduler_planner_type == "moon_ep" and self.num_moe_experts is not None:
+                if self.num_moe_experts > 8192:
+                    raise ValueError("MoonEP supports at most 8192 logical experts.")
+                if self.moe_hybridep_pad_variable_tokens:
+                    raise ValueError(
+                        "MoonEP requires equal physical token counts before planning; "
+                        "moe_hybridep_pad_variable_tokens equalizes only after planning."
+                    )
+            if self.num_moe_experts is None:
+                raise ValueError("MoEScheduler requires num_moe_experts.")
+            if self.moe_expert_capacity_factor is not None or self.moe_pad_expert_input_to_capacity:
+                raise ValueError("MoEScheduler currently supports dropless MoE only.")
+            if self.add_bias_linear:
+                raise ValueError(
+                    "MoEScheduler expert dispatch currently requires add_bias_linear=False."
+                )
+            if self.moe_scheduler_planner_type not in ("echo", "eplb", "moon_ep"):
+                raise ValueError(
+                    "Only moe_scheduler_planner_type='echo', 'eplb', and 'moon_ep' are "
+                    "currently implemented."
+                )
+            if self.moe_scheduler_expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
+                raise ValueError(
+                    "Unsupported moe_scheduler_expert_dispatcher_type; expected one of "
+                    f"{REPLICA_EXPERT_DISPATCHER_TYPES}."
+                )
+            if self.moe_scheduler_replica_storage not in ("shared", "layerwise"):
+                raise ValueError("moe_scheduler_replica_storage must be shared or layerwise.")
+            if self.moe_scheduler_replica_mxfp8_storage not in ("reuse", "separate"):
+                raise ValueError("moe_scheduler_replica_mxfp8_storage must be reuse or separate.")
+            if self.moe_scheduler_replica_exchange_buffer_mb <= 0:
+                raise ValueError("moe_scheduler_replica_exchange_buffer_mb must be positive.")
+            if self.moe_scheduler_home_exchange_buffer_mb <= 0:
+                raise ValueError("moe_scheduler_home_exchange_buffer_mb must be positive.")
+            if self.moe_scheduler_home_update_interval < 0:
+                raise ValueError("moe_scheduler_home_update_interval must be non-negative.")
+            if self.moe_scheduler_home_update_interval:
+                if self.moe_scheduler_planner_type != "eplb":
+                    raise ValueError("Periodic home exchange requires the EPLB planner.")
+                if self.moe_scheduler_expert_dispatcher_type != "replica_nccl":
+                    raise ValueError("Home exchange currently requires NCCL; Peer-TMA is reserved.")
+
+            if self.moe_scheduler_num_idle_experts is None:
+                raise ValueError(
+                    "moe_scheduler_num_idle_experts must be set when MoEScheduler is enabled."
+                )
+            if self.moe_scheduler_num_idle_experts < 0:
+                raise ValueError("moe_scheduler_num_idle_experts must be non-negative.")
+            if self.moe_scheduler_num_idle_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    "moe_scheduler_num_idle_experts must be divisible by "
+                    "expert_model_parallel_size."
+                )
+            if self.num_moe_experts % self.expert_model_parallel_size != 0:
+                raise ValueError(
+                    "num_moe_experts must be divisible by expert_model_parallel_size when "
+                    "MoEScheduler is enabled."
+                )
+            if (
+                self.moe_scheduler_planner_type == "moon_ep"
+                and self.moe_scheduler_num_idle_experts != self.num_moe_experts
+            ):
+                raise ValueError(
+                    "moe_scheduler_planner_type='moon_ep' requires "
+                    "moe_scheduler_num_idle_experts to equal num_moe_experts."
+                )
+            if self.moe_scheduler_num_idle_experts == 0 and not (
+                self.moe_scheduler_planner_type == "eplb"
+                and self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+                and self.moe_scheduler_home_update_interval > 0
+            ):
+                raise ValueError(
+                    "Replica expert dispatch requires at least one replica slot per "
+                    "expert-parallel rank, except EPLB with NCCL and a positive home update "
+                    "interval, which supports home-only execution."
+                )
+            # Preserve the caller's capacity policy. Generic planners need dynamic
+            # sizing when no explicit budget is set. A completed MoonEP plan may
+            # separately provide a proven route bound; HybridEP adds per-expert
+            # padding and checks that contract on-device. Never silently rewrite
+            # this flag without installing training's explicit-budget retry runner.
+            replica_mxfp8 = (
+                self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            )
+            required_values = {
+                "moe_megakernel_backend": None,
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "moe_single_grouped_bias": False,
+                "use_transformer_engine_op_fuser": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_pad_expert_input_to_capacity": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            replica_requirements = [
+                (getattr(self, name) == value, f"{name}={value!r}")
+                for name, value in required_values.items()
+            ] + [
+                (
+                    self.bf16 and self.params_dtype == torch.bfloat16,
+                    "BF16 execution and BF16 parameters",
+                ),
+                (
+                    (not self.fp8 or replica_mxfp8) and not self.fp4,
+                    "quantization disabled or MXFP8 E4M3 with native FP8 parameters",
+                ),
+                (self.moe_router_topk <= 32, "moe_router_topk<=32"),
+                (
+                    (self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu))
+                    or (
+                        not self.gated_linear_unit
+                        and self.activation_func == squared_relu
+                        and self.use_fused_weighted_squared_relu
+                    ),
+                    "fused SwiGLU, quick-GeGLU or weighted squared-ReLU activation",
+                ),
+                (
+                    (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                    "moe_latent_size (or hidden_size) divisible by 128",
+                ),
+                (
+                    self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size % 128 == 0,
+                    "moe_ffn_hidden_size divisible by 128",
+                ),
+                (
+                    self.moe_expert_rank_capacity_factor is None
+                    or self.moe_expert_rank_capacity_factor >= 1.0,
+                    "moe_expert_rank_capacity_factor=None or >=1.0",
+                ),
+                (
+                    not self.moe_router_padding_for_quantization or replica_mxfp8,
+                    "moe_router_padding_for_quantization=False unless using MXFP8",
+                ),
+                (
+                    not self.fine_grained_activation_offloading
+                    or not {"expert_fc1", "moe_act"}.intersection(self.offload_modules or ()),
+                    "no expert_fc1/moe_act offloading with the fused grouped MLP",
+                ),
+                (
+                    self.recompute_granularity != "selective"
+                    or "moe" not in (self.recompute_modules or ()),
+                    "no MoE layer recompute",
+                ),
+            ]
+            replica_errors = [
+                message for satisfied, message in replica_requirements if not satisfied
+            ]
+            if replica_errors:
+                raise ValueError(
+                    "Replica scheduler configuration is unsupported; require "
+                    + ", ".join(replica_errors)
+                    + "."
+                )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
@@ -4590,6 +4866,44 @@ class TransformerConfig(ModelParallelConfig):
             )
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes
+        if (
+            self.moe_enable_scheduler
+            and self.moe_expert_rank_capacity_factor is None
+            and self.cuda_graph_impl != "none"
+            and (
+                self.cuda_graph_impl == "full_iteration"
+                or not self.cuda_graph_modules
+                or CudaGraphModule.moe in self.cuda_graph_modules
+            )
+        ):
+            raise ValueError(
+                "MoEScheduler MoE CUDA graph capture requires an explicit "
+                "moe_expert_rank_capacity_factor; dynamic dropless dispatch "
+                "uses host synchronization."
+            )
+        if (
+            self.moe_enable_scheduler
+            and (
+                self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+                or (
+                    self.moe_scheduler_replica_storage == "layerwise"
+                    and (
+                        not self.fp8_param or self.moe_scheduler_replica_mxfp8_storage == "separate"
+                    )
+                )
+            )
+            and self.cuda_graph_impl != "none"
+            and (
+                self.cuda_graph_impl == "full_iteration"
+                or not self.cuda_graph_modules
+                or {CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
+                & set(self.cuda_graph_modules)
+            )
+        ):
+            raise ValueError(
+                "replica_nccl host schedules and replica weight caching do not support "
+                "MoE CUDA graph capture."
+            )
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."
@@ -5001,14 +5315,12 @@ class TransformerConfig(ModelParallelConfig):
                             'mlp cuda graph is only supported for dense layers, '
                             'but not found in the model.'
                         )
-                    if self.moe_virtual_expert_load_balance:
-                        # The virtual-expert planner keeps its routing metadata private to one
-                        # forward, which only the whole-layer moe scope preserves.
+                    if self.moe_virtual_expert_load_balance or self.moe_enable_scheduler:
                         assert not {
                             CudaGraphModule.moe_router,
                             CudaGraphModule.moe_preprocess,
                         } & set(self.cuda_graph_modules), (
-                            'virtual-expert load balancing supports the moe CUDA graph scope only; '
+                            'Expert load balancing supports the whole moe CUDA graph scope only; '
                             'moe_router and moe_preprocess are not supported.'
                         )
                     elif (

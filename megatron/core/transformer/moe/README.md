@@ -324,7 +324,7 @@ Triton kernels, a virtual-expert dispatcher, and Transformer Engine's grouped ex
 
 - **Dispatcher:** Flex selects `_VirtualExpertHybridEPManager` in
   [token_dispatcher.py](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py), which extends the existing HybridEP manager with
-  `VirtualExpertLoadBalancer`. It accepts the router's `[tokens, topk]` expert IDs and
+  `MoonEPExecutionRuntime` (also available as `VirtualExpertLoadBalancer`). It accepts the router's `[tokens, topk]` expert IDs and
   probabilities, starts planning and weight prefetch, then supplies remapped runtime expert
   IDs to HybridEP. HybridEP handles token dispatch and combine using a fixed receive capacity
   calculated to cover the balanced workload and padding.
@@ -334,7 +334,7 @@ Triton kernels, a virtual-expert dispatcher, and Transformer Engine's grouped ex
   kernel launch. Separate transport kernels push selected weights into peer virtual slots and
   read replica gradients back into their owners' native gradients through NCCL symmetric memory.
   These kernels move expert weights and gradients; token movement remains with HybridEP.
-- **Expert buffers:** [virtual_expert_load_balancer.py](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/virtual_expert_load_balancer.py) binds
+- **Expert buffers:** [moe_scheduler_runtime.py](moe_scheduler_runtime.py) binds
   native weights and temporary virtual slots into the FC1/FC2 runtime weight lists consumed by
   TE's grouped GEMMs. Compatible layers share persistent weight and gradient arenas, reusing
   replica storage across layers. Non-GTP native gradients accumulate directly into DDP buffers;
@@ -865,6 +865,8 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 ```
 
 </details>
+
+For MoEScheduler and cached mock routing, see [MoE load balancing](../../../../docs/moe_load_balance.md).
 
 ## Contributing
 

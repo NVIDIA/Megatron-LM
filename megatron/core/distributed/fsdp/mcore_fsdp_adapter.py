@@ -84,6 +84,53 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def _validate_moe_scheduler_fsdp(
+    config: TransformerConfig,
+    ddp_config: DistributedDataParallelConfig,
+    *,
+    fsdp_version: int,
+    expert_fsdp_size: int = 1,
+) -> None:
+    """Reject unsupported scheduler ownership before allocating FSDP buffers.
+
+    With sharded expert gradients, get_main_grad() exposes the communication
+    bucket. Otherwise it exposes the persistent main-gradient buffer. Replica
+    GEMMs must write directly into that owner's dtype, without native staging.
+    """
+    if not config.moe_enable_scheduler:
+        return
+    if fsdp_version != 1:
+        raise ValueError(
+            "MoEScheduler currently supports Megatron-FSDP v1 only; set "
+            "megatron_fsdp_version=1. FSDP v2 parameter/gradient ownership and "
+            "home-exchange optimizer bindings are not implemented."
+        )
+    if config.moe_scheduler_num_idle_experts == 0:
+        # Home-only EPLB uses the native expert computation and gradient policy.
+        return
+    main_dtype = ddp_config.megatron_fsdp_main_grads_dtype or config.params_dtype
+    sharded_grads = (
+        get_sharding_strategy(ddp_config, is_expert_param=True)
+        in ("optim_grads", "optim_grads_params")
+        and expert_fsdp_size > 1
+    )
+    owner_dtype = (
+        ddp_config.megatron_fsdp_grad_comm_dtype or main_dtype if sharded_grads else main_dtype
+    )
+    replica_dtype = torch.bfloat16 if config.grad_reduce_in_bf16 else torch.float32
+    if owner_dtype != replica_dtype:
+        raise ValueError(
+            f"MoEScheduler replica gradients require owner main_grad dtype {replica_dtype}, "
+            f"but Megatron-FSDP exposes {owner_dtype} (expert gradient sharding={sharded_grads}, "
+            f"megatron_fsdp_main_grads_dtype={ddp_config.megatron_fsdp_main_grads_dtype}, "
+            f"megatron_fsdp_grad_comm_dtype={ddp_config.megatron_fsdp_grad_comm_dtype}). "
+            "Set megatron_fsdp_main_grads_dtype and, for sharded expert gradients, "
+            "megatron_fsdp_grad_comm_dtype to match grad_reduce_in_bf16 "
+            "(False: float32; True: bfloat16). Native gradients are written directly "
+            "to main_grad; dtype conversion/staging is not supported."
+        )
+
+
 def _get_default_fsdp_unit_modules(overlap_moe_expert_parallel_comm: bool) -> List[torch.nn.Module]:
     fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
 
@@ -246,6 +293,16 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         )
 
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
+
+        if config.moe_enable_scheduler:
+            _validate_moe_scheduler_fsdp(
+                config,
+                ddp_config,
+                fsdp_version=1,
+                expert_fsdp_size=self.megatron_fsdp_dist_index.get_fsdp_group(
+                    is_expert_parallel=True
+                ).size(),
+            )
 
         if config.gradient_accumulation_fusion:
             assert is_te_min_version("2.10"), (
@@ -633,6 +690,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
+        _validate_moe_scheduler_fsdp(config, ddp_config, fsdp_version=2)
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
         FullyShardedDataParallelV2._validate_config(

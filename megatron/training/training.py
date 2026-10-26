@@ -114,6 +114,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.rerun_state_machine import (
+    EXIT_CODE_FAILED_ON_RESULT_VALIDATION,
     RerunDataIterator,
     RerunMode,
     destroy_rerun_state_machine,
@@ -129,7 +130,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa_logging import
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_logging import (
+    get_moe_metrics_tracker,
+    get_moe_overload_factor_tracker,
+)
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -4305,6 +4309,10 @@ def setup_model_and_optimizer(
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
+    from megatron.core.transformer.moe.home_expert_training import initialize_home_expert_optimizers
+
+    initialize_home_expert_optimizers(model, optimizer)
+
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
     )
@@ -4456,7 +4464,23 @@ def setup_model_and_optimizer(
             optimizer.reload_model_params()
 
     # Convert checkpoint format.
+    # Checkpoint loading can replace optimizer tensors; bind their final storage
+    # before either the first training step or conversion-only home export.
+    initialize_home_expert_optimizers(model, optimizer)
     if args.ckpt_convert_format is not None:
+        if getattr(args, "moe_scheduler_export_logical_checkpoint", False):
+            from megatron.core.transformer.moe.home_expert_training import (
+                canonicalize_home_experts_for_export,
+            )
+
+            canonicalize_home_experts_for_export(model, optimizer)
+            args.moe_enable_scheduler = False
+            args.moe_scheduler_home_update_interval = 0
+            args.moe_scheduler_num_idle_experts = 0
+            args.moe_scheduler_export_logical_checkpoint = False
+            # Conversion exits immediately after save_checkpoint; complete the
+            # exported checkpoint synchronously before reaching that exit.
+            args.async_save = False
         load_ckpt_format = args.ckpt_format
         args.ckpt_format = args.ckpt_convert_format
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
@@ -4914,6 +4938,12 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=config.barrier_with_L1_time)
+    from megatron.core.transformer.moe.home_expert_training import (
+        finish_home_expert_step,
+        prepare_home_expert_step,
+    )
+
+    home_schedulers = prepare_home_expert_step(model, optimizer)
     _opt_cm = (
         span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None
@@ -4932,10 +4962,6 @@ def train_step(
 
     timers('optimizer').stop()
 
-    # Checkpoint params with parameter names.
-    if save_params_in_this_iteration:
-        _save_state_dict(attr_name="data", label="params")
-
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
     if pg_collection is None:
@@ -4952,6 +4978,10 @@ def train_step(
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
+    finish_home_expert_step(home_schedulers, optimizer, update_successful)
+
+    if save_params_in_this_iteration:
+        _save_state_dict(attr_name="data", label="params")
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
@@ -5355,6 +5385,15 @@ def training_log(
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
+        if args.log_moe_overload_factor:
+            # All ranks must reduce and clear the tracker every step, including
+            # steps that do not print an iteration line to stdout.
+            moe_log_string += get_moe_overload_factor_tracker().report(
+                iteration=iteration,
+                writer=writer,
+                wandb_writer=wandb_writer,
+                per_layer_logging=args.moe_per_layer_logging,
+            )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
@@ -6835,7 +6874,7 @@ def train(
             callback_manager.callback_context.skipped_iter = bool(skipped_iter)
             callback_manager.trigger("on_train_step_end")
 
-        if should_checkpoint:
+        if should_checkpoint and args.save is not None:
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -6846,6 +6885,18 @@ def train(
                 train_data_iterator=train_data_iterator,
                 callback_manager=callback_manager,
             )
+        elif should_checkpoint:
+            # Result validation may request a diagnostic checkpoint even when
+            # normal checkpointing is disabled. Preserve the failed outcome
+            # instead of passing None to the checkpoint path builder or
+            # advertising a resumable checkpoint that was never written.
+            print_rank_0(
+                "Result validation requested a diagnostic checkpoint, but --save is unset. "
+                "Exiting on validation failure without a checkpoint; set --save to enable "
+                "cross-GPU rerun diagnostics."
+            )
+            should_exit = True
+            exit_code = EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         if should_exit:
             break
 

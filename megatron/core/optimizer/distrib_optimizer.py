@@ -67,6 +67,7 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    OptimizerStateBinding,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
     param_group_identifier_keys,
@@ -3087,6 +3088,36 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
 
+    def get_parameter_state_binding(self, parameter: torch.Tensor) -> OptimizerStateBinding | None:
+        """Resolve optimizer-owned shard offsets without exposing bucket maps."""
+        if self._optimizer_state_offloader is not None:
+            raise NotImplementedError("External state updates require resident optimizer state.")
+        if self.optimizer is None:
+            return None
+        if self.ddp_config.use_megatron_fsdp:
+            for group in self.optimizer.param_groups:
+                for main in group['params']:
+                    if getattr(main, 'orig_param', None) is parameter:
+                        for chunk in self.model_chunks:
+                            binding = chunk.param_and_grad_buffer.get_main_weight_shard_location(
+                                parameter
+                            )
+                            if binding is not None:
+                                start, dp_group = binding
+                                return OptimizerStateBinding(self.optimizer, main, start, dp_group)
+                        raise ValueError("Cannot locate FSDP authoritative weight buffer.")
+            return None
+        if parameter in self.model_param_gbuf_map or any(
+            parameter in buffer.param_index_map for buffer in self.buffers
+        ):
+            index = self.model_param_group_index_map.get(parameter)
+            if index is None:
+                return OptimizerStateBinding(self.optimizer, None, 0, self.data_parallel_group)
+            main = self.optimizer.param_groups[index[0]]['params'][index[1]]
+            start = self._get_model_param_range_map(parameter)['param'].start
+            return OptimizerStateBinding(self.optimizer, main, start, self.data_parallel_group)
+        return super().get_parameter_state_binding(parameter)
+
     def _copy_main_params_to_model_params(self):
         """
         Copy main params to model params.
@@ -3553,13 +3584,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         update_successful = super().step_with_ready_grads()
 
-        should_sync_params = not self.ddp_config.overlap_param_gather and not getattr(
-            self, '_defer_param_sync', False
+        should_sync_params = (
+            not self.ddp_config.overlap_param_gather
+            and not getattr(self, '_defer_param_sync', False)
+            and not self.param_sync_deferred_for_state_update
         )
         timers = self.config.timers
         if timers is not None and (self.ddp_config.use_megatron_fsdp or should_sync_params):
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
-        if self.ddp_config.use_megatron_fsdp:
+        if self.ddp_config.use_megatron_fsdp and not self.param_sync_deferred_for_state_update:
             # Optionally all-gather Megatron-FSDP sharded main weights
             # early in preparation for the subsequent forward pass.
             for model_chunk in self.model_chunks:

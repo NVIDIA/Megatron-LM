@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model and data parallel groups."""
 
@@ -2646,6 +2646,15 @@ def destroy_model_parallel():
         VirtualExpertLoadBalancer.finalize()
     except Exception:
         logger.warning("Failed to finalize MoonEP resources during teardown", exc_info=True)
+
+    try:
+        from megatron.core.transformer.moe.replica_expert_runtime import (
+            finalize_replica_expert_runtimes,
+        )
+
+        finalize_replica_expert_runtimes()
+    except Exception:  # finalization must never block process-group teardown
+        pass
 
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
