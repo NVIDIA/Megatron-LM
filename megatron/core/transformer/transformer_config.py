@@ -1456,9 +1456,10 @@ class TransformerConfig(ModelParallelConfig):
 
     inference_moe_triton_router: bool = False
     """Route sigmoid MoE inference with Triton top-k kernels instead of the compiled
-    PyTorch router. Applies to InferenceTopKRouter with sigmoid scores, an expert bias,
-    fp32 logits and gradients disabled; group-limited routing, router replay,
-    moe_router_fusion and batch-invariant mode keep the compiled path. Top-k up to 32
+    PyTorch router. Applies to InferenceTopKRouter in inference mode, with or without
+    gradients enabled, for sigmoid scores, an expert bias and fp32 logits; group-limited
+    routing, router replay, moe_router_fusion and batch-invariant mode keep the compiled
+    path. The kernel's outputs carry no autograd graph. Top-k up to 32
     runs as one fused kernel; probabilities match the compiled path bitwise for top-k
     below eight and to within the last fp32 bit otherwise. Off by default."""
 

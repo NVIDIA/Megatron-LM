@@ -4,8 +4,8 @@
 
 Expert indices must match the compiled inference router bit for bit. Probabilities
 match bitwise for top-k below eight; for larger top-k the compiled path sums the k
-scores in another order, so they may differ in the last bit. Batch-invariant and
-autograd paths retain their existing behavior.
+scores in another order, so they may differ in the last bit. Batch-invariant mode
+retains its existing behavior.
 """
 
 import pytest
@@ -268,28 +268,23 @@ class TestInferenceRouterUsesKernel:
         _assert_matches_compiled(probs, indices, ref_probs, ref_indices)
 
     @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
-    def test_grad_enabled_preserves_compiled_routing_and_autograd(
-        self, num_experts, topk, scaling_factor
-    ):
-        """InferenceMode alone does not disable gradients or sorted top-k selection."""
+    def test_grad_enabled_inference_uses_kernel(self, num_experts, topk, scaling_factor):
+        """Inference with gradients enabled (e.g. RL evaluation) routes like no-grad inference."""
         router = self._router(
             num_moe_experts=num_experts,
             moe_router_topk=topk,
             moe_router_topk_scaling_factor=scaling_factor,
         )
         hidden = torch.randn(40, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        with InferenceMode.active(), torch.enable_grad():
-            probs, indices = router(hidden)
-            ref_probs, ref_indices = _compiled_reference(
-                router.gating(hidden).squeeze(1), router.expert_bias, topk, scaling_factor
-            )
-            assert probs.requires_grad
-            assert torch.equal(indices, ref_indices)
-            assert torch.equal(probs, ref_probs)
-            weights = torch.arange(topk, device="cuda", dtype=torch.float32)
-            grad = torch.autograd.grad((probs * weights).sum(), hidden)[0]
-            ref_grad = torch.autograd.grad((ref_probs * weights).sum(), hidden)[0]
-        assert torch.equal(grad, ref_grad)
+        with InferenceMode.active():
+            with torch.enable_grad():
+                assert router._uses_sigmoid_topk_kernel(router.gating(hidden).squeeze(1), None)
+                probs, indices = router(hidden)
+            with torch.no_grad():
+                ref_probs, ref_indices = router(hidden)
+        assert not probs.requires_grad
+        assert torch.equal(indices, ref_indices)
+        assert torch.equal(probs.view(torch.int32), ref_probs.view(torch.int32))
 
     @pytest.mark.parametrize("num_experts,topk,scaling_factor", MODEL_ROUTING_CONFIGS)
     @pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 17, 65, 1024, 8192])

@@ -1394,20 +1394,19 @@ class InferenceTopKRouter(TopKRouter):
         """Whether this inference call uses the fused sigmoid top-k kernel.
 
         It is opt-in through config.inference_moe_triton_router and covers sigmoid
-        scores with an expert bias, fp32 logits and supported shapes, with gradients
-        disabled, without group-limited routing, router replay, precomputed indices
-        or TE's fused router; batch-invariant mode keeps its uncompiled reference
-        path. Expert selection matches the compiled path; for top-k of eight or more
-        a probability can differ from it in the last bit.
+        scores with an expert bias, fp32 logits and supported shapes, without
+        group-limited routing, router replay, precomputed indices or TE's fused
+        router; batch-invariant mode keeps its uncompiled reference path. forward()
+        only reaches this path while InferenceMode is active, whether or not
+        gradients are enabled, and the kernel's outputs carry no autograd graph.
+        Expert selection matches the compiled path; for top-k of eight or more a
+        probability can differ from it in the last bit.
         """
         return (
             self.config.inference_moe_triton_router
             and HAVE_SIGMOID_TOPK_KERNEL
             and logits.is_cuda
             and logits.dtype == torch.float32
-            # InferenceMode is independent of autograd. With gradients enabled,
-            # the reference uses sorted top-k and retains probability gradients.
-            and not torch.is_grad_enabled()
             and self.score_function == "sigmoid"
             and self.expert_bias is not None
             and is_sigmoid_topk_supported(logits.shape[-1], self.topk)
