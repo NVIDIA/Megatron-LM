@@ -39,6 +39,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -132,39 +133,6 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
     """
     for submodule in module.modules():
         _materialize_meta_module(submodule, device)
-
-
-def _collect_fsdp_units(
-    module: nn.Module,
-    fsdp_unit_modules: tuple[Type[nn.Module], ...],
-    include_experts: bool,
-    inside_shortcut: bool = False,
-    units_to_shard: list[nn.Module] | None = None,
-) -> list[nn.Module]:
-    """Collect FSDP units in pre-order, excluding helper-invoked shortcut containers.
-
-    The initial call includes the root. Recursive calls share the output list and
-    carry the shortcut context without retaining a separate descendant collection.
-    """
-    if units_to_shard is None:
-        units_to_shard = [module]
-    # Shortcut blocks call these containers through helpers.
-    if (
-        isinstance(module, fsdp_unit_modules)
-        and not (inside_shortcut and isinstance(module, (TransformerLayer, MambaLayer, MoELayer)))
-        and module not in units_to_shard
-    ):
-        units_to_shard.append(module)
-    if include_experts and isinstance(module, MoELayer):
-        if module.experts not in units_to_shard:
-            units_to_shard.append(module.experts)
-
-    inside_shortcut = inside_shortcut or isinstance(module, ShortcutMoEBlock)
-    for child in module.children():
-        _collect_fsdp_units(
-            child, fsdp_unit_modules, include_experts, inside_shortcut, units_to_shard
-        )
-    return units_to_shard
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -759,9 +727,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = nullcontext(active_context)
         with construction_context:
             # Pre-order: collect only the modules to shard.
-            units_to_shard = _collect_fsdp_units(
-                module, tuple(fsdp_unit_modules), include_experts=expert_dp_mesh is not None
+            collector = FsdpUnitCollector(
+                tuple(fsdp_unit_modules), include_experts=expert_dp_mesh is not None
             )
+            units_to_shard = collector.collect(module)
 
             # Reverse pre-order: children claim their parameters before their parents.
             for submodule in reversed(units_to_shard):
