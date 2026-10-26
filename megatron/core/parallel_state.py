@@ -166,6 +166,10 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
+# The ProcessGroupCollection passed to register_process_groups(). The group and rank-list
+# variables above hold its groups, and the accessors of this module return them.
+_REGISTERED_PROCESS_GROUPS = None
+
 
 # List of all process groups
 # Used for updating the timeout for all process groups
@@ -633,7 +637,8 @@ def _inject_gtp_remat_axis(order_str: str, after: str = "cp") -> str:
 class StandardGridExtras:
     """Groups and global rank lists of the standard grid that ProcessGroupCollection has no field
     for. build_process_group_collection() returns them next to the collection, and the
-    parallel_state accessors return them after initialize_model_parallel().
+    parallel_state accessors return them after register_process_groups(), which
+    initialize_model_parallel() calls.
 
     A group or rank list is None when this rank is not a member, or when the configuration does
     not build it.
@@ -645,14 +650,15 @@ class StandardGridExtras:
     intra_dp_cp_gtp_remat: Optional[torch.distributed.ProcessGroup]
     # Partial expert data parallel group spanning EGTP_remat (intra_expt_dp when EGTP_remat is 1).
     intra_expt_dp_gtp_remat: Optional[torch.distributed.ProcessGroup]
-    # Gloo groups with the ranks of dp, dp_cp, intra_dp_cp, expt_dp and intra_expt_dp.
+    # Gloo groups with the ranks of dp, dp_cp, intra_dp_cp, expt_dp and intra_expt_dp. The
+    # intra ones are also collection fields, and register_process_groups() takes the collection's.
     dp_gloo: Optional[torch.distributed.ProcessGroup]
     dp_cp_gloo: Optional[torch.distributed.ProcessGroup]
     intra_dp_cp_gloo: Optional[torch.distributed.ProcessGroup]
     expt_dp_gloo: Optional[torch.distributed.ProcessGroup]
     intra_expt_dp_gloo: Optional[torch.distributed.ProcessGroup]
     # Global ranks of every dense weight-replica (dp_cp) group of the grid, on every rank.
-    weight_replica_rank_sets: List[List[int]]
+    weight_replica_rank_sets: Optional[List[List[int]]]
     # Global ranks of this rank's groups, in the order they were passed to create_group().
     tp_global_ranks: Optional[List[int]]
     pp_global_ranks: Optional[List[int]]
@@ -667,10 +673,85 @@ class StandardGridExtras:
     expt_gtp_remat_global_ranks: Optional[List[int]]
 
 
-def _register_process_groups(
-    pg_collection: "ProcessGroupCollection", extras: StandardGridExtras
+def _grid_extras_from_collection(pg_collection: "ProcessGroupCollection") -> StandardGridExtras:
+    """The StandardGridExtras that follow from the groups of a collection alone.
+
+    The global rank lists are the ranks of the collection's groups. The partial data parallel
+    groups that span GTP_remat are the collection's partial data parallel groups when the
+    GTP_remat axis is off or has size 1, and None otherwise. The intra partial Gloo groups are
+    the collection's. The tensor x data parallel group, the other Gloo groups and the
+    weight-replica rank lists of the other ranks are None: a collection has no field for them.
+    """
+
+    def global_ranks(group):
+        return None if group is None else torch.distributed.get_process_group_ranks(group)
+
+    def spans_ranks(group):
+        return group is not None and group.size() > 1
+
+    return StandardGridExtras(
+        tp_dp=None,
+        intra_dp_cp_gtp_remat=(
+            None if spans_ranks(pg_collection.gtp_remat) else pg_collection.intra_dp_cp
+        ),
+        intra_expt_dp_gtp_remat=(
+            None if spans_ranks(pg_collection.expt_gtp_remat) else pg_collection.intra_expt_dp
+        ),
+        dp_gloo=None,
+        dp_cp_gloo=None,
+        intra_dp_cp_gloo=pg_collection.intra_dp_cp_gloo,
+        expt_dp_gloo=None,
+        intra_expt_dp_gloo=pg_collection.intra_expt_dp_gloo,
+        weight_replica_rank_sets=None,
+        tp_global_ranks=global_ranks(pg_collection.tp),
+        pp_global_ranks=global_ranks(pg_collection.pp),
+        mp_global_ranks=global_ranks(pg_collection.mp),
+        dp_global_ranks=global_ranks(pg_collection.dp),
+        dp_cp_global_ranks=global_ranks(pg_collection.dp_cp),
+        cp_global_ranks=global_ranks(pg_collection.cp),
+        embd_global_ranks=global_ranks(pg_collection.embd),
+        pos_embd_global_ranks=global_ranks(pg_collection.pos_embd),
+        ep_global_ranks=global_ranks(pg_collection.ep),
+        gtp_remat_global_ranks=global_ranks(pg_collection.gtp_remat),
+        expt_gtp_remat_global_ranks=global_ranks(pg_collection.expt_gtp_remat),
+    )
+
+
+def register_process_groups(
+    pg_collection: "ProcessGroupCollection", *, extras: Optional[StandardGridExtras] = None
 ) -> None:
-    """Set the parallel_state globals to the groups built by build_process_group_collection()."""
+    """Register the process groups that the parallel_state accessors return.
+
+    initialize_model_parallel() registers the groups it builds with this function. A framework
+    that builds its own grid, for example with HyperCommGrid, registers its collection here so
+    that code which still reads parallel_state, including
+    ProcessGroupCollection.use_mpu_process_groups(), uses that grid. destroy_model_parallel()
+    clears the registration; until then get_registered_process_groups() returns pg_collection.
+
+    The groups are registered when this function is called: setting a field of pg_collection
+    afterwards does not change what the accessors return. A field that is None or not set
+    registers no group, and the accessor of that group then reports it as not initialized.
+    dp_cp_ag and expt_dp_ag have no accessor.
+
+    Args:
+        pg_collection: The process groups of this rank.
+        extras: The groups and global rank lists of the grid that the collection has no field
+            for, as build_process_group_collection() returns them. When omitted, they are
+            derived from the collection's groups: the global rank lists are the ranks of its
+            groups, and the groups that a collection cannot describe, such as the dp, dp_cp and
+            expt_dp Gloo groups and the tensor x data parallel group, are not registered. The
+            intra partial Gloo groups are collection fields, so they come from pg_collection
+            either way.
+
+    Raises:
+        TypeError: pg_collection is not a ProcessGroupCollection, or extras is not a
+            StandardGridExtras.
+        RuntimeError: Process groups are already registered. Call destroy_model_parallel()
+            first.
+    """
+    # Imported here because process_groups_config imports this module.
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
     global _TENSOR_MODEL_PARALLEL_GROUP, _PIPELINE_MODEL_PARALLEL_GROUP, _MODEL_PARALLEL_GROUP
     global _EMBEDDING_GROUP, _POSITION_EMBEDDING_GROUP
     global _CONTEXT_PARALLEL_GROUP, _TENSOR_AND_CONTEXT_PARALLEL_GROUP
@@ -697,6 +778,14 @@ def _register_process_groups(
     global _EXPERT_MODEL_PARALLEL_RANKS
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS, _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS
     global _WEIGHT_REPLICA_RANK_SETS
+    global _REGISTERED_PROCESS_GROUPS
+
+    if not isinstance(pg_collection, ProcessGroupCollection):
+        raise TypeError(
+            f"pg_collection must be a ProcessGroupCollection, got {type(pg_collection).__name__}"
+        )
+    if extras is not None and not isinstance(extras, StandardGridExtras):
+        raise TypeError(f"extras must be a StandardGridExtras, got {type(extras).__name__}")
 
     for group, description in (
         (_DATA_PARALLEL_GROUP, "data parallel group"),
@@ -724,7 +813,17 @@ def _register_process_groups(
         (_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP, "Inter partial expert data group"),
         (_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP, "Intra distributed optimizer instance group"),
     ):
-        assert group is None, f"{description} is already initialized"
+        if group is not None:
+            raise RuntimeError(
+                f"{description} is already initialized. Call destroy_model_parallel() first."
+            )
+    if _REGISTERED_PROCESS_GROUPS is not None:
+        raise RuntimeError(
+            "Process groups are already registered. Call destroy_model_parallel() first."
+        )
+
+    if extras is None:
+        extras = _grid_extras_from_collection(pg_collection)
 
     _TENSOR_MODEL_PARALLEL_GROUP = pg_collection.tp
     _PIPELINE_MODEL_PARALLEL_GROUP = pg_collection.pp
@@ -747,10 +846,15 @@ def _register_process_groups(
     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = pg_collection.dp_cp_gtp_remat
     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = pg_collection.intra_dp_cp
     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = extras.intra_dp_cp_gtp_remat
-    _DYNAMIC_DP_CP_GROUPS.update(pg_collection.dynamic_cp)
+    if pg_collection.dynamic_cp is not None:
+        _DYNAMIC_DP_CP_GROUPS.update(pg_collection.dynamic_cp)
     # With TP1 the TP x runtime-CP accessors return the runtime CP groups, so this map only
     # holds the groups built for TP > 1.
-    if pg_collection.tp is not None and pg_collection.tp.size() > 1:
+    if (
+        pg_collection.tp is not None
+        and pg_collection.tp.size() > 1
+        and pg_collection.dynamic_tp_cp is not None
+    ):
         _DYNAMIC_TENSOR_DATA_CONTEXT_PARALLEL_GROUPS.update(pg_collection.dynamic_tp_cp)
     _GTP_WEIGHT_REMAT_GROUP = pg_collection.gtp_remat
     _EXPERT_GTP_WEIGHT_REMAT_GROUP = pg_collection.expt_gtp_remat
@@ -763,9 +867,9 @@ def _register_process_groups(
 
     _DATA_PARALLEL_GROUP_GLOO = extras.dp_gloo
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = extras.dp_cp_gloo
-    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = extras.intra_dp_cp_gloo
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = pg_collection.intra_dp_cp_gloo
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = extras.expt_dp_gloo
-    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = extras.intra_expt_dp_gloo
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = pg_collection.intra_expt_dp_gloo
 
     _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = extras.tp_global_ranks
     _PIPELINE_GLOBAL_RANKS = extras.pp_global_ranks
@@ -779,6 +883,17 @@ def _register_process_groups(
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = extras.gtp_remat_global_ranks
     _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = extras.expt_gtp_remat_global_ranks
     _WEIGHT_REPLICA_RANK_SETS = extras.weight_replica_rank_sets
+
+    _REGISTERED_PROCESS_GROUPS = pg_collection
+
+
+def get_registered_process_groups() -> Optional["ProcessGroupCollection"]:
+    """Return the collection passed to register_process_groups(), or None if there is none.
+
+    initialize_model_parallel() registers the collection it returns. destroy_model_parallel()
+    clears the registration.
+    """
+    return _REGISTERED_PROCESS_GROUPS
 
 
 # pylint: disable=C0301
@@ -1897,8 +2012,9 @@ def initialize_model_parallel(
 ) -> "ProcessGroupCollection":
     """Initialize model data parallel groups.
 
-    Creates the groups with build_process_group_collection() and registers them in
-    parallel_state, whose accessors such as get_tensor_model_parallel_group() then return them.
+    Creates the groups with build_process_group_collection() and registers them with
+    register_process_groups(), so that the parallel_state accessors such as
+    get_tensor_model_parallel_group() return them.
 
     Args:
         virtual_pipeline_model_parallel_size (int, optional):
@@ -1922,8 +2038,9 @@ def initialize_model_parallel(
         The other arguments are documented in build_process_group_collection().
 
     Returns:
-        ProcessGroupCollection: the registered groups of this rank, which are the same objects
-        that ProcessGroupCollection.use_mpu_process_groups() returns.
+        ProcessGroupCollection: the registered groups of this rank. It is the collection that
+        get_registered_process_groups() returns, and ProcessGroupCollection.use_mpu_process_groups()
+        returns its groups.
     """
     if virtual_pipeline_model_parallel_size is not None:
         if not pipeline_model_parallel_size > 1:
@@ -1971,7 +2088,7 @@ def initialize_model_parallel(
         min_dynamic_context_parallel_size=min_dynamic_context_parallel_size,
         gtp_remat_num_sequence_shards=gtp_remat_num_sequence_shards,
     )
-    _register_process_groups(pg_collection, extras)
+    register_process_groups(pg_collection, extras=extras)
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -2993,8 +3110,14 @@ def destroy_model_parallel():
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 
+    global _MODEL_PARALLEL_GLOBAL_RANKS
+    _MODEL_PARALLEL_GLOBAL_RANKS = None
+
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
+
+    global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
+    _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
     global _GTP_WEIGHT_REMAT_GROUP
     _GTP_WEIGHT_REMAT_GROUP = None
@@ -3007,14 +3130,26 @@ def destroy_model_parallel():
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
 
+    global _PIPELINE_GLOBAL_RANKS
+    _PIPELINE_GLOBAL_RANKS = None
+
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+
+    global _DATA_PARALLEL_GLOBAL_RANKS
+    _DATA_PARALLEL_GLOBAL_RANKS = None
 
     global _DATA_PARALLEL_GROUP_WITH_GTP_REMAT
     _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
+    _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
+
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None
@@ -3028,6 +3163,9 @@ def destroy_model_parallel():
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 
+    global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
+
     global _DYNAMIC_DP_CP_GROUPS
     _DYNAMIC_DP_CP_GROUPS = {}
 
@@ -3036,6 +3174,9 @@ def destroy_model_parallel():
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
+
+    global _EMBEDDING_GLOBAL_RANKS
+    _EMBEDDING_GLOBAL_RANKS = None
 
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
@@ -3093,6 +3234,17 @@ def destroy_model_parallel():
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
+    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    if (
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+        and torch.distributed.distributed_c10d._world.pg_map.get(
+            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO, None
+        )
+        is not None
+    ):
+        torch.distributed.destroy_process_group(_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
+    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+
     # Destroy parallel state related to expert parallelism.
     global _EXPERT_GTP_WEIGHT_REMAT_GROUP
     _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
@@ -3102,6 +3254,9 @@ def destroy_model_parallel():
 
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None
+
+    global _EXPERT_MODEL_PARALLEL_RANKS
+    _EXPERT_MODEL_PARALLEL_RANKS = None
 
     global _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
@@ -3167,6 +3322,9 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _REGISTERED_PROCESS_GROUPS
+    _REGISTERED_PROCESS_GROUPS = None
 
     global _global_process_group_list
     _global_process_group_list = None

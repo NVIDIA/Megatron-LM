@@ -265,7 +265,7 @@ def test_initialize_twice_raises_already_initialized():
     _require_divisible(2)
     _initialize(tensor_model_parallel_size=2)
     try:
-        with pytest.raises(AssertionError, match="data parallel group is already initialized"):
+        with pytest.raises(RuntimeError, match="data parallel group is already initialized"):
             ps.initialize_model_parallel(tensor_model_parallel_size=2)
     finally:
         Utils.destroy_model_parallel()
