@@ -55,6 +55,9 @@ except ImportError:
 
     HAVE_FLA = False
 
+# fla.ops.cp is only needed for chunkwise context parallelism and is missing from
+# some FLA builds. Import it separately so its absence does not disable GDN
+# entirely; the CP paths check for None and raise with an actionable message.
 try:
     from fla.ops.cp import build_cp_context
 except ImportError:
@@ -247,6 +250,11 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
+        # Chunkwise CP keeps every TP-local head on each CP rank and shards the sequence
+        # contiguously; headwise CP all-to-alls heads across the CP group instead. Only
+        # variants that implement chunkwise CP may run with it (see _setup_variant_attrs).
+        self.chunkwise_context_parallel = config.linear_cp_mode == "chunkwise" and self.cp_size > 1
+        self.cp_size_headwise = 1 if self.chunkwise_context_parallel else self.cp_size
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
@@ -380,6 +388,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
             self.recompute_gdn = "gdn" in self.config.recompute_modules
+
+        # FLA chunkwise CP contexts for unpacked (SBHD) inputs, keyed by (global seq_len,
+        # batch). Packed-sequence cu_seqlens vary per batch, so those contexts are not cached.
+        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.out_proj = _build_with_kda_fp8_disabled(
             self.config,
@@ -583,7 +595,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
-        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
+        cp_size = self.cp_size_headwise if cp_size_headwise is None else cp_size_headwise
         # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
@@ -842,7 +854,8 @@ def get_parameter_local_cp(
     Args:
         param (torch.Tensor): The entire parameter to get the local parameter for.
         dim (int): The dimension to split the parameter along. Usually the dimension of head.
-        cp_group (torch.distributed.ProcessGroup): The context parallel group.
+        cp_group (torch.distributed.ProcessGroup | None): The context parallel group, or None
+            when the parameter is not split over CP (e.g. chunkwise CP).
         split_sections (Optional[list[int]]): If not None,
             first split the parameter along the dimension dim into sections,
             then get the local hidden parallel weights separately,
@@ -893,7 +906,8 @@ def tensor_a2a_cp2hp(
             Currently only support (seq_len, batch, head_dim) shaped tensor.
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
-        cp_group (torch.distributed.ProcessGroup): The context parallel group.
+        cp_group (torch.distributed.ProcessGroup | None): The context parallel group, or None
+            for no CP all-to-all.
         split_sections (Optional[list[int]]): If not None, split the tensor along the dimension
             head_dim into sections first, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
@@ -958,7 +972,8 @@ def tensor_a2a_hp2cp(
             Currently only support (seq_len, batch, head_dim) shaped tensor.
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
-        cp_group (torch.distributed.ProcessGroup): The context parallel group.
+        cp_group (torch.distributed.ProcessGroup | None): The context parallel group, or None
+            for no CP all-to-all.
         split_sections (Optional[list[int]]): If not None, first split the tensor along the
             dimension head_dim into sections, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
@@ -1024,8 +1039,8 @@ def a2a_cp_to_hp(
         qkvzba: in_proj output in sbhd format, sharded along the sequence dim over CP.
         in_proj_split_sections: per-section sizes of the in_proj output, local to this
             TP rank, used to build the pre-a2a head permutation.
-        cp_size: context-parallel world size.
-        cp_group: context-parallel process group.
+        cp_size: headwise context-parallel size (1 under chunkwise CP).
+        cp_group: headwise context-parallel group (None under chunkwise CP).
         cu_seqlens_q: cumulative sequence lengths, required for the ``thd`` path.
         seq_len: global (unsharded) sequence length.
         packed_seq_params: packed-sequence params; the ``thd`` path is taken when its
@@ -1070,8 +1085,8 @@ def a2a_hp_to_cp(
 
     Args:
         norm_out: gated-norm output in sbhd format, sharded along the head dim over CP.
-        cp_size: context-parallel world size.
-        cp_group: context-parallel process group.
+        cp_size: headwise context-parallel size (1 under chunkwise CP).
+        cp_group: headwise context-parallel group (None under chunkwise CP).
         packed_seq_params: packed-sequence params; the ``thd`` path is taken when its
             ``qkv_format`` is ``'thd'``.
         thd_cp_a2a_inv: sequence-dim inverse permutation returned by
