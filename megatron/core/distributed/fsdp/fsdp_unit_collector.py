@@ -36,7 +36,16 @@ class FsdpUnitCollector:
         return self._units_to_shard
 
     def _visit(self, module: nn.Module, inside_shortcut: bool) -> None:
-        # Shortcut blocks call these containers through helpers, bypassing their hooks.
+        # ShortcutMoEBlock interleaves stages during training by calling
+        # compute_layer.forward_pre_attn_and_core_attn()/forward_post_core_attn(),
+        # moe_layer._pre_mlp_layernorm_and_residual(), and moe_layer.mlp.route()/dispatch().
+        # These helper calls bypass the __call__ hooks of compute_layer,
+        # moe_layer, and moe_layer.mlp. Sharding these modules separately would leave
+        # their weights ungathered; the enclosing FSDP unit cannot gather parameters
+        # owned by a nested unit. Leave these parameters with the enclosing FSDP unit.
+        # Skipping these modules does not skip visiting their children. In particular,
+        # moe_layer.mlp.experts runs through experts(...), which invokes its hooks,
+        # so we collect it for separate wrapping on the expert-DP mesh.
         if (
             isinstance(module, self._fsdp_unit_modules)
             and not (
