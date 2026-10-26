@@ -106,8 +106,12 @@ training-loop code unless a change explicitly opts in.
 
 ## The CI check
 
-The "Process group usage check" CI job runs `tools/check_process_group_usage.py`. It fails a PR
-that adds a read of the global grid anywhere in `megatron/core`.
+The "Process group usage check" CI job runs `tools/check_process_group_usage.py`, which finds every
+read of the global grid that a PR adds anywhere in `megatron/core`. The job is report-only: it
+lists new reads in its log but does not fail, while the project decides whether new code may still
+fall back to `parallel_state` (see [#6307](https://github.com/NVIDIA/Megatron-LM/issues/6307)).
+Reviewers act on the report. Run locally, the checker exits with an error when it finds a new read
+or a stale allowlist entry.
 
 Existing reads are listed in `tools/process_group_usage_allowlist.json`. An entry records the
 file, the enclosing function or class, and the accessor, but not the line number, so code can move
@@ -135,7 +139,7 @@ It does not count:
 
 The check is syntactic. Reviewers still look for reads it cannot see.
 
-### When the check fails
+### When the check reports a new read
 
 The job lists each new read with its location, the enclosing scope, and the accessor, for
 example `megatron/core/foo.py:12  my_func:accessor:parallel_state.get_tensor_model_parallel_group`.
@@ -149,7 +153,7 @@ example `megatron/core/foo.py:12  my_func:accessor:parallel_state.get_tensor_mod
 
 ### When you remove reads
 
-The check also fails when an allowlisted read no longer exists. Refresh the allowlist and commit
+The check also reports allowlisted reads that no longer exist. Refresh the allowlist and commit
 it with your change:
 
 ```bash
@@ -177,7 +181,7 @@ module itself is not planned.
 The steps are:
 
 1. **Migrate the readers.** Components in `megatron/core` take their groups from the caller. The
-   CI check keeps new reads out while this happens.
+   CI check reports new reads while this happens.
 2. **Add a builder.** A function built on `HyperCommGrid` returns the `ProcessGroupCollection` for
    the standard grid without setting any globals.
 3. **Make `initialize_model_parallel` a thin wrapper.** It calls the builder and registers the
