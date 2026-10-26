@@ -124,8 +124,9 @@ class DeepSeekV41Model(HybridModel):
         """Run text training with packed CP data and explicit cross-stage state.
 
         ``capture_layers`` is an explicit warmup/capture request for zero-based physical
-        layers. Normal training reuses those profiles. Variable-split Engram lookups and
-        full recomputation stay outside capture. Reserve one slot per outstanding microbatch.
+        layers. Normal training reuses those profiles. Engram runs eagerly before its
+        captured consumer. Reserve one slot per outstanding microbatch; full recomputation
+        uses a separate execution profile.
         """
         adapter = self.decoder.forward_adapter
         incoming, self._incoming_payload = self._incoming_payload, None
@@ -138,11 +139,14 @@ class DeepSeekV41Model(HybridModel):
             values = {}
             codec = V41StateCodec(self.config, shape, self.pg_collection.cp)
             if codec.last_token_layer >= 0:
-                values['tokens'] = input_ids
+                # Loader buffers may be reused while a pipeline backward is outstanding.
+                values['tokens'] = input_ids.clone()
             if packed_seq_params is not None:
                 cu = packed_seq_params.cu_seqlens_q
                 padded = packed_seq_params.cu_seqlens_q_padded
-                values.update(cu=cu.int(), cu_padded=(cu if padded is None else padded).int())
+                values.update(
+                    cu=cu.int().clone(), cu_padded=(cu if padded is None else padded).int().clone()
+                )
         else:
             if incoming.boundary_id != f'v41:{adapter.start}':
                 raise ValueError('Received V4.1 payload belongs to another pipeline boundary')

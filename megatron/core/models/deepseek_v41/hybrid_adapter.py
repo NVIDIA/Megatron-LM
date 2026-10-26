@@ -2,6 +2,7 @@
 
 """V4.1 execution on HybridStack, with shared state explicit at every replay boundary."""
 
+from copy import copy
 from dataclasses import dataclass, field, replace
 
 import torch
@@ -39,8 +40,15 @@ class V41ForwardContext(HybridStackForwardContext):
 class _LayerRegion(nn.Module):
     """Rebuild mutable state from tensor arguments on every forward and replay."""
 
-    def __init__(self, layer, codec, kwargs, loss):
+    def __init__(self, layer, codec, kwargs, loss, *, include_engram=True):
         super().__init__()
+        if not include_engram and getattr(layer, 'engram', None) is not None:
+            # Share the captured parameters, excluding the eager memory's parameter hooks
+            # and potentially large main_grad buffers from graph warmup and replay.
+            layer = copy(layer)
+            layer._modules = {
+                name: child for name, child in layer._modules.items() if name != 'engram'
+            }
         self.layer, self.codec, self.kwargs, self.loss = layer, codec, kwargs, loss
         self.training = layer.training
 
@@ -104,7 +112,7 @@ class DeepSeekV41Adapter:
         )
         return context
 
-    def _prepare_region(self, layer, hidden, context, kwargs, loss):
+    def _prepare_region(self, layer, hidden, context, kwargs, loss, *, include_engram=True):
         kwargs = dict(kwargs)
         kwargs.pop('packed_seq_params', None)
         kwargs.pop('mhc_recompute_manager', None)
@@ -113,7 +121,7 @@ class DeepSeekV41Adapter:
             context.cross_layer_state, context.mhc_state, context.values, boundary
         )
         inputs = context.codec.schema(boundary).fields
-        if getattr(layer, 'engram', None) is not None:
+        if include_engram and getattr(layer, 'engram', None) is not None:
             values['hashes'] = context.hashes
             inputs = (
                 *inputs,
@@ -121,7 +129,7 @@ class DeepSeekV41Adapter:
                     'hashes', tuple(context.hashes.shape), torch.int64, 'contiguous', False
                 ),
             )
-        region = _LayerRegion(layer, context.codec, kwargs, loss)
+        region = _LayerRegion(layer, context.codec, kwargs, loss, include_engram=include_engram)
         return (
             StatefulModule(region, inputs, context.codec.schema(boundary + 1, loss=loss).fields),
             values,
@@ -150,17 +158,22 @@ class DeepSeekV41Adapter:
         capture = context.capture is not None and layer_id in context.capture['layers']
         if capture and layer_id % 2:
             raise ValueError('Variable-token MoE execution remains outside layer capture')
+        if recompute and (capture or graph_key in self.graphs):
+            raise ValueError('Full recompute and layer capture are separate execution profiles')
+        if not recompute and (capture or graph_key in self.graphs):
+            engram = getattr(layer, 'engram', None)
+            if engram is not None:
+                layout = csa.thd_layout
+                hidden_states = engram(
+                    hidden_states,
+                    context.hashes,
+                    None if layout is None else layout.valid_tokens.unsqueeze(0),
+                )
         if recompute or graph_key in self.graphs or capture:
-            region, values = self._prepare_region(layer, hidden_states, context, kwargs, loss)
+            region, values = self._prepare_region(
+                layer, hidden_states, context, kwargs, loss, include_engram=recompute
+            )
             if capture:
-                if recompute:
-                    raise ValueError(
-                        'Full recompute and layer capture are separate execution profiles'
-                    )
-                if getattr(layer, 'engram', None) is not None:
-                    raise ValueError(
-                        'Variable-split Engram EP lookup remains outside layer capture'
-                    )
                 capture_kwargs = {}
                 if c.fp8:
                     if context.capture['backend'] != 'transformer_engine':

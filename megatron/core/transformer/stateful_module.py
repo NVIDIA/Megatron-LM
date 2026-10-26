@@ -110,6 +110,18 @@ def _checkpoint_contexts():
     return forward(), replay()
 
 
+class _GraphInputGrad(torch.autograd.Function):
+    """Give shared producers gradients independent of a graph's reusable buffers."""
+
+    @staticmethod
+    def forward(ctx, tensor):
+        return tensor.view_as(tensor)
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient.clone()
+
+
 class _GraphOutputs(torch.autograd.Function):
     """Protect captured buffers and reject unsupported dynamic gradient activity."""
 
@@ -303,7 +315,10 @@ class StatefulGraphs:
             tuple(tensor.shape),
             tensor.dtype,
             tensor.device,
-            tensor.stride(),
+            # Singleton dimensions do not advance the storage offset.
+            tuple(
+                stride if size != 1 else 0 for size, stride in zip(tensor.shape, tensor.stride())
+            ),
             tensor.requires_grad,
         )
 
@@ -348,6 +363,7 @@ class StatefulGraphs:
             raise ValueError("Stateful graph input profile differs from capture")
         if self._recorded[slot]:
             torch.cuda.current_stream(self.device).wait_event(self._events[slot])
+        args = (args[0], *(_GraphInputGrad.apply(t) if t.requires_grad else t for t in args[1:]))
         outputs = self._callables[slot](*args)
         if torch.is_grad_enabled() and any(t.requires_grad for t in outputs):
             self._busy[slot] = True

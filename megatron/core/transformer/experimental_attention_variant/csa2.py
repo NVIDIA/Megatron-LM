@@ -623,11 +623,7 @@ class CSA2Indexer(MegatronModule):
         # An incomplete first compression group produces no key rows.
         k = self.k_norm(k) if k.shape[0] else k * self.k_norm.weight
         key_dtype = k.dtype
-        rotary_dtype = torch.float32 if self.precision == "bf16" else None
-        # Fused RoPE keeps BF16 I/O and promotes arithmetic with FP32 tables.
-        # The unfused PyTorch path still needs FP32 inputs for one final cast.
-        if self.precision == "bf16" and not self.config.apply_rope_fusion:
-            k = k.float()
+        # Match V4's activation-dtype tables independently of scorer precision.
         if thd_layout is not None:
             return apply_csa2_thd_rope(
                 k,
@@ -635,7 +631,6 @@ class CSA2Indexer(MegatronModule):
                 self.config,
                 thd_layout,
                 cp_group if cp_group is not None else self.cp_group,
-                rotary_dtype=rotary_dtype,
             ).to(key_dtype)
         pos_dim = self.config.qk_pos_emb_head_dim
         return _apply_rope(
@@ -648,7 +643,6 @@ class CSA2Indexer(MegatronModule):
             ratio=self.compress_ratio,
             cp_group=self.cp_group,
             inplace=False,
-            rotary_dtype=rotary_dtype,
         ).to(key_dtype)
 
     def _project_inputs(
@@ -689,9 +683,6 @@ class CSA2Indexer(MegatronModule):
         q, _ = self.linear_wq_b(qr)
         q = q.reshape(*q.shape[:-1], self.n_heads, self.head_dim)
         query_dtype = q.dtype
-        rotary_dtype = torch.float32 if self.precision == "bf16" else None
-        if self.precision == "bf16" and not self.config.apply_rope_fusion:
-            q = q.float()
         if thd_layout is not None:
             if indexer_k.shape[:2] != (compressed_layout.capacity, 1):
                 raise ValueError("CSA2 shared indexer keys must match the THD compression layout.")
@@ -702,7 +693,6 @@ class CSA2Indexer(MegatronModule):
                 self.config,
                 thd_layout,
                 cp_group if cp_group is not None else self.cp_group,
-                rotary_dtype=rotary_dtype,
             )
             with get_fp8_disabled_context(self.config):
                 weights, _ = self.linear_weights_proj(x)
@@ -716,7 +706,6 @@ class CSA2Indexer(MegatronModule):
             config=self.config,
             rotary_seq_len=q.shape[0],
             cp_group=self.cp_group,
-            rotary_dtype=rotary_dtype,
         )
         with get_fp8_disabled_context(self.config):
             weights, _ = self.linear_weights_proj(x)
@@ -1131,16 +1120,10 @@ class CompressedSparseAttention2(MegatronModule):
                     # The indexer's linear backward retains this same latent,
                     # including when its input was detached from the compressor.
                     inplace=False,
-                    rotary_dtype=torch.float32,
                 )
             else:
                 state.global_kv = apply_csa2_thd_rope(
-                    latent,
-                    self.rotary_pos_emb,
-                    self.config,
-                    local_layout,
-                    cp_group,
-                    rotary_dtype=torch.float32,
+                    latent, self.rotary_pos_emb, self.config, local_layout, cp_group
                 )
             if cp_layout is not None:
                 # One autograd edge per shared tensor: reduce-scatter runs after
