@@ -9,6 +9,7 @@ import importlib.util
 import logging
 from collections import namedtuple
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -581,6 +582,9 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions."""
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
+    # A full reduction (`x.mean()`, `torch.mean(x)`) arrives with an empty dim list.
+    if dim is None or len(dim) == 0:
+        dim = list(range(input.ndim))
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:
@@ -1335,13 +1339,14 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
             raise RuntimeError("Batch-invariant RMSNorm requires CUDA tensors.")
         if not _is_supported_dtype_for_bik(x.dtype):
             raise RuntimeError(f"Unsupported dtype for batch-invariant RMSNorm: {x.dtype}")
-        weight_eff = weight + 1.0 if zero_centered_gamma else weight
 
         # We do everything in rmsnorm_batch_invariant manually here so that we can
         # save rsigma in full precision for backward to match the TE behavior.
         x_dtype = x.dtype
         x_fp32 = x.float()
         w_fp32 = weight.to(device=x.device, dtype=torch.float32)
+        if zero_centered_gamma:
+            w_fp32 = w_fp32 + 1.0
         ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
         rsigma = torch.rsqrt(ms + eps)
         out_fp32 = (x_fp32 * rsigma) * w_fp32
@@ -1363,11 +1368,11 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         accumulation and reduction behavior for numerical stability.
         """
         x, weight, rsigma = ctx.saved_tensors
-        w_eff = (weight + 1.0) if ctx.zero_centered_gamma else weight
-
         go_fp32 = grad_output.float()
         x_fp32 = x.float()
-        w_fp32 = w_eff.to(device=x.device, dtype=torch.float32)
+        w_fp32 = weight.to(device=x.device, dtype=torch.float32)
+        if ctx.zero_centered_gamma:
+            w_fp32 = w_fp32 + 1.0
         r = rsigma
         r3 = r * r * r
         D = x.shape[-1]
@@ -1376,7 +1381,7 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         g_w = (go_fp32 * x_fp32 * r).sum(dim=red_dims).to(weight.dtype)
 
         s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
-        dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
+        dx = go_fp32 * (w_fp32 * r) - r3 * (s * x_fp32) / D
         dx = dx.to(x.dtype)
 
         return dx, g_w, None, None
@@ -1659,7 +1664,34 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 
 # Originals saved by _enable_te_native_workspace_starvation for restoration.
 _TE_WORKSPACE_SIZE_FN_ORIG = None
+_TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
+
+
+def te_supports_batch_invariant_grouped_gemm(device: int | None = None) -> bool:
+    """Whether TE device-metadata GEMM has been validated on this GPU/library pair.
+
+    This path cannot use workspace starvation. Keep the numerical validation
+    boundary explicit; aligned expert padding alone does not guarantee invariance.
+    """
+    import transformer_engine_torch as tex
+
+    return (
+        torch.cuda.get_device_capability(device) == (10, 0) and tex.get_cublasLt_version() == 130501
+    )
+
+
+@lru_cache(maxsize=None)
+def _get_te_native_grouped_workspace(device: int, layout: str) -> torch.Tensor:
+    """Keep TE's required full workspace only on the validated grouped-GEMM path."""
+    if not te_supports_batch_invariant_grouped_gemm(device):
+        raise RuntimeError(
+            "Batch-invariant TE device-metadata grouped GEMM requires SM100 and "
+            "cuBLASLt 13.5.1. Use moe_use_grouped_tensor=False on other versions."
+        )
+    # Keep TN/NN/NT allocations separate: cuBLAS retains layout-specific metadata
+    # in this workspace, and sharing it can corrupt forward/backward graph replay.
+    return torch.empty(_TE_WORKSPACE_SIZE_FN_ORIG(), dtype=torch.uint8, device=device)
 
 
 def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
@@ -1683,7 +1715,7 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
     import logging
     import os
 
-    global _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
     logger = logging.getLogger(__name__)
 
     # CUBLASLT_WORKSPACE_SIZE must be pinned (not setdefault): a preset value
@@ -1718,6 +1750,17 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
             if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
                 _te_gemm_mod.get_cublas_workspace.cache_clear()
+        # Only device-metadata grouped GEMM needs the full workspace. Gate that
+        # exception at dispatch, including BF16 modules in a mixed recipe; dense
+        # and legacy grouped GEMMs retain their restricted workspace.
+        if _TE_GROUPED_WORKSPACE_FN_ORIG is None and hasattr(
+            _te_gemm_mod, "_get_grouped_cublas_workspace"
+        ):
+            _TE_GROUPED_WORKSPACE_FN_ORIG = _te_gemm_mod._get_grouped_cublas_workspace
+            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
+                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
+            _get_te_native_grouped_workspace.cache_clear()
+            _te_gemm_mod._get_grouped_cublas_workspace = _get_te_native_grouped_workspace
     except ImportError:
         pass
 
@@ -1726,7 +1769,18 @@ def _disable_te_native_workspace_starvation():
     """Restore the TE workspace function and env pinned by the te_native backend."""
     import os
 
-    global _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
+    if _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
+        _get_te_native_grouped_workspace.cache_clear()
+        try:
+            import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
+
+            _te_gemm_mod._get_grouped_cublas_workspace = _TE_GROUPED_WORKSPACE_FN_ORIG
+            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
+                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
+        except ImportError:
+            pass
+        _TE_GROUPED_WORKSPACE_FN_ORIG = None
     if _TE_WORKSPACE_SIZE_FN_ORIG is not None:
         try:
             import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
@@ -1805,9 +1859,10 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available. Under te_native
-    # BOTH skips are set, so no TE kernel is substituted at all: GEMMs (dense
-    # and grouped) stay native under the starved workspace, and norms stay
-    # native under the 64-multiple alignment discipline. (The TE attention
+    # BOTH skips are set, so no TE kernel is substituted: dense GEMMs stay
+    # native under the starved workspace, device-metadata grouped GEMMs keep
+    # their required full workspace only on validated GPU/library versions, and norms
+    # stay native under the 64-multiple alignment discipline. (The TE attention
     # version gate is a separate standalone assert, not part of this patch.)
     if backend == "te_native":
         # te_native also keeps TE's NATIVE RMSNorm: its M%32 reduction

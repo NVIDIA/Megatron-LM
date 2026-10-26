@@ -1,8 +1,8 @@
 # Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# Forked from `fla/utils.py`, `fla/ops/utils/op.py`, `fla/ops/utils/index.py` and
-# `fla/modules/l2norm.py` in flash-linear-attention v0.5.1
+# Forked from `fla/utils.py`, `fla/ops/utils/op.py`, `fla/ops/utils/softplus.py`,
+# `fla/ops/utils/index.py` and `fla/modules/l2norm.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
 # Licensed under the MIT license; see the LICENSE file in the repository root.
@@ -11,18 +11,23 @@
 
 The kernel modules in this package reference a handful of names that do not
 belong to any one of them: the hardware-capability probes that select autotune
-configurations, the chunk-descriptor builders, `exp` / `exp2`, and the L2
+configurations, the chunk-descriptor builders, `exp` / `exp2` / `softplus`, and the L2
 normalization applied to the queries and keys. Keeping them here makes the
 package self-contained, with no `fla` import at run time.
 
 Take care when changing the probes: they choose which autotune configurations
 exist, so editing one changes which kernel variants get benchmarked and picked.
+Every GDP autotune config list must pass through `autotune_configs`: timing-based
+selection can otherwise choose numerically different reduction tilings between
+deterministic-mode processes.
 """
 
 import functools
 import os
 
 import torch
+
+from megatron.core.tuning import autotune_configs
 
 try:
     import triton
@@ -124,6 +129,35 @@ def exp2(x):
 
 
 # ----------------------------------------------------------------------------
+# `fla.ops.utils.softplus`
+# ----------------------------------------------------------------------------
+# FLA's NVIDIA softplus is approximate inline PTX; it is copied verbatim so the
+# in-kernel GDN gate stays bitwise identical to upstream.
+_SOFTPLUS_PTX: tl.constexpr = tl.constexpr(
+    "{ .reg .pred p; setp.gt.f32 p, $1, 20.; @p mov.f32 $0, $1;"
+    " @!p mul.f32 $0, $1, 1.4426950408889634; @!p ex2.approx.ftz.f32 $0, $0;"
+    " @!p add.f32 $0, $0, 1.0; @!p lg2.approx.ftz.f32 $0, $0;"
+    " @!p mul.f32 $0, $0, 0.6931471805599453; }"
+)
+
+if IS_NVIDIA:
+
+    @triton.jit
+    def softplus(x):
+        """`log(1 + exp(x))` in fp32, saturating to the identity above 20."""
+        return tl.inline_asm_elementwise(
+            asm=_SOFTPLUS_PTX, constraints="=r,r", args=[x], dtype=tl.float32, is_pure=True, pack=1
+        )
+
+else:
+
+    @triton.jit
+    def softplus(x):
+        """`log(1 + exp(x))` in fp32, saturating to the identity above 20."""
+        return tl.where(x < 20.0, tl.math.log(1 + tl.math.exp(x)), x)
+
+
+# ----------------------------------------------------------------------------
 # `fla.ops.utils.index`
 # ----------------------------------------------------------------------------
 def _segmented_arange(counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -174,7 +208,9 @@ _BT_LIST = [8, 16, 32, 64, 128]
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]],
+    configs=autotune_configs(
+        [triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]]
+    ),
     key=["D"],
 )
 @triton.jit
@@ -194,11 +230,13 @@ def l2norm_fwd_kernel1(x, y, rstd, eps, D, BD: tl.constexpr):
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BT": BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in _BT_LIST
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({"BT": BT}, num_warps=num_warps)
+            for num_warps in [1, 2, 4, 8, 16]
+            for BT in _BT_LIST
+        ]
+    ),
     key=["D", "NB"],
 )
 @triton.jit(do_not_specialize=["T"])

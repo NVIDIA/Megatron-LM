@@ -91,8 +91,8 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Feature | Surface | Notes |
 |---|---|---|
 | Suspend/resume | `engine.suspend()` / `engine.resume()`; tests use `--suspend-timeout`, `--suspend-resume-interval` | Offloads GPU state to CPU/disk |
-| KV cache management on suspend | `--rl-kv-cache-management-mode {persist, offload, recompute}` | What to do with KV when suspending |
-| Static KV pointers | `InferenceConfig.static_kv_memory_pointers` | Keep KV buffer addrs across suspend/resume |
+| KV cache management on suspend | `--inference-kv-cache-management-mode {persist, offload, recompute}` | What to do with KV when suspending |
+| Static KV pointers | `--inference-static-kv-memory-pointers` (`InferenceConfig.static_kv_memory_pointers`) | Keep KV buffer addrs across suspend/resume |
 | Track paused events | `--inference-dynamic-batching-track-paused-request-events` | Telemetry only |
 | Track per-token events | `--inference-dynamic-batching-track-generated-token-events` | Telemetry only |
 
@@ -113,7 +113,6 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Feature | CLI / config | Notes |
 |---|---|---|
 | Data-parallel coordinator (ZMQ) | uses `gpt_dynamic_inference_with_coordinator.py`; `--inference-use-synchronous-zmq-collectives` | Cross-rank routing |
-| Disable EP consensus | `--inference-disable-ep-consensus` | Skip all-reduce for single-EP |
 | Tensor / pipeline / expert parallel | `--{tensor,pipeline,expert}-model-parallel-size` | Standard parallel knobs |
 
 ### I. Model-family-specific
@@ -121,7 +120,7 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Family | Features |
 |---|---|
 | Hybrid (Mamba+Attn) | `--mamba-inference-conv-states-dtype`, `--mamba-inference-ssm-states-dtype`, mamba chunk size |
-| MoE | `--moe-enable-routing-replay` (router replay), `--moe-grouped-gemm`, `--moe-token-dispatcher-type` |
+| MoE | `--moe-enable-routing-replay` (router replay; supports legacy and async scheduling), `--moe-grouped-gemm`, `--moe-token-dispatcher-type` |
 
 ---
 

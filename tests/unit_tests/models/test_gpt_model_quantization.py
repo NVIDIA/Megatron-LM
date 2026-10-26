@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
+import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -574,6 +575,102 @@ class TestGPTModelTEQuantizationConfig:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        ("transformer_impl", "recipe_storage"),
+        [
+            ("transformer_engine", {}),
+            ("transformer_engine", {"inherit_model_init_context": True}),
+            ("inference_optimized", {}),
+        ],
+    )
+    def test_selective_mxfp8_parameter_storage_at_construction(
+        self, transformer_impl, recipe_storage
+    ):
+        """Recipe names must reach constructors, before checkpoint values are quantized."""
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("MXFP8 parameter initialization requires Blackwell or newer")
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+        config = TransformerConfig(
+            num_layers=8,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            normalization="RMSNorm",
+            num_moe_experts=2,
+            moe_grouped_gemm=True,
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.silu,
+            moe_router_dtype="fp32",
+            add_bias_linear=False,
+            gradient_accumulation_fusion=False,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_param=True,
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=2,
+            num_layers_at_end_in_bf16=4,
+            transformer_impl=transformer_impl,
+            inference_grouped_gemm_backend="torch",
+            quant_recipe=RecipeConfig.from_config_dict(
+                {
+                    "configs": {
+                        "bf16": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {"override_quantized_autocast": True},
+                        },
+                        "mxfp8": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {
+                                "fp8_quantization_recipe": "mxfp8",
+                                **recipe_storage,
+                                "override_quantized_autocast": True,
+                            },
+                        },
+                    },
+                    "matchers": {
+                        "routed": {
+                            "type": "glob",
+                            "pattern": "*mlp.experts.linear_fc*",
+                            "config": "mxfp8",
+                            "enabled": True,
+                        },
+                        "other": {
+                            "type": "glob",
+                            "pattern": "*",
+                            "config": "bf16",
+                            "enabled": True,
+                        },
+                    },
+                }
+            ),
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(
+                config, use_transformer_engine=transformer_impl == "transformer_engine"
+            ),
+            vocab_size=256,
+            max_sequence_length=32,
+        )
+        quantized_names = []
+        use_mxfp8_storage = transformer_impl == "inference_optimized" or recipe_storage.get(
+            "inherit_model_init_context", False
+        )
+        for name, parameter in model.named_parameters():
+            expected_mxfp8 = (
+                use_mxfp8_storage
+                and name.startswith(("decoder.layers.2.", "decoder.layers.3."))
+                and ".mlp.experts.linear_fc" in name
+            )
+            assert isinstance(parameter, MXFP8Tensor) == expected_mxfp8, name
+            if expected_mxfp8:
+                quantized_names.append(name)
+        # Two middle layers, two projections, two experts; training defaults remain BF16.
+        assert len(quantized_names) == (8 if use_mxfp8_storage else 0)
 
     def test_te_config_resolution_dense(self) -> None:
         from megatron.core.extensions.transformer_engine import (

@@ -6,7 +6,34 @@ import torch
 from megatron.core.activations import fast_gelu, quick_gelu, squared_relu
 
 
+# Nemotron 2/3 are the preferred model names. Keep the former Nemotron 5/6
+# identifiers as aliases so existing launch scripts and saved arguments still work.
+# These aliases select identical architectures; they do not rename tokenizer
+# prompt formats, which are a separate interface controlling tokenization/loss masks.
+_LANGUAGE_MODEL_TYPE_ALIASES = {
+    "nemotron5-8b": "nemotron2-8b",
+    "nemotron5-hybrid-8b": "nemotron2-hybrid-8b",
+    "nemotron5-hybrid-12b": "nemotron2-hybrid-12b",
+    "nemotron5-hybrid-56b": "nemotron2-hybrid-56b",
+    "nemotron6-moe": "nemotron3-moe",
+    "nemotron6-super": "nemotron3-super",
+}
+
+
+def canonical_language_model_type(language_model_type: str) -> str:
+    """Resolve legacy model names without modifying the supplied/saved configuration."""
+    return _LANGUAGE_MODEL_TYPE_ALIASES.get(language_model_type, language_model_type)
+
+
+def is_hybrid_language_model_type(language_model_type: str) -> bool:
+    """Select the same hybrid layer specification for preferred and legacy names."""
+    return canonical_language_model_type(language_model_type).startswith(
+        ("nemotron2-hybrid", "nemotron3-moe", "nemotron3-super")
+    )
+
+
 def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=None):
+    language_model_type = canonical_language_model_type(config.language_model_type)
     config.bias_activation_fusion = enable_fusions
     config.bias_dropout_fusion = enable_fusions
     config.apply_rope_fusion = enable_fusions
@@ -53,7 +80,7 @@ def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=No
         )
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 14336
-    elif config.language_model_type == "nemotron5-8b":
+    elif language_model_type == "nemotron2-8b":
         config.add_bias_linear = False
         config.gated_linear_unit = False
         config.activation_func = squared_relu
@@ -104,7 +131,7 @@ def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=No
         )
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 29568
-    elif config.language_model_type == "nemotron5-hybrid-8b":
+    elif language_model_type == "nemotron2-hybrid-8b":
         config.activation_func = squared_relu
         config.bias_activation_fusion = False
         config.squared_relu = True
@@ -116,7 +143,7 @@ def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=No
         )
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 21504
-    elif config.language_model_type == "nemotron5-hybrid-12b":
+    elif language_model_type == "nemotron2-hybrid-12b":
         config.activation_func = squared_relu
         config.bias_activation_fusion = False
         config.squared_relu = True
@@ -131,7 +158,7 @@ def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=No
         config.mamba_state_dim = 128
         config.mamba_num_heads = 128
         config.mamba_head_dim = 80
-    elif config.language_model_type == "nemotron5-hybrid-56b":
+    elif language_model_type == "nemotron2-hybrid-56b":
         config.activation_func = squared_relu
         config.bias_activation_fusion = False
         config.squared_relu = True
@@ -154,7 +181,11 @@ def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=No
         )
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 8192
-    elif config.language_model_type == "nemotron6-moe":
+    elif language_model_type == "nemotron3-moe":
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
+    elif language_model_type == "nemotron3-super":
+        config.activation_func = squared_relu
         config.bias_activation_fusion = False
         config.bias_dropout_fusion = False
     elif config.language_model_type.startswith("hf://"):
@@ -176,7 +207,7 @@ def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=No
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 14336
-    elif config.language_model_type == "nemotron6-moe":
+    elif language_model_type == "nemotron3-moe":
         config.bias_activation_fusion = False
         config.bias_dropout_fusion = False
     else:
@@ -186,11 +217,12 @@ def get_language_model_config(config, enable_fusions=False, apply_rope_fusion=No
 
 
 def get_vision_model_config(config, enable_fusions=False):
+    language_model_type = canonical_language_model_type(config.language_model_type)
     config.bias_activation_fusion = False   # Radio uses an incompatible activation func.
     config.bias_dropout_fusion = enable_fusions
     config.apply_rope_fusion = enable_fusions
 
-    if config.language_model_type == "nemotron6-moe":
+    if language_model_type in ("nemotron3-moe", "nemotron3-super"):
         config.bias_dropout_fusion = False
 
     if config.vision_model_type == "clip":
@@ -334,6 +366,7 @@ def get_vision_model_config(config, enable_fusions=False):
 
 
 def get_vision_projection_config(config, hidden_size, enable_fusions=False):
+    language_model_type = canonical_language_model_type(config.language_model_type)
     # If using FP8, then keep the whole vision projection in FP8.
     config.first_last_layers_bf16 = False
     config.num_layers_at_start_in_bf16 = 0
@@ -375,27 +408,32 @@ def get_vision_projection_config(config, hidden_size, enable_fusions=False):
         config.ffn_hidden_size = 29568
         config.normalization = "LayerNorm"
         config.activation_func = torch.nn.functional.gelu
-    elif config.language_model_type == "nemotron5-hybrid-56b":
+    elif language_model_type == "nemotron2-hybrid-56b":
         config.ffn_hidden_size = 32768
         config.activation_func = squared_relu
         config.bias_activation_fusion = False
-    elif config.language_model_type in ("nemotron5-8b", "nemotron5-hybrid-8b"):
+    elif language_model_type in ("nemotron2-8b", "nemotron2-hybrid-8b"):
         config.ffn_hidden_size = 21504
         config.activation_func = squared_relu
         config.bias_activation_fusion = False
-    elif config.language_model_type == "nemotron5-hybrid-12b":
+    elif language_model_type == "nemotron2-hybrid-12b":
         config.ffn_hidden_size = 20480
         config.activation_func = squared_relu
         config.bias_activation_fusion = False
-    elif config.language_model_type == "nemotron6-moe":
+    elif language_model_type == "nemotron3-moe":
         config.ffn_hidden_size = 20480
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
+    elif language_model_type == "nemotron3-super":
+        config.ffn_hidden_size = 20480
+        config.activation_func = squared_relu
         config.bias_activation_fusion = False
         config.bias_dropout_fusion = False
     elif config.language_model_type == "llama3.2_1b":
         config.ffn_hidden_size = 2048
         config.activation_func = torch.nn.functional.gelu
         config.normalization = "LayerNorm"
-    elif config.language_model_type == "nemotron6-moe":
+    elif language_model_type == "nemotron3-moe":
         config.ffn_hidden_size = 20480
         config.bias_activation_fusion = False
         config.bias_dropout_fusion = False
@@ -427,6 +465,7 @@ def get_sound_model_config(config):
     return config
 
 def get_sound_projection_config(config, hidden_size, enable_fusions=False):
+    language_model_type = canonical_language_model_type(config.language_model_type)
     config.gated_linear_unit = False
     config.add_bias_linear = False
     config.hidden_size = hidden_size  # Used as the vision projection output size, i.e., the input to the language model.
@@ -441,7 +480,7 @@ def get_sound_projection_config(config, hidden_size, enable_fusions=False):
         config.layernorm_epsilon = 1e-5
         config.add_bias_linear = True
         config.normalization = "LayerNorm"
-    elif config.language_model_type == "nemotron6-moe":
+    elif language_model_type == "nemotron3-moe":
         config.ffn_hidden_size = 4096
         config.bias_activation_fusion = False
     elif config.language_model_type == "llama_nemotron_8b":

@@ -14,19 +14,25 @@ Training and the static-batching inference path call the pip
 `flash-linear-attention` kernels, which own the backward pass. Only the
 dynamic-batching decode and prefill steps route here:
 
-* `fused_recurrent_gated_delta_rule_update` -- decode.
+* `fused_recurrent_gated_delta_rule_update` -- decode (shared with GDN, whose
+  gate and beta sigmoid it can apply in-kernel).
+* `gdp_decode_prepare` -- the reshape/gating step feeding decode.
 * `chunk_gated_delta_product_varlen` -- prefill.
+* `gdp_prefill_prepare` -- the reshape/gating step feeding prefill.
 
-Both entry points are forward-only.
+All entry points are forward-only.
 """
 
 from .chunk import chunk_gated_delta_product_varlen
 from .fused_recurrent import fused_recurrent_gated_delta_rule_update
 from .metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
+from .prepare import gdp_decode_prepare, gdp_prefill_prepare
 
 __all__ = [
     "chunk_gated_delta_product_varlen",
     "fused_recurrent_gated_delta_rule_update",
+    "gdp_decode_prepare",
+    "gdp_prefill_prepare",
     "build_gdp_chunk_descriptors",
     "max_gdp_chunk_counts",
 ]

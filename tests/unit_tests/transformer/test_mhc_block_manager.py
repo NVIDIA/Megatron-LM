@@ -505,6 +505,25 @@ class TestTransformerBlockMHCRecompute:
         block, _ = self._make_mhc_block(num_layers=2)
         assert block.mhc_recompute_enabled
 
+    def test_plain_transformer_layer_still_fails_fast_in_transformer_block(self):
+        """The Hybrid ownership exception must not weaken ordinary TransformerBlock wiring."""
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_mhc_connections=True,
+        )
+
+        with pytest.raises(ValueError, match="HyperConnectionTransformerLayer"):
+            TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+
     def test_block_forward_input_expand_output_contract(self):
         """Forward exercises ``input_expand`` (pre) and ``output_contract`` (post)."""
         block, config = self._make_mhc_block(num_layers=2, mhc_recompute_layer_num=2)

@@ -22,7 +22,12 @@ from megatron.core.resharding.refit import swap_model_weights
 from megatron.training import get_args
 from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
 from megatron.training.initialize import initialize_megatron
 
 
@@ -75,12 +80,12 @@ def model_provider(pre_process=True, post_process=True, parallel_output=False,
     )
 
 
-def create_refit_service(method):
+def create_refit_service(method, execution_batch_bytes: int | None = None):
     """Create and return a refit service instance."""
     if method == 'nvshmem':
         return NVSHMEMCopyService()
     elif method == 'nccl_m2n':
-        return NCCLM2NCopyService()
+        return NCCLM2NCopyService(max_group_bytes=execution_batch_bytes)
     elif method == 'nccl':
         return NCCLCopyService()
     elif method == 'gloo':
@@ -100,18 +105,30 @@ def print_config_summary(args, src_config, dst_config, world_size, mode):
     print_rank_0(f"Model: {args.num_layers}L, {args.hidden_size}H, {args.num_attention_heads} heads, vocab={args.vocab_size}")
     if args.num_experts:
         print_rank_0(f"MoE: {args.num_experts} experts, top-{args.moe_router_topk}")
-    print_rank_0(f"Backend: {args.refit_method}")
+    print_rank_0(f"Backend: {get_run_config().rl.refit_method}")
     print_rank_0(f"{'='*80}\n")
 
 
-def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iterations):
+def run_benchmark(
+    src_model,
+    dst_model,
+    refit_service,
+    num_warmup,
+    num_iterations,
+    execution_batch_bytes: int | None = None,
+):
     """Run warmup and benchmark iterations, return timings."""
     # Warmup (builds refit plan on first iteration)
     print_rank_0(f"Warmup: {num_warmup} iterations...")
     for i in range(num_warmup):
         torch.cuda.synchronize()
         torch.distributed.barrier()
-        swap_model_weights(src_model, dst_model, refit_method=refit_service)
+        swap_model_weights(
+            src_model,
+            dst_model,
+            refit_method=refit_service,
+            execution_batch_bytes=execution_batch_bytes,
+        )
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
@@ -126,7 +143,12 @@ def run_benchmark(src_model, dst_model, refit_service, num_warmup, num_iteration
         torch.distributed.barrier()
 
         start_time = time.perf_counter()
-        swap_model_weights(src_model, dst_model, refit_method=refit_service)
+        swap_model_weights(
+            src_model,
+            dst_model,
+            refit_method=refit_service,
+            execution_batch_bytes=execution_batch_bytes,
+        )
         torch.cuda.synchronize()
         end_time = time.perf_counter()
 
@@ -144,18 +166,19 @@ def print_results(timings):
     """Print benchmark results."""
     if torch.distributed.get_rank() == 0:
         args = get_args()
+        cfg = get_run_config()
         mean_time = sum(timings) / len(timings)
         min_time = min(timings)
         max_time = max(timings)
 
         result = {
-            'backend': args.refit_method,
+            'backend': cfg.rl.refit_method,
             'mode': args.refit_mode,
             'world_size': torch.distributed.get_world_size(),
             'source_tp': args.tensor_model_parallel_size,
             'source_pp': args.pipeline_model_parallel_size,
-            'destination_tp': args.rl_inference_tensor_model_parallel_size,
-            'destination_pp': args.rl_inference_pipeline_model_parallel_size,
+            'destination_tp': cfg.rl.rl_inference_tensor_model_parallel_size,
+            'destination_pp': cfg.rl.rl_inference_pipeline_model_parallel_size,
             'num_layers': args.num_layers,
             'hidden_size': args.hidden_size,
             'sequence_length': args.seq_length,
@@ -187,6 +210,7 @@ def print_results(timings):
 def benchmark_collocated():
     """Benchmark refit in collocated mode (both models on same GPUs)."""
     args = get_args()
+    cfg = get_run_config()
     world_size = torch.distributed.get_world_size()
 
     # Calculate parallelism
@@ -196,9 +220,9 @@ def benchmark_collocated():
     src_world = src_tp * src_pp * src_ep
     src_dp = world_size // src_world
 
-    dst_tp = args.rl_inference_tensor_model_parallel_size or src_tp
-    dst_pp = args.rl_inference_pipeline_model_parallel_size or src_pp
-    dst_ep = args.rl_inference_expert_model_parallel_size or src_ep
+    dst_tp = cfg.rl.rl_inference_tensor_model_parallel_size or src_tp
+    dst_pp = cfg.rl.rl_inference_pipeline_model_parallel_size or src_pp
+    dst_ep = cfg.rl.rl_inference_expert_model_parallel_size or src_ep
     dst_world = dst_tp * dst_pp * dst_ep
     dst_dp = world_size // dst_world
 
@@ -224,8 +248,8 @@ def benchmark_collocated():
         tp_size=dst_tp,
         pp_size=dst_pp,
         ep_size=dst_ep,
-        expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
     )
 
     dst_config = core_transformer_config_from_args(args)
@@ -233,8 +257,8 @@ def benchmark_collocated():
         dst_config.expert_model_parallel_size = dst_ep
     dst_config.tensor_model_parallel_size = dst_tp
     dst_config.pipeline_model_parallel_size = dst_pp
-    if args.rl_inference_expert_tensor_model_parallel_size:
-        dst_config.expert_tensor_parallel_size = args.rl_inference_expert_tensor_model_parallel_size
+    if cfg.rl.rl_inference_expert_tensor_model_parallel_size:
+        dst_config.expert_tensor_parallel_size = cfg.rl.rl_inference_expert_tensor_model_parallel_size
 
     dst_model = get_training_model(
         lambda pre_process, post_process, **kwargs: model_provider(
@@ -250,8 +274,10 @@ def benchmark_collocated():
     torch.distributed.barrier()
 
     # Create refit service
-    print_rank_0(f"Creating {args.refit_method} service...")
-    refit_service = create_refit_service(args.refit_method)
+    print_rank_0(f"Creating {cfg.rl.refit_method} service...")
+    refit_service = create_refit_service(
+        cfg.rl.refit_method, execution_batch_bytes=cfg.rl.refit_execution_batch_bytes
+    )
     print_rank_0("Service created.\n")
 
     try:
@@ -261,6 +287,7 @@ def benchmark_collocated():
             refit_service,
             args.num_benchmark_warmup,
             args.num_benchmark_iterations,
+            execution_batch_bytes=cfg.rl.refit_execution_batch_bytes,
         )
         print_results(timings)
     finally:
@@ -271,6 +298,7 @@ def benchmark_collocated():
 def benchmark_non_collocated():
     """Benchmark refit in non-collocated mode (separate GPU sets)."""
     args = get_args()
+    cfg = get_run_config()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
 
@@ -280,13 +308,13 @@ def benchmark_non_collocated():
     src_ep = args.expert_model_parallel_size
     src_world = src_tp * src_pp * src_ep
 
-    dst_tp = args.rl_inference_tensor_model_parallel_size or src_tp
-    dst_pp = args.rl_inference_pipeline_model_parallel_size or src_pp
-    dst_ep = args.rl_inference_expert_model_parallel_size or src_ep
+    dst_tp = cfg.rl.rl_inference_tensor_model_parallel_size or src_tp
+    dst_pp = cfg.rl.rl_inference_pipeline_model_parallel_size or src_pp
+    dst_ep = cfg.rl.rl_inference_expert_model_parallel_size or src_ep
     dst_world = dst_tp * dst_pp * dst_ep
 
     required_size = src_world + dst_world
-    if args.refit_method == 'nccl_m2n' and world_size != required_size:
+    if cfg.rl.refit_method == 'nccl_m2n' and world_size != required_size:
         raise ValueError(
             f"NCCL M2N requires exactly {required_size} source and destination GPUs, "
             f"got {world_size}"
@@ -313,8 +341,8 @@ def benchmark_non_collocated():
         tp_size=dst_tp,
         pp_size=dst_pp,
         ep_size=dst_ep,
-        expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
     torch.distributed.barrier()
@@ -342,8 +370,8 @@ def benchmark_non_collocated():
             dst_config.expert_model_parallel_size = dst_ep
         dst_config.tensor_model_parallel_size = dst_tp
         dst_config.pipeline_model_parallel_size = dst_pp
-        if args.rl_inference_expert_tensor_model_parallel_size:
-            dst_config.expert_tensor_parallel_size = args.rl_inference_expert_tensor_model_parallel_size
+        if cfg.rl.rl_inference_expert_tensor_model_parallel_size:
+            dst_config.expert_tensor_parallel_size = cfg.rl.rl_inference_expert_tensor_model_parallel_size
 
         dst_model = get_training_model(
             lambda pre_process, post_process, **kwargs: model_provider(
@@ -360,8 +388,10 @@ def benchmark_non_collocated():
     torch.distributed.barrier()
 
     # Create refit service
-    print_rank_0(f"Creating {args.refit_method} service...")
-    refit_service = create_refit_service(args.refit_method)
+    print_rank_0(f"Creating {cfg.rl.refit_method} service...")
+    refit_service = create_refit_service(
+        cfg.rl.refit_method, execution_batch_bytes=cfg.rl.refit_execution_batch_bytes
+    )
     print_rank_0("Service created.\n")
 
     try:
@@ -371,6 +401,7 @@ def benchmark_non_collocated():
             refit_service,
             args.num_benchmark_warmup,
             args.num_benchmark_iterations,
+            execution_batch_bytes=cfg.rl.refit_execution_batch_bytes,
         )
         print_results(timings)
     finally:
@@ -380,7 +411,7 @@ def benchmark_non_collocated():
 
 def main():
     """Main benchmark function."""
-    parse_and_validate_args(
+    args = parse_and_validate_args(
         extra_args_provider=add_benchmark_args,
         args_defaults={
             'tokenizer_type': 'NullTokenizer',
@@ -391,13 +422,17 @@ def main():
         },
         ignore_unknown_args=False,
     )
+    # The RL section is read from the run config, like the training loop does; the benchmark
+    # builds its models from a provider, so the container carries no model config.
+    set_run_config(pretrain_cfg_container_from_args(args))
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
-    initialize_megatron(skip_dependency_compilation=True)
+    initialize_megatron(training=True, skip_dependency_compilation=True)
 
     args = get_args()
+    cfg = get_run_config()
 
-    if args.refit_method == 'nccl_m2n' and args.refit_mode != 'non-collocated':
+    if cfg.rl.refit_method == 'nccl_m2n' and args.refit_mode != 'non-collocated':
         raise ValueError("NCCL M2N supports only non-collocated refit")
 
     # Set default vocab size if not provided

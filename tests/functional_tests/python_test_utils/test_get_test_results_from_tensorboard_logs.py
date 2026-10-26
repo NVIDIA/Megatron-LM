@@ -5,7 +5,33 @@ import json
 from click.testing import CliRunner
 
 from tests.functional_tests.python_test_utils import get_test_results_from_tensorboard_logs
-from tests.functional_tests.python_test_utils.common import GoldenValueMetric
+from tests.functional_tests.python_test_utils.common import GoldenValueMetric, ValuePrecision
+
+
+def test_serializes_full_precision_metadata_and_value(monkeypatch, tmp_path):
+    output_path = tmp_path / "golden_values.json"
+    metric = GoldenValueMetric(
+        start_step=1,
+        end_step=1,
+        step_interval=1,
+        value_precision=ValuePrecision.FULL,
+        values={1: 1.23456789},
+    )
+    monkeypatch.setattr(
+        get_test_results_from_tensorboard_logs.common,
+        "read_tb_logs_as_list",
+        lambda *args, **kwargs: {"lm loss": metric},
+    )
+
+    result = CliRunner().invoke(
+        get_test_results_from_tensorboard_logs.collect_train_test_metrics,
+        ["--logs-dir", str(tmp_path), "--train-iters", "1", "--output-path", str(output_path)],
+    )
+
+    assert result.exit_code == 0
+    serialized_metric = json.loads(output_path.read_text())["lm loss"]
+    assert serialized_metric["value_precision"] == "full"
+    assert serialized_metric["values"]["1"] == 1.23456789
 
 
 def test_non_finite_value_does_not_leave_partial_output(monkeypatch, tmp_path):

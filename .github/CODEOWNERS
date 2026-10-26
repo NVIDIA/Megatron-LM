@@ -40,6 +40,8 @@ megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/c
 
 megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
+megatron/core/resharding/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/refit
+
 megatron/core/optimizer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
 
 megatron/core/optimizer/distrib_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
@@ -72,8 +74,7 @@ megatron/post_training/ @NVIDIA/post-training
 
 megatron/core/transformer/cuda_graphs.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/cuda-graphs
 
-megatron/training/ @NVIDIA/training-adlr @NVIDIA/training-nemo
-megatron/training/arguments.py
+megatron/training/ @NVIDIA/training
 
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
@@ -94,5 +95,12 @@ tests/unit_tests/test_api_backwards_compat_setup.py @NVIDIA/ci
 
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
-test/unit_tests/test_rl_utils.py @NVIDIA/reinforcement-learning
+tests/unit_tests/rl/ @NVIDIA/reinforcement-learning
 train_rl.py @NVIDIA/reinforcement-learning
+
+# Batch-invariant implementations.
+# Retain existing owners because the last matching CODEOWNERS rule wins.
+/megatron/core/transformer/custom_layers/batch_invariant_kernels.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transformer @NVIDIA/batch-invariant
+/megatron/core/transformer/moe/batch_invariant.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech @NVIDIA/batch-invariant
+/megatron/core/inference/moe/batch_invariant.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference @NVIDIA/batch-invariant
+/megatron/core/ssm/ops/mamba2/batch_invariant_decode.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model @NVIDIA/batch-invariant

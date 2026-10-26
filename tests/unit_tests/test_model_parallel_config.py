@@ -8,22 +8,77 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.training.arguments import parse_args, validate_args
 
 
-def test_te_cross_entropy_loss_fusion_warns_in_model_parallel_config():
-    with pytest.warns(UserWarning, match="known stability issues"):
-        config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='te')
+def test_dynamic_cp_selects_default_scheduler_and_variable_lengths():
+    config = ModelParallelConfig(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
 
-    assert config.cross_entropy_loss_fusion
-    assert config.cross_entropy_fusion_impl == 'te'
-
-
-def test_native_cross_entropy_loss_fusion_is_allowed():
-    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='native')
-
-    assert config.cross_entropy_loss_fusion
-    assert config.cross_entropy_fusion_impl == 'native'
+    assert config.sequence_packing_scheduler == "default_dynamic_cp"
+    assert config.variable_seq_lengths is True
 
 
-def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
+def test_dynamic_cp_rejects_non_dynamic_scheduler():
+    with pytest.raises(ValueError, match="requires.*default_dynamic_cp"):
+        ModelParallelConfig(
+            dynamic_context_parallel=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=4096,
+        )
+
+
+def test_default_dynamic_cp_scheduler_requires_dynamic_cp():
+    with pytest.raises(ValueError, match="requires.*dynamic_context_parallel=True"):
+        ModelParallelConfig(
+            sequence_packing_scheduler="default_dynamic_cp", max_seqlen_per_dp_cp_rank=4096
+        )
+
+
+@pytest.mark.parametrize("use_legacy_alias", [False, True])
+def test_dynamic_cp_rejects_deterministic_mode(use_legacy_alias):
+    options = {"hybrid_context_parallel" if use_legacy_alias else "dynamic_context_parallel": True}
+    if use_legacy_alias:
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            with pytest.raises(ValueError, match="does not support deterministic_mode"):
+                ModelParallelConfig(
+                    **options, deterministic_mode=True, max_seqlen_per_dp_cp_rank=4096
+                )
+    else:
+        with pytest.raises(ValueError, match="does not support deterministic_mode"):
+            ModelParallelConfig(**options, deterministic_mode=True, max_seqlen_per_dp_cp_rank=4096)
+
+
+def test_static_packing_preserves_deterministic_mode():
+    config = ModelParallelConfig(
+        sequence_packing_scheduler="dp_balanced",
+        deterministic_mode=True,
+        max_seqlen_per_dp_cp_rank=4096,
+    )
+
+    assert config.deterministic_mode
+    assert not config.dynamic_context_parallel
+
+
+def test_hybrid_cp_alias_normalizes_to_dynamic_cp():
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        config = ModelParallelConfig(hybrid_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+
+    assert config.dynamic_context_parallel is True
+    assert config.hybrid_context_parallel is False
+    assert config.sequence_packing_scheduler == "default_dynamic_cp"
+
+
+@pytest.mark.parametrize("alignment", [None, "32", "max"])
+def test_packed_padding_cli_normalizes_alignment(monkeypatch, alignment):
+    argv = ["test_model_parallel_config.py"]
+    if alignment is not None:
+        argv += ["--pad-packed-seq-alignment", alignment]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = parse_args()
+    config = ModelParallelConfig(
+        pad_packed_seq_alignment=args.pad_packed_seq_alignment, max_seqlen_per_dp_cp_rank=128
+    )
+    assert config.pad_packed_seq_alignment == (32 if alignment == "32" else alignment)
+
+
+def _te_cross_entropy_training_args(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['test_model_parallel_config.py'])
     args = parse_args()
     args.num_layers = 2
@@ -40,6 +95,36 @@ def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
     args.vocab_size = 1024
     args.cross_entropy_loss_fusion = True
     args.cross_entropy_fusion_impl = 'te'
+    return args
 
-    with pytest.raises(AssertionError, match="Transformer Engine cross entropy loss fusion"):
+
+def test_te_cross_entropy_loss_fusion_is_allowed_in_model_parallel_config():
+    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='te')
+
+    assert config.cross_entropy_loss_fusion
+    assert config.cross_entropy_fusion_impl == 'te'
+
+
+def test_native_cross_entropy_loss_fusion_is_allowed():
+    config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='native')
+
+    assert config.cross_entropy_loss_fusion
+    assert config.cross_entropy_fusion_impl == 'native'
+
+
+def test_te_cross_entropy_loss_fusion_is_allowed_by_training_args(monkeypatch):
+    args = _te_cross_entropy_training_args(monkeypatch)
+    monkeypatch.setattr('megatron.training.arguments.is_te_min_version', lambda version: True)
+
+    validated_args = validate_args(args)
+
+    assert validated_args.cross_entropy_loss_fusion
+    assert validated_args.cross_entropy_fusion_impl == 'te'
+
+
+def test_te_cross_entropy_loss_fusion_requires_te_2_19(monkeypatch):
+    args = _te_cross_entropy_training_args(monkeypatch)
+    monkeypatch.setattr('megatron.training.arguments.is_te_min_version', lambda version: False)
+
+    with pytest.raises(AssertionError, match="disabled due to stability issues"):
         validate_args(args)

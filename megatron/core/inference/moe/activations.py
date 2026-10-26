@@ -5,6 +5,7 @@ These kernels skip padding rows (where permutation_map == -1) to avoid
 wasted computation on aligned-but-empty expert slots.
 """
 
+from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -19,6 +20,7 @@ from megatron.core.utils import null_decorator
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 
     HAVE_TRITON = True
 except ImportError:
@@ -28,10 +30,30 @@ if not HAVE_TRITON:
     triton = MagicMock()
     triton.jit = null_decorator
     tl = MagicMock()
+    libdevice = MagicMock()
 
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
+
+
+@triton.jit
+def _clamped_relu(x, clamp_scale, CLAMP: tl.constexpr):
+    """ReLU, optionally tanh soft-clamped to ``(0, clamp_scale)``.
+
+    Returns the pre-square value of the squared-ReLU activation. When ``CLAMP`` is set this
+    is ``clamp_scale * tanh(ReLU(x) / clamp_scale)``, which equals training's
+    ``ReLU(clamp_scale * tanh(x / clamp_scale))``: the soft clamp is non-decreasing and maps
+    0 to 0, so it commutes with the ReLU.
+
+    The clamped value stays in FP32, matching training's fused
+    ``weighted_clamped_squared_relu``, which squares ``clamp_scale * tanh(...)`` directly
+    with no intermediate downcast.
+    """
+    r = tl.maximum(x, 0.0)
+    if CLAMP:
+        r = clamp_scale * libdevice.tanh(r / clamp_scale)
+    return r
 
 
 @triton.jit
@@ -42,13 +64,18 @@ def _squared_relu_kernel(
     n_used_ptr,
     N,
     max_rows,  # output_size (fixed for CG)
+    clamp_scale,
+    CLAMP: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+    ZERO_PADDING: tl.constexpr,
 ):
     """Squared ReLU that skips rows beyond n_used and alignment-padding rows (perm_map == -1).
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
     n_used_ptr gates how many rows are processed — required for CUDA graph compatibility.
+    MXFP8 quantization and grouped GEMM do not receive ``perm_map``. ZERO_PADDING
+    therefore materializes neutral values for dummy rows inside each expert segment.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -60,13 +87,21 @@ def _squared_relu_kernel(
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
                     m = o < N
-                    x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
-                    r = tl.maximum(x, 0.0)
-                    tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
+                    x = tl.load(input_ptr + row.to(tl.int64) * N + o, mask=m).to(tl.float32)
+                    r = _clamped_relu(x, clamp_scale, CLAMP)
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, (r * r).to(tl.bfloat16), mask=m)
+            elif ZERO_PADDING:
+                for n in tl.range(0, N, BLOCK_N):
+                    o = n + tl.arange(0, BLOCK_N)
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, 0.0, mask=o < N)
 
 
 def padded_squared_relu(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    clamp_scale: Optional[float] = None,
+    zero_padding: bool = False,
 ) -> torch.Tensor:
     """Squared ReLU activation that skips rows beyond n_used and alignment-padding rows.
 
@@ -74,13 +109,28 @@ def padded_squared_relu(
         x: [output_size, ffn_hidden] BF16 FC1 output.
         permutation_map: [output_size] int32, original token index or -1 for padding.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
+        clamp_scale: config.activation_func_tanh_clamp_scale. If set, soft-clamp the
+            pre-activation with ``s * tanh(x / s)`` first, bounding the output by ``s ** 2``.
+        zero_padding: write zeros to alignment-padding rows instead of leaving them
+            undefined. MXFP8 quantization and grouped GEMM cannot skip dummy rows through
+            ``permutation_map``. Rows beyond n_used remain undefined.
     """
     M, N = x.shape
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     NUM_BLOCKS = min(M, 512)
     _squared_relu_kernel[(NUM_BLOCKS,)](
-        x, out, permutation_map, n_used, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+        x,
+        out,
+        permutation_map,
+        n_used,
+        N,
+        M,
+        clamp_scale if clamp_scale is not None else 0.0,
+        CLAMP=clamp_scale is not None,
+        BLOCK_N=BLOCK_N,
+        NUM_BLOCKS=NUM_BLOCKS,
+        ZERO_PADDING=zero_padding,
     )
     return out
 
@@ -95,11 +145,14 @@ def _swiglu_kernel(
     max_rows,
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    ZERO_PADDING: tl.constexpr,
 ):
     """SwiGLU: SiLU(gate) * up, skipping rows beyond n_used and padding rows (perm_map == -1).
 
     Input row width is 2N: gate = first N cols, up = last N cols (megatron chunk convention).
     Output row width is N. Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph compatible.
+    MXFP8 quantization and grouped GEMM do not receive ``perm_map``. ZERO_PADDING
+    therefore materializes neutral values for dummy rows inside each expert segment.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -112,14 +165,22 @@ def _swiglu_kernel(
                 for n in tl.range(0, N, BLOCK_N):
                     o = n + tl.arange(0, BLOCK_N)
                     m = o < N
-                    gate = tl.load(input_ptr + row * two_N + o, mask=m).to(tl.float32)
-                    up = tl.load(input_ptr + row * two_N + N + o, mask=m).to(tl.float32)
+                    gate = tl.load(input_ptr + row.to(tl.int64) * two_N + o, mask=m).to(tl.float32)
+                    up = tl.load(input_ptr + row.to(tl.int64) * two_N + N + o, mask=m).to(
+                        tl.float32
+                    )
                     silu = gate * tl.sigmoid(gate)
-                    tl.store(output_ptr + row * N + o, (silu * up).to(tl.bfloat16), mask=m)
+                    tl.store(
+                        output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m
+                    )
+            elif ZERO_PADDING:
+                for n in tl.range(0, N, BLOCK_N):
+                    o = n + tl.arange(0, BLOCK_N)
+                    tl.store(output_ptr + row.to(tl.int64) * N + o, 0.0, mask=o < N)
 
 
 def padded_swiglu(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, zero_padding: bool = False
 ) -> torch.Tensor:
     """SwiGLU activation (SiLU(gate) * up); skips rows beyond n_used and alignment-padding rows.
 
@@ -130,6 +191,9 @@ def padded_swiglu(
         x: [output_size, 2 * ffn_hidden] BF16 FC1 output.
         permutation_map: [output_size] int32, original token index or -1 for padding.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
+        zero_padding: write zeros to alignment-padding rows instead of leaving them
+            undefined. MXFP8 quantization and grouped GEMM cannot skip dummy rows through
+            ``permutation_map``. Rows beyond n_used remain undefined.
     Returns:
         [output_size, ffn_hidden] BF16.
     """
@@ -140,7 +204,15 @@ def padded_swiglu(
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     NUM_BLOCKS = min(M, 512)
     _swiglu_kernel[(NUM_BLOCKS,)](
-        x, out, permutation_map, n_used, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+        x,
+        out,
+        permutation_map,
+        n_used,
+        N,
+        M,
+        BLOCK_N=BLOCK_N,
+        NUM_BLOCKS=NUM_BLOCKS,
+        ZERO_PADDING=zero_padding,
     )
     return out
 
@@ -170,10 +242,10 @@ def _silu_mul_bounded_kernel(
             for n in tl.range(0, N, BLOCK_N):
                 o = n + tl.arange(0, BLOCK_N)
                 m = o < N
-                gate = tl.load(input_ptr + row * two_N + o, mask=m).to(tl.float32)
-                up = tl.load(input_ptr + row * two_N + N + o, mask=m).to(tl.float32)
+                gate = tl.load(input_ptr + row.to(tl.int64) * two_N + o, mask=m).to(tl.float32)
+                up = tl.load(input_ptr + row.to(tl.int64) * two_N + N + o, mask=m).to(tl.float32)
                 silu = gate * tl.sigmoid(gate)
-                tl.store(output_ptr + row * N + o, (silu * up).to(tl.bfloat16), mask=m)
+                tl.store(output_ptr + row.to(tl.int64) * N + o, (silu * up).to(tl.bfloat16), mask=m)
 
 
 def bounded_silu_mul(x: torch.Tensor, n_rows: torch.Tensor) -> torch.Tensor:
@@ -208,6 +280,8 @@ def _squared_relu_quantize_kernel(
     K,
     n_col_blocks,
     max_rows,  # output_size (fixed for CG)
+    clamp_scale,
+    CLAMP: tl.constexpr,
     REAL_GROUPS: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
@@ -229,8 +303,10 @@ def _squared_relu_quantize_kernel(
                 mask = offs < K
 
                 # Load and apply squared ReLU
-                x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
-                relu = tl.maximum(x, 0.0)
+                x = tl.load(input_ptr + row.to(tl.int64) * K + offs, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                relu = _clamped_relu(x, clamp_scale, CLAMP)
                 # Match training and unfused inference: squared ReLU is materialized
                 # in BF16 before MXFP8 quantization, which determines the MXFP8 bins.
                 activated = (relu * relu).to(tl.bfloat16).to(tl.float32)
@@ -250,14 +326,14 @@ def _squared_relu_quantize_kernel(
                 out_fp8 = quantized_flat.to(tl.float8e4nv)
 
                 # Store FP8 data
-                tl.store(out_fp8_ptr + row * K + offs, out_fp8, mask=mask)
+                tl.store(out_fp8_ptr + row.to(tl.int64) * K + offs, out_fp8, mask=mask)
 
                 # Store swizzled scales
                 scale_exp = (dequant_exp >> 23).to(tl.uint8)
                 col_offs = tl.arange(0, BLOCK_GROUPS)
                 col_mask = col_offs < REAL_GROUPS
 
-                macro_row_block = row // 128
+                macro_row_block = row.to(tl.int64) // 128
                 macro_col_block = col_offs // 4
                 local_row = row % 128
                 local_col = col_offs % 4
@@ -270,7 +346,10 @@ def _squared_relu_quantize_kernel(
 
 
 def squared_relu_and_quantize_mxfp8(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    clamp_scale: Optional[float] = None,
 ):
     """Fused squared ReLU + MXFP8 quantize + swizzle.
 
@@ -282,6 +361,8 @@ def squared_relu_and_quantize_mxfp8(
         permutation_map: [output_size] int32, original token index or -1 for padding.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1]. Rows beyond
             this are skipped before even checking the permutation_map.
+        clamp_scale: config.activation_func_tanh_clamp_scale. If set, soft-clamp the
+            pre-activation with ``s * tanh(x / s)`` before the square.
 
     Returns:
         MXFP8Tensor with .data [output_size, K] float8_e4m3fn and .scale (swizzled e8m0).
@@ -312,6 +393,8 @@ def squared_relu_and_quantize_mxfp8(
         K,
         n_col_blocks,
         M,
+        clamp_scale if clamp_scale is not None else 0.0,
+        CLAMP=clamp_scale is not None,
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
