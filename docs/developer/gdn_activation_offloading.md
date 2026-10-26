@@ -27,9 +27,11 @@ backends, full-layer recomputation and CUDA graphs.
 The manager's minimum tensor size, offload fraction and last-group margin apply.
 After warmup, fraction zero selects no transfers. Warmup can still copy eligible
 tensors to collect size statistics. The default minimum is 1,048,576 elements;
-short correctness tests use 1024 elements to exercise copies. Current validation
-covers fixed-length training initialized by a training step; evaluation-first
-initialization and tensor-size changes after warmup are not qualified. Use multiple GDN
+short correctness tests use 1024 elements to exercise copies. Native GPU checks cover fixed-length training, evaluation before the first
+training iteration, and sequence lengths 8/256/64/256 after a small warmup.
+The fraction is selected from warmup-eligible groups; changing sizes does not
+recompute a positive-fraction budget. Fraction zero remains transfer-free after
+warmup even when previously small tensors become eligible. Use multiple GDN
 layers when measuring steady-state savings: one GDN group is kept resident after
 warmup. Evaluation, no-grad and fully frozen recurrence execution bypass the scope.
 
@@ -146,7 +148,24 @@ qualify GPU training, and earlier fixed-reduction results do not qualify the
 native fused path. [Historical logs, CSVs and reports](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/cf8df32ec2424bcc6c42a5486d2fe68213c74294/split-20261015/historical)
 retain their original revisions separately.
 
-Complete-Qwen measurements at `87c22d1abae13abf375e8ed4ddfe62301cde87f4`
+Complete-Qwen measurements at `1f2c9ae4f7e617b12caa115e387d95e668517c62`
+use one RTX A6000, sequence 4096, four microbatches, fraction 1, the default
+tensor threshold and norm recomputation off. Each setting has three
+fresh-process on/off pairs, three warmup steps and ten measured complete optimizer
+steps. Peak allocated memory decreases by 952 MiB: 3.43% with unfused pre-GDR
+and 3.47% with native fused pre-GDR. Paired median step-time changes are
++0.50% (−0.26% to +0.55%) and +4.11% (+3.58% to +6.11%), respectively.
+Peak reserved memory increases by 650–652 MiB and 738–756 MiB; offloading
+retains 1008 MiB in 72 pinned buffers, all returned to the pool before cleanup.
+These allocator and host-memory costs accompany the active-allocation saving.
+The GPU had no competing active workload during measurement; other GPUs on the
+shared host were in use. Raw commands, rank logs, timing samples and telemetry
+are [publicly retained with the executed source revision](https://github.com/Pinoeer-kingxi/Megatron-LM/tree/evidence/gdn-acceptance-20261026/gdn-acceptance-20261026).
+Input preparation and snapshots
+are outside timed steps. These results compare on/off within each setting and
+do not establish a cross-version speedup.
+
+Historical complete-Qwen measurements at `87c22d1abae13abf375e8ed4ddfe62301cde87f4`
 use one RTX A6000, sequence 4096, four microbatches, fraction 1, the default
 tensor threshold and norm recomputation off. Each fusion setting has three
 fresh-process pairs, three warmup steps and ten timed optimizer steps. Peak
