@@ -85,6 +85,12 @@ def test_the_section_holds_megatron_cores_config(tokenizer):
     assert data.dataset.tokenizer is None and data.dataset.token_dtype_code is None
     assert data.dataset.mock is True and data.dataset.split is None  # the even split is derived
     assert data.dataset.split_matrix is not None
+    explicit = DataConfig(dataset=_dataset(split="949,50,1"))  # --mock-data --split 949,50,1
+    assert explicit.dataset.split == "949,50,1"  # kept as given (and serialized as given)
+    assert explicit.dataset.split_matrix == data.dataset.split_matrix  # the even split, as before
+    explicit.validate()
+    explicit.finalize()
+    assert explicit.dataset_type is MockGPTDataset
     data.validate()  # the section's checks and Core's tokenizer-free ones
     data.finalize()
     assert data.dataset_type is MockGPTDataset
@@ -212,8 +218,11 @@ def test_to_cfg_dict_omits_tokenizer_owned_and_derived_fields(tokenizer):
     assert fim["fim_extra_tokens"] == FIM_TOKENS
     assert type(instantiate(fim, mode=InstantiationMode.STRICT)) is GPTFIMDatasetConfig
     # A mock section carries no split: Megatron Core derives the even split (split_matrix) from
-    # the absence of a source and writes nothing back.
+    # the absence of a source and writes nothing back; an explicit split is kept as given and, as
+    # before, not used by the mock dataset.
     assert DataConfig(dataset=_dataset()).to_cfg_dict()["dataset"]["split"] is None
+    explicit = DataConfig(dataset=_dataset(split="949,50,1")).to_cfg_dict()["dataset"]
+    assert explicit["split"] == "949,50,1"
     assert DataConfig().to_cfg_dict()["dataset"] is None
 
 

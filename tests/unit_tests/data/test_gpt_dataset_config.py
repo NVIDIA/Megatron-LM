@@ -43,6 +43,12 @@ def test_construction_needs_no_tokenizer_and_derives_the_sources():
     assert mock.tokenizer is None and mock.token_dtype_code is None
     assert mock.mock is True and mock.split is None  # the even split is derived, not written
     assert mock.split_matrix == _base().split_matrix == _base(split="1,1,1").split_matrix
+    # Mock data always uses the even split, whatever split says (as before); split stays as given.
+    explicit = _config(split="949,50,1")
+    assert explicit.mock is True and explicit.split == "949,50,1"
+    assert explicit.split_matrix == mock.split_matrix
+    assert _base(split="100,0,0").split_matrix == mock.split_matrix
+    assert _base(blend=BLEND, split="100,0,0").split_matrix == [(0, 1.0), None, None]
     assert not {"mock", "split_matrix", "token_dtype_code"} & set(
         GPTDatasetConfig.__dataclass_fields__
     )

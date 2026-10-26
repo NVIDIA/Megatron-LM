@@ -132,16 +132,18 @@ class BlendedMegatronDatasetConfig:
     @property
     def split_matrix(self) -> Optional[List[Tuple[float, float]]]:
         """The split matrix consisting of non-overlapping book-ends of each split in order, from
-        ``split`` (an arbitrarily even split when the config is mock and no split was given). For
-        more information, refer to 'convert_split_vector_to_split_matrix'. None with
-        ``blend_per_split``, which carries one blend per split."""
+        ``split``. Mock data always uses an arbitrarily even split, whatever ``split`` says, as it
+        always has; ``split`` itself is left as given. For more information, refer to
+        'convert_split_vector_to_split_matrix'. None with ``blend_per_split``, which carries one
+        blend per split."""
         if self.blend_per_split is not None and any(self.blend_per_split):
             return None
-        split = self.split
-        if split is None:
-            if not self.mock:
-                return None  # validate() rejects a blend without a split
+        if self.mock:
             split = "1,1,1"
+        elif self.split is None:
+            return None  # validate() rejects a blend without a split
+        else:
+            split = self.split
         return convert_split_vector_to_split_matrix(parse_and_normalize_split(split))
 
 

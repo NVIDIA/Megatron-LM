@@ -101,6 +101,11 @@ def test_validate_args_keeps_the_legacy_data_normalizations(warnings_log):
     # The arguments carry no split for a mock run and neither does the section: Megatron Core
     # derives the even split (split_matrix) from the absence of a source.
     assert args.split is None and dataset.split is None and dataset.split_matrix is not None
+    # An explicit --split with mock data is kept on the section but, as before, the mock dataset
+    # uses the even split.
+    explicit = gpt_data_config_from_args(_validated(["--mock-data", "--split", "949,50,1"]))
+    assert explicit.dataset.split == "949,50,1"
+    assert explicit.dataset.split_matrix == dataset.split_matrix
     assert data.dataloader.dataloader_type == "single"
     assert not hasattr(dataset, "phase_transition_iterations")
     varlen = _validated(["--use-varlen-dataset", "--mock-data", "--calculate-per-token-loss"])
