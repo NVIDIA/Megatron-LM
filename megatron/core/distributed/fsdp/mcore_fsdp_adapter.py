@@ -35,12 +35,12 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -429,72 +429,60 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
     def _init_dist_index(self, pg_collection):
         """
         Initialize the distributed index for the module.
+
+        Args:
+            pg_collection: Process groups of the wrapped model. If None, the groups come from the
+                global grid in ``parallel_state``; this fallback is deprecated and emits a
+                ``ProcessGroupFallbackWarning``.
         """
         enable_hsdp = self.ddp_config.num_distributed_optimizer_instances > 1
         if pg_collection is None:
-            # Migration fallback for callers that do not pass pg_collection. The data-parallel
-            # accessors default to the groups that include GTP weight-remat peers; with GTP
-            # weight remat off, these hold the same ranks as the replicate groups that the
-            # pg_collection path reads.
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-            expt_tp_group = parallel_state.get_expert_tensor_parallel_group()
+            # Migration fallback for callers that do not pass pg_collection: every group that
+            # this method reads, from the global grid. The data-parallel fields hold the
+            # replicate groups. With GTP weight remat off, which this class requires, they are
+            # the same groups as the GTP-inclusive ones that the data-parallel accessors return
+            # by default.
+            fallback_groups = ["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
             if enable_hsdp:
-                dp_cp_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=True
-                )
-                outer_fsdp_group = parallel_state.get_inter_distributed_optimizer_instance_group()
-                hybrid_fsdp_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=False
-                )
-                expt_dp_group = parallel_state.get_expert_data_parallel_group(
-                    partial_expert_data_parallel=True
-                )
-                hybrid_fsdp_expt_group = parallel_state.get_expert_data_parallel_group(
-                    partial_expert_data_parallel=False
-                )
-                ep_group = parallel_state.get_expert_model_parallel_group()
-            else:
-                dp_cp_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=False
-                )
-                outer_fsdp_group = None
-                hybrid_fsdp_group = None
-                expt_dp_group = parallel_state.get_expert_data_parallel_group()
-                ep_group = parallel_state.get_expert_model_parallel_group()
-            dp_cp_ag = None
-            expt_dp_ag = None
+                fallback_groups += ["intra_dp_cp", "inter_dist_opt", "intra_expt_dp"]
+            pg_collection = resolve_process_groups(
+                None,
+                owner=type(self).__name__,
+                required=fallback_groups,
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+        required = ["dp_cp"]
+        if enable_hsdp:
+            required += ["intra_dp_cp", "inter_dist_opt"]
+        if self.num_moe_experts is not None:
+            required += ["ep", "expt_dp"]
+            if enable_hsdp:
+                required.append("intra_expt_dp")
+        missing = [name for name in required if vars(pg_collection).get(name) is None]
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__}: pg_collection must provide {missing} "
+                "for this configuration."
+            )
+        # tp, expt_tp and the all-gather groups are optional; unset fields read as None.
+        tp_group = pg_collection.tp
+        expt_tp_group = pg_collection.expt_tp
+        ep_group = pg_collection.ep
+        if enable_hsdp:
+            dp_cp_group = pg_collection.intra_dp_cp
+            outer_fsdp_group = pg_collection.inter_dist_opt
+            hybrid_fsdp_group = pg_collection.dp_cp
+            # This has not been tested yet.
+            expt_dp_group = pg_collection.intra_expt_dp
+            hybrid_fsdp_expt_group = pg_collection.expt_dp
         else:
-            required = ["dp_cp"]
-            if enable_hsdp:
-                required += ["intra_dp_cp", "inter_dist_opt"]
-            if self.num_moe_experts is not None:
-                required += ["ep", "expt_dp"]
-                if enable_hsdp:
-                    required.append("intra_expt_dp")
-            missing = [name for name in required if vars(pg_collection).get(name) is None]
-            if missing:
-                raise ValueError(
-                    f"{type(self).__name__}: pg_collection must provide {missing} "
-                    "for this configuration."
-                )
-            # tp, expt_tp and the all-gather groups are optional; unset fields read as None.
-            tp_group = pg_collection.tp
-            expt_tp_group = pg_collection.expt_tp
-            ep_group = pg_collection.ep
-            if enable_hsdp:
-                dp_cp_group = pg_collection.intra_dp_cp
-                outer_fsdp_group = pg_collection.inter_dist_opt
-                hybrid_fsdp_group = pg_collection.dp_cp
-                # This has not been tested yet.
-                expt_dp_group = pg_collection.intra_expt_dp
-                hybrid_fsdp_expt_group = pg_collection.expt_dp
-            else:
-                dp_cp_group = pg_collection.dp_cp
-                outer_fsdp_group = None
-                hybrid_fsdp_group = None
-                expt_dp_group = pg_collection.expt_dp
-            dp_cp_ag = pg_collection.dp_cp_ag
-            expt_dp_ag = pg_collection.expt_dp_ag
+            dp_cp_group = pg_collection.dp_cp
+            outer_fsdp_group = None
+            hybrid_fsdp_group = None
+            expt_dp_group = pg_collection.expt_dp
+        dp_cp_ag = pg_collection.dp_cp_ag
+        expt_dp_ag = pg_collection.expt_dp_ag
 
         # A collection without a TP or expert TP group runs that axis at size 1. Creating groups
         # is collective, so every rank creates the same single-rank groups in the same order.
@@ -809,7 +797,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
-        if not hasattr(pg_collection, 'dp_cp'):
+        # vars(), not hasattr: an unset field reads as None, so hasattr is always True.
+        if vars(pg_collection).get("dp_cp") is None:
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
         if config.mtp_detach_heads:

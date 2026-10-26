@@ -12,14 +12,14 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, forbid_global_process_groups
 from tools import check_process_group_usage
 
 pytestmark = pytest.mark.skipif(
@@ -187,6 +187,12 @@ def _ranks_in_index(fsdp):
     return ranks
 
 
+@pytest.fixture(autouse=True)
+def fresh_fallback_warnings(monkeypatch):
+    """Each test observes the first process-group fallback warning of every owner."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
 @pytest.fixture
 def global_grid_tp2():
     """A global grid whose layout differs from the collections that the tests pass."""
@@ -304,14 +310,27 @@ def test_collection_missing_a_needed_group_raises(global_grid_tp2, moe, hsdp, fi
         ),
     ],
 )
-def test_standard_grid_collection_selects_the_fallback_ranks(grid, needs):
-    """On the standard grid, the collection path picks the ranks the global fallback picks."""
+def test_standard_grid_fallback_warns_and_selects_the_collection_groups(grid, needs):
+    """Without a collection, the adapter warns and uses the groups of the standard grid.
+
+    It reads the global grid only through the warned resolver. Its index holds the same groups as
+    an index built from the standard grid's collection, and its data-parallel groups are the ones
+    that the data-parallel accessors return by default.
+    """
     _skip_unless_world_size_divisible_by(needs)
     moe = grid.get("expert_model_parallel_size", 1) > 1
     hsdp = grid.get("num_distributed_optimizer_instances", 1) > 1
     Utils.initialize_model_parallel(**grid)
     try:
-        fallback = FullyShardedDataParallelV1(**_fsdp_inputs(moe=moe, hsdp=hsdp))
+        inputs = _fsdp_inputs(moe=moe, hsdp=hsdp)
+        with (
+            forbid_global_process_groups(forbid_shim=False),
+            pytest.warns(
+                ProcessGroupFallbackWarning,
+                match=re.escape("FullyShardedDataParallelV1 was called without `pg_collection`"),
+            ),
+        ):
+            fallback = FullyShardedDataParallelV1(**inputs)
         fallback.stop_communication()
         explicit = FullyShardedDataParallelV1(
             **_fsdp_inputs(moe=moe, hsdp=hsdp),
@@ -319,6 +338,18 @@ def test_standard_grid_collection_selects_the_fallback_ranks(grid, needs):
         )
         explicit.stop_communication()
 
-        assert _ranks_in_index(explicit) == _ranks_in_index(fallback)
+        assert _group_names(_groups_in_index(fallback)) == _group_names(_groups_in_index(explicit))
+        assert _ranks_in_index(fallback) == _ranks_in_index(explicit)
+        index = fallback.megatron_fsdp_dist_index
+        assert _group_names(
+            {"fsdp": index.get_fsdp_group(), "dp": index.get_dp_group()}
+        ) == _group_names(
+            {
+                "fsdp": parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, partial_data_parallel=hsdp
+                ),
+                "dp": parallel_state.get_data_parallel_group(with_context_parallel=True),
+            }
+        )
     finally:
         Utils.destroy_model_parallel()
