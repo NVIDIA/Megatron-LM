@@ -388,11 +388,12 @@ class FsdpModule:
 
     def _release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
         """Select and release gathered storage after the current compute finishes."""
-        groups_to_release = tuple(
-            group
-            for group in self._parameter_groups
-            if not rowwise_only or group.is_rowwise_unsharded
-        )
+        if rowwise_only:
+            groups_to_release = tuple(
+                group for group in self._parameter_groups if group.is_rowwise_unsharded
+            )
+        else:
+            groups_to_release = self._parameter_groups
         if not groups_to_release:
             return
         allgather_stream = self.context.allgather_stream
