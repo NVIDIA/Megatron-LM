@@ -1,11 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -56,10 +59,16 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
     yq.write_text(
         f"#!{sys.executable}\n"
         "import json, sys, yaml\n"
-        "assert sys.argv[1:4] == ['-o', 'json', '[.products[].test_case[]]']\n"
-        "with open(sys.argv[4]) as stream:\n"
+        "assert sys.argv[1:3] == ['-o', 'json']\n"
+        "if len(sys.argv) == 5:\n"
+        "    assert sys.argv[3] == '[.products[].test_case[]]'\n"
+        "else:\n"
+        "    assert sys.argv[3] == "
+        "'[.products[].test_case[] | { \"bucket\": .}] | sort_by(.model, .test_case)'\n"
+        "with open(sys.argv[4]) if len(sys.argv) == 5 else sys.stdin as stream:\n"
         "    recipe = yaml.safe_load(stream)\n"
-        "print(json.dumps([case for product in recipe['products'] for case in product['test_case']]))\n"
+        "cases = [case for product in recipe['products'] for case in product['test_case']]\n"
+        "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
     )
     yq.chmod(0o755)
     for platform in ("h100", "gb200"):
@@ -93,9 +102,13 @@ def test_producer_consumes_the_actual_build_matrix(
             "IS_MAINTAINER": maintainer,
             "ENABLE_GB_TESTING": gb_enabled,
             "REGISTRY_AWS": "h100.example.test/team",
+            "REGISTRY_GCP_H100": "gcp.example.test/team",
             "REGISTRY_GB_GPU": "gb200.example.test/team",
             "SELECTED_RUNNER": "h100-runner",
+            "SELECTED_RUNNER_GCP_H100": "gcp-build-runner",
             "SELECTED_RUNNER_GB_GPU": "gb200-runner",
+            "USE_GCP_H100": "false",
+            "INCLUDE_GCP_H100": "false",
         },
     )
     assert build.returncode == 0, build.stderr
@@ -148,6 +161,58 @@ def test_producer_rejects_an_unsupported_built_platform(
     )
     assert result.returncode != 0
     assert "matrix" not in outputs
+
+
+def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
+    tmp_path: Path, shell_environment: dict[str, str]
+) -> None:
+    build_step = _step("_build_ci_container.yml", "cicd-compute-build-matrix", "compute")
+    build, build_outputs = _run(
+        build_step["run"],
+        tmp_path,
+        {
+            "IS_MAINTAINER": "true",
+            "ENABLE_GB_TESTING": "true",
+            "REGISTRY_AWS": "h100.example.test/team",
+            "REGISTRY_GCP_H100": "gcp.example.test/team",
+            "REGISTRY_GB_GPU": "gb200.example.test/team",
+            "SELECTED_RUNNER": "h100-runner",
+            "SELECTED_RUNNER_GCP_H100": "gcp-build-runner",
+            "SELECTED_RUNNER_GB_GPU": "gb200-runner",
+            "USE_GCP_H100": "false",
+            "INCLUDE_GCP_H100": "true",
+        },
+    )
+    assert build.returncode == 0, build.stderr
+    builds = json.loads(build_outputs["matrix"])["include"]
+    assert {entry["cloud"] for entry in builds} == {"aws-h100", "gcp-h100", "gb-gpu"}
+
+    source_sha = "1234567890abcdef" * 2 + "12345678"
+    producer_step = _step("populate-build-cache.yml", "parse-unit-tests", "matrix")
+    producer, outputs = _run(
+        producer_step["run"],
+        tmp_path,
+        {**shell_environment, "BUILDS": build_outputs["matrix"], "SOURCE_SHA": source_sha},
+    )
+    assert producer.returncode == 0, producer.stderr
+    matrix = json.loads(outputs["matrix"])
+    assert {entry["platform"] for entry in matrix} == {"dgx_h100", "dgx_gb200"}
+
+    for platform, bucket_file, cloud, registry, runner in (
+        ("dgx_h100", "h100", "aws-h100", "h100.example.test/team", "h100-runner"),
+        ("dgx_gb200", "gb200", "gb-gpu", "gb200.example.test/team", "gb200-runner"),
+    ):
+        recipe = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml").read_text()
+        )
+        expected_buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        entries = [entry for entry in matrix if entry["platform"] == platform]
+        assert [entry["bucket"] for entry in entries] == expected_buckets
+        assert all(
+            entry["runner"] == runner
+            and entry["image"] == f"{registry}/megatron-lm:{source_sha}-{cloud}"
+            for entry in entries
+        )
 
 
 @pytest.mark.parametrize(
@@ -398,18 +463,196 @@ def configure_environment(
         "REF": "refs/heads/pull-request/6934",
         "FORCE_RUN_ALL": "false",
         "TEST_PR_LABEL_LOOKUP_EXIT": "0",
+        "H100_TRAFFIC_MODE": "aws",
+        "PREFLIGHT_IS_MEMBER": "true",
+        "IS_MAINTAINER": "true",
+        "EPHEMERAL_RUNNER": "nvidia-ci-aws-gpu-x8-ephemeral",
+        "RUN_ATTEMPT": "1",
+        "REGISTRY_AWS": "h100.example.test/team",
+        "REGISTRY_GCP_H100": "gcp.example.test/team",
     }
 
 
 def _run_configure(
-    tmp_path: Path, environment: dict[str, str], labels: list[str]
+    tmp_path: Path, environment: dict[str, str], labels: list[str], random_seed: int | None = None
 ) -> tuple[subprocess.CompletedProcess, dict]:
     script = _step("cicd-main.yml", "configure", "configure")["run"]
     script = script.replace(
         "${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}", "6934"
     )
     script = script.replace("${{ github.repository }}", "NVIDIA/Megatron-LM")
-    return _run(script, tmp_path, {**environment, "TEST_PR_LABELS": json.dumps(labels)})
+    effective_environment = {
+        **environment,
+        "IS_PR": str(
+            environment["EVENT_NAME"] == "push"
+            and environment["REF"].startswith("refs/heads/pull-request/")
+        ).lower(),
+    }
+    if random_seed is not None:
+        # Seed Bash's RANDOM before the actual workflow script for repeatable
+        # coverage of each 50-50 routing outcome.
+        script = f"RANDOM={random_seed}\n{script}"
+    return _run(script, tmp_path, {**effective_environment, "TEST_PR_LABELS": json.dumps(labels)})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "random_seed", "cloud", "build_runner", "gpu_runner", "registry", "use_gcp"),
+    [
+        pytest.param(
+            {},
+            None,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="member-pr-aws",
+        ),
+        pytest.param(
+            {"H100_TRAFFIC_MODE": "gcp"},
+            None,
+            "gcp-h100",
+            "nvidia-ci-gcp-cpu-h100",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-gcp-h100-x8"},
+            "gcp.example.test/team",
+            "true",
+            id="member-pr-gcp",
+        ),
+        pytest.param(
+            {"H100_TRAFFIC_MODE": "50-50"},
+            3,
+            "gcp-h100",
+            "nvidia-ci-gcp-cpu-h100",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-gcp-h100-x8"},
+            "gcp.example.test/team",
+            "true",
+            id="member-pr-50-50-gcp",
+        ),
+        pytest.param(
+            {"H100_TRAFFIC_MODE": "50-50"},
+            2,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="member-pr-50-50-aws",
+        ),
+        pytest.param(
+            {
+                "PREFLIGHT_IS_MEMBER": "false",
+                "IS_MAINTAINER": "false",
+                "H100_TRAFFIC_MODE": "gcp",
+                "EPHEMERAL_RUNNER": "ephe-v2-example",
+                "RUN_ATTEMPT": "2",
+            },
+            None,
+            "aws-h100",
+            "ephe-v2-example-a2",
+            "ephe-v2-example-a2",
+            "h100.example.test/team",
+            "false",
+            id="external-pr-ephemeral-aws",
+        ),
+        pytest.param(
+            {
+                "EVENT_NAME": "merge_group",
+                "REF": "refs/heads/gh-readonly-queue/main/pr-6934-abc",
+                "H100_TRAFFIC_MODE": "gcp",
+            },
+            None,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="merge-queue-stays-aws",
+        ),
+        pytest.param(
+            {
+                "EVENT_NAME": "workflow_dispatch",
+                "REF": "refs/heads/main",
+                "H100_TRAFFIC_MODE": "gcp",
+            },
+            None,
+            "aws-h100",
+            "nvidia-ci-aws-cpu",
+            {"group": "nemo-ci-gpu-x8", "labels": "nvidia-ci-aws-gpu-x8"},
+            "h100.example.test/team",
+            "false",
+            id="dispatch-stays-aws",
+        ),
+    ],
+)
+def test_h100_runner_traffic_routing(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    overrides: dict[str, str],
+    random_seed: int | None,
+    cloud: str,
+    build_runner: str,
+    gpu_runner: dict[str, str] | str,
+    registry: str,
+    use_gcp: str,
+) -> None:
+    result, outputs = _run_configure(
+        tmp_path, {**configure_environment, **overrides}, [], random_seed=random_seed
+    )
+    assert result.returncode == 0, result.stderr
+    assert outputs["h100_cloud"] == cloud
+    assert outputs["h100_build_runner"] == build_runner
+    assert json.loads(outputs["h100_gpu_runs_on"]) == gpu_runner
+    assert outputs["h100_registry"] == registry
+    assert outputs["h100_use_gcp"] == use_gcp
+
+
+def test_nemo_cicd_validator_declares_every_needs_reference_directly() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())
+    job = workflow["jobs"]["Nemo_CICD_Test"]
+    direct_dependencies = set(job["needs"])
+    referenced_dependencies = set(re.findall(r"needs\.([A-Za-z0-9_-]+)", yaml.safe_dump(job)))
+    assert "configure" in direct_dependencies
+    assert (
+        job["steps"][-1]["env"]["RUN_H100_FUNCTIONAL"]
+        == "${{ needs.configure.outputs.run_h100_functional }}"
+    )
+    assert referenced_dependencies <= direct_dependencies
+
+
+@pytest.mark.parametrize(
+    ("run_h100_functional", "h100_result", "expected_success"),
+    [("true", "skipped", False), ("false", "skipped", True), ("true", "success", True)],
+)
+def test_nemo_cicd_validator_checks_h100_functional_result(
+    tmp_path: Path, run_h100_functional: str, h100_result: str, expected_success: bool
+) -> None:
+    gh = tmp_path / "bin/gh"
+    gh.parent.mkdir(parents=True)
+    gh.write_text("#!/bin/sh\nprintf '0\\n'\n")
+    gh.chmod(0o755)
+    step = _step("cicd-main.yml", "Nemo_CICD_Test", "result")
+    result, _ = _run(
+        step["run"],
+        tmp_path,
+        {
+            "PATH": f"{gh.parent}{os.pathsep}{os.environ['PATH']}",
+            "GH_TOKEN": "test-token",
+            "GITHUB_RUN_ID": "1",
+            "DOCS_ONLY": "false",
+            "IS_DEPLOYMENT": "false",
+            "IS_MAINTAINER": "true",
+            "IS_CI_WORKLOAD": "false",
+            "FORCE_RUN_ALL": "false",
+            "RUN_H100_FUNCTIONAL": run_h100_functional,
+            "GB200_SHOULD_RUN": "false",
+            "ENABLE_GB200_TESTING": "false",
+            "UNIT_RESULT": "success",
+            "UNIT_GB200_RESULT": "skipped",
+            "H100_RESULT": h100_result,
+            "GB200_RESULT": "skipped",
+        },
+    )
+    assert (result.returncode == 0) == expected_success, result.stdout + result.stderr
 
 
 def test_selective_default_uses_the_repository_variable() -> None:
@@ -522,3 +765,295 @@ def test_full_test_guards_override_selective_requests(
     summary = (tmp_path / "summary").read_text()
     assert f"| `unit_testmon_requested` | `{str(requested).lower()}` |" in summary
     assert "| `unit_testmon_eligible` | `false` |" in summary
+
+
+@pytest.mark.parametrize("has_tests", [False, True], ids=["empty", "selected"])
+def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_environment, has_tests):
+    # Hosted runners provide zstd, but the existing GPU baselines use gzip.
+    zstd = tmp_path / "zstd"
+    zstd.write_text("#!/bin/sh\nprintf '1.5.7\\n'\n")
+    zstd.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+    result, compression = _run(
+        _step("_unit-tests.yml", "select", "cache-compression")["run"],
+        tmp_path,
+        {**environment, "RUNNER_TEMP": str(tmp_path)},
+    )
+    assert result.returncode == 0, result.stderr
+    restore = _step("_unit-tests.yml", "select", "plan")
+    assert restore["env"]["PATH"] == "${{ steps.cache-compression.outputs.path }}"
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    assert all(
+        "PATH" not in step.get("env", {})
+        for step in workflow["jobs"]["select"]["steps"]
+        if step.get("id") != "plan"
+    )
+    probe = subprocess.run(
+        ["zstd", "--quiet", "--version"],
+        env={**environment, "PATH": compression["path"]},
+        text=True,
+        capture_output=True,
+    )
+    # The pinned cache action uses gzip when the version probe emits no output.
+    assert probe.stdout == probe.stderr == ""
+    assert probe.returncode != 0
+    assert (
+        subprocess.check_output(["zstd", "--quiet", "--version"], env=environment, text=True)
+        == "1.5.7\n"
+    )
+
+    bucket = "tests/unit_tests/test_example.py"
+    outputs = {"has_tests": str(has_tests).lower()}
+    assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
+    assert workflow["jobs"]["select"]["name"] == "unit tests selection"
+    assert workflow["jobs"]["select"]["if"] == "inputs.unit_testmon_mode == 'enforce'"
+    for step in workflow["jobs"]["select"]["steps"]:
+        assert "unit_testmon_mode" not in step.get("if", "")
+    for platform, parser_job, output in (
+        ("h100", "cicd-parse-unit-tests", "unit-tests"),
+        ("gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+    ):
+        parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
+        result, parsed = _run(parser["run"], tmp_path, shell_environment)
+        assert result.returncode == 0, result.stderr
+        recipe = yaml.safe_load(
+            (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
+        )
+        assert json.loads(parsed[output]) == [
+            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+        ]
+    assert restore["env"]["BUCKETS"] == "${{ inputs.buckets }}"
+    assert workflow[True]["workflow_call"]["inputs"]["buckets"]["required"] is True
+    assert workflow[True]["workflow_call"]["inputs"]["buckets"]["type"] == "string"
+    assert workflow["jobs"]["run"]["needs"] == "select"
+    expression = workflow["jobs"]["run"]["if"].removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("!cancelled()", "True").replace("&&", "and").replace("||", "or")
+    needs = SimpleNamespace(
+        select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
+    )
+    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    context = {"needs": needs, "inputs": inputs}
+    assert eval(expression, {"__builtins__": {}}, context) == has_tests
+    assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
+        "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
+    )
+    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
+        "${{ matrix.mode || 'full' }}"
+    )
+
+    # CPU failures stop GPU scheduling; full-suite requests bypass selection.
+    needs.select.result = "failure"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    needs.select.result = "skipped"
+    assert not eval(expression, {"__builtins__": {}}, context)
+    inputs.unit_testmon_mode = "full"
+    assert eval(expression, {"__builtins__": {}}, context)
+    callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
+    for caller, parser, output in (
+        ("cicd-unit-tests-latest", "cicd-parse-unit-tests", "unit-tests"),
+        ("cicd-unit-tests-latest-gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+    ):
+        assert "strategy" not in callers[caller]
+        assert parser in callers[caller]["needs"]
+        assert callers[caller]["with"]["buckets"] == (
+            "${{ needs." + parser + ".outputs." + output + " }}"
+        )
+    coverage = _step("cicd-main.yml", "Coverage", "coverage")
+    for variable, job, output in (
+        ("H100_BUCKETS", "cicd-parse-unit-tests", "unit-tests"),
+        ("GB200_BUCKETS", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+    ):
+        assert job in callers["Coverage"]["needs"]
+        assert coverage["env"][variable] == (
+            "${{ needs." + job + ".outputs." + output + " || '[]' }}"
+        )
+
+    for platform in ("dgx_h100", "dgx_gb200"):
+        directory = tmp_path / f"unit-test-plan-{platform}"
+        directory.mkdir()
+        (directory / "plan.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "source_sha": "a" * 40,
+                    "bucket": bucket,
+                    "platform": platform,
+                    "mode": "selected",
+                    "phases": {"prod": [bucket] if has_tests else [], "experimental": []},
+                }
+            )
+        )
+    result, outputs = _run(
+        coverage["run"],
+        tmp_path,
+        {
+            "SELECTIVE": "true",
+            "H100_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "GB200_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "SOURCE_SHA": "a" * 40,
+        },
+    )
+    # Missing coverage is valid only when every bucket selected no tests.
+    assert (result.returncode == 0) == (not has_tests), result.stdout + result.stderr
+    assert outputs == ({} if has_tests else {"has_coverage": "false"})
+
+
+@pytest.mark.parametrize(
+    "scenario", ["mixed", "empty", "cache-error", "selector-error", "upload-error"]
+)
+def test_grouped_cpu_selection(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    pytest.importorskip("testmon")
+    buckets = [
+        {"bucket": f"tests/unit_tests/{name}/**/*.py", "timeout": 40}
+        for name in (["empty"] if scenario == "empty" else ["selected", "empty", "full"])
+    ]
+    unit_tests = tmp_path / "tests/unit_tests"
+    unit_tests.mkdir(parents=True)
+    for script in (
+        "testmon_cache.py",
+        "testmon_selector.py",
+        "testmon_plan.py",
+        "testmon_mandatory.py",
+        "find_test_cases.py",
+    ):
+        (unit_tests / script).symlink_to(ROOT / "tests/unit_tests" / script)
+    (unit_tests / "testmon_mandatory_tests.yaml").write_text("mappings: []\n")
+    dataset = tmp_path / "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text("")
+    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text(
+        json.dumps({"products": [{"test_case": [entry["bucket"] for entry in buckets]}]})
+    )
+    selected = unit_tests / "selected/test_case.py"
+    selected.parent.mkdir()
+    selected.write_text("def test_case(): pass\n")
+    pr_files = tmp_path / "pr-files"
+    pr_files.mkdir()
+    (pr_files / "changed-files").write_text("")
+    (pr_files / "metadata.json").write_text(
+        json.dumps({"tested_sha": "a" * 40, "changed_paths": 0})
+    )
+    environment = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+        "PYTHONPATH": str(unit_tests),
+        "BUCKETS": json.dumps(buckets),
+        "RECIPE_PLATFORM": "dgx_h100",
+        "SOURCE_SHA": "a" * 40,
+        "TARGET_BRANCH": "main",
+        "PR_FILES_DIR": str(pr_files),
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_OUTPUT": str(tmp_path / "outputs"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+    }
+    # Empty recorded databases are sufficient: a new file is selected, and a
+    # bucket without files is skipped. Use real cache validation and selection.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import json, os
+from pathlib import Path
+from testmon.db import DB
+from testmon_cache import PHASES, cache_identity, record_phase, finalize
+for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
+    if '/full/' in entry['bucket']:
+        continue
+    directory = Path('saved') / str(index)
+    for phase in PHASES:
+        database = directory / phase / '.testmondata'
+        database.parent.mkdir(parents=True)
+        DB(str(database)).con.close()
+        record_phase(directory, phase)
+    identity = cache_identity(Path.cwd(), entry['bucket'], 'dgx_h100')
+    finalize(directory, identity, 'b' * 40, '111-1')
+""",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    spec = importlib.util.spec_from_file_location(
+        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+    )
+    assert spec is not None and spec.loader is not None
+    selector = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(selector)
+    monkeypatch.chdir(tmp_path)
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    uploads = []
+    restores = 0
+
+    def actions(operation, *args):
+        nonlocal restores
+        if operation == "restore":
+            path, key, prefix, key_file = args
+            assert path == "assets_dir/testmon"
+            assert key == f"{prefix}lookup-123-2"
+            assert not Path(path).exists(), "previous bucket cache was not cleared"
+            index = restores
+            restores += 1
+            if scenario == "selector-error" and index == 1:
+                (unit_tests / "testmon_selector.py").unlink()
+            if scenario == "cache-error" and index == 0:
+                raise subprocess.CalledProcessError(1, [operation])
+            saved = tmp_path / "saved" / str(index)
+            if saved.exists():
+                shutil.copytree(saved, path)
+            Path(key_file).write_text(f"{prefix}111-1" if saved.exists() else "")
+        else:
+            assert operation == "upload"
+            if scenario == "upload-error":
+                raise subprocess.CalledProcessError(1, [operation])
+            name, plan, root = args
+            assert root == "assets_dir/testmon-plan"
+            assert plan == f"{root}/plan.json"
+            uploads.append({"name": name, "plan": json.loads(Path(plan).read_text())})
+
+    monkeypatch.setattr(selector, "_actions", actions)
+    if scenario in {"selector-error", "upload-error"}:
+        with pytest.raises(subprocess.CalledProcessError):
+            selector.main()
+        assert not (tmp_path / "outputs").exists()
+        assert restores == (2 if scenario == "selector-error" else 1)
+        assert len(uploads) == (1 if scenario == "selector-error" else 0)
+        return
+    selector.main()
+    assert restores == len(buckets)
+    outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
+    matrix = json.loads(outputs["matrix"])
+    assert outputs["has_tests"] == str(scenario != "empty").lower()
+    assert [entry["bucket"] for entry in matrix] == [
+        entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
+    ]
+    assert [entry["mode"] for entry in matrix] == (
+        []
+        if scenario == "empty"
+        else ["full" if scenario == "cache-error" else "preselected", "full"]
+    )
+    assert all(entry["timeout"] == 40 for entry in matrix)
+    assert bool(caplog.records) == (scenario == "cache-error")
+    for upload in uploads:
+        plan = upload["plan"]
+        assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])
+        expected = (
+            ["tests/unit_tests/selected/test_case.py"] if "/selected/" in plan["bucket"] else []
+        )
+        assert plan["phases"] == {"prod": expected, "experimental": expected}
+        assert plan["source_sha"] == "a" * 40
+        matches = [entry for entry in matrix if entry["bucket"] == plan["bucket"]]
+        assert bool(matches) == bool(expected)
+        if matches:
+            assert matches[0]["plan_artifact"] == upload["name"]
+    assert any("/empty/" in upload["plan"]["bucket"] for upload in uploads)
+    assert all(entry["plan_artifact"] == "" for entry in matrix if entry["mode"] == "full")

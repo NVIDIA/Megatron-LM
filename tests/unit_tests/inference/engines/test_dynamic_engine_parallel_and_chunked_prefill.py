@@ -139,14 +139,21 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize(
-        "async_sched_mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC]
+        ("async_sched_mode", "num_cuda_graphs"),
+        [
+            pytest.param(AsyncScheduleMode.LEGACY, None, id="legacy-eager"),
+            pytest.param(AsyncScheduleMode.ASYNC, None, id="async-eager"),
+            pytest.param(AsyncScheduleMode.ASYNC, 1, id="async-cuda-graph"),
+        ],
     )
     @torch.inference_mode()
-    def test_non_greedy_sampling_with_mamba_mtp_ep(self, async_sched_mode):
-        """Run cumulative Mamba, MTP, and EP sampling support to completion.
+    def test_non_greedy_sampling_with_mamba_mtp_ep(self, async_sched_mode, num_cuda_graphs):
+        """Run cumulative Mamba, MTP, EP, and routing capture to completion.
 
         Args:
             async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
+            num_cuda_graphs (Optional[int]): Number of CUDA graph buckets, or
+                ``None`` for eager execution.
         """
         skip_if_mamba_sequence_packing_not_available("hybrid")
         if int(os.environ.get("WORLD_SIZE", "1")) < 2:
@@ -169,6 +176,11 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             skip_prompt_log_probs=True,
             context_max_requests=8,
             async_sched_mode=async_sched_mode,
+            moe_enable_routing_replay=True,
+            moe_pad_experts_for_cuda_graph_inference=num_cuda_graphs is not None,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
         )
 
         assert all(request.status == Status.COMPLETED for request in env.requests)
@@ -1405,14 +1417,15 @@ class TestChunkedPrefillCudaGraphs:
         ssm_mixer="mamba",
         hidden_size=32,
         num_query_groups=None,
-        flash_attention_version=None,
+        flash_attention_version=2,
         init_method_std=0.02,
     ):
         """Create a GPT or hybrid model with optional CUDA graph support.
 
         `ssm_mixer` selects the hybrid stack's linear-attention mixer ("mamba"
         or "gdp"); it is ignored for GPT. `hidden_size`, `num_query_groups`,
-        `flash_attention_version` and `init_method_std` apply to GPT only.
+        and `init_method_std` apply to GPT only. `flash_attention_version`
+        applies to both model types.
         """
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
 
@@ -1446,6 +1459,7 @@ class TestChunkedPrefillCudaGraphs:
         elif model_provider == "hybrid":
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
+                flash_attention_version=flash_attention_version,
                 num_layers=3,
                 hidden_size=256,
                 **hybrid_mixer_kwargs(ssm_mixer),

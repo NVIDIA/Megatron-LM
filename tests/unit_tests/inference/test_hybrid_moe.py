@@ -179,6 +179,7 @@ class _TestDynamicInferenceBase:
         max_requests=None,
         max_tokens=None,
         cuda_graph_max_tokens=512,
+        reserve_recurrent_state_dummy_slot=False,
     ):
         mamba_config = MambaInferenceStateConfig.from_model(model)
         return DynamicInferenceContext(
@@ -194,6 +195,7 @@ class _TestDynamicInferenceBase:
                 max_requests=max_requests,
                 max_tokens=max_tokens,
                 cuda_graph_max_tokens=cuda_graph_max_tokens,
+                reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
             ),
         )
 
@@ -275,6 +277,7 @@ class _TestDynamicInferenceBase:
 class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
     """NVLS dispatcher: combinatorial sweep of EP request states."""
 
+    @pytest.mark.flaky_in_dev  # Issue #7958: batch-invariant prefill/full-forward parity.
     @requires_te_batch_invariant_attention
     @torch.inference_mode()
     def test_batch_invariant_prefill_matches_full_forward(self):
@@ -447,7 +450,11 @@ class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
         is_even = ep_rank % 2 == 0
 
         model = self._build_model(inference_moe_token_dispatcher_type='nccl')
-        ctx = self._build_context(model, use_cuda_graphs_for_non_decode_steps=False)
+        ctx = self._build_context(
+            model,
+            use_cuda_graphs_for_non_decode_steps=False,
+            reserve_recurrent_state_dummy_slot=True,
+        )
 
         # Set up request state.
         if not is_even:

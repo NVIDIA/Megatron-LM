@@ -18,18 +18,21 @@ import dataclasses
 import functools
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from contextvars import ContextVar
 
-import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpContext, FsdpModule
+from .context import FsdpContext, current_fully_shard_context
+from .module import FsdpModule
 from .schedule import SchedulePolicy
 
-_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
+# TODO(wujingyue): Separate fully_shard_context from FsdpContext in a follow-up PR.
+# Scope management and shared runtime state are separate responsibilities (SRP):
+# https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html
+# Keep this alias for now to avoid changing callers and limit this PR's scope.
+fully_shard_context = FsdpContext
 
 MeshAxis = int | str
 
@@ -60,83 +63,15 @@ class Placements:
                 raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
-def current_fully_shard_context() -> FsdpContext | None:
-    """Return the innermost active ``fully_shard_context``, or ``None``.
-
-    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
-    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
-    active. Callers that must share one context -- for example per-chunk wrappers built by
-    a single wrap call -- use it to join the caller's ambient context instead of opening a
-    second one.
-    """
-    return _FSDP_CONTEXT.get()
-
-
-@contextmanager
-def fully_shard_context(
-    device: torch.device | None = None,
-    *,
-    use_symmetric_memory: bool = False,
-    unify_communication_stream: bool = False,
-    parameter_to_owner: dict[nn.Parameter, int] | None = None,
-    caller_managed_grad_sync: bool = False,
-) -> Iterator[FsdpContext]:
-    """Construct FSDP modules that share runtime streams and prefetch orders.
-
-    Independent roots are ordered by their root-level ``fully_shard`` calls.
-    Construction must finish before any of the registered modules run forward.
-
-    Args:
-        device: CUDA device on which to create communication streams. Defaults to
-            the current CUDA device.
-        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
-            NCCL symmetric-memory pool.
-        unify_communication_stream: Whether all-gathers and reduce-scatters share one
-            communication stream to reduce peak transient memory. See
-            https://github.com/NVIDIA/Megatron-LM/issues/6471.
-        parameter_to_owner: Construction-time owner assignments for TensorAtomic
-            parameters, keyed by the original parameters before sharding. Owners are
-            ranks in each parameter group's 1-D data-parallel mesh and must agree across
-            that mesh. Every TensorAtomic parameter needs an entry; other entries are
-            ignored. Tensors are packed by owner without changing logical parameter order.
-        caller_managed_grad_sync: Disable the automatic autograd completion callback,
-            allowing delayed weight gradients or custom backward schedules. The caller must
-            call ``context.finish_grad_sync()`` after all backward work and before reading
-            or modifying gradients.
-    """
-    if _FSDP_CONTEXT.get() is not None:
-        raise RuntimeError("fully_shard_context does not support nesting.")
-
-    device = device or torch.device("cuda", torch.cuda.current_device())
-    if device.type != "cuda":
-        raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
-
-    context = FsdpContext(
-        device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        unify_communication_stream=unify_communication_stream,
-        parameter_to_owner=parameter_to_owner,
-        caller_managed_grad_sync=caller_managed_grad_sync,
-    )
-    token = _FSDP_CONTEXT.set(context)
-    try:
-        yield context
-    except Exception:
-        raise
-    else:
-        context.finalize()
-    finally:
-        _FSDP_CONTEXT.reset(token)
-
-
 def fully_shard(
     module: nn.Module,
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    grad_divisor: int = 1,
+    grad_scale: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     register_hooks: bool = True,
+    grad_accumulation_count: int | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -149,8 +84,7 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        grad_divisor: Additional divisor applied to the reduced gradient, on top of the
-            averaging the mesh already performs. Defaults to 1, which is correct whenever
+        grad_scale: Multiplier applied after mesh averaging. Defaults to 1, which is correct when
             each mesh rank contributes exactly one term to the gradient.
 
             Expert parallelism is the motivating case. A rank's experts process tokens
@@ -158,17 +92,25 @@ def fully_shard(
             pass routes those tokens' gradients back, so a rank's expert gradient already
             sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
             the expert-data-parallel mesh alone therefore divides by too little, and
-            ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
-            their own rank's tokens and need no divisor.
+            ``grad_scale=1 / ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no additional scaling.
+
+            For per-token loss, ``grad_scale=mesh.size()`` cancels mesh averaging
+            so gradients are summed. Normalize once by the global token count after
+            accumulating all microbatches and before clipping or updating weights.
         schedule_policy: Communication scheduling policy for this FSDP module.
         register_hooks: Whether to register the automatic forward and backward execution
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
+        grad_accumulation_count: Total parameter-gradient callbacks per reduction
+            window, including contributions from separate GraphTasks and delayed
+            weight gradients. Defaults to one per owned trainable parameter.
+            The scheduler must declare the complete count before sharding the unit.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
-    context = _FSDP_CONTEXT.get()
+    context = current_fully_shard_context()
     if context is None:
         raise RuntimeError("fully_shard must run inside fully_shard_context.")
     for submodule in module.modules():
@@ -192,10 +134,11 @@ def fully_shard(
             main_grad_placements=tuple(placements.gradient),
             main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
-            grad_divisor=grad_divisor,
+            grad_scale=grad_scale,
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             register_hooks=register_hooks,
+            grad_accumulation_count=grad_accumulation_count,
         )
     except Exception:
         module.__class__ = original_cls
@@ -234,13 +177,13 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
     """Mark an FSDP microbatch as the last accumulation microbatch.
 
-    At present, this is only needed for HSDP/HFSDP gradient accumulation, so
-    FSDP finalizes gradients only on the last backward. Plain all-``Shard(0)`` data
-    parallelism finalizes gradients on every backward and does not need it.
+    Non-final microbatches still release unsharded weights, but defer automatic
+    gradient synchronization. HSDP/HFSDP also defer DP-outer gradient reduction
+    until the last microbatch. Wrap both forward and backward in this scope.
 
     Args:
         context: FSDP context whose roots should use this microbatch state.
-        is_last: Whether forwards in this scope are for the last microbatch.
+        is_last: Whether this scope contains the last accumulation microbatch.
     """
     context.ensure_finalized()
     previous_state = context.is_last_microbatch

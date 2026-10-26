@@ -643,10 +643,9 @@ def test_attention_shortcut_wide_residual_ep2_serial_overlap_parity(
 
         def record_residual_writes(model, mode):
             def hook(_module, _args, kwargs, output):
-                if kwargs.get("operation") == "write":
-                    residual_write_dtypes[mode].append(output.dtype)
+                residual_write_dtypes[mode].append(output.dtype)
 
-            model.layers[0].moe_layer.residual_connection_mlp.register_forward_hook(
+            model.layers[0].moe_layer.residual_write_mlp.register_forward_hook(
                 hook, with_kwargs=True
             )
 
@@ -1273,13 +1272,13 @@ class TestHybridBlock:
         recomputed_output, recomputed_gradients = run(recomputed, recomputed_input)
 
         shortcut = recomputed.layers[0]
-        compute_read = getattr(shortcut.compute_layer, "residual_connection", None)
+        compute_read = getattr(shortcut.compute_layer, "residual_read", None)
         if compute_read is None:
-            compute_read = shortcut.compute_layer.residual_connection_self_attn
+            compute_read = shortcut.compute_layer.residual_read_self_attn
         independent_reads = (
             shortcut.shortcut_residual_read,
             compute_read,
-            shortcut.moe_layer.residual_connection_mlp,
+            shortcut.moe_layer.residual_read_mlp,
         )
         assert all(residual_read is not None for residual_read in independent_reads)
         assert len({id(read.read_map.logit) for read in independent_reads}) == 3
@@ -1412,12 +1411,14 @@ class TestHybridBlock:
         """With the "gdn2" variant, 'G' builds GatedDeltaNet2 while '*' still wraps
         SelfAttention.
 
-        `deterministic_mode` selects GDN2's pure-torch kernel fallback so this test
-        also runs without flash-linear-attention; the env var is Transformer Engine's
-        requirement for deterministic mode.
+        `gdn_kernel_backend="torch"` selects GDN2's pure-torch kernel so this test also
+        runs without flash-linear-attention; deterministic mode requires that backend,
+        and the env var is Transformer Engine's requirement for deterministic mode.
         """
         monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
-        block = self.get_gdn2_hybrid_block(Symbols.GDN + Symbols.ATTENTION, deterministic_mode=True)
+        block = self.get_gdn2_hybrid_block(
+            Symbols.GDN + Symbols.ATTENTION, deterministic_mode=True, gdn_kernel_backend="torch"
+        )
         layers = block.layers
         assert isinstance(layers[0], TransformerLayer)
         assert isinstance(layers[0].self_attention, GatedDeltaNet2)

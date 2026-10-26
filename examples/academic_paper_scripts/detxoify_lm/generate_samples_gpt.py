@@ -26,7 +26,7 @@ from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.global_vars import initialize_runtime_services, set_run_config
+from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -233,7 +233,6 @@ def main():
                                            'no_load_optim': True,
                                            'seq_length': 2048})
     set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
-    initialize_runtime_services(args)
     initialize_megatron()
 
     # Set up model and load checkpoint

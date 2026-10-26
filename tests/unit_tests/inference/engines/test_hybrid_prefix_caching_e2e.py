@@ -169,6 +169,7 @@ class TestMambaPrefixCachingE2E:
 
     def _create_model(self, num_cuda_graphs=None):
         transformer_config = TransformerConfig(
+            flash_attention_version=2,
             params_dtype=torch.bfloat16,
             num_layers=3,
             hidden_size=256,
