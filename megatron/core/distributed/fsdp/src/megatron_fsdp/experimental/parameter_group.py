@@ -423,6 +423,11 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
+    def _switch_to_unsharded_parameters(self) -> None:
+        """Expose each FsdpParameter's unsharded Parameter on its owning module."""
+        for fsdp_parameter in self.fsdp_parameters:
+            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
+
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
         if isinstance(self.post_optimizer_model_weight, DBuffer):
@@ -454,7 +459,8 @@ class FsdpParameterGroup:
         """Prepare this group's Parameters for the requested compute phase.
 
         On the caller-selected all-gather stream, refresh compute weights, gather
-        missing data if sharded, install the Parameters, and record readiness.
+        missing data if sharded, update FsdpParameters, switch the module's
+        Parameters to their unsharded representations, and record readiness.
         Reuse existing events so compute never waits for a later prefetch when its
         weights are already available.
         """
@@ -474,10 +480,10 @@ class FsdpParameterGroup:
             unsharded_model_weight = self.model_weight
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(unsharded_model_weight, DBuffer):
-            self._all_gather_model_weight()
+            self._allgather_model_weight()
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
-            self._all_gather_model_weight(
+            self._allgather_model_weight(
                 rowwise=Phase.FORWARD in missing_phases, columnwise=Phase.BACKWARD in missing_phases
             )
             ready_phases = missing_phases
@@ -486,6 +492,7 @@ class FsdpParameterGroup:
             rowwise=Phase.FORWARD in ready_phases,
             columnwise=Phase.BACKWARD in ready_phases,
         )
+        self._switch_to_unsharded_parameters()
         event = torch.cuda.current_stream().record_event()
         for ready_phase in ready_phases:
             self._unshard_events[ready_phase] = event
@@ -504,7 +511,7 @@ class FsdpParameterGroup:
         rowwise: bool = True,
         columnwise: bool = True,
     ) -> None:
-        """Update compute Parameters' data and install them on their owning modules.
+        """Update each FsdpParameter's unsharded data and scales from the weight buffer.
 
         ``rowwise`` and ``columnwise`` select the newly gathered MXFP8 planes to
         install, preserving planes already installed for the other phase. Regular
@@ -522,9 +529,8 @@ class FsdpParameterGroup:
                 update_mxfp8_tensor(
                     tensor_view, fsdp_parameter.unsharded, rowwise=rowwise, columnwise=columnwise
                 )
-            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
-    def _all_gather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
+    def _allgather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
         """Allocate the gather buffer and fill it from sharded compute weights.
 
         ``rowwise`` and ``columnwise`` select the MXFP8 planes to gather. Regular
