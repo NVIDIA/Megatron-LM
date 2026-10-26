@@ -49,6 +49,7 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import (
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
@@ -817,9 +818,10 @@ class _InQuantizationContext(torch.nn.Module):
         super().__init__()
         self.module = module
         self.config = config
+        self.pg_collection = global_amax_groups()
 
     def forward(self, *args):
-        with get_fp8_context(self.config):
+        with get_fp8_context(self.config, pg_collection=self.pg_collection):
             return self.module(*args)
 
 
