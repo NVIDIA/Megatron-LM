@@ -7,8 +7,11 @@ from dataclasses import dataclass, field, replace
 import torch
 from torch import nn
 
+from megatron.core.extensions.transformer_engine import te_checkpoint
+from megatron.core.fp8_utils import get_fp8_context, get_fp8_recipe, is_first_last_bf16_layer
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_stack_adapter import HybridStackForwardContext
+from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.experimental_attention_variant.csa2_module_spec import (
     csa2_layer_spec,
 )
@@ -45,17 +48,19 @@ class _LayerRegion(nn.Module):
         """Export the objective so logging and loss scaling execute only once."""
         boundary = self.layer.layer_number - 1
         csa, mhc, packed = self.codec.restore(values, boundary)
-        engram = getattr(self.layer, 'engram', None)
-        if engram is not None:
-            mask = csa.thd_layout.valid_tokens.unsqueeze(0) if packed is not None else None
-            hidden = engram(hidden, values['hashes'], mask)
-        hidden, _ = self.layer(
-            hidden_states=hidden,
-            cross_layer_state=csa,
-            mhc_state=mhc,
-            packed_seq_params=packed,
-            **self.kwargs,
-        )
+        # Checkpoint replay runs after the stack's per-layer FP8 context has exited.
+        with get_fp8_context(self.layer.config, boundary):
+            engram = getattr(self.layer, 'engram', None)
+            if engram is not None:
+                mask = csa.thd_layout.valid_tokens.unsqueeze(0) if packed is not None else None
+                hidden = engram(hidden, values['hashes'], mask)
+            hidden, _ = self.layer(
+                hidden_states=hidden,
+                cross_layer_state=csa,
+                mhc_state=mhc,
+                packed_seq_params=packed,
+                **self.kwargs,
+            )
         return hidden, self.codec.snapshot(csa, mhc, values, boundary + 1, loss=self.loss)
 
 
@@ -156,17 +161,39 @@ class DeepSeekV41Adapter:
                     raise ValueError(
                         'Variable-split Engram EP lookup remains outside layer capture'
                     )
+                capture_kwargs = {}
+                if c.fp8:
+                    if context.capture['backend'] != 'transformer_engine':
+                        raise ValueError('V4.1 FP8 layer capture requires the TE graph backend')
+                    capture_kwargs = dict(
+                        fp8_enabled=not is_first_last_bf16_layer(c, layer_id),
+                        fp8_recipe=get_fp8_recipe(c),
+                        fp8_group=self.pg_collection.tp,
+                    )
                 self.graphs[graph_key] = StatefulGraphs(
                     region,
                     hidden_states,
                     values,
                     slots=context.capture['slots'],
                     backend=context.capture['backend'],
+                    capture_kwargs=capture_kwargs,
                 )
                 self._next_slot[graph_key] = (0, context.capture['slots'])
             graph = self.graphs.get(graph_key)
             if graph is None:
-                hidden_states, values = region.run(hidden_states, values, recompute=recompute)
+                if recompute and c.fp8:
+                    result = te_checkpoint(
+                        region,
+                        False,
+                        get_cuda_rng_tracker,
+                        self.pg_collection.tp,
+                        hidden_states,
+                        *region.inputs.pack(values),
+                        use_reentrant=False,
+                    )
+                    hidden_states, values = region.restore_result(result, values)
+                else:
+                    hidden_states, values = region.run(hidden_states, values, recompute=recompute)
             else:
                 slot, slots = self._next_slot[graph_key]
                 hidden_states, values = graph.run(hidden_states, values, slot=slot)

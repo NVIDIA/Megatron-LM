@@ -1706,6 +1706,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(f"Unsupported dsv4_version: {self.dsv4_version}")
         if self.dsv4_version == "v4.1" and self.experimental_attention_variant != "dsv4_hybrid":
             raise ValueError("V4.1 requires experimental_attention_variant='dsv4_hybrid'")
+        if self.dsa_indexer_precision != "bf16" and self.dsv4_version != "v4.1":
+            raise ValueError("MXFP8 indexer selection is currently supported by CSA2 only")
         self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (
