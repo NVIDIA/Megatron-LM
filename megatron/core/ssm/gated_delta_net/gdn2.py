@@ -103,8 +103,8 @@ class GatedDeltaNet2(_GDNBase):
             raise ValueError(
                 "deterministic_mode=True requires gdn_kernel_backend='torch' for GDN2."
             )
-        if backend == "transformer_engine":
-            raise ValueError("GDN2 does not support gdn_kernel_backend='transformer_engine'.")
+        if backend in ("transformer_engine", "cudnn", "internal"):
+            raise ValueError(f"GDN2 does not support gdn_kernel_backend={backend!r}.")
         if backend == "torch":
             self.gdn_backend = "torch"
             self.gated_delta_rule = torch_chunk_gdn2

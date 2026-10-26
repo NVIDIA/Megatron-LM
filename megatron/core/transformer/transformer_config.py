@@ -19,6 +19,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -492,10 +493,35 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
-    gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
+    gdn_kernel_backend: Literal["transformer_engine", "fla", "torch", "cudnn", "internal"] = "fla"
     """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
-    there is no automatic fallback. ``torch`` selects the PyTorch-native reference
-    implementation and is required when deterministic mode is enabled."""
+    there is no automatic fallback between these values. ``torch`` selects the PyTorch-native
+    reference implementation and is required when deterministic mode is enabled.
+
+    ``cudnn`` uses cuDNN Frontend's FLA-compatible GDN adapter
+    (``cudnn.fla.accelerate_fla``), which keeps its own automatic fla fallback for
+    unsupported inputs; with context parallelism it supports only headwise CP, and with
+    attention CUDA-graph capture it requires ``cuda_graph_warmup_steps > 0``.
+
+    ``internal`` is the in-tree SM10x (Blackwell) CuTe DSL GDR backend in
+    ``ssm/gated_delta_net/internal_gdn_backend``: fused CuTe DSL forward and backward plus
+    CuTe DSL context-parallel boundary preprocessing for chunkwise CP. The
+    ``MCORE_GDN_INTERNAL_BACKEND`` environment variable sets its runtime dispatch: ``auto``
+    (default) runs CuTe DSL where the inputs are supported and fla otherwise (per call, and
+    for the backward separately: the fused CuTe backward serves bf16 H=64, D=128); ``cute``
+    raises instead of falling back; ``fla`` bypasses CuTe DSL. Layers whose attention is
+    captured into a CUDA graph with packed (THD) inputs use fla."""
+
+    gdn_gdr_recompute_h: bool = False
+    """Whether the internal GDR backward recomputes recurrent states instead of saving them.
+    Requires ``gdn_kernel_backend='internal'``."""
+
+    has_gated_delta_net_layers: bool = False
+    """Whether the model actually builds GatedDeltaNet layers. Set for hybrid models whose
+    layer pattern contains 'G'; a pure-GDN model instead signals this through
+    experimental_attention_variant='gdn'. A hybrid stack cannot use the variant name for this:
+    it is a single global value and a GDN+attention hybrid (Qwen3.8-Flash-Next is GDN+QSA)
+    must set it to the attention family so the right layer spec is composed."""
 
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
@@ -1929,10 +1955,33 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.gdn_kernel_backend not in {"transformer_engine", "fla", "torch"}:
+        gdn_kernel_backends = ("transformer_engine", "fla", "torch", "cudnn", "internal")
+        if self.gdn_kernel_backend not in gdn_kernel_backends:
             raise ValueError(
-                "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
+                f"gdn_kernel_backend must be one of {gdn_kernel_backends}, "
                 f"got {self.gdn_kernel_backend!r}."
+            )
+        if self.gdn_kernel_backend == "cudnn":
+            if not (
+                self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+            ):
+                # Same predicate as gdn_pre_gated_delta_rule_fusion: the backend is read by the
+                # GatedDeltaNet module itself, so what matters is that GDN layers exist, not the
+                # global variant name (a GDN+QSA hybrid must set that to "qsa").
+                raise ValueError(
+                    "gdn_kernel_backend='cudnn' requires a model with GatedDeltaNet layers "
+                    "(experimental_attention_variant='gdn', or a hybrid layer pattern "
+                    "containing 'G')."
+                )
+            if self.context_parallel_size > 1 and self.linear_cp_mode != "headwise":
+                raise ValueError(
+                    "gdn_kernel_backend='cudnn' only supports "
+                    "linear_cp_mode='headwise' when context_parallel_size > 1."
+                )
+        if self.gdn_gdr_recompute_h and self.gdn_kernel_backend != "internal":
+            raise ValueError(
+                "gdn_gdr_recompute_h only applies to gdn_kernel_backend='internal', "
+                f"got gdn_kernel_backend={self.gdn_kernel_backend!r}."
             )
 
         if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
@@ -2108,11 +2157,19 @@ class TransformerConfig(ModelParallelConfig):
                     )
             self.hetereogenous_dist_checkpoint = True
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+        if self.gdn_pre_gated_delta_rule_fusion and not (
+            self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+        ):
+            # The fusion is a property of the GatedDeltaNet module, which reads
+            # gdn_pre_gated_delta_rule_fusion directly and never looks at
+            # experimental_attention_variant. What it needs is that GDN layers exist at all,
+            # so gate on that: either a pure-GDN model (variant 'gdn') or a hybrid stack whose
+            # layer pattern contains 'G' (has_gated_delta_net_layers).
             raise ValueError(
-                "gdn_pre_gated_delta_rule_fusion is only supported with "
+                "gdn_pre_gated_delta_rule_fusion requires a model with GatedDeltaNet layers: "
                 "experimental_attention_variant='gdn' "
-                "or deprecated alias experimental_attention_variant='gated_delta_net'."
+                "or deprecated alias experimental_attention_variant='gated_delta_net', "
+                "or a hybrid layer pattern containing 'G'."
             )
 
         if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant != "gdn":
@@ -4783,6 +4840,27 @@ class TransformerConfig(ModelParallelConfig):
                     "Batch-invariant MoE supports dynamic dropless routing only. "
                     "Disable MoE capacity/expert padding."
                 )
+
+        # cudnn-frontend caches one execution graph (and its buffers) per input shape for
+        # the whole process, and that state does not reliably survive a released CUDA graph:
+        # after a captured GDN layer is freed, the next GDR call with the same shapes can
+        # fault with an illegal memory access. It reproduces deterministically when the
+        # first call for a shape happens inside graph construction (Transformer Engine's
+        # capture warmup or the capture itself), and intermittently even after an eager
+        # call. Training is safe as long as the cache entries are built in eager iterations
+        # before capture (cuda_graph_warmup_steps > 0) and the graphs live for the whole run;
+        # releasing and re-capturing graphs in one process is not supported with cuDNN GDR.
+        # Needs the normalized cuda_graph_modules, so it lives here.
+        if (
+            self.gdn_kernel_backend == "cudnn"
+            and cuda_graph_captures_attention(self)
+            and self.cuda_graph_warmup_steps <= 0
+        ):
+            raise ValueError(
+                "gdn_kernel_backend='cudnn' with attention CUDA-graph capture requires "
+                "cuda_graph_warmup_steps > 0, so cuDNN's per-shape GDR graphs are built in "
+                "eager iterations rather than during capture."
+            )
 
         # Scheduler-value, max-seqlen, and variable_seq_lengths handling live in
         # ModelParallelConfig.__post_init__ next to the field definitions; only the
