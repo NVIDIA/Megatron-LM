@@ -286,19 +286,16 @@ class _MegatronLLMBase:
 
         if not use_coordinator:
             # Take the EP group from the configured inference process groups, else from the
-            # model's own collection, which a legacy model does not have.
+            # model's own collection. A legacy model has none; then the inference config resolves
+            # its groups through its warned fallback, and the engine built below shares them.
             pg_collection = inference_config.pg_collection
             if pg_collection is None:
                 pg_collection = getattr(unwrap_model(model), "pg_collection", None)
-            if pg_collection is not None:
-                # An unset EP group means expert parallelism is off.
-                ep_group = vars(pg_collection).get("ep")
-                ep_size = 1 if ep_group is None else ep_group.size()
-            else:
-                # Compatibility fallback for models that do not carry a process-group collection.
-                from megatron.core import parallel_state
-
-                ep_size = parallel_state.get_expert_model_parallel_world_size()
+            if pg_collection is None:
+                pg_collection = inference_config.resolve_pg_collection(model)
+            # An unset EP group means expert parallelism is off.
+            ep_group = vars(pg_collection).get("ep")
+            ep_size = 1 if ep_group is None else ep_group.size()
             if ep_size > 1:
                 raise ValueError(
                     f"use_coordinator=True is required when expert_model_parallel_size > 1 "
