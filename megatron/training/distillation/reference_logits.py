@@ -2,11 +2,16 @@
 
 """FP16 reference logits with an explicit tail and a stable coarse KL loss.
 
-For K selected vocabulary indices, store K values: the tail log-sum-exp in
+Format v3 stores K values for K selected vocabulary indices: the tail log-sum-exp in
 slot 0, and the K-1 non-anchor logit differences in the remaining slots.
 The first selected index is the anchor, whose relative logit is exactly zero.
 Masked selected slots use -inf. The tail includes *all* unselected indices.
 No probabilities, or differences from one, are stored.
+
+Format v4 can instead store normalized top-K log-probabilities on tokens where
+their measured round-trip error is smaller (coarse KL by default, or tail error).
+A redundant sign bit in slot 1
+tags the encoding; format-aware decoding preserves the same K-value footprint.
 """
 
 import torch
@@ -118,11 +123,106 @@ def encode_reference_logits(
     ``keep[..., 0]`` must be true: the highest-logit selected token is the
     reference. Top-P selection must happen before rounding to the cache dtype.
     """
+    folded = _fold_excluded_logits(coarse_logits, keep)
+    return torch.cat((folded[..., -1:], folded[..., 1:-1]), -1).to(dtype)
+
+
+def _fold_excluded_logits(coarse_logits, keep):
     selected = coarse_logits[..., :-1]
     excluded = selected.masked_fill(keep, -torch.inf)
     tail = torch.logsumexp(torch.cat((coarse_logits[..., -1:], excluded), -1), -1, keepdim=True)
-    gaps = selected[..., 1:].masked_fill(~keep[..., 1:], -torch.inf)
-    return torch.cat((tail, gaps), -1).to(dtype)
+    return torch.cat((selected.masked_fill(~keep, -torch.inf), tail), -1)
+
+
+def uses_reference_logits(values: torch.Tensor) -> torch.Tensor:
+    """Read the per-token v4 encoding tag without allocating a saved mode tensor.
+
+    For K >= 2 the second value's sign is redundant: both log probabilities
+    and reference-logit gaps are nonpositive. Positive (including +0 and
+    +inf) selects reference logits, negative selects normalized log-probs.
+    K=1 always uses the v3 reference encoding and needs no tag.
+    """
+    if values.size(-1) == 1:
+        return torch.ones_like(values[..., 0], dtype=torch.bool)
+    return ~torch.signbit(values[..., 1])
+
+
+def _normalized_topk_to_reference(values):
+    mass = values.exp().sum(-1, keepdim=True)
+    # A cache candidate with mass > 1 is rejected by the encoder. Clamping
+    # here also makes the unselected decode branch safe for mixed tensors.
+    tail = torch.log1p(-mass.clamp(max=1))
+    return torch.cat((values, tail), -1) - values[..., :1]
+
+
+def decode_adaptive_logits(values: torch.Tensor) -> torch.Tensor:
+    """Decode a v4 mixed cache into K+1 reference logits, without changing K."""
+    if values.size(-1) == 1:
+        return decode_reference_logits(values)
+    reference_mode = uses_reference_logits(values)
+    raw = values.to(_working_dtype(values)).clone()
+    raw[..., 1] = -raw[..., 1].abs()  # Restore the magnitude's original negative sign.
+    reference = decode_reference_logits(raw)
+    # Use a harmless one-hot placeholder on reference-mode rows, so their
+    # slot-0 tail LSE cannot produce invalid log-prob arithmetic in this branch.
+    probabilities = raw.masked_fill(reference_mode.unsqueeze(-1), -torch.inf)
+    probabilities[..., 0] = torch.where(reference_mode, 0, raw[..., 0])
+    probability_reference = _normalized_topk_to_reference(probabilities)
+    return torch.where(reference_mode.unsqueeze(-1), reference, probability_reference)
+
+
+def adaptive_logprobs(values: torch.Tensor) -> torch.Tensor:
+    """Return v4 normalized log-probabilities in selected-token, tail order."""
+    return stable_log_softmax(decode_adaptive_logits(values))
+
+
+def encode_adaptive_logits(
+    coarse_logits: torch.Tensor,
+    keep: torch.Tensor,
+    dtype: torch.dtype = torch.float16,
+    metric: str = "kl",
+) -> torch.Tensor:
+    """Choose the smaller round-trip error for each token at cache creation.
+
+    The teacher distribution is available here, so no confidence threshold or
+    trained selector is needed. Both candidates are decoded in the same FP32
+    arithmetic as training. Scoring uses FP64 only on K+1 categories, with no
+    FP64 vocabulary buffer and no persistent storage beyond K cache values.
+    Reference logits win ties and invalid normalized-probability candidates.
+    ``metric='tail'`` minimizes absolute tail error, equivalent to relative
+    tail error for a fixed positive teacher tail. It need not minimize KL.
+    """
+    if metric not in ("kl", "tail"):
+        raise ValueError(f"Unsupported encoding selection metric: {metric}")
+    reference = encode_reference_logits(coarse_logits, keep, dtype)
+    if reference.size(-1) == 1:
+        return reference
+    target = _fold_excluded_logits(coarse_logits.float(), keep)
+    probabilities = stable_log_softmax(target)[..., :-1].to(dtype)
+    decoded_probability = _normalized_topk_to_reference(probabilities.float())
+    decoded_reference = decode_reference_logits(reference.float())
+    if metric == "kl":
+        probability_error, _ = _macro_kl(decoded_probability.double(), target.double())
+        reference_error, _ = _macro_kl(decoded_reference.double(), target.double())
+    else:
+        true_tail = stable_log_softmax(target.double())[..., -1].exp()
+        probability_tail = stable_log_softmax(decoded_probability)[..., -1].exp().double()
+        reference_tail = stable_log_softmax(decoded_reference)[..., -1].exp().double()
+        probability_error = (probability_tail - true_tail).abs()
+        reference_error = (reference_tail - true_tail).abs()
+    valid_probability = probabilities.float().exp().sum(-1) <= 1
+    use_probability = (
+        valid_probability
+        & torch.isfinite(probability_error)
+        & (probability_error < reference_error)
+    )
+    reference_mode = ~use_probability
+    selected = torch.where(reference_mode.unsqueeze(-1), reference, probabilities)
+    sign = torch.where(
+        reference_mode, torch.ones_like(selected[..., 1]), -torch.ones_like(selected[..., 1])
+    )
+    selected[..., 1] = torch.copysign(selected[..., 1].abs(), sign)
+    return selected
 
 
 def _macro_kl(student, teacher):
@@ -172,8 +272,9 @@ def _macro_kl(student, teacher):
 
 class _ReferenceLogitsKL(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, logits, values, indices, tp_size, tp_rank, tp_group):
-        teacher = decode_reference_logits(values).to(_working_dtype(logits))
+    def forward(ctx, logits, values, indices, tp_size, tp_rank, tp_group, cache_format_version):
+        decoder = decode_adaptive_logits if cache_format_version == 4 else decode_reference_logits
+        teacher = decoder(values).to(_working_dtype(logits))
         valid = torch.isfinite(teacher[..., :-1])
         student, anchor = coarsen_logits(logits, indices, valid, tp_size, tp_rank, tp_group)
         loss, gradient = _macro_kl(student, teacher)
@@ -220,7 +321,7 @@ class _ReferenceLogitsKL(torch.autograd.Function):
         previous = output.gather(-1, anchor_local)
         anchor_grad = torch.where(anchor_owned, -other_sum.reshape_as(anchor), previous)
         output.scatter_(-1, anchor_local, anchor_grad.to(logits.dtype))
-        return output, None, None, None, None, None
+        return output, None, None, None, None, None, None
 
 
 def reference_logits_kl_div(
@@ -230,6 +331,7 @@ def reference_logits_kl_div(
     tp_size: int = 1,
     tp_rank: int = 0,
     tp_group: dist.ProcessGroup | None = None,
+    cache_format_version: int = 3,
 ) -> torch.Tensor:
     """Compute KL on selected tokens plus one tail, replicated across TP ranks.
 
@@ -238,6 +340,14 @@ def reference_logits_kl_div(
     according to the student's own conditional probabilities. The caller must
     not sum this replicated loss across TP ranks a second time.
     """
+    if cache_format_version not in (3, 4):
+        raise ValueError(f"Unsupported reference-logits format_version={cache_format_version}")
     return _ReferenceLogitsKL.apply(
-        student_logits, teacher_values, teacher_indices, tp_size, tp_rank, tp_group
+        student_logits,
+        teacher_values,
+        teacher_indices,
+        tp_size,
+        tp_rank,
+        tp_group,
+        cache_format_version,
     )

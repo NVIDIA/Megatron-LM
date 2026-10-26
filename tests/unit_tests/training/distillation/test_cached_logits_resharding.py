@@ -62,7 +62,12 @@ def _write_v2_cache(
     root: Path, *, mbs: int, dp: int, gbs: int, iterations: int, format_version: int = 2
 ) -> None:
     metadata = {
-        "saver": {"format_version": format_version, "mbs_save": mbs, "dp_size_save": dp, "gbs_save": gbs}
+        "saver": {
+            "format_version": format_version,
+            "mbs_save": mbs,
+            "dp_size_save": dp,
+            "gbs_save": gbs,
+        }
     }
     for dp_rank in range(dp):
         members = {}
@@ -73,7 +78,7 @@ def _write_v2_cache(
                 f"{iteration * gbs}-{(iteration + 1) * gbs}" f"{LOGPROBS_TAR_MEMBER_SUFFIX}"
             ] = _torch_save_bytes(
                 {
-                    "reference_values" if format_version == 3 else "values": torch.zeros_like(
+                    "reference_values" if format_version >= 3 else "values": torch.zeros_like(
                         indices, dtype=torch.float32
                     ),
                     "indices_low": indices_low,
@@ -140,7 +145,7 @@ def _assert_dataset_indices(
     ("dp_save", "dp_load", "gbs"),
     [(4, 4, 24), (4, 8, 24), (8, 4, 24), (4, 6, 24), (6, 4, 24), (3, 5, 30), (5, 3, 30)],
 )
-@pytest.mark.parametrize("format_version", [1, 2, 3])
+@pytest.mark.parametrize("format_version", [1, 2, 3, 4])
 def test_dataset_dp_resharding_preserves_global_indices(
     tmp_path, monkeypatch, dp_save, dp_load, gbs, format_version
 ):
@@ -149,7 +154,12 @@ def test_dataset_dp_resharding_preserves_global_indices(
         _write_v1_cache(tmp_path, mbs=1, dp=dp_save, gbs=gbs, iterations=iterations)
     else:
         _write_v2_cache(
-            tmp_path, mbs=1, dp=dp_save, gbs=gbs, iterations=iterations, format_version=format_version
+            tmp_path,
+            mbs=1,
+            dp=dp_save,
+            gbs=gbs,
+            iterations=iterations,
+            format_version=format_version,
         )
     _assert_dataset_indices(
         tmp_path,
@@ -379,7 +389,7 @@ def test_init_dataloader_rejects_partial_global_batch(monkeypatch):
         loss._init_dataloader(12)
 
 
-@pytest.mark.parametrize("format_version", [1, 2, 3])
+@pytest.mark.parametrize("format_version", [1, 2, 3, 4])
 def test_dataset_yields_global_start_sample_when_resuming(tmp_path, monkeypatch, format_version):
     gbs = 8
     if format_version == 1:

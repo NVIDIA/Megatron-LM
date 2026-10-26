@@ -72,7 +72,41 @@ by one compressed payload per saved iteration. Vocab indices are stored as 16 lo
 `numpy.packbits`/`unpackbits`, not `torch.bool`'s 1 byte/element), reconstructed as
 `(bit_17 << 16) | low_16_bits`.
 
-New dumps use **format version 3**. For K selected indices, `values` still contains
+New dumps use **format version 4**, selecting an encoding separately for every token
+when the teacher distribution is available. The saver rounds both reference logits
+and normalized top-K log-probabilities to FP16, decodes them using training's FP32
+arithmetic, and chooses the lower `KL(teacher || decoded_cache)` over the K selected
+tokens plus the aggregate tail. FP64 is used only to score these K+1 categories;
+the full vocabulary and persistent caches are never expanded to FP64. Candidates
+whose rounded top-K probability mass exceeds one are rejected. Reference logits win
+ties. This minimizes the measured coarse KL, which can differ from minimizing
+tail-only absolute or relative error.
+
+To select the codec by tail reconstruction error instead, pass
+`--logits-save-encoding-metric tail`. This minimizes absolute tail error per token
+(equivalently relative tail error when the true tail is positive), and can increase
+the full coarse KL. The default `kl` is intended for distillation; `tail` matches
+tail-reconstruction-only numerical comparisons.
+
+For K >= 2, the second value's sign records the choice: positive (including `+0`
+and `+inf`) means reference logits, negative means normalized log-probabilities.
+Both representations' second untagged value is nonpositive, so its sign carries no
+numerical information. The decoder restores it before use. No additional mode
+array, stored value, index, or per-token byte is needed. K=1 keeps reference logits.
+
+Use the format-aware decoder on version-4 caches:
+
+```python
+from megatron.training.distillation.reference_logits import adaptive_logprobs
+
+tail_probability = adaptive_logprobs(values)[..., -1].exp()
+```
+
+The adaptive selector changes cache creation only; the student always uses the
+same cancellation-resistant coarse KL and gradient. The teacher remains independent
+of the live student. Version-3 caches continue to use their fixed reference encoding.
+
+For **format version 3**, K selected indices are represented by
 exactly K FP16 numbers per token by default:
 
 - `indices[..., 0]` is the highest teacher logit, used as the reference (implicit zero).
@@ -105,8 +139,8 @@ from the other vocabulary gradients. Teacher FP16 quantization still changes the
 target distribution: zero gradient is guaranteed at the decoded target, rather than
 at every unquantized teacher value that rounds to it.
 
-Versions 1 and 2 remain readable with their original loss semantics. Version-3 dumps
-require the updated reader and loss. Use a fresh cache directory when regenerating
+Versions 1 and 2 remain readable with their original loss semantics. Versions 3 and 4
+require the corresponding updated reader and loss. Use a fresh cache directory when regenerating
 an older dump; mixed payload formats are rejected. An old cache cannot recover tail
 information already lost during normalization or FP16 rounding.
 
@@ -141,6 +175,7 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
 | `--logits-save-top-p` | Optional top-P (nucleus) threshold applied after top-K selection — keeps only the smallest prefix of entries whose cumulative probability mass reaches this value. Must be in `(0, 1]`. Default: `None` (disabled). |
 | `--logits-save-top-p-min-k` | Minimum entries kept per token when top-P masking is active, regardless of cumulative mass. Default: `1`. |
 | `--logits-save-dtype` | On-disk dtype for saved log-probabilities: `fp16`, `bf16`, or `fp32`. Default: `fp16`. |
+| `--logits-save-encoding-metric` | Per-token codec selection by round-trip `kl` (default) or `tail` error. The choice uses only the teacher distribution at save time and does not change cache size. |
 | `--freeze-all-layers` | Freezes all model parameters. Not required by `--logits-save-dir`, but recommended for a dedicated teacher-dump run: without it, the LM loss is still computed and gradients still update the model while logits are being saved. |
 
 **Student loading:**

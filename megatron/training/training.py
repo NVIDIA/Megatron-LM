@@ -3003,6 +3003,7 @@ def setup_model_and_optimizer(
             p=args.logits_save_top_p,
             min_k=args.logits_save_top_p_min_k,
             save_dtype=args.logits_save_dtype,
+            selection_metric=args.logits_save_encoding_metric,
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 

@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """
-Utilities for saving top-K reference logits and an explicit tail during training.
+Utilities for saving compact top-K teacher distributions during training.
 
 This module provides hook-based utilities to capture and persist top-K log-probabilities
 during training while respecting tensor parallelism and minimizing communication,
@@ -14,6 +14,8 @@ Local top-K candidates are gathered to TP rank 0 for global selection. All TP
 ranks then reduce the omitted vocabulary directly, using bounded FP32 chunks.
 The reference logit's implicit zero frees a slot for that tail log-sum-exp:
 K selected indices still require only K floating values per token.
+Version 4 also measures a normalized-log-probability candidate per token and
+sign-tags the encoding with smaller error, without adding values or mode bytes.
 
 Index storage optimization:
 - Global vocab requires 17 bits, so we store lower 16 bits as uint16
@@ -49,7 +51,7 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.distillation.reference_logits import (
     coarsen_logits,
-    encode_reference_logits,
+    encode_adaptive_logits,
     stable_log_softmax,
 )
 from megatron.training.distillation.utils import (
@@ -121,8 +123,9 @@ class LogitsSaverHooks:
     The hook accumulates logits across microbatches and saves all log-probs to disk
     in a single I/O call once all microbatches have been collected.
 
-    Top-K selection uses raw logits. Version-3 values encode the K-1
-    non-anchor logit differences plus one directly computed tail log-sum-exp.
+    Top-K selection uses raw logits. Version-4 values select between K-1
+    non-anchor logit differences plus a directly computed tail log-sum-exp,
+    and normalized top-K log-probabilities, using one redundant sign bit.
     All TP ranks participate in selection and tail reduction; TP rank 0
     gathers CP shards so CP rank 0 can save one DP shard.
 
@@ -172,6 +175,8 @@ class LogitsSaverHooks:
             is active, regardless of cumulative mass.  Defaults to 1.
         save_dtype: String name of the dtype for top-K log-probabilities on
             disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
+        selection_metric: Per-token round-trip error to minimize, either
+            ``'kl'`` (default) over selected tokens plus tail, or ``'tail'``.
     """
 
     _DTYPE_MAP = {
@@ -188,6 +193,7 @@ class LogitsSaverHooks:
         p: Optional[float] = None,
         min_k: int = 1,
         save_dtype: str = 'fp16',
+        selection_metric: str = 'kl',
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
@@ -196,6 +202,9 @@ class LogitsSaverHooks:
                 f"save_dtype must be one of {list(self._DTYPE_MAP)}, got '{save_dtype}'"
             )
         self._save_dtype = self._DTYPE_MAP[save_dtype]
+        if selection_metric not in ('kl', 'tail'):
+            raise ValueError(f"Unsupported encoding selection metric: {selection_metric}")
+        self.selection_metric = selection_metric
 
         if p is not None and not (0.0 < p <= 1.0):
             raise ValueError(
@@ -251,6 +260,7 @@ class LogitsSaverHooks:
                 # Recorded so the loader can build a LogprobsReshardPlan and
                 # support changing MBS / DP / GBS at student-side load time.
                 "format_version": LOGPROBS_FORMAT_VERSION,
+                "encoding_selection": self.selection_metric,
                 "mbs_save": int(args.micro_batch_size),
                 "dp_size_save": int(self.dp_size),
                 "gbs_save": int(args.global_batch_size),
@@ -482,10 +492,12 @@ class LogitsSaverHooks:
     def _process_single_microbatch(
         self, logits: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Select top-K indices and encode reference logits plus the exact tail.
+        """Select top-K indices and adaptively encode the coarse distribution.
 
         Only K values are stored: the anchor's implicit zero frees one slot
-        for the excluded vocabulary's log-sum-exp. FP32 vocabulary workspaces
+        for the excluded vocabulary's directly computed log-sum-exp. A per-token
+        selector compares this with normalized top-K log-probs and sign-tags the
+        chosen encoding. FP32 vocabulary workspaces
         are chunked; accumulated and serialized tensors stay in save_dtype.
 
         All TP ranks participate in the collective operations (all-reduce for
@@ -546,7 +558,9 @@ class LogitsSaverHooks:
             )
             keep = logprobs != CACHED_LOGITS_LOGPROB_SENTINEL
 
-        return encode_reference_logits(coarse, keep, self._save_dtype), global_indices
+        return encode_adaptive_logits(
+            coarse, keep, self._save_dtype, self.selection_metric
+        ), global_indices
 
     def _gather_full_cp_microbatch(
         self,
@@ -723,11 +737,12 @@ class LogitsSaverHooks:
     ) -> None:
         """Serialize a per-iteration monolith and buffer for async flush.
 
-        File format (``format_version == 3``): serialized dict with:
+        File format (``format_version == 4``): serialized dict with:
 
         - ``reference_values``: ``(seq, samples_per_dp_per_iter, K_max)`` tensor of
-          reference values in ``self._save_dtype`` (default ``torch.float16``):
-          slot 0 holds the tail LSE, other slots hold non-anchor logit gaps
+          adaptively encoded values in ``self._save_dtype`` (default ``torch.float16``).
+          For K >= 2, slot 1's sign selects reference logits (positive) or
+          normalized log-probs (negative). K=1 uses reference logits.
         - ``indices_low``: ``(seq, samples_per_dp_per_iter, K_max)`` uint16
           tensor (lower 16 bits of vocab indices)
         - ``bit_17``: 1-D uint8 tensor, the 17th bit of every index in

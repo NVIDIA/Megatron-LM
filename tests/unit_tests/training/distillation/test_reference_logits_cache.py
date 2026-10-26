@@ -12,7 +12,7 @@ import torch.multiprocessing as mp
 
 from megatron.training.distillation import cached_logits_loss, logits_saver
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
-from megatron.training.distillation.reference_logits import reference_logprobs
+from megatron.training.distillation.reference_logits import adaptive_logprobs
 from megatron.training.distillation.utils import (
     LOGPROBS_FORMAT_VERSION,
     decode_logprobs_payload,
@@ -31,6 +31,7 @@ def _bare_saver(k=3, p=None):
     saver.p = p
     saver.min_k = 1
     saver._save_dtype = torch.float16
+    saver.selection_metric = 'kl'
     saver._topp_kept_counts = []
     return saver
 
@@ -40,7 +41,7 @@ def _payload(values, indices, version):
     buffer = io.BytesIO()
     torch.save(
         {
-            "reference_values" if version == 3 else "values": values,
+            "reference_values" if version >= 3 else "values": values,
             "indices_low": low,
             "bit_17": high,
             "format_version": version,
@@ -57,12 +58,12 @@ def test_saver_payload_and_student_loss(p):
     values, indices = saver._process_single_microbatch(teacher)
     assert values.dtype == torch.float16
     assert values.shape == (2, 1, 3)
-    assert LOGPROBS_FORMAT_VERSION == 3
+    assert LOGPROBS_FORMAT_VERSION == 4
     loaded, unpacked, _ = decode_logprobs_payload(
-        _payload(values, indices, 3), expected_format_version=3
+        _payload(values, indices, 4), expected_format_version=4
     )
     torch.testing.assert_close(loaded, values, atol=0, rtol=0)
-    decoded = reference_logprobs(loaded).exp()
+    decoded = adaptive_logprobs(loaded).exp()
     keep = torch.cat(
         (torch.ones_like(values[..., :1], dtype=torch.bool), values[..., 1:].isfinite()), -1
     )
@@ -76,7 +77,7 @@ def test_saver_payload_and_student_loss(p):
     student = (teacher + torch.tensor([0.1, -0.1, 0.2, -0.2])).requires_grad_()
     before = student.detach().clone()
     loss = cached_logits_loss.topk_kl_div(
-        student, loaded, unpacked, 1, 0, None, add_ghost_token=True, cache_format_version=3
+        student, loaded, unpacked, 1, 0, None, add_ghost_token=True, cache_format_version=4
     )
     assert loss.shape == (1, 2)
     loss.sum().backward()
@@ -90,7 +91,7 @@ def test_payload_rejects_mixed_and_unknown_formats():
     with pytest.raises(ValueError, match="does not match"):
         decode_logprobs_payload(_payload(values, indices, 2), expected_format_version=3)
     with pytest.raises(ValueError, match="Unsupported"):
-        decode_logprobs_payload(_payload(values, indices, 4))
+        decode_logprobs_payload(_payload(values, indices, 5))
 
 
 def test_saver_rejects_appending_to_an_old_cache(monkeypatch):
@@ -163,6 +164,40 @@ def _writer_tp_worker(rank, rendezvous):
                     torch.testing.assert_close(result[1], expected[1], atol=0, rtol=0)
                 else:
                     assert result is None
+                # Exercise the format-4 writer, decoder, and distributed loss
+                # together, including top-P masks and an empty aggregate tail.
+                values = result[0] if rank == 0 else torch.empty(1, 1, k, dtype=torch.float16)
+                indices = result[1] if rank == 0 else torch.empty(1, 1, k, dtype=torch.long)
+                dist.broadcast(values, src=0)
+                dist.broadcast(indices, src=0)
+                student = (teacher + torch.linspace(-0.2, 0.2, 8)).requires_grad_()
+                expected_loss = cached_logits_loss.topk_kl_div(
+                    student,
+                    values,
+                    indices,
+                    1,
+                    0,
+                    None,
+                    add_ghost_token=True,
+                    cache_format_version=4,
+                )
+                expected_loss.sum().backward()
+                shard = student.detach().chunk(2, -1)[rank].contiguous().requires_grad_()
+                actual_loss = cached_logits_loss.topk_kl_div(
+                    shard,
+                    values,
+                    indices,
+                    2,
+                    rank,
+                    dist.group.WORLD,
+                    add_ghost_token=True,
+                    cache_format_version=4,
+                )
+                actual_loss.sum().backward()
+                torch.testing.assert_close(actual_loss, expected_loss, atol=2e-7, rtol=2e-5)
+                torch.testing.assert_close(
+                    shard.grad, student.grad.chunk(2, -1)[rank], atol=2e-7, rtol=2e-5
+                )
     finally:
         dist.destroy_process_group()
 

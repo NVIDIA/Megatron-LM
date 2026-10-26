@@ -3,9 +3,10 @@
 """
 Offline knowledge distillation using cached teacher top-K distributions.
 
-Version-3 caches store reference logits and an explicit tail, using a stable
-coarse forward KL against live student logits. Versions 1 and 2 retain their
-original top-K log-probability representation and loss semantics.
+Version-3 caches store reference logits and an explicit tail; version 4 selects
+an encoding per token. Both use a stable coarse forward KL against live student
+logits. Versions 1 and 2 retain their original top-K log-probability representation
+and loss semantics.
 
 Design highlights
 -----------------
@@ -263,7 +264,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             )
         self._meta = meta
         self.format_version = meta.get("saver", {}).get("format_version", 1)
-        if self.format_version not in (2, 3):
+        if self.format_version not in (2, 3, 4):
             raise ValueError(f"Unsupported cached-logits format_version={self.format_version}")
         self._plan = self._build_plan(meta, dp_size=dp_size)
 
@@ -1049,7 +1050,7 @@ def make_teacher_tar_dataset(
     """
     meta = peek_first_logprobs_metadata(logprobs_dir)
     fmt = (meta or {}).get("saver", {}).get("format_version", 1)
-    if fmt not in (1, 2, 3):
+    if fmt not in (1, 2, 3, 4):
         raise ValueError(f"Unsupported cached-logits format_version={fmt}")
     cls: type = TeacherTarDataset if fmt >= 2 else LegacyTeacherTarDataset
     return cls(
@@ -1083,11 +1084,17 @@ def topk_kl_div(
     cache_format_version: int = 2,
 ) -> torch.Tensor:
     """Compute per-token KL with format-specific normalization and tail handling."""
-    if cache_format_version == 3:
+    if cache_format_version in (3, 4):
         if not add_ghost_token:
             raise ValueError("Reference-logits caches require the aggregated tail category.")
         return reference_logits_kl_div(
-            student_logits, teacher_topk_logprobs, teacher_topk_indices, tp_size, tp_rank, tp_group
+            student_logits,
+            teacher_topk_logprobs,
+            teacher_topk_indices,
+            tp_size,
+            tp_rank,
+            tp_group,
+            cache_format_version=cache_format_version,
         ).transpose(0, 1).contiguous()
     if cache_format_version not in (1, 2):
         raise ValueError(f"Unsupported cached-logits loss format_version={cache_format_version}")
@@ -1236,7 +1243,7 @@ class CachedLogitsKDLoss:
     @property
     def loss_is_tp_replicated(self) -> bool:
         """Whether each TP rank already reports the complete coarse loss."""
-        return self._cache_format_version == 3
+        return self._cache_format_version in (3, 4)
 
     def _init_dataloader(self, start_sample: int) -> None:
         """Create the DataLoader starting from global sample *start_sample*."""
@@ -1481,7 +1488,7 @@ class LossFuncCallable:
 
             loss_kd = self.kd_func(logits)
             loss_kd = self._mask_loss(loss_kd, loss_mask)
-            # Legacy loss returns shard-local terms; v3 is already replicated.
+            # Legacy loss returns shard-local terms; v3/v4 are already replicated.
             if not getattr(self.kd_func, "loss_is_tp_replicated", False):
                 dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
         except StopIteration as e:
