@@ -31,6 +31,9 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
@@ -767,6 +770,139 @@ class TestGPTWithDynamicInference:
         padding_logits = logits[0, padding_start_idx:padding_end_idx, :]
 
         # Assert that all padding logits are zero.
+        assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+class TestGPTDynamicInferencePaddingWithCudaGraphs:
+    """Padding-token zeroing must hold when a forward is replayed from a CUDA graph.
+
+    The zeroing only runs for FP8/FP4 models, so these BF16 tests patch
+    `is_using_quantization_scales` to exercise it without FP8 hardware.
+    """
+
+    def setup_method(self, method):
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+
+    def teardown_method(self, method):
+        delete_cuda_graphs()
+        model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "inference_cuda_graph_scope", [InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block]
+    )
+    @torch.inference_mode()
+    def test_padding_logits_are_zero_after_cuda_graph_replay(self, inference_cuda_graph_scope):
+        """Replaying a graph with fewer real tokens than it holds still zeroes the padding rows.
+
+        Graphs are captured the way the engine captures them, with dummy requests that fill
+        the graph. Prefill attention never writes the rows of padding tokens, so the test
+        poisons those rows to stand in for stale memory.
+        """
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            cuda_graph_impl="local",
+            inference_cuda_graph_scope=inference_cuda_graph_scope,
+            inference_rng_tracker=True,
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
+            parallel_output=True,
+        )
+        model = Float16Module(config, model).cuda().eval()
+
+        context = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=config.params_dtype,
+                num_layers=config.num_layers,
+                kv_channels=config.hidden_size // config.num_attention_heads,
+                num_attention_heads=config.num_attention_heads,
+            ),
+            # Prefill steps only have 64-token graphs.
+            inference_config=InferenceConfig(
+                max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
+                buffer_size_gb=1.0,
+                block_size_tokens=256,
+                max_tokens=DynamicInferenceContext.TOKEN_ROUNDER,
+                max_requests=4,
+                materialize_only_last_token_logits=False,
+                num_cuda_graphs=1,
+                use_cuda_graphs_for_non_decode_steps=True,
+            ),
+        )
+
+        # Rows of the attention kernel output at or past this index get a stale value.
+        stale_from = torch.zeros(1, dtype=torch.int32, device="cuda")
+        flash_decode_and_prefill = Attention.flash_decode_and_prefill
+
+        def flash_decode_and_prefill_with_stale_rows(self, *args, **kwargs):
+            output = flash_decode_and_prefill(self, *args, **kwargs)
+            rows = torch.arange(output.shape[0], dtype=torch.int32, device=output.device)
+            is_stale = (rows >= stale_from).view(-1, *([1] * (output.dim() - 1)))
+            return output.masked_fill(is_stale, 1.0e4)
+
+        def forward():
+            input_ids, position_ids = context.current_input_and_position_ids()
+            with InferenceMode.active():
+                return model.forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=None,
+                    inference_context=context,
+                    runtime_gather_output=True,
+                )
+
+        with (
+            patch.object(
+                Attention, "flash_decode_and_prefill", flash_decode_and_prefill_with_stale_rows
+            ),
+            patch(
+                "megatron.core.transformer.attention.is_using_quantization_scales",
+                return_value=True,
+            ),
+            patch(
+                "megatron.core.models.gpt.gpt_model.is_using_quantization_scales", return_value=True
+            ),
+        ):
+            for graph_batch_dimensions in context.cuda_graph_batch_dimensions_list:
+                context.initialize_attention_state(
+                    construct_graph_dimensions=graph_batch_dimensions
+                )
+                stale_from.fill_(context.padded_active_token_count)
+                forward()
+                context.reset()
+
+            active_token_count = 10
+            context.add_request(
+                DynamicInferenceRequest(
+                    request_id=0,
+                    prompt_tokens=torch.arange(active_token_count, dtype=torch.long, device='cuda'),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1),
+                )
+            )
+            context.initialize_attention_state()
+            assert context.using_cuda_graph_this_step()
+            stale_from.fill_(active_token_count)
+            logits = forward()
+
+        padding_logits = logits[0, active_token_count : context.padded_active_token_count, :]
+        assert padding_logits.numel() > 0
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
 
 

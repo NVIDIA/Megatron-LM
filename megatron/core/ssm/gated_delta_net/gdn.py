@@ -33,7 +33,14 @@ from megatron.core.ssm.gated_delta_net.common import (
     l2norm,
 )
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
-from megatron.core.ssm.ops.gdp import fused_recurrent_gated_delta_rule_update
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+    causal_conv1d_varlen_carry_states,
+    causal_conv1d_varlen_fn,
+)
+from megatron.core.ssm.ops.gdp import (
+    chunk_gated_delta_product_varlen,
+    fused_recurrent_gated_delta_rule_update,
+)
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
@@ -101,6 +108,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             self.cp_size if self.config.linear_cp_mode == "headwise" else 1
         )
         self.chunk_size = 64
+        # GDN is GDP with one Householder update. Advertise this to the inference
+        # context so it owns persistent chunk descriptors for graph replay.
+        self.num_householder = 1
 
         backend = self.config.gdn_kernel_backend
         if backend == "transformer_engine" and (
@@ -474,7 +484,12 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         ssm_state: torch.Tensor,
         context: DynamicInferenceContext,
     ) -> torch.Tensor:
-        """Run packed variable-length GDN prefill and populate request states."""
+        """Run graph-safe GDN prefill using the single-update GDP recurrence.
+
+        Chunk descriptors belong to the inference context and are refreshed in
+        place before replay. Their padded capacity fixes every workspace and
+        launch grid independently of the lengths used during graph capture.
+        """
         assert (
             not context.is_chunked_prefill_enabled()
         ), "GDN dynamic inference does not support chunked prefill."
@@ -488,31 +503,50 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         read_indices = batch_indices.clamp(min=0)
 
         qkv_dtype = qkv.dtype
-        qkv, final_conv_state = causal_conv1d(
-            x=qkv.to(conv_state.dtype),
+        conv_input = qkv.squeeze(0).to(conv_state.dtype).contiguous()
+        previous_conv_state = conv_state[read_indices]
+        final_conv_state = causal_conv1d_varlen_carry_states(
+            conv_input, cu_seqlens, previous_conv_state
+        )
+        qkv = causal_conv1d_varlen_fn(
+            x=conv_input,
             weight=self.conv1d.weight.squeeze(1).to(conv_state.dtype),
             bias=self.conv1d.bias.to(conv_state.dtype) if self.conv1d.bias is not None else None,
             activation=self.activation,
-            initial_state=conv_state[read_indices].contiguous(),
-            output_final_state=True,
+            initial_states=previous_conv_state[:, :, 1:],
             cu_seqlens=cu_seqlens,
+            precomputed_seq_idx=metadata.conv_seq_idx,
+            precomputed_seq_start=metadata.conv_seq_start,
         )
-        qkv = qkv.to(qkv_dtype)
+        qkv = qkv.unsqueeze(0).to(qkv_dtype)
         tensor_masked_update(conv_state, batch_indices, final_conv_state)
 
         kernel_inputs = self._prepare_inference_inputs(qkv, beta, alpha, 1, token_count)
-        core_attn_out, final_ssm_state = chunk_gated_delta_rule(
-            **kernel_inputs,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            initial_state=ssm_state[read_indices].contiguous(),
-            output_final_state=True,
+        # GDP expects matching Q/K/V head counts and already-transformed gates.
+        # Preserve the fp32 gate arithmetic of FLA's fused GDN inference path.
+        query, key, value = kernel_inputs["q"], kernel_inputs["k"], kernel_inputs["v"]
+        head_repeats = value.shape[2] // query.shape[2]
+        if head_repeats != 1:
+            query = query.repeat_interleave(head_repeats, dim=2)
+            key = key.repeat_interleave(head_repeats, dim=2)
+        g = -self.A_log.float().exp() * F.softplus(alpha.float() + self.dt_bias.float())
+        beta = beta.float().sigmoid()
+        core_attn_out, _ = chunk_gated_delta_product_varlen(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            num_householder=self.num_householder,
+            initial_state=ssm_state[read_indices],
+            state=ssm_state,
+            state_indices=batch_indices,
             use_qk_l2norm_in_kernel=self.use_qk_l2norm,
-            use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
             cu_seqlens=cu_seqlens,
+            chunk_indices=metadata.gdp_chunk_indices,
+            chunk_indices_dp=metadata.gdp_chunk_indices_dp,
+            chunk_offsets=metadata.gdp_chunk_offsets,
         )
-        tensor_masked_update(ssm_state, batch_indices, final_ssm_state)
         y = self._apply_gated_norm(core_attn_out, gate)
         return y.reshape(1, token_count, -1).transpose(0, 1).contiguous()
 

@@ -18,10 +18,10 @@ def test_hybrid_cached_logits_loss_uses_reader_and_keeps_reporting(monkeypatch):
     args = SimpleNamespace(
         logits_load_dir="teacher-cache",
         logits_load_decode_threads=2,
-        logits_load_prefetch_factor=3,
         logits_load_msc_prefetch_depth=4,
         logits_load_kd_loss_alpha=0.5,
         logits_load_ignore_errors=False,
+        logits_load_ignore_hash=True,
         check_for_nan_in_loss_and_grad=False,
         check_for_spiky_loss=False,
     )
@@ -37,10 +37,10 @@ def test_hybrid_cached_logits_loss_uses_reader_and_keeps_reporting(monkeypatch):
     factory.assert_called_once_with(
         logprobs_dir="teacher-cache",
         decode_threads=2,
-        prefetch_factor=3,
         msc_prefetch_depth=4,
         kd_loss_alpha=0.5,
         ignore_errors=False,
+        ignore_hash=True,
     )
     assert all(actual is wanted for actual, wanted in zip(result, expected))
 

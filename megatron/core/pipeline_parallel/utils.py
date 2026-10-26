@@ -281,6 +281,17 @@ class ScheduleNode:
             else:
                 data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
 
+            if self.forward_no_grad:
+                # no_grad does not make the output graph-free: forward_func may re-enter
+                # grad mode (TransformerLayer runs its bias-dropout-add under
+                # torch.enable_grad), and the output then carries a grad_fn that pins the
+                # tensors it was built from for as long as the output is retained, i.e.
+                # across the forward->backward gap when it becomes the next segment's input.
+                if isinstance(data, tuple):
+                    data = tuple(e.detach() if isinstance(e, torch.Tensor) else e for e in data)
+                else:
+                    data = data.detach()
+
             self.output = data
 
         if self.tensor_release is not None:
