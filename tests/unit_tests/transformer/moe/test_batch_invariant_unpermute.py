@@ -9,11 +9,13 @@ visible: one shard sums to 1, two shards sum to 0 (each 1 is lost next to 1e20 b
 partials cancel), and four shards sum to 1.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.moe.moe_utils import unpermute
 from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
@@ -72,13 +74,35 @@ def test_unpermute_splits_experts_by_the_given_ep_size(monkeypatch, ep_size):
     torch.testing.assert_close(output, expected, rtol=0.0, atol=0.0)
 
 
-def test_unpermute_without_ep_size_uses_the_global_ep_size(monkeypatch):
-    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 2)
-    with set_batch_invariant_mode(True):
+def _global_ep_group(monkeypatch, group):
+    """Stand in ``group`` for the expert-parallel group of the global grid."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+    monkeypatch.setattr(
+        parallel_state, "get_expert_model_parallel_group", lambda check_initialized=True: group
+    )
+
+
+def test_unpermute_without_ep_size_warns_and_uses_the_global_ep_size(monkeypatch):
+    _global_ep_group(monkeypatch, SimpleNamespace(size=lambda: 2))
+    with (
+        set_batch_invariant_mode(True),
+        pytest.warns(ProcessGroupFallbackWarning, match="unpermute was called without `ep_size`"),
+    ):
         output = _unpermute()
 
     expected = torch.full((1, _HIDDEN), _SUM_BY_EP_SIZE[2], device="cuda")
     torch.testing.assert_close(output, expected, rtol=0.0, atol=0.0)
+
+
+def test_unpermute_without_ep_size_or_global_ep_group_raises(monkeypatch):
+    _global_ep_group(monkeypatch, None)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    with (
+        set_batch_invariant_mode(True),
+        pytest.warns(ProcessGroupFallbackWarning),
+        pytest.raises(ValueError, match="ep_size"),
+    ):
+        _unpermute()
 
 
 class TestAlltoAllDispatcherBatchInvariantCombine:
