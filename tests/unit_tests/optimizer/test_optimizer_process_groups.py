@@ -76,6 +76,26 @@ class TestGetMegatronOptimizer:
         assert isinstance(dense_optimizer, Float16OptimizerWithFloat16Params)
         assert dense_optimizer.pg_collection is pg_collection
 
+    def test_without_a_collection_warns_and_uses_the_global_groups(self, model_parallel):
+        model = _ddp_linear()
+
+        with pytest.warns(
+            ProcessGroupFallbackWarning,
+            match="get_megatron_optimizer was called without `pg_collection`",
+        ):
+            optimizer = get_megatron_optimizer(
+                _optimizer_config(), [model], use_gloo_process_groups=False
+            )
+
+        (dense_optimizer,) = optimizer.chained_optimizers
+        # The fallback sets every field to the group use_mpu_process_groups() returns.
+        expected = ProcessGroupCollection.use_mpu_process_groups()
+        assert vars(dense_optimizer.pg_collection) == vars(expected)
+        assert dense_optimizer.tp_group is parallel_state.get_tensor_model_parallel_group()
+        assert dense_optimizer.grad_stats_parallel_group is (
+            parallel_state.get_model_parallel_group()
+        )
+
 
 class TestLayerWiseDistributedOptimizer:
 

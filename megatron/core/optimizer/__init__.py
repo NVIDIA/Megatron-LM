@@ -3,7 +3,7 @@ import copy
 import logging
 import warnings
 from collections import defaultdict
-from dataclasses import astuple
+from dataclasses import astuple, fields
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -53,7 +53,7 @@ from megatron.core.optimizer_param_scheduler import (
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     get_ep_rank_and_size,
     get_global_unique_param_name,
@@ -1056,7 +1056,9 @@ def get_megatron_optimizer(
             subsets of parameters (identified by ParamKey).
         use_gloo_process_groups (bool): if false, disable use of Gloo process groups
             in underlying Megatron optimizers.
-        pg_collection: Optional unified process group for distributed training.
+        pg_collection (Optional[ProcessGroupCollection]): process groups of the model that
+            ``model_chunks`` belong to. Omitting it is deprecated: get_megatron_optimizer then
+            warns and builds every group from the global parallel state.
         dump_param_to_param_group_map (Optional[str]): path to dump parameter to param group map.
         param_group_process_group (Optional[torch.distributed.ProcessGroup]): group whose ranks
             must construct aligned optimizer parameter groups. ``None`` preserves WORLD alignment.
@@ -1087,7 +1089,16 @@ def get_megatron_optimizer(
     # construction, so the global-state fallback lives here and nowhere deeper: every helper below
     # receives an explicit collection. See docs/developer/parallel-state-deprecation.md.
     if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Build every field, as use_mpu_process_groups() does by default. The optimizers built
+        # below read most of them, and several of their readers treat an unset field
+        # differently from one set to None.
+        pg_collection = resolve_process_groups(
+            None,
+            owner="get_megatron_optimizer",
+            required=[field.name for field in fields(ProcessGroupCollection)],
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
 
     is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
