@@ -449,7 +449,10 @@ class FsdpParameterGroup:
         # Replicated compute weights use persistent model_weight storage and never
         # allocate this gather buffer after construction.
         buffer = self._unsharded_model_weight
-        return isinstance(buffer, QuantizedDBuffer) and buffer.is_rowwise_allocated
+        # QuantizedDBuffer aliases DBuffer when TE is unavailable.
+        if isinstance(buffer, DBuffer):
+            return False
+        return buffer.is_rowwise_allocated
 
     def unshard_parameters(self, phase: Phase | None = None) -> None:
         """Gather missing weights and record their readiness on the current stream.
@@ -457,8 +460,8 @@ class FsdpParameterGroup:
         The caller selects the all-gather stream. Reuse existing events so compute
         never waits for a later prefetch when its weights are already available.
         """
-        phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
-        missing_phases = tuple(p for p in phases if p not in self._unshard_events)
+        requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
+        missing_phases = tuple(p for p in requested_phases if p not in self._unshard_events)
         if not missing_phases:
             return
 
@@ -473,11 +476,11 @@ class FsdpParameterGroup:
             # Reinstall so parameters see the latest optimizer update; MXFP8 padded
             # scales are copies.
             self._install_unsharded_parameters(self.model_weight)
-            missing_phases = (Phase.FORWARD, Phase.BACKWARD)
+            ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(unsharded_model_weight, DBuffer):
             self._materialize_unsharded_model_weight()
             self._install_unsharded_parameters(unsharded_model_weight)
-            missing_phases = (Phase.FORWARD, Phase.BACKWARD)
+            ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         else:
             rowwise = Phase.FORWARD in missing_phases
             columnwise = Phase.BACKWARD in missing_phases
@@ -485,16 +488,17 @@ class FsdpParameterGroup:
             self._install_unsharded_parameters(
                 unsharded_model_weight, rowwise=rowwise, columnwise=columnwise
             )
+            ready_phases = missing_phases
         self._switch_to_unsharded_parameters()
         event = torch.cuda.current_stream().record_event()
-        for ready_phase in missing_phases:
+        for ready_phase in ready_phases:
             self._unshard_events[ready_phase] = event
 
     def wait_for_unshard(self, phase: Phase | None) -> None:
         """Make the current stream wait for this group's requested weights."""
-        phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
+        requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
         # Fixed phase order, with one wait when BF16 shares an event across phases.
-        for event in dict.fromkeys(self._unshard_events[p] for p in phases):
+        for event in dict.fromkeys(self._unshard_events[p] for p in requested_phases):
             torch.cuda.current_stream().wait_event(event)
 
     def _install_unsharded_parameters(
