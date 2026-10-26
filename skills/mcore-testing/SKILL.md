@@ -169,6 +169,7 @@ uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q \
   test, for example under `pytest.warns`, stays silent. A test that must
   catch it calls `enable_strict_process_group_fallbacks()` from
   `megatron.core.process_groups_config` inside `warnings.catch_warnings()`.
+- Training runs opt in with `--strict-process-group-fallbacks`.
 
 ### CI parity
 

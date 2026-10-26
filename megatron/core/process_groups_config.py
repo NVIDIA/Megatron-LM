@@ -37,7 +37,8 @@ class ProcessGroupFallbackWarning(FutureWarning):
 
     It is a ``FutureWarning``, so filters and tests that match ``FutureWarning`` also match it.
     To turn every fallback into an error, for example in CI, call
-    ``enable_strict_process_group_fallbacks()``, or run pytest with
+    ``enable_strict_process_group_fallbacks()`` (training: ``--strict-process-group-fallbacks``),
+    or run pytest with
     ``-W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning``. The same option
     passed to ``python`` itself, or set in ``PYTHONWARNINGS``, has no effect: Python resolves it
     before site-packages, and so torch, can be imported, and ignores it with a note on stderr.
@@ -97,10 +98,10 @@ def enable_strict_process_group_fallbacks() -> None:
     affected. It also forgets which fallbacks already warned in this process, so those raise
     too the next time they are reached.
 
-    Call it after the process's own warning setup: a filter installed later that also matches
-    this class, for example ``warnings.simplefilter("ignore")``, takes precedence again. A
-    ``warnings.catch_warnings()`` block restores the previous filters on exit, which scopes strict
-    mode to the block.
+    Training calls this for ``--strict-process-group-fallbacks``. Other frameworks call it after
+    their own warning setup: a filter installed later that also matches this class, for example
+    ``warnings.simplefilter("ignore")``, takes precedence again. A ``warnings.catch_warnings()``
+    block restores the previous filters on exit, which scopes strict mode to the block.
 
     Unit tests opt in through pytest, which accepts a dotted class path:
     ``pytest -W error::megatron.core.process_groups_config.ProcessGroupFallbackWarning`` for a

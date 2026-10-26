@@ -3218,6 +3218,13 @@ def _add_distributed_args(parser):
     group.add_argument('--pad-packed-seq-alignment', default=None,
                        help="Pad packed THD inputs to a CP-local multiple or 'max'. "
                        "MXFP8 additionally aligns to 32 tokens after SP sharding.")
+    group.add_argument('--strict-process-group-fallbacks', action='store_true',
+                       help='Raise an error instead of a ProcessGroupFallbackWarning whenever '
+                       'Megatron Core falls back to the global process groups in '
+                       'megatron.core.parallel_state because a caller omitted its process '
+                       'groups. Applies on every rank, from before distributed initialization '
+                       'and model construction, so a run can check that it passes its process '
+                       'groups explicitly.')
     return parser
 
 
