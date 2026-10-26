@@ -2,13 +2,18 @@
 
 """Checkpoint settings are owned by CheckpointConfig; the CLI and the containers agree on them."""
 
+import ast
+import inspect
 from argparse import Namespace
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
-from megatron.training import global_vars
+import megatron.training
+from megatron.training import async_utils, global_vars, training
 from megatron.training.argument_utils import (
     checkpoint_config_from_args,
     inference_cfg_container_from_args,
@@ -20,6 +25,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
 )
+from megatron.training.utils import common_utils
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -330,3 +336,166 @@ def test_set_global_variables_finalizes_an_inference_container(monkeypatch):
     assert cfg._finalized
     assert cfg.checkpoint.replication_jump is None
     services.assert_called_once_with(args, build_tokenizer=True, training=False)
+
+
+# ---- consumers read the owner, with the namespace stripped and with the namespace disagreeing ----
+
+CHECKPOINT_NAMES = tuple(f.name for f in fields(CheckpointConfig)) + (
+    "no_save_optim",
+    "no_save_rng",
+    "no_load_optim",
+    "no_load_rng",
+    "ckpt_fully_parallel_save",
+    "ckpt_fully_parallel_load",
+    "use_dist_ckpt",
+)
+
+
+def _args_without_checkpoint(args):
+    """The parsed namespace with every checkpoint-owned name removed."""
+    for name in CHECKPOINT_NAMES:
+        if hasattr(args, name):
+            delattr(args, name)
+    return args
+
+
+def _args_contradicting(args, checkpoint):
+    """The parsed namespace with every checkpoint-owned name set against the section."""
+    for item in fields(CheckpointConfig):
+        value = getattr(checkpoint, item.name)
+        if isinstance(value, bool):
+            setattr(args, item.name, not value)
+        elif isinstance(value, str) or value is None:
+            setattr(args, item.name, "/contradiction")
+        elif isinstance(value, int):
+            setattr(args, item.name, value + 7)
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        setattr(args, f"no_{name}", getattr(checkpoint, name))
+    args.ckpt_fully_parallel_save = not checkpoint.fully_parallel_save
+    args.ckpt_fully_parallel_load = not checkpoint.fully_parallel_load
+    args.use_dist_ckpt = not checkpoint.use_dist_ckpt
+    return args
+
+
+@pytest.mark.parametrize("namespace", ["stripped", "contradicting"])
+@pytest.mark.parametrize("async_save", [False, True])
+def test_async_finalization_follows_the_section(monkeypatch, run_config, namespace, async_save):
+    run_config.checkpoint.async_save = async_save
+    args = _validated()
+    args = (
+        _args_without_checkpoint(args)
+        if namespace == "stripped"
+        else _args_contradicting(args, run_config.checkpoint)
+    )
+    monkeypatch.setattr(async_utils, "get_args", lambda: args, raising=False)
+    queue = Mock()
+    monkeypatch.setattr(async_utils, "_async_calls_queue", queue)
+    monkeypatch.setattr(async_utils, "_tag_current_span_call_idx", Mock())
+    monkeypatch.setattr(async_utils, "is_empty_async_queue", lambda: True)
+    async_utils.maybe_finalize_async_save(blocking=False)
+    assert queue.maybe_finalize_async_calls.called is async_save
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_lazy_async_queue_follows_the_section(monkeypatch, run_config, persistent):
+    """The lazy queue used to read use_persistent_ckpt_worker through a getattr with a False
+    default, which a stripped namespace alone would not catch; the namespace disagrees instead."""
+    core = pytest.importorskip("nvidia_resiliency_ext.checkpointing.async_ckpt.core")
+    run_config.checkpoint.use_persistent_ckpt_worker = persistent
+    args = _validated()
+    args.use_persistent_ckpt_worker = not persistent
+    monkeypatch.setattr(async_utils, "get_args", lambda: args, raising=False)
+    monkeypatch.setattr(async_utils, "_async_calls_queue", None)
+    queue_cls = Mock()
+    monkeypatch.setattr(core, "AsyncCallsQueue", queue_cls)
+    async_utils._get_async_calls_queue()
+    queue_cls.assert_called_once_with(persistent=persistent)
+
+
+@pytest.mark.parametrize("section_saves", [False, True])
+def test_autoresume_saves_only_when_the_section_has_a_save_directory(
+    monkeypatch, run_config, section_saves
+):
+    run_config.checkpoint.save = "/section/save" if section_saves else None
+    args = _validated()
+    args.save = None if section_saves else "/namespace/save"
+    monkeypatch.setattr(common_utils, "get_args", lambda: args)
+    autoresume = SimpleNamespace(termination_requested=lambda: True, request_resume=Mock())
+    monkeypatch.setattr(common_utils, "get_adlr_autoresume", lambda: autoresume)
+    monkeypatch.setattr(common_utils.torch.distributed, "barrier", Mock())
+    monkeypatch.setattr(common_utils.torch.distributed, "get_rank", lambda: 0)
+    save = Mock()
+    monkeypatch.setattr("megatron.training.checkpointing.save_checkpoint", save)
+    with pytest.raises(SystemExit):
+        common_utils.check_adlr_autoresume_termination(3, [], None, None)
+    assert save.called is section_saves
+
+
+def test_pretrain_finalizes_the_container_before_fault_tolerance_reads_it():
+    """Fault tolerance captures the save directory and the async mode at setup; it must see the
+    derived values (the async flip, the conversion exit flag)."""
+    source = inspect.getsource(training.pretrain)
+    assert source.index("cfg_container.finalize()") < source.index("ft_integration.setup()")
+
+
+# ---- no consumer inside the migrated boundary reads a checkpoint name from args ----
+
+CONSUMER_MODULES = (
+    "megatron/training/checkpointing.py",
+    "megatron/training/training.py",
+    "megatron/training/async_utils.py",
+    "megatron/training/initialize.py",
+    "megatron/training/ft_integration.py",
+    "megatron/training/global_vars.py",
+    "megatron/training/utils/common_utils.py",
+    "megatron/rl/rl_utils.py",
+    "megatron/post_training/checkpointing.py",
+    "megatron/post_training/model_builder.py",
+    "megatron/inference/utils.py",
+)
+# Legacy helpers that maintain the argument namespace itself rather than consume it.
+ARGS_MAINTAINERS = {("megatron/training/utils/common_utils.py", "update_use_dist_ckpt")}
+
+
+def _args_reads(path, names, skip_functions):
+    """`args.<name>` and `getattr(args, "<name>")` uses outside the skipped functions."""
+    module = ast.parse(path.read_text())
+    skipped = [
+        range(node.lineno, node.end_lineno + 1)
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef) and node.name in skip_functions
+    ]
+    reads = []
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "args"
+            and node.attr in names
+        ):
+            name = node.attr
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("getattr", "hasattr")
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "args"
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value in names
+        ):
+            name = node.args[1].value
+        else:
+            continue
+        if not any(node.lineno in span for span in skipped):
+            reads.append(f"{path.name}:{node.lineno} args.{name}")
+    return reads
+
+
+def test_consumers_read_no_checkpoint_name_from_args():
+    root = Path(megatron.training.__file__).resolve().parents[2]
+    reads = []
+    for module in CONSUMER_MODULES:
+        skip = {function for owner, function in ARGS_MAINTAINERS if owner == module}
+        reads += _args_reads(root / module, set(CHECKPOINT_NAMES), skip)
+    assert reads == []

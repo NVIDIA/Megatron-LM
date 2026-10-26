@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -24,6 +24,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.training import checkpointing
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
@@ -42,6 +43,7 @@ from megatron.training.checkpointing import (
 from megatron.training.config import CheckpointConfig, ProfilingConfig
 from megatron.training.global_vars import get_args, set_args
 from megatron.training.state import TrainState
+from megatron.training.utils.checkpoint_utils import get_checkpoint_run_config_filename
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
@@ -1415,3 +1417,88 @@ class TestBuildShardedStateDictMetadata:
             args, dp_cp_group=self.DUMMY_GROUP, checkpoint=_metadata_checkpoint(args)
         )
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+def test_save_follows_the_section_not_the_namespace(
+    init_model_parallel, create_args, tmp_path_dist_ckpt, run_config
+):
+    """A save goes where the registered section says, in its format, whatever the namespace says,
+    and the persisted arguments describe the policy that produced the checkpoint."""
+    args = create_args
+    args.use_distributed_optimizer = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_save_follows_the_section", sync=True) as save_dir:
+        args.save = str(save_dir / "section")
+        args.ckpt_format = "torch"
+        args.use_dist_ckpt = False
+        args.save_tokenizer_assets = False
+        set_args(args)
+        before = replace(sync_checkpoint_config(args))
+        # The namespace now disagrees on every setting a save reads.
+        args.save = str(save_dir / "namespace")
+        args.ckpt_format = "torch_dist"
+        args.use_dist_ckpt = True
+        args.async_save = True
+        args.no_save_optim = True
+
+        save_checkpoint(7, [model], optimizer, opt_param_scheduler, 0)
+
+        ckpt_file = save_dir / "section" / "iter_0000007" / "mp_rank_00" / "model_optim_rng.pt"
+        assert os.path.exists(ckpt_file)
+        assert not os.path.exists(save_dir / "namespace")
+        state = torch.load(ckpt_file, weights_only=False)
+        assert "optimizer" in state
+        assert state["args"].save == str(save_dir / "section")
+        assert state["args"].ckpt_format == "torch"
+        assert state["args"].no_save_optim is False and state["args"].use_dist_ckpt is False
+        # Neither the namespace nor the registered section was written.
+        assert args.ckpt_format == "torch_dist" and args.no_save_optim is True
+        assert run_config.checkpoint == before
+
+
+@pytest.mark.parametrize("section_says_rng", [True, False, None])
+def test_the_saved_section_decides_what_a_resume_requests(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, run_config, section_says_rng
+):
+    """The load template requests what the checkpoint holds as its saved checkpoint section says;
+    the arguments persisted with the checkpoint decide only when there is no saved section (None
+    here: the YAML is removed, and those arguments say the RNG state was saved)."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.fp16 = False
+    args.bf16 = False
+    args.save_tokenizer_assets = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_saved_section_decides", sync=True) as ckpt_dir:
+        args.save = str(ckpt_dir)
+        args.load = str(ckpt_dir)
+        set_args(args)
+        sync_checkpoint_config(args)
+        save_checkpoint(5, [MockModel(config)], None, None, 0)
+
+        config_filename = get_checkpoint_run_config_filename(str(ckpt_dir / "iter_0000005"))
+        if torch.distributed.get_rank() == 0:
+            if section_says_rng is None:
+                os.remove(config_filename)
+            elif section_says_rng is False:
+                with open(config_filename) as handle:
+                    saved = yaml.safe_load(handle)
+                saved["checkpoint"]["save_rng"] = False
+                with open(config_filename, "w") as handle:
+                    yaml.safe_dump(saved, handle)
+        torch.distributed.barrier()
+
+        with mock.patch(
+            "megatron.training.checkpointing.get_rng_state", wraps=checkpointing.get_rng_state
+        ) as rng_template:
+            iteration, _ = load_checkpoint([MockModel(config)], None, None, strict=True)
+        assert iteration == 5
+        # The RNG shard is requested unless the saved section says it is not there.
+        assert rng_template.called is (section_says_rng is not False)
