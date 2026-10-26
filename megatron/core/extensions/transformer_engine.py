@@ -2213,13 +2213,23 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
         super().__init__()
         if not HAVE_TE_GDN:
             raise ImportError("Transformer Engine GatedDeltaNetAttention (GDN) is not available.")
-        assert _TE_LINEAR_ATTENTION is not None
+        self.num_attention_heads = num_attention_heads
+        self.qk_head_dim = qk_head_dim
         self.value_head_dim = value_head_dim
-        self.te_attention = _TE_LINEAR_ATTENTION(
+        self.layer_number = layer_number
+        self.te_attention = self._make_te_attention(num_attention_heads)
+        # TE GDN has no parameters. Keep runtime variants outside module registration
+        # so selecting another head count does not change checkpoint state.
+        self._runtime_attentions: dict[int, torch.nn.Module] = {}
+
+    def _make_te_attention(self, num_attention_heads: int) -> torch.nn.Module:
+        """Build a TE adapter whose head geometry remains fixed across forwards."""
+        assert _TE_LINEAR_ATTENTION is not None
+        return _TE_LINEAR_ATTENTION(
             num_attention_heads=num_attention_heads,
-            kv_channels=(qk_head_dim, value_head_dim),
+            kv_channels=(self.qk_head_dim, self.value_head_dim),
             qkv_format="bshd",
-            layer_number=layer_number,
+            layer_number=self.layer_number,
         )
 
     def forward(
@@ -2238,6 +2248,14 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
         """Run TE GDN through the FLA-compatible Megatron kernel interface."""
         del kwargs
 
+        runtime_heads = q.shape[-2]
+        attention = self.te_attention
+        if runtime_heads != self.num_attention_heads:
+            if runtime_heads not in self._runtime_attentions:
+                self._runtime_attentions[runtime_heads] = self._make_te_attention(runtime_heads)
+            attention = self._runtime_attentions[runtime_heads]
+            attention.train(self.training)
+
         batch, sequence = q.shape[:2]
         qkv_format = "bshd"
         if cu_seqlens is not None:
@@ -2245,7 +2263,7 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
             q, k, v = (tensor.reshape(-1, *tensor.shape[2:]) for tensor in (q, k, v))
             g, beta = (tensor.reshape(-1, tensor.shape[-1]) for tensor in (g, beta))
 
-        result = self.te_attention(
+        result = attention(
             q,
             k,
             v,
