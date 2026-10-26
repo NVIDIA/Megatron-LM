@@ -50,7 +50,9 @@ class T5LMHead(MegatronModule):
         super(T5LMHead, self).__init__(config=config)
 
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         self.parallel_output = parallel_output
 
