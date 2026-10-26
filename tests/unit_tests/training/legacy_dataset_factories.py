@@ -7,7 +7,9 @@ names differ) from the entry points at that commit, before the providers started
 runtime config from ``PretrainConfigContainer.dataset``. ``test_dataset_providers.py`` compares
 what every entry point builds now against ``pretrain_gpt.py``'s, and lists where the other three
 differed from it. The dataset-class selection of the legacy providers is reproduced at the end of
-this module.
+this module. One deviation from verbatim: #7047 (``main`` ``ea99fdfce``) renamed
+``hybrid_context_parallel`` to ``dynamic_context_parallel`` on ``GPTDatasetConfig`` and in these
+factories, and the copies follow that rename so the oracle compares the field ``main`` now sets.
 """
 
 import json
@@ -65,7 +67,7 @@ def legacy_gpt_dataset_config(args: Any) -> GPTDatasetConfig:
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,  # #7047 renamed the field
         "inter_document_masking": args.dataloader_inter_document_masking,
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
@@ -137,7 +139,7 @@ def legacy_hybrid_dataset_config(args: Any) -> GPTDatasetConfig:
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
         varlen_sbhd_validation=args.varlen_sbhd_validation,
@@ -214,7 +216,7 @@ def legacy_prepare_cache_dataset_config(args: Any) -> GPTDatasetConfig:
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
     )
 
 

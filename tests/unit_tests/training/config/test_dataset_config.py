@@ -120,7 +120,7 @@ def test_bind_tokenizer_runs_megatron_cores_checks(tokenizer):
         DataConfig(dataset=_dataset(reset_position_ids=None)).validate()
     with pytest.raises(AssertionError):
         DataConfig(dataset=_dataset(reset_position_ids=None)).bind_tokenizer(tokenizer)
-    sbhd = DataConfig(dataset=_dataset(varlen_sbhd_validation=True, hybrid_context_parallel=True))
+    sbhd = DataConfig(dataset=_dataset(varlen_sbhd_validation=True, dynamic_context_parallel=True))
     with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
         sbhd.validate()
     with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
@@ -181,16 +181,19 @@ def test_fim_config_is_megatron_cores(tokenizer):
 
 
 def test_container_written_fields_are_the_layout_and_the_validation_flags():
-    """The six fields other sections own, left at Megatron Core's defaults until the container
-    writes them; the seed is the section's own setting, not one of them."""
+    """The seven fields other sections own (the deprecated hybrid_context_parallel alias among
+    them), left at Megatron Core's defaults until the container writes them; the seed is the
+    section's own setting, not one of them."""
     assert CONTAINER_WRITTEN_FIELDS == (
         "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
-        "hybrid_context_parallel", "multiple_validation_sets", "full_validation",
+        "dynamic_context_parallel", "hybrid_context_parallel",
+        "multiple_validation_sets", "full_validation",
     )  # fmt: skip
     defaults = {f.name: f.default for f in fields(GPTDatasetConfig)}
     assert {name: defaults[name] for name in CONTAINER_WRITTEN_FIELDS} == {
         "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
-        "hybrid_context_parallel": False, "multiple_validation_sets": None, "full_validation": None,
+        "dynamic_context_parallel": False, "hybrid_context_parallel": False,
+        "multiple_validation_sets": None, "full_validation": None,
     }  # fmt: skip
     assert "random_seed" not in CONTAINER_WRITTEN_FIELDS
 

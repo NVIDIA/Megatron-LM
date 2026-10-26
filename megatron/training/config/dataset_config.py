@@ -9,9 +9,10 @@ tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the 
 ``validate()``, which needs the tokenizer, runs in ``DataConfig.bind_tokenizer`` once the runtime
 services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Six Core fields are owned by other container sections (the parallel layout,
-the validation flags): the container writes them at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``)
-and they are not serialized with the section.
+saved with the section. Seven Core fields are owned by other container sections (the parallel
+layout with its deprecated ``hybrid_context_parallel`` alias, the validation flags): the container
+writes them at ``finalize()`` (``CONTAINER_WRITTEN_FIELDS``) and they are not serialized with the
+section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
@@ -33,11 +34,14 @@ DATASET_FAMILIES = ("gpt", "fim", "varlen", "sft")
 # Fields of the dataset config that other container sections own: the parallel layout (the model
 # config) and the validation flags (the validation config). PretrainConfigContainer writes them at
 # finalize(), the container-oriented factory leaves them unset and the section serializes without
-# them: they are recorded once, in their owning sections.
+# them: they are recorded once, in their owning sections. hybrid_context_parallel is the deprecated
+# alias of dynamic_context_parallel (#7047): the container folds it into the canonical field and
+# clears it, so it is neither serialized nor left set.
 CONTAINER_WRITTEN_FIELDS = (
     "data_parallel_size",
     "context_parallel_size",
     "sequence_parallel_size",
+    "dynamic_context_parallel",
     "hybrid_context_parallel",
     "multiple_validation_sets",
     "full_validation",

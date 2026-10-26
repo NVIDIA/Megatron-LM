@@ -49,12 +49,14 @@ SOURCE = ["--data-path", "prefix-a", "--split", "9,1,0"]
 BLEND = (["prefix-a", "prefix-b"], [0.3, 0.7])
 # The layout fields the container writes from the model config; a run without one keeps them.
 LAYOUT_FIELDS = (
-    "data_parallel_size", "context_parallel_size", "sequence_parallel_size", "hybrid_context_parallel",
+    "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
+    "dynamic_context_parallel", "hybrid_context_parallel",
 )  # fmt: skip
 # Megatron Core's defaults for the fields the container writes: what an unset field holds.
 CORE_DEFAULTS = {
     "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
-    "hybrid_context_parallel": False, "multiple_validation_sets": None, "full_validation": None,
+    "dynamic_context_parallel": False, "hybrid_context_parallel": False,
+    "multiple_validation_sets": None, "full_validation": None,
 }  # fmt: skip
 
 
@@ -175,7 +177,7 @@ def _layout(**overrides):
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         sequence_parallel=False,
-        hybrid_context_parallel=False,
+        dynamic_context_parallel=False,
         gtp_weight_remat_size=1,
         gtp_remat_num_sequence_shards=1,
         cuda_graph_impl="none",
@@ -359,6 +361,7 @@ def test_standalone_config_takes_the_container_written_fields_from_args():
     assert standalone.sequence_parallel_size == args.tensor_model_parallel_size * int(
         args.sequence_parallel
     )
+    assert standalone.dynamic_context_parallel is False
     assert standalone.hybrid_context_parallel is False
     owned = gpt_data_config_from_args(args).dataset
     assert _written_fields(owned) == CORE_DEFAULTS
@@ -443,7 +446,7 @@ def test_container_writes_the_owned_fields_at_finalize(container_factory, monkey
         tensor_model_parallel_size=2,
         context_parallel_size=2,
         sequence_parallel=True,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
     )
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     # The owners stay editable after construction: no stale copy on the dataset config. The dataset
@@ -464,7 +467,8 @@ def test_container_writes_the_owned_fields_at_finalize(container_factory, monkey
     assert dataset.random_seed == 99 and cfg.rng.seed == 42
     assert dataset.full_validation is True and dataset.multiple_validation_sets is True
     assert (dataset.context_parallel_size, dataset.sequence_parallel_size) == (2, 2)
-    assert dataset.hybrid_context_parallel is True and dataset.data_parallel_size == 2
+    assert dataset.dynamic_context_parallel is True and dataset.data_parallel_size == 2
+    assert dataset.hybrid_context_parallel is False  # the deprecated alias is never written True
     assert cfg.data.dataset_type is MockGPTDataset
     assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
     assert cfg.to_dict()["data"]["dataset"]["random_seed"] == 99
@@ -483,11 +487,11 @@ def test_a_layout_field_at_core_default_carries_no_explicit_value(container_fact
         tensor_model_parallel_size=2,
         context_parallel_size=2,
         sequence_parallel=True,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
     )
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     dataset.data_parallel_size, dataset.sequence_parallel_size = 1, 0
-    dataset.hybrid_context_parallel = False
+    dataset.dynamic_context_parallel = False
     cfg.validate()
     dataset.sequence_parallel_size = 1
     with pytest.raises(ValueError, match="data.dataset.sequence_parallel_size=1 disagrees"):
@@ -495,7 +499,33 @@ def test_a_layout_field_at_core_default_carries_no_explicit_value(container_fact
     dataset.sequence_parallel_size = 0
     cfg.finalize()
     assert (dataset.data_parallel_size, dataset.sequence_parallel_size) == (2, 2)
-    assert dataset.hybrid_context_parallel is True
+    assert dataset.dynamic_context_parallel is True
+
+
+def test_the_deprecated_hybrid_alias_is_folded_into_dynamic_context_parallel(
+    container_factory, monkeypatch
+):
+    """A section carrying Megatron Core's deprecated hybrid_context_parallel alias (#7047) counts
+    as the canonical flag for the cross-section check and is folded at finalize(): Core warns about
+    the alias in validate_without_tokenizer() and does not rewrite it; the container writes
+    dynamic_context_parallel from the model config and clears the alias."""
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    dataset = cfg.data.dataset
+    dataset.hybrid_context_parallel = True
+    cfg.model = _layout(dynamic_context_parallel=False)
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
+    with pytest.warns(DeprecationWarning, match="hybrid_context_parallel is deprecated"):
+        with pytest.raises(
+            ValueError, match="data.dataset.dynamic_context_parallel=True disagrees"
+        ):
+            cfg.validate()
+    cfg.model = _layout(dynamic_context_parallel=True)
+    with pytest.warns(DeprecationWarning):
+        cfg.validate()
+        cfg.finalize()
+    assert dataset.dynamic_context_parallel is True and dataset.hybrid_context_parallel is False
+    cfg.validate()  # nothing deprecated is left on the section
+    assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
 
 
 def test_layout_without_a_model_section_survives_a_reload(
@@ -509,7 +539,7 @@ def test_layout_without_a_model_section_survives_a_reload(
     cfg.finalize()
     cfg.data.bind_tokenizer(tokenizer)
     layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_FIELDS)
-    assert layout == (1, None, 0, False)
+    assert layout == (1, None, 0, False, False)
     cfg.validate()  # Core's defaults are not explicit values
     reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
     reloaded.finalize()
@@ -545,7 +575,9 @@ def test_owned_fields_without_a_model_section(container_factory, tokenizer):
         ("multiple_validation_sets", True, "data.dataset.multiple_validation_sets=True disagrees with validation.multiple_validation_sets=False"),
         ("context_parallel_size", 4, "data.dataset.context_parallel_size=4 disagrees with model.transformer.context_parallel_size=2"),
         ("sequence_parallel_size", 1, "data.dataset.sequence_parallel_size=1 disagrees with the model layout"),
-        ("hybrid_context_parallel", True, "data.dataset.hybrid_context_parallel=True disagrees with model.transformer.hybrid_context_parallel=False"),
+        ("dynamic_context_parallel", True, "data.dataset.dynamic_context_parallel=True disagrees with model.transformer.dynamic_context_parallel=False"),
+        # the deprecated alias counts as the canonical flag (Core warns about it)
+        ("hybrid_context_parallel", True, "data.dataset.dynamic_context_parallel=True disagrees with model.transformer.dynamic_context_parallel=False"),
     ],
 )  # fmt: skip
 def test_each_owned_field_is_checked_against_its_owner(container_factory, field, value, message):

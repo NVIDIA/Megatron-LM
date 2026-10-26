@@ -866,7 +866,8 @@ def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
         "data_parallel_size": args.data_parallel_size,
         "context_parallel_size": args.context_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * int(bool(args.sequence_parallel)),
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
+        "hybrid_context_parallel": args.hybrid_context_parallel,  # False after validate_args
         "full_validation": args.full_validation,
         "multiple_validation_sets": args.multiple_validation_sets,
     }

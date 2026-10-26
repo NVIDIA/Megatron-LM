@@ -507,11 +507,15 @@ class PretrainConfigContainer(ConfigContainerBase):
                 f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
                 "it unset."
             )
-        hybrid_context_parallel = bool(getattr(transformer, "hybrid_context_parallel", False))
-        if dataset.hybrid_context_parallel and not hybrid_context_parallel:
+        dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
+        # The deprecated hybrid_context_parallel alias counts as the canonical flag here (Core
+        # warns about it in validate_without_tokenizer()); finalize() folds it and clears it.
+        if (
+            dataset.dynamic_context_parallel or dataset.hybrid_context_parallel
+        ) and not dynamic_context_parallel:
             raise ValueError(
-                "data.dataset.hybrid_context_parallel=True disagrees with "
-                "model.transformer.hybrid_context_parallel=False; the container writes this field "
+                "data.dataset.dynamic_context_parallel=True disagrees with "
+                "model.transformer.dynamic_context_parallel=False; the container writes this field "
                 "at finalize(), leave it unset."
             )
 
@@ -546,8 +550,9 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:
-            # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
-            # from the validation config, the layout from the model config when there is one.
+            # The seven fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # from the validation config, the layout from the model config when there is one (the
+            # deprecated hybrid_context_parallel alias is folded into dynamic_context_parallel).
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
             if transformer is not None:
@@ -556,9 +561,10 @@ class PretrainConfigContainer(ConfigContainerBase):
                 dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
                     bool(transformer.sequence_parallel)
                 )
-                dataset.hybrid_context_parallel = bool(
-                    getattr(transformer, "hybrid_context_parallel", False)
+                dataset.dynamic_context_parallel = bool(
+                    getattr(transformer, "dynamic_context_parallel", False)
                 )
+                dataset.hybrid_context_parallel = False
         self.data.finalize()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)

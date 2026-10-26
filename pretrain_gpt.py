@@ -27,10 +27,8 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
-)
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
@@ -94,13 +92,22 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+def get_batch(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
     """Generate a batch."""
 
     args = get_args()
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
+        if pg_collection is None:
+            # Compatibility for direct entrypoint callers; Core receives explicit groups.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+            )
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
@@ -109,8 +116,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 mtp_num_layers=config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=vp_stage,
+                pp_group=pg_collection.pp,
+                vp_size=config.virtual_pipeline_model_parallel_size or 1,
             ),
             vp_stage=vp_stage,
+            dynamic_cp=args.dynamic_context_parallel,
+            pg_collection=pg_collection,
+            config=config,
         )
 
     cp_size = args.context_parallel_size
@@ -124,7 +136,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.hybrid_context_parallel
+    # Dynamic CP always uses the sequence-packing path above.
+    assert not args.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -148,7 +161,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=False,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
@@ -179,9 +192,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     batch = get_batch_on_this_cp_rank(
         batch,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
     )
 
@@ -312,7 +324,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator', log_level=2).start()
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        batch = get_batch(data_iterator, vp_stage)
+        batch = get_batch(
+            data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
+        )
 
         # Only populated by the has_cu_seqlens (--sft) 10-tuple branch below;
         # stays None for the 6-/7-tuple (unpacked) batch shapes.

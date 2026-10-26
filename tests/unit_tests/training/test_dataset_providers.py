@@ -50,14 +50,15 @@ PARALLEL_OVERRIDES = dict(
     tensor_model_parallel_size=2,
     sequence_parallel=True,
     data_parallel_size=4,
-    hybrid_context_parallel=True,
+    dynamic_context_parallel=True,
     full_validation=True,
     multiple_validation_sets=True,
 )
 VALIDATION_OVERRIDES = dict(full_validation=True, multiple_validation_sets=True)
 # The layout fields the container writes from the model config (pretrain_hybrid_flex.py has none).
 LAYOUT_FIELDS = (
-    "data_parallel_size", "context_parallel_size", "sequence_parallel_size", "hybrid_context_parallel",
+    "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
+    "dynamic_context_parallel", "hybrid_context_parallel",
 )  # fmt: skip
 
 
@@ -222,7 +223,7 @@ def _layout_from_args(args):
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
         sequence_parallel=args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
         gtp_weight_remat_size=args.gtp_weight_remat_size,
         gtp_remat_num_sequence_shards=args.gtp_remat_num_sequence_shards,
         cuda_graph_impl="none",
