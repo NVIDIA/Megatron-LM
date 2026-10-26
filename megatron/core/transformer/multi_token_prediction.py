@@ -2385,7 +2385,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                     m.is_repeated_layer = True
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
-        self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
+        # Only a sequence-parallel CP layout conversion needs tp_cp, and it raises without one.
+        self.tp_cp_group = vars(pg_collection).get('tp_cp')
         self.pp_rank = pg_collection.pp.rank()
         self.dp_group = pg_collection.dp if self.config.mtp_hsm else None
         self.hidden_state_mixing_rng_tracker_name = (
