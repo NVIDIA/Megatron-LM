@@ -2,8 +2,8 @@
 
 """Candidate-aware CSA2 selection and indexer supervision.
 
-Candidate IDs are read directly by the kernels. Selection uses BF16 projections
-and DSv4 radix Top-K. Supervision uses the
+Candidate IDs are read directly by the kernels. Selection uses TE MXFP8 data
+and E8M0 scales or BF16, followed by DSv4 radix Top-K. Supervision uses the
 original projections. Forward consumes bounded score/target tiles once for loss
 and unit-loss gradients; backward only scales those gradients, as in V4. Shared
 K gradients still reach the owning Full layer.
@@ -14,6 +14,14 @@ from functools import cached_property
 
 import torch
 from torch import Tensor
+
+from megatron.core.ops.attention.csa.indexer_quantization import (
+    indexer_mxfp8_thd_scale_capacity,
+    indexer_mxfp8_thd_scale_shape,
+    make_indexer_mxfp8_scale_cu_seqlens,
+    quantize_indexer_mxfp8,
+    quantize_indexer_mxfp8_logical,
+)
 
 from . import fused_sparse_attention
 from .csa2_candidates import CSA2CandidateBlocks, select_compact_positions
@@ -179,6 +187,89 @@ def _chunk_rows(width: int) -> int:
     return min(_QUERY_CHUNK_SIZE, max(1, _SCORE_CHUNK_MAX_BYTES // (max(width, 1) * 12)))
 
 
+@torch.compile
+def _compact_candidate_offsets(cu_q: Tensor, offsets: Tensor, ratio: int) -> Tensor:
+    """Compute cuDNN's causal candidate prefixes from live device metadata."""
+    lengths = cu_q[1:].to(torch.int64) - cu_q[:-1]
+    starts = offsets.to(torch.int64)
+
+    def count(length):
+        quotient = torch.div(length, ratio, rounding_mode="floor")
+        remainder = length - quotient * ratio
+        return ratio * quotient * (quotient - 1) // 2 + quotient * (remainder + 1)
+
+    counts = count(starts + lengths) - count(starts)
+    return torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+
+
+@torch.no_grad()
+def fused_mxfp8_topk(inputs: CSA2IndexerInputs, topk: int) -> Tensor:
+    """Use cuDNN's compact MXFP8 scorer for ordinary Full/Reindex selection.
+
+    All layouts use the existing packed rows, including CP-local queries and
+    global keys. Dispatch-local scratch and host-known bounds keep capture
+    independent of live prefix values without a second workspace/cache API.
+    """
+    q, k, weights = inputs.q, inputs.k, inputs.weights
+    width = min(topk, inputs.key_capacity)
+    shape = (*inputs.output_shape, width)
+    if q.shape[0] == 0 or k.shape[0] == 0 or width == 0 or inputs.max_keys == 0:
+        return torch.full(shape, -1, dtype=torch.int32, device=q.device)
+    heads = q.shape[-2]
+    weights = (weights.float() * (q.shape[-1] ** -0.5 * heads**-0.5)).to(weights.dtype)
+    if heads == 32:
+        q = torch.nn.functional.pad(q, (0, 0, 0, 32))
+        weights = torch.nn.functional.pad(weights, (0, 32))
+    cu_q, cu_k, max_q, max_k = inputs.packed_metadata
+    offsets = inputs.packed_causal_offsets
+    # Odd r2 spans can have one more causal candidate than complete K groups.
+    max_k = max(max_k, (max_q + inputs.ratio - 1) // inputs.ratio)
+    quantized = []
+    for value, prefix, num_heads in ((q, cu_q, q.shape[-2]), (k, cu_k, 1)):
+        scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(prefix, num_heads)
+        capacity = indexer_mxfp8_thd_scale_capacity(value.shape[0], prefix.numel() - 1, num_heads)
+        scales = torch.empty(
+            indexer_mxfp8_thd_scale_shape(capacity, num_heads, value.shape[-1]),
+            dtype=torch.float8_e8m0fnu,
+            device=value.device,
+        )
+        data, scales = quantize_indexer_mxfp8(
+            value, cu_seqlens=prefix, cu_seqlens_scale_padded=scale_prefix, out_scale=scales
+        )
+        quantized.append((data, scales, scale_prefix))
+    (q, qs, q_prefix), (k, ks, k_prefix) = quantized
+    fused_sparse_attention._ensure_dsa_namespace()
+    result = fused_sparse_attention._DSA.indexer_forward_top_k_wrapper(
+        q,
+        k.unsqueeze(1),
+        weights,
+        top_k=width,
+        ratio=inputs.ratio,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        q_causal_offsets=offsets,
+        precision="mxfp8",
+        q_scale=qs,
+        k_scale=ks,
+        cu_seqlens_q_scale_padded=q_prefix,
+        cu_seqlens_k_scale_padded=k_prefix,
+        cand_buffer=torch.empty(q.shape[0] * max_k, dtype=torch.float32, device=q.device),
+        cand_batch_offsets=_compact_candidate_offsets(cu_q, offsets, inputs.ratio),
+        deterministic=True,
+        return_softmax=False,
+        topk_indices_global=False,
+    )
+    indices = result["indices"]
+    valid = (indices >= 0) & (indices < inputs.visible[:, None]) & inputs.valid[:, None]
+    if inputs.thd_layout is not None:
+        indices = indices + inputs.starts[:, None]
+    sentinel = torch.iinfo(torch.int32).max
+    indices = indices.masked_fill(~valid, sentinel).sort(-1).values
+    return indices.masked_fill(indices == sentinel, -1).reshape(shape).contiguous()
+
+
 if HAVE_TRITON:
 
     @triton.jit
@@ -221,11 +312,15 @@ if HAVE_TRITON:
         q,
         k,
         weights,
+        q_scale,
+        k_scale,
         ids,
         counts,
         starts,
         visible,
         scores,
+        Q_SCALE_STRIDE: tl.constexpr,
+        K_SCALE_STRIDE: tl.constexpr,
         HEADS: tl.constexpr,
         DIM: tl.constexpr,
         STRIDE: tl.constexpr,
@@ -233,6 +328,7 @@ if HAVE_TRITON:
         ID_WIDTH: tl.constexpr,
         MODE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
+        MXFP8: tl.constexpr,
         SCALE: tl.constexpr,
         ROUND_WEIGHTS: tl.constexpr,
         TILE_K: tl.constexpr,
@@ -247,7 +343,24 @@ if HAVE_TRITON:
             q + (row * HEADS + h[:, None]) * DIM + d[None, :], h[:, None] < HEADS, other=0.0
         )
         kv = tl.load(k + keys[None, :] * DIM + d[:, None], valid[None, :], other=0.0)
-        dots = tl.dot(qv, kv)
+        if MXFP8:
+            groups = tl.arange(0, DIM // 32)
+            qs = tl.load(
+                q_scale + (row * HEADS + h[:, None]) * Q_SCALE_STRIDE + groups[None, :],
+                h[:, None] < HEADS,
+                other=127,
+            )
+            ks = tl.load(
+                k_scale + keys[:, None] * K_SCALE_STRIDE + groups[None, :],
+                valid[:, None],
+                other=127,
+            )
+            # Triton's SM100 scaled MMA lowering requires M >= 128. Use the
+            # candidate-key axis as M and real H32/H64 as N, then transpose.
+            # This avoids padding Q or silently emulating MXFP8 through BF16.
+            dots = tl.trans(tl.dot_scaled(tl.trans(kv), ks, "e4m3", tl.trans(qv), qs, "e4m3"))
+        else:
+            dots = tl.dot(qv, kv)
         w = tl.load(weights + row * HEADS + h, h < HEADS, other=0.0).to(tl.float32) * SCALE
         if ROUND_WEIGHTS:
             w = w.to(tl.bfloat16).to(tl.float32)
@@ -484,18 +597,24 @@ def _score_chunk(
     mode: int,
     block_size: int,
     selection: bool = False,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     scores = torch.empty((q.shape[0], stride), dtype=torch.float32, device=q.device)
-    tile_k = 64
+    tile_k = 128 if q_scale is not None else 64
     _score_kernel[(q.shape[0], triton.cdiv(stride, tile_k))](
         q,
         k,
         weights,
+        q_scale,
+        k_scale,
         ids,
         counts,
         starts,
         visible,
         scores,
+        q_scale.stride(0) if q_scale is not None else 0,
+        k_scale.stride(0) if k_scale is not None else 0,
         q.shape[-2],
         q.shape[-1],
         stride,
@@ -503,6 +622,7 @@ def _score_chunk(
         ids.shape[-1],
         mode,
         block_size,
+        q_scale is not None,
         q.shape[-1] ** -0.5 * q.shape[-2] ** -0.5,
         selection,
         tile_k,
@@ -515,8 +635,8 @@ def fused_candidate_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -
     """Score only candidate blocks and select sorted local/physical key positions."""
     if not HAVE_TRITON or not inputs.q.is_cuda:
         raise RuntimeError("Fused CSA2 Reindex requires CUDA and Triton")
-    if precision != "bf16":
-        raise ValueError("CSA2 currently uses the main BF16 scorer")
+    if precision not in ("bf16", "mxfp8"):
+        raise ValueError("CSA2 Reindex precision must be bf16 or mxfp8")
     if inputs.candidates is None:
         raise ValueError("Candidate-aware Reindex requires compact candidate blocks")
     q, k, w = inputs.q, inputs.k, inputs.weights
@@ -535,11 +655,17 @@ def fused_candidate_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -
     counts = candidate.lengths.reshape(-1).contiguous()
     stride = triton.cdiv(max(width, topk), 8) * 8
     flat_output = output.reshape(q.shape[0], topk)
+    kernel_k, k_scale = quantize_indexer_mxfp8_logical(k) if precision == "mxfp8" else (k, None)
     for start in range(0, q.shape[0], _chunk_rows(stride)):
         end = min(start + _chunk_rows(stride), q.shape[0])
+        kernel_q, q_scale = (
+            quantize_indexer_mxfp8_logical(q[start:end])
+            if precision == "mxfp8"
+            else (q[start:end], None)
+        )
         scores = _score_chunk(
-            q[start:end],
-            k,
+            kernel_q,
+            kernel_k,
             w[start:end],
             ids[start:end],
             counts[start:end],
@@ -550,6 +676,8 @@ def fused_candidate_topk(inputs: CSA2IndexerInputs, topk: int, precision: str) -
             mode=1,
             block_size=candidate.block_size,
             selection=True,
+            q_scale=q_scale,
+            k_scale=k_scale,
         )
         slots, _ = select_compact_positions(
             scores, torch.full_like(counts[start:end], stride), topk
