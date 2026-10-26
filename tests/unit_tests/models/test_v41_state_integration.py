@@ -141,11 +141,25 @@ def _run(stack, x, cfg, groups, values=None):
     return out, context
 
 
-def test_hybrid_stack_checkpoint_and_pipeline_owner_gradients(setup):
+@pytest.mark.parametrize(
+    'method,num_layers',
+    [
+        ('uniform', 1),
+        ('uniform', 2),
+        ('uniform', 4),
+        ('uniform', 7),
+        ('block', 1),
+        ('block', 3),
+        ('block', 6),
+    ],
+)
+def test_hybrid_stack_checkpoint_and_pipeline_owner_gradients(setup, method, num_layers):
     cfg, spec, groups = setup
     full = _stack(cfg, spec, groups)
     checkpointed = copy.deepcopy(full)
     checkpointed.config.recompute_granularity = 'full'
+    checkpointed.config.recompute_method = method
+    checkpointed.config.recompute_num_layers = num_layers
     # Split between Full and its future Reindex/Reuse consumers, including the mHC edge.
     stages = [_stack(cfg, spec, groups, 0, 2), _stack(cfg, spec, groups, 2, 6)]
     for stage, offset in zip(stages, (0, 2)):

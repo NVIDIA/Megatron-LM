@@ -42,6 +42,10 @@ class HybridStackForwardAdapter(Protocol):
         """Execute a layer with explicit state, including an optional replay boundary."""
         ...
 
+    def checkpointed_forward(self, layers, hidden_states, context, **kwargs) -> Tensor:
+        """Checkpoint local layer groups using the owning model's state contract."""
+        ...
+
     def finalize_forward(
         self, output: Tensor | tuple[Tensor, Tensor], context: HybridStackForwardContext
     ) -> Any:

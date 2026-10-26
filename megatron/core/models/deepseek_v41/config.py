@@ -62,9 +62,13 @@ class DeepSeekV41Config(MLATransformerConfig):
                 "V4.1 residual storage uses the model dtype; mixing arithmetic is FP32"
             )
         if self.recompute_granularity == 'full' and (
-            self.recompute_method != 'uniform' or self.recompute_num_layers != 1
+            self.recompute_method not in ('uniform', 'block')
+            or type(self.recompute_num_layers) is not int
+            or self.recompute_num_layers <= 0
         ):
-            raise ValueError("V4.1 full recompute currently uses one explicit layer per region")
+            raise ValueError(
+                "V4.1 full recompute requires uniform/block and a positive layer count"
+            )
         if self.context_parallel_size > 1 and self.linear_cp_layout != 'contiguous':
             raise ValueError("V4.1 keeps a contiguous CP layout across attention and MoE layers")
         if self.engram_config is not None:
