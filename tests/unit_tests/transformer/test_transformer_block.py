@@ -78,9 +78,7 @@ class TestParallelTransformerBlock:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states = parallel_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask
-        )
+        hidden_states = parallel_transformer_block(hidden_states, attention_mask=attention_mask)
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
@@ -216,9 +214,7 @@ class TestParallelTransformerBlock:
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
         hidden_states = full_transformer_block(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            rotary_pos_emb=rotary_pos_emb,
+            hidden_states, attention_mask=attention_mask, rotary_pos_emb=rotary_pos_emb
         )
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
@@ -247,9 +243,7 @@ class TestParallelTransformerBlock:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states = selective_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask
-        )
+        hidden_states = selective_transformer_block(hidden_states, attention_mask=attention_mask)
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
@@ -271,7 +265,7 @@ class TestParallelTransformerBlock:
 
         # Test with None (should return just hidden_states)
         output = parallel_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=None
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=None
         )
         assert isinstance(output, torch.Tensor)
         assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
@@ -279,9 +273,7 @@ class TestParallelTransformerBlock:
         # Test with single layer extraction
         extract_indices = {0}
         result = parallel_transformer_block(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            extract_layer_indices=extract_indices,
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -297,9 +289,7 @@ class TestParallelTransformerBlock:
         # Test with multiple layer extraction (config has 2 layers: indices 0, 1)
         extract_indices = {0, 1}
         result = parallel_transformer_block(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            extract_layer_indices=extract_indices,
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -333,7 +323,7 @@ class TestParallelTransformerBlock:
 
         # Test with None (should return just hidden_states)
         output = block_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=None
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=None
         )
         assert isinstance(output, torch.Tensor)
         assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
@@ -341,9 +331,7 @@ class TestParallelTransformerBlock:
         # Test with single layer extraction
         extract_indices = {0}
         result = block_transformer_block(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            extract_layer_indices=extract_indices,
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -360,9 +348,7 @@ class TestParallelTransformerBlock:
         # Unlike uniform, block method supports extraction at every layer
         extract_indices = {0, 1}
         result = block_transformer_block(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            extract_layer_indices=extract_indices,
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -403,7 +389,7 @@ class TestParallelTransformerBlock:
 
         # Test with None (should return just hidden_states)
         output = uniform_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=None
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=None
         )
         assert isinstance(output, torch.Tensor)
         assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
@@ -412,9 +398,7 @@ class TestParallelTransformerBlock:
         # Only the chunk boundary (layer 1) can be extracted; layer 0 is inside the chunk.
         extract_indices = {0, 1}
         result = uniform_transformer_block(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            extract_layer_indices=extract_indices,
+            hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -465,7 +449,7 @@ class TestParallelTransformerBlock:
         )
 
         # This should not raise an IndexError
-        output = uniform_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        output = uniform_block(hidden_states, attention_mask=attention_mask)
         assert output.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size)
 
 
@@ -603,7 +587,7 @@ class TestProcessGroupTransformerBlock:
             lambda *args: observed.append(args),
             frozenset({"residual_accumulator", "residual_contribution"}),
         ):
-            output = block(hidden_states=hidden_states, attention_mask=None)
+            output = block(hidden_states, attention_mask=None)
 
         torch.testing.assert_close(output, hidden_states + 1)
         assert [(value[1], value[2]) for value in observed] == [
@@ -670,7 +654,7 @@ class TestProcessGroupTransformerBlock:
             device="cuda",
         )
 
-        hidden_states = self.transformer_block(hidden_states=hidden_states, attention_mask=None)
+        hidden_states = self.transformer_block(hidden_states, attention_mask=None)
 
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
@@ -770,7 +754,7 @@ class TestMixedProcessGroups:
             device="cuda",
         )
 
-        hidden_states = self.transformer_block(hidden_states=hidden_states, attention_mask=None)
+        hidden_states = self.transformer_block(hidden_states, attention_mask=None)
 
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size

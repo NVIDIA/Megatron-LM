@@ -538,7 +538,7 @@ class TestTransformerBlockMHCRecompute:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool, device='cuda')
 
-        out = block(hidden_states=hidden_states, attention_mask=attention_mask)
+        out = block(hidden_states, attention_mask=attention_mask)
         assert out.shape == hidden_states.shape, (
             f"output_contract should restore original shape, got {tuple(out.shape)} "
             f"vs expected {tuple(hidden_states.shape)}"

@@ -238,12 +238,8 @@ class TestSpecCustomization:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        out1 = parallel_transformer_block1(
-            hidden_states=hidden_states, attention_mask=attention_mask
-        )
-        out2 = parallel_transformer_block2(
-            hidden_states=hidden_states, attention_mask=attention_mask
-        )
+        out1 = parallel_transformer_block1(hidden_states, attention_mask=attention_mask)
+        out2 = parallel_transformer_block2(hidden_states, attention_mask=attention_mask)
 
         assert torch.all(torch.eq(out1, out2))
         assert out1.shape[0] == sequence_length == out2.shape[0]
@@ -274,7 +270,7 @@ class TestSpecCustomization:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        output, bias = self_attention(hidden_states=hidden_states, attention_mask=attention_mask)
+        output, bias = self_attention(hidden_states, attention_mask=attention_mask)
 
         # Assert output shape is same as input shape
         assert output.shape == hidden_states.shape

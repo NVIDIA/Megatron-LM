@@ -95,7 +95,7 @@ class _LayerStackWrapper(torch.nn.Module):
             fn()
 
     def forward(self, hidden_states=None, attention_mask=None, **kwargs):
-        return self.block(hidden_states=hidden_states, attention_mask=attention_mask)
+        return self.block(hidden_states, attention_mask=attention_mask)
 
 
 def _build_layer(

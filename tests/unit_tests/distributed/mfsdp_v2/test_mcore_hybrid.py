@@ -110,7 +110,7 @@ def _train(model, optimizer, steps=3, microbatches=1):
         batch_iterator = iter(batches)
 
         def forward():
-            output = model(hidden_states=next(batch_iterator), attention_mask=None)
+            output = model(next(batch_iterator), attention_mask=None)
             return torch.nn.functional.mse_loss(
                 output.float(), torch.zeros_like(output, dtype=torch.float32)
             )
@@ -156,7 +156,7 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
     hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
     def forward():
-        output = model(hidden_states=hidden, attention_mask=None)
+        output = model(hidden, attention_mask=None)
         return torch.nn.functional.mse_loss(
             output.float(), torch.zeros_like(output, dtype=torch.float32), reduction="sum"
         )
