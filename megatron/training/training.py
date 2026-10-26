@@ -4734,7 +4734,19 @@ def train_step(
                     num_microbatches,
                     seqlen_sum_this_global_batch,
                     seqlen_squared_sum_this_global_batch,
-                ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                ) = wrap_data_iterator(
+                    data_iterator,
+                    config,
+                    get_num_microbatches(),
+                    pg_collection=pg_collection,
+                    prefetch_next=(
+                        iteration is not None
+                        and cfg.train.train_iters is not None
+                        and iteration + 1 < cfg.train.train_iters
+                        and args.dataloader_type != 'external'
+                        and (args.num_workers > 0 or args.use_varlen_dataset)
+                    ),
+                )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
             forward_backward_data_iterator = packed_data_iterator

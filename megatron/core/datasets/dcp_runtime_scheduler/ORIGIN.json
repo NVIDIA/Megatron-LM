@@ -1,0 +1,63 @@
+{
+  "repository": "https://github.com/xiaoyao0115/dcp-scheduler",
+  "commit": "a55b345f20462182b2c4bb00fbc488a414dd5961",
+  "scope": "Selected scalar CPU formulas, compact runtime coefficients and unchanged lightweight solver",
+  "adaptations": [
+    "remove historical heads/schema compatibility/report production",
+    "retain the selected numerical operations and coefficient values",
+    "extract only runtime parameters; original validation reports remain in the source repository",
+    "remove unused offline adapters and signature estimates; share sequence-cap and Python/Numba dispatch implementations",
+    "flatten scalar attention evaluation and share forward/backward geometry validation; remove unused fitting diagnostics, preserving all consumed coefficients",
+    "share solver pack filling, guide/exact layout pricing, input validation and result construction; remove unused offline plan fields",
+    "group cost models and coefficient files under models; share RuntimePlanner without one solver inheriting the other; move scoring timeline into runtime; formulas, parameters and public factory names unchanged"
+  ],
+  "source_python_sha256": {
+    "runtime/lightweight.py": "86720aded0f19a6a45d4fb10752ed7228a12ddb9c4dd41d78d9087df4d85cc17",
+    "runtime/planner.py": "ffdb09978204a006314b71fd5ce1599ee417d89daa166b9bd54de29700243d53",
+    "runtime/cost_model.py": "a659e35598e35e0f74038b4c27f20da1b9ff8e944c56eb65808ad052763087a0",
+    "runtime/sched/costs.py": "c26d469c1deff529dec8f526c946f08d003c6e50a0c507dbe35386dab87f16d9",
+    "runtime/sched/timeline.py": "6c0723afc72531e4cac128cf2785fec94118ca6ba78bb27333e0d68a73296aae",
+    "attention/cuda_graph_attention_predictor.py": "cb1a7f980a43d5ab721f8e83820a625362a0ea8b202136e18e2dcd8703f9b164",
+    "attention/cuda_graph_backward/composer.py": "b646294ead71a6dd57af4f149350164894a23bb0bcbf323c29a3a885141cbca0",
+    "e2e/models/qwen35_core.py": "65f653aed3cbb8d59c7576f087b1b126ec2142b9585c6c6c429880d9be6ca240",
+    "e2e/models/qwen35_proxy.py": "595371d3d377d102eac5df34fb7c5bef08504ece7acd3e99d0b1c7d08b7f2a05"
+  },
+  "source_files_sha256": {
+    "attention/cuda_graph_wp_g3_20261006/cuda_graph_attention_model.json": "41747868ed35aaa61f1eb33e9a503fba23ba2d54166a3b0411a0d7d598b0e4c6",
+    "attention/cuda_graph_backward/data/cp1_model_f5b1_jmax_bwd_f0.json": "7e06b18d31376f52ebc10a2cf723971d44fb7b99217a071a469817a65b8331f6",
+    "attention/cuda_graph_backward/data/ring_bwd_served.json": "ee4a27ef5f5f4ade03e8981430e1f6b09fef2488f8eed9dde65f950d72542c28",
+    "attention/cuda_graph_backward/data_gb200_round2/round2_served_setting.json": "4ed403c04013139a8f04873825a3d2c11c38bb1eebb87c417bd18021b405e46f",
+    "attention/cuda_graph_backward/data_gb300/cp1_model_f5b1_jmax_bwd_f0.json": "a8e57f156beae6283000802b9e3268340455d26ad5cb44b8acbaad47cadcff8e",
+    "attention/cuda_graph_backward/data_gb300/ring_bwd_served.json": "a30092d576b3f6ca9fb8ddecfd386a61b005de77e6f13c39d01500b071d2fcce",
+    "e2e/models/qwen35_calibration/gb200_local16384_proxy.json": "b507ae5571bfa6c8a82d7de0538ebd593d9d80b44cc3e23e0a7ff47b8b6cadc7",
+    "e2e/models/profiles/gb200-ep4-local16384-7319138.json": "83a4d1f6e261cec514bc47741aabcbb5fda3e1f4504bf18e85fdca8aab0324f1",
+    "e2e/models/fa_remainder.json": "5a36d8f33258b5720d3a2bc80acf2a36d20e0a451aee6eb888a96d5956b57f0b"
+  },
+  "runtime_parameters_sha256": {
+    "models/attention/gb200.json": "5becc0bb6bf737b6ab8bfacf41e78930cba0e9c74d9c07c838ac1a3c123629c1",
+    "models/attention/gb300.json": "c6ea0650b7dcb37e76c4a56452d7eee85e8bef5d985480ad4e09a5c9ad45d73a",
+    "models/qwen35.json": "c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc"
+  },
+  "dynamic_usp": {
+    "repository": "https://github.com/mazhuoru/DynamicUSP",
+    "commit": "1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
+    "scope": "Generic solve_gbs Stage 1 and temporary default usp_calib_v1 cost proxy",
+    "adaptations": [
+      "remove head and communication-specific constraints; caller supplies legal group sizes",
+      "use the existing injected cost model and physical-capacity predicate",
+      "retain the original aligned power-of-two allocation policy",
+      "port default usp_calib_v1 scalar costs with unchanged synthetic shape and calibration table; provisional proxy for native P2P",
+      "omit custom profile options, profile-specific Stage 2, CLI and pipeline simulation"
+    ],
+    "source_python_sha256": {
+      "gbs/allocator.py": "7f9e3da37e6d613a46d504f2677a6e9c8a920af9b393f729ab6222647fbc2a8a",
+      "gbs/bounds.py": "8ec1410c93b9760b394c5ccaef03a0713ba61e602a55848e1a829a89136ff3ee",
+      "gbs/placement.py": "c3d33039a108e72caa67abc632c89f78d706e1b1b83e0da2ca8e2b150f06ed1b",
+      "gbs/search.py": "f3235b85347b2e111b219722969c5bef562f253c5ce9e67410d56f5eeec2aa9e",
+      "profiles/usp_calib_v1.py": "a2dbcff0099936e283b2386783861d7191c5319e1cf9e22a8bff30f33207329d"
+    },
+    "source_files_sha256": {
+      "profiles/calib_table_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7"
+    }
+  }
+}

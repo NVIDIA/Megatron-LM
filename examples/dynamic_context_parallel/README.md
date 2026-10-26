@@ -11,6 +11,44 @@ The script reuses the normal Megatron-LM training stack:
 
 No model class or custom dataset class is introduced by this example.
 
+## Runtime cost models and async planning
+
+The existing classic CP ProcessGroups and TE attention path can use either
+in-tree CPU solver. Add a model to enable the runtime planner:
+
+```text
+--dynamic-cp-runtime-model calibrated_attention
+--dynamic-cp-runtime-model-options '{"hardware":"gb200","query_heads":32,"kv_heads":4,"head_dim":128,"layer_count":48,"allow_provisional":true}'
+```
+
+The default lightweight solver searches legal power-of-two CP widths and
+size-aligned rank intervals. Select the independent DynamicUSP allocator with
+`--dynamic-cp-runtime-solver dynamic_usp`; model and solver selection are
+independent. No custom native transport or external scheduler package is needed.
+The frozen models have limited calibration domains; see the
+[model and solver documentation](../../megatron/core/datasets/dcp_runtime_scheduler/README.md)
+before using their predictions.
+
+A persistent CPU worker on the DPxCP leader prepares one future schedule while
+the current batch trains. Use `--no-dynamic-cp-runtime-async` as a same-solver
+synchronous control and `--dynamic-cp-runtime-trace-dir PATH` for timing, input
+digests, executed rows and worker telemetry. PP1/VPP1 and sequence-parallel size
+one are currently required. Mock varlen data or DataLoader workers enable the
+lookahead training hook; evaluation and external iterators do not read ahead.
+Stochastic transforms must run in DataLoader workers to preserve training RNG.
+`--dynamic-cp-runtime-force-powers` is a baseline-only diagnostic and bypasses
+the solver; it is disabled by default.
+
+## Topology-aware scheduling
+
+For a Cartesian rank mapping, `--dynamic-cp-nvlink-domain-size 8` declares that
+each consecutive eight global ranks share an NVLink domain. The heuristic
+maps those domains into the DPxCP groups and scores exposed communication with
+`--dynamic-cp-communication-cost 1024 2304`. These equivalent-token weights are
+configurable reference coefficients, not a latency calibration. Classic CP
+keeps power-of-two widths and size-aligned starts during placement and spare-rank
+allocation. Omitting the domain size preserves compute-only scheduling.
+
 ## Run
 
 From the Megatron-LM repository root:
