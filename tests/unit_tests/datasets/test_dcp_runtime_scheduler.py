@@ -81,7 +81,7 @@ def test_classic_geometry_rejects_cp4_starting_at_rank2():
 
 
 @pytest.mark.parametrize('planner_type', [LightweightRuntimePlanner, DynamicUSPRuntimePlanner])
-@pytest.mark.parametrize('world', [4, 8, 12, 16, 32])
+@pytest.mark.parametrize('world', [4, 8, 16, 32])
 def test_solvers_search_only_supported_classic_intervals(planner_type, world):
     allowed = tuple(cp for cp in range(1, world + 1) if cp & (cp - 1) == 0 and world % cp == 0)
     geometry = RuntimePlanGeometry(world, 256, 2, allowed, 2 * world, 64, True)
@@ -98,6 +98,15 @@ def test_solvers_search_only_supported_classic_intervals(planner_type, world):
             assert planner.last_statistics['scored_candidates'] > 0
         else:
             assert planner.last_statistics['candidates']
+
+
+@pytest.mark.parametrize('planner_type', [LightweightRuntimePlanner, DynamicUSPRuntimePlanner])
+def test_non_power_domain_uses_only_existing_power_groups(planner_type):
+    geometry = RuntimePlanGeometry(12, 256, 2, (1, 2, 4), 24, 64, True)
+    lengths = {sid: 240 for sid in range(12)}
+    plan = planner_type(geometry, QuadraticCostModel(geometry)).plan(lengths)
+    validate_rows(plan.rows, lengths, geometry, 1)
+    assert all(cp in (1, 2, 4) and start % cp == 0 for row in plan.groups for start, cp, _ in row)
 
 
 def test_rotation_scores_only_supported_classic_starts(monkeypatch):
