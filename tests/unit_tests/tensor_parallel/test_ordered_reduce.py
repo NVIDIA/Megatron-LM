@@ -142,7 +142,7 @@ class TestOrderedReduce:
 
     @pytest.mark.parametrize("exact", [False, True])
     def test_symmetric_memory_paths_match_all_to_all(self, exact):
-        """The inference (symmetric-memory pull) paths give the all-to-all path's bits."""
+        """The inference (symmetric-memory pull) path gives the all-to-all path's bits."""
         buf, hdl = _symm_buffer(self.group, 64 << 20)
         if hdl is None:
             pytest.skip("symmetric memory is not available")
@@ -155,10 +155,6 @@ class TestOrderedReduce:
                 orr.symm_ordered_reduce_scatter(rs, sin, hdl, exact=exact)
                 ref_rs = orr.ordered_reduce_scatter(x, self.group, exact=exact)
                 assert torch.equal(_bits(rs), _bits(ref_rs))
-                ar = torch.empty_like(x)
-                orr.symm_ordered_all_reduce(ar, sin, hdl, exact=exact)
-                ref_ar = orr.ordered_all_reduce(x, self.group, exact=exact)
-                assert torch.equal(_bits(ar), _bits(ref_ar))
 
     @pytest.mark.parametrize("exact", [False, True])
     def test_symmetric_push_matches_all_to_all(self, exact, monkeypatch):
@@ -172,9 +168,9 @@ class TestOrderedReduce:
             for rows, hidden in ((4, 2688), (12, 1000), (2048, 8192), (8192, 4096)):
                 x = _partials((rows, hidden), dtype, seed=rows + hidden + 1)
                 push = orr.ordered_reduce_scatter(x, self.group, exact=exact)
-                monkeypatch.setattr(orr, "USE_SYMM_PUSH", False)
-                a2a = orr.ordered_reduce_scatter(x, self.group, exact=exact)
-                monkeypatch.setattr(orr, "USE_SYMM_PUSH", True)
+                with monkeypatch.context() as m:  # no staging -> all-to-all + fold
+                    m.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
+                    a2a = orr.ordered_reduce_scatter(x, self.group, exact=exact)
                 assert torch.equal(_bits(push), _bits(a2a))
                 ref = _left_fold(_all_partials(x, self.group), exact)
                 k = rows // TP
@@ -191,7 +187,6 @@ class TestOrderedReduce:
             sin = buf[: x.numel() * 2].view(torch.bfloat16).view(x.shape)
             sin.copy_(x)
             symm_rs = torch.empty_like(expected_rs)
-            symm_ar = torch.empty_like(expected_ar)
         static_in = x.clone()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -206,7 +201,6 @@ class TestOrderedReduce:
             ar = orr.ordered_all_reduce(static_in, self.group)
             if sin is not None:
                 orr.symm_ordered_reduce_scatter(symm_rs, sin, hdl)
-                orr.symm_ordered_all_reduce(symm_ar, sin, hdl)
         for _ in range(3):
             graph.replay()
         torch.cuda.synchronize()
@@ -214,7 +208,6 @@ class TestOrderedReduce:
         assert torch.equal(_bits(ar), _bits(expected_ar))
         if sin is not None:
             assert torch.equal(_bits(symm_rs), _bits(expected_rs))
-            assert torch.equal(_bits(symm_ar), _bits(expected_ar))
 
     def test_stock_nccl_is_not_position_invariant(self):
         """Informational: shows the invariance tests above are not vacuous at TP=4."""

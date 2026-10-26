@@ -1506,7 +1506,7 @@ class TELinear(te.pytorch.Linear):
     def reset_parameters(self, defer_init=False):
         """Reset parameters (keeping the row-parallel metadata, see above)."""
         super().reset_parameters(defer_init=defer_init)
-        if getattr(self, "_explicit_bi_tp_reduce", False) and not defer_init:
+        if self._explicit_bi_tp_reduce and not defer_init:
             self._set_bi_row_parallel_attributes()
 
     def _bi_tp_reduce(self, out):
@@ -1526,7 +1526,7 @@ class TELinear(te.pytorch.Linear):
     def _bi_tp_shards_forward(self, x):
         """Row-parallel forward with several batch_invariant_tp_shards per rank (see __init__)."""
         assert (
-            self.config.fp8 is None and getattr(self.config, "fp4", None) is None
+            self.config.fp8 is None and self.config.fp4 is None
         ), "batch_invariant_tp_shards with more shards than TP ranks supports BF16 only"
         out = tp_shard_row_linear(
             x,

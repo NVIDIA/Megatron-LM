@@ -41,7 +41,6 @@ class TestShardReductions:
         torch.cuda.synchronize()
         SymmetricMemoryManager.destroy()
         orr._PEER_VIEWS.clear()
-        orr.USE_SYMM_PUSH = True
         Utils.destroy_model_parallel()
 
     def test_shard_partials_match_per_shard_gemm(self):
@@ -54,10 +53,11 @@ class TestShardReductions:
 
     @pytest.mark.parametrize("tp,shards", [(2, 4), (2, 8), (4, 8), (4, 4), (2, 2)])
     @pytest.mark.parametrize("path", ["push", "all_to_all"])
-    def test_reduce_scatter_shards_is_the_canonical_value(self, tp, shards, path):
+    def test_reduce_scatter_shards_is_the_canonical_value(self, tp, shards, path, monkeypatch):
         Utils.initialize_model_parallel(tp, 1)
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
-        orr.USE_SYMM_PUSH = path == "push"
+        if path == "all_to_all":  # no staging -> grouped NCCL send/recv + fold
+            monkeypatch.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
         m, k, n = 64 * tp, 512 * shards, 448
         x, w = _inputs(m, k, n, 1)  # identical on every rank
         r, kl = group.rank(), k // tp

@@ -28,11 +28,11 @@ Paths:
     the staged partials in rank order. No receive buffer of the input's size, no NCCL.
     Falls back to all-to-all + fold for uneven splits or without symmetric memory.
   * symmetric-memory pull (inference, NVLink): the partials are already in a symmetric
-    buffer; one kernel barriers through the signal pad, reads the owned slice (RS) or
-    everything (one-shot AR) from every peer with plain loads (not multimem, whose
-    in-switch reduction order is unspecified) and folds in rank order.
+    buffer; one kernel barriers through the signal pad, reads the owned slice from every
+    peer with plain loads (not multimem, whose in-switch reduction order is unspecified)
+    and folds in rank order.
 
-The ordered all-reduce of large messages is ordered reduce-scatter + all-gather.
+The ordered all-reduce is ordered reduce-scatter + all-gather.
 Only forward reductions use these paths; backward keeps the stock collectives.
 
 With ``batch_invariant_tp_shards`` (see the last section) the partials are those of fixed
@@ -54,6 +54,7 @@ from megatron.core.inference.communication.torch_symm_triton.kernel_config impor
     SYMM_MEM_KERNEL_CONFIG,
 )
 from megatron.core.inference.communication.torch_symm_triton.utils import sync_threads
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_collective,
     is_batch_invariant_mode_enabled,
@@ -459,8 +460,6 @@ def ordered_fold(
 # Push staging: 16 warps, PUSH_VECS 16-byte vectors per thread and peer, two slots per block.
 _PUSH_WARPS = 16
 _PUSH_MAX_VECS = 4
-# Set to False to force the all-to-all path (same bits; for benchmarks and debugging).
-USE_SYMM_PUSH = True
 # Above this input size the push (one barrier per staging chunk) is not faster than NCCL
 # all-to-all + fold on GB200 TP4; both give the same bits, so the threshold is speed-only.
 PUSH_MAX_INPUT_BYTES = 64 << 20
@@ -479,8 +478,7 @@ def _push_staging(group, tensor: torch.Tensor, num_parts: int = 1):
     allocated (collectively) on the first eligible call; outside of a CUDA-graph capture.
     """
     if not (
-        USE_SYMM_PUSH
-        and HAVE_TRITON
+        HAVE_TRITON
         and tensor.is_cuda
         and 2 <= group.size() <= _MAX_PULL_WORLD_SIZE
         # The cap is speed-only (see above). With several shard partials per rank the push
@@ -489,9 +487,6 @@ def _push_staging(group, tensor: torch.Tensor, num_parts: int = 1):
         and (num_parts > 1 or tensor.numel() * tensor.element_size() <= PUSH_MAX_INPUT_BYTES)
     ):
         return None
-    # Imported here: megatron.core.inference imports tensor_parallel.
-    from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-
     key = f"tp_ordered_push:{group.group_name}" + (f":x{num_parts}" if num_parts > 1 else "")
     if not SymmetricMemoryManager.is_initialized(key):
         if torch.cuda.is_current_stream_capturing():
@@ -725,26 +720,6 @@ def symm_ordered_reduce_scatter(
     views = _peer_views(
         symm_mem_hdl, byte_offset // elem + symm_mem_hdl.rank * n_out, n_out, input_.dtype
     )
-    return _launch_pull(views, output, symm_mem_hdl, exact)
-
-
-def symm_ordered_all_reduce(
-    output: torch.Tensor,
-    input_: torch.Tensor,
-    symm_mem_hdl,
-    byte_offset: int = 0,
-    exact: Optional[bool] = None,
-) -> torch.Tensor:
-    """One-shot all-reduce: every rank reads all of every peer's partial and folds them.
-
-    Reads TP x the message per rank, so it is meant for small (latency-bound) messages.
-    Same bits as :func:`ordered_all_reduce`.
-    """
-    assert input_.numel() == output.numel() and input_.dtype == output.dtype
-    assert output.is_contiguous()
-    elem = input_.element_size()
-    assert byte_offset % elem == 0
-    views = _peer_views(symm_mem_hdl, byte_offset // elem, input_.numel(), input_.dtype)
     return _launch_pull(views, output, symm_mem_hdl, exact)
 
 
