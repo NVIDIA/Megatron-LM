@@ -16,6 +16,7 @@ import torch
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference import communication_utils
+from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.text_generation_server import tokenization
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
@@ -293,3 +294,49 @@ class TestBuildInferencePgCollection:
         _check_fallback_warnings(
             record, ("build_inference_pg_collection", "training_pg_collection")
         )
+
+
+@pytest.fixture
+def unit_rounders(monkeypatch):
+    """Pad to the next multiple of the TP size only, so that the TP size shows in the result."""
+    monkeypatch.setattr(DynamicInferenceContext, "TOKEN_ROUNDER", 1)
+    monkeypatch.setattr(DynamicInferenceContext, "REQUEST_ROUNDER", 1)
+
+
+@pytest.mark.usefixtures("unit_rounders")
+class TestRoundUpWithoutTensorParallelSize:
+    """Without `tp_size`, the rounders pad to the global TP size and warn."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_fallback_pads_to_global_tp_size(self):
+        _require_even_world_size()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+
+        with pytest.warns(ProcessGroupFallbackWarning) as record, _reads_only_through_resolver():
+            assert DynamicInferenceContext.round_up_tokens(3) == 4
+            assert DynamicInferenceContext.round_up_requests(5) == 6
+
+        _check_fallback_warnings(
+            record,
+            ("DynamicInferenceContext.round_up_tokens", "tp_size"),
+            ("DynamicInferenceContext.round_up_requests", "tp_size"),
+        )
+
+    def test_fallback_without_global_grid_pads_to_one(self):
+        Utils.destroy_model_parallel()
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            assert DynamicInferenceContext.round_up_tokens(3) == 3
+
+        _check_fallback_warnings(record, ("DynamicInferenceContext.round_up_tokens", "tp_size"))
+
+    def test_given_tp_size_reads_no_global_state(self, monkeypatch):
+        def no_global_state():
+            raise AssertionError("parallel_state.is_initialized() reads global state")
+
+        monkeypatch.setattr(parallel_state, "is_initialized", no_global_state)
+        with forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            assert DynamicInferenceContext.round_up_tokens(3, tp_size=2) == 4
+            assert DynamicInferenceContext.round_up_requests(5, tp_size=2) == 6
