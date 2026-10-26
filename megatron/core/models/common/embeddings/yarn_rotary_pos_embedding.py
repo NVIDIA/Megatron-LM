@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import math
 from functools import lru_cache
-from typing import Optional
+from typing import ClassVar, Optional
+from weakref import WeakSet
 
 import torch
 from torch import Tensor
@@ -44,6 +45,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
             Defaults to None.
     """
+
+    _cache_instances: ClassVar[WeakSet[RotaryEmbedding]] = WeakSet()
 
     def __init__(
         self,
@@ -228,6 +231,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         ):
             self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group, mscale)
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
+
+
+setattr(YarnRotaryEmbedding.forward, "cache_clear", YarnRotaryEmbedding._clear_all_caches)
 
 
 # Inverse dim formula to find dim based on number of rotations

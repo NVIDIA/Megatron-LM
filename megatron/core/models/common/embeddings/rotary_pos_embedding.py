@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -14,6 +14,7 @@ import logging
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
+from weakref import WeakSet
 
 import torch
 from torch import Tensor, nn
@@ -68,6 +69,8 @@ class RotaryEmbedding(nn.Module):
 
     # Maximum number of entries not retained by CUDA graphs.
     CACHE_CAPACITY = 32
+    # The legacy forward.cache_clear() was shared across instances.
+    _cache_instances: ClassVar[WeakSet[RotaryEmbedding]] = WeakSet()
 
     def __init__(
         self,
@@ -104,6 +107,13 @@ class RotaryEmbedding(nn.Module):
         )
         self._embedding_cache: OrderedDict[_RotaryCacheKey, tuple[Tensor, float]] = OrderedDict()
         self._cuda_graph_cache_keys: set[_RotaryCacheKey] = set()
+        self._cache_instances.add(self)
+
+    @classmethod
+    def _clear_all_caches(cls) -> None:
+        """Support legacy forward.cache_clear() without retaining embedding instances."""
+        for module in tuple(cls._cache_instances):
+            module.clear_cache()
 
     def clear_cache(self, *, include_cuda_graphs: bool = False) -> None:
         """Release cached embeddings, retaining constants used by captured CUDA graphs.
@@ -371,6 +381,11 @@ class RotaryEmbedding(nn.Module):
         rotary_seq_len *= transformer_config.context_parallel_size
 
         return rotary_seq_len
+
+
+# Both RotaryEmbedding.forward.cache_clear() and instance.forward.cache_clear()
+# retain the former class-wide scope while protecting captured constants.
+setattr(RotaryEmbedding.forward, "cache_clear", RotaryEmbedding._clear_all_caches)
 
 
 class MultimodalRotaryEmbedding(nn.Module):

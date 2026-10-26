@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -31,7 +33,10 @@ class _RotaryConsumer(torch.nn.Module):
 
 @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
 @pytest.mark.parametrize("position_embedding_type", ["rope", "yarn"])
-def test_block_graph_rotary_survives_train_generation_switch(model_type, position_embedding_type):
+@pytest.mark.parametrize("clear_api", ["instance", "legacy_bound", "legacy_class"])
+def test_block_graph_rotary_survives_train_generation_switch(
+    model_type, position_embedding_type, clear_api
+):
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
     try:
@@ -69,6 +74,12 @@ def test_block_graph_rotary_survives_train_generation_switch(model_type, positio
             )
             model.decoder = _RotaryConsumer()
         model = model.cuda().eval()
+        if clear_api == "instance":
+            clear_cache = model.rotary_pos_emb.clear_cache
+        elif clear_api == "legacy_bound":
+            clear_cache = model.rotary_pos_emb.forward.cache_clear
+        else:
+            clear_cache = type(model.rotary_pos_emb).forward.cache_clear
 
         # Capture the actual preprocessing that runs inside a block graph. The
         # attention/MLP arithmetic is not needed to exercise this ownership bug.
@@ -117,7 +128,7 @@ def test_block_graph_rotary_survives_train_generation_switch(model_type, positio
         # saved for backward even though generation populated them in inference mode.
         model.train()
         InferenceMode.unset_active()
-        model.rotary_pos_emb.clear_cache()
+        clear_cache()
         gc.collect()
         torch.cuda.empty_cache()
         for seq_len, ref, *_ in graphs:
@@ -137,7 +148,7 @@ def test_block_graph_rotary_survives_train_generation_switch(model_type, positio
         training_ref = weakref.ref(forward())
         model.eval()
         InferenceMode.set_active()
-        model.rotary_pos_emb.clear_cache()
+        clear_cache()
         gc.collect()
         torch.cuda.empty_cache()
         assert training_ref() is None
@@ -150,4 +161,39 @@ def test_block_graph_rotary_survives_train_generation_switch(model_type, positio
 
     finally:
         InferenceMode.unset_active()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("embedding_type", [RotaryEmbedding, YarnRotaryEmbedding])
+def test_legacy_cache_clear_scope_and_module_lifetime(embedding_type):
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        first = embedding_type(32, 1.0)
+        second = embedding_type(32, 1.0)
+        other_type = YarnRotaryEmbedding if embedding_type is RotaryEmbedding else RotaryEmbedding
+        other = other_type(32, 1.0)
+
+        def embedding_ref(module):
+            result = module(16)
+            return weakref.ref(result[0] if isinstance(result, tuple) else result)
+
+        first_ref, second_ref, other_ref = map(embedding_ref, (first, second, other))
+        first.clear_cache()
+        assert first_ref() is None
+        assert second_ref() is not None
+        assert other_ref() is not None
+
+        first_ref = embedding_ref(first)
+        first.forward.cache_clear()
+        assert first_ref() is None
+        assert second_ref() is None
+        assert other_ref() is not None
+
+        first_ref = embedding_ref(first)
+        module_ref = weakref.ref(first)
+        del first
+        gc.collect()
+        assert module_ref() is None
+        assert first_ref() is None
+    finally:
         Utils.destroy_model_parallel()
