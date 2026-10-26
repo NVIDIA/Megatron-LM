@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
+import contextlib
 import os
 from dataclasses import fields, replace
 from types import SimpleNamespace
@@ -1502,3 +1503,70 @@ def test_the_saved_section_decides_what_a_resume_requests(
         assert iteration == 5
         # The RNG shard is requested unless the saved section says it is not there.
         assert rng_template.called is (section_says_rng is not False)
+
+
+@pytest.mark.parametrize(
+    "saved_section, saved_no_save_optim, expected",
+    [
+        ({"checkpoint": {"save_optim": True}}, True, True),  # the saved section wins
+        ({"checkpoint": {"save_optim": False}}, False, False),  # in both directions
+        (None, True, False),  # no saved section: the saved arguments decide
+        (None, False, True),
+    ],
+)
+def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
+    init_model_parallel, monkeypatch, run_config, saved_section, saved_no_save_optim, expected
+):
+    """The guard that keeps optimizer rows from being loaded across a different GLU layout
+    decides whether optimizer state will be loaded exactly as the load template does: from the
+    saved checkpoint section, and from the saved arguments only when the checkpoint has none."""
+    args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        swiglu=True,
+        moe_mlp_glu_interleave_size=2,
+        use_distributed_optimizer=False,
+    )
+    saved_args = SimpleNamespace(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        world_size=1,
+        data_parallel_size=1,
+        no_save_optim=saved_no_save_optim,
+        swiglu=True,
+        moe_mlp_glu_interleave_size=1,
+    )
+    state = {"args": saved_args, "model": {}}
+    run_config.checkpoint.load = "/synthetic"
+    run_config.checkpoint.load_rng = False
+    monkeypatch.setattr(checkpointing, "get_args", lambda: args)
+    monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
+    monkeypatch.setattr(
+        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        checkpointing,
+        "_load_base_checkpoint",
+        lambda *a, **k: (state, "/synthetic/iter_0000001", False, CheckpointType.GLOBAL),
+    )
+    monkeypatch.setattr(checkpointing, "_read_checkpoint_run_config", lambda *a, **k: saved_section)
+    monkeypatch.setattr(
+        checkpointing, "_maybe_setup_gpt_to_hybrid_load", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(checkpointing, "validate_glu_checkpoint_backend", mock.Mock())
+    decisions = []
+
+    class StopAtTheGuard(Exception):
+        pass
+
+    def guard(state_dict, run_args, *, loading_optimizer):
+        decisions.append(loading_optimizer)
+        raise StopAtTheGuard  # Before any tensor storage is read.
+
+    monkeypatch.setattr(checkpointing, "validate_glu_optimizer_layout", guard)
+    optimizer = SimpleNamespace(is_stub_optimizer=False)
+    with pytest.raises(StopAtTheGuard):
+        load_checkpoint([object()], optimizer, None, restore_training_state=True)
+    assert decisions == [expected]

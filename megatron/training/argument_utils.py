@@ -804,27 +804,38 @@ def project_checkpoint_policy(args: Namespace, checkpoint: CheckpointConfig) -> 
     the policy that produced the file; the live namespace is never written.
     """
     projected = copy.copy(args)
+    defaults = {item.name: item.default for item in fields(CheckpointConfig)}
     for item in fields(CheckpointConfig):
-        # The six alias-backed fields live in args under their CLI names only; a field with no
-        # CLI flag (most_recent_k) is added only when it departs from its default.
-        if item.name in _CHECKPOINT_ALIASED_FIELDS:
-            continue
         value = getattr(checkpoint, item.name)
+        if item.name in _CHECKPOINT_ALIASED_FIELDS:
+            # A namespace built in Python may carry the canonical name; it follows the policy.
+            # The CLI spellings are handled below.
+            if hasattr(args, item.name):
+                setattr(projected, item.name, value)
+            continue
+        # A field with no CLI flag (most_recent_k) is added only when it departs from its default.
         if hasattr(args, item.name) or value != item.default:
             setattr(projected, item.name, value)
     # An alias that already agrees with the policy keeps its spelling (an unset store_true flag
     # is None, not False), so a CLI run's saved arguments are byte-identical to the parsed ones.
+    # A namespace with neither spelling gets the alias when the value departs from the default,
+    # which is what the factory would otherwise reconstruct.
     for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
-        wanted = not getattr(checkpoint, name)
-        if bool(getattr(args, f"no_{name}", None)) != wanted:
-            setattr(projected, f"no_{name}", wanted)
-    for name, value in (
-        ("ckpt_fully_parallel_save", checkpoint.fully_parallel_save),
-        ("ckpt_fully_parallel_load", checkpoint.fully_parallel_load),
-        ("use_dist_ckpt", checkpoint.use_dist_ckpt),
-    ):
-        if getattr(args, name, _MISSING) != value:
-            setattr(projected, name, value)
+        alias, value = f"no_{name}", getattr(checkpoint, name)
+        if hasattr(args, alias):
+            if bool(getattr(args, alias)) != (not value):
+                setattr(projected, alias, not value)
+        elif not hasattr(args, name) and value != defaults[name]:
+            setattr(projected, alias, not value)
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        alias, value = f"ckpt_{name}", getattr(checkpoint, name)
+        if hasattr(args, alias):
+            if getattr(args, alias) != value:
+                setattr(projected, alias, value)
+        elif not hasattr(args, name) and value != defaults[name]:
+            setattr(projected, alias, value)
+    if getattr(args, "use_dist_ckpt", _MISSING) != checkpoint.use_dist_ckpt:
+        projected.use_dist_ckpt = checkpoint.use_dist_ckpt
     return projected
 
 

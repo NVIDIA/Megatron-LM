@@ -2516,7 +2516,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
+        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
     # Build model.
     def build_model():
@@ -2830,7 +2830,7 @@ def setup_model_and_optimizer(
     wrap_with_ddp = not skip_optimizer
 
     if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
+        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
     def _build_model_wrapper(wrap_with_ddp: bool):
         if cfg_container is not None and getattr(cfg_container, "model", None) is not None:

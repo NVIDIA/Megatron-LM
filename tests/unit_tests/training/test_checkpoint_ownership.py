@@ -127,6 +127,40 @@ def test_a_sparse_namespace_keeps_the_field_defaults():
 
 
 @pytest.mark.parametrize(
+    "name, alias",
+    [
+        ("save_optim", "no_save_optim"),
+        ("save_rng", "no_save_rng"),
+        ("load_optim", "no_load_optim"),
+        ("load_rng", "no_load_rng"),
+        ("fully_parallel_save", "ckpt_fully_parallel_save"),
+        ("fully_parallel_load", "ckpt_fully_parallel_load"),
+    ],
+)
+@pytest.mark.parametrize("spelling", ["canonical", "alias", "both", "none"])
+@pytest.mark.parametrize("value", [True, False])
+def test_projection_round_trips_every_spelling_of_the_aliased_fields(name, alias, spelling, value):
+    """The persisted arguments reconstruct the effective policy whatever spelling the namespace
+    uses for an aliased field (a namespace built in Python carries the canonical name, a parsed
+    one the CLI alias, a sparse one neither), and the live namespace is never written."""
+    negative = alias.startswith("no_")
+    attrs = {}
+    if spelling in ("canonical", "both"):
+        attrs[name] = not value  # The namespace starts against the policy.
+    if spelling in ("alias", "both"):
+        attrs[alias] = value if negative else not value
+    args = Namespace(**attrs)
+    before = dict(vars(args))
+    effective = replace(checkpoint_config_from_args(args), **{name: value})
+    projected = project_checkpoint_policy(args, effective)
+    assert getattr(checkpoint_config_from_args(projected), name) is value
+    assert checkpoint_config_from_args(projected) == effective
+    assert dict(vars(args)) == before
+    if spelling == "canonical":
+        assert not hasattr(projected, alias)  # No second spelling is introduced.
+
+
+@pytest.mark.parametrize(
     "argv, match",
     [
         (["--ckpt-convert-format", "torch"], None),

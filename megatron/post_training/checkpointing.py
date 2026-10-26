@@ -28,24 +28,27 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     read_metadata,
 )
+from megatron.training.config import CheckpointConfig
 from megatron.training.global_vars import get_run_config
 from megatron.training.utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 
 
-def has_modelopt_state(checkpoint_path: str) -> bool:
+def has_modelopt_state(checkpoint_path: str, *, checkpoint: CheckpointConfig) -> bool:
     """Check if modelopt_state folder exists inside the checkpoint and contains nontrivial state.
 
     NOTE: Ignores distillation (KD) state, which is deprecated and unused.
 
     Args:
         checkpoint_path: Path to the checkpoint directory
+        checkpoint: The checkpoint policy to inspect with (its format selects the reader): the
+            registered section at run time, or, at startup before any run config exists, the
+            section built from the arguments.
 
     Returns:
         True if modelopt_state exists and contains nontrivial state, False otherwise
     """
-    args = get_args()
 
     def _has_nontrivial_modelopt_state(modelopt_state: dict) -> bool:
         """Check whether modelopt_state contains state beyond the (deprecated, unused) KD mode."""
@@ -56,9 +59,11 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
         return len(modes) > 0
 
     try:
-        if get_run_config().checkpoint.ckpt_format == "torch":
-            # Non-sharded
-            state_dict, _, _, _ = _load_base_checkpoint(checkpoint_path, rank0=False)
+        if checkpoint.ckpt_format == "torch":
+            # Non-sharded; the legacy reader is the one path that needs the arguments.
+            state_dict, _, _, _ = _load_base_checkpoint(
+                checkpoint_path, get_args(), rank0=False, checkpoint=checkpoint
+            )
             if state_dict is None:
                 return False
             modelopt_state = state_dict.get("modelopt_state")

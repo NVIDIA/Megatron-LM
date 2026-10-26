@@ -772,6 +772,7 @@ def save_checkpoint(
     rng_state_key_prefix: str = '',
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     on_saved: Optional[Callable[[], None]] = None,
+    *,
     checkpoint: Optional[CheckpointConfig] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
@@ -2938,23 +2939,29 @@ def load_checkpoint(
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release and restore_training_state
 
-    def validate_glu_layout(checkpoint_state, is_release):
+    def validate_glu_layout(checkpoint_state, is_release, state_name, state_type):
         validate_glu_checkpoint_backend(
             args, ckpt_format=ckpt_format, skip_load_to_model_and_opt=skip_load_to_model_and_opt
         )
+        # Whether the checkpoint holds optimizer state follows its saved checkpoint section (the
+        # saved arguments only without one), as the optimizer load template below does.
+        holds_optimizer = _saved_checkpoint_policy(
+            _read_checkpoint_run_config(checkpoint_state, state_name, state_type),
+            checkpoint_state.get('args') or types.SimpleNamespace(),
+        ).save_optim
         loading_optimizer = (
             optimizer is not None
             and not getattr(optimizer, 'is_stub_optimizer', False)
             and not is_release
             and (not checkpoint.finetune or gpt_compat_load_optim)
             and checkpoint.load_optim
-            and not getattr(checkpoint_state.get('args'), 'no_save_optim', False)
+            and holds_optimizer
         )
         validate_glu_optimizer_layout(checkpoint_state, args, loading_optimizer=loading_optimizer)
 
     if state_dict is not None:
         # Check common metadata before DCP can write into model/optimizer storage.
-        validate_glu_layout(state_dict, release)
+        validate_glu_layout(state_dict, release, checkpoint_name, ckpt_type)
 
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
@@ -3297,7 +3304,7 @@ def load_checkpoint(
 
     # Legacy checkpoints are first read here. Convert the state dict itself so
     # --load-main-params-from-ckpt observes the same rows as model.load_state_dict.
-    validate_glu_layout(state_dict, release)
+    validate_glu_layout(state_dict, release, checkpoint_name, ckpt_type)
     state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
 
     # Set checkpoint version.
