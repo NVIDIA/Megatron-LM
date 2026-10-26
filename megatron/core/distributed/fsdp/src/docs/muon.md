@@ -67,9 +67,8 @@ to Muon while retaining module-level sharding.
 
 **TensorAtomic.** Whole-matrix inputs are already local. The challenge is
 to enforce the layout requested by Muon without substantially slowing
-forward/backward. Whole-matrix ownership can create uneven rank segments
-within each module; slower parameter materialization and gradient reduction
-could outweigh the savings from a communication-free optimizer step.
+forward/backward. If gathering weights or reducing gradients takes longer,
+that extra time could cancel out the time saved in the optimizer step.
 
 ## Algorithm options
 
