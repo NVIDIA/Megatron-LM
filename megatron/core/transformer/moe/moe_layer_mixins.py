@@ -32,6 +32,20 @@ class TEPartialCaptureMoEMixin:
             ):
                 self.run_shared_experts_after_router = False
 
+    def _te_cuda_graph_outputs_shared_expert(self) -> bool:
+        """Whether a ``moe_router`` partial CUDA graph outputs the shared expert's result.
+
+        True when the shared expert runs inside the graph: it exists and is not overlapped
+        with the expert-parallel communication. A megakernel layer's router-prefix graph has
+        no shared-expert output: the shared expert is fused into the eager megakernel (capture
+        is refused otherwise, see MoELayer._megakernel_capture_outputs).
+        """
+        return (
+            self.config.moe_shared_expert_intermediate_size is not None
+            and not self.config.moe_shared_expert_overlap
+            and getattr(self, "megakernel_experts", None) is None
+        )
+
     def _te_cuda_graph_resume(self, cuda_graph_output, padding_mask, packed_seq_params=None):
         """Restore captured intermediates and resume the eager MoE steps.
 
@@ -39,10 +53,7 @@ class TEPartialCaptureMoEMixin:
         remaining work and receives (hidden_states, probs, shared_expert_output).
         """
         shared_expert_output, routing_map = None, None
-        if (
-            self.config.moe_shared_expert_intermediate_size is not None
-            and not self.config.moe_shared_expert_overlap
-        ):
+        if self._te_cuda_graph_outputs_shared_expert():
             # The shared expert output is the last second element in the CUDA graph output.
             shared_expert_output = cuda_graph_output.pop()
 

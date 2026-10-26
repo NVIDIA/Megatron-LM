@@ -2297,6 +2297,10 @@ def _te_cuda_graph_layer_is_graphable(layer, config):
         config.cuda_graph_impl == "transformer_engine"
         and isinstance(layer, TECudaGraphMixin)
         and layer.config.cuda_graph_impl == "transformer_engine"
+        # Layers declare their own eligibility (e.g. a layer hosting Engram, or an attention
+        # variant with host synchronizations). This applies under every scope, including the
+        # whole-layer one, so such a layer stays eager while the rest of the model is captured.
+        and layer.is_cuda_graph_capturable()
         and layer.is_graphable_for_scope(config.cuda_graph_modules)
     )
 

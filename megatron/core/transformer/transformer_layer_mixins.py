@@ -166,10 +166,7 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
 
         # Captured forward needs attention-side static input only when this
         # layer's attention is inside the captured scope.
-        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        )
+        attn_in_graph = self._attention_in_cuda_graph()
 
         if self._is_thd_cuda_graph():
             if attn_in_graph:
@@ -344,6 +341,18 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             return True
         return False
 
+    def _attention_in_cuda_graph(self) -> bool:
+        """Whether this layer's attention is inside the configured capture scope."""
+        return not isinstance(self.self_attention, IdentityOp) and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+
+    def _moe_cuda_graph_outputs_shared_expert(self) -> bool:
+        """Whether a ``moe_router`` partial CUDA graph of this MoE layer outputs the shared
+        expert's result (see TEPartialCaptureMoEMixin._te_cuda_graph_outputs_shared_expert)."""
+        return self.mlp._te_cuda_graph_outputs_shared_expert()
+
     def _moe_router_in_cuda_graph(self) -> bool:
         """Return True when this layer's MoE router runs inside the TE CUDA graph."""
         return self.is_moe_layer and (
@@ -394,10 +403,7 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             submodules += [self.pre_mlp_layernorm, self.mlp]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 submodules += [self.mlp.shared_experts]
         return submodules
 

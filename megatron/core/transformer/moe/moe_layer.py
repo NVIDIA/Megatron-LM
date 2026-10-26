@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -773,6 +773,28 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    def _megakernel_capture_outputs(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """CUDA-graph outputs of the ``moe_router`` scope for a megakernel MoE layer.
+
+        Returns ``[hidden_states, router_weights, top_experts]``. Backends that expose
+        ``compact_routes`` (MOK) convert the dense route set inside the graph, so replay
+        resumes directly at the megakernel; the conversion has static shapes ([tokens, topk])
+        and no host synchronization. There is no shared-expert output: the shared expert is
+        fused into the megakernel. On replay _te_cuda_graph_resume stores these three tensors in
+        ``te_cuda_graph_tensor_store`` as (hidden_states, probs, routing_map).
+        """
+        compact = getattr(self.megakernel_experts, "compact_routes", None)
+        if compact is None:
+            raise RuntimeError(
+                "moe_router CUDA-graph capture of a megakernel MoE layer requires a backend "
+                "that implements compact_routes()"
+            )
+        num_tokens = hidden_states.numel() // hidden_states.shape[-1]
+        router_weights, top_experts = compact(num_tokens, probs, routing_map)
+        return [hidden_states, router_weights, top_experts]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -819,13 +841,31 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                 )
 
             def megakernel_forward(hidden_states, padding_mask):
-                probs, routing_map = self.route(
-                    hidden_states,
-                    padding_mask,
-                    input_ids,
-                    packed_seq_params=packed_seq_params,
-                    replay_topk_idx=replay_topk_idx,
-                )
+                # The store exists only under per-layer Transformer Engine CUDA graphs.
+                store = getattr(self, "te_cuda_graph_tensor_store", None)
+                if store is not None and not store.is_empty():
+                    # Replay of a ``moe_router`` partial CUDA graph: the graph ran the router
+                    # and the route compaction, and _te_cuda_graph_resume placed its outputs
+                    # in the store (see _megakernel_capture_outputs). Only the megakernel
+                    # itself runs eagerly.
+                    return apply_module(self.megakernel_experts)(
+                        hidden_states, store.probs, store.routing_map, routes_are_compact=True
+                    )
+                try:
+                    probs, routing_map = self.route(
+                        hidden_states,
+                        padding_mask,
+                        input_ids,
+                        packed_seq_params=packed_seq_params,
+                        replay_topk_idx=replay_topk_idx,
+                    )
+                except TEMoECudaGraphPartialCaptureSignal as signal:
+                    # ``moe_router`` capture: end the graph after the router and the
+                    # static-shape route compaction. The megakernel (dispatch, experts,
+                    # combine) has data-dependent work and stays outside the graph.
+                    return self._megakernel_capture_outputs(
+                        hidden_states, signal.kwargs['probs'], signal.kwargs['routing_map']
+                    )
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
             if self.moe_layer_recompute and self.training:
@@ -834,6 +874,9 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                 )
             else:
                 output = megakernel_forward(hidden_states, padding_mask)
+            if isinstance(output, list):
+                # CUDA-graph capture outputs of the moe_router scope (see above).
+                return output
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
