@@ -2366,6 +2366,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         self.mlp_hyper_connection = build_module(
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
+        # The mHC weights are replicated across the layer's tensor-parallel group, which sets
+        # their checkpoint replica ids.
+        self.self_attention_hyper_connection.tp_group = self.tp_group
+        self.mlp_hyper_connection.tp_group = self.tp_group
 
         # Set per-call by __call__ from kwargs so forward can read it without re-piping
         # the manager through the CUDA-graph kwarg path (CheckpointWithoutOutputManager
