@@ -616,6 +616,10 @@ class EngramConfig:
         # The whole-layer Transformer Engine scope (no cuda_graph_modules) stays rejected as
         # well: it would also capture the MoE expert all-to-all of every MoE layer, a
         # combination never validated with Engram.
+        # With cuda_graph_capture_engram_host (TransformerConfig, opt-in) the hybrid
+        # hyper-connection wrapper runs the Engram lookup eagerly in front of the host
+        # layer's graph and captures only the rest of that layer, so the lookup itself is
+        # still never inside a graph and the rules above are unchanged.
         if transformer_config.cuda_graph_impl not in ("none", "transformer_engine"):
             raise ValueError(
                 "Engram does not yet support cuda_graph_impl="

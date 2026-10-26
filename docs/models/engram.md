@@ -57,7 +57,12 @@ Startup validates the following before model allocation:
   selected layers, maximum order, and hash seed;
 - FSDP is off, and CUDA graphs are either off or Transformer Engine per-layer capture with
   explicit `cuda_graph_modules` (e.g. `attn`, `moe_router`, `moe_preprocess`); the
-  Engram-hosting layer declares itself uncapturable and stays eager while the rest is captured;
+  Engram-hosting layer declares itself uncapturable and stays eager while the rest is captured.
+  With `--cuda-graph-capture-engram-host` (requires the `attn` scope and the hybrid
+  hyper-connection wrapper, `--enable-mhc-connections`; not with full or `mhc` recompute) the
+  wrapper instead runs the Engram lookup eagerly in front of the host layer's graph and captures
+  the rest of that layer; the lookup is never inside a graph, and an Engram host can head a
+  grouped attention + MoE-router graph but never be its tail;
 - the sequence-packing scheduler (and dynamic CP, which selects it) is off, and hash-routed MoE
   layers (`--moe-num-hash-layers`) are not combined with sequence parallelism;
 - packed (THD) sequences use the `--sft` family (schedulers including `--use-varlen-dataset`

@@ -2212,11 +2212,44 @@ def _layer_is_graphable(layer, config):
         return True
 
     # import modules here to avoid a circular import
+    from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+        HyperConnectionHybridLayer,
+    )
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    # mHC wrapper: graphability is decided by the inner layer's type/scope. Non-MoE
+    # inner layers are captured as one whole-wrapper graph (mHC aggregate + inner + BDA).
+    # MoE inner layers use partial capture: the wrapper graphs the deterministic prefix
+    # (mHC aggregate + router/preprocess) and runs the expert all-to-all + mHC BDA eagerly
+    # (the all-to-all is not graph-safe).
+    if isinstance(layer, HyperConnectionHybridLayer):
+        inner = layer.inner_layer
+        if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
+            return True
+        if isinstance(inner, TransformerLayer):
+            if isinstance(inner.mlp, MoELayer):
+                # MoE inner: graphable via partial (router/preprocess) capture.
+                if (
+                    CudaGraphModule.moe in config.cuda_graph_modules
+                    or CudaGraphModule.moe_router in config.cuda_graph_modules
+                    or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
+                ):
+                    return True
+                # attn-only scope on an MoE inner: the (identity) attention prefix has
+                # nothing graph-worthy, so leave eager.
+                return False
+            if CudaGraphModule.attn in config.cuda_graph_modules and not (
+                isinstance(inner.self_attention, IdentityOp)
+                and isinstance(inner.cross_attention, IdentityOp)
+            ):
+                return True
+            if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
+                return True
+        return False
 
     if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
         # mamba layer.
@@ -2239,6 +2272,39 @@ def _layer_is_graphable(layer, config):
             # mlp layer.
             return True
     return False
+
+
+def _get_graphable_te_callables(layers, config):
+    """Return graphable layers, grouping a supported adjacent hybrid attention/MoE pair.
+
+    A layer that can head a group (``_can_group_te_cuda_graph_with``, the HybridStack mHC
+    wrapper) and its graphable successor become one callable; the successor is attached to
+    the head as its capture-only group tail and is not a callable of its own.
+    """
+    graphable_layers = []
+    layer_number = 0
+    while layer_number < len(layers):
+        layer = layers[layer_number]
+        if not _layer_is_graphable(layer, config):
+            layer_number += 1
+            continue
+
+        if layer_number + 1 < len(layers):
+            next_layer = layers[layer_number + 1]
+            can_group = getattr(layer, '_can_group_te_cuda_graph_with', None)
+            if (
+                can_group is not None
+                and _layer_is_graphable(next_layer, config)
+                and can_group(next_layer)
+            ):
+                layer._set_te_cuda_graph_group_tail(next_layer)
+                graphable_layers.append(layer)
+                layer_number += 2
+                continue
+
+        graphable_layers.append(layer)
+        layer_number += 1
+    return graphable_layers
 
 
 class TECudaGraphHelper:
@@ -2330,12 +2396,12 @@ class TECudaGraphHelper:
                     num_mtp_layers = 0
                 num_graphable_layers = 0
                 callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
+                for layer in _get_graphable_te_callables(
+                    chunk_with_decoder.decoder.layers, self.config
+                ):
+                    num_graphable_layers += 1
+                    callables.append(layer)
+                    callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
                     if _layer_is_graphable(layer, self.config):
@@ -2489,12 +2555,21 @@ class TECudaGraphHelper:
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
 
+            from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+                HyperConnectionHybridLayer,
+            )
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
+            # Hybrid mHC wraps the concrete TransformerLayer, but the wrapper is the
+            # callable passed to TE. Inspect the inner layer when deciding whether
+            # rotary embeddings belong to the graph's static keyword inputs.
+            attention_layer = (
+                layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
+            )
             contains_self_attn = (
-                isinstance(layer, TransformerLayer)
-                and not isinstance(layer.self_attention, IdentityOp)
+                isinstance(attention_layer, TransformerLayer)
+                and not isinstance(attention_layer.self_attention, IdentityOp)
                 and (
                     not self.config.cuda_graph_modules
                     or CudaGraphModule.attn in self.config.cuda_graph_modules

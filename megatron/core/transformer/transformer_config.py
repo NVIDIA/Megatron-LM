@@ -1481,6 +1481,16 @@ class TransformerConfig(ModelParallelConfig):
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
 
+    cuda_graph_capture_engram_host: bool = False
+    """Capture the non-Engram part of each Engram-hosting layer under per-layer Transformer
+    Engine CUDA graphs. By default a layer that hosts an Engram module stays eager, because the
+    Engram hashed lookup and its all-to-all have data-dependent shapes. With this option the
+    hybrid hyper-connection wrapper (HybridStack with enable_mhc_connections) runs the Engram
+    lookup eagerly in front of the layer's graph and captures the rest of the layer (mHC
+    aggregate, attention, n-stream BDA, and a grouped MoE router prefix) like any other layer.
+    The math is unchanged: the Engram output is added to the n-stream input either way.
+    Requires cuda_graph_impl="transformer_engine" with the "attn" scope."""
+
     inference_cuda_graph_scope: Optional[InferenceCudaGraphScope] = field(
         default=None,
         metadata={
@@ -3458,19 +3468,55 @@ class TransformerConfig(ModelParallelConfig):
                     "use_fused_mhc applies only to mhc_connection_variant='mhc'; the "
                     "gated-residual variant uses its own native kernels."
                 )
-            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
-                # Per-layer capture of a hybrid layer goes through its hyper-connection
-                # wrapper, which is not graphable on this base (the TE path would silently
-                # leave every wrapped layer eager), and whole-layer / full-iteration capture
-                # has not been validated against the variant's 4-tuple contract (its h_res
-                # slot is None, see GatedResidualModule.produces_h_res).
+            # The variant's h_res slot is None (GatedResidualModule.produces_h_res). The
+            # hybrid hyper-connection wrapper's TE per-layer capture keys on produces_h_res
+            # and omits the slot from its partial-MoE graph outputs, so that capture is
+            # supported. The `local` implementation and full-iteration capture have not been
+            # validated against the 4-tuple contract.
+            if (
+                self.cuda_graph_impl not in ("none", "transformer_engine")
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
+            ):
                 raise ValueError(
-                    "CUDA graphs are not supported with "
-                    "mhc_connection_variant='gated_residual' yet: per-layer capture of the "
-                    "hyper-connection hybrid wrapper is not implemented, and whole-layer and "
-                    "full-iteration capture have not been validated for this variant. "
-                    "Disable CUDA graphs to train with gated residuals."
+                    "CUDA graphs with mhc_connection_variant='gated_residual' are "
+                    "supported only as cuda_graph_impl='transformer_engine' partial "
+                    f"capture, got cuda_graph_impl={self.cuda_graph_impl!r}"
+                    f"{', enable_cuda_graph' if self.enable_cuda_graph else ''}"
+                    f"{', external_cuda_graph' if self.external_cuda_graph else ''}. "
+                    "Whole-layer and full-iteration capture have not been validated "
+                    "against the 4-tuple contract."
                 )
+            if self.cuda_graph_impl == "transformer_engine":
+                # ``attn`` captures each attention-type hybrid layer as one whole-wrapper
+                # graph (aggregate + inner attention + n-stream BDA). The output is the
+                # n-stream hidden state only, so the 4-tuple's None h_res slot never becomes
+                # a graph output there.
+                _gr_graphable_scopes = {
+                    CudaGraphModule.attn,
+                    CudaGraphModule.moe,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                }
+                # cuda_graph_modules entries may still be plain strings here: this guard runs
+                # before the generic CUDA-graph normalization, and only arguments.py converts
+                # the CLI values to enum members. Compare on names so both forms work.
+                _gr_graphable_names = {m.name for m in _gr_graphable_scopes}
+                _gr_modules = self.cuda_graph_modules
+                if isinstance(_gr_modules, str):
+                    # "full" (the default) is the deprecated spelling of whole-layer capture.
+                    _gr_modules = [] if _gr_modules == "full" else _gr_modules.split(",")
+                elif isinstance(_gr_modules, CudaGraphModule):
+                    _gr_modules = [_gr_modules]
+                _gr_scopes = {getattr(m, "name", m) for m in (_gr_modules or [])}
+                if not _gr_scopes or not _gr_scopes <= _gr_graphable_names:
+                    raise ValueError(
+                        "CUDA graphs with mhc_connection_variant='gated_residual' are "
+                        "validated only for cuda_graph_modules restricted to attn and the "
+                        "MoE scopes (moe / moe_router / moe_preprocess); "
+                        f"got {sorted(_gr_scopes) or 'all layers'}. Whole-layer capture "
+                        "and the mlp / mamba scopes are untested for this variant."
+                    )
             if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
                 warnings.warn(
                     "mhc_connection_variant='gated_residual' with tensor parallelism "
@@ -4401,6 +4447,53 @@ class TransformerConfig(ModelParallelConfig):
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
+        if self.cuda_graph_capture_engram_host:
+            if not self.engram_enabled:
+                raise ValueError("cuda_graph_capture_engram_host requires Engram to be enabled")
+            if (
+                self.cuda_graph_impl != "transformer_engine"
+                or CudaGraphModule.attn not in self.cuda_graph_modules
+            ):
+                raise ValueError(
+                    "cuda_graph_capture_engram_host requires cuda_graph_impl="
+                    "'transformer_engine' with the 'attn' scope in cuda_graph_modules"
+                )
+            if not self.enable_mhc_connections:
+                # Only HyperConnectionHybridLayer moves the Engram lookup in front of the
+                # graph; plain TransformerLayer hosts would silently stay eager.
+                raise ValueError(
+                    "cuda_graph_capture_engram_host is implemented by the hybrid "
+                    "hyper-connection wrapper and requires enable_mhc_connections=True"
+                )
+            if self.recompute_granularity == "full" or (
+                self.recompute_granularity == "selective"
+                and "mhc" in (self.recompute_modules or [])
+            ):
+                # Not validated: these recompute modes re-run layers through their own
+                # schedule, and must replay the eager Engram lookup consistently.
+                raise ValueError(
+                    "cuda_graph_capture_engram_host does not support full recompute or the "
+                    "mhc selective recompute"
+                )
+        # local per-layer capture: CheckpointWithoutOutput.checkpoint() bypasses only under
+        # is_graph_warmup(), not is_graph_capturing(), so the local implementation records the
+        # mHC checkpoint bodies and their registration into the layer graph. Replays run no
+        # Python, so nothing re-registers while the group-end discard still runs eagerly --
+        # and the local backward graph captures torch.autograd.grad, so a recompute hook
+        # recorded there fires under stream capture, where the RNG rewind either raises or
+        # silently replays a different dropout mask. A captured checkpoint recovers no memory
+        # either way, so this combination has no upside to preserve.
+        if (
+            self.recompute_granularity == "selective"
+            and "mhc" in (self.recompute_modules or [])
+            and self.cuda_graph_impl == "local"
+        ):
+            raise ValueError(
+                "mHC recompute is not supported with cuda_graph_impl='local': the local "
+                "per-layer capture records the mHC checkpoints and their recompute hooks into "
+                "the layer graphs, where the backward-time RNG rewind cannot run. Use "
+                "cuda_graph_impl='transformer_engine', or disable CUDA graphs."
+            )
 
         assert not (
             self.moe_shortcut_connection

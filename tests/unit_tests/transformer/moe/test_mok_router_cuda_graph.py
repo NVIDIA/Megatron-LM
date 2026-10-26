@@ -11,7 +11,9 @@ megakernel runs eagerly on those outputs. These tests cover
 * the backend contract: the compact-route entry point hands the megakernel exactly what the
   dense path does;
 * the layer plumbing end to end: a hybrid MoE layer whose router prefix is
-  captured with Transformer Engine and replayed matches eager execution bit for bit
+  captured with Transformer Engine -- plain, and wrapped in the gated-residual hybrid
+  hyper-connection wrapper (HyperConnectionHybridLayer) -- and replayed matches eager
+  execution bit for bit
   (forward output, input gradient, and every parameter gradient). The megakernel is replaced
   by a deterministic toy behind the real backend ``forward`` so the test does not need the
   MOK extension or expert parallelism.
@@ -36,6 +38,7 @@ HIDDEN = 256
 EXPERTS = 8
 TOPK = 2
 SEQ = 128
+STREAMS = 4
 
 
 def _config(**overrides):
@@ -70,6 +73,19 @@ def _config(**overrides):
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
+
+
+def _gated_residual_config(**overrides):
+    """The same MoE layer under the gated-residual hybrid hyper-connection wrapper."""
+    kwargs = dict(
+        is_hybrid_model=True,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=STREAMS,
+        mhc_connection_variant="gated_residual",
+        hc_lowrank=64,
+    )
+    kwargs.update(overrides)
+    return _config(**kwargs)
 
 
 class TestMokCudaGraphScopeValidation:
@@ -206,6 +222,37 @@ def _moe_layer(config, monkeypatch):
     return layer.cuda().train()
 
 
+def _moe_wrapper(config, monkeypatch):
+    import megatron.core.transformer.moe.moe_layer as moe_layer_module
+    from megatron.core.models.hybrid.hybrid_layer_specs import gated_residual_hybrid_stack_spec
+    from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+        HyperConnectionHybridLayer,
+    )
+    from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+    from megatron.core.transformer.spec_utils import build_module
+
+    toy = _ToyMegakernel()
+    monkeypatch.setattr(moe_layer_module, "build_megakernel_backend", lambda **kwargs: toy)
+    monkeypatch.setattr(mok_backend, "_MoKAutograd", SimpleNamespace(apply=_toy_apply))
+    spec = gated_residual_hybrid_stack_spec.submodules.moe_layer
+    layer = build_module(spec, config=config, layer_number=1)
+    assert layer.mlp.megakernel_experts is toy
+    wrapper = HyperConnectionHybridLayer(config, layer)
+    convert_module_to_dtype_except_fp32_marked(wrapper, torch.bfloat16)
+    return wrapper.cuda().train()
+
+
+def _build(wrapped, monkeypatch, **overrides):
+    """Return (config, graph callable, its MoE TransformerLayer, hidden width, param prefix)."""
+    if wrapped:
+        config = _gated_residual_config(**overrides)
+        wrapper = _moe_wrapper(config, monkeypatch)
+        return config, wrapper, wrapper.inner_layer, STREAMS * HIDDEN, "inner_layer."
+    config = _config(**overrides)
+    layer = _moe_layer(config, monkeypatch)
+    return config, layer, layer, HIDDEN, ""
+
+
 def _run(wrapper, x, grad_out):
     wrapper.zero_grad(set_to_none=True)
     x = x.detach().clone().requires_grad_(True)
@@ -232,41 +279,49 @@ class TestMokRouterCaptureMatchesEager:
         initialize_rng_tracker(force_reset=True)
         Utils.destroy_model_parallel()
 
-    def test_layer_is_graphable_with_router_prefix_only(self, monkeypatch):
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_layer_is_graphable_with_router_prefix_only(self, monkeypatch, wrapped):
         from megatron.core.transformer.cuda_graphs import _layer_is_graphable
 
-        config = _config()
-        layer = _moe_layer(config, monkeypatch)
-        assert _layer_is_graphable(layer, config)
-        covered = layer._get_submodules_under_cudagraphs()
+        config, callable_, layer, _, _ = _build(wrapped, monkeypatch)
+        assert _layer_is_graphable(callable_, config)
+        covered = callable_._get_submodules_under_cudagraphs()
         assert layer.mlp.router in covered
+        if wrapped:
+            # Partial capture: the mHC aggregate plus the router prefix, experts eager.
+            assert callable_._inner_is_partial_moe_capture()
+            assert callable_.hyper_connection in covered
         # The shared expert is fused into the eager megakernel: not graph-owned.
         assert layer.mlp.shared_experts not in covered
         assert layer.mlp.megakernel_experts not in covered
         assert not layer._moe_cuda_graph_outputs_shared_expert()
         # attn-only scope: the MoE layer stays eager, as before.
-        attn_only = _config(cuda_graph_modules=[CudaGraphModule.attn])
-        assert not _layer_is_graphable(layer, attn_only)
+        attn_only = (_gated_residual_config if wrapped else _config)(
+            cuda_graph_modules=[CudaGraphModule.attn]
+        )
+        assert not _layer_is_graphable(callable_, attn_only)
 
+    @pytest.mark.parametrize("wrapped", [False, True])
     @pytest.mark.parametrize("load_balancing", ["aux_loss", "none"])
-    def test_replay_matches_eager_bitwise(self, monkeypatch, load_balancing):
+    def test_replay_matches_eager_bitwise(self, monkeypatch, load_balancing, wrapped):
         from transformer_engine.pytorch import graph as te_graph
 
         from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
 
-        config = _config(moe_router_load_balancing_type=load_balancing)
-        wrapper = _moe_layer(config, monkeypatch)
+        config, wrapper, layer, width, prefix = _build(
+            wrapped, monkeypatch, moe_router_load_balancing_type=load_balancing
+        )
         calls = {"compact": 0}
-        compact = wrapper.mlp.megakernel_experts.compact_routes
+        compact = layer.mlp.megakernel_experts.compact_routes
 
         def counting_compact(*args, **kwargs):
             calls["compact"] += 1
             return compact(*args, **kwargs)
 
-        monkeypatch.setattr(wrapper.mlp.megakernel_experts, "compact_routes", counting_compact)
+        monkeypatch.setattr(layer.mlp.megakernel_experts, "compact_routes", counting_compact)
 
         torch.manual_seed(0)
-        shape = (SEQ, 1, HIDDEN)
+        shape = (SEQ, 1, width)
         xs = [torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
         grad_outs = [torch.randn_like(x) for x in xs]
 
@@ -309,11 +364,11 @@ class TestMokRouterCaptureMatchesEager:
             out, dx, grads = _run(wrapper, x, g)
             # Replay: the compaction ran inside the graph, not eagerly.
             assert calls["compact"] == before
-            assert wrapper.mlp.cudagraph_tensor_store.is_empty()
+            assert layer.mlp.cudagraph_tensor_store.is_empty()
             assert torch.equal(out, out_ref)
             assert torch.equal(dx, dx_ref)
             assert grads.keys() == grads_ref.keys()
-            assert "mlp.router.weight" in grads
+            assert f"{prefix}mlp.router.weight" in grads
             assert any(name.endswith("expert_scale") for name in grads)
             for name, ref in grads_ref.items():
                 assert torch.equal(grads[name], ref), f"{name} grad differs"

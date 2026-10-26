@@ -1793,6 +1793,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """
         if self.engram is not None:
             return False
+        return self.submodules_are_cuda_graph_capturable()
+
+    def submodules_are_cuda_graph_capturable(self) -> bool:
+        """Whether the attention and MLP submodules allow per-layer CUDA graph capture.
+
+        This is ``is_cuda_graph_capturable`` without the Engram rule. A caller that runs the
+        Engram lookup itself, outside the layer's graph (``HyperConnectionHybridLayer`` with
+        ``cuda_graph_capture_engram_host``), consults it for the remaining part of the layer.
+        """
         for submodule in (self.self_attention, self.cross_attention, self.mlp):
             predicate = getattr(submodule, "is_cuda_graph_capturable", None)
             if predicate is not None and not predicate():
@@ -2015,6 +2024,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 hidden_states = kwargs.pop("hidden_states")
                 hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
+
+        cuda_graph_outputs = self._te_cuda_graph_capture_impl(*args, **kwargs)
+
+        # Record the forward event on cuda graph stream for cuda graph capture.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the D2H transfer on offloading stream.
+        if self.offload_module_in_cuda_graph:
+            self.off_interface.forward_record()
+        return cuda_graph_outputs
+
+    def _te_cuda_graph_capture_impl(self, *args, **kwargs):
+        """Capture this layer's graph-safe body without offload boundary events.
+
+        The public capture entry owns the graph boundary. Outer graphable wrappers
+        (``HyperConnectionHybridLayer``) call this implementation when they capture the
+        TransformerLayer body as part of a larger callable, avoiding nested events in the
+        middle of that graph. ``packed_seq_params`` must already be reconstructed by the
+        boundary owner.
+        """
+        assert 'cu_seqlens_q' not in kwargs, (
+            "TransformerLayer CUDA graph capture body received raw THD sequence tensors. "
+            "The outer capture boundary must reconstruct PackedSeqParams first."
+        )
+
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -2050,11 +2083,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             cuda_graph_outputs = list(hidden_states)
         if context is not None:
             cuda_graph_outputs.append(context)
-        # Record the forward event on cuda graph stream for cuda graph capture.
-        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
-        # and overlaps with the D2H transfer on offloading stream.
-        if self.offload_module_in_cuda_graph:
-            self.off_interface.forward_record()
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -2101,6 +2129,60 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         finally:
             if self.config.delay_offload_until_cuda_graph:
                 self.off_interface.exit_replay()
+
+    def resume_moe_experts_after_partial_cudagraph(self, cuda_graph_output, padding_mask=None):
+        """Resume the eager MoE *expert* compute after a partial (moe_router[/moe_preprocess])
+        CUDA graph and return the raw ``mlp_output_with_bias`` (NOT the post-residual layer
+        output). ``cuda_graph_output`` is the list of captured router/preprocess intermediates,
+        with any outer (e.g. mHC) state already stripped by the caller.
+
+        Used by the mHC hybrid wrapper (``HyperConnectionHybridLayer``): the wrapper's n-stream
+        BDA owns the residual combine, so the inner layer's own MLP BDA is intentionally
+        skipped here. EP-overlap is not supported on this path.
+        """
+        assert not self.config.overlap_moe_expert_parallel_comm, (
+            "HyperConnectionHybridLayer MoE CUDA-graph capture requires "
+            "overlap_moe_expert_parallel_comm=False."
+        )
+        shared_expert_output, routing_map = None, None
+        # The inner residual is the last captured element; the mHC wrapper does not use it
+        # (the n-stream BDA combines the residual), so drop it.
+        cuda_graph_output.pop()
+        if self._moe_cuda_graph_outputs_shared_expert():
+            shared_expert_output = cuda_graph_output.pop()
+
+        if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
+            (hidden_states, probs), attr_outputs = cuda_graph_output[:2], cuda_graph_output[2:]
+            valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
+            assert len(attr_outputs) == len(
+                valid_cudagraph_attrs
+            ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+            for i, attr_name in enumerate(valid_cudagraph_attrs):
+                hier_attr_name = attr_name.split('.')
+                attr = self.mlp.token_dispatcher
+                for name in hier_attr_name[:-1]:
+                    attr = getattr(attr, name)
+                setattr(attr, hier_attr_name[-1], attr_outputs[i])
+        else:
+            assert len(cuda_graph_output) == 3, (
+                "CUDA graph output should be [hidden_states, probs, routing_map], "
+                f"but got {len(cuda_graph_output)} elements"
+            )
+            hidden_states, probs, routing_map = cuda_graph_output
+
+        nvtx_range_push(suffix="mlp")
+        self.mlp.cudagraph_tensor_store.set(
+            hidden_states=hidden_states,
+            probs=probs,
+            routing_map=routing_map,
+            shared_expert_output=shared_expert_output,
+        )
+        # The cached router outputs are unmasked; eager preprocess needs the replay mask
+        # so the dispatcher can exclude padded rows.
+        mlp_output_with_bias = apply_module(self.mlp)(hidden_states, padding_mask=padding_mask)
+        self.mlp.cudagraph_tensor_store.clear()
+        nvtx_range_pop(suffix="mlp")
+        return mlp_output_with_bias
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""

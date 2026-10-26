@@ -755,6 +755,10 @@ class HybridStack(MegatronModule):
                 )
             else:
                 layer_types = self.layer_type_list
+                # A layer whose TE CUDA graph also covers the next layer (an mHC attention
+                # wrapper grouped with the following MoE router prefix) returns that layer's
+                # output; the grouped layer is then skipped here.
+                grouped_tail_to_skip = None
                 for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
                     zip(
                         self._execution_layer_indices,
@@ -763,6 +767,13 @@ class HybridStack(MegatronModule):
                         strict=True,
                     )
                 ):
+                    if layer is grouped_tail_to_skip:
+                        grouped_tail_to_skip = None
+                        if cp_layout_state is not None:
+                            hidden_states = cp_layout_state.finalize_layer(
+                                physical_layer_idx, hidden_states
+                            )
+                        continue
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx
@@ -888,6 +899,9 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                 )
                         nvtx_range_pop(layer_range)
+                        grouped_tail_to_skip = getattr(
+                            layer, "_get_active_te_cuda_graph_group_tail", lambda: None
+                        )()
 
                         if isinstance(hidden_states, tuple):
                             hidden_states = hidden_states[0]
