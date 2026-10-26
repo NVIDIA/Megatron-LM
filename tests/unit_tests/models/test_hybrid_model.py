@@ -974,6 +974,7 @@ class TestHybridModel:
             layout_state = SimpleNamespace(
                 manager=layout_manager,
                 prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
+                get_layer_padding_mask=lambda index, default, masks: default,
                 finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
             )
             layout_manager.build_forward_state = lambda *args, **kwargs: layout_state

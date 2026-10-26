@@ -155,6 +155,12 @@ def test_attention_latent_norm_epsilon_defaults_to_layernorm_epsilon():
     assert config.attention_latent_norm_epsilon == pytest.approx(3e-6)
 
 
+def test_config_rejects_dynamic_context_parallel():
+    """DSv4 has no dynamic context parallelism path yet."""
+    with pytest.raises(ValueError, match="DSv4 dynamic context parallelism is not supported"):
+        _make_config(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+
+
 def test_attention_latent_norm_epsilon_accepts_override():
     """DSv4 latent norms can use the model recipe's dedicated epsilon."""
     config = _make_config(layernorm_epsilon=3e-6, attention_latent_norm_epsilon=1e-5)

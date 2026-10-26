@@ -32,7 +32,9 @@ class _Rerun:
         return False, True, 0  # (checkpoint, exit, code)
 
 
-def _run(*, args_overrides=None, model=None, optimizer=None, return_result=False, **kwargs):
+def _run(
+    *, args_overrides=None, model=None, optimizer=None, config=None, return_result=False, **kwargs
+):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -65,21 +67,42 @@ def _run(*, args_overrides=None, model=None, optimizer=None, return_result=False
             model=model,
             optimizer=optimizer,
             opt_param_scheduler=None,
-            config=SimpleNamespace(),
+            config=config or SimpleNamespace(),
             forward_backward_func=lambda **kw: captured.update(kw) or [],
             iteration=0,
             **kwargs,
         )
+    # Dev's 12-field result with main's scheduled microbatch count appended.
+    assert len(result) == 13
+    assert result[-2] is None  # early exit before optimizer/sample accounting
+    captured['returned_num_microbatches'] = result[-1]
     return result if return_result else captured
 
 
 def test_train_step_early_exit_keeps_normal_result_field_order():
+    # Dev's 12-field train_step result, with main's scheduled microbatch count
+    # (ea99fdfce) appended as the 13th field.
     result = _run(return_result=True)
-    assert len(result) == 12
+    assert len(result) == 13
     assert result[:5] == ({}, True, False, True, 0)
     assert result[5:8] == (None, None, None)
     assert result[8] == 1  # num_microbatches, not an exit-path placeholder
     assert result[11] is None  # samples_seen is not computed before early exit
+    assert result[12] == 1  # main's appended scheduled microbatch count
+
+
+def test_train_step_returns_scheduled_microbatch_count():
+    packed_iterator = iter([1, 2, 3])
+    with (
+        mock.patch.object(
+            training_mod, 'wrap_data_iterator', return_value=(packed_iterator, 3, 60, 1200)
+        ),
+        mock.patch.object(training_mod, 'get_attr_wrapped_model', return_value=object()),
+        mock.patch.object(training_mod, 'set_seqlen_stats_in_iteration'),
+    ):
+        captured = _run(config=SimpleNamespace(sequence_packing_scheduler='default_dynamic_cp'))
+    assert captured['num_microbatches'] == captured['returned_num_microbatches'] == 3
+    assert captured['data_iterator'] is packed_iterator
 
 
 def test_train_step_forwards_schedule_plumbing():
@@ -470,7 +493,14 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     config = SimpleNamespace(sequence_packing_scheduler="default_dynamic_cp")
     captured = {}
     forwarded_iterators = []
-    model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+    # wrap_data_iterator takes pg_collection from the model (main ea99fdfce), so the
+    # mock has to carry one for the plumbing assertion below.
+    model_pg_collection = object()
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False, zero_grad_buffer=lambda: None, pg_collection=model_pg_collection
+        )
+    ]
     rerun = mock.MagicMock()
     rerun.should_run_forward_backward.side_effect = [True, True, False]
     rerun.should_checkpoint_and_exit.return_value = (False, True, 0)
@@ -504,11 +534,13 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     assert rerun.should_run_forward_backward.call_args_list[0].args[0] is original_iterator
     assert rerun.should_run_forward_backward.call_args_list[1].args[0] is packed_iterator
     assert rerun.should_run_forward_backward.call_args_list[2].args[0] is packed_iterator
-    wrap_data_iterator.assert_called_once_with(original_iterator, config, 1)
+    wrap_data_iterator.assert_called_once_with(
+        original_iterator, config, 1, pg_collection=model_pg_collection
+    )
     assert forwarded_iterators == [packed_iterator, packed_iterator]
     assert captured["num_microbatches"] == 3
-    assert len(result) == 12
-    assert result[8:] == (3, 12.0, 34.0, None)
+    assert len(result) == 13
+    assert result[8:] == (3, 12.0, 34.0, None, 3)
 
 
 @pytest.mark.parametrize(

@@ -9,7 +9,8 @@ the router gating GEMM, and virtual-expert planning against a CPU oracle in eage
 graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
 deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available).
+``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
+``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
 """
 
 import pytest
@@ -907,17 +908,27 @@ class TestMoEModules:
         moe_utils.get_moe_metrics_tracker().clear()
 
     @pytest.mark.parametrize(
-        "balancing,score,expert_bias,hash_routing",
+        "balancing,score,expert_bias,hash_routing,per_token_loss",
         [
-            ("aux_loss", "softmax", False, False),
-            ("seq_aux_loss", "sigmoid", True, False),
-            ("sinkhorn", "softmax", False, False),
-            ("none", "sigmoid", False, True),
-            ("none", "softmax", False, True),
+            ("aux_loss", "softmax", False, False, False),
+            ("seq_aux_loss", "sigmoid", True, False, False),
+            ("sinkhorn", "softmax", False, False, False),
+            ("none", "sigmoid", False, True, False),
+            ("none", "softmax", False, True, False),
+            ("seq_aux_loss", "softmax", False, False, True),
         ],
-        ids=["aux_loss", "seq_aux_loss+sigmoid+bias", "sinkhorn", "hash+sigmoid", "hash+softmax"],
+        ids=[
+            "aux_loss",
+            "seq_aux_loss+sigmoid+bias",
+            "sinkhorn",
+            "hash+sigmoid",
+            "hash+softmax",
+            "seq_aux_loss+per_token_loss",
+        ],
     )
-    def test_topk_router_replays(self, balancing, score, expert_bias, hash_routing):
+    def test_topk_router_replays(
+        self, balancing, score, expert_bias, hash_routing, per_token_loss, monkeypatch
+    ):
         self._init()
         seeded()
         config = _moe_config(
@@ -930,11 +941,19 @@ class TestMoEModules:
             moe_aux_loss_coeff=0.0 if balancing in ("sinkhorn", "none") else 0.01,
             moe_num_hash_layers=int(hash_routing),
             hash_moe_vocab_size=128 if hash_routing else None,
+            calculate_per_token_loss=per_token_loss,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
         ).cuda()
         router.set_layer_number(0)
+        if per_token_loss:
+            # Without a padding mask, seq aux loss uses the Python-int token-count branch.
+            monkeypatch.setattr(
+                moe_utils.MoEAuxLossAutoScaler,
+                "main_loss_backward_scale",
+                torch.ones((), device="cuda"),
+            )
         hidden = torch.randn(2048, 4, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         inputs = (hidden,)
         if expert_bias:
@@ -1086,6 +1105,65 @@ class TestMoEModules:
             contention=True,
             what="TEGroupedMLP",
         )
+
+    @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
+    def test_inference_nvfp4_moe_layer_replays(self, gated):
+        """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
+        from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
+
+        class _InInferenceMode(torch.nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, hidden):
+                with InferenceMode.active():
+                    return self.module(hidden)
+
+        self._init(ep=1)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            num_moe_experts=8,
+            moe_ffn_hidden_size=1024,
+            moe_router_topk=2,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            activation_func=F.silu if gated else squared_relu,
+            gated_linear_unit=gated,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="flashinfer",
+            inference_moe_token_dispatcher_type="nccl",
+            inference_moe_nvfp4_recipe="per_token",
+        )
+        NCCLAllGatherDispatcher.allocate_buffers()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        hidden = torch.randn(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), deterministic_algorithms(True):
+            assert_module_replays_bit_exact(
+                _InInferenceMode(layer),
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what="MoELayer[inference, flashinfer per-token NVFP4]",
+            )
+        assert layer.experts._nvfp4_weights is not None
 
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(

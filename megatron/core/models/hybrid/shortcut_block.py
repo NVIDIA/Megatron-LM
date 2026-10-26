@@ -488,9 +488,13 @@ class ShortcutMoEBlock(MegatronModule):
             )
         moe_hidden_states = hidden_states
         moe_packed_seq_params = packed_seq_params
+        moe_padding_mask = padding_mask
         if cp_layout_state is not None:
             moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
                 self.moe_local_idx, moe_hidden_states
+            )
+            moe_padding_mask = cp_layout_state.get_layer_padding_mask(
+                self.moe_local_idx, padding_mask, padding_mask_by_layout
             )
 
         if padding_mask_by_layout is not None:
@@ -509,13 +513,17 @@ class ShortcutMoEBlock(MegatronModule):
             )
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
-                padding_mask=padding_mask,
+                padding_mask=moe_padding_mask,
                 packed_seq_params=moe_packed_seq_params,
                 input_ids=input_ids,
                 recompute_context=attn_recompute_context,
             )
             if overlap:
                 self.route_ready_event.record(torch.cuda.current_stream())
+
+        # Only the non-inference paths below produce a paired state; the inference path
+        # returns its output directly and never reaches the post-core-attn call.
+        paired_state = None
 
         # Launch the input and attn of the attention layer
         with quant_context_factory(attn_config, self.attn_layer_idx):
@@ -589,7 +597,7 @@ class ShortcutMoEBlock(MegatronModule):
             shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
                 self._moe_shared_experts(
                     hidden_states=attn_layer_output,
-                    padding_mask=padding_mask,
+                    padding_mask=moe_padding_mask,
                     packed_seq_params=moe_packed_seq_params,
                     recompute_context=moe_recompute_context,
                 )
