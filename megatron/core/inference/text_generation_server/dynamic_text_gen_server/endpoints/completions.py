@@ -221,10 +221,6 @@ try:
         # escapes the handler and those requests generate to their token limit
         # holding batch slots, the same leak the abort below closes.
         #
-        # TODO: streaming submissions made before a mid-loop failure are not
-        # covered. Their handles are AsyncStreams, not ids, and they abort
-        # through openai_stream's finally, which never runs because the
-        # generator is never started.
         try:
             # Hash and serialize shared media once before fanning it out across
             # the prompts in this batch, the same way chat completions does.
@@ -252,14 +248,14 @@ try:
                 )
                 per_req_params.seed = sampling_params_for_choice(sampling_params, index).seed
                 if stream_requested:
-                    tasks.append(
-                        client.add_request_streaming(
-                            prompt_tokens,
-                            per_req_params,
-                            multi_modal_data=prepared_multimodal_data,
-                            offload_params=offload_params,
-                        )
+                    stream = client.add_request_streaming(
+                        prompt_tokens,
+                        per_req_params,
+                        multi_modal_data=prepared_multimodal_data,
+                        offload_params=offload_params,
                     )
+                    request_ids.append(stream.request_id)
+                    tasks.append(stream)
                 else:
                     # add_request_with_id, not add_request: a non-streaming response
                     # writes nothing to the socket while generating, so a disconnect
@@ -310,6 +306,11 @@ try:
             abort_requests(client, request_ids, "client disconnected")
             raise
         except Exception as e:
+            # gather returns as soon as one request raises, but does not cancel
+            # the remaining engine work. Abort every admitted request: completed
+            # IDs are harmless no-ops at the client, while pending siblings
+            # would otherwise keep generating after this HTTP response ends.
+            abort_requests(client, request_ids, f"inference failed: {e}")
             return f"Error during inference: {e}", 500
 
         if current_app.config['verbose']:
