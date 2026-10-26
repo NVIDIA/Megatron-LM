@@ -701,7 +701,7 @@ class TransformerConfig(ModelParallelConfig):
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", "residual_stream", "dsa_simple_routing",
-    "dsa_indexer_k", "dsa_selected_scores".
+    "dsa_indexer_k", "dsa_selected_scores", "mamba".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -719,6 +719,7 @@ class TransformerConfig(ModelParallelConfig):
             enable_mhc_connections=True. Cannot be used with "mlp".
     "shortcut_pre_mlp_layernorm": recompute the shortcut router's input normalization.
             Requires moe_shortcut_connection=True and selective recomputation.
+    "mamba": recompute the Mamba mixer (conv + selective SSM/SSD) in a Mamba layer.
     "residual_stream": replay wide-residual reads, connected norms, and writes via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager.
     "dsa_simple_routing": recompute the simplified DSA routing top-k in the backward pass
@@ -734,7 +735,7 @@ class TransformerConfig(ModelParallelConfig):
             dsa_indexer_use_sparse_loss.
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
     "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "core_attn", "mlp", "moe", "shared_experts", and "mamba" use normal checkpointing.
     """
 
     ####################
@@ -2780,6 +2781,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
 
+        if "mamba" in self.recompute_modules and self.moe_shortcut_connection:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Mamba mixer recomputation is not supported with moe_shortcut_connection; "
+                "the shortcut MoE path does not recompute the Mamba mixer.",
+            )
+
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
@@ -2799,6 +2808,7 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_simple_routing",
                     "dsa_indexer_k",
                     "dsa_selected_scores",
+                    "mamba",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
