@@ -84,7 +84,10 @@ def initialize_megatron(
     compilation in addition to the shared distributed execution and RNG setup.
     `build_tokenizer` is False for workloads that provide their own tokenization.
     `seed_pg_collection` seeds the random number generators from the process
-    groups of the model being trained instead of the mpu globals.
+    groups of the model being trained. Without it, they are seeded from the
+    collection of the parallel grid that this function builds, or from the mpu
+    globals when it builds none (for example with `skip_model_parallel_init`,
+    or when the grid was initialized before this call).
     Returns a function to finalize distributed env initialization
     (optionally, only when cfg.dist.lazy_mpu_init == True)
     """
@@ -157,7 +160,7 @@ def initialize_megatron(
         cfg = get_run_config()
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed(
+        grid_pg_collection = _initialize_distributed(
             get_embedding_ranks,
             get_position_embedding_ranks,
             store,
@@ -187,7 +190,9 @@ def initialize_megatron(
                 tp_group=seed_tp_group,
                 ep_group=seed_ep_group,
                 etp_group=seed_etp_group,
-                pg_collection=seed_pg_collection,
+                pg_collection=(
+                    seed_pg_collection if seed_pg_collection is not None else grid_pg_collection
+                ),
             )
 
         # Setup MoE aux loss scale value.
@@ -348,7 +353,12 @@ def _initialize_tp_communicators(
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
                             skip_model_parallel_init=False):
-    """Initialize torch.distributed and core model parallel."""
+    """Initialize torch.distributed and core model parallel.
+
+    Returns the ProcessGroupCollection of the parallel grid that this call
+    builds, or None when it builds none: model-parallel setup is skipped, the
+    grid is already initialized, or no CUDA device is present.
+    """
     cfg = get_run_config()
     args = get_args()
 
@@ -444,6 +454,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     # (skipped when caller owns model-parallel setup)
+    pg_collection = None
     if device_count > 0 and not skip_model_parallel_init:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
@@ -459,7 +470,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             # Dense grid: world_size must be divisible by
             # TP * PP * (runtime_CP / gtp_remat_num_sequence_shards) * GTP_remat.
             # Expert grid: world_size must be divisible by ETP * EP * PP * EGTP_remat.
-            mpu.initialize_model_parallel(
+            pg_collection = mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
@@ -485,17 +496,17 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 sharp_enabled_group=cfg.dist.sharp_enabled_group,
             )
             print_rank_0(
-                f"> initialized tensor model parallel with size "
-                f"{mpu.get_tensor_model_parallel_world_size()}"
+                f"> initialized tensor model parallel with size {get_pg_size(pg_collection.tp)}"
             )
             print_rank_0(
                 f"> initialized gtp weight remat with size "
-                f"{mpu.get_gtp_weight_remat_world_size()}"
+                f"{get_pg_size(pg_collection.gtp_remat)}"
             )
             print_rank_0(
                 f"> initialized pipeline model parallel with size "
-                f"{mpu.get_pipeline_model_parallel_world_size()}"
+                f"{get_pg_size(pg_collection.pp)}"
             )
+    return pg_collection
 
 
 def _init_autoresume():
