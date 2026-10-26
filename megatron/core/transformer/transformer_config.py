@@ -6170,11 +6170,16 @@ class TransformerConfig(ModelParallelConfig):
                     self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
+                    # Fixed data-side padding happens before the router/planner.
+                    # Unlike alignment to a multiple, it equalizes physical rows
+                    # without a second, post-planner dispatcher equalization.
+                    and self.pad_packed_seq_alignment != "max"
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "
-                        "moe_hybridep_pad_variable_tokens=True because packed token "
-                        "counts can differ across dispatcher ranks"
+                        "moe_hybridep_pad_variable_tokens=True or "
+                        "pad_packed_seq_alignment='max' because packed token counts "
+                        "can differ across dispatcher ranks"
                     )
 
         if self.cuda_graph_impl != "none" and (

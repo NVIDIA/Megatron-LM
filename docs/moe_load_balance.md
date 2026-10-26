@@ -574,6 +574,10 @@ Unimplemented HybridEP weight transport, MoonEP/peer-TMA EP sizes above 64,
 and MoonEP expert counts above 8192 are rejected before allocation. MoonEP
 requires equal physical token counts on all EP ranks; post-planner variable
 token equalization cannot satisfy this requirement and is rejected.
+For packed THD input, `pad_packed_seq_alignment='max'` pads the model input to
+`max_seqlen_per_dp_cp_rank` before routing. HybridEP recognizes this fixed
+data-side capacity and does not require post-planner variable-token padding.
+Alignment to a smaller multiple does not guarantee equal physical row counts.
 
 Learned and mock routing retain exactly top-k assignments on padding rows
 with zero probabilities. Padding contributes physical work to the planner but

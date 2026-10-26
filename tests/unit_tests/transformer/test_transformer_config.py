@@ -741,6 +741,83 @@ def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
     assert config.moe_hybridep_pad_uneven_dispatch_inputs is True
 
 
+@requires_te_2_9
+@pytest.mark.parametrize("alignment", [None, 128, "max"])
+@pytest.mark.parametrize("scheduler", [False, True])
+def test_hybridep_packing_recognizes_fixed_data_side_padding(alignment, scheduler):
+    """MoonEP must see equal rows before planning, not just before dispatch."""
+    kwargs = dict(
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_router_dtype="fp32",
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_enable_scheduler=scheduler,
+        moe_scheduler_planner_type="moon_ep",
+        moe_scheduler_expert_dispatcher_type="replica_peer_tma",
+        moe_scheduler_num_idle_experts=4,
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        gradient_accumulation_fusion=True,
+        add_bias_linear=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
+        pad_packed_seq_alignment=alignment,
+    )
+    if alignment != "max":
+        with pytest.raises(ValueError, match="HybridEP requires"):
+            _make_packing_config(**kwargs)
+        return
+    config = _make_packing_config(**kwargs)
+    assert config.moe_hybridep_pad_variable_tokens is False
+    assert config.max_seqlen_per_dp_cp_rank == 4096
+    if scheduler:
+        with pytest.raises(ValueError, match="equal physical token counts before planning"):
+            _make_packing_config(**kwargs, moe_hybridep_pad_variable_tokens=True)
+
+
+@pytest.mark.parametrize("valid_tokens", [128, 257, 4096])
+def test_max_packed_padding_equalizes_model_inputs(valid_tokens):
+    """Different packed lengths acquire identical physical rows before MoE."""
+    from megatron.core.packed_seq_params import (
+        PackedSeqParams,
+        get_thd_padding_kwargs,
+        pad_sequence_for_thd,
+    )
+
+    cu = torch.tensor([0, valid_tokens], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        cu_seqlens_q_padded=cu.clone(),
+        cu_seqlens_kv_padded=cu.clone(),
+        max_seqlen_q=valid_tokens,
+        max_seqlen_kv=valid_tokens,
+    )
+    alignment, target, max_seqs = get_thd_padding_kwargs("max", 4096, None, False)
+    tokens = torch.arange(valid_tokens).view(1, -1)
+    padded, _, _, _, _, mask = pad_sequence_for_thd(
+        tokens,
+        None,
+        None,
+        None,
+        params,
+        alignment=alignment,
+        target_len=target,
+        max_num_seqs=max_seqs,
+        cp_size=1,
+        cp_rank=0,
+    )
+    assert padded.shape == (1, 4096)
+    torch.testing.assert_close(padded[:, :valid_tokens], tokens)
+    assert mask.sum().item() == 4096 - valid_tokens
+
+
 @pytest.mark.parametrize(
     "dev_flag,main_flag", [(False, False), (True, False), (False, True), (True, True)]
 )
