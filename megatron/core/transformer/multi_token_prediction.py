@@ -834,6 +834,21 @@ def mtp_on_this_rank(
               True if any virtual sub-rank includes at least one MTP layer.
         - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
           pipeline stage. The function returns True only on the last pipeline stage.
+
+    Args:
+        layout: Custom pipeline layout of the model, if any.
+        mtp_num_layers: Number of MTP layers of the model; None without MTP.
+        ignore_virtual: Check all virtual pipeline stages of this pipeline rank instead of
+            ``vp_stage`` alone.
+        vp_stage: Virtual pipeline stage to check when ``ignore_virtual`` is False.
+        pp_group: Pipeline-parallel group of the model. Omitting it is deprecated: the global
+            pipeline group in ``parallel_state`` is used instead, with a
+            ``ProcessGroupFallbackWarning``.
+        vp_size: Number of virtual pipeline stages of the model, for example
+            ``config.virtual_pipeline_model_parallel_size or 1``; 1 means no virtual pipeline.
+            A layout provides its own size. Without a layout and with ``ignore_virtual`` False,
+            omitting it is deprecated: the global virtual pipeline size in ``parallel_state`` is
+            used instead, with a ``ProcessGroupFallbackWarning``.
     """
     if layout is None and mtp_num_layers is None:
         # No MTP layers anywhere, so the pipeline rank is not needed.
@@ -849,6 +864,9 @@ def mtp_on_this_rank(
     if vp_size is None and layout is not None:
         vp_size = layout.virtual_pipeline_model_parallel_size
     elif vp_size is None and not ignore_virtual:
+        warn_global_process_group_fallback(
+            "mtp_on_this_rank", "vp_size", deprecated_in="0.21", removed_in="0.23"
+        )
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
     if layout is not None:
