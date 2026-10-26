@@ -173,7 +173,7 @@ class _GDPRuntimeCP:
     """Forward-local GDP context-parallel geometry."""
 
     group: torch.distributed.ProcessGroup
-    helper: GDPContextParallel
+    helper: GDPContextParallel | None
     chunkwise: bool
     d_inner: int
     nheads: int
@@ -498,25 +498,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             name=(name + f".out_proj") if name is not None else None,
         )
 
-        # Headwise CP slices TP-local parameters across CP ranks. Keep this
-        # helper even for chunkwise-capable models so a runtime CP1 microbatch
-        # can execute with CP fully disabled.
-        self.cp = GDPContextParallel(
-            cp_group=self.pg_collection.cp,
-            d_inner_local_tp=self.d_inner_local_tp,
-            nheads_local_tp=self.nheads_local_tp,
-            ngroups_local_tp=self.ngroups_local_tp,
-            d_state=self.d_state,
-            num_householder=self.num_householder,
-            headdim=self.headdim,
-            conv1d_cp1=self.conv1d,
-            dt_bias_cp1=self.dt_bias,
-            A_log_cp1=self.A_log,
-            D_cp1=self.D,
-            D_has_hdim=self.D_has_hdim,
-            sequence_is_contiguous=self.config.linear_cp_layout == "contiguous",
-        )
+        # Chunkwise CP keeps every TP-local head, so headwise divisibility constraints
+        # must not be applied. Runtime CP1 helpers can be created lazily when needed.
+        self.cp = None
         if not self.chunkwise_context_parallel:
+            self.cp = self._make_headwise_cp_helper(self.pg_collection.cp)
             self.d_inner_local_cp = self.cp.d_inner_local_tpcp
             self.nheads_local_cp = self.cp.nheads_local_tpcp
             self.ngroups_local_cp = self.cp.ngroups_local_tpcp
@@ -543,11 +529,30 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         """Apply GDP's output projection to a recurrence output."""
         return self.out_proj(y)
 
+    def _make_headwise_cp_helper(
+        self, cp_group: torch.distributed.ProcessGroup
+    ) -> GDPContextParallel:
+        """Build headwise geometry sharing this mixer's TP-local parameters."""
+        return GDPContextParallel(
+            cp_group=cp_group,
+            d_inner_local_tp=self.d_inner_local_tp,
+            nheads_local_tp=self.nheads_local_tp,
+            ngroups_local_tp=self.ngroups_local_tp,
+            d_state=self.d_state,
+            num_householder=self.num_householder,
+            headdim=self.headdim,
+            conv1d_cp1=self.conv1d,
+            dt_bias_cp1=self.dt_bias,
+            A_log_cp1=self.A_log,
+            D_cp1=self.D,
+            D_has_hdim=self.D_has_hdim,
+            sequence_is_contiguous=self.config.linear_cp_layout == "contiguous",
+        )
+
     def _resolve_runtime_cp(self, packed_seq_params: PackedSeqParams | None) -> _GDPRuntimeCP:
         """Resolve the CP mode and dimensions for one microbatch."""
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         assert cp_group is not None, "GDP requires a context-parallel process group"
-        cp_helper = self.cp.for_context_parallel_group(cp_group)
         chunkwise = self.config.linear_cp_mode == "chunkwise" and cp_group.size() > 1
         if chunkwise:
             if self.chunkwise_cp_backend is None:
@@ -555,7 +560,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             d_inner = self.d_inner_local_tp
             nheads = self.nheads_local_tp
             ngroups = self.ngroups_local_tp
+            cp_helper = None
         else:
+            cp_helper = (
+                self.cp.for_context_parallel_group(cp_group)
+                if self.cp is not None
+                else self._make_headwise_cp_helper(cp_group)
+            )
             d_inner = cp_helper.d_inner_local_tpcp
             nheads = cp_helper.nheads_local_tpcp
             ngroups = cp_helper.ngroups_local_tpcp
@@ -610,7 +621,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 ok, reason = check_fla_sequence_packing_support()
                 assert ok, reason
                 assert (
-                    runtime_cp.helper.cp_size == 1
+                    runtime_cp.group.size() == 1
                 ), "Context parallel is not supported for GDP dynamic inference"
                 return self.ssm_dynamic_inference(hidden_states, inference_context)
             assert (
@@ -904,6 +915,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         zVKQba, _ = self.in_proj(hidden_states)
 
         if not runtime_cp.chunkwise:
+            assert runtime_cp.helper is not None
             zVKQba = runtime_cp.helper.pre_conv_ssm(zVKQba, packed_seq_params=packed_seq_params)
 
         return self._preprocess(zVKQba, runtime_cp=runtime_cp)
@@ -968,6 +980,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 global_seq_idx=seq_idx,
             )
         else:
+            assert runtime_cp.helper is not None
             # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor in channels-last memory,
             # which is also what it requires when ``seq_idx`` is set. ``x`` is a view into
             # the channels-last ``zVKQba``, so the transpose alone already gives
@@ -1104,6 +1117,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             A_log = self.A_log
             dt_bias = self.dt_bias
         else:
+            assert runtime_cp.helper is not None
             A_log = runtime_cp.helper.get_A_log()
             dt_bias = runtime_cp.helper.get_dt_bias()
         g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
@@ -1125,10 +1139,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             runtime_cp = self._resolve_runtime_cp(packed_seq_params)
         y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
         if not runtime_cp.chunkwise:
+            assert runtime_cp.helper is not None
             y = runtime_cp.helper.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
             z = rearrange(z, "b l d -> l b d").contiguous()
             if not runtime_cp.chunkwise:
+                assert runtime_cp.helper is not None
                 z = runtime_cp.helper.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
         return y
@@ -1148,7 +1164,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single-token static-batching decode step (updates state in place)."""
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
-        assert self.cp.cp_size == 1, "Context parallel not supported for GDP inference decode"
+        assert (
+            self.cp is not None and self.cp.cp_size == 1
+        ), "Context parallel not supported for GDP inference decode"
 
         # (1, b, d_model) -> (1, b, proj_dim)
         zVKQba, _ = self.in_proj(hidden_states)
@@ -1214,6 +1232,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             "the speculative-decoding conv and SSM snapshot buffers must be passed together; "
             "a rollback needs both halves of the recurrent state"
         )
+        assert self.cp is not None, "Headwise geometry is required for GDP inference"
 
         # Keep the sequence dimension so the shared helpers apply: their (b, l, ...)
         # reshapes give exactly the layouts the fla recurrent kernel wants here, i.e.
@@ -1309,6 +1328,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         so need neither a host synchronization nor a data-dependent shape.
         Padding requests are zero-length sequences with a `-1` state slot; they
         produce zero output and touch no state."""
+        assert self.cp is not None, "Headwise geometry is required for GDP inference"
         metadata = context.mamba_metadata
         slot_allocator = context.mamba_slot_allocator
         cu_seqlens = metadata.cu_seqlens
