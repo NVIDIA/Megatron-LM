@@ -303,8 +303,10 @@ class DSAIndexerLossLoggingHelper:
             loss: The loss tensor.
             layer_number: Layer index of the loss, 1-indexed.
             num_layers: The number of total layers.
-            reduce_group: The group for reducing the loss.
-            avg_group: The group for averaging the loss.
+            reduce_group: Legacy CP sum-group metadata. Reduction uses the fixed DP x CP
+                group supplied when logging.
+            avg_group: CP group whose size normalizes this local contribution before it
+                is accumulated. No collective is performed here.
             raw_loss: The unscaled loss, before the indexer loss coefficient is applied.
                 Optional so call sites that do not track it (the fused-kernel path) keep
                 working; it is appended last to preserve the positional order above.
@@ -325,7 +327,10 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        tracker["values"][layer_number - 1] += loss.detach()
+        # CP topology may change between microbatches. Apply CP-mean scaling to each
+        # contribution now, then reduce the accumulator over a fixed group exactly once.
+        average_scale = 1.0 / avg_group.size() if avg_group is not None else 1.0
+        tracker["values"][layer_number - 1].add_(loss.detach(), alpha=average_scale)
         if raw_loss is not None:
             if "raw_values" not in tracker or tracker["raw_values"].shape[0] < needed:
                 grown = torch.zeros(
@@ -334,7 +339,9 @@ class DSAIndexerLossLoggingHelper:
                 if "raw_values" in tracker:
                     grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
                 tracker["raw_values"] = grown
-            tracker["raw_values"][layer_number - 1] += raw_loss.detach()
+            tracker["raw_values"][layer_number - 1].add_(raw_loss.detach(), alpha=average_scale)
+        # Preserve legacy metadata for callers that retain it across graph replays.
+        # These groups must never be applied to the accumulated losses.
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -358,12 +365,15 @@ class DSAIndexerLossLoggingHelper:
         """Collect and reduce indexer losses across every pipeline rank.
 
         Args:
-            pg_collection: Process groups used for pipeline and data-parallel reductions.
+            pg_collection: Fixed pipeline, DP and DP x CP groups, plus optional GTP-remat.
             num_layers: Total number of decoder and MTP layers. When provided, ranks without
                 local indexer losses contribute zeros to the pipeline-wide reduction.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
         pp_group = pg_collection.pp
+        dp_cp_group = getattr(pg_collection, "dp_cp", None)
+        if dp_cp_group is None:
+            raise ValueError("DSA indexer logging requires a fixed dp_cp process group")
 
         # Pipeline ranks can own different attention variants, so first agree on
         # a common tracker size. Cache the result because layer allocation is
@@ -397,28 +407,21 @@ class DSAIndexerLossLoggingHelper:
             if "raw_values" in tracker:
                 grown[: tracker["raw_values"].shape[0]] = tracker["raw_values"]
             tracker["raw_values"] = grown
+        # Preserve DP/remat averaging. Any CP-mean factor has already been applied
+        # per contribution; CP sums are part of the fixed DP x CP reduction below.
+        contributing_ranks = pg_collection.dp.size()
+        gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
+        if gtp_remat_group is not None:
+            contributing_ranks *= gtp_remat_group.size()
         for values in (tracker["values"], tracker["raw_values"]):
             torch.distributed.all_reduce(values, group=pp_group)
-            # Reduce indexer losses across ranks.
-            if tracker.get('reduce_group') is not None:
-                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-            if tracker.get('avg_group') is not None:
-                torch.distributed.all_reduce(
-                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-                )
-            # Sum over every rank holding a distinct micro-batch, then divide once. gtp_remat
-            # ranks each carry their own, so they are a second data dimension beside dp. CP is
-            # excluded on purpose: the loss is already summed across it before it gets here.
-            contributing_ranks = pg_collection.dp.size()
             torch.distributed.all_reduce(
-                values, group=pg_collection.dp, op=torch.distributed.ReduceOp.SUM
+                values, group=dp_cp_group, op=torch.distributed.ReduceOp.SUM
             )
-            gtp_remat_group = getattr(pg_collection, "gtp_remat", None)
             if gtp_remat_group is not None and gtp_remat_group.size() > 1:
                 torch.distributed.all_reduce(
                     values, group=gtp_remat_group, op=torch.distributed.ReduceOp.SUM
                 )
-                contributing_ranks *= gtp_remat_group.size()
             values /= contributing_ranks
 
     @staticmethod
@@ -440,7 +443,7 @@ class DSAIndexerLossLoggingHelper:
             loss_scale: Scale factor for the loss.
             iteration: Current training iteration.
             writer: TensorBoard writer.
-            pg_collection: Process groups used for pipeline and data-parallel reductions.
+            pg_collection: Fixed pipeline, DP and DP x CP groups, plus optional GTP-remat.
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
