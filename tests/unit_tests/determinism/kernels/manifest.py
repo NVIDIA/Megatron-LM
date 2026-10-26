@@ -1259,6 +1259,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "EP > 1 request routing counts requests with scatter_add_ / bincount on integers "
         "(exact in any order); the all-to-all exchange is not replayed here.",
     ),
+    KernelEntry(
+        name="gated_residual",
+        sources=(
+            "megatron/core/transformer/gated_residual.py",
+            "megatron/core/transformer/gated_residual_triton.py",
+        ),
+        tests=(K + "test_gated_residual_kernels.py",),
+        kind="triton",
+        notes="Read gate, write gate and write-back of the gated-residual hyper-connection. "
+        "deterministic_mode=False runs the fused Triton kernels (fixed tiles, fixed-order "
+        "partial sums, no atomics, no autotuning) around cuBLAS GEMMs; deterministic_mode=True "
+        "keeps the torch.compile path. Both are replayed forward and backward, at kernel "
+        "level and through GatedResidualModule.",
+    ),
     # ==== end of the Qwen3.8-Flash-Next stack ====
 )
 

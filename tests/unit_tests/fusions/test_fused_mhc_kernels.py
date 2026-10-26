@@ -52,6 +52,15 @@ def test_all_mhc_backends_declare_determinism():
     assert set(MHC_BACKEND_DETERMINISM.values()) <= valid_statuses
 
 
+def test_hyper_connection_module_declares_its_h_res_slot():
+    """mHC mixes the streams through the Sinkhorn-projected H_res these kernels compute, so the
+    module's h_res slot carries a tensor. Callers that capture or replay that slot (the hybrid
+    wrapper's partial-MoE CUDA graph) read the flag instead of testing the variant name."""
+    from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
+    assert HyperConnectionModule.produces_h_res is True
+
+
 def _assert_cosine_similar(a: Tensor, b: Tensor, threshold: float, msg: str = ""):
     """Assert that flattened tensors have cosine similarity >= threshold."""
     a_flat = a.flatten().float()

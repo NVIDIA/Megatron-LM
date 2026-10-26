@@ -1691,6 +1691,21 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        if self.mhc_enabled and self.config.mhc_connection_variant == "gated_residual":
+            # Qwen4-Exp MTP: pre_fc_norm_hidden normalizes the [n*h] multi-stream hidden
+            # state as a grouped RMSNorm with a per-channel [n*h] gamma (the same layout as
+            # every hc_norm of the model; the released checkpoint stores
+            # mtp.pre_fc_norm_hidden.weight as [hc_count * hidden_size]). A plain [h] norm
+            # shared by the streams cannot hold those weights.
+            from megatron.core.transformer.gated_residual import GroupedRMSNorm
+
+            self.hnorm = GroupedRMSNorm(
+                self.config.mhc_num_residual_streams * self.config.hidden_size,
+                group_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+            )
+            mark_keep_in_fp32(self.hnorm.weight)
 
         if self.mhc_enabled:
             projection_kwargs = {
@@ -1831,9 +1846,21 @@ class MultiTokenPredictionLayer(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
         if self.mhc_enabled:
-            hc_mult = self.config.mhc_num_residual_streams
-            hc_dim = self.config.hidden_size * hc_mult
-            if self.config.mhc_learned_output_contract:
+            if self.config.mhc_connection_variant == "gated_residual":
+                # Qwen4-Exp exit contract for the MTP head: the same low-rank
+                # per-channel read gate + mean as the decoder exit
+                # (use_combine=False). Like the decoder, the released Qwen3.8 MTP
+                # head has no final RMSNorm after its hyper_connection_mixer
+                # (mtp.hyper_connection_mixer.* exists, mtp.norm.* does not).
+                from megatron.core.transformer.gated_residual import GatedResidualModule
+
+                self.hc_exit_contract = GatedResidualModule(
+                    self.config, layer_number=0, use_combine=False
+                )
+                self.final_layernorm = None
+            elif self.config.mhc_learned_output_contract:
+                hc_mult = self.config.mhc_num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
                 self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
                 self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
                 self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
@@ -2022,9 +2049,18 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.mhc_enabled:
             n = self.config.mhc_num_residual_streams
             h = self.config.hidden_size
+            # hidden_states is [s, b, n*h] (multi-stream).
+            # hnorm operates per-stream on the h dimension: mHC applies one [h] norm to every
+            # stream; gated_residual applies the grouped [n*h] norm on the flat tensor (per-stream
+            # statistics, per-channel gamma) and then splits the streams.
             seq_len, batch_size, _ = hidden_states.shape
-            hidden_streams = hidden_states.view(seq_len, batch_size, n, h)
-            hidden_streams = apply_module(self.hnorm)(hidden_streams)
+            if self.config.mhc_connection_variant == "gated_residual":
+                hidden_streams = apply_module(self.hnorm)(hidden_states).view(
+                    seq_len, batch_size, n, h
+                )
+            else:
+                hidden_streams = hidden_states.view(seq_len, batch_size, n, h)
+                hidden_streams = apply_module(self.hnorm)(hidden_streams)
             hidden_streams = make_viewless_tensor(
                 inp=hidden_streams, requires_grad=True, keep_graph=True
             )
@@ -2149,7 +2185,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
 
         if self.mhc_enabled:
-            if self.config.mhc_learned_output_contract:
+            if self.config.mhc_connection_variant == "gated_residual":
+                hidden_states = self.hc_exit_contract(hidden_states)
+            elif self.config.mhc_learned_output_contract:
                 hidden_states = learned_output_contract(
                     hidden_states,
                     self.hc_head_fn,
@@ -2169,8 +2207,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                     .to(hidden_states.dtype)
                 )
 
-        # Layer norm before shared head layer.
-        hidden_states = apply_module(self.final_layernorm)(hidden_states)
+        # Layer norm before shared head layer (None for the gated-residual variant, whose
+        # exit contract is the last normalization).
+        if self.final_layernorm is not None:
+            hidden_states = apply_module(self.final_layernorm)(hidden_states)
         # TENorm produces a "viewed" tensor. This will result in schedule.py's
         # deallocate_output_tensor() throwing an error, so a viewless tensor is
         # created to prevent this.

@@ -41,11 +41,16 @@ from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.gated_residual import GatedResidualModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.residual_recompute import (
     build_recompute_block_end_plan,
     build_recompute_layer_managers,
@@ -439,7 +444,7 @@ class HybridStack(MegatronModule):
             else None
         )
 
-        if self.post_process and self.post_layer_norm:
+        if self.post_process and self.post_layer_norm and not self._gated_residual_exit():
             # Final layer norm before output.
             self.final_norm = TENorm(
                 config=self.config,
@@ -448,9 +453,19 @@ class HybridStack(MegatronModule):
             )
 
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
-            hc_mult = self.config.mhc_num_residual_streams
-            hc_dim = self.config.hidden_size * hc_mult
-            if self.config.mhc_learned_output_contract:
+            if self._gated_residual_exit():
+                # Qwen4-Exp exit contract: same low-rank per-channel read gate +
+                # mean as the per-layer modules (use_combine=False).
+                self.hc_exit_contract = GatedResidualModule(
+                    self.config, layer_number=0, use_combine=False
+                )
+                if self.config.params_dtype is not None:
+                    convert_module_to_dtype_except_fp32_marked(
+                        self.hc_exit_contract, self.config.params_dtype
+                    )
+            elif self.config.mhc_learned_output_contract:
+                hc_mult = self.config.mhc_num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
                 self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
                 self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
                 self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
@@ -605,6 +620,19 @@ class HybridStack(MegatronModule):
                         return state_shapes
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
+
+    def _gated_residual_exit(self) -> bool:
+        """Whether the stack ends with the gated-residual exit contract instead of a final norm.
+
+        Qwen4-Exp (HF ``Qwen4ExpTextModel``) has no final RMSNorm: ``hyper_connection_mixer``
+        (whose group norm already normalizes every stream) feeds ``lm_head`` directly, and the
+        released checkpoint carries no ``norm.weight``. Building a ``final_norm`` here would add
+        a layer the reference model does not have.
+        """
+        return bool(
+            self.config.enable_mhc_connections
+            and self.config.mhc_connection_variant == "gated_residual"
+        )
 
     def _compute_mhc_block_end_plan(self) -> Tuple[bool, ...]:
         """Compute deterministic per-layer mHC recompute block boundaries."""
@@ -968,7 +996,9 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            if self.config.mhc_learned_output_contract:
+            if self._gated_residual_exit():
+                hidden_states = self.hc_exit_contract(hidden_states)
+            elif self.config.mhc_learned_output_contract:
                 hidden_states = learned_output_contract(
                     hidden_states,
                     self.hc_head_fn,
@@ -986,8 +1016,9 @@ class HybridStack(MegatronModule):
                     .to(hidden_states.dtype)
                 )
 
-        # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        # Final layer norm (absent for the gated-residual variant: the exit contract's group
+        # norm is the last normalization, as in HF Qwen4-Exp).
+        if self.post_process and self.post_layer_norm and not self._gated_residual_exit():
             hidden_states = self.final_norm(hidden_states)
 
         # Ensure that the tensor passed between pipeline parallel stages is
