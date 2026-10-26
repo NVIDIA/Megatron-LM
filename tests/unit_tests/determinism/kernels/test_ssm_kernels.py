@@ -18,6 +18,8 @@ workspace when the explicit deterministic policy (or ``torch.use_deterministic_a
 Each kernel is replayed in that mode, including with Triton's autotune cache enabled.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -172,6 +174,58 @@ def test_runtime_cp_gdn_module_replays(variant):
                     assert all(bytes_equal(expected[name], actual[name]) for name in expected)
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_gdp_chunkwise_runtime_cp_full_head_gating_replays():
+    """Replay GDP gating with two heads across CP1/4/2/1 without head partitioning."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+
+    Utils.initialize_distributed()
+    seeded()
+    mixer = GatedDeltaProductMixer.__new__(GatedDeltaProductMixer)
+    torch.nn.Module.__init__(mixer)
+    mixer.config = SimpleNamespace(
+        linear_cp_mode="chunkwise", linear_cp_layout="contiguous", gdp_cutedsl_kernel=False
+    )
+    mixer.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 4, rank=lambda: 0))
+    mixer.cp = None
+    mixer.chunkwise_cp_backend = object()
+    mixer.d_inner_local_tp, mixer.nheads_local_tp, mixer.ngroups_local_tp = 32, 2, 1
+    mixer.d_state, mixer.headdim, mixer.num_householder = 8, 16, 2
+    mixer.conv1d = torch.nn.Conv1d(88, 88, 4, groups=88, device="cuda")
+    mixer.A_log = torch.nn.Parameter(torch.randn(2, device="cuda"))
+    mixer.dt_bias = torch.nn.Parameter(torch.randn(2, device="cuda"))
+    mixer.D, mixer.D_has_hdim = None, False
+
+    class Gating(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mixer = mixer
+
+        def forward(self, ba, packed):
+            runtime = self.mixer._resolve_runtime_cp(packed)
+            assert runtime.nheads == 2
+            beta, g = self.mixer._compute_gating(ba, runtime_cp=runtime)
+            return torch.cat((beta.flatten(), g.flatten()))
+
+    module = Gating()
+    ba = torch.randn(2, 128, 6, device="cuda", requires_grad=True)
+    reference = None
+    for size in (1, 4, 2, 1):
+        # Gating reads CP geometry but performs no communication or sequence sharding.
+        group = SimpleNamespace(size=lambda size=size: size, rank=lambda: 0)
+        packed = PackedSeqParams(local_cp_size=size, cp_group=group)
+        result = assert_module_replays_bit_exact(
+            module, (ba, packed), replays=3, contention=True, what=f"GDP full-head gating CP{size}"
+        )
+        assert mixer.cp is None
+        assert {"chunk0.mixer.A_log", "chunk0.mixer.dt_bias"}.issubset(result[1])
+        if reference is None:
+            reference = result
+        for expected, actual in zip(reference, result):
+            assert expected.keys() == actual.keys()
+            assert all(bytes_equal(expected[name], actual[name]) for name in expected)
 
 
 @pytest.mark.parametrize("kind", ["mamba", "gdp"])
