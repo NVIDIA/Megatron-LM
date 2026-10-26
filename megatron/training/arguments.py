@@ -17,6 +17,7 @@ from megatron.core.models.engram.variants import DEEPSEEK_VARIANT_NAME, ENGRAM_V
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -1599,6 +1600,22 @@ def validate_args(args, defaults={}):
         )
         assert args.step_batch_size_schedule is None, (
             "Scheduler CUDA graphs require a fixed source global batch size."
+        )
+
+    # The --sft packed path has no sequence-packing scheduler, so nothing else tells the
+    # graph-capture code that attention sees packed (THD) inputs. Captured without static THD
+    # inputs, attention would replay every pack as one sequence; require the static THD
+    # contract (validated in TransformerConfig) instead.
+    if (
+        args.sft
+        and args.sequence_packing_scheduler is None
+        and cuda_graph_captures_attention(args)
+        and args.cuda_graph_thd_max_packed_sequences is None
+    ):
+        raise ValueError(
+            'CUDA graph capture of attention on the --sft packed path requires '
+            '--cuda-graph-thd-max-packed-sequences (and --pad-packed-seq-alignment max) so attention is '
+            'captured with static THD inputs.'
         )
 
     # Data blend checks

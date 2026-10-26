@@ -332,11 +332,19 @@ class MockSFTDataset(SFTDataset):
         pack_length = self.config.sequence_length
         eod = tokenizer.eod
         pad = tokenizer.pad
+        # `pad` is a *label* sentinel here and may legitimately be negative -- vocab-parallel
+        # cross-entropy masks targets outside the local vocabulary range, and the loss mask
+        # below keys off it. The input stream has no such freedom: every id it carries is fed
+        # to an embedding and to the hashing of any token-indexed memory, so a negative one
+        # aborts the step in a gather kernel. NullTokenizer, which every mock run uses,
+        # defaults `pad_id` to -1 (set --null-tokenizer-pad-id to choose another), so fall
+        # back to EOD for the tokens while leaving the targets as they were.
+        pad_input = pad if pad is not None and pad >= 0 else eod
 
         tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
 
         def extend_with_padding(tokens, targets, positions, pad_len):
-            tokens.extend([pad] * pad_len)
+            tokens.extend([pad_input] * pad_len)
             targets.extend([pad] * pad_len)
             positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
 
@@ -366,7 +374,7 @@ class MockSFTDataset(SFTDataset):
             max_body = pack_length - 1
             pack_tokens = pack_tokens[:max_body]
             pack_targets = pack_targets[:max_body]
-            pack_tokens.extend([eod, pad])
+            pack_tokens.extend([eod, pad_input])
             pack_targets.extend([eod, pad])
             pack_positions = pack_positions[:pack_length + 1]
             cu_seqlens[-1] = len(pack_tokens) - 1

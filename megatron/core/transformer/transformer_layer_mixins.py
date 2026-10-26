@@ -419,8 +419,7 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
-        for name in ('cu_seqlens_q', 'cu_seqlens_kv', 'cu_seqlens_q_padded', 'cu_seqlens_kv_padded'):
-            offsets = getattr(packed_seq_params, name)
+        for name, offsets in self._thd_graph_cu_seqlens_kwargs(packed_seq_params).items():
             if (
                 offsets is None
                 or offsets.numel() != self.config.cuda_graph_thd_max_packed_sequences + 1

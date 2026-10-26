@@ -26,6 +26,11 @@ from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.packed_seq_params import (
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
+)
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -265,6 +270,74 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     )
 
 
+def _uses_static_thd_contract(config) -> bool:
+    """Whether packed SFT rows must be padded to the static THD capacity.
+
+    The sequence-packing scheduler path pads its packs inside the scheduler. The SFT packed
+    path has no scheduler, so it opts into the same fixed-capacity contract by setting both
+    ``--pad-packed-seq-alignment`` and ``--cuda-graph-thd-max-packed-sequences``; THD CUDA graphs rely on
+    it because cu_seqlens and the token dimension are graph inputs with captured shapes.
+    """
+    return (
+        getattr(config, "sequence_packing_scheduler", None) is None
+        and getattr(config, "pad_packed_seq_alignment", None) is not None
+        and getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None
+    )
+
+
+def _pad_packed_batch_to_static_thd(config, cp_batch: ContextParallelBatch):
+    """Pad an SFT packed microbatch to the static THD capacity.
+
+    Token-like tensors are padded to ``max_seqlen_per_dp_cp_rank`` (``max`` alignment) and all
+    four cu_seqlens tensors to ``cuda_graph_thd_max_packed_sequences + 1`` entries, with the padding tail
+    represented by ``thd_tail_padding_policy`` (a dummy sequence by default). Returns a
+    ContextParallelBatch carrying the padded tensors, the rebuilt PackedSeqParams and the
+    padding mask (True at padded slots).
+
+    Middle pipeline stages hold only the packed boundaries (the TP batch broadcast sends them to
+    every stage). The padding is a function of those boundaries and the config, so such a stage
+    gets the same PackedSeqParams and padding mask as the first stage, whose padded hidden
+    states it receives; its token-like tensors stay None.
+    """
+    if len(cp_batch.batches_by_layout) != 1 or cp_batch.thd_plan is not None:
+        # The padding is applied to the CP-local tensors of one layout; a second layout (for
+        # example GDN chunkwise CP's contiguous linear layout next to zigzag attention) would
+        # need the same tail in its own token order.
+        raise NotImplementedError(
+            "The static THD contract on the --sft path supports a single CP layout only; "
+            f"got layouts {sorted(cp_batch.batches_by_layout)}."
+        )
+    batch = dict(cp_batch.get_batch())
+    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+        config.pad_packed_seq_alignment,
+        config.max_seqlen_per_dp_cp_rank,
+        config.cuda_graph_thd_max_packed_sequences,
+        config.cuda_graph_impl != "none",
+    )
+    (
+        batch["tokens"],
+        batch["labels"],
+        batch["loss_mask"],
+        batch["position_ids"],
+        packed_seq_params,
+        batch["padding_mask"],
+    ) = pad_sequence_for_thd(
+        batch.get("tokens"),
+        batch.get("labels"),
+        batch.get("loss_mask"),
+        batch.get("position_ids"),
+        cp_batch.get_packed_seq_params(),
+        alignment=alignment,
+        target_len=target_len,
+        max_num_seqs=max_num_seqs,
+        tail_padding_policy=resolve_thd_tail_padding_policy(config),
+        padding_mask=batch.get("padding_mask"),
+    )
+    return ContextParallelBatch.from_single_layout(
+        cp_batch.boundary_layout, batch, packed_seq_params
+    )
+
+
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
@@ -384,6 +457,9 @@ def forward_step(data_iterator, model: HybridModel):
         cp_batch = get_batch(
             data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
         )
+        config = get_attr_wrapped_model(model, "config")
+        if cp_batch.get_packed_seq_params() is not None and _uses_static_thd_contract(config):
+            cp_batch = _pad_packed_batch_to_static_thd(config, vp_stage, cp_batch)
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
