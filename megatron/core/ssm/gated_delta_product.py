@@ -36,7 +36,11 @@ from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.module import (
+    MegatronModule,
+    TwoStageAttentionLayer,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -417,18 +421,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         with get_cuda_rng_tracker().fork():
             # MCore Mamba2 initialization
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+            # Compute and retain the decay parameter in FP32.
             dt = torch.exp(
                 torch.rand(
-                    self.nheads_local_tp,
-                    device=torch.cuda.current_device(),
-                    dtype=config.params_dtype,
+                    self.nheads_local_tp, device=torch.cuda.current_device(), dtype=torch.float32
                 )
                 * (math.log(dt_max) - math.log(dt_min))
                 + math.log(dt_min)
             ).clamp(min=dt_init_floor)
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
-            self.dt_bias = nn.Parameter(inv_dt)
+            self.dt_bias = mark_keep_in_fp32(nn.Parameter(inv_dt))
 
             # Our initialization would set all Linear.bias to zero,
             # need to mark this one as _no_reinit
@@ -445,7 +448,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
             ).uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
-            self.A_log = nn.Parameter(A_log)
+            self.A_log = mark_keep_in_fp32(nn.Parameter(A_log))
             self.A_log._no_weight_decay = True
             setattr(self.A_log, "tensor_model_parallel", True)
 
