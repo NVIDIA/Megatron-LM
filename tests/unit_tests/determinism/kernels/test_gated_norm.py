@@ -63,3 +63,47 @@ def test_output_norm_replays(zero_centered, strided_gate, batch, length, heads, 
         )
         assert fused.call_count >= 3
     assert len(outputs) == 1 and len(grads) == 3
+
+
+def test_sigmoid_output_gate_is_refused_by_the_fusion_and_replays_unfused():
+    """The fused kernel implements a SiLU gate only. With gdn_output_gate_activation='sigmoid'
+    the fused entry raises, and the unfused RMSNorm + sigmoid gate replays bit for bit."""
+    te = pytest.importorskip("transformer_engine.pytorch")
+    seeded()
+    batch, length, heads, dim = 2, 37, 8, 64
+    norm = te.RMSNorm(dim, eps=1e-6, params_dtype=torch.bfloat16, device="cuda")
+
+    class GatedNorm(torch.nn.Module):
+        _apply_gated_norm_unfused = GatedDeltaNet._apply_gated_norm_unfused
+
+        def __init__(self, fusion):
+            super().__init__()
+            self.config = SimpleNamespace(
+                deterministic_mode=False,
+                gdn_gated_output_norm_fusion=fusion,
+                gdn_output_gate_activation="sigmoid",
+            )
+            self.cp_size = 1
+            self.activation = "silu"
+            self.out_norm = norm
+            self.value_head_dim = dim
+            self.output_gate_act_fn = torch.sigmoid
+
+        def forward(self, x, gate):
+            return GatedDeltaNet._apply_gated_norm(self, x, gate)
+
+    x = torch.randn(
+        (batch, length, heads, dim), device="cuda", dtype=torch.bfloat16
+    ).requires_grad_()
+    gate = torch.randn_like(x).requires_grad_()
+
+    with pytest.raises(ValueError, match="SiLU output gate"):
+        GatedNorm(fusion=True)(x, gate)
+    outputs, grads = assert_module_replays_bit_exact(
+        GatedNorm(fusion=False),
+        (x, gate),
+        replays=3,
+        contention=True,
+        what="GDN output RMSNorm with a sigmoid gate",
+    )
+    assert len(outputs) == 1 and len(grads) == 3

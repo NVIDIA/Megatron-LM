@@ -61,6 +61,18 @@ def test_post_fusion_is_independent_of_pre_fusion(variant, pre_fusion):
     assert config.gdn_pre_gated_delta_rule_fusion == pre_fusion
 
 
+@pytest.mark.parametrize("gate_activation", [None, "silu"])
+def test_post_fusion_accepts_silu_output_gate(gate_activation):
+    config = _config(gdn_gated_output_norm_fusion=True, gdn_output_gate_activation=gate_activation)
+    assert config.gdn_gated_output_norm_fusion
+
+
+def test_post_fusion_rejects_sigmoid_output_gate():
+    """The fused kernel applies a SiLU gate, so a sigmoid output gate must not reach it."""
+    with pytest.raises(ValueError, match="gdn_output_gate_activation"):
+        _config(gdn_gated_output_norm_fusion=True, gdn_output_gate_activation="sigmoid")
+
+
 @pytest.mark.parametrize("variant", [None, "gdn2"])
 def test_post_fusion_requires_gdn(variant):
     with pytest.raises(ValueError, match="gdn_gated_output_norm_fusion"):
