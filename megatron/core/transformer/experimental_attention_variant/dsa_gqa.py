@@ -31,12 +31,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_min_memory imp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_using_quantization_scales
-
-try:
-    import deep_select
-except ImportError:
-    deep_select = None
 
 # pylint: disable=line-too-long,missing-class-docstring,missing-function-docstring
 
@@ -54,18 +48,6 @@ def _repeat_grouped_key_value(key: torch.Tensor, value: torch.Tensor, num_query_
     key = key.repeat_interleave(repeat_factor, dim=2)
     value = value.repeat_interleave(repeat_factor, dim=2)
     return key, value
-
-
-def _paged_cache_rows(
-    cache: torch.Tensor,
-    block_table_row: torch.Tensor,
-    token_positions: torch.Tensor,
-    block_size_tokens: int,
-) -> torch.Tensor:
-    """Gather logical token positions from one request's paged cache."""
-    physical_blocks = block_table_row[token_positions // block_size_tokens].long()
-    local_positions = token_positions % block_size_tokens
-    return cache[physical_blocks, local_positions]
 
 
 @dataclass(frozen=True)
@@ -569,65 +551,6 @@ def _simplified_index_scores(
     )
 
 
-def _deepselect_decode_supported(device: torch.device, topk: int) -> bool:
-    """The pinned DeepSelect CUDA build contains SM100a/SM103a kernels with K <= 4096."""
-    return (
-        deep_select is not None
-        and device.type == "cuda"
-        and 0 < topk <= 4096
-        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
-    )
-
-
-def _simplified_decode_topk(
-    scores: torch.Tensor,
-    context_lengths: torch.Tensor,
-    topk: int,
-    *,
-    batch_invariant_mode: bool = False,
-) -> torch.Tensor:
-    """Select decode tokens with DeepSelect, falling back to PyTorch on unsupported inputs.
-
-    Pass FP32/BF16 scores to DeepSelect without changing their precision. Each
-    row's true end fixes the valid range used for tie breaking across batches,
-    including BF16's batch/width-dependent kernel dispatch. The output order is
-    deterministic but differs from stable argsort's score-then-position order.
-    The PyTorch fallback uses stable argsort only in batch-invariant mode.
-    """
-    if scores.numel() == 0:
-        return torch.full((scores.size(0), topk), -1, dtype=torch.int32, device=scores.device)
-    if scores.dtype in (torch.float32, torch.bfloat16) and _deepselect_decode_supported(
-        scores.device, topk
-    ):
-        alignment = deep_select.get_stride_requirement()[0] // scores.element_size()
-        aligned_width = (scores.size(1) + alignment - 1) // alignment * alignment
-        # DeepSelect's CUDA kernels require the padded width to be strictly < 2^23.
-        if aligned_width < 2**23:
-            if scores.stride(1) != 1 or scores.stride(0) % alignment or scores.data_ptr() % 16:
-                scores = F.pad(scores, (0, aligned_width - scores.size(1)), value=-torch.inf)
-            with torch.cuda.device(scores.device):
-                _, indices = deep_select.topk(
-                    scores,
-                    topk,
-                    end=context_lengths.to(torch.int32).contiguous(),
-                    indices_type=torch.int32,
-                    sorted_index=False,
-                    return_value=False,
-                    idx_oob_fill_value=-1,
-                )
-            return indices.contiguous()
-
-    if batch_invariant_mode:
-        indices = scores.argsort(dim=-1, descending=True, stable=True)[:, :topk].to(torch.int32)
-        indices.masked_fill_(indices >= context_lengths[:, None], -1)
-    else:
-        indices = scores.topk(min(topk, scores.size(-1)), dim=-1).indices.to(torch.int32)
-    # Keep the attention kernel's shared-memory capacity fixed for short contexts.
-    if indices.size(1) < topk:
-        indices = F.pad(indices, (0, topk - indices.size(1)), value=-1)
-    return indices.contiguous()
-
-
 def _simplified_qk_topk_naive(
     q_index: torch.Tensor,
     main_key: torch.Tensor,
@@ -819,11 +742,8 @@ class DSGQACoreAttention(MegatronModule):
         use_indexer_rope: bool = False,
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
-        """Run mixed dynamic inference with training prefill and paged CuTe decode."""
-        from megatron.core.transformer.experimental_attention_variant.dsa_gqa_decode_kernel import (
-            dsa_gqa_decode_attention,
-            dsa_gqa_decode_indexer_score,
-        )
+        """Run paged Triton prefill and Gluon/Triton decode."""
+        from .dsa_gqa_inference import dynamic_sparse_attention
 
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         if self.config.dsa_fwd_use_dense_attn:
@@ -835,9 +755,8 @@ class DSGQACoreAttention(MegatronModule):
         elif query.dim() != 4:
             raise ValueError(f"Dynamic DSA-GQA expected THD/SBHD query, got {query.shape}.")
 
-        total_tokens, batch_size, num_query_heads, _ = query.shape
+        _, batch_size, _, _ = query.shape
         assert batch_size == 1, "Dynamic DSA-GQA expects packed tokens with batch=1."
-        output = value_cache.new_zeros((total_tokens, 1, num_query_heads * value_cache.size(-1)))
         indexer_hidden_states = hidden_states.detach()
         if _simplified_indexer_uses_main_input_norm(self.config):
             indexer_hidden_states = _normalized_indexer_input(
@@ -848,134 +767,19 @@ class DSGQACoreAttention(MegatronModule):
             indexer_hidden_states, use_rope=use_indexer_rope, inference_context=inference_context
         )
         inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
-        index_key_cache, index_block_table = inference_context.dsa_key_cache(provider_layer_number)
+        index_key_cache, _ = inference_context.dsa_key_cache(provider_layer_number)
 
-        if self.config.dsa_inference_backend != "cute":
-            from .dsa_gqa_inference import dynamic_sparse_attention
-
-            return dynamic_sparse_attention(
-                query=query,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                index_query=index_q,
-                index_key_cache=index_key_cache,
-                block_table=block_table,
-                inference_context=inference_context,
-                index_topk=self.indexer.index_topk,
-                softmax_scale=self.softmax_scale,
-                backend=self.config.dsa_inference_backend,
-            )
-
-        request_count = inference_context.get_active_request_count()
-        if request_count == 0:
-            return output
-
-        state_data = inference_context.active_attn_metadata["mha_metadata"].state_data
-        query_lengths = state_data["query_lengths"][:request_count].to(torch.long)
-        kv_lengths = state_data["kv_seq_lengths"][:request_count].to(torch.long)
-        query_offsets, _ = inference_context.cu_query_lengths()
-        query_offsets = query_offsets[: request_count + 1].to(torch.long)
-        active_tokens = inference_context.active_token_count
-        # The inference engine carries packing metadata in its dynamic context;
-        # ordinary model wrappers need not also construct PackedSeqParams.
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.total_tokens is not None
-            and packed_seq_params.total_tokens != active_tokens
-        ):
-            raise RuntimeError(
-                f"Dynamic DSA-GQA received {packed_seq_params.total_tokens} packed tokens, "
-                f"but the inference context has {active_tokens}."
-            )
-
-        num_decode_requests = inference_context.num_decode_requests
-        if num_decode_requests:
-            decode_lengths = query_lengths[:num_decode_requests]
-            if not bool((decode_lengths == 1).all().item()):
-                raise NotImplementedError(
-                    "The CuTe decode indexer currently supports one query token per request."
-                )
-            max_context_length = int(kv_lengths[:num_decode_requests].max().item())
-            if _deepselect_decode_supported(query.device, self.indexer.index_topk):
-                # Write DeepSelect's row alignment padding in the score kernel, avoiding
-                # a full score-buffer copy between the indexer and TopK.
-                alignment = deep_select.get_stride_requirement()[0] // torch.float32.itemsize
-                max_context_length = (max_context_length + alignment - 1) // alignment * alignment
-            decode_context_lengths = kv_lengths[:num_decode_requests].to(torch.int32).contiguous()
-            decode_scores = torch.empty(
-                (num_decode_requests, max_context_length), dtype=torch.float32, device=query.device
-            )
-            dsa_gqa_decode_indexer_score(
-                index_q[:num_decode_requests, 0, 0, :].contiguous(),
-                index_key_cache,
-                index_block_table[:num_decode_requests].to(torch.int32).contiguous(),
-                decode_context_lengths,
-                out=decode_scores,
-            )
-            decode_topk = _simplified_decode_topk(
-                decode_scores,
-                decode_context_lengths,
-                self.indexer.index_topk,
-                batch_invariant_mode=self.config.batch_invariant_mode,
-            )
-            decode_output = value_cache.new_empty(
-                (num_decode_requests, num_query_heads, value_cache.size(-1))
-            )
-            dsa_gqa_decode_attention(
-                query[:num_decode_requests, 0],
-                key_cache,
-                value_cache,
-                block_table[:num_decode_requests].to(torch.int32).contiguous(),
-                decode_topk.contiguous(),
-                decode_context_lengths,
-                self.softmax_scale,
-                out=decode_output,
-            )
-            output[:num_decode_requests, 0] = decode_output.flatten(1)
-
-        request_kv_offsets = inference_context.gpu_view.request_kv_length_offsets[
-            :request_count
-        ].to(torch.long)
-        for prefill_request_idx in range(num_decode_requests, request_count):
-            query_start = int(query_offsets[prefill_request_idx].item())
-            query_end = int(query_offsets[prefill_request_idx + 1].item())
-            query_length = query_end - query_start
-            kv_length = int(kv_lengths[prefill_request_idx].item())
-            if (
-                int(request_kv_offsets[prefill_request_idx].item()) != 0
-                or query_length != kv_length
-            ):
-                raise NotImplementedError(
-                    "Training-path prefill reuse currently requires an uncached full prompt."
-                )
-            positions = torch.arange(kv_length, device=query.device)
-            request_key = _paged_cache_rows(
-                key_cache,
-                block_table[prefill_request_idx],
-                positions,
-                inference_context.block_size_tokens,
-            ).unsqueeze(1)
-            request_value = _paged_cache_rows(
-                value_cache,
-                block_table[prefill_request_idx],
-                positions,
-                inference_context.block_size_tokens,
-            ).unsqueeze(1)
-            output[query_start:query_end] = self.forward(
-                query=query[query_start:query_end],
-                key=request_key,
-                value=request_value,
-                attention_mask=None,
-                hidden_states=hidden_states[query_start:query_end],
-                use_indexer_rope=use_indexer_rope,
-                indexer_input_norm=indexer_input_norm,
-                attn_mask_type=AttnMaskType.causal,
-                packed_seq_params=None,
-            )
-
-        if is_using_quantization_scales(self.config):
-            output[inference_context.padding_slice] = 0.0
-        return output
+        return dynamic_sparse_attention(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            index_query=index_q,
+            index_key_cache=index_key_cache,
+            block_table=block_table,
+            inference_context=inference_context,
+            index_topk=self.indexer.index_topk,
+            softmax_scale=self.softmax_scale,
+        )
 
     def _forward_min_memory(
         self,
@@ -1207,12 +1011,6 @@ class DSGroupedSelfAttention(SelfAttention):
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
         """Dispatch dynamic batching to the mixed prefill/decode DSA path."""
-        if (
-            self.config.dsa_inference_backend == "cute"
-            and inference_context.using_cuda_graph_this_step()
-        ):
-            raise NotImplementedError("The CuTe DSA-GQA backend does not support CUDA graphs.")
-
         provider_layer_number = self.layer_number - self._get_pp_layer_offset_for_inference()
         return self.core_attention.forward_dynamic(
             query=query,

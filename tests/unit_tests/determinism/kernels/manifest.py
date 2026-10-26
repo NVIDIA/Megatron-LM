@@ -637,23 +637,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- inference (single GPU)
     KernelEntry(
-        name="dsa_gqa_decode",
-        sources=(
-            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_decode_kernel.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
-        ),
-        tests=(
-            K + "test_dsa_gqa_decode.py",
-            "tests/unit_tests/transformer/test_attention_variant_dsa_gqa.py",
-        ),
-        kind="cutedsl",
-        training_path=False,
-        notes="Paged BF16 indexer and sparse attention: byte-exact CUDA Graph replay with "
-        "updated inputs and launch-time streams; DeepSelect FP32/BF16 routing with per-request lengths, "
-        "and a PyTorch fallback with stable sorting gated by batch_invariant_mode. "
-        "Model-level logprobs compare teacher-forced training with paged prefill and decode.",
-    ),
-    KernelEntry(
         name="inference_kv_cache_tensor_ops",
         sources=(
             "megatron/core/inference/contexts/attention_context/triton/tensor_ops.py",
@@ -998,18 +981,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_triton_inference",
         sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_filter_kernels.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_fused_select.py",
-            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_flashinfer.py",
         ),
         tests=(
             "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py",
         ),
         kind="triton",
         training_path=False,
-        notes="Paged Triton/FlashInfer attention and exact selection replay with refreshed inputs.",
+        notes="Paged Triton prefill and native decode replay with refreshed inputs.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
