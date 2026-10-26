@@ -2,6 +2,7 @@
 
 """Deprecated global process-group fallbacks keep working and warn once per owner."""
 
+import logging
 import warnings
 
 import pytest
@@ -20,6 +21,7 @@ from megatron.core.models.multimodal.context_parallel import (
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     ProcessGroupFallbackWarning,
+    enable_strict_process_group_fallbacks,
     resolve_process_groups,
     warn_global_process_group_fallback,
 )
@@ -29,6 +31,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
+from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_TE:
@@ -107,6 +110,94 @@ def test_strict_mode_turns_every_fallback_into_an_error():
             with pytest.raises(ProcessGroupFallbackWarning, match="Owner was called without"):
                 warn_global_process_group_fallback("Owner")
     assert [str(w.message) for w in record] == ["an unrelated FutureWarning"]
+
+
+@pytest.fixture
+def restore_pytree_logger_level():
+    """The rank-0 log suppression quiets torch's pytree logger; later tests expect the default."""
+    pytree_logger = logging.getLogger("torch.utils._pytree")
+    original_level = pytree_logger.level
+    yield
+    pytree_logger.setLevel(original_level)
+
+
+def test_enable_strict_mode_raises_on_every_fallback_and_nothing_else():
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        enable_strict_process_group_fallbacks()
+        warnings.warn("an unrelated FutureWarning", FutureWarning)
+        for _ in range(2):
+            with pytest.raises(ProcessGroupFallbackWarning, match="Owner was called without"):
+                warn_global_process_group_fallback("Owner")
+    assert [str(w.message) for w in record] == ["an unrelated FutureWarning"]
+
+
+def test_enable_strict_mode_raises_for_fallbacks_that_already_warned():
+    # A fallback reached before strict mode, for example by another library, warned once.
+    with pytest.warns(ProcessGroupFallbackWarning):
+        warn_global_process_group_fallback("Owner", "tp_group")
+    with warnings.catch_warnings():
+        enable_strict_process_group_fallbacks()
+        with pytest.raises(
+            ProcessGroupFallbackWarning, match="Owner was called without `tp_group`"
+        ):
+            warn_global_process_group_fallback("Owner", "tp_group")
+
+
+def test_enable_strict_mode_precedes_earlier_filters_once():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore")
+        enable_strict_process_group_fallbacks()
+        enable_strict_process_group_fallbacks()
+        strict_filters = [
+            f for f in warnings.filters if f[0] == "error" and f[2] is ProcessGroupFallbackWarning
+        ]
+        assert strict_filters == [warnings.filters[0]]
+        with pytest.raises(ProcessGroupFallbackWarning, match="Owner was called without"):
+            warn_global_process_group_fallback("Owner")
+
+
+@pytest.mark.parametrize("rank", ["0", "1"], ids=["rank0", "rank1"])
+@pytest.mark.parametrize("strict_first", [False, True], ids=["after", "before"])
+def test_enable_strict_mode_raises_despite_rank0_log_suppression(
+    rank, strict_first, monkeypatch, restore_pytree_logger_level
+):
+    """Rank 0 raises under strict mode, so the ranks whose logs are quieted must raise too.
+
+    A rank that only warned would go on and wait for rank 0 at its next collective.
+    """
+    monkeypatch.setenv("RANK", rank)
+    with warnings.catch_warnings():
+        if strict_first:
+            enable_strict_process_group_fallbacks()
+        suppress_duplicate_logs_off_rank0()
+        if not strict_first:
+            enable_strict_process_group_fallbacks()
+        with pytest.raises(ProcessGroupFallbackWarning, match="Owner was called without"):
+            warn_global_process_group_fallback("Owner")
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs ranks other than rank 0")
+def test_strict_mode_raises_on_every_rank_after_rank0_log_suppression(
+    monkeypatch, restore_pytree_logger_level
+):
+    """The order of a training entry point: quiet duplicate logs on import, then go strict."""
+    Utils.initialize_distributed()
+    # The launcher's rank decides which ranks the suppression quiets.
+    monkeypatch.setenv("RANK", str(torch.distributed.get_rank()))
+    with warnings.catch_warnings():
+        suppress_duplicate_logs_off_rank0()
+        enable_strict_process_group_fallbacks()
+        try:
+            warn_global_process_group_fallback("Owner")
+        except ProcessGroupFallbackWarning:
+            raised = True
+        else:
+            raised = False
+    raised_on_ranks = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(raised_on_ranks, raised)
+    assert raised_on_ranks == [True] * len(raised_on_ranks)
 
 
 def _forbid_global_collection(monkeypatch):
