@@ -391,9 +391,7 @@ class ShortcutMoEBlock(MegatronModule):
             dispatched_input, dispatched_probs = self._wait_dispatch(
                 dispatched_input, dispatched_probs
             )
-        output, _ = self.moe_layer.mlp.routed_experts_compute(
-            dispatched_input, dispatched_probs
-        )
+        output, _ = self.moe_layer.mlp.routed_experts_compute(dispatched_input, dispatched_probs)
         return output
 
     def _launch_combine(self, output: torch.Tensor, async_op: bool = False) -> torch.Tensor:
@@ -556,9 +554,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         # Launch the dispatch, experts, and combine
         with quant_context_factory(moe_config, self.moe_layer_idx):
-            output = self._dispatch_and_compute_routed_experts(
-                route_input, route_probs, overlap
-            )
+            output = self._dispatch_and_compute_routed_experts(route_input, route_probs, overlap)
             combined_output = self._launch_combine(output, async_op=overlap)
             if self.shortcut_pre_mlp_layernorm_checkpoint is not None:
                 self.shortcut_pre_mlp_layernorm_checkpoint.discard_output_and_register_recompute(

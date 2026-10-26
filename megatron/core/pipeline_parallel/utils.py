@@ -86,9 +86,11 @@ class ScheduleNodeInputWrapper(torch.Tensor):
 
 class _UnwrapRealTensor(torch.autograd.Function):
     """Connect a wrapper leaf to its already-detached real tensor."""
+
     @staticmethod
     def forward(ctx, wrapper):
         return wrapper._take_real_tensor()
+
     @staticmethod
     def backward(ctx, grad):
         return grad
@@ -384,13 +386,11 @@ class ScheduleNode:
             self.stream = self.stream()
         with self.stream_acquire_context(f"{self.name} backward"):
             output_edges = self._output_edges
-            assert len(output_edges) == len(output_grads), (
-                f"{len(output_edges)} outputs is not equal to {len(output_grads)} output gradients"
-            )
+            assert len(output_edges) == len(
+                output_grads
+            ), f"{len(output_edges)} outputs is not equal to {len(output_grads)} output gradients"
             backward_pairs = tuple(
-                (edge, grad)
-                for edge, grad in zip(output_edges, output_grads)
-                if edge is not None
+                (edge, grad) for edge, grad in zip(output_edges, output_grads) if edge is not None
             )
             backward_edges = tuple(edge for edge, _ in backward_pairs)
             backward_grads = tuple(grad for _, grad in backward_pairs)
