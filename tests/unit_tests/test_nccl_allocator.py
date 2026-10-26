@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 
 import pytest
@@ -22,10 +22,15 @@ class TestNCCLAllocator:
         version.parse(torch.__version__) < version.parse('2.7.0'),
         reason="Requires PyTorch 2.7.0 or later",
     )
-    def test_nccl_allocator_init_sets_env_vars(self):
+    def test_nccl_allocator_init_sets_env_vars(self, monkeypatch):
+        monkeypatch.delenv("NCCL_NVLS_ENABLE", raising=False)
         nccl_allocator.init()
         assert os.environ.get("NCCL_NVLS_ENABLE") == "1"
         assert os.environ.get("TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK") == "0"
+
+        monkeypatch.setenv("NCCL_NVLS_ENABLE", "0")
+        nccl_allocator.init()
+        assert os.environ.get("NCCL_NVLS_ENABLE") == "0"
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.7.0'),
