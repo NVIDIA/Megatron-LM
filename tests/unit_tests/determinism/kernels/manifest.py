@@ -1170,6 +1170,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "in FP32 regardless of the parameter dtype, which "
         "test_sparse_attention_backward_torch_accumulates_repeated_keys_in_fp32 pins.",
     ),
+    # ==== Qwen3.8-Flash-Next stack ====
+    KernelEntry(
+        name="gdn_internal_cute_backend",
+        sources=(
+            "megatron/core/ssm/gated_delta_net/internal_gdn_backend/chunk.py",
+            "megatron/core/ssm/gated_delta_net/internal_gdn_backend/implementation.py",
+            "megatron/core/ssm/gated_delta_net/internal_gdn_backend/kda.py",
+            "megatron/core/ssm/gated_delta_net/internal_gdn_backend/kernels/fused_gdr_fwd_cute/fused_fwd.py",
+        ),
+        kind="dispatch",
+        exempt_reason="gdn_kernel_backend='internal' is rejected with deterministic_mode=True "
+        "(only the torch backend is accepted). Its fused forward, backward and "
+        "context-parallel kernels are CuTe DSL kernels (internal_gdn_backend/kernels/) that "
+        "need nvidia-cutlass-dsl, cuda.bindings, CUDA 13 and an SM100 (Blackwell) GPU, none of "
+        "which the H100 determinism bucket has. On any other device these modules forward to "
+        "flash-linear-attention's chunk_gated_delta_rule / chunk_kda Triton kernels, which "
+        "are recorded as non-deterministic (see gated_delta_net).",
+    ),
+    # ==== end of the Qwen3.8-Flash-Next stack ====
 )
 
 
