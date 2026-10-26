@@ -446,16 +446,12 @@ class FsdpParameterGroup:
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
-    def _is_model_weight_unsharded(self) -> bool:
-        """Whether full compute storage is the persistent model-weight buffer."""
-        return self._unsharded_model_weight is self.model_weight
-
     @property
     def is_rowwise_unsharded(self) -> bool:
         """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
-        if self._is_model_weight_unsharded():
-            return False
         buffer = self._unsharded_model_weight
+        if buffer is self.model_weight:
+            return False
         # QuantizedDBuffer aliases DBuffer when TE is unavailable.
         if isinstance(buffer, DBuffer):
             return False
@@ -481,7 +477,7 @@ class FsdpParameterGroup:
             )
             self._model_weight_is_stale = False
 
-        if self._is_model_weight_unsharded():
+        if self._unsharded_model_weight is self.model_weight:
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(self._unsharded_model_weight, DBuffer):
             self._allgather_model_weight()
@@ -579,13 +575,13 @@ class FsdpParameterGroup:
         """
         unsharded_model_weight = self._unsharded_model_weight
         if rowwise_only:
-            self._unshard_events.pop(Phase.FORWARD, None)
+            del self._unshard_events[Phase.FORWARD]
         else:
             self._unshard_events.clear()
 
         # Clear readiness so the next unshard refreshes Parameter data/scales,
         # but never free persistent compute weights or their padded scale copies.
-        if self._is_model_weight_unsharded():
+        if unsharded_model_weight is self.model_weight:
             return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
