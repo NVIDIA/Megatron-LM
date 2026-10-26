@@ -70,12 +70,14 @@ def layout_extend_last(lengths, cp_size, storage_tokens, alignment, dataset_alig
     capacity = storage * cp
     if sum(padded) > capacity:
         raise ValueError(
-            f'aligned storage {sum(padded)} exceeds the pack capacity {capacity} (storage {storage} tokens per rank x cp {cp}, alignment {align})'
+            f'aligned storage {sum(padded)} exceeds the pack capacity {capacity} '
+            f'(storage {storage} tokens per rank x cp {cp}, alignment {align})'
         )
     padded[-1] += capacity - sum(padded)
     if cp > 1 and any((v % (2 * cp) for v in padded)):
         raise ValueError(
-            f'padded lengths {padded} are not divisible by 2 x cp = {2 * cp}: alignment {align} does not support the zigzag layout at cp {cp}'
+            f'padded lengths {padded} are not divisible by 2 x cp = {2 * cp}: '
+            f'alignment {align} does not support the zigzag layout at cp {cp}'
         )
     return padded
 
@@ -163,7 +165,7 @@ def active_pieces(pieces):
 
 
 def units_kv(pieces, mask, q_heads, tile=TILE, block_rows=BLOCK_ROWS):
-    """The kernel's units in launch order (pack order x heads x Q blocks ascending): kv tiles per unit."""
+    """KV tiles per unit in launch order: pack order x heads x Q blocks ascending."""
     if mask not in MASKS:
         raise ValueError(f'mask must be one of {MASKS}, got {mask!r}')
     out = []
@@ -187,7 +189,7 @@ def makespan(kv_tiles, P, rho):
 
 
 def static_ms(n_active, us_per_slot, thd_max):
-    """The fixed static-batch term: every empty cu_seqlens slot of the thd_max-sized static batch costs us_per_slot."""
+    """Fixed static-batch term: each empty slot of a thd_max-sized batch costs us_per_slot."""
     return float(us_per_slot) * 0.001 * (int(thd_max) - int(n_active))
 
 

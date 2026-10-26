@@ -332,6 +332,7 @@ class DpBalancedScheduler(BasePackingScheduler):
 
             # Step 1: Fetch batches and gather global sequence lengths
             runtime = getattr(self, 'runtime', None)
+            sample_id_groups = None
             if runtime is None:
                 prepared = get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
             else:
