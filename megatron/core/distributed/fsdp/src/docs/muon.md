@@ -138,9 +138,12 @@ and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 | --- | --- | --- |
 | Persistent storage | More balanced group shards, with row or block alignment | Whole tensors assigned to owners, potentially less balanced |
 | Optimizer communication | Gather/scatter remote fragments of split matrices | None for the matrix update |
-| Forward/backward | Equal-sized group collectives | Uneven group materialization and reduction |
-| Memory | Sharded state plus temporary full matrices | Whole-matrix state and workspace must fit on each owner |
+| Forward/backward | Existing group collectives | Uneven group materialization and reduction |
+| Optimizer staging memory | Extra gather/scatter buffers | No gather/scatter buffers needed |
 | Load balance | Compute owners restricted to existing fragment holders | Balance persistent memory and compute across modules |
+
+Both approaches need Newton–Schulz workspace. Total peak memory also
+depends on how balanced ownership is.
 
 The benefit depends on how much boundary-matrix traffic is removed relative
 to the cost of uneven forward/backward communication.
