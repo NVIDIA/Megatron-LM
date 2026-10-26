@@ -130,11 +130,18 @@ class TestDuplicateFilterFallbacks:
         if is_expert:
             param.allreduce = False
         argument = "expert_tp_group" if is_expert else "tp_group"
-        with mock.patch.object(
-            tensor_parallel_layers, "get_tensor_model_parallel_rank", return_value=1
+        # The filter resolves the global TP group through resolve_process_groups, which warns.
+        global_groups = ProcessGroupCollection(tp=mock.sentinel.global_tp)
+        with (
+            mock.patch.object(parallel_state, "model_parallel_is_initialized", return_value=True),
+            mock.patch.object(
+                ProcessGroupCollection, "use_mpu_process_groups", return_value=global_groups
+            ),
+            mock.patch.object(tensor_parallel_layers, "get_pg_rank", return_value=1) as rank,
         ):
             with pytest.warns(ProcessGroupFallbackWarning) as record:
                 assert not param_is_not_tensor_parallel_duplicate(param)
+        rank.assert_called_once_with(mock.sentinel.global_tp)
         (message,) = _fallback_messages(record)
         assert message.startswith(
             f"param_is_not_tensor_parallel_duplicate was called without `{argument}`"
@@ -147,10 +154,18 @@ class TestDuplicateFilterFallbacks:
         if is_expert:
             param.allreduce = False
         argument = "expert_gtp_group" if is_expert else "gtp_group"
-        accessor = "get_expert_gtp_weight_remat_rank" if is_expert else "get_gtp_weight_remat_rank"
-        with mock.patch.object(tensor_parallel_layers, accessor, return_value=1):
+        # The filter reads the global GTP_remat group through resolve_gtp_remat_group(None).
+        with (
+            mock.patch.object(
+                tensor_parallel_layers,
+                "resolve_gtp_remat_group",
+                return_value=mock.sentinel.global_gtp,
+            ) as resolve,
+            mock.patch.object(tensor_parallel_layers, "get_pg_rank", return_value=1),
+        ):
             with pytest.warns(ProcessGroupFallbackWarning) as record:
                 assert not param_is_not_gtp_duplicate(param)
+        resolve.assert_called_once_with(None, is_expert=is_expert)
         (message,) = _fallback_messages(record)
         assert message.startswith(f"param_is_not_gtp_duplicate was called without `{argument}`")
         assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message
@@ -160,11 +175,7 @@ class TestDuplicateFilterFallbacks:
         param = torch.nn.Parameter(torch.empty(1))
         if is_expert:
             param.allreduce = False
-        global_reads = [
-            "get_tensor_model_parallel_rank",
-            "get_gtp_weight_remat_rank",
-            "get_expert_gtp_weight_remat_rank",
-        ]
+        global_reads = ["resolve_process_groups", "resolve_gtp_remat_group"]
         with warnings.catch_warnings():
             warnings.simplefilter("error", ProcessGroupFallbackWarning)
             with mock.patch.multiple(

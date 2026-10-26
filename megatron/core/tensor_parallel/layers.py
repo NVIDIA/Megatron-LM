@@ -17,15 +17,14 @@ from typing_extensions import override
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
-    get_expert_gtp_weight_remat_rank,
     get_global_memory_buffer,
-    get_gtp_weight_remat_rank,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     resolve_gtp_remat_group,
+    resolve_process_groups,
     warn_global_process_group_fallback,
 )
 from megatron.core.utils import (
@@ -111,10 +110,10 @@ def param_is_not_tensor_parallel_duplicate(
         expert_tp_group: Tensor-parallel group of the expert parameters.
         use_global_fallback: What a ``None`` group means. With ``True``, an expert parameter
             without ``expert_tp_group`` uses ``tp_group``, and a parameter left without a group
-            reads the global tensor-parallel rank. Callers that took both groups from the
-            owner's ``ProcessGroupCollection`` pass ``False``: ``None`` then marks an axis that
-            is off, so the parameter has no replica along it and is kept. The read of the
-            global rank is deprecated and emits a ``ProcessGroupFallbackWarning``.
+            reads the global tensor-parallel rank. That fallback is deprecated and emits a
+            ``ProcessGroupFallbackWarning``. Callers that took both groups from the owner's
+            ``ProcessGroupCollection`` pass ``False``: ``None`` then marks an axis that is off,
+            so the parameter has no replica along it and is kept.
     """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
@@ -129,13 +128,15 @@ def param_is_not_tensor_parallel_duplicate(
     if tp_group is not None:
         return tp_group.rank() == 0
     # Fallback to legacy global state (back-compat).
-    warn_global_process_group_fallback(
-        "param_is_not_tensor_parallel_duplicate",
-        "expert_tp_group" if is_expert else "tp_group",
+    global_groups = resolve_process_groups(
+        None,
+        owner="param_is_not_tensor_parallel_duplicate",
+        required=("tp",),
+        argument="expert_tp_group" if is_expert else "tp_group",
         deprecated_in="0.21",
         removed_in="0.23",
     )
-    return get_tensor_model_parallel_rank() == 0
+    return get_pg_rank(global_groups.tp) == 0
 
 
 def copy_gtp_attributes(destination, source):
@@ -157,10 +158,13 @@ def param_is_not_gtp_duplicate(
     rank 0 of the gtp_remat/egtp_remat axis (else counted N times). When GTP_remat is off rank is 0,
     so every param is kept.
 
-    Pass the group that owns the param's GTP axis. The MPU fallback below is only correct for
-    callers whose axis is the global one: a module carrying its own grid (MIMO builds every
-    module's ``gtp_remat`` group in its HyperCommGrid and never initializes the MPU globals)
-    reads rank 0 on every rank there, which keeps every replicated param on every peer.
+    Pass the group that owns the param's GTP axis. Without it, the param is filtered by the
+    global GTP group, resolved as the layers resolve it without a collection
+    (``resolve_gtp_remat_group``). That fallback is deprecated and emits a
+    ``ProcessGroupFallbackWarning``. It is only correct for callers whose axis is the global
+    one: a module carrying its own grid (MIMO builds every module's ``gtp_remat`` group in its
+    HyperCommGrid and never initializes the MPU globals) reads rank 0 on every rank there,
+    which keeps every replicated param on every peer.
 
     Callers that took both groups from the owner's ``ProcessGroupCollection`` pass
     ``use_global_fallback=False``: a ``None`` group then marks a GTP axis that is off, so the
@@ -177,16 +181,15 @@ def param_is_not_gtp_duplicate(
         return group.rank() == 0
     if not use_global_fallback:
         return True
-    # Fallback to legacy global state (back-compat).
+    # Fallback to legacy global state (back-compat). The group is None, and every param is
+    # kept, when the global parallel state has no GTP_remat group.
     warn_global_process_group_fallback(
         "param_is_not_gtp_duplicate",
         "expert_gtp_group" if is_expert else "gtp_group",
         deprecated_in="0.21",
         removed_in="0.23",
     )
-    if is_expert:
-        return get_expert_gtp_weight_remat_rank() == 0
-    return get_gtp_weight_remat_rank() == 0
+    return get_pg_rank(resolve_gtp_remat_group(None, is_expert=is_expert)) == 0
 
 
 def gtp_local_pad_zero_count(gtp_shard, range_start, range_end):
@@ -487,7 +490,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                replica_group=getattr(pg_collection, "dp_cp", None),
+                # The replicas of each shard, over which checkpointing elects its writer. Without
+                # them, checkpointing falls back to the global grid and warns.
+                replica_group=None if pg_collection is None else pg_collection.dp_cp,
             )
             self.gtp_remat_size = gtp_remat_group.size()
             # Nothing prefetches embedding — it is head of the UNGRAPHED
@@ -1318,9 +1323,12 @@ class ColumnParallelLinear(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                # Expert weights replicate over EXPERT dp; dense over dp_cp.
-                replica_group=getattr(
-                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                # Expert weights replicate over EXPERT dp; dense over dp_cp. Without that group,
+                # checkpointing falls back to the global grid and warns.
+                replica_group=(
+                    None
+                    if pg_collection is None
+                    else (pg_collection.expt_dp if self.is_expert else pg_collection.dp_cp)
                 ),
             )
             self.gtp_remat_size = gtp_remat_group.size()
@@ -1715,9 +1723,12 @@ class RowParallelLinear(torch.nn.Module):
                 self,
                 ["weight"],
                 gtp_remat_group,
-                # Expert weights replicate over EXPERT dp; dense over dp_cp.
-                replica_group=getattr(
-                    pg_collection, "expt_dp" if self.is_expert else "dp_cp", None
+                # Expert weights replicate over EXPERT dp; dense over dp_cp. Without that group,
+                # checkpointing falls back to the global grid and warns.
+                replica_group=(
+                    None
+                    if pg_collection is None
+                    else (pg_collection.expt_dp if self.is_expert else pg_collection.dp_cp)
                 ),
             )
             self.gtp_remat_size = gtp_remat_group.size()
