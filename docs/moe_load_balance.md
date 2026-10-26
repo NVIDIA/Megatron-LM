@@ -939,3 +939,11 @@ EP sizes or different planner/transport configurations. Full GPT checkpoint
 continuation remains a separate end-to-end test.
 The GB200 unit-test recipe runs this replay file in its own bucket so pinned
 process-global autotune state does not leak into ordinary MoE tests.
+The platform selector excludes this file and the four-rank BF16 layer parity,
+MoonEP dispatch-capacity, and PR7450 training suites from H100's eight-GPU
+bucket. Those suites still run once on GB200; the replay file has a dedicated
+process and the other three belong to the GB200 catch-all bucket. The
+`launch_on_gb200` marker is an opt-in, not a general H100 exclusion: portable
+planner, NCCL, and home-exchange coverage remains selected on both platforms.
+`tests/test_utils/test_dev_unit_test_selection.py` checks these ownership rules
+using both platform recipes and the production selector without importing CUDA.

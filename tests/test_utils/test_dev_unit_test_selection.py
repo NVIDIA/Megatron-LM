@@ -49,6 +49,7 @@ def test_every_unit_file_has_exactly_one_platform_bucket(monkeypatch, capsys, pl
     buckets = [bucket for entry in recipe["products"] for bucket in entry["test_case"]]
     monkeypatch.setattr(finder, "get_test_cases", lambda _path: buckets)
     owners = Counter()
+    owner_buckets = {}
     for bucket in buckets:
         monkeypatch.setattr(sys, "argv", ["find_test_cases.py", bucket, platform])
         finder.main()
@@ -58,6 +59,9 @@ def test_every_unit_file_has_exactly_one_platform_bucket(monkeypatch, capsys, pl
             for path in finder.expand_pattern(bucket)
             if Path(path).name.startswith("test_") and path not in ignored
         )
+        for path in finder.expand_pattern(bucket):
+            if Path(path).name.startswith("test_") and path not in ignored:
+                owner_buckets.setdefault(path, []).append(bucket)
     expected = {
         str(path)
         for root in (Path("tests/unit_tests"), Path("examples/multimodal_dev/tests"))
@@ -69,6 +73,31 @@ def test_every_unit_file_has_exactly_one_platform_bucket(monkeypatch, capsys, pl
         expected = {path for path in expected if finder.file_has_marker(path, marker)}
     assert set(owners) == expected
     assert all(count == 1 for count in owners.values())
+    scheduler_dir = "tests/unit_tests/transformer/moe/"
+    replay = scheduler_dir + "test_scheduler_determinism.py"
+    for filename in (
+        "test_scheduler_bf16_layer_parity.py",
+        "test_moonep_dispatch_capacity.py",
+        "test_moonep_pr7450_training.py",
+        "test_scheduler_determinism.py",
+    ):
+        path = scheduler_dir + filename
+        if platform == "h100":
+            assert path not in owners, "Four-rank GB200 recipes must not run on eight H100s"
+        else:
+            expected_bucket = replay if path == replay else "tests/unit_tests/**/*.py"
+            assert owner_buckets[path] == [expected_bucket]
+            assert recipe["spec"]["nodes"] == 1
+            assert recipe["spec"]["gpus"] == 4
+    # The GB200 opt-in marker must not remove portable scheduler coverage on H100.
+    for filename in (
+        "test_echo_moe_scheduler.py",
+        "test_eplb_moe_scheduler.py",
+        "test_replica_nccl_transport.py",
+        "test_home_expert_exchange.py",
+        "test_home_only_expert_dispatch.py",
+    ):
+        assert owners[scheduler_dir + filename] == 1
     if platform == "h100":
         # The upstream GDN suite moved to GB200; dev GDN and DSv4 still run here.
         assert "tests/unit_tests/ssm/test_gated_delta_net.py" not in owners

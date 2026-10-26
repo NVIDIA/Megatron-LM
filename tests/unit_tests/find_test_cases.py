@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #!/usr/bin/env python3
 
 import subprocess
@@ -11,7 +11,20 @@ PLATFORM_MARKERS = {"gb200": "launch_on_gb200"}
 
 # Match main #8148: the legacy GDN/TE suite owns a GB200 bucket. H100 still
 # exercises dev's GDN headwise/chunkwise and fusion suites in their own buckets.
-PLATFORM_EXCLUSIONS = {"h100": {"tests/unit_tests/ssm/test_gated_delta_net.py"}}
+PLATFORM_EXCLUSIONS = {
+    "h100": {
+        "tests/unit_tests/ssm/test_gated_delta_net.py",
+        # These scheduler recipes use a four-rank topology and GB200 grouped
+        # expert kernels (including MXFP8). Keep them on the four-GPU GB200
+        # recipe, not H100's eight-GPU MoE bucket. Replay also pins global
+        # autotune state and must run only in its dedicated GB200 bucket.
+        # launch_on_gb200 opts tests into GB200; it does not exclude H100.
+        "tests/unit_tests/transformer/moe/test_scheduler_bf16_layer_parity.py",
+        "tests/unit_tests/transformer/moe/test_moonep_dispatch_capacity.py",
+        "tests/unit_tests/transformer/moe/test_moonep_pr7450_training.py",
+        "tests/unit_tests/transformer/moe/test_scheduler_determinism.py",
+    }
+}
 
 
 def file_has_marker(filepath, marker):
