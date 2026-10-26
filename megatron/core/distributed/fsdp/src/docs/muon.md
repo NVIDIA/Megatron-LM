@@ -136,7 +136,7 @@ and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 
 | | Gather/scatter | TensorAtomic |
 | --- | --- | --- |
-| Persistent storage | Equal-sized group shards, with alignment padding | Whole tensors packed into uneven owner segments |
+| Persistent storage | More balanced group shards, with row or block alignment | Whole tensors assigned to owners, potentially less balanced |
 | Optimizer communication | Gather/scatter remote fragments of split matrices | None for the matrix update |
 | Forward/backward | Equal-sized group collectives | Uneven group materialization and reduction |
 | Memory | Sharded state plus temporary full matrices | Whole-matrix state and workspace must fit on each owner |
