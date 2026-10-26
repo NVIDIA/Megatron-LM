@@ -655,9 +655,10 @@ class ProcessGroupCollection:
             else:
                 expt_tp_pp_with_egtp_remat_group = expt_tp_pp_group
 
-            # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
-            expt_gtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
+            # GTP weight-shard groups, used to detect whether GTP is on. A collection that does
+            # not set one, or sets it to None, has that axis off.
+            gtp_remat_group = pg_set.get('gtp_remat')
+            expt_gtp_remat_group = pg_set.get('expt_gtp_remat')
 
             # Gloo groups come from the collection. GTP_remat jobs build no Gloo groups (their
             # optimizer uses DCP), so only those may enable Gloo without supplying the groups.
@@ -791,8 +792,8 @@ class ProcessGroupCollection:
                         "but not provided in pg_collection"
                     )
 
-            # 3. Handle expert data parallel group (DDP-specific: create if missing)
-            if hasattr(pg_collection, 'expt_dp') and pg_collection.expt_dp is not None:
+            # 3. Handle expert data parallel group (DDP-specific: create if unset or None)
+            if pg_set.get('expt_dp') is not None:
                 result['expt_dp_group'] = pg_collection.expt_dp
             else:
                 # Without an expert data-parallel group, that axis runs at size 1. Creating
@@ -838,9 +839,10 @@ class ProcessGroupCollection:
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
 
-            # GTP weight-shard groups (None when inactive); used to detect whether GTP is on.
-            result['gtp_remat_group'] = getattr(pg_collection, 'gtp_remat', None)
-            result['expt_gtp_remat_group'] = getattr(pg_collection, 'expt_gtp_remat', None)
+            # GTP weight-shard groups, used to detect whether GTP is on. A collection that does
+            # not set one, or sets it to None, has that axis off.
+            result['gtp_remat_group'] = pg_set.get('gtp_remat')
+            result['expt_gtp_remat_group'] = pg_set.get('expt_gtp_remat')
 
             return result
 
