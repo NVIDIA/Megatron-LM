@@ -37,6 +37,7 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
     ArgumentGroupFactory,
     _default_config_from_args,
     _wide_residual_config_from_args,
+    checkpoint_config_from_args,
     core_transformer_config_from_args,
 )
 from megatron.training.utils import (
@@ -422,22 +423,10 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
-    # Prep for checkpoint conversion.
+    # Prep for checkpoint conversion. CheckpointConfig.validate() checks the prerequisites below;
+    # the legacy argument copy keeps the derived flag for its remaining readers.
     if args.ckpt_convert_format is not None:
-        assert args.ckpt_convert_save is not None
-        assert args.load is not None
         args.exit_on_missing_checkpoint = True
-
-    # Temporary
-    assert args.non_persistent_ckpt_type in ['global', 'local', None], \
-        'Currently only global and local checkpoints are supported'
-    if args.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
-        except ModuleNotFoundError as e:
-            raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
     # validate model config args from heterogeneous config (if provided).
     validate_model_config_args_from_heterogeneous_config(args)
@@ -604,6 +593,11 @@ def validate_args(args, defaults={}):
                                                  v2=getattr(args, key)))
         else:
             setattr(args, key, defaults[key])
+
+    # Checkpoint settings are owned by CheckpointConfig: run its checks here, on the arguments as
+    # the entry point defaulted them, so a CLI run fails before any container is built. The
+    # containers run the same checks again, and the cross-section ones, when they are validated.
+    checkpoint_config_from_args(args).validate()
 
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'
@@ -946,8 +940,6 @@ def validate_args(args, defaults={}):
             "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
         assert not args.gradient_accumulation_fusion, \
             '--use-torch-fsdp2 is not supported with gradient accumulation fusion'
-        assert args.ckpt_format in ('torch_dist', 'torch_dcp'), \
-            '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         assert args.untie_embeddings_and_output_weights, \
             '--use-torch-fsdp2 requires --untie-embeddings-and-output-weights'
         assert not args.fp16, \
@@ -1082,9 +1074,6 @@ def validate_args(args, defaults={}):
 
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
-
-        assert args.ckpt_format == "fsdp_dtensor", \
-            "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
         if args.nccl_ub:
             # In Megatron-LM, required implementation for manual registration is already provided.
@@ -1229,14 +1218,6 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
-    if args.save is not None:
-        assert args.save_interval is not None
-        assert args.save_interval > 0
-        if args.save_retain_interval is not None:
-            assert args.save_retain_interval > 0
-            assert args.save_retain_interval % args.save_interval == 0
-        if args.save_params_interval is not None:
-            assert not args.overlap_param_gather
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -1542,17 +1523,13 @@ def validate_args(args, defaults={}):
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
 
-    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
+    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks. The pairing of
+    # torch_dcp and fsdp_dtensor with their FSDP wrapper is checked by CheckpointConfig.validate_run().
     if args.ckpt_format == "torch_dcp":
-        assert args.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
         assert args.tensor_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."
         assert args.pipeline_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron pipeline parallelism."
-
-    # fsdp_dtensor checkpointing format checks.
-    if args.ckpt_format == "fsdp_dtensor":
-        assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
     # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
     # because they are mutually-exclusive top-level dataset selectors that both
@@ -1714,17 +1691,8 @@ def validate_args(args, defaults={}):
         "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
     )
 
-    # Make sure all functionality that requires Gloo process groups is disabled.
-    if not args.use_gloo_process_groups:
-        if args.use_distributed_optimizer:
-            # If using distributed optimizer, must use distributed checkpointing.
-            # Legacy checkpointing uses Gloo process groups to collect full distributed
-            # optimizer state in the CPU memory of DP rank 0.
-            assert args.use_dist_ckpt
-
-            if args.dist_ckpt_optim_fully_reshardable:
-                assert not args.distrib_optim_fully_reshardable_mem_efficient, \
-                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+    # Without Gloo process groups the distributed optimizer needs a distributed checkpoint
+    # format: checked by CheckpointConfig.validate_run() against the owning sections.
 
     if args.fake_process_group:
         assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."
@@ -1762,51 +1730,12 @@ def validate_args(args, defaults={}):
                 "Other algorithms cannot guarantee numerical stability yet."
             )
 
-    # The PG-distribution cache stores one file per parallelization group, keyed by
-    # that group's ordered global ranks, and each file holds both the save and the
-    # load distribution derived from one gather over that group. A single create
-    # run (even one that only loads) therefore covers later saves only when save
-    # and load use the same group; otherwise a read run finds no cache file for the
-    # other side's group. Require both sides to use the same group.
-    if args.ckpt_pg_tensors_cache_path is not None:
-        assert (
-            args.ckpt_fully_parallel_save_process_group
-            == args.ckpt_fully_parallel_load_process_group
-        ), (
-            "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
-            "--ckpt-fully-parallel-load-process-group to be identical, but got "
-            f"save='{args.ckpt_fully_parallel_save_process_group}' and "
-            f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
-            "parallelization group, so with mixed groups a run that creates the cache for one "
-            "side leaves the other side without a cache file."
-        )
-
-    if args.load_main_params_from_ckpt:
-        assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
-
     if args.stream_ckpt_dequant:
-        # Inference-only load path: the loaded state dict holds the re-quantized params
-        # themselves, so nothing that consumes the loaded values in high precision (optimizer
-        # main params) may run. `load_checkpoint` additionally refuses any optimizer.
-        assert args.no_load_optim and not args.finetune, (
-            '--stream-ckpt-dequant is an inference-only load path: it requires --no-load-optim '
-            'and cannot be used with --finetune.'
-        )
-        assert not args.load_main_params_from_ckpt, (
-            '--stream-ckpt-dequant cannot be used with --load-main-params-from-ckpt: the main '
-            'params would be initialized from the re-quantized params instead of the '
-            'high-precision checkpoint values.'
-        )
+        # The other --stream-ckpt-dequant rules live in CheckpointConfig.validate(); this one pairs
+        # it with the precision recipe, which is not config-owned yet.
         assert args.fp8 is None or args.fp8_recipe != 'delayed', (
             '--stream-ckpt-dequant does not support --fp8-recipe delayed (its scale is only '
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
-        )
-        assert (
-            not args.ckpt_fully_parallel_load
-            or args.ckpt_fully_parallel_load_exchange_algo == 'broadcast'
-        ), (
-            '--stream-ckpt-dequant supports --ckpt-fully-parallel-load only with '
-            '--ckpt-fully-parallel-load-exchange-algo broadcast.'
         )
 
     if args.use_dist_ckpt and args.async_save:
@@ -1845,9 +1774,6 @@ def validate_args(args, defaults={}):
                 '--freeze-all-layers incompatible with overlap_param_gather. Disabling overlap_param_gather.'
             )
             args.overlap_param_gather = False
-
-    if args.override_ckpt_iteration is not None:
-        assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -1894,12 +1820,8 @@ def validate_args(args, defaults={}):
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
 
-    if args.non_persistent_ckpt_type == "local":
-        assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
-    if args.replication:
-        assert args.replication_jump is not None, "--replication requires the value of --replication-jump!"
-        assert args.non_persistent_ckpt_type == "local", f"--replication requires args.non_persistent_ckpt_type == 'local', but got: {args.non_persistent_ckpt_type}"
-    elif args.replication_jump:
+    # Local checkpointing and replication prerequisites are checked by CheckpointConfig.validate().
+    if not args.replication and args.replication_jump:
         warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
 

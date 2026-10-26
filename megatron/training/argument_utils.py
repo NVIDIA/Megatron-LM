@@ -1,7 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
 import builtins
+import copy
 import dataclasses
 import enum
 import importlib
@@ -771,6 +772,62 @@ def profiling_config_from_args(args: Namespace) -> ProfilingConfig:
     return ProfilingConfig(**deepcopy(kwargs))
 
 
+_MISSING = object()
+_CHECKPOINT_ALIASED_FIELDS = frozenset(
+    ("save_optim", "save_rng", "load_optim", "load_rng", "fully_parallel_save", "fully_parallel_load")
+)
+
+
+def checkpoint_config_from_args(args: Namespace) -> CheckpointConfig:
+    """Build the checkpoint section from the argparse namespace.
+
+    One translation for the training container, the inference container and the parse-time base
+    load of ``--use-checkpoint-args``. The four ``--no-*`` flags and the two ``ckpt_fully_parallel_*``
+    dests are folded here; a namespace without them (an args-only entry point) keeps the field
+    defaults. The CLI alias wins over a same-named field when a namespace carries both.
+    """
+    kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        if hasattr(args, f"no_{name}"):
+            kwargs[name] = not getattr(args, f"no_{name}")
+    for name in ("fully_parallel_save", "fully_parallel_load"):
+        if hasattr(args, f"ckpt_{name}"):
+            kwargs[name] = getattr(args, f"ckpt_{name}")
+    return CheckpointConfig(**kwargs)
+
+
+def project_checkpoint_policy(args: Namespace, checkpoint: CheckpointConfig) -> Namespace:
+    """The inverse of ``checkpoint_config_from_args``: a shallow copy of ``args`` whose
+    checkpoint-owned names reflect ``checkpoint``.
+
+    Used for the argument namespace persisted in a checkpoint, so that saved arguments describe
+    the policy that produced the file; the live namespace is never written.
+    """
+    projected = copy.copy(args)
+    for item in fields(CheckpointConfig):
+        # The six alias-backed fields live in args under their CLI names only; a field with no
+        # CLI flag (most_recent_k) is added only when it departs from its default.
+        if item.name in _CHECKPOINT_ALIASED_FIELDS:
+            continue
+        value = getattr(checkpoint, item.name)
+        if hasattr(args, item.name) or value != item.default:
+            setattr(projected, item.name, value)
+    # An alias that already agrees with the policy keeps its spelling (an unset store_true flag
+    # is None, not False), so a CLI run's saved arguments are byte-identical to the parsed ones.
+    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
+        wanted = not getattr(checkpoint, name)
+        if bool(getattr(args, f"no_{name}", None)) != wanted:
+            setattr(projected, f"no_{name}", wanted)
+    for name, value in (
+        ("ckpt_fully_parallel_save", checkpoint.fully_parallel_save),
+        ("ckpt_fully_parallel_load", checkpoint.fully_parallel_load),
+        ("use_dist_ckpt", checkpoint.use_dist_ckpt),
+    ):
+        if getattr(args, name, _MISSING) != value:
+            setattr(projected, name, value)
+    return projected
+
+
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
@@ -781,14 +838,6 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         of a model builder/model provider function pointer.
         """
         warnings.warn(msg)
-
-    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    ckpt_kwargs["save_optim"] = not args.no_save_optim
-    ckpt_kwargs["save_rng"] = not args.no_save_rng
-    ckpt_kwargs["load_optim"] = not args.no_load_optim
-    ckpt_kwargs["load_rng"] = not args.no_load_rng
-    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
-    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
 
     rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
     rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
@@ -806,7 +855,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),
         logger=deepcopy(_default_config_from_args(LoggerConfig, args)),
-        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        checkpoint=checkpoint_config_from_args(args),
         profiling=profiling_config_from_args(args),
         tokenizer=_default_config_from_args(TokenizerConfig, args),
         rl=_default_config_from_args(RLConfig, args),
@@ -854,19 +903,9 @@ def inference_cfg_container_from_args(
         else:
             model_cfg = gpt_config_from_args(args)
 
-    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
-    # Args-only entrypoints need not supply checkpoint/profiling CLI aliases.
-    # Preserve canonical config values or defaults when an alias is absent.
-    for name in ("save_optim", "save_rng", "load_optim", "load_rng"):
-        if hasattr(args, f"no_{name}"):
-            ckpt_kwargs[name] = not getattr(args, f"no_{name}")
-    for name in ("fully_parallel_save", "fully_parallel_load"):
-        if hasattr(args, f"ckpt_{name}"):
-            ckpt_kwargs[name] = getattr(args, f"ckpt_{name}")
-
     cfg = InferenceConfigContainer(
         model=model_cfg,
-        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        checkpoint=checkpoint_config_from_args(args),
         inference=inference_cfg_from_args(args),
         dist=deepcopy(_default_config_from_args(DistributedInitConfig, args)),
         rng=_default_config_from_args(RNGConfig, args),

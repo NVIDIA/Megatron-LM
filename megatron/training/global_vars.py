@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron global variables."""
 
@@ -177,8 +177,10 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     cfg_container.validate()
     set_run_config(cfg_container)
     set_args(args)
-    if training:
-        cfg_container.finalize()
+    # Every container is finalized here: the checkpoint derivations apply to inference containers
+    # too, and the checkpoint converters bootstrap through this function without reaching
+    # initialize_megatron. Finalizing constructs no runtime service.
+    cfg_container.finalize()
     initialize_runtime_services(
         args,
         build_tokenizer=build_tokenizer,
