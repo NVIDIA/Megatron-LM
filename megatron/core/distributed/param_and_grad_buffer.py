@@ -1627,14 +1627,10 @@ class _ParamAndGradBuffer:
         )
         self.nvfp4_packed_numel_unpadded = sum(nvfp4_packed_per_bucket_numel_unpadded)
 
-    def scale_gradients(self, scaling_factor: float | torch.Tensor) -> None:
+    def scale_gradients(self, scaling_factor: torch.Tensor) -> None:
         """Scale the gradient data by `scaling_factor`."""
         buffer_scale = scaling_factor
-        if (
-            isinstance(buffer_scale, torch.Tensor)
-            and buffer_scale.is_cuda
-            and buffer_scale.ndim == 0
-        ):
+        if buffer_scale.is_cuda and buffer_scale.ndim == 0:
             # A scalar tensor does not promote the buffer's dtype. Keep the factor's
             # precision during multiplication; only the stored gradient is rounded.
             buffer_scale = buffer_scale.reshape(1)

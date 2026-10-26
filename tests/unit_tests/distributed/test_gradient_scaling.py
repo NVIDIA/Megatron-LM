@@ -52,14 +52,13 @@ def test_scale_gradients_preserves_factor_precision(dtype, num_tokens, use_graph
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("factor_kind", ["python", "cpu_scalar", "cuda_vector"])
-def test_scale_gradients_other_factor_types(dtype, factor_kind):
-    """Existing Python, CPU-scalar and dimensioned CUDA factors remain supported."""
-    factor = 0.1
+@pytest.mark.parametrize("factor_kind", ["cpu_scalar", "cuda_vector"])
+def test_scale_gradients_other_tensor_factors(dtype, factor_kind):
+    """CPU-scalar and dimensioned CUDA tensor factors remain supported."""
     if factor_kind == "cpu_scalar":
-        factor = torch.tensor(factor, dtype=torch.float32)
-    elif factor_kind == "cuda_vector":
-        factor = torch.tensor([factor], device="cuda", dtype=torch.float32)
+        factor = torch.tensor(0.1, dtype=torch.float32)
+    else:
+        factor = torch.tensor([0.1], device="cuda", dtype=torch.float32)
     original = torch.tensor([-130, 0, 130], device="cuda", dtype=dtype)
     buffer = SimpleNamespace(grad_data=original.clone(), extra_main_grads=[original.float()])
     expected = original * factor
