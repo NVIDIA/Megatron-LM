@@ -12,12 +12,11 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import utils as transformer_utils
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -31,19 +30,30 @@ from megatron.core.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 
+def _read_global_data_parallel_group(*args, **kwargs):
+    raise AssertionError("read the global data-parallel group")
+
+
 class _ParallelStateWithoutGlobalDpCpGroup:
-    """``parallel_state`` as ``transformer.utils`` sees it, without the global DP x CP group."""
+    """``parallel_state`` as the collection shim sees it, without the global DP x CP group.
+
+    The shim binds a getter for every field and calls only the requested ones, so the data-parallel
+    getter raises when it is called, and requests for other fields still resolve.
+    """
 
     def __getattr__(self, name):
         if name == 'get_data_parallel_group':
-            raise AssertionError("read the global data-parallel group")
+            return _read_global_data_parallel_group
         return getattr(parallel_state, name)
 
 
 def forbid_global_dp_cp_group():
-    """Make the global DP x CP fallback in ``transformer.utils`` raise."""
+    """Make reads of the global data-parallel group through the collection shim raise.
+
+    The DP x CP fallbacks of the checkpoint helpers read the group there.
+    """
     return mock.patch.object(
-        transformer_utils, 'parallel_state', _ParallelStateWithoutGlobalDpCpGroup()
+        process_groups_config, 'parallel_state', _ParallelStateWithoutGlobalDpCpGroup()
     )
 
 
