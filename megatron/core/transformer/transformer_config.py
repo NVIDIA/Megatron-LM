@@ -388,11 +388,15 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    dsa_inference_backend: Literal["cute", "triton", "triton_gluon", "flashinfer"] = "cute"
+    """Dynamic DSA-GQA backend; triton_gluon uses native Gluon scoring and Triton decode."""
+
     dsa_kernel_backend: (
         Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
         | None
     ) = None
-    """Which DSA implementation to run. This is the only backend selector.
+    """Which training/MLA DSA implementation to run. Dynamic DSA-GQA inference uses
+    ``dsa_inference_backend``.
 
     When unset, DSv4 hybrid resolves to ``cudnn`` and every other attention variant to
     ``none``, which the DSA-over-GQA path then resolves again as described below.

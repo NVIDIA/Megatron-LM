@@ -44,7 +44,6 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_type_list,
 )
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -449,6 +448,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
         )
+        self.cache_dsa_row_metadata = (
+            self.cache_dsa_indexer_keys and model_config.dsa_inference_backend != "cute"
+        )
+        self._dsa_decode_workspaces = {}
         # FlashInfer's DSA kernels take a per-step plan built with the row metadata.
         self.dsa_flashinfer = (
             self.cache_dsa_indexer_keys and model_config.dsa_inference_backend == "flashinfer"
@@ -1711,7 +1714,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
-        if self.cache_dsa_indexer_keys:
+        if self.cache_dsa_row_metadata:
             self._allocate_dsa_row_metadata()
             if self.dsa_flashinfer:
                 self._allocate_dsa_flashinfer_plan()
@@ -2146,7 +2149,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.dsa_max_score_blocks = self.max_requests + -(-self.max_tokens // SCORE_ROW_BLOCK)
         self.dsa_max_filter_blocks = self.max_requests + -(-self.max_tokens // PREFILL_ROW_BLOCK)
         sizes = (
-            [self.max_tokens, self.max_tokens]
+            [self.max_tokens, self.max_tokens, self.max_requests]
             + [self.dsa_max_score_blocks] * 3
             + [self.dsa_max_filter_blocks] * 3
         )
@@ -2162,6 +2165,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         (
             self._cpu_dsa_row_requests,
             self._cpu_dsa_row_lengths,
+            self._cpu_dsa_decode_lengths,
             self._cpu_dsa_block_starts,
             self._cpu_dsa_block_rows,
             self._cpu_dsa_block_requests,
@@ -2170,6 +2174,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         (
             self.dsa_row_requests,
             self.dsa_row_lengths,
+            self.dsa_decode_lengths,
             self.dsa_block_starts,
             self.dsa_block_rows,
             self.dsa_block_requests,
@@ -2195,6 +2200,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self._cpu_dsa_row_lengths[:real_tokens] = row_lengths
         self._cpu_dsa_row_requests[real_tokens:padded_tokens] = -1
         self._cpu_dsa_row_lengths[real_tokens:padded_tokens] = 0
+        self._cpu_dsa_decode_lengths.zero_()
+        leading_decode = 0
+        for length in query_lengths[:real_bs].tolist():
+            if length != 1:
+                break
+            leading_decode += 1
+        self._cpu_dsa_decode_lengths[:leading_decode] = kv_lengths[:leading_decode]
         # The block count depends only on the padded dimensions, so a CUDA graph's launch
         # covers any batch that fits them.
         self.dsa_num_score_blocks = padded_bs + -(-padded_tokens // self.dsa_score_row_block)
@@ -3148,7 +3160,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             max_seqlen_k=max_seqlen_k,
         )
 
-        if self.cache_dsa_indexer_keys:
+        if self.cache_dsa_row_metadata:
             self._fill_dsa_row_metadata(
                 real_bs, padded_bs, self._cpu_mha_query_lengths, self._cpu_mha_kv_seq_lengths
             )
@@ -3333,7 +3345,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # initialize_attention_state(); the H2D above populates the underlying
         # bytes. Nothing else to do here for MHA.
 
-        if self.cache_dsa_indexer_keys:
+        if self.cache_dsa_row_metadata:
             self._gpu_dsa_row_buf.copy_(self._cpu_dsa_row_buf, non_blocking=record_done_event)
             if self.dsa_flashinfer:
                 self._gpu_dsa_fi_buf.copy_(self._cpu_dsa_fi_buf, non_blocking=record_done_event)

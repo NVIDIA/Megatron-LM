@@ -158,6 +158,7 @@ if HAVE_CUTE_DSL:
             tiled_copy: cute.TiledCopy,
             tiled_mma: cute.TiledMma,
         ):
+            """Filter paged indexer candidates for the assigned query blocks."""
             tidx, _, _ = cute.arch.thread_idx()
             worker, block, _ = cute.arch.block_idx()
             workers, _, _ = cute.arch.grid_dim()
@@ -421,6 +422,7 @@ if HAVE_CUTE_DSL:
             topk: cutlass.Int32,
             capacity: cutlass.Int32,
         ):
+            """Filter paged indexer candidates for the assigned query blocks."""
             warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             tidx, _, _ = cute.arch.thread_idx()
             worker, block, _ = cute.arch.block_idx()
@@ -444,6 +446,8 @@ if HAVE_CUTE_DSL:
 
                 @cute.struct
                 class SharedStorage:
+                    """Shared-memory barriers and TMEM ownership state for the selector."""
+
                     a_mbar: cute.struct.MemRange[cutlass.Int64, 2]
                     b_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
                     acc_mbar: cute.struct.MemRange[cutlass.Int64, _ACC_STAGES * 2]
