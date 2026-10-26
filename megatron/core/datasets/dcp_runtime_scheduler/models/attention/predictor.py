@@ -22,8 +22,8 @@ SECTION_MASK = {'diagonal': 'causal', 'lower': 'rectangle', 'upper': 'rectangle'
 DEFAULT_CLOCK_LAW = 'alpha'
 
 PARAMETER_HASHES = {
-    'attention/gb200.json': 'c66c6abe5e37f1a61161980dbba6943b96a18a7da814bab8446cd517e3aefddc',
-    'attention/gb300.json': '520b2f993773a17a917fc54d41f73ef00d3d86afe617a2b53b446f5d020dc37a',
+    'attention/gb200.json': '5becc0bb6bf737b6ab8bfacf41e78930cba0e9c74d9c07c838ac1a3c123629c1',
+    'attention/gb300.json': 'c6ea0650b7dcb37e76c4a56452d7eee85e8bef5d985480ad4e09a5c9ad45d73a',
     'qwen35.json': 'c4a93f1a6221c53d68dacf2fb8660f63ec85a3e3aaaabfe1ac0615596fe51ffc',
 }
 
