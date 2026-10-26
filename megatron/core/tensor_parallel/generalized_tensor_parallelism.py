@@ -2348,9 +2348,10 @@ class GTPShardedParam(torch.nn.Parameter):
 
             outputs = []
             nvtx_range_push(f"{nvtx_label}.batched_gtp_rs")
-            with torch.distributed._coalescing_manager(
-                group=self.group, device=wgrads[0].device, async_ops=async_op
-            ) as cm:
+            # reduce_scatter_tensor uses fast-path coalescing. Adding device coalescing
+            # can replace its Work handle with an outer Work, retaining input tensors
+            # after the returned handle is waited on.
+            with torch.distributed._coalescing_manager(group=self.group, async_ops=async_op) as cm:
                 for out_buffer, tensor in zip(out_buffers, wgrads):
                     out, _ = reduce_scatter_along_first_dim(tensor, self.group, output=out_buffer)
                     outputs.append(out)
