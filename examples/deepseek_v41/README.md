@@ -3,13 +3,15 @@
 This composition uses main's HybridModel, MoE, distributed optimizer and packed CP
 path. Each logical block is `VE`: CSA2 attention followed by MoE. It does not
 include vision, DSpark, FP4 QAT or a Sinkhorn optimizer. The fused attention uses
-main's 512-dimensional KV path, with BF16 indexer H32/H64 and D128.
+main's 512-dimensional KV path, with BF16 or MXFP8 index selection, H32/H64 and D128. MXFP8 selection
+requires SM100 or later and the cuDNN backend; indexer supervision retains its
+original BF16/FP32 path.
 
 A small GPU smoke configuration (requires the normal Megatron CI container,
 FlashMLA and cuDNN Frontend):
 
 ```bash
-CUDA_DEVICE_MAX_CONNECTIONS=1 uv run python -m torch.distributed.run \
+uv run python -m torch.distributed.run \
   --nproc-per-node=1 pretrain_hybrid.py \
   --dsv4-version v4.1 --hybrid-layer-pattern VEVEVE \
   --num-layers 6 --hidden-size 256 --num-attention-heads 64 \
@@ -48,8 +50,10 @@ For PP/VPP, insert `|` at explicit stage/chunk boundaries. The builder creates
 one typed pipeline control group per replica and reuses it for virtual chunks.
 Packed batches are staged before P2P; ordinary CP1 batches remain lazy. CP uses
 `--attention-cp-layout contiguous --linear-cp-layout contiguous` and an existing
-SFT packed loader or `--dataloader-inter-document-masking`. Dynamic hybrid-CP and
-the separate sequence-packing scheduler are not enabled in this draft.
+SFT packed loader, `--dataloader-inter-document-masking`, or static varlen
+scheduling with `--use-varlen-dataset --sequence-packing-scheduler dp_balanced`.
+The scheduler path preserves logical and padded prefixes separately and slices
+queries contiguously. Dynamic hybrid-CP remains unsupported.
 
 Full recomputation uses `--recompute-granularity full --recompute-method uniform
 --recompute-num-layers 1`. Selective mHC recomputation keeps main's existing
@@ -64,5 +68,43 @@ projections and RoPE storage for TE/CUDA, and compare eager, checkpoint and spli
 PP outputs/parameter gradients. H100 qualification also covers real FlashMLA/cuDNN attention forward/backward,
 native/fused and CP gradient parity, Torch/TE state graphs, PP2/VPP2 overlap,
 DP2/EP2/PP2/CP2 training, fused mHC and full recomputation, plus checkpoint save/load.
-These runs use small proxy models and synthetic data, not released-model convergence
-or a production throughput qualification. Blackwell validation is left to CI.
+These checks use synthetic data and do not establish released-model convergence.
+
+Blackwell validation additionally covers real MXFP8 selection, parameter gather,
+recompute, explicit layer graphs and distributed training. The integrated stack
+(with the MoK dependency from #8210) passed 16-GPU PP2/VPP4/EP8/CP4, 16K packed
+training with both BF16 and MXFP8, including overlapping gradient reduction and
+parameter gather. Each precision completed 12 iterations without skipped or
+non-finite logged steps. Full cross-branch, same-weight gradient parity and
+released-model convergence are separate from these training checks.
+
+
+## MXFP8 configuration
+
+Model precision and indexer precision are independent. For the validated MXFP8
+path, add these options to a compatible distributed model configuration:
+
+```text
+--bf16
+--fp8-recipe mxfp8
+--fp8-format e4m3
+--fp8-param-gather
+--reuse-grad-buf-for-mxfp8-param-ag
+--moe-router-padding-for-quantization
+--dsa-kernel-backend cudnn
+--dsa-indexer-precision mxfp8
+```
+
+Use `--use-distributed-optimizer` for distributed parameter updates; the tested
+recipe uses Muon with `--muon-coefficient-type deepseekv4`, ten Newton-Schulz
+steps, `--overlap-grad-reduce` and `--overlap-param-gather`. BF16-only runs omit
+the FP8 recipe, parameter-gather reuse and quantization-padding options and set
+`--dsa-indexer-precision bf16`.
+
+The 16K proxy keeps 24 logical blocks / 48 physical V/E layers, hidden size 5120,
+48 experts with Top-6 routing, MBS1 and GBS128. It uses selective
+`--recompute-modules mla_up_proj mhc`, `--mhc-recompute-layer-num 2`, and no
+CUDA graphs or Engram. It does not measure the full model's 64K candidate-pruning
+ratio. The validated environment is GB200, PyTorch nv26.09, Transformer Engine
+2.20.2 and cuDNN Frontend 1.29. MoK is an optional, separate dependency; the
+individual V4.1 component PRs do not install or embed that backend.
