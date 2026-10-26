@@ -69,20 +69,7 @@ def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     name = group.group_name
     pool = _pools.get(name)
     if pool is None:
-        try:
-            vmm_symm_allocator.init()
-            pool = vmm_symm_allocator.create_vmm_mem_pool()
-        except RuntimeError as e:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"[MCORE][GTP] {e}\n"
-                "[MCORE][GTP] FALLING BACK to ncclMemAlloc-backed symmetric pools. "
-                "ncclMemAlloc maps every allocation on all P2P-visible peer GPUs, "
-                "which slows CPU-side kernel launching at scale.",
-            )
-            nccl_allocator.init()
-            pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+        pool = vmm_symm_allocator.create_symm_mem_pool()
         _pools[name] = pool
     return pool
 

@@ -13,6 +13,7 @@ import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
+import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1239,13 +1240,12 @@ class _ParamAndGradBuffer:
         elif self.ddp_config.use_distributed_optimizer and any(
             getattr(p, 'needs_nccl_mem', False) for p in self.params
         ):
-            # Params opted into ncclMemAlloc backing so the caller can window-register this
+            # Params opted into symmetric-pool backing so the caller can window-register this
             # buffer on other comm groups; it registers and warms them itself, so this branch
             # only allocates. Distopt-gated: without it there is no param_data to back.
             # Always symmetric: --disable-symmetric-registration is rejected in combination
             # with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub at argument validation.
-            nccl_allocator.init()
-            pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+            pool = vmm_symm_allocator.create_symm_mem_pool()
             self.nccl_mem_pool = pool
             mem_alloc_context = functools.partial(torch.cuda.use_mem_pool, pool)
         else:
