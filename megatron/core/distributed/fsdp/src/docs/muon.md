@@ -63,7 +63,7 @@ full-matrix Muon orthogonalization.
 input for each complete logical matrix using Newton–Schulz. Applying it
 independently to row or block shards, or to the concatenated group buffer,
 would change the update. The challenge is to provide whole-matrix inputs
-while retaining module-level sharding.
+to Muon while retaining module-level sharding.
 
 **TensorAtomic.** Whole-matrix inputs are already local. The challenge is
 to enforce the layout requested by Muon without substantially slowing
