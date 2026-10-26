@@ -1,22 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """
-Utilities for saving top-K log-probabilities during model training with minimal overhead.
+Utilities for saving top-K reference logits and an explicit tail during training.
 
 This module provides hook-based utilities to capture and persist top-K log-probabilities
 during training while respecting tensor parallelism and minimizing communication,
 computation, I/O, and disk space overhead.
 
-The forward hook accumulates raw logits across microbatches and, once all microbatches
-have been collected, converts them to log-probs and writes them to disk in a single I/O call.
+The forward hook encodes each microbatch immediately, accumulates the small
+encoded tensors, and buffers the iteration for asynchronous serialization.
 
-For efficient global top-K log-prob computation across TP ranks:
-- Local top-K is computed on fp32 logits first to avoid materializing
-  a full vocab-sized log-softmax tensor
-- The log-softmax denominator (log-sum-exp) is computed TP-aware and applied
-  only to the top-K values
-- Local candidates are gathered to TP rank 0 for global top-K selection
-- TP rank 0 saves the full top-K log-probabilities (unsharded)
+Local top-K candidates are gathered to TP rank 0 for global selection. All TP
+ranks then reduce the omitted vocabulary directly, using bounded FP32 chunks.
+The reference logit's implicit zero frees a slot for that tail log-sum-exp:
+K selected indices still require only K floating values per token.
 
 Index storage optimization:
 - Global vocab requires 17 bits, so we store lower 16 bits as uint16
@@ -50,6 +47,11 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
+from megatron.training.distillation.reference_logits import (
+    coarsen_logits,
+    encode_reference_logits,
+    stable_log_softmax,
+)
 from megatron.training.distillation.utils import (
     CACHED_LOGITS_INDEX_SENTINEL,
     CACHED_LOGITS_LOGPROB_SENTINEL,
@@ -64,6 +66,7 @@ from megatron.training.distillation.utils import (
     is_remote_storage_path,
     open_logit_file,
     pad_and_stack_cu_seqlens,
+    peek_first_logprobs_metadata,
     quarantine_contained_tars,
     reassemble_cp_sequence,
     storage_glob_with_caching,
@@ -118,26 +121,14 @@ class LogitsSaverHooks:
     The hook accumulates logits across microbatches and saves all log-probs to disk
     in a single I/O call once all microbatches have been collected.
 
-    Top-K selection is performed on raw logits first, then log-probabilities
-    are computed only for the selected positions using the log-softmax
-    denominator (log-sum-exp).  Because log-softmax is monotonically
-    increasing, the top-K positions are identical to those of the raw logits.
-    This avoids materializing a full vocab-sized log-softmax tensor.
+    Top-K selection uses raw logits. Version-3 values encode the K-1
+    non-anchor logit differences plus one directly computed tail log-sum-exp.
+    All TP ranks participate in selection and tail reduction; TP rank 0
+    gathers CP shards so CP rank 0 can save one DP shard.
 
-    The implementation efficiently handles tensor parallelism by:
-    - Computing local top-K on fp32 logits to reduce memory and communication
-    - Concatenating values and indices before all_gather
-    - Computing global top-K from gathered results
-    - Having TP rank 0 gather CP shards so CP rank 0 can save one DP shard
-
-    When ``p`` is set, a top-P (nucleus) mask is applied after global top-K
-    selection.  The K dimension is truncated to the maximum per-token nucleus
-    size (reducing the amount of data written to disk), and tokens whose
-    nucleus is smaller than that maximum have their trailing entries masked
-    with cached-logit value/index sentinels.  These sentinels are
-    compatible with :func:`topk_kl_div` in ``cached_logits_loss.py`` because
-    the value sentinel makes the masked teacher probability effectively zero.
-    At least ``min_k`` entries are always kept per token.
+    When ``p`` is set, a nucleus mask is applied before FP16 rounding. The
+    full K dimension is retained, masked gaps become -inf, and their mass
+    is folded into the tail. At least ``min_k`` indices are always kept.
 
     Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
     CP rank 0 stores one CP-group payload per DP rank; tar filenames are DP-only.
@@ -241,6 +232,14 @@ class LogitsSaverHooks:
         # first member of every batched tar so the student loader can
         # verify alignment per-tar without an extra tarfile.open.
         self.dataset_hash, self._dataset_identifiers = compute_dataset_hash()
+        existing_meta = peek_first_logprobs_metadata(self.save_dir)
+        if existing_meta is not None:
+            existing_version = existing_meta.get("saver", {}).get("format_version", 1)
+            if existing_version != LOGPROBS_FORMAT_VERSION:
+                raise ValueError(
+                    f"Cannot append format-version-{LOGPROBS_FORMAT_VERSION} reference logits "
+                    f"to a format-version-{existing_version} cache. Use a fresh logits-save-dir."
+                )
         self.metadata_dict: Dict[str, Any] = {
             "hash": self.dataset_hash,
             "identifiers": self._dataset_identifiers,
@@ -483,13 +482,11 @@ class LogitsSaverHooks:
     def _process_single_microbatch(
         self, logits: torch.Tensor
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Process a single logits tensor and return top-K log-probability data.
+        """Select top-K indices and encode reference logits plus the exact tail.
 
-        Selects local top-K positions on raw logits first, then computes
-        the global log-sum-exp denominator using ``torch.logsumexp`` for
-        the local shard (leveraging PyTorch's fused CUDA kernel) combined
-        across TP ranks via a numerically stable log-space reduction.
-        This avoids materializing a full vocab-sized log-softmax tensor.
+        Only K values are stored: the anchor's implicit zero frees one slot
+        for the excluded vocabulary's log-sum-exp. FP32 vocabulary workspaces
+        are chunked; accumulated and serialized tensors stay in save_dtype.
 
         All TP ranks participate in the collective operations (all-reduce for
         the log-sum-exp combination, gather for top-K candidates), but only
@@ -500,7 +497,7 @@ class LogitsSaverHooks:
             logits: Tensor of shape (seq_len, batch, local_vocab_size)
 
         Returns:
-            Tuple of (log_prob_values, global_indices) on TP rank 0,
+            Tuple of (reference_values, global_indices) on TP rank 0,
             ``None`` on other TP ranks.
         """
         local_vocab_size = logits.shape[-1]
@@ -513,46 +510,43 @@ class LogitsSaverHooks:
         effective_k = min(self.k, global_vocab_size)
         local_k = min(effective_k, local_vocab_size)
 
-        # Convert to fp32 to lessen precision issues
-        logits = logits.float()
-
         local_logit_vals, local_indices = torch.topk(logits, local_k, dim=-1)
-
-        # Local log-sum-exp via PyTorch's fused CUDA kernel
-        local_lse = torch.logsumexp(logits, dim=-1, keepdim=True)
-
-        if self.tp_size > 1:
-            # Combine local log-sum-exp values across TP ranks using
-            # the standard numerically stable log-space reduction:
-            #   global_lse = max_lse + log(sum_i(exp(lse_i - max_lse)))
-            max_lse = local_lse.clone()
-            dist.all_reduce(max_lse, op=dist.ReduceOp.MAX, group=self.tp_group)
-            sum_exp_lse = torch.exp(local_lse - max_lse)
-            dist.all_reduce(sum_exp_lse, op=dist.ReduceOp.SUM, group=self.tp_group)
-            global_lse = max_lse + torch.log(sum_exp_lse)
-        else:
-            global_lse = local_lse
-
-        local_logprob_vals = local_logit_vals - global_lse
 
         if self.tp_size > 1:
             result = self._compute_global_topk(
-                local_logit_vals, local_logprob_vals, local_indices, effective_k, local_vocab_size
+                local_logit_vals.float(), local_indices, effective_k, local_vocab_size
             )
-            if result is None:
-                return None
-            global_values, global_indices = result
+            if self.tp_rank == 0:
+                _, global_indices = result
+            else:
+                global_indices = torch.empty(
+                    (*logits.shape[:-1], effective_k), dtype=torch.long, device=logits.device
+                )
+            # Every rank needs the selected indices to exclude its own part
+            # of the tail. Non-owner ranks must not return before these calls.
+            dist.broadcast(global_indices, src=self._tp_dst_rank_global, group=self.tp_group)
         else:
-            global_values, global_indices = local_logprob_vals, local_indices
+            global_indices = local_indices
 
+        coarse, _ = coarsen_logits(
+            logits,
+            global_indices,
+            torch.ones_like(global_indices, dtype=torch.bool),
+            self.tp_size,
+            self.tp_rank,
+            self.tp_group,
+        )
+        if self.tp_rank != 0:
+            return None
+
+        keep = torch.ones_like(global_indices, dtype=torch.bool)
         if self.p is not None:
-            global_values, global_indices = self._apply_topp_truncation(
-                global_values, global_indices,
+            logprobs, global_indices = self._apply_topp_truncation(
+                stable_log_softmax(coarse)[..., :-1], global_indices
             )
+            keep = logprobs != CACHED_LOGITS_LOGPROB_SENTINEL
 
-        global_values = global_values.to(self._save_dtype)
-
-        return global_values, global_indices
+        return encode_reference_logits(coarse, keep, self._save_dtype), global_indices
 
     def _gather_full_cp_microbatch(
         self,
@@ -598,7 +592,6 @@ class LogitsSaverHooks:
     def _compute_global_topk(
         self,
         local_logit_vals: torch.Tensor,
-        local_logprob_vals: torch.Tensor,
         local_indices: torch.Tensor,
         k: int,
         local_vocab_size: int,
@@ -606,8 +599,7 @@ class LogitsSaverHooks:
         """Gather local top-K candidates to rank 0 and compute global top-K.
 
         The ranking is performed on fp32 *logit* values for numerical
-        precision; the returned log-prob values are still fp32 here and
-        are only cast to the on-disk ``save_dtype`` by the caller.
+        precision; normalization and encoding happen after index selection.
 
         Only TP rank 0 receives the gathered data and performs the final
         top-K selection.  Other ranks return ``None`` after participating
@@ -615,26 +607,22 @@ class LogitsSaverHooks:
 
         Args:
             local_logit_vals: Local top-K fp32 logit values (seq, batch, local_k)
-            local_logprob_vals: Local top-K fp32 log-prob values at the
-                same positions (seq, batch, local_k)
             local_indices: Local top-K indices in [0, local_vocab_size)
             k: Target number of top elements
             local_vocab_size: Size of the local vocab shard (vocab_size / tp_size)
 
         Returns:
-            Tuple of (global_logprob_values, global_indices) on TP rank 0,
+            Tuple of (global_logit_values, global_indices) on TP rank 0,
             ``None`` on other TP ranks.
         """
         vocab_offset = self.tp_rank * local_vocab_size
         global_indices = local_indices + vocab_offset
 
-        # Pack logits, log-probs, and indices into a single tensor.
+        # Pack logits and indices into a single tensor.
         # fp32 can exactly represent integers up to 2^24, sufficient for
-        # 17-bit vocab indices.  Shape: (seq, batch, local_k, 3)
+        # 17-bit vocab indices.  Shape: (seq, batch, local_k, 2)
         combined = torch.stack(
-            [local_logit_vals,
-             local_logprob_vals.float(),
-             global_indices.float()],
+            [local_logit_vals, global_indices.float()],
             dim=-1,
         )
 
@@ -647,19 +635,18 @@ class LogitsSaverHooks:
         if self.tp_rank != 0:
             return None
 
-        # (seq, batch, tp_size * local_k, 3)
+        # (seq, batch, tp_size * local_k, 2)
         gathered = torch.cat(gather_list, dim=-2)
 
         gathered_logits = gathered[..., 0]
-        gathered_logprobs = gathered[..., 1].to(local_logprob_vals.dtype)
-        gathered_indices = gathered[..., 2].to(local_indices.dtype)
+        gathered_indices = gathered[..., 1].to(local_indices.dtype)
 
         _, topk_positions = torch.topk(gathered_logits, k, dim=-1)
 
-        topk_logprobs = torch.gather(gathered_logprobs, -1, topk_positions)
+        topk_logits = torch.gather(gathered_logits, -1, topk_positions)
         topk_global_indices = torch.gather(gathered_indices, -1, topk_positions)
 
-        return topk_logprobs, topk_global_indices
+        return topk_logits, topk_global_indices
 
     def _apply_topp_truncation(
         self,
@@ -736,10 +723,11 @@ class LogitsSaverHooks:
     ) -> None:
         """Serialize a per-iteration monolith and buffer for async flush.
 
-        File format (``format_version == 2``): serialized dict with:
+        File format (``format_version == 3``): serialized dict with:
 
-        - ``values``: ``(seq, samples_per_dp_per_iter, K_max)`` tensor of
-          log-probabilities in ``self._save_dtype`` (default ``torch.float16``)
+        - ``reference_values``: ``(seq, samples_per_dp_per_iter, K_max)`` tensor of
+          reference values in ``self._save_dtype`` (default ``torch.float16``):
+          slot 0 holds the tail LSE, other slots hold non-anchor logit gaps
         - ``indices_low``: ``(seq, samples_per_dp_per_iter, K_max)`` uint16
           tensor (lower 16 bits of vocab indices)
         - ``bit_17``: 1-D uint8 tensor, the 17th bit of every index in
@@ -768,7 +756,9 @@ class LogitsSaverHooks:
         """
         buffer = io.BytesIO()
         torch.save({
-            'values': values_tensor,
+            # A distinct key makes pre-v3 readers fail instead of silently
+            # interpreting relative logits as normalized log-probabilities.
+            'reference_values': values_tensor,
             'indices_low': indices_low_tensor,
             'bit_17': bit_17_tensor,
             'cu_seqlens_padded': cu_seqlens_padded_tensor,

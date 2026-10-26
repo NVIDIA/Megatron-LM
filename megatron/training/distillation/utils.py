@@ -97,7 +97,8 @@ CACHED_LOGITS_INDEX_SENTINEL = -1
 # On-disk payload format version.  ``1`` is the legacy list-of-microbatches
 # layout (``values: List[Tensor]``); ``2`` is the monolithic per-iter layout
 # (``values: Tensor``) that supports flexible MBS / DP / GBS resharding.
-LOGPROBS_FORMAT_VERSION = 2
+# ``3`` keeps that layout but encodes reference logits and a direct tail LSE.
+LOGPROBS_FORMAT_VERSION = 3
 
 # Cache to not have to re-run the glob operation for the same pattern, which is expensive for MSC.
 _STORAGE_GLOB_CACHE: dict[str, List[str]] = {}
@@ -815,12 +816,14 @@ def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
     return _broadcast_without_pp(peek)
 
 
-def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tensor]]:
+def decode_logprobs_payload(
+    data: bytes, *, expected_format_version: Optional[int] = None
+) -> Tuple[Any, Any, Optional[torch.Tensor]]:
     """Decode one zstd-compressed cached-logits payload.
 
     Dispatches on the payload's ``format_version`` field:
 
-    * v2 (``format_version >= 2``): returns ``(values, indices,
+    * v2/v3: returns ``(values, indices,
       cu_seqlens_padded)``. ``values``/``indices`` are monolithic
       per-iteration tensors of shape ``(seq, samples_per_dp_per_iter, K)``;
       slicing along the sample dim is a zero-copy (but non-contiguous)
@@ -828,7 +831,9 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tenso
       them. ``cu_seqlens_padded`` is a
       ``(samples_per_dp_per_iter, max_boundaries)`` int tensor of
       per-sample document boundaries when the saving run had any
-      (``--sft``), else ``None``.
+      (``--sft``), else ``None``. Version 3 uses the ``reference_values``
+      payload key and encodes relative logits and an explicit tail; v2
+      uses ``values`` and encodes top-K normalized log-probabilities.
     * v1 (legacy, no ``format_version``): returns ``(values_list,
       indices_list, None)`` mirroring the original saved
       list-of-microbatches structure. The v1 branch is slated for removal
@@ -847,8 +852,16 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any, Optional[torch.Tenso
 
     data = zstandard.ZstdDecompressor().decompress(data)
     tensors = torch.load(io.BytesIO(data), weights_only=True)
-    if tensors.get("format_version", 1) >= 2:
-        values = tensors["values"]
+    version = tensors.get("format_version", 1)
+    if version not in (1, 2, 3):
+        raise ValueError(f"Unsupported cached-logits payload format_version={version}")
+    if expected_format_version is not None and version != expected_format_version:
+        raise ValueError(
+            f"Cached-logits payload format_version={version} does not match "
+            f"metadata format_version={expected_format_version}; mixed cache formats are unsafe."
+        )
+    if version >= 2:
+        values = tensors["reference_values" if version == 3 else "values"]
         indices = v2_unpack_indices(tensors["indices_low"], tensors["bit_17"])
         return values, indices, tensors.get("cu_seqlens_padded")
     # ---- v1 LEGACY (remove with LegacyTeacherTarDataset) ----
