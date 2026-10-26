@@ -67,20 +67,9 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
-@pytest.mark.parametrize(
-    "shortcut, overlap",
-    [
-        pytest.param(False, False, id="standard"),
-        pytest.param(True, False, id="wide-shortcut"),
-        pytest.param(True, True, id="wide-shortcut-overlap"),
-    ],
-)
-def test_build_train_step_and_clip(process_group_collections, distributed_setup, shortcut, overlap):
-    """Compare MoE training and gradient clipping against an EP=1 reference."""
+def test_standard_moe_train_step_and_clip(process_group_collections, distributed_setup):
+    """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
-    world_size = distributed_setup.world_size
-    # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
-    # initialization instead uses the globally configured EP rank in its RNG seed.
     config = TransformerConfig(
         num_layers=3,
         hidden_size=64,
@@ -92,10 +81,6 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         moe_router_topk=2,
         moe_grouped_gemm=True,
         moe_ffn_hidden_size=128,
-        moe_shortcut_connection=shortcut,
-        moe_shortcut_parallel=overlap,
-        moe_shortcut_post_norm=shortcut,
-        moe_shared_expert_intermediate_size=128 if shortcut else None,
         add_bias_linear=False,
         use_cpu_initialization=True,
         params_dtype=torch.float32,
@@ -103,18 +88,11 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         hidden_dropout=0.0,
         gradient_accumulation_fusion=False,
         attention_backend=AttnBackend.unfused,
-        wide_residual=(
-            WideResidualConfig(num_streams=3, learned_retention=True) if shortcut else None
-        ),
-        recompute_granularity="selective" if shortcut else None,
-        recompute_modules=["moe_act"] if shortcut else None,
     )
-    # Pair CPU initialization with an explicit common seed for the reference and EP model.
     torch.manual_seed(123)
-    reference_config = replace(config, expert_model_parallel_size=1)
     reference_model = HybridModel(
-        config=reference_config,
-        hybrid_stack_spec=(wide_residual_hybrid_stack_spec if shortcut else hybrid_stack_spec),
+        config=replace(config, expert_model_parallel_size=1),
+        hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
         hybrid_layer_pattern="*E*",
@@ -122,34 +100,109 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
     ).cuda()
     model = HybridModel(
         config=config,
-        hybrid_stack_spec=(wide_residual_hybrid_stack_spec if shortcut else hybrid_stack_spec),
+        hybrid_stack_spec=hybrid_stack_spec,
         vocab_size=128,
         max_sequence_length=8,
         hybrid_layer_pattern="*E*",
         pg_collection=process_group_collection,
     ).cuda()
+    model = _train_and_compare(
+        model, reference_model, process_group_collection, distributed_setup.world_size
+    )
+    assert isinstance(model.module.decoder.layers[-1], FsdpModule)
+    experts = model.module.decoder.layers[1].mlp.experts
+    assert isinstance(experts, FsdpModule)
+    for parameter in experts.parameters():
+        assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["no-overlap", "overlap"])
+def test_shortcut_moe_train_step_and_clip(process_group_collections, distributed_setup, overlap):
+    """Keep shortcut parameters together while matching reference training with wide residuals."""
+    process_group_collection, reference_process_group_collection = process_group_collections
+    config = TransformerConfig(
+        num_layers=3,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_layer_freq=[0, 1, 0],
+        moe_token_dispatcher_type="alltoall",
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_ffn_hidden_size=128,
+        moe_shortcut_connection=True,
+        moe_shortcut_parallel=overlap,
+        moe_shortcut_post_norm=True,
+        moe_shared_expert_intermediate_size=128,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+        wide_residual=WideResidualConfig(num_streams=3, learned_retention=True),
+        recompute_granularity="selective",
+        recompute_modules=["moe_act"],
+    )
+    torch.manual_seed(123)
+    reference_model = HybridModel(
+        config=replace(config, expert_model_parallel_size=1),
+        hybrid_stack_spec=wide_residual_hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="*E*",
+        pg_collection=reference_process_group_collection,
+    ).cuda()
+    model = HybridModel(
+        config=config,
+        hybrid_stack_spec=wide_residual_hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="*E*",
+        pg_collection=process_group_collection,
+    ).cuda()
+    block = model.decoder.layers[0]
+    assert isinstance(block, ShortcutMoEBlock)
+    experts = block.moe_layer.mlp.experts
+    assert experts not in FsdpUnitCollector((ShortcutMoEBlock,)).collect(model)
+
+    model = _train_and_compare(
+        model, reference_model, process_group_collection, distributed_setup.world_size
+    )
+    assert isinstance(block, FsdpModule)
+    assert not isinstance(block.compute_layer, FsdpModule)
+    assert not isinstance(block.moe_layer, FsdpModule)
+    assert not isinstance(block.moe_layer.mlp, FsdpModule)
+    assert not isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule)
+    assert isinstance(model.module.decoder.layers[-1], FsdpModule)
+    assert isinstance(experts, FsdpModule)
+    for parameter in experts.parameters():
+        assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
+
+
+def _train_and_compare(model, reference_model, process_group_collection, world_size):
+    """Copy reference weights, wrap with MFSDP, and compare five training steps."""
+    # CPU initialization gives each rank the same reference weights. Remap the
+    # EP=1 reference's global expert indices to the EP=2 model's local indices.
     model.load_state_dict(reference_model.state_dict(), strict=False)
-    for model_layer, reference_layer in zip(model.decoder.layers, reference_model.decoder.layers):
-        if isinstance(model_layer, ShortcutMoEBlock):
-            model_layer = model_layer.moe_layer
-            reference_layer = reference_layer.moe_layer
-        if not isinstance(model_layer.mlp, MoELayer):
+    for name, moe in model.named_modules():
+        if not isinstance(moe, MoELayer):
             continue
+        reference_moe = reference_model.get_submodule(name)
         for fc in ("linear_fc1", "linear_fc2"):
-            model_fc = getattr(model_layer.mlp.experts, fc)
-            reference_fc = getattr(reference_layer.mlp.experts, fc)
-            for local, global_ in enumerate(model_layer.mlp.local_expert_indices):
+            model_fc = getattr(moe.experts, fc)
+            reference_fc = getattr(reference_moe.experts, fc)
+            for local, global_ in enumerate(moe.local_expert_indices):
                 for parameter_name in ("weight", "bias"):
                     model_parameter = getattr(model_fc, f"{parameter_name}{local}", None)
                     reference_parameter = getattr(reference_fc, f"{parameter_name}{global_}", None)
                     if model_parameter is not None:
                         model_parameter.data.copy_(reference_parameter.data)
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
-    if shortcut:
-        experts = model.decoder.layers[0].moe_layer.mlp.experts
-        assert experts not in FsdpUnitCollector((ShortcutMoEBlock,)).collect(model)
     model = FullyShardedDataParallel(
-        config=config,
+        config=model.config,
         ddp_config=DistributedDataParallelConfig(
             use_megatron_fsdp=True,
             megatron_fsdp_version=2,
@@ -161,21 +214,6 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
         pg_collection=process_group_collection,
     )
     assert isinstance(model.module, FsdpModule)
-    if shortcut:
-        block = model.module.decoder.layers[0]
-        assert isinstance(block, ShortcutMoEBlock)
-        assert isinstance(block, FsdpModule)
-        assert not isinstance(block.compute_layer, FsdpModule)
-        assert not isinstance(block.moe_layer, FsdpModule)
-        assert not isinstance(block.moe_layer.mlp, FsdpModule)
-        assert not isinstance(block.shortcut_pre_mlp_layernorm, FsdpModule)
-        experts = block.moe_layer.mlp.experts
-    else:
-        experts = model.module.decoder.layers[1].mlp.experts
-    assert isinstance(model.module.decoder.layers[-1], FsdpModule)
-    assert isinstance(experts, FsdpModule)
-    for parameter in experts.parameters():
-        assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
 
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
@@ -243,3 +281,4 @@ def test_build_train_step_and_clip(process_group_collections, distributed_setup,
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
+    return model
