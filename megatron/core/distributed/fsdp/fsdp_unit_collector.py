@@ -23,41 +23,43 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 class FsdpUnitCollector:
-    """Collect dense and expert modules in pre-order, including the root."""
+    """Collect selected units and their routed experts in pre-order."""
 
-    def __init__(self, fsdp_unit_modules: tuple[type[nn.Module], ...]) -> None:
-        self._fsdp_unit_modules = fsdp_unit_modules
-        self._units_to_shard: list[nn.Module] = []
+    def __init__(self, fsdp_unit_module_types: tuple[type[nn.Module], ...]) -> None:
+        self._fsdp_unit_module_types = fsdp_unit_module_types
+        self._collected_units_in_preorder: dict[nn.Module, None] = {}
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules in pre-order, parents before children."""
-        self._units_to_shard = [module]
-        self._visit(module, inside_shortcut=False)
-        return self._units_to_shard
+        self._collected_units_in_preorder = {module: None}
+        self._visit(module, under_shortcut=False)
+        return list(self._collected_units_in_preorder)
 
-    def _visit(self, module: nn.Module, inside_shortcut: bool) -> None:
+    def _visit(self, module: nn.Module, under_shortcut: bool) -> None:
+        if self._should_shard(module, under_shortcut):
+            self._collected_units_in_preorder[module] = None
+
+        if MoELayer in self._fsdp_unit_module_types and isinstance(module, MoELayer):
+            self._collected_units_in_preorder[module.experts] = None
+
+        under_shortcut = under_shortcut or isinstance(module, ShortcutMoEBlock)
+        for child in module.children():
+            self._visit(child, under_shortcut)
+
+    def _should_shard(self, module: nn.Module, under_shortcut: bool) -> bool:
+        """Whether this module should be an independent FSDP unit."""
+        if not isinstance(module, self._fsdp_unit_module_types):
+            return False
+
         # ShortcutMoEBlock interleaves stages during training by calling
         # compute_layer.forward_pre_attn_and_core_attn()/forward_post_core_attn(),
         # moe_layer._pre_mlp_layernorm_and_residual(), and moe_layer.mlp.route()/dispatch().
         # These helper calls bypass the __call__ hooks of compute_layer,
         # moe_layer, and moe_layer.mlp. Sharding these modules separately would leave
-        # their weights ungathered; the enclosing FSDP unit cannot gather parameters
-        # owned by a nested unit. Leave these parameters with the enclosing FSDP unit.
-        # Skipping these modules does not skip visiting their children. In particular,
+        # their weights ungathered. Leave their parameters with the enclosing FSDP unit.
+        # We still visit their children. In particular,
         # moe_layer.mlp.experts runs through experts(...), which invokes its hooks,
-        # so we collect it for separate wrapping on the expert-DP mesh.
-        if (
-            isinstance(module, self._fsdp_unit_modules)
-            and not (
-                inside_shortcut and isinstance(module, (TransformerLayer, MambaLayer, MoELayer))
-            )
-            and module not in self._units_to_shard
-        ):
-            self._units_to_shard.append(module)
-        if isinstance(module, MoELayer):
-            if module.experts not in self._units_to_shard:
-                self._units_to_shard.append(module.experts)
-
-        inside_shortcut = inside_shortcut or isinstance(module, ShortcutMoEBlock)
-        for child in module.children():
-            self._visit(child, inside_shortcut)
+        # so selecting MoELayer also selects its experts for the expert-DP mesh.
+        if under_shortcut and isinstance(module, (TransformerLayer, MambaLayer, MoELayer)):
+            return False
+        return True

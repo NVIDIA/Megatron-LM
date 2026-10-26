@@ -601,8 +601,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ddp_config: Data-parallel and sharding configuration.
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
-                unspecified, transformer, MoE transformer, Mamba layers, and shortcut
-                MoE blocks are used. An explicit list replaces these defaults.
+                unspecified, transformer, MoE transformer, MoE MLP, Mamba layers, and
+                shortcut MoE blocks are used. An explicit list replaces these defaults.
+                Including MoELayer also selects its routed experts for the expert-DP
+                mesh. Custom lists must include MoELayer when expert and dense
+                sharding settings differ.
                 Directly invoked shortcut helper layers remain owned by their enclosing
                 FSDP unit.
             disable_bucketing: Compatibility argument that must remain ``False`` for
@@ -638,6 +641,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             fsdp_unit_modules = [
                 TransformerLayer,
                 MoETransformerLayer,
+                MoELayer,
                 MambaLayer,
                 ShortcutMoEBlock,
             ]
@@ -726,7 +730,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            # Pre-order: collect only the modules to shard.
             collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
             units_to_shard = collector.collect(module)
 

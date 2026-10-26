@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -35,15 +36,16 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.fixture
-def process_group_collections(distributed_setup):
-    """Yield EP=2 process groups and singleton reference groups, then clean them up."""
+def process_group_collections(distributed_setup, request):
+    """Yield the requested EP groups and singleton reference groups, then clean up."""
     world_size = distributed_setup.world_size
-    if world_size < 2 or world_size % 2:
-        pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
-    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
+    ep_size = getattr(request, "param", 2)
+    if world_size < 2 or world_size % ep_size:
+        pytest.skip("MFSDP v2 EP adapter test requires at least two ranks, divisible by EP.")
+    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
     process_group_collection = ProcessGroupCollection.use_mpu_process_groups()
-    assert process_group_collection.ep.size() == 2
-    assert process_group_collection.expt_dp.size() == world_size // 2
+    assert process_group_collection.ep.size() == ep_size
+    assert process_group_collection.expt_dp.size() == world_size // ep_size
     reference_group = torch.distributed.new_group(
         [torch.distributed.get_rank()], use_local_synchronization=True
     )
@@ -67,20 +69,71 @@ def process_group_collections(distributed_setup):
     destroy_model_parallel()
 
 
+@pytest.fixture
+def shortcut_model(process_group_collections):
+    """Build a small shortcut model for unit-selection checks."""
+    process_group_collection, _ = process_group_collections
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        expert_model_parallel_size=process_group_collection.ep.size(),
+        moe_layer_freq=[0, 1],
+        moe_token_dispatcher_type="alltoall",
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_ffn_hidden_size=128,
+        moe_shortcut_connection=True,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        gradient_accumulation_fusion=False,
+        attention_backend=AttnBackend.unfused,
+    )
+    return HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        hybrid_layer_pattern="*E",
+        pg_collection=process_group_collection,
+    ).cuda()
+
+
+@pytest.mark.parametrize("include_moe", [False, True])
+def test_moe_selection_controls_expert_unit(shortcut_model, include_moe):
+    """Only selected MoE types automatically contribute expert units."""
+    block = shortcut_model.decoder.layers[0]
+    moe = block.moe_layer.mlp
+    unit_types = [ShortcutMoEBlock]
+    if include_moe:
+        unit_types.append(MoELayer)
+    units = FsdpUnitCollector(tuple(unit_types)).collect(shortcut_model)
+    assert units[:2] == [shortcut_model, block]
+    # The shortcut path invokes the MoE helpers directly, even when its type is enabled.
+    assert moe not in units
+    assert (moe.experts in units) == include_moe
+    assert FsdpUnitCollector(()).collect(moe) == [moe]
+
+
 @pytest.mark.parametrize(
-    "shortcut, custom_units, overlap, recompute_norms, wide_residual",
+    "shortcut, custom_units, overlap, recompute_norms, wide_residual, "
+    "exclude_moe, process_group_collections",
     [
-        (False, False, False, False, False),
-        (False, True, False, False, False),
-        (True, False, False, False, False),
-        (True, True, False, False, False),
-        (True, True, True, False, False),
-        (True, True, False, True, False),
-        (True, True, True, True, False),
-        (False, False, False, False, True),
-        (True, False, False, False, True),
-        (True, False, True, False, True),
+        (False, False, False, False, False, False, 2),
+        (False, True, False, False, False, False, 2),
+        (True, False, False, False, False, False, 2),
+        (True, True, False, False, False, False, 2),
+        (True, True, True, False, False, False, 2),
+        (True, True, False, True, False, False, 2),
+        (True, True, True, True, False, False, 2),
+        (False, False, False, False, True, False, 2),
+        (True, False, False, False, True, False, 2),
+        (True, False, True, False, True, False, 2),
+        (False, False, False, False, False, True, 1),
+        (True, False, False, False, True, True, 1),
     ],
+    indirect=["process_group_collections"],
     ids=[
         "standard",
         "standard-custom-units",
@@ -92,6 +145,8 @@ def process_group_collections(distributed_setup):
         "wide-residual-moe-act",
         "wide-residual-shortcut-moe-act",
         "wide-residual-shortcut-overlap-moe-act",
+        "ep1-excluded-moe",
+        "ep1-excluded-wide-shortcut-moe",
     ],
 )
 def test_build_train_step_and_clip(
@@ -102,18 +157,19 @@ def test_build_train_step_and_clip(
     overlap,
     recompute_norms,
     wide_residual,
+    exclude_moe,
 ):
-    """Shard experts over expert-DP and clip their combined gradients."""
+    """Compare MoE training and gradient clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
     world_size = distributed_setup.world_size
     # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
-    # initialization instead uses the globally configured EP=2 rank in its RNG seed.
+    # initialization instead uses the globally configured EP rank in its RNG seed.
     config = TransformerConfig(
         num_layers=4 if wide_residual else 2,
         hidden_size=64,
         num_attention_heads=4,
         num_moe_experts=4,
-        expert_model_parallel_size=2,
+        expert_model_parallel_size=process_group_collection.ep.size(),
         moe_layer_freq=[0, 1, 0, 1] if wide_residual else [0, 1],
         moe_token_dispatcher_type="alltoall",
         moe_router_topk=2,
@@ -179,6 +235,8 @@ def test_build_train_step_and_clip(
     fsdp_unit_modules = None
     if custom_units:
         fsdp_unit_modules = [ShortcutMoEBlock, TransformerLayer, MoETransformerLayer, MoELayer]
+    if exclude_moe:
+        fsdp_unit_modules = [ShortcutMoEBlock, TransformerLayer, MoETransformerLayer]
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -204,9 +262,12 @@ def test_build_train_step_and_clip(
         experts = block.moe_layer.mlp.experts
     else:
         experts = model.module.decoder.layers[1].mlp.experts
-    assert isinstance(experts, FsdpModule)
+    assert isinstance(experts, FsdpModule) == (not exclude_moe)
     for parameter in experts.parameters():
-        assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
+        if exclude_moe:
+            assert parameter.device_mesh.get_group("dp") == process_group_collection.dp_cp
+        else:
+            assert parameter.device_mesh.get_group("expert_dp") == process_group_collection.expt_dp
 
     optimizer_config = OptimizerConfig(
         lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
@@ -280,11 +341,11 @@ def test_build_train_step_and_clip(
     "unit_modules, shard_shortcut",
     [
         (None, True),
-        ([ShortcutMoEBlock], True),
+        ([ShortcutMoEBlock, MoELayer], True),
         ([TransformerLayer, MoETransformerLayer, MoELayer], False),
-        ([], False),
+        ([MoELayer], False),
     ],
-    ids=["default", "explicit-shortcut", "other-types", "root-only"],
+    ids=["default", "explicit-shortcut", "other-types", "root-and-experts"],
 )
 def test_shortcut_ownership_and_weight_lifetime(
     process_group_collections, unit_modules, shard_shortcut
