@@ -8,13 +8,24 @@
 
 MFSDP shards one **module** at a time. By default, parameters owned by that
 module with the same dtype and `requires_grad` form one parameter group.
-They are packed into a shared buffer, which is all-gathered for module
-computation and gradient-reduced together after backward. The default
-`RowAtomic` layout divides that buffer into equal-sized rank segments,
-keeping rows intact while allowing matrices to cross rank boundaries.
+Each group packs its weights and gradients into separate contiguous
+buffers. Ranks store local segments of these buffers. Weights are
+all-gathered for module computation; gradients are reduce-scattered after
+backward.
 
+The [sharding placements](../megatron_fsdp/experimental/placement.py)
+determine how the buffers are partitioned:
+
+- `RowAtomic`: keeps rows intact, with equal-sized rank segments. This is
+  the default for ordinary floating-point parameters.
+- `BlockAtomic(k)`: keeps blocks of `k` consecutive rows intact, with
+  equal-sized rank segments. MXFP8 uses `k=32`.
+- `TensorAtomic`: assigns each complete parameter to one rank. Rank
+  segments may differ in size or be empty.
+
+By contrast,
 [PyTorch FSDP2](https://docs.pytorch.org/docs/2.14/distributed.fsdp.fully_shard.html#communication-grouping-and-scheduling)
-instead shards **each parameter independently along dim 0**. Both systems
+shards **each parameter independently along dim 0**. Both systems
 can group parameters for communication; the difference is how they form
 the shards.
 
@@ -25,8 +36,8 @@ is to provide whole-matrix inputs while retaining module-level sharding.
 
 ### Example
 
-Five trainable FP32 parameters in one module share the following buffer.
-This layout comes from
+Five trainable FP32 parameters owned by one module are packed as follows.
+This RowAtomic layout comes from
 [`test_compute_layout_fills_lcm_padding_gaps`](../../../../../../tests/unit_tests/distributed/mfsdp_v2/test_dbuffer.py#L60)
 and the illustration in
 [`build_for_row_atomic`](../megatron_fsdp/experimental/layout_builder.py#L39).
