@@ -154,7 +154,10 @@ def switch_load_balancing_loss_func(
     else:
         safe_total_num_tokens = max(total_num_tokens, 1)
 
-    if fused:
+    # TE's fused value reduction uses floating-point atomicAdd. Its derivative
+    # can be repeatable while the reported scalar differs by an ULP. Honor the
+    # caller's deterministic mode with the existing ordered PyTorch expression.
+    if fused and not torch.are_deterministic_algorithms_enabled():
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
         return fused_moe_aux_loss(

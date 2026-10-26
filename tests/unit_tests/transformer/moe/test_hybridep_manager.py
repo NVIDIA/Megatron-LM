@@ -30,7 +30,10 @@ def test_combine_only_releases_dynamic_token_count(
         return kwargs["x"]
 
     monkeypatch.setattr(
-        "megatron.core.transformer.moe.token_dispatcher.hybrid_ep_combine", fake_hybrid_ep_combine
+        manager,
+        "_fused_a2a",
+        SimpleNamespace(hybrid_ep_combine=fake_hybrid_ep_combine),
+        raising=False,
     )
 
     hidden_states = torch.empty(4, 8)

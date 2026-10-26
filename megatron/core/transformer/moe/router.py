@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -12,11 +12,11 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -589,6 +589,13 @@ class TopKRouter(Router):
             and self.routing_type != "sinkhorn"
         )
         backend = config.moe_flex_dispatcher_backend
+        supports_dense_hybridep = False
+        if fused_dense_routing and backend == "hybridep":
+            # Optional MoE transports must not load their native DSOs before the
+            # CP parent communicator has been initialized.
+            from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
+
+            supports_dense_hybridep = HAVE_HYBRIDEP_DENSE_ROUTING
 
         if config.moe_virtual_expert_load_balance:
             # The MoonEP planner consumes int64 IDs for every routing mode.
@@ -599,7 +606,7 @@ class TopKRouter(Router):
             fused_dense_routing
             and backend == "hybridep"
             and config.moe_hybridep_routing_map_mode == "indices"
-            and HAVE_HYBRIDEP_DENSE_ROUTING
+            and supports_dense_hybridep
             and self.expt_tp_group.size() * config.num_moe_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
         ):
             return torch.int16
@@ -675,6 +682,11 @@ class TopKRouter(Router):
         if seq_aux_loss_coeff == 0:
             return probs
 
+        if packed_seq_params is not None and packed_seq_params.seq_idx is not None:
+            return self._apply_packed_seq_aux_loss(
+                probs, scores_for_aux_loss, routing_map, seq_aux_loss_coeff, packed_seq_params
+            )
+
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
         routing_map = routing_map.reshape(seq_length, -1)
 
@@ -718,6 +730,83 @@ class TopKRouter(Router):
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
         )
         return probs
+
+    def _apply_packed_seq_aux_loss(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        seq_aux_loss_coeff: float,
+        packed_seq_params: PackedSeqParams,
+    ) -> torch.Tensor:
+        """Apply token-weighted sequence aux loss to a flattened THD pack.
+
+        Sequence IDs survive CP slicing, so statistics are computed for each
+        original sequence rather than treating the whole flattened pack as one
+        sample.  The token-weighted numerator is additive across arbitrary pack
+        and microbatch boundaries.
+        """
+        seq_idx = packed_seq_params.seq_idx.reshape(-1)
+        local_rows = routing_map.shape[0]
+        if seq_idx.numel() != local_rows:
+            tp_size = self.tp_group.size()
+            if not self.config.sequence_parallel or seq_idx.numel() != local_rows * tp_size:
+                raise RuntimeError(
+                    f"Packed sequence IDs have {seq_idx.numel()} rows, but router input has "
+                    f"{local_rows} rows"
+                )
+            seq_idx = seq_idx.narrow(0, self.tp_group.rank() * local_rows, local_rows)
+        seq_idx = seq_idx.to(torch.int64)
+
+        cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+        if cu_seqlens is None:
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+        if cu_seqlens is None:
+            raise RuntimeError("Packed sequence aux loss requires cu_seqlens metadata")
+        # PackedSeqParams assigns an implicit tail the index len(cu_seqlens) - 1.
+        # Reserve that slot on every CP rank, even ranks with no local tail tokens.
+        num_sequence_slots = cu_seqlens.numel()
+
+        local_tokens_per_expert = scores_for_aux_loss.new_zeros(
+            (num_sequence_slots, self.config.num_moe_experts)
+        )
+        local_tokens_per_expert.index_add_(
+            0, seq_idx, routing_map.to(dtype=scores_for_aux_loss.dtype)
+        )
+        global_tokens_per_expert = local_tokens_per_expert
+        aux_loss_groups = self._get_aux_loss_groups(packed_seq_params)
+        for group in aux_loss_groups.loss_reduce_groups:
+            global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                global_tokens_per_expert, group
+            )
+
+        local_probability_sums = scores_for_aux_loss.new_zeros(
+            (num_sequence_slots, self.config.num_moe_experts)
+        )
+        local_probability_sums.index_add_(0, seq_idx, scores_for_aux_loss)
+
+        tokens_per_sequence = global_tokens_per_expert.sum(dim=-1) / self.topk
+        safe_tokens_per_sequence = tokens_per_sequence.clamp(min=1)
+        weighted_aux_numerator = (
+            (local_probability_sums * global_tokens_per_expert).sum(dim=-1)
+            / safe_tokens_per_sequence
+        ).sum() * (self.config.num_moe_experts / self.topk)
+        total_num_tokens = tokens_per_sequence.sum()
+        aux_loss = weighted_aux_numerator * seq_aux_loss_coeff / total_num_tokens.clamp(min=1)
+        local_num_tokens = local_tokens_per_expert.sum() / self.topk
+
+        return self.attach_and_log_load_balancing_loss(
+            probs,
+            seq_aux_loss_coeff,
+            aux_loss,
+            "seq_load_balancing_loss",
+            self.tp_dp_cp_group,
+            needs_dp_avg=False,
+            valid_token_count=local_num_tokens,
+            aux_loss_scale_num_tokens=total_num_tokens,
+            metric_value=weighted_aux_numerator,
+            normalize_metric_by_global_tokens=True,
+        )
 
     def _apply_global_aux_loss(
         self,
@@ -823,6 +912,8 @@ class TopKRouter(Router):
         aux_loss_logging_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_num_tokens: Optional[Union[int, torch.Tensor]] = None,
+        metric_value: Optional[torch.Tensor] = None,
+        normalize_metric_by_global_tokens: bool = False,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -856,6 +947,8 @@ class TopKRouter(Router):
             and self.config.mtp_num_layers is not None
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
+            if metric_value is not None:
+                metric_value = metric_value / self.config.mtp_num_layers
 
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
@@ -863,11 +956,12 @@ class TopKRouter(Router):
         # results and the reduced load_balancing_loss logging value.
         layer_number, num_layers = self._get_metric_layer_number()
 
-        metric_value = aux_loss / aux_loss_coeff
+        if metric_value is None:
+            metric_value = aux_loss / aux_loss_coeff
         if aux_loss_logging_reduce_groups is not None:
             metric_value = metric_value.detach().clone()
             for group in aux_loss_logging_reduce_groups:
-                torch.distributed.all_reduce(metric_value, group=group)
+                metric_value = reduce_from_tensor_model_parallel_region(metric_value, group)
 
         get_moe_metrics_tracker().record(
             aux_loss_name,
@@ -877,6 +971,7 @@ class TopKRouter(Router):
             reduce_group=reduce_group,
             avg_group=avg_group,
             needs_dp_avg=needs_dp_avg,
+            normalize_by_global_tokens=normalize_metric_by_global_tokens,
         )
         if self.calculate_per_token_loss:
             # Finalize-model-grads divides by the global valid-token count. Weight
@@ -900,7 +995,9 @@ class TopKRouter(Router):
                     assert reduce_group is not None, "reduce_group is required for aux-loss scaling"
                     aux_loss_scale_reduce_groups = (reduce_group,)
                 for group in aux_loss_scale_reduce_groups:
-                    torch.distributed.all_reduce(aux_loss_scale_num_tokens, group=group)
+                    aux_loss_scale_num_tokens = reduce_from_tensor_model_parallel_region(
+                        aux_loss_scale_num_tokens, group
+                    )
             activation = MoEAuxLossAutoScaler.apply(
                 activation, aux_loss * aux_loss_scale_num_tokens
             )

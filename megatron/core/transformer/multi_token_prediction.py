@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import inspect
@@ -17,6 +17,7 @@ from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layo
 from megatron.core.context_parallel.sequence_roll import roll_contiguous, roll_contiguous_fields
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
+from megatron.core.dynamic_cp_group import LogicalCPGroup, get_process_group_ranks
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
@@ -31,6 +32,7 @@ from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
+    reduce_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.tensor_parallel.inference_layers import (
@@ -80,6 +82,99 @@ _MTP_SEQUENCE_FIELD_FILL_VALUES = {
     "padding_mask": True,
     "mtp_input_mask": False,
 }
+
+
+def bind_native_mtp_cp_group(
+    cp_group: torch.distributed.ProcessGroup | LogicalCPGroup | None,
+    parent_group: torch.distributed.ProcessGroup | None,
+) -> None:
+    """Bind a logical MTP group before halo exchange, including before attention.
+
+    Args:
+        cp_group: Effective CP group for this microbatch.
+        parent_group: Existing native transport's parent ProcessGroup.
+    """
+    if isinstance(cp_group, LogicalCPGroup) and cp_group.size() > 1:
+        from transformer_engine.pytorch.attention.native_cp_transport import (
+            set_native_cp_parent_group,
+        )
+
+        set_native_cp_parent_group(cp_group, parent_group)
+
+
+def _get_native_mtp_transport(cp_group):
+    if not isinstance(cp_group, LogicalCPGroup):
+        return None
+    from transformer_engine.pytorch.attention.native_cp_transport import get_native_cp_transport
+
+    transport = get_native_cp_transport(cp_group)
+    if transport is None:
+        raise RuntimeError("Logical MTP CP group has no native parent transport")
+    return transport
+
+
+def _exchange_mtp_halos(cp_group, send_buffers, send_rank, recv_buffers, recv_rank):
+    """Exchange matching field halos, retaining grouped NCCL for real ProcessGroups."""
+    transport = _get_native_mtp_transport(cp_group)
+    if transport is not None:
+        for send, recv in zip(send_buffers, recv_buffers):
+            transport.exchange(send, send_rank, recv, recv_rank, channel=3)
+        return []
+
+    p2p_ops = []
+    if recv_rank is not None:
+        p2p_ops.extend(
+            torch.distributed.P2POp(torch.distributed.irecv, recv, recv_rank, group=cp_group)
+            for recv in recv_buffers
+        )
+    if send_rank is not None:
+        p2p_ops.extend(
+            torch.distributed.P2POp(torch.distributed.isend, send, send_rank, group=cp_group)
+            for send in send_buffers
+        )
+    return torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
+
+
+def _exchange_zigzag_mtp_boundaries(cp_group, send_buffers, recv_buffers, fill_value):
+    """Exchange the front and mirrored-tail boundaries in two matching directions."""
+    ranks = get_process_group_ranks(cp_group)
+    rank = cp_group.rank()
+    previous = ranks[rank - 1] if rank else None
+    following = ranks[rank + 1] if rank + 1 < len(ranks) else None
+    transport = _get_native_mtp_transport(cp_group)
+    if transport is not None:
+        transport.exchange(send_buffers[0], previous, recv_buffers[0], following, channel=3)
+        transport.exchange(send_buffers[1], following, recv_buffers[1], previous, channel=3)
+    else:
+        ops = []
+        if previous is not None:
+            ops.extend(
+                (
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, send_buffers[0], previous, cp_group
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, recv_buffers[1], previous, cp_group
+                    ),
+                )
+            )
+        if following is not None:
+            ops.extend(
+                (
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, recv_buffers[0], following, cp_group
+                    ),
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, send_buffers[1], following, cp_group
+                    ),
+                )
+            )
+        for work in torch.distributed.batch_isend_irecv(ops) if ops else []:
+            work.wait()
+    if previous is None:
+        recv_buffers[1].fill_(fill_value)
+    if following is None:
+        recv_buffers[0].copy_(send_buffers[1])
 
 
 class MTPSequenceRollHalos:
@@ -386,8 +481,8 @@ def _build_contiguous_packed_seq_roll_plan(
 
     local_seq_len = tensor.size(dims)
     cp_size = cp_group.size()
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = cp_group.rank()
+    global_ranks = get_process_group_ranks(cp_group)
 
     cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
     if cu.numel() > 1:
@@ -631,6 +726,10 @@ def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
     """Exchange both roll boundaries with the adjacent context-parallel ranks."""
     first_boundary = first_boundary.contiguous()
     second_boundary = second_boundary.contiguous()
+    if isinstance(cp_group, LogicalCPGroup):
+        received = [torch.empty_like(first_boundary), torch.empty_like(second_boundary)]
+        _exchange_zigzag_mtp_boundaries(cp_group, [first_boundary, second_boundary], received, 0)
+        return received
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
     local_rank = torch.distributed.get_rank(group=cp_group)
     first_received = (
@@ -875,7 +974,7 @@ def _roll_tensor_unpacked_zigzag_cp(tensor, shifts, dims, cp_group, fill_value=0
         rolled_tensor_list[1].select(dims, shifts),
         cp_group,
     )
-    if fill_value != 0 and torch.distributed.get_rank(group=cp_group) == 0:
+    if fill_value != 0 and cp_group.rank() == 0:
         # Rank 0 holds the global sequence end; the shared exchange zero-fills it.
         second_received.fill_(fill_value)
 
@@ -1048,7 +1147,7 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
     first_received, second_received = _exchange_cp_roll_boundaries(
         first_boundary, second_boundary, cp_group
     )
-    if fill_value != 0 and torch.distributed.get_rank(group=cp_group) == 0:
+    if fill_value != 0 and cp_group.rank() == 0:
         # Rank 0 holds every document's global end; the shared exchange zero-fills it.
         second_received.fill_(fill_value)
 
@@ -1119,26 +1218,12 @@ def _prefetch_contiguous_packed_cp_roll_halos(
         halos.append(tensor.new_full(halo_shape, fill_value))
 
     # Retain contiguous send slices until every grouped work handle completes.
-    send_buffers: List[Tensor] = []
-    p2p_ops = []
-    if plan.has_sequences and plan.recv_rank is not None:
-        for halo in halos:
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, halo, plan.recv_rank, group=plan.cp_group
-                )
-            )
-    if plan.has_sequences and plan.send_rank is not None:
-        for tensor in tensors:
-            send_buffer = tensor.narrow(-1, 0, width).contiguous()
-            send_buffers.append(send_buffer)
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, send_buffer, plan.send_rank, group=plan.cp_group
-                )
-            )
-
-    works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
+    send_buffers = [tensor.narrow(-1, 0, width).contiguous() for tensor in tensors]
+    works = (
+        _exchange_mtp_halos(plan.cp_group, send_buffers, plan.send_rank, halos, plan.recv_rank)
+        if plan.has_sequences
+        else []
+    )
     for work in works:
         work.wait()
 
@@ -1255,46 +1340,22 @@ def _roll_tensors_packed_seq_contiguous_cp(
             rolled_tensor[..., contiguous_roll_plan.invalid_next] = fill_value
         return rolled_tensors
 
-    recv_buffers: List[Optional[Tensor]] = [None] * len(tensors)
+    recv_buffers = [torch.empty_like(tensor.select(dims, 0)) for tensor in tensors]
     # Keep contiguous send buffers alive until every grouped work handle completes.
-    send_buffers: List[Tensor] = []
-    p2p_ops = []
-
-    if contiguous_roll_plan.recv_rank is not None:
-        # After a left roll, each local tail consumes the first element from the
-        # next contiguous CP shard.
-        for index, tensor in enumerate(tensors):
-            recv_buffer = torch.empty_like(tensor.select(dims, 0))
-            recv_buffers[index] = recv_buffer
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    recv_buffer,
-                    contiguous_roll_plan.recv_rank,
-                    group=contiguous_roll_plan.cp_group,
-                )
-            )
-    if contiguous_roll_plan.send_rank is not None:
-        # This rank's first element becomes the previous shard's local tail.
-        for tensor in tensors:
-            send_buffer = tensor.select(dims, 0).contiguous()
-            send_buffers.append(send_buffer)
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend,
-                    send_buffer,
-                    contiguous_roll_plan.send_rank,
-                    group=contiguous_roll_plan.cp_group,
-                )
-            )
-
-    works = torch.distributed.batch_isend_irecv(p2p_ops) if p2p_ops else []
+    send_buffers = [tensor.select(dims, 0).contiguous() for tensor in tensors]
+    works = _exchange_mtp_halos(
+        contiguous_roll_plan.cp_group,
+        send_buffers,
+        contiguous_roll_plan.send_rank,
+        recv_buffers,
+        contiguous_roll_plan.recv_rank,
+    )
     rolled_tensors = [torch.roll(tensor, shifts=-1, dims=dims) for tensor in tensors]
     for work in works:
         work.wait()
 
     for rolled_tensor, recv_buffer, fill_value in zip(rolled_tensors, recv_buffers, fill_values):
-        if recv_buffer is not None:
+        if contiguous_roll_plan.recv_rank is not None:
             rolled_tensor.select(dims, -1).copy_(recv_buffer)
         # Apply the shared boundary mask after installing the adjacent value so a
         # physical packed-sequence end always wins over a cross-rank successor.
@@ -2548,10 +2609,16 @@ def process_mtp_loss(
             # and re-scale by the original token count.
             # Avoid division by zero
             assert original_num_tokens is not None
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
-            )
+            normalization_counts = torch.stack((original_num_tokens, num_tokens))
+            if cp_group is not None and cp_group.size() > 1:
+                # All shards of one pack share its original/rolled-token ratio.
+                # Logical groups reduce through the same native parent arena.
+                normalization_counts = reduce_from_tensor_model_parallel_region(
+                    normalization_counts, cp_group
+                )
+            original_count, rolled_count = normalization_counts.unbind()
+            num_tokens_safe = torch.clamp(rolled_count, min=1)
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss * (original_count / num_tokens_safe)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
             mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
@@ -2638,6 +2705,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
+        self._mtp_cp_parent_group = getattr(pg_collection, "dp_cp", None)
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mhc_enabled = self.config.enable_mhc_connections
@@ -2844,26 +2912,33 @@ class MultiTokenPredictionLayer(MegatronModule):
             embedding: Parent model's embedding module.
             hidden_states: Current-depth hidden states in [s, b, h] layout.
             packed_seq_params: Packed sequence layout metadata.
-            padding_mask: Optional padding mask rolled with input IDs.
+            padding_mask: CP-local padding mask rolled with input IDs. Direct callers
+                may pass an SP shard, which is gathered before token-side rolling.
             sequence_roll_context: Layout-specific state shared by MTP rolls
                 in this microbatch.
             roll_depth: Zero-based prediction depth selecting the prefetched
                 successor row for this repeated roll.
         """
         cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        bind_native_mtp_cp_group(cp_group, getattr(self, "_mtp_cp_parent_group", None))
 
-        # The parent model keeps a full-length mask, while subsequent MTP depths
-        # receive the SP-local mask returned below. Gather only the latter.
-        if (
-            padding_mask is not None
-            and self.config.sequence_parallel
-            and padding_mask.shape != input_ids.shape
-        ):
-            padding_mask = gather_from_sequence_parallel_region(
-                padding_mask.transpose(0, 1).contiguous(),
-                tensor_parallel_output_grad=False,
-                group=self.tp_group,
-            ).transpose(0, 1)
+        if padding_mask is not None and padding_mask.shape != input_ids.shape:
+            if (
+                not self.config.sequence_parallel
+                or padding_mask.shape[:-1] != input_ids.shape[:-1]
+                or padding_mask.shape[-1] * self.tp_group.size() != input_ids.shape[-1]
+            ):
+                raise ValueError("MTP padding_mask must match CP-local tokens or their SP shard")
+            padding_mask = (
+                gather_from_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(),
+                    tensor_parallel_output_grad=False,
+                    group=self.tp_group,
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         tensors_to_roll = [input_ids]
         fill_values = [0]
         sequence_fields = ["input_ids"]
@@ -2905,14 +2980,6 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         if mtp_input_mask is not None:
             mtp_input_mask = rolled_tensors[next_rolled_tensor].bool()
-        if padding_mask is not None and self.config.sequence_parallel:
-            padding_mask = (
-                scatter_to_sequence_parallel_region(
-                    padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
         if mtp_input_mask is not None:
             valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
@@ -3392,6 +3459,22 @@ class MultiTokenPredictionLayer(MegatronModule):
                 decoder_input=decoder_input, hidden_states=hidden_states
             )
 
+        # Token-side rolls retain the full CP-local mask. Precomputed embeddings
+        # may already carry an SP mask, so only shard full-length metadata here.
+        transformer_padding_mask = padding_mask
+        if (
+            padding_mask is not None
+            and padding_mask.shape[1] != hidden_states.shape[0]
+            and self.config.sequence_parallel
+        ):
+            transformer_padding_mask = (
+                scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+
         # Legacy GPT MTP owns one outer checkpoint around its projection and Transformer
         # layer. Hybrid MTP instead delegates full recompute to the nested HybridStack so
         # that ``recompute_num_layers`` controls its layer chunks without nesting checkpoints.
@@ -3406,7 +3489,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 decoder_input=decoder_input,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                padding_mask=padding_mask,
+                padding_mask=transformer_padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -3425,7 +3508,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 decoder_input=decoder_input,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                padding_mask=padding_mask,
+                padding_mask=transformer_padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -3617,6 +3700,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         if pg_collection is None:
             # Use default MPU process groups if not provided
             required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
+            if config.use_native_cp_transport:
+                required_pgs.append('dp_cp')
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         else:
             # Ensure the provided process groups include TP, CP, and PP.

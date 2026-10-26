@@ -2894,6 +2894,7 @@ def pretrain(
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
+        model_config=getattr(cfg_container, "model", None),
         training=True,
         build_tokenizer=build_tokenizer,
         get_embedding_ranks=get_embedding_ranks,
@@ -5320,6 +5321,7 @@ def training_log(
             num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
+            total_real_tokens=total_real_tokens_in_batch,
         )
 
     # Log MTP metrics.

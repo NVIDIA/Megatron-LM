@@ -1,7 +1,8 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import torch
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import (
     get_pg_size,
@@ -30,6 +31,14 @@ def _reduce(input_, group):
     # Bypass the function if we are using only 1 GPU.
     if group.size() == 1:
         return input_
+
+    if isinstance(group, LogicalCPGroup):
+        from transformer_engine.pytorch.attention.native_cp_transport import get_native_cp_transport
+
+        transport = get_native_cp_transport(group)
+        if transport is None:
+            raise RuntimeError("Logical CP group has no native parent transport")
+        return transport.all_reduce(input_, group)
 
     # All-reduce.
     # Note: If input_ is contiguous, it is mutated in-place.

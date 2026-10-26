@@ -35,6 +35,7 @@ from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
+    bind_native_mtp_cp_group,
     mtp_on_this_rank,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
@@ -859,6 +860,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # Prefetch only after converting to the MTP layout: cached rows belong
             # to these token IDs and this packed metadata, not the decoder layout.
             mtp_cp_group = resolve_cp_group(self.pg_collection.cp, mtp_inputs.packed_seq_params)
+            bind_native_mtp_cp_group(mtp_cp_group, getattr(self.pg_collection, "dp_cp", None))
             sequence_roll_tokens = (
                 mtp_inputs.input_ids if mtp_inputs.input_ids is not None else mtp_inputs.labels
             )

@@ -1,9 +1,10 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model and data parallel groups."""
 
 import logging
 import os
+import sys
 import warnings
 from datetime import timedelta
 from typing import Callable, Dict, List, Optional, Sequence
@@ -11,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
 from .tensor_parallel.gtp_parallel_layout import GTPParallelLayout
@@ -459,32 +461,49 @@ def create_dynamic_dp_cp_groups(
     ranks: Sequence[int],
     pg_options: object,
     min_cp_size: int = 1,
+    use_logical_groups: bool = False,
     timeout: Optional[timedelta] = None,
-) -> Dict[int, torch.distributed.ProcessGroup]:
+) -> Dict[int, torch.distributed.ProcessGroup | LogicalCPGroup]:
     """
     Creates groups required for dynamic DPxCP.
     Creates a group for every valid runtime size below the full DPxCP size.
     Returns a dictionary indexed by group size.
+
+    Native transport uses topology-only logical groups in bounded-peer ring
+    order. The legacy path keeps its original ProcessGroups and rank order.
     """
     dynamic_dp_cp_groups = {}
-    valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(len(ranks))
-    if min_cp_size not in valid_group_sizes:
-        raise ValueError(
-            f"min_dynamic_context_parallel_size={min_cp_size} is not a valid group size "
-            f"for DPxCP size {len(ranks)}; expected one of {valid_group_sizes}"
-        )
-    group_sizes = [
-        group_size for group_size in valid_group_sizes if min_cp_size <= group_size < len(ranks)
-    ]
+    # The existing DPxCP parent is the largest legacy group. Native mode also
+    # needs a logical descriptor for that size so attention can select its ring.
+    if use_logical_groups:
+        if not 1 <= min_cp_size <= len(ranks):
+            raise ValueError("min_dynamic_context_parallel_size is outside the DPxCP domain")
+        group_sizes = range(min_cp_size, len(ranks) + 1)
+    else:
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(len(ranks))
+        if min_cp_size not in valid_group_sizes:
+            raise ValueError(
+                f"min_dynamic_context_parallel_size={min_cp_size} is not a valid group size "
+                f"for DPxCP size {len(ranks)}; expected one of {valid_group_sizes}"
+            )
+        group_sizes = [size for size in valid_group_sizes if min_cp_size <= size < len(ranks)]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
-            group = create_group(
-                ranks[i : i + group_size],
-                timeout=timeout,
-                pg_options=pg_options,
-                group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
-            )
-            if rank in ranks[i : i + group_size]:
+            group_ranks = ranks[i : i + group_size]
+            if use_logical_groups and len(group_ranks) != group_size:
+                continue
+            if use_logical_groups:
+                if rank not in group_ranks:
+                    continue
+                group = LogicalCPGroup.from_parent_interval(ranks, i, group_size, rank)
+            else:
+                group = create_group(
+                    group_ranks,
+                    timeout=timeout,
+                    pg_options=pg_options,
+                    group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
+                )
+            if rank in group_ranks:
                 assert (
                     group_size not in dynamic_dp_cp_groups
                 ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
@@ -654,8 +673,17 @@ def initialize_model_parallel(
     dynamic_context_parallel: bool = False,
     min_dynamic_context_parallel_size: int = 1,
     gtp_remat_num_sequence_shards: int = 1,
+    use_native_cp_transport: bool = False,
+    native_cp_transport_checker: Optional[
+        Callable[[Optional[torch.distributed.ProcessGroup]], Optional[str]]
+    ] = None,
 ) -> None:
     """Initialize model data parallel groups.
+
+    A ``native_cp_transport_checker`` may return a local unavailability reason
+    (or None). It is called first without a parent, then with the materialized
+    DP×CP parent; all WORLD ranks agree before creating dynamic CP groups.
+    Without a checker, ``use_native_cp_transport`` retains the explicit library behavior.
 
     Args:
         tensor_model_parallel_size (int, default = 1):
@@ -1128,6 +1156,20 @@ def initialize_model_parallel(
 
     if dynamic_context_parallel:
         global _DYNAMIC_DP_CP_GROUPS
+        if native_cp_transport_checker is not None:
+            use_native_cp_transport = _agree_on_native_cp_transport(
+                native_cp_transport_checker(None)
+            )
+        if use_native_cp_transport:
+            # Materialize the parent before model construction can load optional native MoE DSOs.
+            torch.distributed.barrier(
+                group=_DATA_PARALLEL_GROUP_WITH_CP, device_ids=[torch.cuda.current_device()]
+            )
+            torch.cuda.synchronize()
+            if native_cp_transport_checker is not None:
+                use_native_cp_transport = _agree_on_native_cp_transport(
+                    native_cp_transport_checker(_DATA_PARALLEL_GROUP_WITH_CP)
+                )
         for ranks_with_cp in token_rank_generator.get_ranks("dp-cp"):
             _DYNAMIC_DP_CP_GROUPS.update(
                 create_dynamic_dp_cp_groups(
@@ -1135,6 +1177,7 @@ def initialize_model_parallel(
                     ranks_with_cp,
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
+                    use_logical_groups=use_native_cp_transport,
                     timeout=timeout,
                 )
             )
@@ -1142,21 +1185,17 @@ def initialize_model_parallel(
         # NCCL initializes communicators lazily. Touch every local runtime
         # group, including the singleton CP-off group, in a deterministic order.
         data_parallel_size_with_cp = data_parallel_size * context_parallel_size
-        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
-            data_parallel_size_with_cp
-        )
-        if min_dynamic_context_parallel_size not in valid_group_sizes:
-            raise ValueError(
-                "min_dynamic_context_parallel_size="
-                f"{min_dynamic_context_parallel_size} is not a valid group size for "
-                f"DPxCP size {data_parallel_size_with_cp}; expected one of {valid_group_sizes}"
+        # Native transport borrows the parent communicator and creates no subgroup NCCL state.
+        if not use_native_cp_transport:
+            valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(
+                data_parallel_size_with_cp
             )
-        for group_size in valid_group_sizes:
-            if group_size < min_dynamic_context_parallel_size:
-                continue
-            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
-            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
-            torch.cuda.synchronize()
+            for group_size in valid_group_sizes:
+                if group_size < min_dynamic_context_parallel_size:
+                    continue
+                group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+                torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+                torch.cuda.synchronize()
 
     for ranks in token_rank_generator.get_ranks("dp"):
         group = create_group(
@@ -1718,6 +1757,21 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
+def _agree_on_native_cp_transport(unavailable_reason):
+    """Select one transport across all pipeline/tensor/data parallel ranks at startup."""
+    reasons = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(reasons, unavailable_reason)
+    reason = next((reason for reason in reasons if reason is not None), None)
+    if reason is not None and torch.distributed.get_rank() == 0:
+        logger.warning("Dynamic CP uses legacy ProcessGroups: %s", reason)
+    return reason is None
+
+
+def is_native_cp_transport_enabled() -> bool:
+    """Whether initialized dynamic CP groups use the native transport."""
+    return any(isinstance(group, LogicalCPGroup) for group in _DYNAMIC_DP_CP_GROUPS.values())
+
+
 def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
     """
     Helper function to create all-gather process groups for AG/RS overlap.
@@ -1970,11 +2024,26 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 
 
 def get_dynamic_data_context_parallel_groups(
-    check_initialized: bool = True, group_size: Optional[int] = None
-) -> torch.distributed.ProcessGroup:
-    """Get the dynamic CP group of ``group_size`` containing the caller rank."""
-    # Runtime DCP subdivides the replicate DPxCP domain, not the independent
-    # GTP-remat data-distribution axis.
+    check_initialized: bool = True,
+    group_size: Optional[int] = None,
+    group_start: Optional[int] = None,
+) -> torch.distributed.ProcessGroup | LogicalCPGroup:
+    """Get the dynamic context parallel groups the caller rank belongs to."""
+    if group_start is not None:
+        key = (int(group_size), int(group_start))
+        if key not in _DYNAMIC_DP_CP_GROUPS:
+            parent_ranks = torch.distributed.get_process_group_ranks(
+                get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False)
+            )
+            _DYNAMIC_DP_CP_GROUPS[key] = LogicalCPGroup.from_parent_interval(
+                parent_ranks, int(group_start), int(group_size), torch.distributed.get_rank()
+            )
+        return _DYNAMIC_DP_CP_GROUPS[key]
+    if group_size in _DYNAMIC_DP_CP_GROUPS:
+        return _DYNAMIC_DP_CP_GROUPS[group_size]
+    # Dynamic CP groups are carved from the replicate 'dp-cp' ranks, so compare against the
+    # replicate DP-CP size; the GTP_remat-aware groups are not yet built when this is called
+    # from initialize_model_parallel.
     if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
@@ -2657,12 +2726,12 @@ def destroy_model_parallel():
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
     # Idempotent and a no-op when NCCL EP was never bootstrapped.
-    try:
-        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
-
-        nccl_ep_finalize()
-    except Exception:  # finalize must never block teardown
-        pass
+    fused_a2a = sys.modules.get('megatron.core.transformer.moe.fused_a2a')
+    if fused_a2a is not None:
+        try:
+            fused_a2a.nccl_ep_finalize()
+        except Exception:  # finalize must never block teardown
+            pass
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
@@ -2688,6 +2757,15 @@ def destroy_model_parallel():
     _DATA_PARALLEL_GROUP_WITH_GTP_REMAT = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
+    if _DATA_PARALLEL_GROUP_WITH_CP is not None:
+        try:
+            from transformer_engine.pytorch.attention.native_cp_transport import (
+                destroy_native_cp_transport,
+            )
+
+            destroy_native_cp_transport(_DATA_PARALLEL_GROUP_WITH_CP)
+        except ImportError:
+            pass
     _DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT

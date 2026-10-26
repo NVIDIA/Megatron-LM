@@ -177,6 +177,11 @@ class ModelParallelConfig:
     """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
     The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
 
+    use_native_cp_transport: bool = False
+    """Internal transport selection, resolved before dynamic CP groups are created.
+    Training automatically selects TE's native transport for supported full-attention models.
+    """
+
     dynamic_cp_nvlink_domain_size: Optional[int] = None
     """Enable topology-aware DCP scheduling with this many consecutive global ranks
     per NVLink domain. This is a user-declared physical layout, not topology discovery;
@@ -193,7 +198,7 @@ class ModelParallelConfig:
     """In-tree cost model ('calibrated_attention', 'qwen35_gb200' or 'usp_calib_v1'),
     or a CPU factory
     ('package.module:factory') for the bounded runtime DCP solver. Replaces the default
-    heuristic when set; PP1/VPP1 only. Uses the existing aligned, power-of-two CP groups.
+    heuristic when set; PP1/VPP1 only. Native transport also permits arbitrary CP groups.
     No external scheduler package is needed.
     'usp_calib_v1' is a provisional upstream U8 cost proxy, not a native P2P calibration.
     """

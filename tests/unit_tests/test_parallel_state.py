@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from datetime import timedelta
 
@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as ps
+from megatron.core.dynamic_cp_group import LogicalCPGroup, build_bounded_peer_ring
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
@@ -634,6 +635,94 @@ def test_expert_data_parallel_gloo_group_timeout():
     assert group._get_backend(torch.device("cpu")).options._timeout == timedelta(minutes=45)
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    ("group_start", "cp_size", "expected"),
+    [(0, 3, (0, 1, 2)), (0, 6, (0, 1, 3, 5, 4, 2)), (1, 5, (1, 3, 5, 4, 2))],
+)
+def test_bounded_dynamic_cp_ring(group_start, cp_size, expected):
+    assert build_bounded_peer_ring(range(16), group_start, cp_size) == expected
+
+
+def test_bounded_dynamic_cp_ring_peer_degree():
+    peers = [set() for _ in range(16)]
+    for cp_size in range(1, 17):
+        for group_start in range(0, 17 - cp_size):
+            ring = build_bounded_peer_ring(range(16), group_start, cp_size)
+            assert set(ring) == set(range(group_start, group_start + cp_size))
+            if cp_size == 1:
+                continue
+            for src, dst in zip(ring, ring[1:] + ring[:1]):
+                assert abs(src - dst) <= 2
+                peers[src].add(dst)
+                peers[dst].add(src)
+    assert max(map(len, peers)) == 4
+
+
+def test_native_dynamic_cp_groups_are_logical_and_include_parent(monkeypatch):
+    monkeypatch.setattr(
+        ps, "create_group", lambda *_args, **_kwargs: pytest.fail("created a ProcessGroup")
+    )
+
+    groups = ps.create_dynamic_dp_cp_groups(
+        rank=3, ranks=list(range(8)), pg_options=None, use_logical_groups=True
+    )
+
+    assert isinstance(groups[8], LogicalCPGroup)
+    assert groups[8].ranks == (0, 1, 3, 5, 7, 6, 4, 2)
+    assert groups[8].rank() == 2
+
+
+def test_legacy_dynamic_cp_groups_remain_power_of_two(monkeypatch):
+    monkeypatch.setattr(ps, "create_group", lambda ranks, **_kwargs: tuple(ranks))
+
+    groups = ps.create_dynamic_dp_cp_groups(
+        rank=0, ranks=list(range(8)), pg_options=None, use_logical_groups=False
+    )
+
+    assert groups == {1: (0,), 2: (0, 1), 4: (0, 1, 2, 3)}
+
+
+@pytest.mark.parametrize("parent_size", [1, 3, 6, 8, 10, 12, 14, 16])
+@pytest.mark.parametrize("min_cp_size", [1, 2])
+def test_legacy_dynamic_cp_groups_preserve_valid_layouts(monkeypatch, parent_size, min_cp_size):
+    """Every legacy rank retains the divisor layouts requested by initialization warmup."""
+    monkeypatch.setattr(ps, "create_group", lambda ranks, **_kwargs: tuple(ranks))
+    valid_sizes = ps.get_valid_dynamic_context_parallel_group_sizes(parent_size)
+    if min_cp_size not in valid_sizes:
+        with pytest.raises(ValueError, match="is not a valid group size"):
+            ps.create_dynamic_dp_cp_groups(0, list(range(parent_size)), None, min_cp_size)
+        return
+    sizes = [size for size in valid_sizes if min_cp_size <= size < parent_size]
+    for parent_rank in range(parent_size):
+        groups = ps.create_dynamic_dp_cp_groups(
+            rank=parent_rank,
+            ranks=list(range(parent_size)),
+            pg_options=None,
+            min_cp_size=min_cp_size,
+        )
+        expected = {
+            size: tuple(
+                range(
+                    parent_rank // size * size, min((parent_rank // size + 1) * size, parent_size)
+                )
+            )
+            for size in sizes
+        }
+        assert groups == expected
+
+
+def test_native_dynamic_cp_group_can_start_at_noncanonical_tail(monkeypatch):
+    monkeypatch.setattr(ps, "_DYNAMIC_DP_CP_GROUPS", {})
+    monkeypatch.setattr(ps, "get_data_parallel_group", lambda **_kwargs: object())
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: list(range(8)))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 7)
+
+    group = ps.get_dynamic_data_context_parallel_groups(group_size=3, group_start=5)
+
+    assert group.ranks == (5, 7, 6)
+    assert group.rank() == 1
 
 
 def test_valid_dynamic_cp_group_sizes():

@@ -105,11 +105,16 @@ C = "tests/unit_tests/determinism/correctness/"
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="mtp_packed_cp1_roll",
-        sources=("megatron/core/transformer/multi_token_prediction.py",),
-        tests=(K + "test_dev_sync_kernels.py",),
+        sources=(
+            "megatron/core/transformer/multi_token_prediction.py",
+            "megatron/core/context_parallel/sequence_roll.py",
+        ),
+        tests=(K + "test_dev_sync_kernels.py", K + "test_native_cp_replay.py"),
         kind="torch-op",
         notes="CP1 packed roll forward/backward with repeated static metadata boundaries "
-        "and physical padding not represented by logical documents.",
+        "and physical padding not represented by logical documents; native CP3/CP5 boundary "
+        "exchange and differentiable contiguous rolls use one parent arena. Precomputed MTP "
+        "mask dispatch replays both full and already sequence-sharded metadata.",
     ),
     KernelEntry(
         name="dev_csa_packed_compaction_and_routing",
@@ -418,6 +423,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             C + "test_transformer_layer.py",
             C + "test_gpt_model.py",
             K + "test_csa_packed_kernels.py",
+            K + "test_native_cp_replay.py",
         ),
         kind="external-lib",
         notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite.",
@@ -436,6 +442,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_te_wrappers.py",
             C + "test_fp8_determinism.py",
             K + "test_runtime_cp_attention.py",
+            K + "test_native_cp_replay.py",
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "

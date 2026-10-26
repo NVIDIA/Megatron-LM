@@ -278,6 +278,19 @@ def test_runtime_spec_rejects_unsupported_classic_minimum():
         prefetch.runtime_spec(config, 8)
 
 
+@pytest.mark.parametrize('minimum', [1, 3, 5])
+def test_native_runtime_relaxes_widths_and_group_starts(minimum):
+    config = SimpleNamespace(
+        max_seqlen_per_dp_cp_rank=1024,
+        min_dynamic_context_parallel_size=minimum,
+        use_native_cp_transport=True,
+    )
+    spec = prefetch.runtime_spec(config, 8)
+    assert spec['geometry']['allowed_cp_sizes'] == tuple(range(minimum, 9))
+    assert not spec['geometry']['align_group_starts']
+    assert not spec['force_powers']
+
+
 def test_wrap_activates_runtime_with_classic_process_groups(monkeypatch):
     config = SimpleNamespace(
         max_seqlen_per_dp_cp_rank=1024,
