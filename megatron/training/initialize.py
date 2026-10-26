@@ -615,13 +615,6 @@ def _initialize_distributed(
             "> dynamic CP transport: "
             + ("native (automatic)" if args.use_native_cp_transport else "legacy ProcessGroups")
         )
-        if not args.use_native_cp_transport and (
-            getattr(args, "dynamic_cp_nvlink_domain_size", None) is not None
-            or getattr(config, "dynamic_cp_nvlink_domain_size", None) is not None
-        ):
-            raise ValueError(
-                "Topology-aware DCP scheduling requires an available native transport."
-            )
 
 
 def _init_autoresume():

@@ -15,6 +15,10 @@ except ImportError:
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.msc_utils import maybe_msc
+from megatron.core.num_microbatches_calculator import (
+    get_current_global_batch_size,
+    update_num_microbatches,
+)
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -345,6 +349,43 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         return global_batch_size, eval_global_batch_size, eval_micro_batch_size
 
+    def _resolve_scheduler_step_fields(self):
+        """Calculate user-unspecified scheduler configuration arguments from configurable fields."""
+
+        # Without a training horizon there is nothing to resolve; building the optimizer param
+        # scheduler (get_optimizer_param_scheduler) is what requires one.
+        if self.train.train_iters is None and self.train.train_samples is None:
+            return
+        # Iteration-based training.
+        if self.train.train_iters:
+            if self.scheduler.lr_decay_iters is None:
+                self.scheduler.lr_decay_iters = self.train.train_iters
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wsd_decay_steps = None
+            if self.scheduler.lr_wsd_decay_iters is not None:
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+        # Sample-based training.
+        elif self.train.train_samples:
+            # We need to set training iters for later use. Technically
+            # we need to adjust the training samples too (due to last
+            # batch being incomplete) but we leave it as is for now.
+            update_train_iters(self.train)
+            if self.scheduler.lr_decay_samples is None:
+                self.scheduler.lr_decay_samples = self.train.train_samples
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_samples
+            self.scheduler.wd_incr_steps = self.train.train_samples
+            self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
+            if self.scheduler.lr_warmup_fraction is not None:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+            else:
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
+
+
     def validate(self) -> None:
         """Validate each section, then the RL section against the rest of the run."""
         self.rl.validate_ddp_config(self.ddp)
@@ -365,6 +406,12 @@ class PretrainConfigContainer(ConfigContainerBase):
             save_interval=self.checkpoint.save_interval,
             exit_interval=self.train.exit_interval,
         )
+        self.scheduler.validate_run(
+            train_iters=self.train.train_iters,
+            train_samples=self.train.train_samples,
+            skip_train=self.validation.skip_train,
+            weight_decay=self.optimizer.weight_decay,
+        )
 
     def _finalize(self) -> None:
         from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
@@ -380,8 +427,37 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
         super()._finalize()
+        self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
+        self._resolve_scheduler_step_fields()
         if self.rl.perform_rl_step:
             self.rl.finalize_ddp_config(self.ddp)
+
+
+def update_train_iters(train: TrainingConfig) -> None:
+    """Resolve the sample-based training horizon on the supplied training config."""
+    # Imported lazily: megatron.training.utils imports megatron.training.config.
+    from megatron.training.utils import print_rank_0
+
+    # For iteration-based training, we don't need to do anything
+    if train.train_iters:
+        return
+
+    if train.step_batch_size_schedule is not None:
+        # Sample based training with step batch size schedule.
+        iterations = 0
+        consumed_samples = 0
+        while consumed_samples < train.train_samples:
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
+            iterations += 1
+        # Reset
+        update_num_microbatches(0, consistency_check=False)
+        train.train_iters = iterations
+    else:
+        # Constant batch size with sample-based training.
+        train.train_iters = train.train_samples // train.global_batch_size
+
+    print_rank_0(f'setting training iterations to {train.train_iters}')
 
 
 @dataclass(kw_only=True)

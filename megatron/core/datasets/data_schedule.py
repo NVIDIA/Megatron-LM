@@ -507,6 +507,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                     self.sequence_parallel_size,
                     self.max_seq_len_per_rank,
                     self.padding_alignment,
+                    align_group_starts=not self.allow_arbitrary_group_starts,
                 )
 
             sample_id_groups = align_sample_id_groups(
@@ -659,10 +660,10 @@ def wrap_data_iterator(
         scheduler_kwargs['allow_arbitrary_group_starts'] = getattr(
             config, 'use_native_cp_transport', False
         )
-        if scheduler_kwargs['allow_arbitrary_group_starts'] and config.sequence_parallel:
+        if config.sequence_parallel:
             scheduler_kwargs['sequence_parallel_size'] = config.tensor_model_parallel_size
         domain_size = getattr(config, 'dynamic_cp_nvlink_domain_size', None)
-        if scheduler_kwargs['allow_arbitrary_group_starts'] and domain_size is not None:
+        if domain_size is not None:
             ranks = torch.distributed.get_process_group_ranks
             scheduler_kwargs['nvlink_domains'] = _get_dynamic_cp_nvlink_domains(
                 ranks(dp_cp_group),
@@ -708,7 +709,6 @@ def wrap_data_iterator(
 
     if (
         scheduler_type == 'default_dynamic_cp'
-        and getattr(config, 'use_native_cp_transport', False)
         and getattr(config, 'dynamic_cp_runtime_model', None) is not None
     ):
         from megatron.core.datasets.dcp_schedule_prefetch import DcpSchedulePrefetcher, runtime_spec

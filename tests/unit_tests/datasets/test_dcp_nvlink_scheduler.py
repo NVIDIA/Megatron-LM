@@ -446,11 +446,22 @@ def test_scheduler_rejects_wrong_domain_vector_size(domains):
         )
 
 
-def test_topology_aware_scheduler_rejects_legacy_real_group_placement():
-    with pytest.raises(ValueError, match='arbitrary logical CP groups'):
-        next_hdp_group_packing_aware(
-            [(0, 128)], 2, 128, allow_arbitrary_group_starts=False, nvlink_domains=[0, 1]
-        )
+@pytest.mark.parametrize('parent', [4, 8, 16, 32])
+def test_topology_aware_scheduler_uses_existing_classic_groups(parent):
+    rng = random.Random(20261026)
+    scheduler = DefaultDynamicCPScheduler(
+        256, parent, 1, None, nvlink_domains=[rank // 4 for rank in range(parent)]
+    )
+    for _ in range(20):
+        samples = [(sid, rng.randint(1, parent * 8) * 32) for sid in range(16)]
+        rows = scheduler.get_groups_and_subsamples(samples)
+        for row in rows:
+            start = 0
+            for _, cp in _groups(row):
+                assert cp & (cp - 1) == 0
+                assert start % cp == 0
+                start += cp
+            assert start == parent
 
 
 @pytest.mark.parametrize('tp_size,pp_size,parent', [(1, 1, 16), (2, 2, 8), (4, 3, 8), (2, 2, 3)])

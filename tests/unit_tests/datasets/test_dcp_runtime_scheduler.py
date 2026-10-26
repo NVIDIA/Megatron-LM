@@ -3,6 +3,7 @@
 """Contracts of the in-tree CPU runtime and its frozen timing models."""
 
 import json
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,6 +71,54 @@ def test_every_cp_width_and_unaligned_tail_are_legal(cp):
     assert groups[0][0][:2] == (0, cp)
     if cp < 8:
         assert groups[0][1][:2] == (cp, 8 - cp)
+
+
+def test_classic_geometry_rejects_cp4_starting_at_rank2():
+    geometry = RuntimePlanGeometry(8, 1024, 2, (2, 4, 8), 16, 64, True)
+    rows = [[[0]] * 2 + [[1]] * 4 + [[2]] * 2]
+    with pytest.raises(RuntimeScheduleError, match='size-aligned start'):
+        validate_rows(rows, {0: 256, 1: 256, 2: 256}, geometry, 2)
+
+
+@pytest.mark.parametrize('planner_type', [LightweightRuntimePlanner, DynamicUSPRuntimePlanner])
+@pytest.mark.parametrize('world', [4, 8, 12, 16, 32])
+def test_solvers_search_only_supported_classic_intervals(planner_type, world):
+    allowed = tuple(cp for cp in range(1, world + 1) if cp & (cp - 1) == 0 and world % cp == 0)
+    geometry = RuntimePlanGeometry(world, 256, 2, allowed, 2 * world, 64, True)
+    planner = planner_type(geometry, QuadraticCostModel(geometry))
+    rng = random.Random(20261026)
+    for _ in range(8):
+        # Several feasible packs, including widths that compete on the cost model.
+        lengths = {sid: rng.randint(1, max(allowed) * 128) for sid in range(2 * world)}
+        plan = planner.plan(lengths)
+        validate_rows(plan.rows, lengths, geometry, 1)
+        assert all(start % cp == 0 and cp in allowed for row in plan.groups for start, cp, _ in row)
+        assert not planner.last_statistics['selected_incumbent']
+        if planner_type is LightweightRuntimePlanner:
+            assert planner.last_statistics['scored_candidates'] > 0
+        else:
+            assert planner.last_statistics['candidates']
+
+
+def test_rotation_scores_only_supported_classic_starts(monkeypatch):
+    geometry = RuntimePlanGeometry(8, 1024, 2, (2, 4, 8), 16, 64, True)
+    model = QuadraticCostModel(geometry)
+    model.placement_invariant = True
+    planner = LightweightRuntimePlanner(geometry, model)
+    advance = planner.timeline.advance
+    placements = []
+
+    def checked_advance(state, groups, first):
+        assert all(geometry.supports_group(start, cp) for start, cp, *_ in groups)
+        placements.append([(start, cp) for start, cp, *_ in groups])
+        return advance(state, groups, first)
+
+    monkeypatch.setattr(
+        type(planner.timeline), 'advance', lambda self, *args: checked_advance(*args)
+    )
+    rounds = [[dict(cp=4, sample_ids=[0]), dict(cp=2, sample_ids=[1]), dict(cp=2, sample_ids=[2])]]
+    planner._balance_exact(rounds, {0: 1000, 1: 500, 2: 300})
+    assert len(placements) == 2  # The third cyclic rotation would put CP4 at rank 2.
 
 
 def test_padded_entry_rejects_invalid_inputs_and_keeps_incumbent():

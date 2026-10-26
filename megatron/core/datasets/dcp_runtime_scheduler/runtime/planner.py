@@ -31,6 +31,7 @@ class RuntimePlanGeometry:
     allowed_cp_sizes: Tuple[int, ...]
     dataset_alignment: int
     max_group_seqs: Optional[int] = None
+    align_group_starts: bool = False
 
     def __post_init__(self):
         if self.world_size < 1 or self.tokens_per_rank < 1:
@@ -59,6 +60,14 @@ class RuntimePlanGeometry:
     def capacity(self, cp: int) -> int:
         """Physical tokens of a CP-``cp`` microbatch pack."""
         return int(cp) * self.tokens_per_rank
+
+    def supports_group(self, start: int, cp: int) -> bool:
+        """Whether this contiguous interval is supported by the runtime's groups."""
+        return (
+            cp in self.allowed_cp_sizes
+            and 0 <= start <= self.world_size - cp
+            and (not self.align_group_starts or start % cp == 0)
+        )
 
 
 @dataclass
@@ -134,6 +143,10 @@ def validate_rows(
                 raise RuntimeScheduleError(
                     f"microbatch {m}: group at rank {start} has cp={cp}, allowed {sorted(allowed)} "
                     f"and min_dynamic_context_parallel_size={min_cp_size}"
+                )
+            if not geometry.supports_group(start, cp):
+                raise RuntimeScheduleError(
+                    f"microbatch {m}: cp={cp} group at rank {start} requires a size-aligned start"
                 )
             if geometry.max_group_seqs is not None and len(ids) > geometry.max_group_seqs:
                 raise RuntimeScheduleError(

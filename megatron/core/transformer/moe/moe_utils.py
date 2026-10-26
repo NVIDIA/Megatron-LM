@@ -7,7 +7,10 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+)
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -890,6 +893,8 @@ def topk_routing_with_score_function(
             raise ValueError("Quantile Balancing does not support group-limited routing.")
         if router_replay is not None:
             raise ValueError("Quantile Balancing does not support router replay.")
+        if precomputed_indices is not None:
+            raise ValueError("Histogram Quantile Balancing computes its own top-(k+1).")
         if qb_histogram.dim() != 2 or qb_histogram.shape[0] != num_experts:
             raise ValueError(
                 "qb_histogram must have shape [num_experts, num_bins], got "
@@ -1716,9 +1721,9 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
-    # TE's grouped-tensor and fused grouped-MLP kernels require 256-token alignment.
+    # TE's grouped-tensor and fused grouped-MLP kernels share an expert-token alignment.
     if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
-        return 256
+        return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:

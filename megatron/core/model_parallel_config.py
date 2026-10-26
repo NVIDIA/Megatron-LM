@@ -183,7 +183,7 @@ class ModelParallelConfig:
     """
 
     dynamic_cp_nvlink_domain_size: Optional[int] = None
-    """Enable topology-aware native DCP scheduling with this many consecutive global ranks
+    """Enable topology-aware DCP scheduling with this many consecutive global ranks
     per NVLink domain. This is a user-declared physical layout, not topology discovery;
     it requires Megatron's Cartesian TP/PP/DP/CP rank mapping. None keeps compute-only scoring.
     """
@@ -196,8 +196,9 @@ class ModelParallelConfig:
 
     dynamic_cp_runtime_model: Optional[str] = None
     """In-tree cost model ('calibrated_attention', 'qwen35_gb200' or 'usp_calib_v1'), or a CPU factory
-    ('package.module:factory') for the bounded runtime DCP solver. Replaces the native
-    arbitrary-CP heuristic when set; PP1/VPP1 only. No external scheduler package is needed.
+    ('package.module:factory') for the bounded runtime DCP solver. Replaces the default
+    heuristic when set; PP1/VPP1 only. Native transport also permits arbitrary CP groups.
+    No external scheduler package is needed.
     'usp_calib_v1' is a provisional upstream U8 cost proxy, not a native P2P calibration.
     """
 
@@ -231,7 +232,7 @@ class ModelParallelConfig:
     """Prepare/solve one future batch while the current batch trains. False is the sync control."""
 
     dynamic_cp_runtime_force_powers: bool = False
-    """Use the configured P2 baseline rows without arbitrary-CP search."""
+    """Use the configured P2 baseline rows without solver search (diagnostic control)."""
 
     dynamic_cp_runtime_trace_dir: Optional[str] = None
     """Optional per-rank JSONL scheduling timestamps, input digests and executed rank rows."""

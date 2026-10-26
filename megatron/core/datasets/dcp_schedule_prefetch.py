@@ -308,7 +308,16 @@ def runtime_spec(
     factory = getattr(config, 'dynamic_cp_runtime_model', None)
     options = _json_options(getattr(config, 'dynamic_cp_runtime_model_options', None))
     minimum = config.min_dynamic_context_parallel_size
-    allowed = tuple(range(minimum, world_size + 1))
+    native = getattr(config, 'use_native_cp_transport', False)
+    # Classic CP creates canonical, size-aligned power-of-two subgroups.
+    # Restrict candidates, while leaving the selected solver's search enabled.
+    allowed = tuple(
+        cp
+        for cp in range(minimum, world_size + 1)
+        if native or (cp & (cp - 1) == 0 and world_size % cp == 0)
+    )
+    if minimum not in allowed:
+        raise ValueError('Runtime DCP requires a power-of-two minimum CP dividing DPxCP')
     if factory == 'usp_calib_v1':
         if world_size not in (8, 16, 32) or minimum not in (8, 16, 32) or minimum > world_size:
             raise ValueError('usp_calib_v1 requires DPxCP and minimum CP in (8, 16, 32)')
@@ -321,6 +330,7 @@ def runtime_spec(
             allowed_cp_sizes=allowed,
             dataset_alignment=2 * world_size,
             max_group_seqs=min(max_num_seqs, 64) if max_num_seqs is not None else 64,
+            align_group_starts=not native,
         ),
         model=factory or 'megatron.core.datasets.dcp_runtime_worker:_AttentionWorkModel',
         model_options=options,

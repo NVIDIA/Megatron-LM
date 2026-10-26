@@ -72,6 +72,7 @@ class LightweightRuntimePlanner(RuntimePlanner):
         world = self.geometry.world_size
         slack = world - sum(group["cp"] for group in row)
         dp = {0: (0.0, [])}
+        base_start = 0
         for group in row:
             base = group["cp"]
             values = tuple(lengths[i] for i in group["sample_ids"])
@@ -83,7 +84,9 @@ class LightweightRuntimePlanner(RuntimePlanner):
             next_dp = {}
             for previous, (work, increments) in dp.items():
                 for delta in choices:
-                    if previous + delta <= slack:
+                    if previous + delta <= slack and self.geometry.supports_group(
+                        base_start + previous, base + delta
+                    ):
                         score = work + (
                             self._group_work(values, base + delta) if cost_aware else 0.0
                         )
@@ -91,6 +94,7 @@ class LightweightRuntimePlanner(RuntimePlanner):
                         if key not in next_dp or score < next_dp[key][0]:
                             next_dp[key] = score, increments + [delta]
             dp = next_dp
+            base_start += base
         if slack not in dp:
             return None
         return [
@@ -207,14 +211,14 @@ class LightweightRuntimePlanner(RuntimePlanner):
         while pending:
             row, used = [], 0
             while used < world and pending:
-                remaining = world - used
-                anchor = next((i for i in pending if minimums[i] <= remaining), None)
+                eligible = [c for c in allowed if self.geometry.supports_group(used, c)]
+                anchor = next((i for i in pending if any(minimums[i] <= c for c in eligible)), None)
                 if anchor is None:
                     break
                 cp_min = minimums[anchor]
-                cp = next((c for c in allowed if max(cp_min, floor) <= c <= remaining), None)
+                cp = next((c for c in eligible if max(cp_min, floor) <= c), None)
                 if cp is None:
-                    cp = max(c for c in allowed if cp_min <= c <= remaining)
+                    cp = max(c for c in eligible if cp_min <= c)
                 ids, _ = self._fill_pack(anchor, pending, cp, storage)
                 chosen = set(ids)
                 pending = [i for i in pending if i not in chosen]
@@ -275,12 +279,18 @@ class LightweightRuntimePlanner(RuntimePlanner):
                 rotated = priced[offset:] + priced[:offset]
                 start, shifted = 0, []
                 for group in rotated:
+                    if not self.geometry.supports_group(start, group[1]):
+                        break
                     shifted.append((start, *group[1:]))
                     start += group[1]
+                if len(shifted) != len(rotated):
+                    continue
                 next_state = self.timeline.advance(state, shifted, index == 0)
                 key = max(next_state), sum(next_state), sum(v * v for v in next_state)
                 if best is None or key < best[0]:
                     best = key, next_state, offset
+            if best is None:
+                raise RuntimeScheduleError("no supported group placement in rotation candidates")
             _, state, offset = best
             balanced.append(row[offset:] + row[:offset])
             changed += offset != 0

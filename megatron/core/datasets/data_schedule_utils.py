@@ -875,6 +875,7 @@ def reorder_dcp_groups(
     sequence_parallel_size: int = 1,
     max_seq_len_per_rank: int | None = None,
     padding_alignment: int | str | None = None,
+    align_group_starts: bool = False,
 ) -> List[List[int]]:
     """Compact/fill a rank layout, then greedily place whole packs within NVLink domains.
 
@@ -895,6 +896,12 @@ def reorder_dcp_groups(
             groups.append((1, tuple(samples)))
     if not groups:
         return sample_id_group
+
+    def legal_group(cp, start):
+        return not align_group_starts or (
+            cp & (cp - 1) == 0 and len(sample_id_group) % cp == 0 and start % cp == 0
+        )
+
     boundaries_before = [0]
     for a, b in zip(nvlink_domains, nvlink_domains[1:]):
         boundaries_before.append(boundaries_before[-1] + (a != b))
@@ -928,11 +935,16 @@ def reorder_dcp_groups(
         return maximum, work, traffic
 
     def place(remaining):
+        fallback = sorted(remaining, key=lambda group: -group[0])
         remaining, ordered, start = list(remaining), [], 0
         while remaining:
+            eligible = [
+                index for index, group in enumerate(remaining) if legal_group(group[0], start)
+            ]
+            if not eligible:
+                return fallback
             index = min(
-                range(len(remaining)),
-                key=lambda i: (*cost(remaining[i], start)[1:], -remaining[i][0], i),
+                eligible, key=lambda i: (*cost(remaining[i], start)[1:], -remaining[i][0], i)
             )
             group = remaining.pop(index)
             ordered.append(group)
@@ -962,6 +974,8 @@ def reorder_dcp_groups(
                 )
                 for end in ends:
                     cp = end - start
+                    if not legal_group(cp, start):
+                        continue
                     # CP1 -> CP>1 can increase zigzag padding; do not assume
                     # every expansion fits or that feasibility is monotone.
                     if pack_work(cp, samples)[1] > capacity:
@@ -998,14 +1012,24 @@ def reorder_dcp_groups(
         # enumerate permutations or run an unbounded local search.
         placed = place(groups)
         orders = [groups] if placed == groups else [groups, placed]
+        canonical = sorted(groups, key=lambda group: -group[0])
+        if align_group_starts and canonical not in orders:
+            orders.append(canonical)
         best, best_score = None, None
         for ordered in orders:
-            optimum, _ = allocate(ordered)
-            _, filled = allocate(ordered, optimum[0])
+            try:
+                optimum, _ = allocate(ordered)
+                _, filled = allocate(ordered, optimum[0])
+            except ValueError:
+                if align_group_starts:
+                    continue
+                raise
             candidate_score = score(filled)
             if best is None or candidate_score < best_score:
                 best, best_score = filled, candidate_score
-    # At most two orders, each with O(groups * ranks**2) exact rank allocation.
+        if best is None:
+            raise ValueError('Cannot fill DPxCP ranks without exceeding per-rank token capacity')
+    # A bounded set of orders, each with O(groups * ranks**2) exact rank allocation.
     placed = place(best)
     if score(placed) < best_score:
         best = placed
@@ -1045,8 +1069,6 @@ def next_hdp_group_packing_aware(
     are tunable reference coefficients, not hardware-independent timings.
     """
     topology_aware = _validate_dcp_nvlink_cost(nvlink_domains, communication_cost, total_gpus)
-    if topology_aware and not allow_arbitrary_group_starts:
-        raise ValueError('NVLink-aware placement requires arbitrary logical CP groups')
     if not sample_seqlens:
         return (
             [[] for _ in range(total_gpus)],
@@ -1343,6 +1365,7 @@ def next_hdp_group_packing_aware(
             sequence_parallel_size,
             max_seq_len_per_rank,
             padding_alignment,
+            align_group_starts=not allow_arbitrary_group_starts,
         )
         micro_batches = [[lengths[sid] for sid in samples] for samples in sample_ids_per_gpu]
         rank = 0

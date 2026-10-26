@@ -51,7 +51,15 @@ Available in-tree models:
   are unchanged, not refitted for Qwen or native P2P. `allow_provisional=true`
   is required. The model does not enable Ulysses or all-to-all communication.
 
-Example extra flags for a standard-FA NVL72 run (alongside the native DCP,
+The training adapter uses the existing classic CP ProcessGroups and TE path
+unless automatic native transport selection succeeds. Classic groups restrict
+candidate widths to power-of-two divisors of DPxCP and starts to multiples of
+their width. Native transport relaxes those constraints for the lightweight
+solver; DynamicUSP retains its original aligned power-of-two allocation policy.
+Both solvers optimize over legal candidates; the baseline-only control is
+disabled by default.
+
+Example extra flags for a standard-FA NVL72 run (alongside the DCP,
 varlen, packed-padding and parallelism arguments):
 
 ```bash
@@ -65,7 +73,7 @@ CPU JIT backend, make Numba available in the training environment and add
 `"kernel_backend":"numba"` to model options. No CUDA kernel is launched by these
 predictors. Caller-provided `module:factory` model, solver and historical powers
 baseline hooks remain supported. `--dynamic-cp-runtime-force-powers` bypasses
-the arbitrary search using the configured validated powers-only baseline.
+the solver search using the configured validated powers-only baseline.
 
 With `dynamic_cp_runtime_model` configured, an optional generic hot-switch solver
 is selected independently of the model. Solver/options flags alone do not enable
@@ -97,7 +105,7 @@ The temporary upstream-cost recipe keeps CP powers of two with a minimum of 8:
 
 For a 32-rank DPxCP domain, both candidates and the incumbent are restricted to
 CP8/16/32; CP24 is not supported. This recipe currently accepts DPxCP=8/16/32.
-Execution continues to use the existing native P2P path (`cp_comm_type=p2p`),
+Execution continues to use the existing TE P2P path (`cp_comm_type=p2p`),
 not the modeled U8 all-to-all. This intentional mismatch is a temporary scheduling
 proxy pending upstream updates: predictions are **not** P2P latency or speedup
 evidence. Worker/consume telemetry records the model name, source hashes and

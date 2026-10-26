@@ -462,6 +462,7 @@ def create_dynamic_dp_cp_groups(
     pg_options: object,
     min_cp_size: int = 1,
     use_logical_groups: bool = False,
+    timeout: Optional[timedelta] = None,
 ) -> Dict[int, torch.distributed.ProcessGroup | LogicalCPGroup]:
     """
     Creates groups required for dynamic DPxCP.
@@ -498,6 +499,7 @@ def create_dynamic_dp_cp_groups(
             else:
                 group = create_group(
                     group_ranks,
+                    timeout=timeout,
                     pg_options=pg_options,
                     group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
                 )
@@ -1176,6 +1178,7 @@ def initialize_model_parallel(
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
                     use_logical_groups=use_native_cp_transport,
+                    timeout=timeout,
                 )
             )
 
@@ -1634,7 +1637,7 @@ def initialize_model_parallel(
         )
         if create_gloo_process_groups:
             group_gloo = create_group(
-                ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
+                ranks, timeout=timeout, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
             )
         else:
             group_gloo = None

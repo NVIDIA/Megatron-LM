@@ -722,6 +722,55 @@ def tie_output_layer_state_dict(
     )
 
 
+def _exchange_cp_roll_boundaries(first_boundary, second_boundary, cp_group):
+    """Exchange both roll boundaries with the adjacent context-parallel ranks."""
+    first_boundary = first_boundary.contiguous()
+    second_boundary = second_boundary.contiguous()
+    if isinstance(cp_group, LogicalCPGroup):
+        received = [torch.empty_like(first_boundary), torch.empty_like(second_boundary)]
+        _exchange_zigzag_mtp_boundaries(cp_group, [first_boundary, second_boundary], received, 0)
+        return received
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    first_received = (
+        torch.empty_like(first_boundary) if local_rank != len(global_ranks) - 1 else second_boundary
+    )
+    second_received = (
+        torch.empty_like(second_boundary) if local_rank != 0 else torch.zeros_like(second_boundary)
+    )
+
+    # Keep boundary exchanges on the CP communicator so independent DP lanes
+    # can issue different packed P2P sequences without coupling through WORLD.
+    ops = []
+    if local_rank != 0:
+        previous_rank = global_ranks[local_rank - 1]
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, first_boundary, previous_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, second_received, previous_rank, group=cp_group
+            )
+        )
+    if local_rank != len(global_ranks) - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.irecv, first_received, next_rank, group=cp_group
+            )
+        )
+        ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend, second_boundary, next_rank, group=cp_group
+            )
+        )
+    for request in torch.distributed.batch_isend_irecv(ops):
+        request.wait()
+    return first_received, second_received
+
+
 def roll_tensor(
     tensor=None,
     shifts=-1,
@@ -743,6 +792,36 @@ def roll_tensor(
     Tensor callers retain the main API, including None and optional reductions.
     Grouped callers retain shared metadata, per-field fills and prefetched halos.
     Packed first-axis tensors are moved into the grouped dispatcher's sequence frame.
+
+    Packed rolls respect document boundaries. With zigzag CP > 1, each physical document
+    length must be divisible by twice the CP size so every rank receives two equal chunks.
+    Slots after the final physical document roll as a separate trailing segment, with its
+    last slot set to the fill value. The contiguous layout honors fill_value.
+
+    Args:
+        tensor (Tensor | List[Tensor]): The tensor or grouped fields to roll. If None,
+            returns (None, None).
+        shifts (int): The shift of the tensor (typically -1 for MTP).
+        dims (int): The dimension to roll (typically -1 for sequence dimension).
+        cp_group (ProcessGroup): The context parallelism process group. None or size 1
+            uses a local roll.
+        packed_seq_params (PackedSeqParams): Logical and optional physical document
+            boundaries for packed sequences.
+        return_sum (bool): Whether a single-Tensor call also returns the rolled tensor sum.
+            Defaults to True.
+        cp_layout (CPLayout | None): "contiguous" selects contiguous CP shards and requires
+            shifts=-1; other values retain the zigzag rolling paths.
+        fill_value: Value used outside the same real document in the contiguous path.
+            Other layouts require the default zero fill.
+        tensors (List[Tensor]): Keyword alias for grouped fields; exclusive with tensor.
+        fill_values (List): Optional per-field fill values for grouped fields.
+        roll_context (MTPSequenceRollContext): Optional layout state for this microbatch.
+        sequence_fields (List[str]): Canonical field names that identify prefetched halos.
+        roll_depth (int): Zero-based repeated-roll depth for prefetched halos.
+
+    Returns:
+        tuple | list: (rolled_tensor, sum_of_rolled_tensor) for a single Tensor, where the
+        sum is None when disabled; otherwise the rolled fields in input order.
     """
     if tensors is not None:
         if tensor is not None:
@@ -890,27 +969,19 @@ def _roll_tensor_unpacked_zigzag_cp(tensor, shifts, dims, cp_group, fill_value=0
     for i in range(len(tensor_list)):
         rolled_tensor_list.append(torch.roll(tensor_list[i], shifts=shifts, dims=dims))
 
-    # Prepare tensors for communication between CP ranks
-    # Each CP rank needs to send boundary elements to adjacent ranks
-    tensor_send_list = []
-    tensor_recv_list = []
-    for i in range(len(rolled_tensor_list)):
-        tensor_send_list.append(rolled_tensor_list[i].select(dims, shifts).contiguous())
-        empty_tensor = torch.empty(
-            tensor_send_list[i].shape,
-            dtype=tensor_send_list[i].dtype,
-            device=torch.cuda.current_device(),
-        )
-        tensor_recv_list.append(empty_tensor)
-
-    _exchange_zigzag_mtp_boundaries(cp_group, tensor_send_list, tensor_recv_list, fill_value)
+    first_received, second_received = _exchange_cp_roll_boundaries(
+        rolled_tensor_list[0].select(dims, shifts),
+        rolled_tensor_list[1].select(dims, shifts),
+        cp_group,
+    )
+    if fill_value != 0 and cp_group.rank() == 0:
+        # Rank 0 holds the global sequence end; the shared exchange zero-fills it.
+        second_received.fill_(fill_value)
 
     # Splicing: Replace boundary elements with received elements from adjacent ranks
     # This ensures proper sequence continuity across CP boundaries
-    index = [slice(None)] * rolled_tensor_list[0].dim()
-    index[dims] = shifts
-    for i in range(len(rolled_tensor_list)):
-        rolled_tensor_list[i][tuple(index)] = tensor_recv_list[i]
+    rolled_tensor_list[0].select(dims, shifts).copy_(first_received)
+    rolled_tensor_list[1].select(dims, shifts).copy_(second_received)
 
     # Concatenate the processed chunks back into a single tensor
     rolled_tensor = torch.cat(rolled_tensor_list, dim=dims)
@@ -956,20 +1027,33 @@ def _roll_tensors_packed_seq(
                 raise ValueError("All packed CP1 tensors must have the same sequence length.")
         valid_cu_seqlens = packed_seq_params.cu_seqlens_q
         valid_end_mask = None
-        if valid_cu_seqlens is not None and valid_cu_seqlens is not cu_seqlens:
-            positions = torch.arange(reference_tensor.size(dims), device=reference_tensor.device)
-            doc_idx = torch.searchsorted(cu_seqlens, positions, right=True) - 1
-            doc_idx = doc_idx.clamp(min=0, max=cu_seqlens.numel() - 2)
+        if (
+            valid_cu_seqlens is not None
+            and valid_cu_seqlens is not cu_seqlens
+            and cu_seqlens.numel() > 1
+        ):
+            # Boundaries may live on the host while the token tensors live on the GPU.
+            device = reference_tensor.device
+            physical_cu_seqlens = cu_seqlens.to(device=device)
+            valid_cu_seqlens = valid_cu_seqlens.to(device=device)
+            positions = torch.arange(
+                reference_tensor.size(dims), device=device, dtype=physical_cu_seqlens.dtype
+            )
+            doc_idx = torch.searchsorted(physical_cu_seqlens, positions, right=True) - 1
+            doc_idx = doc_idx.clamp(min=0, max=physical_cu_seqlens.numel() - 2)
             valid_lengths = valid_cu_seqlens[1:] - valid_cu_seqlens[:-1]
             # Static THD metadata can append empty/dummy physical sequences
             # without adding logical documents. Their valid lengths are zero.
-            extra_sequences = cu_seqlens.numel() - valid_cu_seqlens.numel()
+            extra_sequences = physical_cu_seqlens.numel() - valid_cu_seqlens.numel()
             if extra_sequences < 0:
                 raise ValueError("Packed physical boundaries must cover every logical sequence.")
             if extra_sequences:
                 valid_lengths = torch.nn.functional.pad(valid_lengths, (0, extra_sequences))
-            valid_ends = cu_seqlens[:-1] + valid_lengths
-            valid_end_mask = positions + 1 >= valid_ends[doc_idx]
+            valid_ends = physical_cu_seqlens[:-1] + valid_lengths
+            # Slots after the final physical document roll as a separate trailing
+            # segment; only its last slot, an implicit sequence end, is filled.
+            trailing = positions >= physical_cu_seqlens[-1]
+            valid_end_mask = (positions + 1 >= valid_ends[doc_idx]) & ~trailing
         rolled = [
             _roll_tensor_packed_seq_cp1(
                 tensor, shifts, dims, sequence_end_indices, fill_value=fill_value
@@ -1028,62 +1112,47 @@ def _roll_tensor_packed_seq_cp1(tensor, shifts, dims, sequence_end_indices, fill
 
 
 def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0):
-    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries."""
+    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries.
+
+    Each physical document length must be divisible by ``2 * cp_size`` so every rank owns
+    two equal chunks. All documents share one batched boundary exchange. Slots after the
+    final physical boundary roll as a separate segment whose last slot takes fill_value.
+    """
     cp_size = cp_group.size()
-    rolled_tensor = tensor.clone()
+    sequence_dim = dims if dims >= 0 else tensor.dim() + dims
+    physical_cu_seqlens = cu_seqlens.to(device=tensor.device)
+    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=sequence_dim)
+    rolled_tensor.select(sequence_dim, shifts).fill_(fill_value)
 
-    # Iterate over each sequence individually
-    for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i]
-        end_idx = cu_seqlens[i + 1]
+    # CP attention requires two equal chunks per rank for every physical document.
+    aligned = (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all()
+    local_boundaries = torch.div(physical_cu_seqlens, cp_size, rounding_mode='floor').long()
+    local_lengths = torch.diff(local_boundaries)
+    # Exchange one boundary vector per neighbour for all nonempty documents.
+    # RL packing may repeat the final boundary in fixed-size metadata.
+    nonempty = torch.nonzero(local_lengths > 0).flatten()
+    # nonzero already waits for CUDA, so validate on the host before indexing or communication.
+    if not bool(aligned):
+        raise ValueError("Packed document lengths must be divisible by twice the CP size")
+    if nonempty.numel() == 0:
+        return rolled_tensor
+    local_starts = local_boundaries[:-1].index_select(0, nonempty)
+    local_ends = local_boundaries[1:].index_select(0, nonempty)
+    chunk_lengths = local_lengths.index_select(0, nonempty) // 2
+    second_starts = local_starts + chunk_lengths
+    first_ends = second_starts - 1
+    second_ends = local_ends - 1
+    first_boundary = tensor.index_select(sequence_dim, local_starts)
+    second_boundary = tensor.index_select(sequence_dim, second_starts)
+    first_received, second_received = _exchange_cp_roll_boundaries(
+        first_boundary, second_boundary, cp_group
+    )
+    if fill_value != 0 and cp_group.rank() == 0:
+        # Rank 0 holds every document's global end; the shared exchange zero-fills it.
+        second_received.fill_(fill_value)
 
-        # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
-        local_start_idx = start_idx // cp_size
-        local_end_idx = end_idx // cp_size
-
-        # Skip empty sequences - this can happen when a sequence is very short and
-        # after dividing by cp_size, the local slice has zero length
-        local_seq_len = local_end_idx - local_start_idx
-        if local_seq_len == 0:
-            continue
-
-        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
-
-        # The following code is very similar as the code in roll_tensor function
-        local_chunks = tensor_slice.chunk(2, dim=dims)
-        rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
-
-        tensor_send_list = []
-        tensor_recv_list = []
-        for chunk in rolled_chunks:
-            # Skip empty chunks that can occur when the sequence slice is very small
-            if chunk.size(dims) == 0:
-                tensor_send_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                tensor_recv_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                continue
-            boundary = chunk.select(dims, shifts).contiguous().clone()
-            tensor_send_list.append(boundary)
-            tensor_recv_list.append(torch.empty_like(boundary))
-
-        _exchange_zigzag_mtp_boundaries(cp_group, tensor_send_list, tensor_recv_list, fill_value)
-
-        index = [slice(None)] * rolled_chunks[0].dim()
-        index[dims] = shifts
-        for chunk, recv in zip(rolled_chunks, tensor_recv_list):
-            # Skip empty chunks
-            if chunk.size(dims) == 0:
-                continue
-            chunk[tuple(index)] = recv
-
-        seq_result = torch.cat(rolled_chunks, dim=dims)
-
-        # update the rolled tensor
-        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
-
+    rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
+    rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
     return rolled_tensor
 
 
@@ -1379,26 +1448,33 @@ def _packed_seq_params_for_local_hsm_roll(
     if padded is not None and padded is not cu_seqlens:
         cp_size = get_pg_size(cp_group)
         cp_rank = get_pg_rank(cp_group)
-        boundaries = [padded.new_zeros(())]
-        local_offset = padded.new_zeros(())
-        for doc_idx in range(len(cu_seqlens) - 1):
-            padded_length = padded[doc_idx + 1] - padded[doc_idx]
-            valid_length = cu_seqlens[doc_idx + 1] - cu_seqlens[doc_idx]
-            chunk_length = torch.div(padded_length, 2 * cp_size, rounding_mode='floor')
-            if cp_rank == cp_size - 1:
-                owned_length = 2 * chunk_length
-                valid = torch.minimum(
-                    (valid_length - cp_rank * chunk_length).clamp_min(0), owned_length
-                )
-                boundaries.extend([local_offset + valid, local_offset + owned_length])
-                local_offset = local_offset + owned_length
-                continue
-            starts = (cp_rank * chunk_length, (2 * cp_size - cp_rank - 1) * chunk_length)
-            for start in starts:
-                valid = torch.minimum((valid_length - start).clamp_min(0), chunk_length)
-                boundaries.extend([local_offset + valid, local_offset + chunk_length])
-                local_offset = local_offset + chunk_length
-        cp_local = torch.stack(boundaries).unique_consecutive()
+        chunk_lengths = torch.div(torch.diff(padded), 2 * cp_size, rounding_mode='floor')
+        valid_lengths = torch.diff(cu_seqlens)
+        owned_lengths = 2 * chunk_lengths
+        local_starts = torch.cumsum(owned_lengths, dim=0, dtype=padded.dtype) - owned_lengths
+        if cp_rank == cp_size - 1:
+            valid = torch.minimum(
+                (valid_lengths - cp_rank * chunk_lengths).clamp_min(0), owned_lengths
+            )
+            boundaries = torch.stack(
+                (local_starts + valid, local_starts + owned_lengths), dim=1
+            ).flatten()
+        else:
+            front_valid = torch.minimum(
+                (valid_lengths - cp_rank * chunk_lengths).clamp_min(0), chunk_lengths
+            )
+            back_start = (2 * cp_size - cp_rank - 1) * chunk_lengths
+            back_valid = torch.minimum((valid_lengths - back_start).clamp_min(0), chunk_lengths)
+            boundaries = torch.stack(
+                (
+                    local_starts + front_valid,
+                    local_starts + chunk_lengths,
+                    local_starts + chunk_lengths + back_valid,
+                    local_starts + owned_lengths,
+                ),
+                dim=1,
+            ).flatten()
+        cp_local = torch.cat((padded.new_zeros(1), boundaries))
         add_zigzag_midpoints = False
     else:
         cp_size = get_pg_size(cp_group)
@@ -1411,7 +1487,7 @@ def _packed_seq_params_for_local_hsm_roll(
     # A document's local slots are its two zigzag chunks, which are adjacent locally but
     # usually far apart globally, so the midpoint between them is a boundary too: the
     # token after the front chunk's last one lives on another rank, not in the next local
-    # slot. Splitting there is what roll_tensor's CP branch used chunk(2) for.
+    # slot. The local roll must stop at that seam.
     #
     # The exception is the last CP rank. The zigzag hands rank r chunks r and
     # 2 * cp_size - 1 - r, which for r == cp_size - 1 are chunks cp_size - 1 and cp_size:
@@ -2219,6 +2295,28 @@ def _process_mtp_e2e_tv_loss(
     return MTPLossAutoScaler.apply(main_output, normalized_loss)
 
 
+class _MTPHeadGradInjector(torch.autograd.Function):
+    """Route a gradient that was already computed for an MTP head input into the main graph.
+
+    Used by ``mtp_loss_early_backward``: the head's projection + loss + backward have already
+    run, producing ``head_grad`` for the (detached) head input. This node is a no-op in forward
+    and, in backward, hands ``head_grad`` to ``head_hidden`` so it flows into the MTP layers and
+    the main model exactly as the deferred path would have delivered it.
+    """
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, head_hidden: torch.Tensor, head_grad: torch.Tensor):
+        """Pass ``output`` through; stash the precomputed gradient for ``head_hidden``."""
+        ctx.save_for_backward(head_grad)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Return the pass-through gradient and the precomputed head-input gradient."""
+        (head_grad,) = ctx.saved_tensors
+        return grad_output, head_grad, None
+
+
 def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
     """Whether the loss callable takes ``return_argmax`` (LanguageModule's loss does)."""
     try:
@@ -2373,6 +2471,14 @@ def process_mtp_loss(
     contiguous_roll = config.attention_cp_layout == "contiguous" or (
         packed_seq_params is not None and packed_seq_params.cp_partition_mode == "contiguous"
     )
+    # Early backward: fwd(head) -> bwd(head) per depth so at most one head's logits/softmax is
+    # resident at a time. Needs a live graph and cannot run inside CUDA-graph capture/warmup.
+    early_backward = False
+    if getattr(config, "mtp_loss_early_backward", False) and torch.is_grad_enabled():
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        early_backward = not (is_graph_capturing() or is_graph_warmup())
+
     for mtp_layer_number in range(config.mtp_num_layers):
         roll_fields = [mtp_labels, loss_mask]
         sequence_fields = ["input_ids" if derived_labels_from_input_ids else "labels", "loss_mask"]
@@ -2421,8 +2527,12 @@ def process_mtp_loss(
             )
             layer_loss_mask = loss_mask * cumulative_mtp_input_mask
         num_tokens = layer_loss_mask.sum()
+        head_hidden = hidden_states_list[mtp_layer_number + 1]
+        # In early-backward mode the head runs on a detached leaf so its backward stops at the
+        # head input; the resulting gradient is re-injected into the main graph below.
+        head_input = head_hidden.detach().requires_grad_(True) if early_backward else head_hidden
         if fuse_linear_cross_entropy:
-            mtp_hidden_states = hidden_states_list[mtp_layer_number + 1]
+            mtp_hidden_states = head_input
             if scale_logits_fn is not None:
                 # The fused kernel never materialises the logits; the output layer has no bias,
                 # so muP's logit scaling is applied to its input instead.
@@ -2440,9 +2550,7 @@ def process_mtp_loss(
             mtp_preds = None
         else:
             mtp_logits, _ = output_layer(
-                hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
+                head_input, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
             if scale_logits_fn is not None:
                 mtp_logits = scale_logits_fn(mtp_logits)
@@ -2483,7 +2591,7 @@ def process_mtp_loss(
                     with_context_parallel=True
                 )
             MTPLossLoggingHelper.save_loss_to_tracker(
-                torch.sum(mtp_loss),
+                torch.sum(mtp_loss.detach()),
                 num_tokens,
                 mtp_layer_number,
                 config.mtp_num_layers,
@@ -2511,12 +2619,24 @@ def process_mtp_loss(
             original_count, rolled_count = normalization_counts.unbind()
             num_tokens_safe = torch.clamp(rolled_count, min=1)
             mtp_loss_normalized = mtp_loss_scale * mtp_loss * (original_count / num_tokens_safe)
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+
+        if early_backward:
+            # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
+            # frees this head's logits/softmax and accumulates the output-layer weight gradient
+            # before the next head (or the main head) allocates its own logits.
+            torch.autograd.backward(
+                mtp_loss_normalized,
+                torch.ones_like(mtp_loss_normalized) * MTPLossAutoScaler.main_loss_backward_scale,
             )
+            head_grad = head_input.grad
+            head_input.grad = None
+            del mtp_loss, mtp_loss_normalized, mtp_logits, mtp_preds, head_input
+            hidden_states = _MTPHeadGradInjector.apply(hidden_states, head_hidden, head_grad)
+        else:
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
 
     return hidden_states
 

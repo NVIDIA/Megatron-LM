@@ -243,6 +243,72 @@ def test_runtime_respects_real_sequence_cap_after_dummy_tail():
     assert prefetch.runtime_spec(config, 8, max_num_seqs=3)['geometry']['max_group_seqs'] == 3
 
 
+@pytest.mark.parametrize(
+    'world,minimum,allowed', [(8, 1, (1, 2, 4, 8)), (32, 8, (8, 16, 32)), (12, 2, (2, 4))]
+)
+def test_runtime_spec_matches_existing_classic_cp_groups(world, minimum, allowed):
+    config = SimpleNamespace(
+        max_seqlen_per_dp_cp_rank=1024, min_dynamic_context_parallel_size=minimum
+    )
+    spec = prefetch.runtime_spec(config, world)
+    assert spec['geometry']['allowed_cp_sizes'] == allowed
+    assert spec['geometry']['align_group_starts']
+    assert not spec['force_powers']
+
+
+def test_runtime_spec_rejects_unsupported_classic_minimum():
+    config = SimpleNamespace(max_seqlen_per_dp_cp_rank=1024, min_dynamic_context_parallel_size=3)
+    with pytest.raises(ValueError, match='power-of-two minimum'):
+        prefetch.runtime_spec(config, 8)
+
+
+@pytest.mark.parametrize('minimum', [1, 3, 5])
+def test_native_runtime_relaxes_widths_and_group_starts(minimum):
+    config = SimpleNamespace(
+        max_seqlen_per_dp_cp_rank=1024,
+        min_dynamic_context_parallel_size=minimum,
+        use_native_cp_transport=True,
+    )
+    spec = prefetch.runtime_spec(config, 8)
+    assert spec['geometry']['allowed_cp_sizes'] == tuple(range(minimum, 9))
+    assert not spec['geometry']['align_group_starts']
+    assert not spec['force_powers']
+
+
+def test_wrap_activates_runtime_with_classic_process_groups(monkeypatch):
+    config = SimpleNamespace(
+        max_seqlen_per_dp_cp_rank=1024,
+        min_dynamic_context_parallel_size=1,
+        sequence_parallel=False,
+        sequence_packing_scheduler='default_dynamic_cp',
+        virtual_pipeline_model_parallel_size=None,
+        dynamic_cp_runtime_model='module:model',
+    )
+    iterator = SimpleNamespace()
+    single = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+    parent = SimpleNamespace(rank=lambda: 0, size=lambda: 8)
+    groups = SimpleNamespace(dp=single, tp=single, pp=single, dp_cp=parent)
+    created = []
+
+    def create(*args):
+        runtime = SimpleNamespace(spec=args[3])
+        created.append(runtime)
+        return runtime
+
+    def run(self, *args):
+        assert self.runtime is iterator._dcp_schedule_prefetcher
+        assert self.prefetch_next
+        assert not self.allow_arbitrary_group_starts
+        return iter([]), 1, 1, 1
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    monkeypatch.setattr(prefetch, 'DcpSchedulePrefetcher', create)
+    monkeypatch.setattr(data_schedule.DefaultDynamicCPScheduler, 'run', run)
+    for _ in range(2):
+        data_schedule.wrap_data_iterator(iterator, config, 1, groups, prefetch_next=True)
+    assert len(created) == 1
+
+
 def test_runtime_options_are_injectable_and_keep_contiguous(tmp_path):
     options = tmp_path / 'solver.json'
     options.write_text('{"time_budget_s": 0.25, "max_scored_candidates": 2}')

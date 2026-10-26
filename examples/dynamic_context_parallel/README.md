@@ -1,70 +1,5 @@
 # Dynamic Context Parallel Benchmark
 
-## Bounded CPU runtime planner (PP1/VPP1)
-
-Cost models and solvers are bundled in MCore; no external `dcp-scheduler` package
-is required. Model selection is independent of solver selection. For example,
-add these flags to a compatible native-DCP training configuration:
-
-```bash
---dynamic-cp-runtime-model calibrated_attention \
---dynamic-cp-runtime-model-options '{"hardware":"gb200","query_heads":32,"kv_heads":4,"head_dim":128,"layer_count":48,"allow_provisional":true}' \
---dynamic-cp-runtime-trace-dir /path/to/telemetry
-```
-
-The geometry above is illustrative and must match the trained model. The
-`calibrated_attention` model covers per-layer FA core costs, not projections or
-the rest of an arbitrary model; transfer to eager/native is provisional. The
-alternative `qwen35_gb200` includes the frozen W32/EP4/local16K five-layer
-proxy's (3 GDN + 2 FA)
-paired FA remainder/GDN/non-attention parameters, not a universal Qwen model.
-Neither is a substitute for GPU validation. Numba acceleration is optional.
-
-With no solver flag, the lightweight arbitrary-width planner uses a cooperative
-0.8-second budget and scores at most four candidates; mandatory work may overrun.
-To select the communication-agnostic DynamicUSP Stage 1/count-search policy:
-
-```bash
---dynamic-cp-runtime-solver dynamic_usp \
---dynamic-cp-runtime-solver-options '{"candidate_count":4,"outlier_threshold":1.0}'
-```
-
-This policy retains the upstream power-of-two candidate widths. It uses the
-selected cost model, not the upstream USP calibration, and does not choose an
-attention implementation. Both solvers retain the configured powers incumbent
-when their search does not predict an improvement. Model/solver options accept a
-JSON object or file path; custom `module:factory` hooks are still supported.
-See the [runtime contracts and model limits](../../megatron/core/datasets/dcp_runtime_scheduler/README.md).
-
-The existing DataLoader keeps each DP rank's sample stream. `wrap_data_iterator`
-buffers one future global batch on the host and gathers its logical/physical lengths
-on the training thread, using the existing DP collective. A persistent CPU executable
-on the DPxCP leader solves it while the current batch trains. Only lengths, options
-and incumbent rows enter the worker; CUDA visibility is disabled. It does not import
-the training entry point or call CUDA/NCCL. An I/O-only thread handles the worker
-protocol; the training thread broadcasts the completed rows when consumed. No new
-process group is created, and the rerun iterator retains its original consumption order.
-
-`--no-dynamic-cp-runtime-async` is a same-solver synchronous control;
-`--dynamic-cp-runtime-force-powers` selects the configured powers packing. To compare
-against a particular historical revision, set `--dynamic-cp-runtime-baseline
-module:factory`; this factory takes the geometry dictionary and returns a
-`padded_pairs -> rank_rows` callable. Without it the baseline is the current
-checkout's non-arbitrary scheduler, **not** an authenticated historical dev SHA. Legacy
-transport and configurations without a runtime model keep their existing path.
-The runtime requires PP1/no VPP and sequence-parallel size one. The injected cost
-model must match the model's layouts, including contiguous or zigzag partitioning. Training
-lookahead is enabled for the in-tree Varlen path or worker-backed loaders; external
-iterators and evaluation do not read ahead. Stochastic transforms must run in
-DataLoader workers so speculative reads do not change training-process RNG state.
-
-Per-rank JSONL includes submit/solve-start/solve-end/consume monotonic and wall
-timestamps, global logical/physical length digest, rows, residual CPU wait,
-worker CUDA/distributed initialization status, and queue depth (at most one). Global
-IDs are step-local in DP-rank order, **not dataset indices**. Compare leader monotonic
-timestamps on the same host and use GPU traces to establish compute overlap. The
-first step waits for initialization; subsequent steps wait only for unfinished work.
-
 This example compares regular DP-balanced packed-sequence training against
 Dynamic Context Parallelism (DCP) on the same variable-length mock workload.
 
@@ -75,6 +10,44 @@ The script reuses the normal Megatron-LM training stack:
 - `DefaultDynamicCPScheduler` is enabled only for the DCP run.
 
 No model class or custom dataset class is introduced by this example.
+
+## Runtime cost models and async planning
+
+The existing classic CP ProcessGroups and TE attention path can use either
+in-tree CPU solver. Add a model to enable the runtime planner:
+
+```text
+--dynamic-cp-runtime-model calibrated_attention
+--dynamic-cp-runtime-model-options '{"hardware":"gb200","query_heads":32,"kv_heads":4,"head_dim":128,"layer_count":48,"allow_provisional":true}'
+```
+
+The default lightweight solver searches legal power-of-two CP widths and
+size-aligned rank intervals. Select the independent DynamicUSP allocator with
+`--dynamic-cp-runtime-solver dynamic_usp`; model and solver selection are
+independent. No custom native transport or external scheduler package is needed.
+The frozen models have limited calibration domains; see the
+[model and solver documentation](../../megatron/core/datasets/dcp_runtime_scheduler/README.md)
+before using their predictions.
+
+A persistent CPU worker on the DPxCP leader prepares one future schedule while
+the current batch trains. Use `--no-dynamic-cp-runtime-async` as a same-solver
+synchronous control and `--dynamic-cp-runtime-trace-dir PATH` for timing, input
+digests, executed rows and worker telemetry. PP1/VPP1 and sequence-parallel size
+one are currently required. Mock varlen data or DataLoader workers enable the
+lookahead training hook; evaluation and external iterators do not read ahead.
+Stochastic transforms must run in DataLoader workers to preserve training RNG.
+`--dynamic-cp-runtime-force-powers` is a baseline-only diagnostic and bypasses
+the solver; it is disabled by default.
+
+## Topology-aware scheduling
+
+For a Cartesian rank mapping, `--dynamic-cp-nvlink-domain-size 8` declares that
+each consecutive eight global ranks share an NVLink domain. The heuristic
+maps those domains into the DPxCP groups and scores exposed communication with
+`--dynamic-cp-communication-cost 1024 2304`. These equivalent-token weights are
+configurable reference coefficients, not a latency calibration. Classic CP
+keeps power-of-two widths and size-aligned starts during placement and spare-rank
+allocation. Omitting the domain size preserves compute-only scheduling.
 
 ## Run
 
@@ -167,9 +140,8 @@ really describe NVL72 domains. The scheduler maps global ranks to DP×CP
 positions and takes the common boundaries across TP/PP planes so all stages
 choose the same schedule. Custom non-Cartesian process-group layouts are not
 supported by this option. Omitting the domain size preserves compute-only
-scheduling; legacy multi-ProcessGroup DCP is unchanged.
-Explicit topology-aware scheduling requires native transport; initialization
-reports an error if automatic selection cannot provide it.
+scheduling; classic ProcessGroups retain their supported power-of-two widths and aligned starts.
+Native transport permits arbitrary integer widths and group starts.
 
 The lightweight score retains the padded compute proxy `Q = sum(L_i²) / CP`.
 For a group crossing a domain boundary, it adds only the extra exposed ring
@@ -191,8 +163,8 @@ reference, not native-transport calibration; override them for a different
 model, payload or interconnect. Equal weights or a single NVLink domain preserve
 the existing packing/filling policy, including its full-parent packing fallback.
 
-All integer CP sizes remain eligible, including groups that must cross a
-domain. Spare ranks are distributed across packs by a bounded dynamic program,
+With native transport, all integer CP sizes remain eligible, including groups
+that must cross a domain. Spare ranks are distributed across packs by a bounded dynamic program,
 instead of all being assigned to one pack. It minimizes the slowest group, then
 total rank-work and cross-domain traffic, exactly for each fixed pack order.
 Only two orders are tried for rank allocation (original and topology-greedy),

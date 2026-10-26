@@ -2,7 +2,6 @@
 
 import importlib
 import logging
-import os
 import warnings
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional, Tuple
@@ -2014,13 +2013,6 @@ class _NCCLEPManager(_DispatchManager):
                         "requires an sm100+ (Blackwell+) GPU for the CuTe DSL grouped GEMM; unset "
                         "it to use eager mode on older GPUs."
                     )
-                if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-                    raise ValueError(
-                        "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
-                        "requires the CuTe DSL grouped GEMM; set "
-                        "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume "
-                        "ragged per-expert counts on device)."
-                    )
 
         self.dispatch_fwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_dispatch_fwd_dtype)
         self.combine_bwd_quant_recipe = get_fp8_recipe_for_a2a(config.moe_combine_bwd_dtype)
@@ -2172,7 +2164,9 @@ class _NCCLEPManager(_DispatchManager):
             topk_idx,
             topk_weights,
             recv_tokens=_NCCLEPManager._zc_fwd_token_buf if self._zc_quant else None,
-            recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
+            recv_topk_weights=(
+                _NCCLEPManager._zc_recv_topk_weights_buf if self._zc_quant else None
+            ),
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         if not self.eager:
