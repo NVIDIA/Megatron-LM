@@ -67,8 +67,11 @@ to Muon while retaining module-level sharding.
 
 **TensorAtomic.** Whole-matrix inputs are already local. The challenge is
 to enforce the layout requested by Muon without substantially slowing
-forward/backward. If gathering weights or reducing gradients takes longer,
-that extra time could cancel out the time saved in the optimizer step.
+forward/backward. Block-atomic sharding can distribute parameters unevenly
+while keeping the total data per rank largely balanced. Assigning whole
+matrices can make that distribution unbalanced. If gathering weights or
+reducing gradients takes longer, that extra time could cancel out the time
+saved in the optimizer step.
 
 ## Algorithm options
 
