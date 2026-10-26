@@ -3213,6 +3213,22 @@ def test_stop_word_checkpoint_boundary_preserves_result_alignment(
     assert serialized_event_tokens == merged.generated_tokens
 
 
+@pytest.mark.asyncio
+async def test_run_coroutine_sync_preserves_runtime_error_from_running_loop():
+    engine = object.__new__(DynamicInferenceEngine)
+    engine._loop = asyncio.get_running_loop()
+    call_count = 0
+
+    async def fail_from_engine():
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("original engine failure")
+
+    with pytest.raises(RuntimeError, match="original engine failure"):
+        engine._run_coroutine_sync(fail_from_engine())
+    assert call_count == 1
+
+
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod
