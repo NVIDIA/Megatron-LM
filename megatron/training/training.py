@@ -165,7 +165,11 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
-from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
+from megatron.training.logging.dsa_flops import (
+    _dsa_sparse_core_scale,
+    dsa_indexer_flops,
+    dsa_layer_flops,
+)
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -828,6 +832,41 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _qsa_indexer_flops(
+    *, hidden_size, n_heads, head_dim, compress_ratio, num_qsa_layers, indexer_loss_coeff
+):
+    """QSA indexer FLOPs coefficients, fwd/bwd expansion included.
+
+    Conventions (the same as the DSA indexer accounting on ``dev``):
+
+      * the projection ``index_qk_proj`` (``hidden -> (n_heads + 1) * head_dim``:
+        ``n_heads`` MQA query heads plus one shared index-key head) reads a
+        detached input, so with the indexer loss on it pays fwd + wgrad = 2x;
+      * the block scoring scores every query against every visible pooled key
+        block. Keys are mean-pooled over ``compress_ratio`` tokens, so the causal
+        scoring pass is ``n_heads * head_dim / (2 * compress_ratio)`` per
+        ``L^2`` and pays fwd + dq + dk = 3x with the loss on;
+      * with the loss off the indexer only runs forward (1x).
+
+    The indexer distillation loss itself and the top-k selection are NOT
+    counted (auxiliary-loss and sorting work).
+
+    Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
+    Multiply ``token_linear`` by the real token count and ``core`` by
+    ``sum_i(L_i ** 2)``.
+    """
+    if num_qsa_layers <= 0:
+        return 0, 0
+    token_linear = num_qsa_layers * hidden_size * (n_heads + 1) * head_dim
+    core = num_qsa_layers * n_heads * head_dim / (2 * compress_ratio)
+    fma_expansion_factor = 2
+    loss_enabled = (indexer_loss_coeff or 0.0) > 0
+    return (
+        (2 if loss_enabled else 1) * fma_expansion_factor * token_linear,
+        (3 if loss_enabled else 1) * fma_expansion_factor * core,
+    )
+
+
 def num_floating_point_operations(
     args,
     batch_size,
@@ -896,7 +935,7 @@ def num_floating_point_operations(
 
     def attn_layer_flops(
         total_tokens, seqlen_squared_sum, hidden_size, num_heads, gqa=True,
-        gqa_groups=8, kv_channels=None,
+        gqa_groups=8, kv_channels=None, attention_output_gate=False,
     ):
         """Calculate FLOPs for an attention layer.
 
@@ -909,11 +948,15 @@ def num_floating_point_operations(
         """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        # Elementwise output gate: one extra hidden_size -> num_heads * kv_channels projection.
+        gate_projection_size = hidden_size * p if attention_output_gate else 0
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # 2 * total_tokens * h * gate_size: output gate projection (FMA*2).
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
             4 * total_tokens * hidden_size * p
             * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * total_tokens * hidden_size * gate_projection_size
             + 2 * seqlen_squared_sum * hidden_size * p
         )
 
@@ -1011,7 +1054,14 @@ def num_floating_point_operations(
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
-                     vocab_size=256000, mtp_num_layers=0):
+                     vocab_size=256000, mtp_num_layers=0,
+                     attention_output_gate=False,
+                     num_qsa_layers=0,
+                     qsa_indexer_n_heads=4,
+                     qsa_indexer_head_dim=128,
+                     qsa_indexer_budget=2048,
+                     qsa_indexer_compress_ratio=4,
+                     qsa_indexer_loss_coeff=None):
         """Calculate total training FLOPs for the hybrid model, including DSA."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
@@ -1041,11 +1091,39 @@ def num_floating_point_operations(
                 ),
             ) if num_dsa_layers else 0
         )
+        # QSA ('Q') layers: a plain GQA attention block (QKV + output projections and
+        # the optional output gate) whose core attention only covers the indexer's
+        # selection, i.e. ``min(i, budget)`` keys per query -- the same causal
+        # effective-length scaling as DSA's top-k. The indexer is added below,
+        # outside the global fwd+bwd factor.
+        qsa_attn_flops = 0
+        qsa_indexer_total = 0
+        if num_qsa_layers:
+            qsa_core_scale = _dsa_sparse_core_scale(
+                total_tokens, seqlen_squared_sum, qsa_indexer_budget
+            )
+            qsa_attn_flops = num_qsa_layers * attn_layer_flops(
+                total_tokens, seqlen_squared_sum * qsa_core_scale, hidden_size,
+                num_attn_heads, gqa, gqa_groups, kv_channels, attention_output_gate,
+            )
+            qsa_token_term, qsa_core_term = _qsa_indexer_flops(
+                hidden_size=hidden_size,
+                n_heads=qsa_indexer_n_heads,
+                head_dim=qsa_indexer_head_dim,
+                compress_ratio=qsa_indexer_compress_ratio,
+                num_qsa_layers=num_qsa_layers,
+                indexer_loss_coeff=qsa_indexer_loss_coeff,
+            )
+            qsa_indexer_total = (
+                qsa_token_term * total_tokens + qsa_core_term * seqlen_squared_sum
+            )
         flops_fwd = (
                 num_dsa_layers * dsa_attention_flops +
                 num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
-                                                   gqa_groups, kv_channels) +
+                                                   gqa_groups, kv_channels,
+                                                   attention_output_gate) +
+                qsa_attn_flops +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_flops +
@@ -1077,7 +1155,8 @@ def num_floating_point_operations(
                 dsa_indexer_kpool=getattr(args, "dsa_indexer_kpool", 1),
             ) if num_dsa_layers else 0
         )
-        return flops_fwd * 3 + indexer_flops
+        # The DSA and QSA indexer terms already carry their own fwd/bwd factor.
+        return flops_fwd * 3 + indexer_flops + qsa_indexer_total
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1457,14 +1536,23 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers, num_dsa_layers = (
-            itemgetter(
-                Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE,
-                Symbols.DS_ATTENTION,
-            )(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
-            )
-        )
+        (
+            num_mamba_layers,
+            num_gdn_layers,
+            num_attn_layers,
+            num_mlp_layers,
+            num_moe_layers,
+            num_dsa_layers,
+            num_qsa_layers,
+        ) = itemgetter(
+            Symbols.MAMBA,
+            Symbols.GDN,
+            Symbols.ATTENTION,
+            Symbols.MLP,
+            Symbols.MOE,
+            Symbols.DS_ATTENTION,
+            Symbols.QSA,
+        )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -1506,6 +1594,13 @@ def num_floating_point_operations(
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            attention_output_gate=getattr(args, "attention_output_gate", False),
+            num_qsa_layers=num_qsa_layers,
+            qsa_indexer_n_heads=getattr(args, "qsa_indexer_n_heads", 4),
+            qsa_indexer_head_dim=getattr(args, "qsa_indexer_head_dim", 128),
+            qsa_indexer_budget=getattr(args, "qsa_indexer_budget", 2048),
+            qsa_indexer_compress_ratio=getattr(args, "qsa_indexer_compress_ratio", 4),
+            qsa_indexer_loss_coeff=getattr(args, "qsa_indexer_loss_coeff", None),
         ))
     else:
         # Compute standard Transformer model FLOPs.
@@ -3660,8 +3755,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
 
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and active indexer modules (CSA or QSA) for loss logging."""
     tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
+
+    if (getattr(args, "qsa_indexer_loss_coeff", None) or 0) > 0:
+        # QSA carries exactly one indexer per 'Q' layer of the hybrid pattern. QSA is
+        # hybrid-only, so without a pattern there is nothing to count and the logger
+        # falls back to counting whatever reported a loss.
+        if args.hybrid_layer_pattern is None:
+            return tracker_layers, None
+        return tracker_layers, (args.hybrid_layer_pattern.count("Q") or None)
+
     if args.csa_compress_ratios is None:
         return tracker_layers, None
 
@@ -3953,7 +4057,9 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    dsa_loss_on = args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0
+    qsa_loss_on = (getattr(args, "qsa_indexer_loss_coeff", None) or 0) > 0
+    if dsa_loss_on or qsa_loss_on:
         indexer_loss_scale = 1 / get_num_microbatches()
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             assert pg_collection.has_language_model(), (

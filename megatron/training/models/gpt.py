@@ -434,6 +434,21 @@ def mtp_block_spec(
             if transformer_layer_spec.layer_specs:
                 # Reuse the resolved spec: the generic decoder builder rejects experimental attention.
                 spec = transformer_layer_spec.layer_specs[-1]
+            elif transformer_cfg.experimental_attention_variant is not None:
+                # A pipeline stage with no decoder layers still needs a decoder spec for
+                # MTP, and the fallback below builds a plain (non-experimental) attention
+                # layer — take the experimental spec entry point instead, matching the
+                # legacy gpt_builders behavior. This deliberately applies to EVERY
+                # experimental variant (dsa/gdn/gdn2/dsv4_hybrid/qsa): previously such a
+                # stage silently got a vanilla-attention MTP layer, which is a bug for
+                # all of them, not just qsa.
+                from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+                    get_transformer_layer_with_experimental_attention_variant_spec,
+                )
+
+                spec = get_transformer_layer_with_experimental_attention_variant_spec(
+                    config=transformer_cfg
+                )[-1]
             else:
                 # A pipeline stage with no decoder layers still needs a decoder spec for MTP.
                 spec = _te_or_local_layer_spec(config, vp_stage)

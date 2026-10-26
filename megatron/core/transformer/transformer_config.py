@@ -340,9 +340,11 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net', 'qsa']
     ] = None
-    """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
+    """Type of attention variant to use. Supports gdn, gdn2, dsa, dsv4_hybrid, and qsa.
+    'qsa' is the GQA-based Qwen Sparse Attention variant (streaming indexer + block-granular
+    sparse selection); it also selects the layer built for hybrid pattern symbol 'Q'.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
     channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
     Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
@@ -482,6 +484,81 @@ class TransformerConfig(ModelParallelConfig):
     csa_dense_mode: bool = False
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
+
+    ####################
+    # QSA (Qwen Sparse Attention)
+    ####################
+    qsa_indexer_n_heads: int = 4
+    """Number of QSA indexer query heads (MQA over one shared index key head)."""
+
+    qsa_indexer_head_dim: int = 128
+    """Dimension per QSA indexer head (query heads and the shared key head)."""
+
+    qsa_indexer_budget: int = 2048
+    """QSA token budget: number of KV tokens each query attends to through block
+    selection. Selected block count is ``qsa_indexer_budget // qsa_indexer_compress_ratio``.
+    Sequences no longer than the budget degenerate to dense causal attention."""
+
+    qsa_indexer_compress_ratio: int = 4
+    """QSA block size in tokens: index keys are mean-pooled (parameter-free) over
+    fixed, causal-prefix-aligned groups of this many tokens; selection is block-granular."""
+
+    qsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the QSA indexer sparse-KL distillation loss (teacher = the main
+    attention distribution aggregated to blocks, normalized over the selected block set
+    only). None or 0 disables indexer training."""
+
+    qsa_indexer_loss_chunk: int = 256
+    """Query-chunk size for the QSA indexer distillation loss.
+
+    Pure memory staging: the loss's softmax is over the token axis and its accumulator is
+    per-chunk, so this cannot change any result - it trades peak memory for kernel launches.
+    On the Qwen3.8-Flash-Next proxy shape, 1024 costs 0.8 GiB and 4096 costs 13.1 GiB more
+    peak memory than 256."""
+
+    qsa_indexer_loss_impl: Literal["reference", "layout", "fused"] = "fused"
+    """Implementation of the QSA indexer distillation loss (same loss definition for all).
+
+    ``reference``: the original eager path (materializes the gathered selected keys).
+    ``layout``: eager, bit-identical teacher targets without materializing the gathered
+    keys (one GEMM per query chunk over its causal key range, then a logit gather).
+    ``fused``: CuTe DSL teacher kernel (Blackwell, bf16) on the main path's q/k plus the
+    CuTe DSL sparse student; CUDA-graph capturable, deterministic indexer gradients."""
+
+    qsa_use_sparse_attention: bool = False
+    """Use the sparse GQA kernel path (gathered block-sparse attention over the selected
+    4-token blocks; supports BSHD and packed THD). The kernels are CuTe DSL kernels for
+    Blackwell (SM100-class) GPUs with bf16/fp16 inputs; building a QSA layer elsewhere
+    raises. When False, the dense-mask
+    bridge is used: the selection is materialized as a [b, s, s] bool mask fed to dense
+    core attention — functionally identical, no sparsity speedup, BSHD only."""
+
+    qsa_attn_backend: Optional[Literal["dense", "cute", "cudnn"]] = None
+    """QSA attention implementation.
+
+    ``dense``: the dense-mask bridge (see ``qsa_use_sparse_attention=False``). ``cute``: the
+    in-tree CuTe DSL sparse kernels (``qsa_use_sparse_attention=True``). ``cudnn``: the same
+    sparse path with cuDNN Frontend's QSA kernels (``cudnn.ops.qsa_forward``; backward chosen by
+    ``qsa_cudnn_bwd_impl``); bf16, head dim 256, 24 query / 2 KV or 12 / 1 heads per rank,
+    4-token blocks, SM100/SM103, no context parallelism. None (default) follows
+    ``qsa_use_sparse_attention``; any other value sets it (``dense`` -> False, else True)."""
+
+    qsa_cudnn_bwd_impl: Literal["qsa_api", "sparse_gqa"] = "sparse_gqa"
+    """Backward of ``qsa_attn_backend='cudnn'``. ``sparse_gqa`` (default): the index-list QSA
+    backward (``cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100``), one launch per sequence; it needs
+    exactly 512 selected blocks, a GQA ratio of 12 or 16 with an even KV head count per rank, and
+    no CUDA-graph capture of packed (THD) inputs. ``qsa_api``: ``cudnn.ops.qsa_backward`` on the
+    forward's block bitmap; serves the rest (e.g. 12 query / 1 KV heads at TP2). ``sparse_gqa`` is
+    the default because its backward is faster than ``qsa_api`` at lower peak memory, single
+    sequence and packed THD alike."""
+
+    qsa_cp_packing_layout: Literal["per_document", "per_sequence"] = "per_document"
+    """How packed THD batches are zigzag-sharded across context-parallel ranks for QSA.
+    'per_document' splits every document independently into 2*cp chunks (each document
+    length must divide 2*cp); 'per_sequence' zigzags the flattened pack (what
+    per-sequence balancing / inter-document masking dataloaders produce). This is a
+    caller contract — both layouts are legal for the same cu_seqlens and cannot be
+    inferred. Ignored for cp=1 and for BSHD inputs."""
 
     ####################
     # linear attention
@@ -2010,6 +2087,22 @@ class TransformerConfig(ModelParallelConfig):
                 "dsa_kernel_backend='tilelang'/'none'."
             )
 
+        # qsa_attn_backend is the QSA attention switch; qsa_use_sparse_attention stays its
+        # backward-compatible alias ("sparse path"), derived from it whenever it is set. None
+        # keeps the alias in charge (dense when False, cute when True).
+        if self.qsa_attn_backend is not None:
+            if self.qsa_attn_backend not in ("dense", "cute", "cudnn"):
+                raise ValueError(
+                    "qsa_attn_backend must be one of 'dense', 'cute', 'cudnn', got "
+                    f"{self.qsa_attn_backend!r}."
+                )
+            if self.qsa_attn_backend == "dense" and self.qsa_use_sparse_attention:
+                raise ValueError(
+                    "qsa_attn_backend='dense' contradicts qsa_use_sparse_attention=True; set "
+                    "only qsa_attn_backend."
+                )
+            self.qsa_use_sparse_attention = self.qsa_attn_backend != "dense"
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if self.deterministic_mode and self.gdn_kernel_backend != "torch":
                 raise ValueError(
@@ -2156,6 +2249,84 @@ class TransformerConfig(ModelParallelConfig):
                         "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
             self.hetereogenous_dist_checkpoint = True
+
+        elif self.experimental_attention_variant == "qsa":
+            if self.multi_latent_attention:
+                raise ValueError(
+                    "QSA is GQA-based and is incompatible with multi_latent_attention."
+                )
+            if self.qsa_indexer_compress_ratio < 1:
+                raise ValueError(
+                    "qsa_indexer_compress_ratio must be positive, got "
+                    f"{self.qsa_indexer_compress_ratio}."
+                )
+            if (
+                self.qsa_indexer_budget < 1
+                or self.qsa_indexer_budget % self.qsa_indexer_compress_ratio != 0
+            ):
+                raise ValueError(
+                    f"qsa_indexer_budget ({self.qsa_indexer_budget}) must be a positive "
+                    f"multiple of qsa_indexer_compress_ratio ({self.qsa_indexer_compress_ratio})."
+                )
+            if self.qsa_indexer_n_heads < 1 or self.qsa_indexer_head_dim < 1:
+                raise ValueError(
+                    "qsa_indexer_n_heads and qsa_indexer_head_dim must be positive, got "
+                    f"{self.qsa_indexer_n_heads} and {self.qsa_indexer_head_dim}."
+                )
+            if self.qsa_indexer_loss_chunk < 1:
+                raise ValueError(
+                    f"qsa_indexer_loss_chunk must be positive, got {self.qsa_indexer_loss_chunk}."
+                )
+            if self.qsa_indexer_loss_impl not in ("reference", "layout", "fused"):
+                raise ValueError(
+                    "qsa_indexer_loss_impl must be one of 'reference', 'layout', 'fused', "
+                    f"got {self.qsa_indexer_loss_impl!r}."
+                )
+            if self.qsa_indexer_loss_coeff is not None and self.qsa_indexer_loss_coeff < 0:
+                raise ValueError(
+                    f"qsa_indexer_loss_coeff must be non-negative, got "
+                    f"{self.qsa_indexer_loss_coeff}."
+                )
+            # Note: the indexer reuses the main attention's rotary frequencies. Their dim
+            # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
+            # dim; this is asserted at runtime in QSAIndexer.forward.
+            if self.qsa_cudnn_bwd_impl not in ("qsa_api", "sparse_gqa"):
+                raise ValueError(
+                    "qsa_cudnn_bwd_impl must be 'qsa_api' or 'sparse_gqa', got "
+                    f"{self.qsa_cudnn_bwd_impl!r}."
+                )
+            if self.qsa_attn_backend == "cudnn":
+                if self.context_parallel_size > 1:
+                    raise ValueError(
+                        "qsa_attn_backend='cudnn' does not support context parallelism: "
+                        "cudnn.ops.qsa_forward takes queries and keys in one token space, while "
+                        "QSA CP runs local queries against all-gathered keys. Use "
+                        "qsa_attn_backend='cute'."
+                    )
+            if self.qsa_cp_packing_layout not in ("per_document", "per_sequence"):
+                raise ValueError(
+                    "qsa_cp_packing_layout must be 'per_document' or 'per_sequence', got "
+                    f"{self.qsa_cp_packing_layout!r}."
+                )
+            if self.context_parallel_size > 1:
+                # QSA CP is allgather-only: the indexer all-gathers the shared raw index
+                # key head and the sparse path all-gathers K/V; queries stay local at
+                # their zigzag positions. Ring (p2p) attention is not implemented.
+                if not self.qsa_use_sparse_attention:
+                    raise ValueError(
+                        "QSA with context parallelism requires qsa_use_sparse_attention=True "
+                        "(the dense-mask bridge is single-rank only)."
+                    )
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                if any(c not in (None, "all_gather", "allgather") for c in cp_comm_types):
+                    raise ValueError(
+                        "QSA context parallelism supports cp_comm_type='all_gather' only, "
+                        f"got {self.cp_comm_type!r}."
+                    )
 
         if self.gdn_pre_gated_delta_rule_fusion and not (
             self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
@@ -4006,6 +4177,25 @@ class TransformerConfig(ModelParallelConfig):
             "local",
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+
+        # Needs the normalized cuda_graph_modules, so it lives here rather than with the other
+        # QSA checks. Packed (THD) inputs reach the captured layers through the sequence-packing
+        # scheduler or through the static THD capacity (thd_max_packed_sequences).
+        if (
+            self.qsa_attn_backend == "cudnn"
+            and self.qsa_cudnn_bwd_impl == "sparse_gqa"
+            and self.cuda_graph_impl != "none"
+            and (
+                self.sequence_packing_scheduler is not None
+                or self.thd_max_packed_sequences is not None
+            )
+            and cuda_graph_captures_attention(self)
+        ):
+            raise ValueError(
+                "qsa_cudnn_bwd_impl='sparse_gqa' runs one backward per packed document from "
+                "host-side boundaries and cannot be captured into a CUDA graph with packed (THD) "
+                "inputs. Use qsa_cudnn_bwd_impl='qsa_api', or drop attn from --cuda-graph-modules."
+            )
 
         if self.thd_max_packed_sequences is not None:
             # Either the dp_balanced scheduler bounds packing with this capacity, or the caller
