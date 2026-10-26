@@ -8,7 +8,12 @@ import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
-from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
+from transformer_engine.pytorch.fp8 import (
+    check_fp8_block_scaling_support,
+    check_fp8_support,
+    check_mxfp8_support,
+    check_nvfp4_support,
+)
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -34,6 +39,8 @@ from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, reason_for_no_fp8 = check_fp8_support()
+mxfp8_available, reason_for_no_mxfp8 = check_mxfp8_support()
+fp8_block_scaling_available, reason_for_no_fp8_block_scaling = check_fp8_block_scaling_support()
 nvfp4_available, reason_for_no_nvfp4 = check_nvfp4_support()
 
 
@@ -575,9 +582,6 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
     Utils.destroy_model_parallel()
 
 
-# Hopper = SM 9.0, Blackwell = SM 10.0+. mxfp8 needs Blackwell.
-_IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
-
 _QUANT_RECIPES = [
     pytest.param(
         {"fp8": "hybrid", "fp8_recipe": "tensorwise"},
@@ -587,12 +591,14 @@ _QUANT_RECIPES = [
     pytest.param(
         {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
         id="fp8-mxfp8",
-        marks=pytest.mark.skipif(not fp8_available or not _IS_BLACKWELL, reason="needs Blackwell"),
+        marks=pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8),
     ),
     pytest.param(
         {"fp8": "hybrid", "fp8_recipe": "blockwise"},
         id="fp8-blockwise",
-        marks=pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8),
+        marks=pytest.mark.skipif(
+            not fp8_block_scaling_available, reason=reason_for_no_fp8_block_scaling
+        ),
     ),
     pytest.param(
         {"fp4": "e2m1", "fp4_recipe": "nvfp4"},
