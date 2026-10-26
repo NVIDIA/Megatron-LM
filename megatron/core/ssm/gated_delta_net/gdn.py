@@ -194,7 +194,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         # Output gate. In the fused pre-GDR path, gate is a strided view of
         # qkvzba's Z channels. Keep it 4-D so this pointwise operation reads Z
         # through its strides instead of reshape() materializing a copy.
-        y = y * self.act_fn(gate.float())
+        y = y * self.output_gate_act_fn(gate.float())
         y = y.to(x_dtype)
         return y
 
