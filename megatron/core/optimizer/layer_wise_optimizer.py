@@ -24,6 +24,7 @@ from .optimizer import (
     MegatronOptimizer,
     _get_param_grad_norm_group,
     _validate_grad_norm_group,
+    _warn_grad_stats_reduced_over_world,
     set_duplicate_filter_groups,
 )
 from .optimizer_config import OptimizerConfig
@@ -594,6 +595,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
         self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
+        if self.grad_stats_parallel_group is None:
+            # The gradient-norm and zero-count reductions of this class read the attribute
+            # directly, so the fallback to WORLD is reported here, once.
+            _warn_grad_stats_reduced_over_world(type(self).__name__)
 
         # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
         # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
