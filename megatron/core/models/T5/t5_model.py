@@ -176,6 +176,8 @@ class T5Model(LanguageModule):
                     "T5Model tied pipeline embedding/output stages require a usable embd group"
                 )
         super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
+        # LanguageModule resolves an omitted collection; build the submodules on the same groups.
+        pg_collection = self.pg_collection
 
         self.config: TransformerConfig = config
         self.encoder_config: TransformerConfig = encoder_config
