@@ -30,7 +30,7 @@ class FsdpUnitCollector:
         self._units_to_shard: list[nn.Module] = []
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
-        """Return a fresh list to shard in reverse order, children before parents."""
+        """Return selected modules in pre-order, parents before children."""
         self._units_to_shard = [module]
         self._visit(module, inside_shortcut=False)
         return self._units_to_shard
