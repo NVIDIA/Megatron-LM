@@ -42,6 +42,32 @@ boundary. Other matrices can be entirely local to one rank. See the
 [group construction](../megatron_fsdp/experimental/module.py), and
 [layout builders](../megatron_fsdp/experimental/layout_builder.py).
 
+For example, consider five trainable FP32 parameters owned by one module.
+They share one group buffer, partitioned across five ranks as follows. This
+layout is covered by
+[`test_compute_layout_fills_lcm_padding_gaps`](../../../../../../tests/unit_tests/distributed/mfsdp_v2/test_dbuffer.py#L60)
+and illustrated in
+[`build_for_row_atomic`](../megatron_fsdp/experimental/layout_builder.py#L39).
+
+```text
+Shapes: P0=(2,6), P1=(4,4), P2=(4,4), P3=(1,2), P4=(1,6)
+One group buffer, 12 elements per rank (including padding)
+
+rank 0 [ 0,12): | P0 row 0              | P0 row 1               |
+rank 1 [12,24): | P1 row 0      | P1 row 1      | P1 row 2       |
+rank 2 [24,36): | P1 row 3      | P3    | gap   | P2 row 0       |
+rank 3 [36,48): | P2 row 1      | P2 row 2      | P2 row 3       |
+rank 4 [48,60): | P4                    | pad                    |
+```
+
+All-gather assembles these five segments into the full group buffer on
+each rank for module computation. Backward reduces the group's full
+gradient buffers together and scatters the corresponding 12-element
+segments back to their ranks. Each shard contains complete rows, but only
+`P0`, `P3`, and `P4` remain whole on one rank. `P1` spans ranks 1 and 2, and
+`P2` spans ranks 2 and 3; these matrices need gathering before local
+full-matrix Muon orthogonalization.
+
 An FSDP parameter group defines storage and communication. It is distinct
 from an optimizer's `param_groups`, which define settings such as learning
 rate and weight decay. Choosing separate Muon and Adam parameter lists does
