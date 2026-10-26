@@ -21,6 +21,7 @@ from torch import nn
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+from megatron.core.ops._backends import require
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import async_gather_from_sequence_parallel_region
@@ -64,6 +65,7 @@ from .csa_utils.csa2_indexer import (
     fused_candidate_topk,
     fused_csa2_indexer_loss,
     fused_csa2_indexer_sparse_attn,
+    fused_mxfp8_topk,
     prepare_csa2_indexer_inputs,
 )
 from .csa_utils.fused_sparse_attention import (
@@ -555,8 +557,14 @@ class CSA2Indexer(MegatronModule):
             config, "dsa_kernel_backend", "none"
         ) == "cudnn" and use_fused_dsa_kernels(config)
         self.precision = getattr(config, "dsa_indexer_precision", "bf16")
-        if self.precision != "bf16":
-            raise ValueError("CSA2 currently uses the main BF16 indexer backend")
+        if self.precision == "mxfp8" and not self.use_fused_kernels:
+            raise ValueError("CSA2 MXFP8 selection requires the fused indexer backend")
+        if self.precision == "mxfp8":
+            require(
+                "transformer_engine.pytorch.tensor.mxfp8_tensor",
+                "MXFP8Quantizer",
+                needed_by="CSA2 MXFP8 selection",
+            )
         linear_kwargs = dict(
             config=config,
             init_method=config.init_method,
@@ -804,9 +812,11 @@ class CSA2Indexer(MegatronModule):
 
     @torch.no_grad()
     def _fused_topk(self, inputs: CSA2IndexerInputs) -> torch.Tensor:
-        """Use main's BF16 scorer with bounded query tiles and physical packed indices."""
+        """Select physical packed indices with compact MXFP8 or bounded BF16 scoring."""
         if inputs.candidates is not None:
             return fused_candidate_topk(inputs, self.topk, self.precision)
+        if self.precision == "mxfp8":
+            return fused_mxfp8_topk(inputs, self.topk)
         indices, _ = fused_candidate_blocks(
             inputs, topk_blocks=0, block_size=1, precision=self.precision, token_topk=self.topk
         )

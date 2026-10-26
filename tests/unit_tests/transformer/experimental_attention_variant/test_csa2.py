@@ -468,3 +468,107 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         )
         assert cosine > 0.99
         assert (actual.float() - expected.float()).norm() / norm < 0.03
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "ratio,heads,cp", [(r, h, c) for r in (1, 2) for h in (32, 64) for c in (1, 2)]
+)
+def test_mxfp8_packed_selection_matches_quantized_scores(monkeypatch, ratio, heads, cp):
+    """Check compact/source/Reindex selection across empty, padded and CP-cut segments."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from megatron.core.ops.attention.csa.indexer_quantization import quantize_indexer_mxfp8_logical
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_candidates import (
+        candidate_blocks_from_scores,
+        fused_candidate_blocks,
+    )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.csa2_indexer import (
+        fused_candidate_topk,
+        fused_mxfp8_topk,
+        prepare_csa2_indexer_inputs,
+    )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.thd_utils import (
+        build_csa2_thd_layout,
+    )
+    from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 selection requires SM100")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    torch.manual_seed(487)
+    logical = torch.tensor([0, 65, 65, 322], dtype=torch.int32, device="cuda")
+    physical = torch.tensor([0, 66, 66, 326], dtype=torch.int32, device="cuda")
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=260,
+        max_seqlen_kv=260,
+    )
+    group = SimpleNamespace(size=lambda: cp, rank=lambda: cp - 1)
+    layout = build_csa2_thd_layout(params, 326 // cp, cp_group=group)
+    compressed = layout.for_compression(ratio)
+    q = torch.randn(326 // cp, heads, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(compressed.capacity, 128, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(q.shape[0], heads, dtype=torch.bfloat16, device="cuda")
+    inputs = prepare_csa2_indexer_inputs(q, k, w, ratio, None, layout, compressed)
+
+    def dequantize(x):
+        data, scales = quantize_indexer_mxfp8_logical(x)
+        scale = torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
+        return (data.float().reshape(-1, 128) * scale).reshape(x.shape)
+
+    weights = (w.float() * (128**-0.5 * heads**-0.5)).bfloat16().float()
+    scores = (
+        torch.einsum('qhd,kd->qhk', dequantize(q), dequantize(k)).relu() * weights[..., None]
+    ).sum(1)
+    keys = torch.arange(k.shape[0], device=q.device)[None, :]
+    valid = (keys >= inputs.starts[:, None]) & (keys < (inputs.starts + inputs.visible)[:, None])
+    scores.masked_fill_(~valid | ~inputs.valid[:, None], -torch.inf)
+
+    def topk(s):
+        ids = s.argsort(dim=-1, descending=True, stable=True)[:, :7]
+        sentinel = torch.iinfo(torch.int32).max
+        ids = ids.masked_fill(~s.gather(1, ids).isfinite(), sentinel).sort(-1).values
+        return ids.masked_fill(ids == sentinel, -1).int()
+
+    expected = topk(scores)
+    torch.testing.assert_close(fused_mxfp8_topk(inputs, 7), expected)
+    selected, blocks = fused_candidate_blocks(
+        inputs, topk_blocks=3, block_size=8, precision="mxfp8", token_topk=7
+    )
+    torch.testing.assert_close(selected, expected)
+    local_keys = inputs.starts[:, None] + torch.arange(inputs.max_keys, device=q.device)
+    local_scores = scores.gather(1, local_keys.clamp_max(k.shape[0] - 1))
+    local_scores.masked_fill_(local_keys >= (inputs.starts + inputs.visible)[:, None], -torch.inf)
+    expected_blocks = candidate_blocks_from_scores(local_scores, inputs.visible, 3, 8)
+    torch.testing.assert_close(blocks.indices, expected_blocks.indices)
+    torch.testing.assert_close(blocks.lengths, expected_blocks.lengths)
+    mask = blocks.to_mask(k.shape[0], thd_layout=layout, compressed_layout=compressed)
+    torch.testing.assert_close(
+        fused_candidate_topk(replace(inputs, candidates=blocks), 7, "mxfp8"),
+        topk(scores.masked_fill(~mask, -torch.inf)),
+    )
+
+    def select(query, keys, weights):
+        prepared = prepare_csa2_indexer_inputs(
+            query, keys, weights, ratio, None, layout, compressed
+        )
+        source_topk, candidates = fused_candidate_blocks(
+            prepared, topk_blocks=3, block_size=8, precision="mxfp8", token_topk=7
+        )
+        return (
+            fused_mxfp8_topk(prepared, 7),
+            source_topk,
+            candidates.indices,
+            fused_candidate_topk(replace(prepared, candidates=candidates), 7, "mxfp8"),
+        )
+
+    assert_replays_bit_exact(
+        select, (q, k, w), backward=False, replays=3, what="CSA2 MXFP8 packed selection"
+    )

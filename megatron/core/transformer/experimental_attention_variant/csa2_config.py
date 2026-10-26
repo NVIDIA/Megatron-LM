@@ -39,8 +39,15 @@ def validate_csa2_config(config) -> None:
         raise ValueError(
             "CSA2 uses bias-free projections, RMSNorm and unrotated indexer activations"
         )
-    if config.fp8 or config.fp4 or config.quant_recipe is not None:
-        raise NotImplementedError("CSA2 currently supports BF16/FP32 training, without weight QAT")
+    if config.fp4 or config.quant_recipe is not None:
+        raise NotImplementedError("CSA2 does not support FP4 or custom weight QAT")
+    if config.dsa_indexer_precision not in ("bf16", "mxfp8"):
+        raise ValueError("CSA2 indexer precision must be bf16 or mxfp8")
+    if config.dsa_indexer_precision == "mxfp8":
+        if config.dsa_kernel_backend != "cudnn":
+            raise ValueError("CSA2 MXFP8 selection requires the cuDNN backend")
+        if torch.cuda.get_device_capability()[0] < 10:
+            raise ValueError("CSA2 MXFP8 selection requires SM100 or later")
     for name in ("layernorm_epsilon", "csa_compress_rotary_base"):
         if not math.isfinite(getattr(config, name)) or getattr(config, name) <= 0:
             raise ValueError(f"CSA2 requires positive finite {name}")
