@@ -23,7 +23,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from megatron.core.utils import (
     divide,
     get_pg_rank,
@@ -109,7 +113,8 @@ def param_is_not_tensor_parallel_duplicate(
             without ``expert_tp_group`` uses ``tp_group``, and a parameter left without a group
             reads the global tensor-parallel rank. Callers that took both groups from the
             owner's ``ProcessGroupCollection`` pass ``False``: ``None`` then marks an axis that
-            is off, so the parameter has no replica along it and is kept.
+            is off, so the parameter has no replica along it and is kept. The read of the
+            global rank is deprecated and emits a ``ProcessGroupFallbackWarning``.
     """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
@@ -124,6 +129,12 @@ def param_is_not_tensor_parallel_duplicate(
     if tp_group is not None:
         return tp_group.rank() == 0
     # Fallback to legacy global state (back-compat).
+    warn_global_process_group_fallback(
+        "param_is_not_tensor_parallel_duplicate",
+        "expert_tp_group" if is_expert else "tp_group",
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     return get_tensor_model_parallel_rank() == 0
 
 
@@ -153,7 +164,9 @@ def param_is_not_gtp_duplicate(
 
     Callers that took both groups from the owner's ``ProcessGroupCollection`` pass
     ``use_global_fallback=False``: a ``None`` group then marks a GTP axis that is off, so the
-    param is kept instead of being filtered by the global GTP rank.
+    param is kept instead of being filtered by the global GTP rank. With
+    ``use_global_fallback=True``, the MPU fallback is deprecated and emits a
+    ``ProcessGroupFallbackWarning``.
     """
     if getattr(param, "is_gtp_weight_remat", False):
         return True
@@ -165,6 +178,12 @@ def param_is_not_gtp_duplicate(
     if not use_global_fallback:
         return True
     # Fallback to legacy global state (back-compat).
+    warn_global_process_group_fallback(
+        "param_is_not_gtp_duplicate",
+        "expert_gtp_group" if is_expert else "gtp_group",
+        deprecated_in="0.21",
+        removed_in="0.23",
+    )
     if is_expert:
         return get_expert_gtp_weight_remat_rank() == 0
     return get_gtp_weight_remat_rank() == 0

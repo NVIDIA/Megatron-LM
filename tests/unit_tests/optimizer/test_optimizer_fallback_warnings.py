@@ -4,9 +4,10 @@
 
 ``torch.distributed`` reads a ``None`` grad-stats group as WORLD, so an optimizer without one
 reduces its gradient norm, zero count and found-inf flag over every rank in the job. The
-fallback keeps working during the deprecation period: a caller such as Megatron-Bridge, which
-sets ``intra_dist_opt=None`` for a single optimizer instance, keeps training, and is told that
-the fallback goes away.
+duplicate filters of an optimizer built without a collection read the global TP and GTP ranks.
+Both fallbacks keep working during the deprecation period: a caller such as Megatron-Bridge,
+which sets ``intra_dist_opt=None`` for a single optimizer instance, keeps training, and is told
+that the fallback goes away.
 """
 
 import os
@@ -19,12 +20,21 @@ from packaging.version import Version
 
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    _get_megatron_optimizer_based_on_param_groups,
+    get_megatron_optimizer,
+)
 from megatron.core.optimizer import optimizer as optimizer_module
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import FP32Optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from megatron.core.tensor_parallel import layers as tensor_parallel_layers
+from megatron.core.tensor_parallel import (
+    param_is_not_gtp_duplicate,
+    param_is_not_tensor_parallel_duplicate,
+)
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -109,6 +119,121 @@ class TestGradStatsGroupGetters:
             _stub_optimizer(
                 FP32Optimizer, grad_stats_parallel_group=None
             ).get_grad_stats_parallel_group()
+
+
+class TestDuplicateFilterFallbacks:
+    """A ``None`` group with ``use_global_fallback=True`` reads the global rank and warns."""
+
+    @pytest.mark.parametrize("is_expert", [False, True], ids=["dense", "expert"])
+    def test_tensor_parallel_filter_warns_when_it_reads_the_global_rank(self, is_expert):
+        param = torch.nn.Parameter(torch.empty(1))
+        if is_expert:
+            param.allreduce = False
+        argument = "expert_tp_group" if is_expert else "tp_group"
+        with mock.patch.object(
+            tensor_parallel_layers, "get_tensor_model_parallel_rank", return_value=1
+        ):
+            with pytest.warns(ProcessGroupFallbackWarning) as record:
+                assert not param_is_not_tensor_parallel_duplicate(param)
+        (message,) = _fallback_messages(record)
+        assert message.startswith(
+            f"param_is_not_tensor_parallel_duplicate was called without `{argument}`"
+        )
+        assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message
+
+    @pytest.mark.parametrize("is_expert", [False, True], ids=["dense", "expert"])
+    def test_gtp_filter_warns_when_it_reads_the_global_rank(self, is_expert):
+        param = torch.nn.Parameter(torch.empty(1))
+        if is_expert:
+            param.allreduce = False
+        argument = "expert_gtp_group" if is_expert else "gtp_group"
+        accessor = "get_expert_gtp_weight_remat_rank" if is_expert else "get_gtp_weight_remat_rank"
+        with mock.patch.object(tensor_parallel_layers, accessor, return_value=1):
+            with pytest.warns(ProcessGroupFallbackWarning) as record:
+                assert not param_is_not_gtp_duplicate(param)
+        (message,) = _fallback_messages(record)
+        assert message.startswith(f"param_is_not_gtp_duplicate was called without `{argument}`")
+        assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message
+
+    @pytest.mark.parametrize("is_expert", [False, True], ids=["dense", "expert"])
+    def test_axis_off_in_a_collection_neither_warns_nor_reads_the_global_grid(self, is_expert):
+        param = torch.nn.Parameter(torch.empty(1))
+        if is_expert:
+            param.allreduce = False
+        global_reads = [
+            "get_tensor_model_parallel_rank",
+            "get_gtp_weight_remat_rank",
+            "get_expert_gtp_weight_remat_rank",
+        ]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            with mock.patch.multiple(
+                tensor_parallel_layers,
+                **{name: mock.Mock(side_effect=AssertionError(name)) for name in global_reads},
+            ):
+                assert param_is_not_tensor_parallel_duplicate(param, use_global_fallback=False)
+                assert param_is_not_gtp_duplicate(param, use_global_fallback=False)
+
+
+def _parameter_with_grad(grad, **attributes):
+    """A CUDA parameter carrying ``grad`` and the given parallelism attributes."""
+    parameter = torch.nn.Parameter(torch.zeros_like(grad).cuda())
+    parameter.grad = grad.detach().clone().cuda()
+    for name, value in attributes.items():
+        setattr(parameter, name, value)
+    return parameter
+
+
+class TestOptimizerWithoutCollection:
+    """An optimizer built without a collection filters by the global grid, and says so."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_hand_built_optimizer_warns_and_matches_the_collection_on_the_global_grid(self):
+        world_size = Utils.world_size
+        if world_size % 2 != 0:
+            pytest.skip(f"world size {world_size} must be even to form TP pairs")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+
+        generator = torch.Generator().manual_seed(1234 + torch.distributed.get_rank())
+        parameters = [
+            # A TP shard, unique on every rank.
+            _parameter_with_grad(
+                torch.randn(8, 4, generator=generator), tensor_model_parallel=True
+            ),
+            # A bias replicated across the TP pair, counted on TP rank 0 only.
+            _parameter_with_grad(torch.randn(4, generator=generator)),
+        ]
+        grad_stats_group = parallel_state.get_model_parallel_group()
+        config = OptimizerConfig(optimizer='sgd', lr=1.0)
+
+        from_collection = _get_megatron_optimizer_based_on_param_groups(
+            config=config,
+            model_chunks=[torch.nn.Module()],
+            param_groups=[{'params': parameters, 'is_expert_parallel': False}],
+            model_parallel_group=grad_stats_group,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            collection_norm = float(from_collection.get_grad_norm())
+
+        hand_built = FP32Optimizer(torch.optim.SGD(parameters, lr=1.0), config, None)
+        hand_built.grad_stats_parallel_group = grad_stats_group
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            hand_built_norm = float(hand_built.get_grad_norm())
+        messages = _fallback_messages(record)
+        assert any(
+            m.startswith("param_is_not_tensor_parallel_duplicate was called without `tp_group`")
+            for m in messages
+        )
+        assert any(
+            m.startswith("param_is_not_gtp_duplicate was called without `gtp_group`")
+            for m in messages
+        )
+        # On the standard grid the global groups are the collection's, so the norm is unchanged.
+        assert hand_built_norm == pytest.approx(collection_norm, rel=1e-6)
 
 
 class TestDistributedOptimizerWithoutInstanceGroup:
