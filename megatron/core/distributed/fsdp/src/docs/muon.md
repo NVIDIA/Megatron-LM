@@ -134,9 +134,8 @@ and [collectives](../megatron_fsdp/experimental/dbuffer.py) for this.
 
 ## Tradeoffs
 
-- **Gather/scatter favors forward/backward latency and memory** through
-  more balanced sharding.
-- **TensorAtomic favors optimizer latency and memory** by avoiding
+- **Gather/scatter favors forward/backward** through more balanced sharding.
+- **TensorAtomic favors the optimizer** by avoiding
   gather/scatter communication and temporary buffers.
 
 ## Next step
