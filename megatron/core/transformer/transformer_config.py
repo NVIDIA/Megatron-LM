@@ -2759,7 +2759,17 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "DSv4 context parallelism requires attention_cp_layout='contiguous'."
                 )
-            if self.dynamic_context_parallel:
+            if self.dynamic_context_parallel and not self.dsa_cp_balance_indexer:
+                # NOTE(nightly-sync 26_10_2026): main rejects DSv4 + dynamic CP outright
+                # ("not supported yet"), but dev has since implemented it for the balanced
+                # zigzag indexer: the dsa_cp_balance_indexer precondition above accepts
+                # ``dynamic_context_parallel=True`` as a valid CP activation. Scoping the
+                # rejection to the unbalanced path keeps main's guard for the configurations
+                # it was written for while preserving dev's support, so both sides' tests
+                # hold -- test_dsv4_hybrid_attention.py::
+                # test_config_rejects_dynamic_context_parallel (main, no balanced indexer)
+                # and test_cp_balanced_indexer_layout.py::
+                # test_balanced_config_accepts_dynamic_context_parallelism (dev).
                 raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
@@ -4663,8 +4673,30 @@ class TransformerConfig(ModelParallelConfig):
         if self.dynamic_context_parallel:
             # Captured graphs bake in static communicators, so they cannot follow the
             # per-microbatch CP group that dynamic context parallelism selects at runtime.
+            # NOTE(nightly-sync 26_10_2026): dev has since implemented packed-DSA
+            # dynamic CP under CUDA graphs as an experimental-but-supported path --
+            # is_packed_dsa_cp_cuda_graph_experimental() takes dynamic_context_parallel
+            # as an explicit input and only warns (see the warnings.warn call later in
+            # this method, plus PACKED_DSA_CP_CUDA_GRAPH_WARNING's "set
+            # cuda_graph_impl='none' to use the supported eager path"). Main's blanket
+            # rejection would make that whole path unreachable, so scope it to the
+            # configurations main wrote it for. Main's guard tests set neither
+            # experimental_attention_variant="dsa" nor the dynamic-pack scheduler, so
+            # the predicate is False for them and they still raise --
+            # test_transformer_config.py::test_dynamic_context_parallel_validation and
+            # test_hybrid_context_parallel_args.py::
+            # test_hybrid_context_parallel_rejects_cuda_graph_impl hold, as does dev's
+            # test_attention_variant_dsa.py::
+            # test_packed_dsa_cp_cuda_graph_warning_boundary[dynamic_te_mlp].
+            packed_dsa_cp_cuda_graphs = is_packed_dsa_cp_cuda_graph_experimental(
+                experimental_attention_variant=self.experimental_attention_variant,
+                sequence_packing_scheduler=self.sequence_packing_scheduler,
+                dynamic_context_parallel=self.dynamic_context_parallel,
+                context_parallel_size=self.context_parallel_size,
+                cuda_graph_impl=self.cuda_graph_impl,
+            )
             assert (
-                self.cuda_graph_impl == "none"
+                self.cuda_graph_impl == "none" or packed_dsa_cp_cuda_graphs
             ), "Dynamic context parallelism not supported with CUDA Graph"
             assert (
                 self.calculate_per_token_loss

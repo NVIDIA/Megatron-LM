@@ -497,10 +497,14 @@ class ShortcutMoEBlock(MegatronModule):
                 self.moe_local_idx, padding_mask, padding_mask_by_layout
             )
 
-        if padding_mask_by_layout is not None:
-            padding_mask = padding_mask_by_layout[
-                cp_layout_state.manager.layer_layouts[self.moe_local_idx]
-            ]
+        # NOTE(nightly-sync 26_10_2026): main hoisted dev's inline per-layout
+        # padding-mask lookup into ContextParallelLayoutState.get_layer_padding_mask()
+        # (called just above) and renamed the result to moe_padding_mask so the
+        # attention path keeps the unmapped mask. The merge kept both copies, and
+        # dev's leftover block re-clobbered `padding_mask` -- which main's rename
+        # deliberately leaves alone for the attention call site below -- so it is
+        # dropped here. input_ids_by_layout has no main equivalent (dev-only), so
+        # its remap stays inline.
         if input_ids_by_layout is not None:
             input_ids = input_ids_by_layout[
                 cp_layout_state.manager.layer_layouts[self.moe_local_idx]

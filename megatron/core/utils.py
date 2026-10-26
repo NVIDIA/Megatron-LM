@@ -3036,7 +3036,15 @@ def get_batch_on_this_cp_rank(
         # Backward-compatible fallback for callers that pass only ``batch``
         # (pretrain entrypoints historically read the global CP group
         # internally): use the current context-parallel group.
-        cp_group = parallel_state.get_context_parallel_group()
+        #
+        # NOTE(nightly-sync 26_10_2026): this fallback is dev-only — main resolves
+        # nothing here and lets ``cp_group=None`` fall through to
+        # ``torch.distributed.get_world_size(None)``, which yields the default
+        # group. Probing with ``check_initialized=False`` keeps the fallback useful
+        # once CP is initialized while preserving main's behaviour when it is not,
+        # so callers that pass only ``batch`` outside an initialized CP group do
+        # not hit an assert (see tests/unit_tests/data/test_batch_api_compat.py).
+        cp_group = parallel_state.get_context_parallel_group(check_initialized=False)
 
     if use_contiguous_cp:
         from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous

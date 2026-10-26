@@ -261,7 +261,25 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
     monkeypatch.setattr(pretrain_hybrid, "core_transformer_config_from_args", lambda _args: config)
     monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **_kwargs: False)
-    scheduler = MagicMock(return_value=scheduler_batch)
+    # NOTE(nightly-sync 26_10_2026): the hybrid entrypoint now passes main's
+    # return_context_parallel_batch=True, so the scheduler -- not get_batch -- owns wrapping
+    # the batch. Main-only API that four of its own test files depend on, so it is kept and
+    # the stub returns what the real callee returns. The assertions below are unchanged: they
+    # still pin the hook to the normalized TransformerConfig rather than the raw args.
+    scheduler = MagicMock(
+        return_value=ContextParallelBatch.from_single_layout(
+            config.linear_cp_layout,
+            {
+                "tokens": scheduler_batch[0],
+                "labels": scheduler_batch[1],
+                "loss_mask": scheduler_batch[2],
+                "attention_mask": scheduler_batch[3],
+                "position_ids": scheduler_batch[4],
+                "padding_mask": scheduler_batch[6],
+            },
+            packed_seq_params,
+        )
+    )
     finalize = MagicMock(return_value=packed_seq_params)
     prebuild = MagicMock()
     monkeypatch.setattr(pretrain_hybrid, "get_batch_on_this_rank_for_sequence_packing", scheduler)
@@ -323,7 +341,11 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
 
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
-    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *_args, **_kwargs: False)
+    # NOTE(nightly-sync 26_10_2026): main imports this helper under an alias
+    # (`mtp_on_this_rank as mtp_on_this_rank_func`), and pretrain_gpt.get_batch binds a local
+    # variable of the un-aliased name, so patching "mtp_on_this_rank" on the module would
+    # raise AttributeError rather than stub the call.
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *_args, **_kwargs: False)
     scheduler = MagicMock(return_value=scheduler_batch)
     finalize = MagicMock(return_value=packed_seq_params)
     prebuild = MagicMock()
@@ -387,17 +409,43 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
 
     monkeypatch.setattr(module, "get_args", lambda: args)
     monkeypatch.setattr(module, "core_transformer_config_from_args", lambda _args: config)
+    # NOTE(nightly-sync 26_10_2026): main's DCP V2 rewrite (ea99fdfce) moved CP wrapping into the
+    # scheduler for the hybrid frontend (`return_context_parallel_batch=True`, main-only API that
+    # four of its own test files depend on), while the gpt frontend still returns the scheduler's
+    # tuple verbatim. The stub returns what the real callee now returns on each path; every
+    # assertion below is unchanged.
+    scheduler_return = (
+        scheduler_batch
+        if frontend == "gpt"
+        else ContextParallelBatch.from_single_layout(
+            config.linear_cp_layout,
+            {
+                "tokens": scheduler_batch[0],
+                "labels": scheduler_batch[1],
+                "loss_mask": scheduler_batch[2],
+                "attention_mask": scheduler_batch[3],
+                "position_ids": scheduler_batch[4],
+                "padding_mask": scheduler_batch[6],
+            },
+            packed_seq_params,
+        )
+    )
     monkeypatch.setattr(
         module,
         "get_batch_on_this_rank_for_sequence_packing",
-        MagicMock(return_value=scheduler_batch),
+        MagicMock(return_value=scheduler_return),
     )
     finalize = MagicMock(return_value=packed_seq_params)
     monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
     prebuild = MagicMock()
     monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
     if frontend == "gpt":
-        monkeypatch.setattr(module, "mtp_on_this_rank", lambda *_args, **_kwargs: False)
+        # NOTE(nightly-sync 26_10_2026): merged pretrain_gpt.py carries main's aliased import
+        # (`mtp_on_this_rank as mtp_on_this_rank_func`) because main's get_batch binds a local
+        # variable of the un-aliased name; dev imported it bare. Patching "mtp_on_this_rank"
+        # therefore raises AttributeError instead of stubbing the call. Dev's hybrid frontend
+        # already used the alias, which is why only this branch needed updating.
+        monkeypatch.setattr(module, "mtp_on_this_rank_func", lambda *_args, **_kwargs: False)
         result = module.get_batch(None)
         assert result is scheduler_batch
     else:
@@ -453,7 +501,14 @@ def test_hybrid_thd_forward_prebuilds_batch_metadata_once(monkeypatch):
     monkeypatch.setattr(pretrain_hybrid, "stimer", MagicMock())
 
     def get_model_attr(_model, attr):
-        return {"vp_stage": None, "config": config}[attr]
+        # NOTE(nightly-sync 26_10_2026): "pg_collection" is new. Main's DCP V2 rewrite
+        # (ea99fdfce) made forward_step pass the model's collection down to get_batch
+        # (`pg_collection=get_attr_wrapped_model(model, "pg_collection")`); dev's version
+        # requested only "vp_stage" and "config", so this dev-only test's dict stub raised
+        # KeyError on the third attribute. None is the value the real explicit-group path
+        # treats as "bootstrap from MPU globals", and get_batch is mocked below, so it is
+        # never dereferenced -- every assertion in this test is unchanged.
+        return {"vp_stage": None, "pg_collection": None, "config": config}[attr]
 
     monkeypatch.setattr(pretrain_hybrid, "get_attr_wrapped_model", get_model_attr)
     prebuild = MagicMock()
@@ -563,8 +618,14 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
     assert set(cp_batch.batches_by_layout) == {args.linear_cp_layout or args.cp_partition_mode}
     batch = cp_batch.get_batch()
     (
+        # NOTE(nightly-sync 26_10_2026): these names are positional -- they must stay in
+        # pretrain_hybrid.BATCH_KEYS order. BATCH_KEYS is a main-only convention (ea99fdfce)
+        # and is sorted, so the restored dev-only "padding_mask" key belongs between
+        # max_seqlen and position_ids. The merge spliced dev's name in second instead, which
+        # silently shifted eight of the eleven bindings by one (padding_mask received
+        # cu_seqlens, cu_seqlens received cu_seqlens_padded, and so on) -- surfaced by
+        # test_sft_batch's `assert padding_mask is None` failing on a cu_seqlens tensor.
         attention_mask,
-        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -572,6 +633,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         local_cp_size,
         loss_mask,
         max_seqlen,
+        padding_mask,
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
@@ -945,8 +1007,14 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
     cp_batch = get_batch(data_iterator)
     batch = cp_batch.get_batch()
     (
+        # NOTE(nightly-sync 26_10_2026): these names are positional -- they must stay in
+        # pretrain_hybrid.BATCH_KEYS order. BATCH_KEYS is a main-only convention (ea99fdfce)
+        # and is sorted, so the restored dev-only "padding_mask" key belongs between
+        # max_seqlen and position_ids. The merge spliced dev's name in second instead, which
+        # silently shifted eight of the eleven bindings by one (padding_mask received
+        # cu_seqlens, cu_seqlens received cu_seqlens_padded, and so on) -- surfaced by
+        # test_sft_batch's `assert padding_mask is None` failing on a cu_seqlens tensor.
         attention_mask,
-        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -954,6 +1022,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         local_cp_size,
         loss_mask,
         max_seqlen,
+        padding_mask,
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
@@ -1555,8 +1624,14 @@ def test_pretrain_batch(
     cp_batch = get_batch(data_iterator)
     batch = cp_batch.get_batch()
     (
+        # NOTE(nightly-sync 26_10_2026): these names are positional -- they must stay in
+        # pretrain_hybrid.BATCH_KEYS order. BATCH_KEYS is a main-only convention (ea99fdfce)
+        # and is sorted, so the restored dev-only "padding_mask" key belongs between
+        # max_seqlen and position_ids. The merge spliced dev's name in second instead, which
+        # silently shifted eight of the eleven bindings by one (padding_mask received
+        # cu_seqlens, cu_seqlens received cu_seqlens_padded, and so on) -- surfaced by
+        # test_sft_batch's `assert padding_mask is None` failing on a cu_seqlens tensor.
         attention_mask,
-        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -1564,6 +1639,7 @@ def test_pretrain_batch(
         local_cp_size,
         loss_mask,
         max_seqlen,
+        padding_mask,
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]
@@ -1959,8 +2035,14 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
     cp_batch = get_batch(data_iterator)
     batch = cp_batch.get_batch()
     (
+        # NOTE(nightly-sync 26_10_2026): these names are positional -- they must stay in
+        # pretrain_hybrid.BATCH_KEYS order. BATCH_KEYS is a main-only convention (ea99fdfce)
+        # and is sorted, so the restored dev-only "padding_mask" key belongs between
+        # max_seqlen and position_ids. The merge spliced dev's name in second instead, which
+        # silently shifted eight of the eleven bindings by one (padding_mask received
+        # cu_seqlens, cu_seqlens received cu_seqlens_padded, and so on) -- surfaced by
+        # test_sft_batch's `assert padding_mask is None` failing on a cu_seqlens tensor.
         attention_mask,
-        padding_mask,
         cu_seqlens,
         cu_seqlens_padded,
         hybrid_cp_group,
@@ -1968,6 +2050,7 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         local_cp_size,
         loss_mask,
         max_seqlen,
+        padding_mask,
         position_ids,
         tokens,
     ) = [batch[key] for key in pretrain_hybrid.BATCH_KEYS]

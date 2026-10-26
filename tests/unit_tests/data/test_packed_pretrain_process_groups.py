@@ -9,7 +9,24 @@ import torch
 import pretrain_gpt
 import pretrain_hybrid
 from megatron.core import parallel_state
+from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.process_groups_config import ProcessGroupCollection
+
+
+def _scheduler_return(module):
+    """Build a metadata-free scheduler result for the entrypoint under test.
+
+    NOTE(nightly-sync 26_10_2026): get_batch now calls prepare_packed_seq_params on the
+    scheduler's result (dev-only frontend hook, restored on main's structure), so an opaque
+    object() sentinel no longer survives the handoff -- gpt reads index 5 and hybrid calls
+    get_packed_seq_params(). The metadata is None on purpose: with real PackedSeqParams,
+    finalize_packed_seq_params would read parallel_state.get_context_parallel_group and trip
+    this module's own "must not read parallel_state" guard. Each test still asserts that
+    get_batch returns this exact object.
+    """
+    if module is pretrain_hybrid:
+        return ContextParallelBatch.from_single_layout("contiguous", {}, None)
+    return (None,) * 7
 
 
 class _Wrapper:
@@ -56,7 +73,7 @@ def test_packed_batch_uses_supplied_groups_and_mtp_pipeline_stage(
     module, pgs, config = packed_entrypoint
     bootstrap = Mock(side_effect=AssertionError("Explicit groups must not bootstrap globals"))
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", bootstrap)
-    result, iterator = object(), object()
+    result, iterator = _scheduler_return(module), object()
     fetch = Mock(return_value=result)
     monkeypatch.setattr(module, "get_batch_on_this_rank_for_sequence_packing", fetch)
 
@@ -78,7 +95,7 @@ def test_direct_packed_entrypoint_bootstraps_collection(packed_entrypoint, monke
     module, pgs, _ = packed_entrypoint
     bootstrap = Mock(return_value=pgs)
     monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", bootstrap)
-    result, iterator = object(), object()
+    result, iterator = _scheduler_return(module), object()
     fetch = Mock(return_value=result)
     monkeypatch.setattr(module, "get_batch_on_this_rank_for_sequence_packing", fetch)
 

@@ -62,7 +62,11 @@ from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
-from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
+from megatron.training.utils import (
+    get_blend_and_blend_per_split,
+    is_first_or_last_pipeline_stage,
+    prepare_packed_seq_params,
+)
 from model_provider import model_provider
 
 try:
@@ -72,7 +76,10 @@ try:
     from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
-except ImportError:
+except ImportError as error:
+    missing_module = error.name or ""
+    if missing_module != "modelopt" and not missing_module.startswith("modelopt."):
+        raise
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
@@ -88,6 +95,8 @@ BATCH_KEYS = [
     "local_cp_size",
     "loss_mask",
     "max_seqlen",
+    # Dev-only varlen SBHD validation field; see needs_padding_mask in get_batch.
+    "padding_mask",
     "position_ids",
     "tokens",
 ]
@@ -105,7 +114,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
                 required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
             )
-        return get_batch_on_this_rank_for_sequence_packing(
+        cp_batch = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
@@ -122,12 +131,31 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             config=config,
             return_context_parallel_batch=True,
         )
+        # NOTE(nightly-sync 26_10_2026): restored dev-only frontend hook, dropped by main's
+        # DCP V2 rewrite (ea99fdfce). Main never had prepare_packed_seq_params, so this is a
+        # merge accident rather than an intentional removal. Main's structure is kept:
+        # return_context_parallel_batch=True is main-only API that four of its own test files
+        # depend on, so the callee still builds the ContextParallelBatch and the hook runs on
+        # the metadata it carries (dev applied it before wrapping, which is now the callee's
+        # job). prepare_packed_seq_params finalizes CP routes in place, matching the
+        # discard-the-return form dev itself used in forward_step.
+        prepare_packed_seq_params(cp_batch.get_packed_seq_params(), config)
+        return cp_batch
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    # NOTE(nightly-sync 26_10_2026): restored dev-only plumbing. Main's DCP V2 rewrite of
+    # this function (ea99fdfce) dropped it, but the callee in megatron/core/utils.py still
+    # takes needs_padding_mask ("Broadcast a batch-first padding mask on every PP stage")
+    # and dev's tests/unit_tests/data/test_get_batch.py::
+    # test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages still asserts
+    # the behaviour, so the caller was the only side that lost it.
+    needs_padding_mask = getattr(args, "use_varlen_dataset", False) and getattr(
+        args, "varlen_sbhd_validation", False
+    )
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -141,6 +169,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
+        and not needs_padding_mask
     ):
         return ContextParallelBatch(
             boundary_layout=config.linear_cp_layout,
@@ -173,17 +202,23 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        needs_padding_mask=needs_padding_mask,
     )
+    # Non-validation TP receivers do not allocate this optional field.
+    batch.setdefault("padding_mask", None)
 
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert has_cu_seqlens
+        # needs_padding_mask makes this branch reachable with has_cu_seqlens False, so
+        # read the packing fields defensively (dev's shape) instead of indexing them.
+        assert has_cu_seqlens or needs_padding_mask
         batch = {
             **dict.fromkeys(BATCH_KEYS),
-            'cu_seqlens': batch['cu_seqlens'],
-            'cu_seqlens_padded': batch['cu_seqlens_padded'],
-            'max_seqlen': batch['max_seqlen'],
+            'cu_seqlens': batch.get('cu_seqlens'),
+            'cu_seqlens_padded': batch.get('cu_seqlens_padded'),
+            'max_seqlen': batch.get('max_seqlen'),
+            'padding_mask': batch.get('padding_mask'),
         }
 
     additional_layouts = set()
@@ -331,6 +366,12 @@ def forward_step(data_iterator, model: HybridModel):
         padding_mask = batch.get("padding_mask")
         if cu_seqlens is not None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
+        if packed_seq_params is not None:
+            # NOTE(nightly-sync 26_10_2026): restored dev-only hook (dev's forward_step
+            # carried it as well as get_batch). This covers the non-packing get_batch path,
+            # whose ContextParallelBatch is built locally and so never passes through the
+            # scheduler branch that prepares the metadata.
+            prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
         # document boundaries so the saver can persist them alongside the
@@ -375,7 +416,19 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
         # The scheduler sends packing metadata to middle PP stages itself and requires that
         # only the first and last stages hold a data iterator.
         return is_first_or_last_pipeline_stage(vp_stage)
-    elif is_packed_sequence:
+    elif is_packed_sequence or (
+        # NOTE(nightly-sync 26_10_2026): restored dev-only disjunct, the second half of the
+        # same dropped feature as needs_padding_mask in get_batch above. Main's DCP V2
+        # rewrite (ea99fdfce) kept only `is_packed_sequence`, which leaves middle PP stages
+        # without a data iterator -- but varlen SBHD validation needs its padding metadata
+        # on every stage, and dev's
+        # tests/unit_tests/data/test_get_batch.py::
+        # test_hybrid_sbhd_validation_broadcasts_padding_mask_on_all_pp_stages asserts
+        # exactly that (is_dataset_built_on_rank() == (tp_rank == 0) under TP2 x PP4).
+        getattr(args, 'use_varlen_dataset', False)
+        and getattr(args, 'varlen_sbhd_validation', False)
+    ):
+        # Every PP stage needs its padding metadata, even without packed THD inputs.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,

@@ -279,6 +279,11 @@ def test_hybrid_stack_forwards_layout_specific_ids_only_to_hash_layers(monkeypat
         convert_sequence_metadata=convert_metadata,
         prepare_layer=lambda _index, hidden: (hidden, None),
         finalize_layer=lambda _index, hidden: hidden,
+        # Mirrors ContextParallelLayoutState.get_layer_padding_mask: fall back to the
+        # single mask when the caller has no per-layout masks to choose from.
+        get_layer_padding_mask=lambda index, default, by_layout: (
+            default if by_layout is None else by_layout[manager.layer_layouts[index]]
+        ),
     )
     manager.build_forward_state = lambda *_args, **_kwargs: state
     stack._cp_layout_manager = manager
