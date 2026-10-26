@@ -599,6 +599,96 @@ class TestMultiTokenPredictionLayer:
             seen_embeddings[1], torch.tensor([2.0, 3.0, 0.0, 0.0]).view(4, 1, 1)
         )
 
+    @pytest.mark.parametrize("with_mask", [False, True])
+    def test_block_rolls_precomputed_embeddings_with_runtime_cp(self, with_mask):
+        """A CP1-built block must roll embeddings and validity on each microbatch's group."""
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < 2 or world_size % 2:
+            pytest.skip("Runtime CP2 rolling requires an even number of distributed ranks")
+
+        Utils.initialize_model_parallel(dynamic_context_parallel=True)
+        build_group = get_context_parallel_group()
+        assert build_group.size() == 1
+        config = TransformerConfig(
+            num_layers=2, hidden_size=1, num_attention_heads=1, mtp_num_layers=2
+        )
+        seen = []
+
+        class _CaptureLayer:
+            def __call__(
+                self, hidden_states, input_ids, position_ids, padding_mask, decoder_input, **kwargs
+            ):
+                seen.append((decoder_input.clone(), padding_mask))
+                return hidden_states, input_ids, position_ids, padding_mask, None
+
+        block = types.SimpleNamespace(
+            config=config,
+            training=True,
+            vp_stage=None,
+            pp_rank=0,
+            mtp_use_repeated_layer=False,
+            cp_group=build_group,
+            tp_group=get_tensor_model_parallel_group(),
+            sequence_parallel=False,
+            layers=[_CaptureLayer(), _CaptureLayer()],
+        )
+        lengths = (8, 16)
+        full_embeddings = torch.arange(1, 25, dtype=torch.float32, device="cuda").view(24, 1, 1)
+        full_validity = full_embeddings[:, :, 0].remainder(3) != 0
+        cu_seqlens = torch.tensor([0, 8, 24], dtype=torch.int32, device="cuda")
+
+        def shard(tensor, group):
+            pieces = []
+            for sequence in tensor.split(lengths):
+                chunks = sequence.chunk(2 * group.size())
+                pieces.extend((chunks[group.rank()], chunks[2 * group.size() - group.rank() - 1]))
+            return torch.cat(pieces).contiguous()
+
+        def shifted(tensor, depth):
+            # Full-sequence oracle: advance within each document and zero its trailing slots.
+            return torch.cat(
+                [
+                    torch.cat((seq[depth:], torch.zeros_like(seq[:depth])))
+                    for seq in tensor.split(lengths)
+                ]
+            )
+
+        for cp_size in (1, 2, 1):
+            group = get_dynamic_data_context_parallel_groups(group_size=cp_size)
+            packed = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=max(lengths),
+                max_seqlen_kv=max(lengths),
+                local_cp_size=cp_size,
+                cp_group=group,
+            )
+            embeddings = shard(full_embeddings, group)
+            padding_mask = ~shard(full_validity, group).transpose(0, 1) if with_mask else None
+            seen.clear()
+            MultiTokenPredictionBlock.forward(
+                block,
+                input_ids=None,
+                position_ids=None,
+                hidden_states=torch.ones_like(embeddings),
+                decoder_input=embeddings,
+                attention_mask=None,
+                padding_mask=padding_mask,
+                packed_seq_params=packed,
+            )
+            assert len(seen) == config.mtp_num_layers
+            for depth, (actual_embeddings, actual_mask) in enumerate(seen, start=1):
+                torch.testing.assert_close(
+                    actual_embeddings, shard(shifted(full_embeddings, depth), group)
+                )
+                if with_mask:
+                    expected_mask = ~shard(shifted(full_validity, depth), group).transpose(0, 1)
+                    torch.testing.assert_close(actual_mask, expected_mask)
+                else:
+                    assert actual_mask is None
+            assert block.cp_group is build_group
+
     @pytest.mark.parametrize("packed", [False, True])
     def test_hsm_aligns_history_with_target_tokens(self, monkeypatch, packed):
         """Each reuse of an older HSM state advances it by one target token."""
