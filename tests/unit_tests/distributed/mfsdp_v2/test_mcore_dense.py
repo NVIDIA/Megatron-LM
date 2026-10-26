@@ -25,7 +25,7 @@ from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimize
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
@@ -453,6 +453,36 @@ def test_delayed_wgrad_matches_immediate(process_group_collection, distributed_s
     immediate_losses = train(immediate_layer)
     delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
+
+
+def test_rejects_residual_stream_recompute(process_group_collection, distributed_setup):
+    """Reject stack-managed replay before mutating parameters or creating FSDP units."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        gradient_accumulation_fusion=False,
+        wide_residual=WideResidualConfig(num_streams=3),
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=1,
+    )
+    layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
+    parameters = list(layer.parameters())
+    with pytest.raises(ValueError, match="does not support residual_stream recomputation"):
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=layer,
+            pg_collection=process_group_collection,
+        )
+    assert not isinstance(layer, FsdpModule)
+    assert all(actual is original for actual, original in zip(layer.parameters(), parameters))
+    assert all(not isinstance(parameter, DTensor) for parameter in layer.parameters())
 
 
 def test_build_train_and_step(process_group_collection):
