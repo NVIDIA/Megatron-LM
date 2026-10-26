@@ -51,13 +51,19 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 from tests.unit_tests.test_utilities import Utils
 
 NEMO_RL_COMMIT = "b26733300f0f7f5421c43c8ba4cd9e37e5d5f65d"
+
+
 class _CoordinatorTokenizer:
     vocab_size = 100
     eod, bos = 99, None
+
     def tokenize(self, prompt):
         return prompt if isinstance(prompt, list) else [int(token) for token in prompt.split()]
+
     def detokenize(self, tokens):
         return " ".join(map(str, tokens))
+
+
 def _mount_nemo_rl_generation_packages(source):
     for name, relative_path in (
         ("nemo_rl.models.generation", "nemo_rl/models/generation"),
@@ -68,6 +74,8 @@ def _mount_nemo_rl_generation_packages(source):
         package.__path__ = [str(source / relative_path)]
         package.__package__ = name
         sys.modules[name] = package
+
+
 def _load_nemo_rl_adapter():
     source_value = os.environ.get("NEMO_RL_SOURCE")
     if source_value is None:
@@ -91,6 +99,8 @@ def _load_nemo_rl_adapter():
         {},
     )
     return data_module.BatchedDataDict, adapter_cls
+
+
 def _load_nemo_rl_token_capture():
     source_value = os.environ.get("NEMO_RL_SOURCE")
     if source_value is None:
@@ -112,6 +122,8 @@ def _load_nemo_rl_token_capture():
     assert Path(capture_module.__file__).resolve().is_relative_to(source)
     assert Path(gym_module.__file__).resolve().is_relative_to(gym_source)
     return capture_module, gym_module, records_module
+
+
 def _protocol_adapter(mixin_cls, *, stop_token_ids=None, ignore_eos=False):
     adapter = object.__new__(mixin_cls)
     adapter.cfg = {
@@ -128,6 +140,8 @@ def _protocol_adapter(mixin_cls, *, stop_token_ids=None, ignore_eos=False):
     adapter.tokenizer = SimpleNamespace(pad_token_id=0)
     adapter.megatron_tokenizer = SimpleNamespace(eod=99)
     return adapter
+
+
 def _reply(tokens, scores, reason, prompt=None):
     return SimpleNamespace(
         prompt_tokens=prompt,
@@ -135,14 +149,20 @@ def _reply(tokens, scores, reason, prompt=None):
         generated_log_probs=scores,
         finish_reason=reason,
     )
+
+
 def _assert_exact_scores(actual, expected):
     torch.testing.assert_close(actual, torch.tensor(expected), rtol=0, atol=0)
+
+
 async def _wait_for_epoch(engine, epoch):
     for _ in range(100):
         if engine._generation_epoch == epoch:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"generation epoch did not reach {epoch}")
+
+
 async def _drive_engine(engine, futures, witness=None):
     step_count = 0
     while not all(future.done() for future in futures):
@@ -157,11 +177,15 @@ async def _drive_engine(engine, futures, witness=None):
         assert step_count < 100, "dynamic engine did not drain the adapter requests"
         await asyncio.sleep(0)
     return await asyncio.gather(*futures)
+
+
 def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
     config_class = dynamic_engine_tests.TransformerConfig
+
     def build_mxfp8_config(**kwargs):
         kwargs.update(fp8_recipe="mxfp8", fp8_param=True)
         return config_class(**kwargs)
+
     with (
         mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_mxfp8_config),
         mock.patch.object(
@@ -176,6 +200,8 @@ def _build_inference_mxfp8_env(test_case, config, *, quantize=True):
     buffers = quantize_params_to_mxfp8(model.decoder, backend="triton") if quantize else None
     assert not quantize or buffers
     return env
+
+
 class _InProcessInferenceClient:
     def __init__(self, engine, expected_requests, first_request_id, witness):
         self.engine = engine
@@ -184,6 +210,7 @@ class _InProcessInferenceClient:
         self.witness = witness
         self.pending = []
         self.driver = None
+
     def add_request_with_id(self, prompt, sampling_params, *, multi_modal_data=None):
         assert multi_modal_data is None
         request_id = self.next_request_id
@@ -203,8 +230,11 @@ class _InProcessInferenceClient:
             drive = _drive_engine(self.engine, self.pending, self.witness)
             self.driver = asyncio.create_task(drive)
         return request_id, future
+
     def abort_request(self, request_id):  # pragma: no cover - failure path assertion
         raise AssertionError(f"unexpected adapter abort for request {request_id}")
+
+
 class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
     @classmethod
     def setup_class(cls):
@@ -215,11 +245,13 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             expert_tensor_parallel_size=1,
         )
         model_parallel_cuda_manual_seed(123)
+
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
         reset_rounder()
         Utils.destroy_model_parallel()
+
     @pytest.mark.internal
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -307,6 +339,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             },
         )
         if uses_mla:
+
             def build_mla_config(**kwargs):
                 kwargs.update(
                     hidden_size=512,
@@ -324,6 +357,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                     cache_mla_latents=True,
                 )
                 return MLATransformerConfig(**kwargs)
+
             with (
                 mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_mla_config),
                 mock.patch.object(
@@ -368,8 +402,10 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             "flash_mla_request_ids": [],
             "fused_rope_request_ids": [],
         }
+
         def active_request_ids():
             return tuple(engine.context.request_ids[: engine.context.total_request_count].tolist())
+
         model = engine.controller.inference_wrapped_model.model
         mixer_calls = []
         mixer_name = {
@@ -383,6 +419,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             if type(module).__name__ == mixer_name
         ]
         original_forward = model.forward
+
         def traced_forward(*args, **kwargs):
             request_ids = active_request_ids()
             witness["model_request_ids"].append(request_ids)
@@ -391,30 +428,39 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             shape = result.shape[1], ctx.padded_active_token_count, ctx.num_last_token_logits
             witness.setdefault("logit_rows", []).append((request_ids, *shape))
             return result
+
         model.forward = traced_forward
         sampler = engine.controller._sampling
         original_sample_kernel = sampler.sample_kernel
+
         def traced_sample_kernel(*args, **kwargs):
             witness["sampler_request_ids"].append(active_request_ids())
             return original_sample_kernel(*args, **kwargs)
+
         sampler.sample_kernel = traced_sample_kernel
         if feature_config.get("use_flashinfer_fused_rope"):
             original_fused_rope = engine.context.apply_fused_qk_rotary_emb
+
             def traced_fused_rope(*args, **kwargs):
                 witness["fused_rope_request_ids"].append(active_request_ids())
                 return original_fused_rope(*args, **kwargs)
+
             engine.context.apply_fused_qk_rotary_emb = traced_fused_rope
         if uses_mla:
             original_flash_mla = attention_module.flash_mla_with_kvcache
+
             def traced_flash_mla(*args, **kwargs):
                 witness["flash_mla_request_ids"].append(active_request_ids())
                 return original_flash_mla(*args, **kwargs)
+
             monkeypatch.setattr(attention_module, "flash_mla_with_kvcache", traced_flash_mla)
         if feature_config.get("num_speculative_tokens", 0):
             original_mtp_step = engine.controller._run_async_sched_sample_mtp
+
             def traced_mtp_step(*args, **kwargs):
                 witness["mtp_request_ids"].append(active_request_ids())
                 return original_mtp_step(*args, **kwargs)
+
             engine.controller._run_async_sched_sample_mtp = traced_mtp_step
         direct_params = [
             SamplingParams(
@@ -451,10 +497,12 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         witness["flash_mla_request_ids"].clear()
         witness["fused_rope_request_ids"].clear()
         original_schedule = engine.schedule_waiting_requests
+
         def traced_schedule():
             original_schedule()
             if (request_id := engine.context.chunked_prefill_request_id) >= 0:
                 witness["chunked_prefill_request_ids"].append(int(request_id))
+
         engine.schedule_waiting_requests = traced_schedule
         if uses_mla:
             for layer in engine.controller.inference_wrapped_model.model.decoder.layers:
@@ -594,6 +642,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         for hook in mixer_hooks:
             hook.remove()
         assert not engine.requests and not engine.has_unfinished_requests()
+
     @pytest.mark.internal
     @pytest.mark.asyncio
     async def test_real_adapter_joint_sampling_matches_analytic_distribution(self):
@@ -617,6 +666,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
         observed = []
         sampler = engine.controller._sampling
         original_sample_kernel = sampler.sample_kernel
+
         def traced_sample_kernel(logits, n, context, **kwargs):
             result = original_sample_kernel(logits, n, context, **kwargs)
             observed.append(
@@ -631,6 +681,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 }
             )
             return result
+
         sampler.sample_kernel = traced_sample_kernel
         adapter = _protocol_adapter(mixin_cls, ignore_eos=True)
         adapter.cfg["generation"].update(temperature=0.73, top_k=4, top_p=0.9, max_new_tokens=1)
@@ -683,6 +734,7 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
                 1 / sample_count
             )
         assert not engine.requests and not engine.has_unfinished_requests()
+
     @pytest.mark.internal
     @pytest.mark.asyncio
     async def test_public_async_adapter_preserves_row_attribution(self):
@@ -746,6 +798,8 @@ class TestNeMoRLAdapterContract(DynamicInferenceEngineTestBase):
             )
         assert engine.context.async_sched_step_count > 0
         assert not engine.requests and not engine.has_unfinished_requests()
+
+
 @pytest.fixture
 def nemo_parallel(request, monkeypatch):
     topology = request.param
@@ -764,6 +818,8 @@ def nemo_parallel(request, monkeypatch):
         delete_cuda_graphs()
         reset_rounder()
         Utils.destroy_model_parallel()
+
+
 class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.asyncio
@@ -817,6 +873,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
             logprobs_mode="raw_logprobs",
         )
         transformer_config = dynamic_engine_tests.TransformerConfig
+
         def build_transformer_config(**kwargs):
             kwargs.update(
                 expert_tensor_parallel_size=topology.get("etp", 1),
@@ -824,6 +881,7 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
                 add_bias_linear=False if uses_moe else kwargs["add_bias_linear"],
             )
             return transformer_config(**kwargs)
+
         with mock.patch.object(dynamic_engine_tests, "TransformerConfig", build_transformer_config):
             engine = self._build_test_env(config).engine
         engine.controller.tokenizer = _CoordinatorTokenizer()
@@ -870,11 +928,13 @@ class TestNeMoRLAdapterParallelContract(DynamicInferenceEngineTestBase):
         engine.controller.sampling_rng.manual_seed(initial_seed)
         adapter_forward_batches, model = [], engine.controller.inference_wrapped_model.model
         original_forward = model.forward
+
         def traced_forward(*args, **kwargs):
             adapter_forward_batches.append(
                 tuple(engine.context.request_ids[: engine.context.total_request_count].tolist())
             )
             return original_forward(*args, **kwargs)
+
         model.forward = traced_forward
         moe_forward_batches = []
         moe_hooks = [
