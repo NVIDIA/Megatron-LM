@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -71,96 +71,6 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
-
-
-def pad_packed_batch_to_capacity(
-    tokens,
-    labels,
-    loss_mask,
-    position_ids,
-    packed_seq_params,
-    padding_mask,
-    *,
-    local_capacity: int,
-    cp_size: int,
-    max_num_seqs: Optional[int] = None,
-):
-    """Pad already CP-sliced scheduler tensors without changing real document boundaries.
-
-    The existing mask supplies the local storage length on intermediate PP stages,
-    which do not own token or label tensors. Append a separate dummy document in
-    global THD coordinates; each CP rank appends its equal share of that document.
-    """
-    local_rows = padding_mask.shape[-1]
-    if local_rows > local_capacity:
-        raise ValueError(f"Packed local rows {local_rows} exceed capacity {local_capacity}.")
-    local_tail = local_capacity - local_rows
-    if cp_size > 1 and local_tail % 2:
-        raise ValueError("Packed padding tail must preserve the two-way zigzag CP partition.")
-
-    def pad_tensor(tensor, fill=0):
-        if tensor is None:
-            return None
-        if tensor.shape[-1] != local_rows:
-            raise ValueError("Packed token tensors and padding_mask must have the same length.")
-        return (
-            tensor
-            if local_tail == 0
-            else torch.nn.functional.pad(tensor, (0, local_tail), value=fill)
-        )
-
-    fields = {}
-    if local_tail:
-        for name in (
-            'cu_seqlens_q',
-            'cu_seqlens_kv',
-            'cu_seqlens_q_padded',
-            'cu_seqlens_kv_padded',
-        ):
-            offsets = getattr(packed_seq_params, name)
-            if offsets is None:
-                offsets = getattr(packed_seq_params, name.removesuffix('_padded'))
-            # The dummy document occupies physical storage but contains no real
-            # tokens. In particular, CSA's indexer auxiliary loss must ignore it.
-            tail = local_tail * cp_size if name.endswith('_padded') else 0
-            fields[name] = torch.cat((offsets, offsets[-1:] + tail))
-    if max_num_seqs is not None:
-        for name in (
-            'cu_seqlens_q',
-            'cu_seqlens_kv',
-            'cu_seqlens_q_padded',
-            'cu_seqlens_kv_padded',
-        ):
-            offsets = fields.get(name, getattr(packed_seq_params, name))
-            if offsets is None:
-                offsets = fields.get(
-                    name.removesuffix('_padded'),
-                    getattr(packed_seq_params, name.removesuffix('_padded')),
-                )
-            remaining = max_num_seqs + 1 - offsets.numel()
-            if remaining < 0:
-                raise ValueError("Packed documents exceed thd_max_packed_sequences.")
-            if remaining:
-                fields[name] = torch.cat((offsets, offsets[-1:].expand(remaining)))
-    static_capacity = local_capacity * cp_size if max_num_seqs is not None else 0
-    if fields or static_capacity:
-        packed_seq_params = replace(
-            packed_seq_params,
-            **fields,
-            max_seqlen_q=max(packed_seq_params.max_seqlen_q, local_tail * cp_size, static_capacity),
-            max_seqlen_kv=max(
-                packed_seq_params.max_seqlen_kv, local_tail * cp_size, static_capacity
-            ),
-            pad_between_seqs=True,
-        )
-    return (
-        pad_tensor(tokens),
-        pad_tensor(labels),
-        pad_tensor(loss_mask),
-        pad_tensor(position_ids),
-        packed_seq_params,
-        pad_tensor(padding_mask, True),
-    )
 
 
 def resolve_cp_group(
