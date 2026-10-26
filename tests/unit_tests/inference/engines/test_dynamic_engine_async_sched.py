@@ -2136,6 +2136,7 @@ def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected
         "return_log_probs": torch.tensor([True, False, True, False]),
         "skip_prompt_log_probs": torch.tensor([False, True, False, True]),
         "top_n_logprobs": torch.tensor([2, 0, 5, 1]),
+        "seed": torch.tensor([101, 202, 303, 404], dtype=torch.int64),
         "custom_metadata": torch.tensor([101, 202, 303, 404]),
     }
     gpu_view = SimpleNamespace(

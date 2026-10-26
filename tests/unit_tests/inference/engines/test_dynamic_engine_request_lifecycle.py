@@ -145,8 +145,15 @@ _PERSIST_TE_SWA = _AsyncPairScenario(
 _OFFLOAD_FP8 = _AsyncPairScenario(
     name="offload-dynamic-fp8",
     pairs=("kv:offload", "precision:fp8"),
-    config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False, "fp8": True},
-    signals=("fp8",),
+    config={
+        "kv_cache_management_mode": "offload",
+        "static_kv_memory_pointers": False,
+        "fp8": True,
+        "materialize_only_last_token_logits": False,
+        "return_log_probs": True,
+    },
+    sampling=({"return_log_probs": True, "skip_prompt_log_probs": False, "top_n_logprobs": 3},),
+    signals=("fp8", "logprobs", "top-n"),
     prerequisite="fp8",
     atol=5.0e-3,
 )
@@ -178,3 +185,8 @@ class TestRequestLifecycleCorePairwise(RequestLifecyclePairwiseBase):
                 > result.witness["feature_counts_before"][key]
                 > 0
             )
+        for request in result.requests:
+            assert len(request.prompt_log_probs) == len(request.prompt_tokens) - 1
+            assert len(request.prompt_top_n_logprobs) == len(request.prompt_tokens) - 1
+            assert len(request.generated_log_probs) == len(request.generated_tokens)
+            assert len(request.generated_top_n_logprobs) == len(request.generated_tokens)
